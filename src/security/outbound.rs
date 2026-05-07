@@ -89,7 +89,7 @@ fn has_hard_blocker(text: &str, reasons: &mut Vec<String>) -> bool {
 }
 
 fn render_secret_sanitized_text(result: &super::SecretRedactionResult) -> String {
-    if result.primary_kind() == Some(super::SecretInputType::ApiKeyOrToken) {
+    if result.uses_specific_api_key_placeholder() {
         result
             .text
             .replace("[REDACTED_SECRET]", "[REDACTED_API_KEY]")

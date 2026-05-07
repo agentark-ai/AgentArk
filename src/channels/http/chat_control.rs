@@ -4,6 +4,8 @@ use futures::FutureExt as _;
 static CHAT_WORKER_RUNTIME: OnceLock<std::result::Result<Arc<tokio::runtime::Runtime>, String>> =
     OnceLock::new();
 static CHAT_WORKER_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+const CHAT_STREAM_TRACE_LINK_WAIT_ATTEMPTS: usize = 40;
+const CHAT_STREAM_TRACE_LINK_WAIT_MS: u64 = 100;
 
 // Keep long model/tool turns off the control-plane runtime so health and UI APIs stay responsive.
 fn chat_worker_thread_count() -> usize {
@@ -3322,6 +3324,37 @@ fn chat_stream_execution_status(raw: Option<&str>) -> crate::core::ExecutionRunS
     }
 }
 
+async fn wait_for_chat_stream_trace_link(
+    storage: &crate::storage::Storage,
+    trace_id: Option<String>,
+) -> Option<String> {
+    let trace_id = trace_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    for attempt in 0..CHAT_STREAM_TRACE_LINK_WAIT_ATTEMPTS {
+        match storage.get_execution_trace(&trace_id).await {
+            Ok(Some(_)) => return Some(trace_id),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    trace_id,
+                    "Failed to check execution trace before linking chat stream run: {}",
+                    error
+                );
+                return None;
+            }
+        }
+        if attempt + 1 < CHAT_STREAM_TRACE_LINK_WAIT_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(CHAT_STREAM_TRACE_LINK_WAIT_MS)).await;
+        }
+    }
+    tracing::debug!(
+        trace_id,
+        "Execution trace was not persisted before chat stream run linkage window elapsed"
+    );
+    None
+}
+
 async fn upsert_chat_stream_execution_run(
     storage: &crate::storage::Storage,
     run_id: &str,
@@ -3340,6 +3373,7 @@ async fn upsert_chat_stream_execution_run(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let trace_id = wait_for_chat_stream_trace_link(storage, trace_id).await;
     if let Some(conversation_id) = normalized_conversation_id.as_deref() {
         let conversation = crate::storage::entities::conversation::Model {
             id: conversation_id.to_string(),

@@ -879,7 +879,7 @@ pub async fn stream_orbit_chat_turn(
     } else {
         let _ = event_tx
             .send(OrbitAgentEvent::Status {
-                message: "Checking request safety...".to_string(),
+                message: "Reviewing request intent...".to_string(),
             })
             .await;
         run_orbit_inbound_security_guard(&llm, surface_kind, &user_message, &history).await
@@ -3005,6 +3005,8 @@ fn render_orbit_local_time_context(
     )
 }
 
+const RUNTIME_NOTICE_CONTEXT_MESSAGE_MAX_CHARS: usize = 220;
+
 fn render_runtime_notice_context(runtime_notices: &[String]) -> String {
     let notices = runtime_notices
         .iter()
@@ -3013,7 +3015,7 @@ fn render_runtime_notice_context(runtime_notices: &[String]) -> String {
         .take(6)
         .map(|notice| {
             serde_json::json!({
-                "message": truncate_chars(notice, 500),
+                "message": truncate_chars(notice, RUNTIME_NOTICE_CONTEXT_MESSAGE_MAX_CHARS),
             })
         })
         .collect::<Vec<_>>();

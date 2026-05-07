@@ -1208,6 +1208,23 @@ impl SecureConfigManager {
     /// Prefers the global key manager (set at startup from master password) so that all
     /// code paths use the same encryption key, even after password changes.
     pub fn new_with_data_dir(config_dir: &Path, data_dir: Option<&Path>) -> Result<Self> {
+        std::fs::create_dir_all(config_dir).map_err(|error| {
+            anyhow!(
+                "Failed to create secure config directory at {:?}: {}",
+                config_dir,
+                error
+            )
+        })?;
+        if let Some(data_dir) = data_dir {
+            std::fs::create_dir_all(data_dir).map_err(|error| {
+                anyhow!(
+                    "Failed to create secure data directory at {:?}: {}",
+                    data_dir,
+                    error
+                )
+            })?;
+        }
+
         // Prefer global key (master-password-derived) when available
         if let Some(km) = global_key_manager() {
             return Ok(Self {
@@ -1274,6 +1291,12 @@ impl SecureConfigManager {
     }
 
     fn storage_backend(&self) -> Option<crate::storage::Storage> {
+        #[cfg(test)]
+        {
+            if self.config_dir.starts_with(std::env::temp_dir()) {
+                return None;
+            }
+        }
         global_settings_storage()
     }
 

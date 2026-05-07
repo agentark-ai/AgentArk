@@ -142,6 +142,21 @@ impl EncryptedStorage {
         Ok(self.decrypt_fact_content(facts))
     }
 
+    /// Get learned memory rows by semantic category and decrypt their content when needed.
+    pub async fn get_facts_by_project_and_category_decrypted(
+        &self,
+        limit: u64,
+        offset: u64,
+        project_id: Option<&str>,
+        category: &str,
+    ) -> Result<Vec<super::LearnedFactRecord>> {
+        let facts = self
+            .storage
+            .get_facts_by_project_and_category(limit, offset, project_id, category)
+            .await?;
+        Ok(self.decrypt_fact_content(facts))
+    }
+
     // ==================== Encrypted KV Store ====================
 
     /// Set an encrypted value in the KV store

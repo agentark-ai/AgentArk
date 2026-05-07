@@ -441,6 +441,33 @@ fn summarize_daily_brief_result_reports_in_app_only_when_push_fails() {
 }
 
 #[test]
+fn summarize_daily_brief_result_reports_suppressed_in_app_notification() {
+    let action = test_recommended_action("daily_brief_now", "Generate Daily Brief");
+    let summary = summarize_autonomy_action_result(
+        &action,
+        &serde_json::json!({
+            "status": "executed",
+            "kind": "daily_brief_now",
+            "brief": "Morning command brief",
+            "delivery": {
+                "in_app_notification_suppressed": true,
+                "in_app": {
+                    "channel": "web",
+                    "success": false,
+                    "error": "Daily brief generation does not create in-app notifications"
+                },
+                "push_attempts": [
+                    { "channel": "telegram", "success": true, "error": serde_json::Value::Null }
+                ]
+            }
+        }),
+    );
+
+    assert!(summary.contains("Daily brief generated. Push delivered via Telegram."));
+    assert!(summary.contains("Preview: Morning command brief"));
+}
+
+#[test]
 fn summarize_watch_result_reports_saved_watcher() {
     let action = test_recommended_action("watch", "Monitor public updates");
     let summary = summarize_autonomy_action_result(
@@ -712,7 +739,7 @@ async fn chat_fast_path_stores_secret_without_live_server() {
     .expect("test manager should initialize");
     assert_eq!(
         manager
-            .get_custom_secret("TEST_FAST_PATH_SECRET")
+            .get_custom_secret("env:TEST_FAST_PATH_SECRET")
             .expect("secret should be readable"),
         Some("abc123".to_string())
     );
@@ -798,7 +825,7 @@ async fn chat_stream_fast_path_stores_secret_without_live_server() {
     .expect("test manager should initialize");
     assert_eq!(
         manager
-            .get_custom_secret("TEST_STREAM_SECRET")
+            .get_custom_secret("env:TEST_STREAM_SECRET")
             .expect("stream secret should be readable"),
         Some("stream-abc".to_string())
     );

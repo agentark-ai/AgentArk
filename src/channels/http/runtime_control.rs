@@ -21,13 +21,12 @@ static LAST_RUNTIME_PROC_SAMPLE: once_cell::sync::Lazy<
     parking_lot::Mutex<Option<RuntimeProcSample>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
-fn collect_status_runtime_health(uptime_seconds: u64) -> RuntimeHealthResponse {
+fn collect_local_runtime_health(uptime_seconds: u64) -> RuntimeHealthResponse {
     let memory = read_linux_memory_pressure();
     let sample = read_linux_proc_sample();
-    let (cpu_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec) =
-        sample
-            .map(update_runtime_proc_rates)
-            .unwrap_or((None, None, None));
+    let (cpu_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec) = sample
+        .map(update_runtime_proc_rates)
+        .unwrap_or((None, None, None));
 
     RuntimeHealthResponse {
         uptime_seconds,
@@ -36,6 +35,8 @@ fn collect_status_runtime_health(uptime_seconds: u64) -> RuntimeHealthResponse {
         memory_pressure_percent: memory.map(|item| item.2),
         memory_used_bytes: memory.map(|item| item.0),
         memory_total_bytes: memory.map(|item| item.1),
+        memory_source: memory.map(|item| item.3.to_string()),
+        memory_container_count: None,
         disk_read_bytes_per_sec,
         disk_write_bytes_per_sec,
         temperature_celsius: read_linux_temperature_celsius(),
@@ -44,9 +45,54 @@ fn collect_status_runtime_health(uptime_seconds: u64) -> RuntimeHealthResponse {
     }
 }
 
-fn update_runtime_proc_rates(
-    sample: RuntimeProcSample,
-) -> (Option<f64>, Option<f64>, Option<f64>) {
+async fn collect_status_runtime_health(
+    state: &AppState,
+    uptime_seconds: u64,
+) -> RuntimeHealthResponse {
+    let mut health = collect_local_runtime_health(uptime_seconds);
+    if let Some(stats) = read_docker_stack_memory_stats(state).await {
+        health.memory_used_bytes = Some(stats.memory_used_bytes);
+        health.memory_total_bytes = stats.memory_total_bytes;
+        health.memory_pressure_percent = stats.memory_pressure_percent;
+        health.ram_percent = stats.memory_pressure_percent;
+        health.memory_source = Some(stats.source);
+        health.memory_container_count = Some(stats.container_count);
+        health.sampled_at = stats.sampled_at;
+    }
+    health
+}
+
+async fn read_docker_stack_memory_stats(
+    state: &AppState,
+) -> Option<crate::clients::StackMemoryStatsResponse> {
+    if state.server_role != HttpServerRole::ControlPlane {
+        return None;
+    }
+    let executor = state
+        .executor_client
+        .as_ref()
+        .cloned()
+        .or_else(|| build_executor_client().ok().flatten())?;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        executor.stack_memory_stats(),
+    )
+    .await
+    {
+        Ok(Ok(stats)) if stats.status == "ok" && stats.container_count > 0 => Some(stats),
+        Ok(Err(error)) => {
+            tracing::debug!("Docker stack memory stats unavailable: {}", error);
+            None
+        }
+        Err(_) => {
+            tracing::debug!("Docker stack memory stats timed out");
+            None
+        }
+        _ => None,
+    }
+}
+
+fn update_runtime_proc_rates(sample: RuntimeProcSample) -> (Option<f64>, Option<f64>, Option<f64>) {
     let mut previous = LAST_RUNTIME_PROC_SAMPLE.lock();
     let last = previous.replace(sample);
     let Some(last) = last else {
@@ -62,7 +108,9 @@ fn update_runtime_proc_rates(
     let cpu_idle_delta = sample.cpu_idle.saturating_sub(last.cpu_idle);
     let cpu_percent = if cpu_total_delta > 0 {
         let active = cpu_total_delta.saturating_sub(cpu_idle_delta) as f64;
-        Some(round_1((active / cpu_total_delta as f64 * 100.0).clamp(0.0, 100.0)))
+        Some(round_1(
+            (active / cpu_total_delta as f64 * 100.0).clamp(0.0, 100.0),
+        ))
     } else {
         None
     };
@@ -107,9 +155,9 @@ fn read_linux_cpu_counters() -> Option<(u64, u64)> {
     Some((total, idle))
 }
 
-fn read_linux_memory_pressure() -> Option<(u64, u64, f64)> {
+fn read_linux_memory_pressure() -> Option<(u64, u64, f64, &'static str)> {
     if let Some(memory) = read_linux_cgroup_memory_pressure() {
-        return Some(memory);
+        return Some((memory.0, memory.1, memory.2, "cgroup"));
     }
 
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -136,7 +184,12 @@ fn read_linux_memory_pressure() -> Option<(u64, u64, f64)> {
     let available = available_kb.or(free_kb).unwrap_or(0).min(total);
     let used = total.saturating_sub(available);
     let percent = round_1((used as f64 / total as f64 * 100.0).clamp(0.0, 100.0));
-    Some((used.saturating_mul(1024), total.saturating_mul(1024), percent))
+    Some((
+        used.saturating_mul(1024),
+        total.saturating_mul(1024),
+        percent,
+        "proc_meminfo",
+    ))
 }
 
 fn read_linux_cgroup_memory_pressure() -> Option<(u64, u64, f64)> {
@@ -2418,7 +2471,11 @@ pub(super) async fn status(State(state): State<AppState>) -> Json<StatusResponse
         actions_loaded: Some(status.actions_loaded),
         tasks_pending: status.tasks_pending,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        runtime_health: collect_status_runtime_health(state.runtime_started_at.elapsed().as_secs()),
+        runtime_health: collect_status_runtime_health(
+            &state,
+            state.runtime_started_at.elapsed().as_secs(),
+        )
+        .await,
         update: Some(update),
     })
 }

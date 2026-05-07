@@ -63,7 +63,55 @@ pub(super) async fn memory_stats(
 ) -> Response {
     let project_id: Option<&str> = None;
     let agent = state.agent.read().await;
-    let fact_count = agent.storage.count_facts(project_id).await.unwrap_or(0);
+    let profile_fact_count = agent
+        .storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+        )
+        .await
+        .unwrap_or(0);
+    let assistant_preference_count = agent
+        .storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_ASSISTANT_PREFERENCE,
+        )
+        .await
+        .unwrap_or(0);
+    let work_preference_count = agent
+        .storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_WORK_PREFERENCE,
+        )
+        .await
+        .unwrap_or(0);
+    let project_domain_count = agent
+        .storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_PROJECT_DOMAIN,
+        )
+        .await
+        .unwrap_or(0);
+    let ephemeral_count = agent
+        .storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_EPHEMERAL_CONTEXT,
+        )
+        .await
+        .unwrap_or(0);
+    let other_memory_count = agent
+        .storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_OTHER,
+        )
+        .await
+        .unwrap_or(0);
+    let fact_count = profile_fact_count;
     let doc_count = agent.storage.count_documents(project_id).await.unwrap_or(0);
     let preference_count = agent
         .storage
@@ -84,6 +132,12 @@ pub(super) async fn memory_stats(
         StatusCode::OK,
         Json(serde_json::json!({
             "facts": fact_count,
+            "profile_facts": profile_fact_count,
+            "assistant_preferences": assistant_preference_count,
+            "work_preferences": work_preference_count,
+            "project_domain_memory": project_domain_count,
+            "ephemeral_context": ephemeral_count,
+            "other_memory": other_memory_count,
             "documents": doc_count,
             "preferences": preference_count,
             "user_data": user_data_count,
@@ -107,13 +161,34 @@ pub(super) async fn list_facts(
         .get("offset")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
+    let category = params
+        .get("category")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && *value != "all");
     let agent = state.agent.read().await;
-    let total = agent.storage.count_facts(project_id).await.unwrap_or(0);
-    match agent
-        .encrypted_storage
-        .get_facts_by_project_decrypted(limit, offset, project_id)
-        .await
-    {
+    let total = match category {
+        Some(category) => agent
+            .storage
+            .count_facts_by_category(project_id, category)
+            .await
+            .unwrap_or(0),
+        None => agent.storage.count_facts(project_id).await.unwrap_or(0),
+    };
+    let facts_result = match category {
+        Some(category) => {
+            agent
+                .encrypted_storage
+                .get_facts_by_project_and_category_decrypted(limit, offset, project_id, category)
+                .await
+        }
+        None => {
+            agent
+                .encrypted_storage
+                .get_facts_by_project_decrypted(limit, offset, project_id)
+                .await
+        }
+    };
+    match facts_result {
         Ok(facts) => {
             let mut items: Vec<serde_json::Value> = Vec::with_capacity(facts.len());
             for f in &facts {
@@ -124,9 +199,14 @@ pub(super) async fn list_facts(
                     "id": f.id,
                     "fact": f.fact,
                     "confidence": f.confidence,
+                    "memory_kind": f.memory_kind.clone(),
+                    "memory_category": f.memory_category.clone(),
+                    "topics": f.topics.clone(),
+                    "scope": f.scope.clone(),
                     "sources": sources,
                     "evidence_count": evidence_count,
                     "created_at": f.created_at,
+                    "updated_at": f.updated_at,
                 }));
             }
             (
@@ -144,6 +224,75 @@ pub(super) async fn list_facts(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn delete_memory_fact(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let memory_id = id.trim();
+    if memory_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "memory id is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let project_id: Option<&str> = None;
+    let agent = state.agent.read().await;
+    let item = match agent.storage.get_experience_item(memory_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "memory not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if !arkmemory_item_is_memory(&item) || !arkmemory_item_visible_for_project(&item, project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "item is not a deletable ArkMemory learned memory".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    match agent
+        .storage
+        .hard_delete_experience_item_memory(memory_id)
+        .await
+    {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deleted": deleted,
+                "id": memory_id,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
             }),
         )
             .into_response(),
@@ -281,6 +430,35 @@ mod memory_control_tests {
         assert_eq!(
             memory_operation_evidence_source_refs(&operation),
             vec!["message:m1".to_string(), "capture_event:c1".to_string()]
+        );
+    }
+
+    #[test]
+    fn pending_capture_events_group_by_semantic_capture_key() {
+        let now = "2026-05-03T00:00:00Z".to_string();
+        let event = crate::storage::memory_capture_event::Model {
+            id: "memory-capture-pending-1".to_string(),
+            source_message_id: Some("message-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            project_id: None,
+            channel: "chat".to_string(),
+            status: "pending_consolidation".to_string(),
+            capture_kind: "user_fact_memory_capture".to_string(),
+            source_hash: "pending:semantic-source-key".to_string(),
+            attempt_metadata: serde_json::json!({
+                "semantic_capture_key": "semantic-source-key",
+            }),
+            error_history: serde_json::json!([]),
+            replay_count: 0,
+            next_retry_at: None,
+            completed_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        assert_eq!(
+            arkmemory_capture_event_semantic_key(&event),
+            "semantic-source-key"
         );
     }
 }
@@ -792,6 +970,155 @@ fn arkmemory_capture_event_error_summary(
         .map(|value| arkmemory_truncate_chars(&value, 240))
         .filter(|value| !value.is_empty());
     (code, detail)
+}
+
+fn arkmemory_capture_event_semantic_key(
+    event: &crate::storage::memory_capture_event::Model,
+) -> String {
+    event
+        .attempt_metadata
+        .get("semantic_capture_key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            event
+                .source_hash
+                .trim()
+                .strip_prefix("pending:")
+                .unwrap_or_else(|| event.source_hash.trim())
+                .to_string()
+        })
+}
+
+fn arkmemory_capture_event_timestamp(
+    raw: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn arkmemory_pending_capture_group_time_bounds(
+    events: &[crate::storage::memory_capture_event::Model],
+) -> (String, String) {
+    let created_at = events
+        .iter()
+        .min_by_key(|event| event.created_at.as_str())
+        .map(|event| event.created_at.clone())
+        .unwrap_or_default();
+    let updated_at = events
+        .iter()
+        .max_by_key(|event| event.updated_at.as_str())
+        .map(|event| event.updated_at.clone())
+        .unwrap_or_default();
+    (created_at, updated_at)
+}
+
+async fn arkmemory_pending_capture_group_payload(
+    storage: &crate::storage::Storage,
+    semantic_key: String,
+    mut events: Vec<crate::storage::memory_capture_event::Model>,
+) -> serde_json::Value {
+    events.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let primary = events
+        .iter()
+        .find(|event| {
+            event
+                .source_message_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| {
+            events
+                .first()
+                .expect("pending capture group must contain at least one event")
+        });
+    let source_context = arkmemory_capture_source_context(storage, primary).await;
+    let (created_at, updated_at) = arkmemory_pending_capture_group_time_bounds(&events);
+    let now = chrono::Utc::now();
+    let age_seconds = arkmemory_capture_event_timestamp(&created_at)
+        .map(|created| (now - created).num_seconds().max(0));
+    let mut statuses = Vec::<String>::new();
+    let event_rows = events
+        .iter()
+        .map(|event| {
+            let status = event.status.trim().to_string();
+            if !status.is_empty() && !statuses.iter().any(|known| known == &status) {
+                statuses.push(status.clone());
+            }
+            let message_chars = event
+                .attempt_metadata
+                .get("message_chars")
+                .and_then(|value| value.as_u64());
+            serde_json::json!({
+                "id": event.id.clone(),
+                "status": status,
+                "capture_kind": event.capture_kind.clone(),
+                "channel": event.channel.clone(),
+                "source_message_id": event.source_message_id.clone(),
+                "created_at": event.created_at.clone(),
+                "updated_at": event.updated_at.clone(),
+                "message_chars": message_chars,
+                "replay_count": event.replay_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "id": semantic_key,
+        "semantic_capture_key": semantic_key,
+        "status": statuses.first().cloned().unwrap_or_default(),
+        "statuses": statuses,
+        "event_count": event_rows.len(),
+        "events": event_rows,
+        "source_context": source_context,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "age_seconds": age_seconds,
+    })
+}
+
+async fn arkmemory_pending_capture_signal_payloads(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<serde_json::Value>> {
+    let events = storage
+        .list_memory_capture_events_by_statuses(
+            ARKMEMORY_PENDING_CAPTURE_STATUSES,
+            project_id,
+            limit.saturating_mul(2).clamp(50, 200),
+        )
+        .await?;
+    let mut grouped =
+        std::collections::HashMap::<String, Vec<crate::storage::memory_capture_event::Model>>::new(
+        );
+    for event in events {
+        grouped
+            .entry(arkmemory_capture_event_semantic_key(&event))
+            .or_default()
+            .push(event);
+    }
+    let mut payloads = Vec::with_capacity(grouped.len());
+    for (semantic_key, events) in grouped {
+        payloads
+            .push(arkmemory_pending_capture_group_payload(storage, semantic_key, events).await);
+    }
+    payloads.sort_by(|left, right| {
+        let left_updated = left
+            .get("updated_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let right_updated = right
+            .get("updated_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        right_updated.cmp(left_updated)
+    });
+    payloads.truncate(limit as usize);
+    Ok(payloads)
 }
 
 fn arkmemory_capture_review_outcome_label(outcome: &str) -> &'static str {
@@ -1745,7 +2072,48 @@ pub(super) async fn arkmemory_summary(
     let project_id = arkmemory_project_param(&params);
     let agent = state.agent.read().await;
     let storage = &agent.storage;
-    let facts = storage.count_facts(project_id).await.unwrap_or(0);
+    let facts = storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+        )
+        .await
+        .unwrap_or(0);
+    let assistant_preferences = storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_ASSISTANT_PREFERENCE,
+        )
+        .await
+        .unwrap_or(0);
+    let work_preferences = storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_WORK_PREFERENCE,
+        )
+        .await
+        .unwrap_or(0);
+    let project_domain_memory = storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_PROJECT_DOMAIN,
+        )
+        .await
+        .unwrap_or(0);
+    let ephemeral_context = storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_EPHEMERAL_CONTEXT,
+        )
+        .await
+        .unwrap_or(0);
+    let other_memory = storage
+        .count_facts_by_category(
+            project_id,
+            crate::core::memory_schema::MEMORY_CATEGORY_OTHER,
+        )
+        .await
+        .unwrap_or(0);
     let preferences = storage
         .count_user_preferences(project_id)
         .await
@@ -1762,11 +2130,10 @@ pub(super) async fn arkmemory_summary(
         .await
         .map(|items| items.len())
         .unwrap_or(0);
-    let pending_capture = storage
-        .list_memory_capture_events_by_statuses(ARKMEMORY_PENDING_CAPTURE_STATUSES, project_id, 200)
+    let pending_capture_signals = arkmemory_pending_capture_signal_payloads(storage, project_id, 200)
         .await
-        .map(|items| items.len())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let pending_capture = pending_capture_signals.len();
     let failed_capture = storage
         .list_memory_capture_events_by_statuses(ARKMEMORY_FAILED_CAPTURE_STATUSES, project_id, 200)
         .await
@@ -1783,6 +2150,12 @@ pub(super) async fn arkmemory_summary(
         Json(serde_json::json!({
             "current_memory": {
                 "facts": facts,
+                "profile_facts": facts,
+                "assistant_preferences": assistant_preferences,
+                "work_preferences": work_preferences,
+                "project_domain_memory": project_domain_memory,
+                "ephemeral_context": ephemeral_context,
+                "other_memory": other_memory,
                 "preferences": preferences,
                 "user_data": user_data,
                 "knowledge": knowledge,
@@ -1791,6 +2164,7 @@ pub(super) async fn arkmemory_summary(
             "capture_pipeline": {
                 "pending": pending_capture,
                 "failed": failed_capture,
+                "pending_events": pending_capture_signals,
             },
             "ledger": ledger,
             "health": health,

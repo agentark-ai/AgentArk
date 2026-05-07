@@ -26,12 +26,16 @@ import { formatUiDateTime } from "../lib/dateFormat";
 import type { ExtensionPackView } from "../types";
 
 type ExtensionPackMode = "all" | "integrations" | "messaging" | "connectors" | "channels";
+const EXTENSION_PACK_REFRESH_MS = 8000;
+
 type ConnectionSecretField = {
   key: string;
   label: string;
   helperText?: string;
   multiline?: boolean;
   sensitive?: boolean;
+  transport?: string;
+  transportName?: string;
 };
 
 function packKindFilter(mode: ExtensionPackMode): string | undefined {
@@ -40,43 +44,151 @@ function packKindFilter(mode: ExtensionPackMode): string | undefined {
   return undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeSecretPath(value: unknown): string {
+  const raw = stringValue(value);
+  if (!raw) return "";
+  const withoutPrefix = raw.replace(/^secret\s*[:.]\s*/i, "").trim();
+  return /^[A-Za-z0-9_.-]+$/.test(withoutPrefix) ? withoutPrefix : "";
+}
+
+function appendUnique(values: string[], value: unknown) {
+  const normalized = normalizeSecretPath(value);
+  if (normalized && !values.includes(normalized)) {
+    values.push(normalized);
+  }
+}
+
+function collectSecretTemplatePaths(value: unknown, out: string[]) {
+  if (typeof value === "string") {
+    const patterns = [
+      /\{\{\s*secret\.([A-Za-z0-9_.-]+)\s*\}\}/g,
+      /\{\{\s*secret:([A-Za-z0-9_.-]+)\s*\}\}/g,
+    ];
+    for (const pattern of patterns) {
+      for (const match of value.matchAll(pattern)) {
+        appendUnique(out, match[1]);
+      }
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectSecretTemplatePaths(item, out));
+    return;
+  }
+  if (isRecord(value)) {
+    Object.values(value).forEach((item) => collectSecretTemplatePaths(item, out));
+  }
+}
+
+function authModeFallbackSecrets(pack: ExtensionPackView): string[] {
+  const mode = pack.manifest.auth.mode;
+  if (mode === "basic") return ["username", "password"];
+  if (mode === "api_key") {
+    return [normalizeSecretPath(asRecord(pack.manifest.auth.metadata).secret_field) || "api_key"];
+  }
+  return [];
+}
+
+function inferredSecretSpecs(pack: ExtensionPackView): ConnectionSecretField[] {
+  const fields: ConnectionSecretField[] = [];
+  const addField = (
+    key: unknown,
+    details: Partial<ConnectionSecretField> = {},
+  ) => {
+    const normalized = normalizeSecretPath(key);
+    if (!normalized) return;
+    const existing = fields.find((field) => field.key === normalized);
+    if (existing) {
+      Object.entries(details).forEach(([detailKey, detailValue]) => {
+        if (detailValue !== undefined && detailValue !== "") {
+          (existing as Record<string, unknown>)[detailKey] = detailValue;
+        }
+      });
+      return;
+    }
+    fields.push({
+      key: normalized,
+      label: secretFieldBaseLabel(normalized, details.transport),
+      multiline: normalized.split(".").pop() === "allowed_numbers",
+      sensitive: isSensitiveSecretField(normalized),
+      ...details,
+    });
+  };
+
+  const declared = (pack.manifest.auth.required_secrets || [])
+    .map(normalizeSecretPath)
+    .filter(Boolean);
+  declared.forEach((key) => addField(key));
+
+  const authMetadata = asRecord(pack.manifest.auth.metadata);
+  addField(authMetadata.secret_field, {
+    transport: stringValue(authMetadata.auth_binding_type),
+    transportName:
+      stringValue(authMetadata.auth_header) ||
+      stringValue(authMetadata.auth_name),
+  });
+
+  for (const fallback of authModeFallbackSecrets(pack)) {
+    addField(fallback, { transport: pack.manifest.auth.mode });
+  }
+
+  for (const feature of pack.manifest.features || []) {
+    const config = asRecord(feature.binding?.config);
+    const auth = asRecord(config.auth);
+    const authType = stringValue(auth.type);
+    if (authType === "basic") {
+      addField("username", { transport: authType });
+      addField("password", { transport: authType });
+    } else {
+      addField(auth.secret_path, {
+        transport: authType,
+        transportName: stringValue(auth.name),
+      });
+    }
+    const templatedSecrets: string[] = [];
+    collectSecretTemplatePaths(config, templatedSecrets);
+    templatedSecrets.forEach((key) => addField(key, { transport: "template" }));
+  }
+
+  return fields;
+}
+
 function defaultSecretTemplate(pack: ExtensionPackView): string {
-  if (pack.manifest.id === "slack_channel") {
-    return JSON.stringify({ bot_token: "", default_channel_id: "", signing_secret: "" }, null, 2);
-  }
-  if (pack.manifest.id === "teams_channel") {
-    return JSON.stringify(
-      { service_url: "", access_token: "", bot_app_id: "", team_id: "", channel_id: "" },
-      null,
-      2
-    );
-  }
-  if (pack.manifest.id === "whatsapp_channel") {
-    return JSON.stringify(
-      { mode: "cloud_api", access_token: "", phone_number_id: "", allowed_numbers: [""] },
-      null,
-      2
-    );
-  }
-  const requiredSecrets = pack.manifest.auth.required_secrets || [];
+  const requiredSecrets = inferredSecretSpecs(pack).map((field) => field.key);
   if (requiredSecrets.length > 0) {
     const payload = Object.fromEntries(
-      requiredSecrets.map((key) => [key, key === "allowed_numbers" ? [""] : ""])
+      requiredSecrets.map((key) => [
+        key,
+        (key.split(".").filter(Boolean).pop() || key) === "allowed_numbers" ? [""] : "",
+      ])
     );
     return JSON.stringify(payload, null, 2);
-  }
-  const mode = pack.manifest.auth.mode;
-  if (mode === "basic") {
-    return JSON.stringify({ username: "", password: "" }, null, 2);
-  }
-  if (mode === "api_key") {
-    return JSON.stringify({ api_key: "" }, null, 2);
   }
   return "{}";
 }
 
-function secretFieldLabel(key: string): string {
-  switch (key) {
+function secretFieldBaseLabel(key: string, transport?: string): string {
+  const displayKey = key.split(".").filter(Boolean).pop() || key;
+  const normalizedTransport = (transport || "").trim().toLowerCase();
+  if (
+    normalizedTransport === "bearer" &&
+    ["api_key", "access_token", "token", "key"].includes(displayKey.toLowerCase())
+  ) {
+    return "API token";
+  }
+  switch (displayKey) {
     case "api_key":
       return "API key";
     case "access_token":
@@ -86,12 +198,22 @@ function secretFieldLabel(key: string): string {
     case "client_secret":
       return "Client secret";
     default:
-      return titleize(key);
+      return titleize(displayKey);
   }
 }
 
+function secretFieldLabel(pack: ExtensionPackView, field: ConnectionSecretField): string {
+  const baseLabel = secretFieldBaseLabel(field.key, field.transport);
+  const packName = displayPackName(pack);
+  if (!packName) return baseLabel;
+  if (baseLabel.toLowerCase().startsWith(packName.toLowerCase())) {
+    return baseLabel;
+  }
+  return `${packName} ${baseLabel}`;
+}
+
 function isSensitiveSecretField(key: string): boolean {
-  const normalized = key.trim().toLowerCase();
+  const normalized = key.trim().toLowerCase().split(".").pop() || "";
   return (
     normalized.includes("token") ||
     normalized.includes("secret") ||
@@ -103,26 +225,23 @@ function isSensitiveSecretField(key: string): boolean {
 }
 
 function connectionSecretFields(pack: ExtensionPackView): ConnectionSecretField[] {
-  const requiredSecrets = (
-    pack.manifest.auth.required_secrets?.filter((value) => value.trim().length > 0) ||
-    (pack.manifest.auth.mode === "basic"
-      ? ["username", "password"]
-      : pack.manifest.auth.mode === "api_key"
-        ? ["api_key"]
-        : [])
-  );
-  if (requiredSecrets.length === 0) return [];
-  return requiredSecrets.map((key) => ({
-    key,
-    label: secretFieldLabel(key),
+  return inferredSecretSpecs(pack).map((field) => ({
+    ...field,
+    label: secretFieldLabel(pack, field),
     helperText:
-      key === "access_token"
-        ? "Stored encrypted and never sent through normal chat."
-        : key === "api_key"
-          ? "Stored encrypted and never sent through normal chat."
-          : undefined,
-    multiline: key === "allowed_numbers",
-    sensitive: isSensitiveSecretField(key)
+      field.helperText ||
+      [
+        `Stored encrypted for this connection as ${field.key}; no storage key name is required.`,
+        field.transport === "bearer"
+          ? "Sent as a bearer token."
+          : field.transport === "header" && field.transportName
+            ? `Sent in the ${field.transportName} header.`
+            : field.transport === "query" && field.transportName
+              ? `Sent as the ${field.transportName} query parameter.`
+              : field.transport === "basic"
+                ? "Used for HTTP Basic auth."
+                : "No storage key name is required.",
+      ].join(" ")
   }));
 }
 
@@ -130,25 +249,60 @@ function defaultSecretValues(pack: ExtensionPackView): Record<string, string> {
   return Object.fromEntries(connectionSecretFields(pack).map((field) => [field.key, ""]));
 }
 
+function assignStructuredSecretValue(
+  target: Record<string, unknown>,
+  path: string,
+  value: unknown,
+) {
+  const parts = path
+    .split(".")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return;
+  let current = target;
+  for (const part of parts.slice(0, -1)) {
+    const existing = current[part];
+    if (!isRecord(existing)) {
+      current[part] = {};
+    }
+    current = current[part] as Record<string, unknown>;
+  }
+  current[parts[parts.length - 1]] = value;
+}
+
 function buildStructuredSecretPayload(values: Record<string, string>): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(values)
-      .map(([key, value]) => {
-        const trimmed = value.trim();
-        if (!trimmed) return [key, undefined];
-        if (key === "allowed_numbers") {
-          return [
-            key,
-            trimmed
-              .split(/[\r\n,]+/)
-              .map((entry) => entry.trim())
-              .filter(Boolean)
-          ];
-        }
-        return [key, trimmed];
-      })
-      .filter(([, value]) => value !== undefined)
+  const payload: Record<string, unknown> = {};
+  Object.entries(values).forEach(([key, value]) => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    const leaf = key.split(".").filter(Boolean).pop() || key;
+    const structuredValue =
+      leaf === "allowed_numbers"
+        ? trimmed
+            .split(/[\r\n,]+/)
+            .map((entry) => entry.trim())
+            .filter(Boolean)
+        : trimmed;
+    assignStructuredSecretValue(payload, key, structuredValue);
+  });
+  return payload;
+}
+
+function packNeedsManualSecret(pack: ExtensionPackView): boolean {
+  const mode = pack.manifest.auth.mode;
+  return (
+    connectionSecretFields(pack).length > 0 ||
+    (mode !== "none" && mode !== "oauth2_external") ||
+    pack.needs_auth
   );
+}
+
+function hasStructuredSecretValue(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (typeof value === "number" || typeof value === "boolean") return true;
+  if (Array.isArray(value)) return value.some(hasStructuredSecretValue);
+  if (isRecord(value)) return Object.values(value).some(hasStructuredSecretValue);
+  return false;
 }
 
 function runtimeStatusLabel(status: string): string {
@@ -300,7 +454,13 @@ function isBuiltinPack(pack: ExtensionPackView): boolean {
   );
 }
 
-export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode }) {
+export function ExtensionPacksPanel({
+  mode = "all",
+  autoRefresh = false,
+}: {
+  mode?: ExtensionPackMode;
+  autoRefresh?: boolean;
+}) {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
@@ -371,13 +531,18 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
     () => (connectPack ? connectionSecretFields(connectPack) : []),
     [connectPack]
   );
+  const connectNeedsManualSecret = useMemo(
+    () => (connectPack ? packNeedsManualSecret(connectPack) : false),
+    [connectPack]
+  );
   const packsQ = useQuery({
     queryKey: ["extension-packs", kind || "all", search],
     queryFn: () =>
       api.getExtensionPacks({
         query: search.trim() || undefined,
         kind
-      })
+      }),
+    refetchInterval: autoRefresh ? EXTENSION_PACK_REFRESH_MS : false,
   });
 
   const installed = useMemo(() => {
@@ -395,7 +560,8 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
   const connectDetailQ = useQuery({
     queryKey: ["extension-pack-detail", connectPack?.manifest.id],
     enabled: !!connectPack,
-    queryFn: () => api.getExtensionPack(connectPack!.manifest.id)
+    queryFn: () => api.getExtensionPack(connectPack!.manifest.id),
+    refetchInterval: autoRefresh && connectPack ? EXTENSION_PACK_REFRESH_MS : false,
   });
   const eventsQ = useQuery({
     queryKey: ["extension-pack-events", eventsPack?.manifest.id],
@@ -539,7 +705,7 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
 
   const sectionTitle = useMemo(() => {
     if (mode === "messaging" || mode === "channels") return "Generic Channel Packs";
-    if (mode === "integrations" || mode === "connectors") return "User Added Custom Integrations";
+    if (mode === "integrations" || mode === "connectors") return "Extension Pack Integrations";
     return "Generic Packs";
   }, [mode]);
 
@@ -548,7 +714,7 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
       return "Search installed packs, bundled defaults, upload a bundle, or scaffold a new messaging channel pack.";
     }
     if (mode === "integrations" || mode === "connectors") {
-      return "Install and manage custom integrations you add yourself. Built-in connectors are managed separately.";
+      return "Install and manage manifest-based integration packs. Custom API integrations are managed separately above.";
     }
     return "Search installed packs, bundled defaults, upload a bundle, or scaffold from OpenAPI/cURL when nothing exists yet.";
   }, [mode]);
@@ -558,20 +724,20 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
       return "No channel pack matched this search. Ask for a link or local path, upload a manifest/bundle, or scaffold a draft channel pack.";
     }
     if (mode === "integrations" || mode === "connectors") {
-      return "No custom integration matched this search yet. Add one from a link, upload, or scaffold a draft.";
+      return "No extension pack matched this search yet. Add one from a link, upload, or scaffold a draft.";
     }
     return "No pack matched this search. Ask for a link or local path, upload a manifest/bundle, or scaffold a draft pack from docs/OpenAPI/cURL.";
   }, [mode]);
 
   const addButtonLabel = useMemo(() => {
     if (mode === "messaging" || mode === "channels") return "Add Channel Pack";
-    if (mode === "integrations" || mode === "connectors") return "Add Custom Integration";
+    if (mode === "integrations" || mode === "connectors") return "Add Extension Pack";
     return "Add Pack";
   }, [mode]);
 
   const addDialogTitle = useMemo(() => {
     if (mode === "messaging" || mode === "channels") return "Add channel pack";
-    if (mode === "integrations" || mode === "connectors") return "Add custom integration";
+    if (mode === "integrations" || mode === "connectors") return "Add extension pack";
     return "Add pack";
   }, [mode]);
 
@@ -1305,6 +1471,7 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               label="Connection name"
               value={connectionName}
               onChange={(event) => setConnectionName(event.target.value)}
+              helperText="A connection is the saved credential profile for this integration. The default connection is used automatically unless a workflow selects another one."
             />
             {connectSecretFields.length > 0 ? (
               <Stack spacing={1}>
@@ -1328,12 +1495,12 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                   />
                 ))}
               </Stack>
-            ) : (
+            ) : connectNeedsManualSecret ? (
               <>
                 <Typography variant="caption" sx={{
                   color: "text.secondary"
                 }}>
-                  This pack uses a nonstandard secret payload. Use advanced JSON only for this setup.
+                  This pack declares credential requirements that do not map to simple fields. Use advanced JSON for this setup.
                 </Typography>
                 <TextField
                   fullWidth
@@ -1345,6 +1512,10 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                   onChange={(event) => setConnectionSecretJson(event.target.value)}
                 />
               </>
+            ) : (
+              <Alert severity="info" sx={{ borderRadius: 1 }}>
+                This pack does not require credentials for this connection.
+              </Alert>
             )}
           </Stack>
         </DialogContent>
@@ -1381,12 +1552,17 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
               }
               try {
                 const parsedSecret = JSON.parse(connectionSecretJson);
+                const hasSecret = hasStructuredSecretValue(parsedSecret);
+                if (connectNeedsManualSecret && !selectedConnectionId && !hasSecret) {
+                  setConnectError("Enter the required credentials using advanced JSON.");
+                  return;
+                }
                 connectionMutation.mutate({
                   packId: connectPack.manifest.id,
                   body: {
                     connection_id: selectedConnectionId || undefined,
                     name: connectionName.trim() || "Default connection",
-                    secret: parsedSecret
+                    secret: hasSecret ? parsedSecret : undefined
                   }
                 });
               } catch {

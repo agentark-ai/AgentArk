@@ -125,27 +125,39 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AgentArk Web Companion</title>
+  <link rel="icon" type="image/png" href="/favicon.png" />
   <style>
     :root {
       color-scheme: dark;
-      --bg: #090a0d;
-      --panel: #121419;
-      --panel-2: #171a20;
-      --line: rgba(255,255,255,.12);
-      --text: #f6f3ec;
-      --muted: #aaa39a;
-      --accent: #d5a85e;
+      --bg: #030504;
+      --bg-2: #010201;
+      --panel: rgba(10,10,10,.82);
+      --panel-2: rgba(14,18,20,.92);
+      --field: #06090a;
+      --line: rgba(255,255,255,.11);
+      --line-strong: rgba(124,231,255,.38);
+      --text: #eff7ef;
+      --muted: rgba(213,216,223,.72);
+      --dim: rgba(155,159,169,.65);
+      --cyan: #7ce7ff;
+      --violet: #8b5cf6;
+      --amber: #f59e0b;
       --ok: #47c47a;
-      --warn: #e2b85d;
-      --bad: #ec6f6f;
+      --warn: #ffbe63;
+      --bad: #ff9b9b;
+      --shadow: 0 18px 60px rgba(0,0,0,.42);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100dvh;
-      background: radial-gradient(circle at 50% -10%, rgba(213,168,94,.12), transparent 34%), var(--bg);
+      background:
+        linear-gradient(180deg, rgba(124,231,255,.07), transparent 30%),
+        linear-gradient(135deg, rgba(139,92,246,.10), transparent 34%, rgba(245,158,11,.06)),
+        linear-gradient(180deg, var(--bg), var(--bg-2));
       color: var(--text);
       font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
     }
     main {
       width: min(760px, 100%);
@@ -159,9 +171,30 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
       gap: 12px;
       padding: 8px 0 18px;
     }
+    .brand {
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      min-width: 0;
+    }
+    .brand-logo {
+      width: 46px;
+      height: 46px;
+      object-fit: contain;
+      filter: drop-shadow(0 0 14px rgba(124,231,255,.32));
+    }
+    .brand-kicker {
+      margin: 0 0 1px;
+      color: var(--cyan);
+      text-transform: uppercase;
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: .08em;
+    }
     h1 {
       margin: 0;
-      font-size: 22px;
+      font-size: 24px;
       line-height: 1.15;
       font-weight: 720;
       letter-spacing: 0;
@@ -179,7 +212,7 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
       padding: 0 11px;
       border: 1px solid var(--line);
       border-radius: 999px;
-      background: rgba(255,255,255,.04);
+      background: rgba(10,10,10,.72);
       color: var(--muted);
       white-space: nowrap;
       font-size: 13px;
@@ -189,14 +222,15 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
       height: 8px;
       border-radius: 50%;
       background: var(--warn);
-      box-shadow: 0 0 0 3px rgba(226,184,93,.13);
+      box-shadow: 0 0 0 3px rgba(255,190,99,.13);
     }
     .status[data-state="connected"] .dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(71,196,122,.15); }
-    .status[data-state="error"] .dot { background: var(--bad); box-shadow: 0 0 0 3px rgba(236,111,111,.15); }
+    .status[data-state="error"] .dot { background: var(--bad); box-shadow: 0 0 0 3px rgba(255,155,155,.15); }
     section {
       border: 1px solid var(--line);
       border-radius: 12px;
-      background: linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.025)), var(--panel);
+      background: linear-gradient(135deg, rgba(124,231,255,.07), transparent 42%, rgba(255,255,255,.03)), var(--panel);
+      box-shadow: var(--shadow);
       padding: 14px;
       margin: 0 0 12px;
     }
@@ -217,15 +251,15 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
       min-height: 44px;
       border: 1px solid var(--line);
       border-radius: 9px;
-      background: #0c0e12;
+      background: var(--field);
       color: var(--text);
       padding: 10px 11px;
       font: inherit;
       outline: none;
     }
     input:focus {
-      border-color: rgba(213,168,94,.75);
-      box-shadow: 0 0 0 3px rgba(213,168,94,.13);
+      border-color: var(--line-strong);
+      box-shadow: 0 0 0 3px rgba(124,231,255,.13);
     }
     .grid {
       display: grid;
@@ -250,11 +284,12 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
       touch-action: manipulation;
     }
     button.primary {
-      border-color: rgba(213,168,94,.65);
-      background: linear-gradient(180deg, rgba(213,168,94,.24), rgba(213,168,94,.12));
+      border-color: rgba(124,231,255,.58);
+      background: linear-gradient(180deg, rgba(124,231,255,.20), rgba(124,231,255,.09));
+      box-shadow: inset 0 0 22px rgba(124,231,255,.08);
     }
     button.danger {
-      border-color: rgba(236,111,111,.42);
+      border-color: rgba(255,155,155,.42);
       color: #ffd2d2;
     }
     button:disabled {
@@ -283,9 +318,9 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
     }
     .command {
       padding: 11px;
-      border: 1px solid rgba(213,168,94,.28);
+      border: 1px solid rgba(124,231,255,.30);
       border-radius: 10px;
-      background: rgba(213,168,94,.08);
+      background: rgba(124,231,255,.08);
       margin-top: 8px;
     }
     .command-title {
@@ -304,15 +339,19 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
       margin: 0;
       padding: 10px;
       border-radius: 9px;
-      background: #080a0d;
+      background: var(--field);
       border: 1px solid var(--line);
-      color: #c8d8ff;
+      color: #d8f5ff;
       font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
     @media (max-width: 560px) {
+      main { padding-left: 18px; padding-right: 18px; }
       header { align-items: flex-start; flex-direction: column; }
+      .brand { grid-template-columns: 40px minmax(0, 1fr); gap: 10px; }
+      .brand-logo { width: 40px; height: 40px; }
+      h1 { font-size: 22px; }
       .grid { grid-template-columns: 1fr; }
       button { width: 100%; }
       .actions { display: grid; grid-template-columns: 1fr; }
@@ -322,9 +361,13 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
 <body>
   <main>
     <header>
-      <div>
-        <h1>AgentArk Web Companion</h1>
-        <p class="subtitle">No Xcode install. Keep this page open while testing commands.</p>
+      <div class="brand">
+        <img class="brand-logo" src="/logo.svg" alt="AgentArk" />
+        <div>
+          <p class="brand-kicker">AgentArk</p>
+          <h1>Web Companion</h1>
+          <p class="subtitle">No Xcode install. Keep this page open while testing commands.</p>
+        </div>
       </div>
       <div id="status" class="status" data-state="idle"><span class="dot"></span><span id="statusText">Not connected</span></div>
     </header>

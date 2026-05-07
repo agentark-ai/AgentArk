@@ -3775,6 +3775,12 @@ async fn tick_or_shutdown(
     }
 }
 
+fn sentinel_interval_secs(seconds: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(seconds.max(1)));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
 fn watcher_sleep_duration(
     next_wakeup_at: Option<chrono::DateTime<chrono::Utc>>,
     max_sleep: Duration,
@@ -3813,8 +3819,7 @@ pub fn start(
             {
                 return;
             }
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(config.scheduler_interval));
+            let mut interval = sentinel_interval_secs(config.scheduler_interval);
             interval.tick().await;
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -3872,9 +3877,7 @@ pub fn start(
                 if !sleep_or_shutdown(std::time::Duration::from_secs(35), &mut shutdown).await {
                     return;
                 }
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                    config.integration_sync_interval,
-                ));
+                let mut interval = sentinel_interval_secs(config.integration_sync_interval);
                 interval.tick().await;
                 loop {
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -3905,9 +3908,7 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:3004", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.experience_consolidation_interval,
-            ));
+            let mut interval = sentinel_interval_secs(config.experience_consolidation_interval);
             interval.tick().await;
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -3937,9 +3938,8 @@ pub fn start(
         crate::spawn_logged!(
             "src/sentinel.rs:background_session_consolidation",
             async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                    config.background_session_consolidation_interval,
-                ));
+                let mut interval =
+                    sentinel_interval_secs(config.background_session_consolidation_interval);
                 interval.tick().await;
                 loop {
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -3968,9 +3968,7 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:3034", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.heuristic_reflection_interval,
-            ));
+            let mut interval = sentinel_interval_secs(config.heuristic_reflection_interval);
             interval.tick().await;
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -3998,9 +3996,7 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:3064", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.pattern_induction_interval,
-            ));
+            let mut interval = sentinel_interval_secs(config.pattern_induction_interval);
             interval.tick().await;
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -4028,9 +4024,7 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:3094", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.candidate_generation_interval,
-            ));
+            let mut interval = sentinel_interval_secs(config.candidate_generation_interval);
             interval.tick().await;
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -4059,9 +4053,7 @@ pub fn start(
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/sentinel.rs:3095", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.approval_expiry_interval,
-            ));
+            let mut interval = sentinel_interval_secs(config.approval_expiry_interval);
             interval.tick().await; // Skip first immediate tick
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -4100,8 +4092,7 @@ pub fn start(
                 {
                     return;
                 }
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(config.pulse_interval));
+                let mut interval = sentinel_interval_secs(config.pulse_interval);
                 interval.tick().await; // Skip first tick (we already waited)
                 loop {
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -4143,9 +4134,7 @@ pub fn start(
                 {
                     return;
                 }
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                    config.auto_analysis_interval,
-                ));
+                let mut interval = sentinel_interval_secs(config.auto_analysis_interval);
                 interval.tick().await;
                 loop {
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -4212,9 +4201,7 @@ pub fn start(
             if !sleep_or_shutdown(std::time::Duration::from_secs(120), &mut shutdown).await {
                 return;
             }
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.unused_app_check_interval,
-            ));
+            let mut interval = sentinel_interval_secs(config.unused_app_check_interval);
             interval.tick().await; // Skip first tick
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -4246,9 +4233,7 @@ pub fn start(
                 if !sleep_or_shutdown(std::time::Duration::from_secs(45), &mut shutdown).await {
                     return;
                 }
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                    config.container_reaper_interval,
-                ));
+                let mut interval = sentinel_interval_secs(config.container_reaper_interval);
                 interval.tick().await;
                 loop {
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
@@ -4291,7 +4276,7 @@ pub fn start(
             if !sleep_or_shutdown(std::time::Duration::from_secs(600), &mut shutdown).await {
                 return;
             }
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            let mut interval = sentinel_interval_secs(6 * 3600);
             interval.tick().await;
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {

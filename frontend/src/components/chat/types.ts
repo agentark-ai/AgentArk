@@ -86,6 +86,7 @@ export interface ChatStepCard {
   detailFull: string;
   summary: string;
   rawDetailFull: string;
+  traceJson?: string;
   payloadView: ChatPayloadView | null;
   isHeartbeat: boolean;
   time: string;

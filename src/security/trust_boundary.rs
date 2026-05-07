@@ -220,7 +220,14 @@ fn collapse_whitespace(input: &str) -> String {
 
 pub fn redact_json_secrets(value: &Value) -> Value {
     match value {
-        Value::String(text) => Value::String(crate::security::redact_secret_input(text).text),
+        Value::String(text) => {
+            let redacted = crate::security::redact_secret_input(text);
+            if redacted.is_mostly_secret_payload() {
+                Value::String("[REDACTED_SECRET]".to_string())
+            } else {
+                Value::String(redacted.text)
+            }
+        }
         Value::Array(items) => Value::Array(items.iter().map(redact_json_secrets).collect()),
         Value::Object(map) => {
             let mut next = serde_json::Map::new();

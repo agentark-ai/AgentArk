@@ -895,6 +895,46 @@ fn source_secret_present(config_dir: &FsPath, data_dir: &FsPath, source_id: &str
         .is_some_and(|value| !value.trim().is_empty()))
 }
 
+pub(crate) async fn list_webhook_source_inventory(
+    storage: &crate::storage::Storage,
+    config_dir: &FsPath,
+    data_dir: &FsPath,
+    only_connected: bool,
+) -> Result<serde_json::Value> {
+    let mut sources = load_sources(storage).await?;
+    sources.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let total = sources.len();
+    let mut connected_total = 0usize;
+    let mut rows = Vec::new();
+
+    for source in sources {
+        let secret_configured =
+            source_secret_present(config_dir, data_dir, &source.id).unwrap_or(false);
+        let connected = source.enabled
+            && (matches!(source.auth_mode, WebhookAuthMode::None) || secret_configured);
+        if connected {
+            connected_total += 1;
+        }
+        if only_connected && !connected {
+            continue;
+        }
+        let mut value = serde_json::to_value(present_source(&source, secret_configured))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("connected".to_string(), serde_json::json!(connected));
+        }
+        rows.push(value);
+    }
+
+    Ok(serde_json::json!({
+        "available": true,
+        "surface": "webhook_sources",
+        "total": total,
+        "connected_total": connected_total,
+        "filtered_to_connected": only_connected,
+        "sources": rows,
+    }))
+}
+
 fn verify_source_secret(
     config_dir: &FsPath,
     data_dir: &FsPath,

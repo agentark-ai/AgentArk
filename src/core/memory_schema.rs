@@ -105,7 +105,11 @@ pub fn normalize_memory_topics(value: Option<&Value>, max_topics: usize) -> Vec<
         _ => Vec::new(),
     };
     for item in values {
-        let Some(topic) = item.as_str().map(str::trim).filter(|topic| !topic.is_empty()) else {
+        let Some(topic) = item
+            .as_str()
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty())
+        else {
             continue;
         };
         let normalized = topic
@@ -131,4 +135,38 @@ pub fn normalize_memory_topics(value: Option<&Value>, max_topics: usize) -> Vec<
         }
     }
     topics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_schema_category_wins_over_kind_fallback() {
+        assert_eq!(
+            normalize_memory_category(Some(MEMORY_CATEGORY_PROJECT_DOMAIN), Some("preference")),
+            MEMORY_CATEGORY_PROJECT_DOMAIN
+        );
+    }
+
+    #[test]
+    fn canonical_preference_kind_defaults_to_work_preference() {
+        assert_eq!(
+            normalize_memory_category(None, Some("preference")),
+            MEMORY_CATEGORY_WORK_PREFERENCE
+        );
+    }
+
+    #[test]
+    fn topics_are_normalized_and_bounded() {
+        let topics = normalize_memory_topics(
+            Some(&serde_json::json!([
+                "Financial Modeling",
+                "META/equity",
+                "Financial Modeling"
+            ])),
+            4,
+        );
+        assert_eq!(topics, vec!["financial_modeling", "meta/equity"]);
+    }
 }

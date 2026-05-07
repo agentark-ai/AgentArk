@@ -956,7 +956,7 @@ mod tests {
             .write_orbit_file(
                 &orbit_id,
                 "mod/markdown/index.js",
-                b"export const l2 = true;",
+                b"export const l2 = true; export function render(el, ctx) { el.textContent = String(ctx?.title || 'l2'); }",
             )
             .unwrap();
         let resolved = store

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { FileText, MessageSquare, Play } from "lucide-react";
 import type { BriefingResponse, RecommendedAction } from "../../types";
 import { NeuralPanel } from "./NeuralPanel";
 
@@ -21,20 +22,17 @@ export function SuggestedStepCard({
   onExecuteAction,
   executing = false,
 }: SuggestedStepCardProps) {
-  const heroPrompts = useMemo(
-    () => (prompts && prompts.length > 0 ? prompts : [""]),
-    [prompts]
-  );
+  const heroPrompts = useMemo(() => (prompts && prompts.length > 0 ? prompts : [""]), [prompts]);
   const promptSignature = heroPrompts.join("\n");
 
   const [promptIndex, setPromptIndex] = useState(0);
-  const [typedPrompt, setTypedPrompt] = useState("");
   const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
 
   const activePrompt = heroPrompts[promptIndex] || heroPrompts[0] || "";
   const displayPrompt = useMemo(() => {
     const trimmed = activePrompt.trim();
-    return trimmed.length > 96 ? `${trimmed.slice(0, 93).trimEnd()}…` : trimmed;
+    if (!trimmed) return "Ask AgentArk what needs attention next.";
+    return trimmed;
   }, [activePrompt]);
 
   useEffect(() => {
@@ -62,90 +60,67 @@ export function SuggestedStepCard({
   }, []);
 
   useEffect(() => {
-    setTypedPrompt(prefersReducedMotion ? displayPrompt : "");
-  }, [displayPrompt, prefersReducedMotion]);
-
-  useEffect(() => {
-    if (!displayPrompt || typeof window === "undefined") {
+    if (prefersReducedMotion || heroPrompts.length <= 1 || typeof window === "undefined") {
       return undefined;
     }
 
-    if (prefersReducedMotion) {
-      if (heroPrompts.length <= 1) {
-        return undefined;
-      }
-
-      const timer = window.setTimeout(() => {
-        setPromptIndex((prev) => (prev + 1) % heroPrompts.length);
-      }, 5600);
-
-      return () => window.clearTimeout(timer);
-    }
-
-    if (typedPrompt.length < displayPrompt.length) {
-      const nextChar = displayPrompt[typedPrompt.length];
-      const delay = /[.,!?]/.test(nextChar) ? 48 : nextChar === " " ? 16 : 24;
-      const timer = window.setTimeout(() => {
-        setTypedPrompt(displayPrompt.slice(0, typedPrompt.length + 1));
-      }, delay);
-
-      return () => window.clearTimeout(timer);
-    }
-
-    if (heroPrompts.length <= 1) {
-      return undefined;
-    }
-
-    const holdMs = Math.max(1800, Math.min(3200, displayPrompt.length * 28));
-    const timer = window.setTimeout(() => {
+    const timer = window.setInterval(() => {
       setPromptIndex((prev) => (prev + 1) % heroPrompts.length);
-    }, holdMs);
+    }, 7000);
 
-    return () => window.clearTimeout(timer);
-  }, [displayPrompt, heroPrompts.length, prefersReducedMotion, typedPrompt]);
+    return () => window.clearInterval(timer);
+  }, [heroPrompts.length, prefersReducedMotion]);
 
   const recommended = briefing?.recommended_actions ?? [];
 
   return (
     <NeuralPanel title="Suggested Next Step" tag="DAILY USE" tagTone="default" className="nw-panel--suggested">
-      <div className="nw-typewriter">
-        {typedPrompt}
-        {prefersReducedMotion ? null : <span className="nw-typewriter-caret" />}
+      <div className="nw-suggested-prompt" title={activePrompt}>
+        <span className="nw-suggested-prompt-text">{displayPrompt}</span>
       </div>
-      <div className="nw-panel-muted" style={{ marginTop: 6 }}>
-        Rotates through useful OS tasks from your routines, recent work, and unattended runs.
-      </div>
-      <div className="nw-actions nw-actions--suggested">
+
+      <div className="nw-actions nw-suggested-actions">
         {onGoChat ? (
-          <button className="nw-btn nw-btn--primary" onClick={onGoChat}>
-            Ask AgentArk <span className="nw-arrow">→</span>
+          <button className="nw-btn nw-btn--primary" type="button" onClick={onGoChat}>
+            <span className="nw-btn-copy">
+              <MessageSquare size={14} strokeWidth={1.9} aria-hidden />
+              Ask AgentArk
+            </span>
+            <span className="nw-arrow">-&gt;</span>
           </button>
         ) : null}
         {onRunBriefing ? (
-          <button className="nw-btn" disabled={briefingLoading} onClick={onRunBriefing}>
-            {briefingLoading ? "Running..." : "Generate Daily Brief"} <span className="nw-arrow">→</span>
+          <button className="nw-btn" type="button" disabled={briefingLoading} onClick={onRunBriefing}>
+            <span className="nw-btn-copy">
+              <FileText size={14} strokeWidth={1.9} aria-hidden />
+              {briefingLoading ? "Running..." : "Generate Daily Brief"}
+            </span>
+            <span className="nw-arrow">-&gt;</span>
           </button>
         ) : null}
       </div>
+
       {recommended.length > 0 ? (
-        <div className="nw-row-list" style={{ marginTop: 10 }}>
+        <div className="nw-suggested-recommendations">
           {recommended.slice(0, 2).map((act) => (
-            <div key={act.id} className="nw-activity-row">
-              <div className="nw-activity-ic">▸</div>
-              <div className="nw-activity-meta">
+            <div key={act.id} className="nw-suggested-recommendation">
+              <div className="nw-suggested-run-mark">
+                <Play size={11} fill="currentColor" strokeWidth={0} aria-hidden />
+              </div>
+              <div className="nw-suggested-recommendation-copy">
                 <div className="nw-activity-ts">RECOMMENDED</div>
                 <div className="nw-activity-txt">{act.title}</div>
-                {onExecuteAction ? (
-                  <button
-                    className="nw-btn nw-btn--small"
-                    disabled={executing}
-                    onClick={() => onExecuteAction(act)}
-                    style={{ marginTop: 6 }}
-                  >
-                    Run <span className="nw-arrow">→</span>
-                  </button>
-                ) : null}
               </div>
+              {onExecuteAction ? (
+                <button
+                  className="nw-btn nw-btn--small nw-suggested-run"
+                  type="button"
+                  disabled={executing}
+                  onClick={() => onExecuteAction(act)}
+                >
+                  Run <span className="nw-arrow">-&gt;</span>
+                </button>
+              ) : null}
             </div>
           ))}
         </div>

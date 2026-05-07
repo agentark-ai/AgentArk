@@ -811,6 +811,7 @@ pub async fn run_gateway(agent: SharedAgent) -> Result<()> {
         let agent = agent.read().await;
         load_runtime_state(&agent).await?
     };
+    let mut unconfigured_state: Option<&'static str> = None;
 
     loop {
         let maybe_config = {
@@ -818,15 +819,22 @@ pub async fn run_gateway(agent: SharedAgent) -> Result<()> {
             load_config(&agent).await?
         };
         let Some(config) = maybe_config else {
-            tracing::debug!("Discord gateway runtime: no config available yet");
+            if unconfigured_state != Some("no_config") {
+                tracing::debug!("Discord gateway runtime: no config available yet");
+                unconfigured_state = Some("no_config");
+            }
             tokio::time::sleep(Duration::from_secs(60)).await;
             continue;
         };
         if config.bot_token.trim().is_empty() {
-            tracing::debug!("Discord gateway runtime: bot token missing");
+            if unconfigured_state != Some("token_missing") {
+                tracing::debug!("Discord gateway runtime: bot token missing");
+                unconfigured_state = Some("token_missing");
+            }
             tokio::time::sleep(Duration::from_secs(60)).await;
             continue;
         }
+        unconfigured_state = None;
 
         let gateway_url = if let Some(resume_url) = state.resume_gateway_url.clone() {
             resume_url

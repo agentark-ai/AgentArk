@@ -905,9 +905,7 @@ impl Agent {
     fn can_bootstrap_missing_explicit_conversation(channel: &str, conversation_id: &str) -> bool {
         let channel = channel.trim();
         let conversation_id = conversation_id.trim();
-        !channel.is_empty()
-            && !conversation_id.is_empty()
-            && !matches!(channel, "http" | "web")
+        !channel.is_empty() && !conversation_id.is_empty() && !matches!(channel, "http" | "web")
     }
 
     pub(crate) async fn start_new_channel_conversation(

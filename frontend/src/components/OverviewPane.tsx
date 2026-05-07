@@ -1475,7 +1475,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                         : "Run failed"
                   }
                 />
-                {latestDailyBriefNotification ? <Chip size="small" color="info" label="Notification logged" /> : null}
+                {latestDailyBriefNotification ? <Chip size="small" color="info" label="Prior in-app record" /> : null}
                 {latestDailyBriefTrace ? (
                   <Chip size="small" color={automationStatusColor(latestDailyBriefTrace.status)} label={`Trace: ${latestDailyBriefTrace.status || "recorded"}`} />
                 ) : null}
@@ -1494,8 +1494,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                 </Typography>
                 <Stack spacing={0.45}>
                   <Typography variant="body2">- Built a fresh daily brief from current tasks, recent activity, and connected data.</Typography>
-                  <Typography variant="body2">- Logged a `Daily Command Brief` notification inside AgentArk.</Typography>
-                  <Typography variant="body2">- Attempted delivery to your preferred briefing channel if one is configured.</Typography>
+                  <Typography variant="body2">- Skipped creating an in-app notification.</Typography>
+                  <Typography variant="body2">- Attempted push delivery to your preferred briefing channel if one is configured.</Typography>
                 </Stack>
               </Box>
 

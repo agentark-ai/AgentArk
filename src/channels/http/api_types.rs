@@ -54,6 +54,10 @@ pub(super) struct RuntimeHealthResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_container_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_read_bytes_per_sec: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_write_bytes_per_sec: Option<f64>,

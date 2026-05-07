@@ -297,19 +297,20 @@
 }
 
 .nw-dashboard-statusbar--split {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(500px, max-content) minmax(0, 1fr);
   align-items: center;
   justify-content: space-between;
   gap: clamp(12px, 1.2vw, 22px);
   min-height: 58px;
   padding: 8px 12px;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .nw-status-pills {
-  display: flex;
-  flex: 0 1 auto;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(4, max-content);
+  align-items: center;
   gap: 10px;
   min-width: 0;
 }
@@ -339,8 +340,7 @@
 .nw-status-metrics {
   display: grid;
   grid-template-columns: minmax(270px, 2fr) minmax(170px, 1fr) minmax(150px, 0.9fr) minmax(76px, 0.45fr);
-  flex: 1 1 min(1080px, 70vw);
-  min-width: min(100%, 760px);
+  min-width: 0;
 }
 
 .nw-dashboard-statusbar--split .nw-status-cell {
@@ -356,6 +356,22 @@
 
 .nw-dashboard-statusbar--split .nw-status-cell--model {
   padding-left: 8px;
+}
+
+@media (max-width: 1500px) {
+  .nw-dashboard-statusbar--split {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+    row-gap: 8px;
+  }
+
+  .nw-dashboard-statusbar--split .nw-status-pills {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .nw-dashboard-statusbar--split .nw-status-metrics {
+    grid-template-columns: minmax(230px, 2fr) minmax(160px, 1fr) minmax(145px, 1fr) minmax(76px, 0.6fr);
+  }
 }
 
 .nw-metric-inline {
@@ -1016,6 +1032,11 @@
   background: linear-gradient(135deg, rgba(255, 190, 99, 0.05), var(--nw-panel));
 }
 
+.nw-panel--attention-setup {
+  border-color: var(--nw-panel-edge);
+  background: var(--nw-panel);
+}
+
 .nw-panel-h {
   display: flex;
   align-items: center;
@@ -1198,6 +1219,15 @@
 }
 .nw-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .nw-btn .nw-arrow { font-family: var(--nw-mono); color: var(--nw-green); font-size: 13px; }
+.nw-btn-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.nw-btn-copy svg {
+  flex: 0 0 auto;
+}
 .nw-btn--primary {
   background: linear-gradient(135deg, rgba(124, 231, 255, 0.14), rgba(255, 255, 255, 0.025));
   border-color: rgba(124, 231, 255, 0.34);
@@ -2277,16 +2307,17 @@
   }
 
   .nw-dashboard-statusbar--split {
+    grid-template-columns: 1fr;
     align-items: stretch;
-    flex-wrap: wrap;
+    row-gap: 8px;
   }
 
-  .nw-dashboard-statusbar--split .nw-status-pills,
-  .nw-dashboard-statusbar--split .nw-status-metrics {
-    flex: 1 1 100%;
+  .nw-dashboard-statusbar--split .nw-status-pills {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .nw-dashboard-statusbar--split .nw-status-metrics {
+    grid-template-columns: minmax(230px, 2fr) minmax(160px, 1fr) minmax(145px, 1fr) minmax(76px, 0.6fr);
     min-width: 0;
   }
 
@@ -2402,6 +2433,10 @@
 
   .nw-dashboard-statusbar--split .nw-status-metrics {
     grid-template-columns: 1fr;
+  }
+
+  .nw-dashboard-statusbar--split .nw-status-pills {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .nw-dashboard-right-grid > .nw-panel,
@@ -2648,6 +2683,17 @@
 /* =================================================================
  *  ATTENTION ROWS / SETUP CARD / ACTIVITY ROWS
  * ================================================================= */
+.nw-attention-body {
+  display: grid;
+  gap: 8px;
+}
+
+.nw-attention-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+
 .nw-alert-row {
   display: flex;
   justify-content: space-between;
@@ -2656,6 +2702,19 @@
   border-bottom: 1px dashed var(--nw-line);
 }
 .nw-alert-row:last-child { border-bottom: none; }
+
+.nw-attention-counts .nw-alert-row {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--nw-line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.nw-attention-counts .nw-alert-row:last-child {
+  border-bottom: 1px solid var(--nw-line);
+}
+
 .nw-alert-name { font-size: 12.5px; }
 .nw-alert-val {
   font-family: var(--nw-mono);
@@ -2668,14 +2727,18 @@
 .nw-alert-val--crit { color: var(--nw-crit); }
 
 .nw-setup-card {
-  margin-top: 12px;
-  border: 1px dashed rgba(255, 190, 99, 0.40);
+  margin-top: 0;
+  border: 1px dashed rgba(124, 231, 255, 0.30);
   border-radius: 10px;
-  padding: 12px;
-  background: linear-gradient(135deg, rgba(255, 190, 99, 0.06), transparent);
+  padding: 10px;
+  background: linear-gradient(135deg, rgba(124, 231, 255, 0.055), rgba(255, 255, 255, 0.012));
   display: flex;
   gap: 10px;
   align-items: flex-start;
+}
+
+.nw-panel--attention .nw-setup-card {
+  margin-top: 0;
 }
 .nw-setup-icon {
   width: 30px;
@@ -2692,7 +2755,7 @@
   flex-shrink: 0;
 }
 .nw-setup-body { flex: 1; min-width: 0; }
-.nw-setup-title { font-size: 12.5px; color: #ffe9c4; font-weight: 400; }
+.nw-setup-title { font-size: 12.5px; color: #d8f5ff; font-weight: 400; }
 .nw-setup-desc { font-size: 11px; color: var(--nw-dim); margin-top: 3px; line-height: 1.45; }
 
 .nw-activity-row {
@@ -2739,6 +2802,100 @@
 }
 .nw-activity-status--warn { color: var(--nw-warn); }
 .nw-activity-status--crit { color: var(--nw-crit); }
+
+/* Suggested next step: compact command card, not a terminal block. */
+.nw-panel--suggested {
+  padding: 11px 12px 12px;
+}
+
+.nw-suggested-prompt {
+  display: grid;
+  align-items: center;
+  box-sizing: border-box;
+  height: 54px;
+  min-height: 54px;
+  max-height: 54px;
+  overflow: hidden;
+  padding: 9px 10px;
+  border: 1px solid rgba(124, 231, 255, 0.18);
+  border-radius: 8px;
+  background: rgba(124, 231, 255, 0.045);
+  color: var(--nw-ink);
+  font-family: var(--nw-sans);
+  font-size: 13px;
+  font-weight: 520;
+  line-height: 1.32;
+}
+
+.nw-suggested-prompt-text {
+  display: -webkit-box;
+  overflow: hidden;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.nw-suggested-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.nw-suggested-actions .nw-btn {
+  min-height: 34px;
+  padding: 8px 10px;
+}
+
+.nw-suggested-recommendations {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--nw-line);
+}
+
+.nw-suggested-recommendation {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.nw-suggested-run-mark {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(124, 231, 255, 0.26);
+  border-radius: 50%;
+  background: rgba(124, 231, 255, 0.09);
+  color: var(--nw-green);
+}
+
+.nw-suggested-recommendation-copy {
+  min-width: 0;
+}
+
+.nw-suggested-recommendation .nw-activity-txt {
+  display: -webkit-box;
+  overflow: hidden;
+  margin-top: 1px;
+  font-size: 12px;
+  line-height: 1.32;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.nw-suggested-run {
+  align-self: center;
+  min-height: 28px;
+  white-space: nowrap;
+}
 
 /* =================================================================
  *  TYPEWRITER STAGE

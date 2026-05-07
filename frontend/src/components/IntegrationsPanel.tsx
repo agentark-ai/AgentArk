@@ -1047,7 +1047,8 @@ export function IntegrationsPanel({
     whatsapp_dm_policy: "pairing",
     whatsapp_allowed_numbers_csv: ""
   });
-  // NOTE: Integrations are long-lived connectors. URL imports belong to Skills.
+  // NOTE: Integrations are long-lived connectors. API imports stay here; skill
+  // sources belong to the Skills page.
 
   const integrationsQ = useQuery({
     queryKey: ["integrations"],
@@ -3679,7 +3680,7 @@ export function IntegrationsPanel({
               <Typography variant="caption" sx={{
                 color: "text.secondary"
               }}>
-                Use built-in integrations for first-party connectors and the custom integrations panel for pack-based installs.
+                Use built-in integrations for first-party connectors, custom API integrations for imported APIs, and extension packs for manifest-based installs.
               </Typography>
             </>
           ) : (
@@ -3717,18 +3718,18 @@ export function IntegrationsPanel({
                 width: "100%"
               }}>
               <Box>
-                <Typography variant="subtitle2">Custom Integrations</Typography>
+                <Typography variant="subtitle2">Extension Pack Integrations</Typography>
                 <Typography variant="caption" sx={{
                   color: "text.secondary"
                 }}>
-                  Install, connect, and manage pack-based integrations separately from the built-in connector catalog.
+                  Install, connect, and manage manifest-based integration packs separately from the built-in connector catalog.
                 </Typography>
               </Box>
               <Chip size="small" variant="outlined" label="Pack-based" sx={sectionCountChipSx} />
             </Stack>
           </AccordionSummary>
           <AccordionDetails>
-            <ExtensionPacksPanel mode="integrations" />
+            <ExtensionPacksPanel mode="integrations" autoRefresh={autoRefresh} />
           </AccordionDetails>
         </Accordion>
       ) : null}
@@ -3741,6 +3742,13 @@ export function IntegrationsPanel({
             autoRefresh={autoRefresh}
             embedded
             onConfigureIntegration={openConfig}
+          />
+          <IntegrationQuickstartPanel
+            integrations={[]}
+            autoRefresh={autoRefresh}
+            embedded
+            onConfigureIntegration={() => {}}
+            mode="custom-apis-only"
           />
           {readyList.length > 0 ? (
             <Box className="list-shell" sx={{ mb: 1.5 }}>
@@ -3872,7 +3880,7 @@ export function IntegrationsPanel({
               </Stack>
             </Box>
           ) : null}
-          <ExtensionPacksPanel mode="connectors" />
+          <ExtensionPacksPanel mode="connectors" autoRefresh={autoRefresh} />
         </>
       ) : null}
       {showCatalog ? (

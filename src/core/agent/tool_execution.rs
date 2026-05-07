@@ -4232,8 +4232,7 @@ impl Agent {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|state| {
-                    state.automation_kind == "watcher"
-                        && !live_ids.contains(&state.automation_id)
+                    state.automation_kind == "watcher" && !live_ids.contains(&state.automation_id)
                 })
                 .map(list_watchers_history_row),
         );

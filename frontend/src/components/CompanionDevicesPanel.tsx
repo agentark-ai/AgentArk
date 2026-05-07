@@ -4,8 +4,10 @@ import ComputerRoundedIcon from "@mui/icons-material/ComputerRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import DevicesRoundedIcon from "@mui/icons-material/DevicesRounded";
 import HomeRoundedIcon from "@mui/icons-material/HomeRounded";
+import LaunchRoundedIcon from "@mui/icons-material/LaunchRounded";
 import PhoneAndroidRoundedIcon from "@mui/icons-material/PhoneAndroidRounded";
 import PhoneIphoneRoundedIcon from "@mui/icons-material/PhoneIphoneRounded";
+import SendRoundedIcon from "@mui/icons-material/SendRounded";
 import SensorsRoundedIcon from "@mui/icons-material/SensorsRounded";
 import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
 import {
@@ -14,9 +16,14 @@ import {
   Button,
   Checkbox,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
   FormControlLabel,
   IconButton,
+  LinearProgress,
   MenuItem,
   Stack,
   TextField,
@@ -30,6 +37,7 @@ import { formatUiDateTime } from "../lib/dateFormat";
 import type {
   CompanionCapabilityDescriptor,
   CompanionCommandRecord,
+  CompanionDevicesResponse,
   CompanionDeviceRecord,
   CompanionPairingSession,
   CompanionPreset
@@ -152,11 +160,35 @@ function latestSession(sessions: CompanionPairingSession[]): CompanionPairingSes
   return sessions[0] ?? null;
 }
 
+function sessionNeedsPairingPoll(data: CompanionDevicesResponse | undefined, sessionId: string): boolean {
+  if (!sessionId) return false;
+  const session = data?.pairing_sessions?.find((item) => item.id === sessionId);
+  if (!session) return true;
+  return ["pending", "claimed"].includes(session.status.toLowerCase());
+}
+
+type PairingWizardStep = "tunnel" | "pairing" | "approve" | "connected";
+
+function shareTextForCompanionLink(url: string): string {
+  return `Open this AgentArk companion pairing link:\n${url}`;
+}
+
+function whatsappShareUrl(url: string): string {
+  return `https://wa.me/?text=${encodeURIComponent(shareTextForCompanionLink(url))}`;
+}
+
+function telegramShareUrl(url: string): string {
+  const shareUrl = new URL("https://t.me/share/url");
+  shareUrl.searchParams.set("url", url);
+  shareUrl.searchParams.set("text", "AgentArk companion pairing");
+  return shareUrl.toString();
+}
+
 export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<{ kind: "success" | "info" | "warning" | "error"; text: string } | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState("ios");
-  const [draftName, setDraftName] = useState("My iPhone");
+  const [draftName, setDraftName] = useState("My Device");
   const [draftCapabilities, setDraftCapabilities] = useState<string[]>([]);
   const [trustedUnattested, setTrustedUnattested] = useState(false);
   const [customCapability, setCustomCapability] = useState("");
@@ -166,6 +198,9 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   const [commandAction, setCommandAction] = useState("");
   const [commandArgs, setCommandArgs] = useState("{}");
   const [rotatedToken, setRotatedToken] = useState<string | null>(null);
+  const [pairingDialogOpen, setPairingDialogOpen] = useState(false);
+  const [pairingStep, setPairingStep] = useState<PairingWizardStep>("tunnel");
+  const activePairingSessionId = recordString(pairingPayload, "session_id");
 
   const presetsQ = useQuery({
     queryKey: ["companion-presets"],
@@ -183,7 +218,12 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   const devicesQ = useQuery({
     queryKey: ["companion-devices"],
     queryFn: api.getCompanionDevices,
-    refetchInterval: autoRefresh ? 8000 : false
+    refetchInterval: (query) =>
+      sessionNeedsPairingPoll(query.state.data as CompanionDevicesResponse | undefined, activePairingSessionId)
+        ? 2500
+        : autoRefresh
+          ? 8000
+          : false
   });
   const auditQ = useQuery({
     queryKey: ["companion-audit"],
@@ -271,7 +311,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
     mutationFn: api.startCompanionTunnel,
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["companion-connectivity"] });
-      setNotice({ kind: "success", text: "Companion tunnel is ready. Use the generated WebSocket URL in the iPhone app." });
+      setNotice({ kind: "success", text: "Companion tunnel is ready. Use the generated link on the selected device." });
     },
     onError: (error) => setNotice({ kind: "error", text: errMessage(error) })
   });
@@ -288,18 +328,22 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   const createPairingMutation = useMutation({
     mutationFn: async () => {
       if (!selectedPreset) throw new Error("Choose a device type first.");
-      const name = draftName.trim();
-      if (!name) throw new Error("Enter a device name.");
+      const name = draftName.trim() || selectedPreset.label || "Companion device";
+      const grants = draftCapabilities.length
+        ? draftCapabilities
+        : defaultPresetCapabilities(selectedPreset, capabilities);
       return api.createCompanionPairingSession({
         display_name: name,
         preset_id: selectedPreset.id,
         platform: selectedPreset.platform,
-        capabilities: draftCapabilities,
-        trusted_unattested: trustedUnattested && !bundledMobileNeedsAttestation
+        capabilities: grants,
+        trusted_unattested: false
       });
     },
     onSuccess: async (response) => {
       setPairingPayload(response.pairing_payload ?? null);
+      setPairingStep("approve");
+      setPairingDialogOpen(true);
       setNotice({ kind: "success", text: "Pairing code created. Approve it after the device claims the session." });
       await refreshAll();
     },
@@ -413,7 +457,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
     { label: "Approvals", value: overview?.pending_approvals ?? pendingApprovals.length, tone: "warn" }
   ];
   const presetCapabilityIds = selectedPreset?.capability_ids ?? [];
-  const pairingSessionId = recordString(pairingPayload, "session_id");
+  const pairingSessionId = activePairingSessionId;
   const pairingCode = recordString(pairingPayload, "code");
   const pairingWebSocketPath =
     recordString(pairingPayload, "websocket_path") || protocol?.websocket_path || "/companion/ws";
@@ -425,6 +469,76 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   const companionTunnelReady = companionTunnelActive && companionTunnelEnabled && Boolean(companionTunnelWsUrl);
   const recommendedCompanionWsUrl = companionTunnelWsUrl;
   const webCompanionUrl = companionWebUrl(pairingSessionId, pairingCode, recommendedCompanionWsUrl);
+  const activePairingSession = pairingSessionId
+    ? sessions.find((session) => session.id === pairingSessionId) ?? null
+    : null;
+  const activePairingStatus = activePairingSession?.status.toLowerCase() ?? "";
+  const activePairingClaimed = activePairingStatus === "claimed";
+  const activePairingCompleted = activePairingStatus === "completed";
+  const activePairingInProgress = Boolean(pairingSessionId && !activePairingCompleted);
+  const connectedPairingDevice =
+    (activePairingSession?.metadata?.device_id
+      ? devices.find((device) => device.id === activePairingSession.metadata?.device_id)
+      : null) ??
+    devices.find(
+      (device) =>
+        device.display_name === (activePairingSession?.display_name || draftName) &&
+        device.platform === (activePairingSession?.platform || selectedPreset?.platform)
+    ) ??
+    null;
+  const pairingStepIndex = { tunnel: 0, pairing: 1, approve: 2, connected: 3 }[pairingStep];
+  const pairingStepProgress = ((pairingStepIndex + 1) / 4) * 100;
+  const primaryPairingButtonLabel = activePairingInProgress
+    ? "Resume companion pairing"
+    : devices.length
+      ? "Pair another companion device"
+      : "Pair companion device";
+
+  useEffect(() => {
+    if (!pairingDialogOpen) return;
+    if (activePairingCompleted) {
+      setPairingStep("connected");
+    } else if (activePairingClaimed) {
+      setPairingStep("approve");
+    }
+  }, [activePairingClaimed, activePairingCompleted, pairingDialogOpen]);
+
+  const openPairingDialog = () => {
+    if (!selectedPreset && presets[0]) {
+      setSelectedPresetId(presets[0].id);
+      setDraftCapabilities(defaultPresetCapabilities(presets[0], capabilities));
+      setDraftName((current) => current.trim() || presets[0].label || "Companion device");
+    } else if (selectedPreset && !draftCapabilities.length) {
+      setDraftCapabilities(defaultPresetCapabilities(selectedPreset, capabilities));
+    }
+    setPairingStep(activePairingCompleted ? "connected" : activePairingInProgress ? "approve" : "tunnel");
+    setPairingDialogOpen(true);
+  };
+
+  const handleDeviceTypeChange = (nextPresetId: string) => {
+    const preset = presets.find((item) => item.id === nextPresetId) ?? null;
+    setSelectedPresetId(nextPresetId);
+    setDraftCapabilities(defaultPresetCapabilities(preset, capabilities));
+    setDraftName(preset?.label ?? "Companion device");
+    setTrustedUnattested(false);
+    setPairingPayload(null);
+    setPairingStep("tunnel");
+  };
+
+  const startTunnelAndContinue = async () => {
+    try {
+      await startCompanionTunnelMutation.mutateAsync();
+      setPairingStep("pairing");
+    } catch {
+      // Mutation onError surfaces the failure in the panel notice.
+    }
+  };
+
+  const copyWebCompanionLink = async () => {
+    if (!webCompanionUrl) return;
+    await navigator.clipboard?.writeText(webCompanionUrl);
+    setNotice({ kind: "success", text: "Web companion link copied." });
+  };
 
   return (
     <Stack className="companion-devices-panel" spacing={1.25}>
@@ -443,6 +557,283 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
           </Box>
         ))}
       </Box>
+
+      <Box className="settings-inline-card companion-pairing-start">
+        <Stack
+          direction={{ xs: "column", md: "row" }}
+          spacing={1.25}
+          sx={{ alignItems: { xs: "stretch", md: "center" }, justifyContent: "space-between" }}
+        >
+          <Stack direction="row" spacing={1} sx={{ alignItems: "flex-start", minWidth: 0 }}>
+            <Box className="companion-pairing-start-icon">
+              <DevicesRoundedIcon fontSize="small" />
+            </Box>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography className="settings-inline-card-kicker">Companion pairing</Typography>
+              <Typography className="settings-inline-card-title">Pair a companion device</Typography>
+              <Typography className="settings-inline-card-description">
+                Choose the device type, open a secure companion tunnel, send one pairing link, then approve the claimed device in AgentArk.
+              </Typography>
+            </Box>
+          </Stack>
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", justifyContent: { xs: "flex-start", md: "flex-end" } }}>
+            <Chip
+              size="small"
+              color={companionTunnelReady ? "success" : "default"}
+              variant={companionTunnelReady ? "filled" : "outlined"}
+              label={companionTunnelReady ? "Tunnel ready" : "Tunnel needed"}
+            />
+            <Button variant="contained" startIcon={<DevicesRoundedIcon />} onClick={openPairingDialog}>
+              {primaryPairingButtonLabel}
+            </Button>
+          </Stack>
+        </Stack>
+      </Box>
+
+      <Dialog
+        open={pairingDialogOpen}
+        onClose={() => setPairingDialogOpen(false)}
+        fullWidth
+        maxWidth="sm"
+        className="companion-flow-dialog"
+      >
+        <DialogTitle>
+          <Stack spacing={0.45}>
+            <Typography variant="h6" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
+              Pair companion device
+            </Typography>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              You can close this flow anytime; the session remains visible here until it expires or completes.
+            </Typography>
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.4}>
+            <Box>
+              <Stack direction="row" sx={{ justifyContent: "space-between", gap: 1, mb: 0.75 }}>
+                {["Device", "Link", "Approve", "Done"].map((label, index) => (
+                  <Typography
+                    key={label}
+                    variant="caption"
+                    sx={{
+                      color: index <= pairingStepIndex ? "primary.main" : "text.secondary",
+                      fontWeight: index === pairingStepIndex ? 700 : 500
+                    }}
+                  >
+                    {label}
+                  </Typography>
+                ))}
+              </Stack>
+              <LinearProgress variant="determinate" value={pairingStepProgress} />
+            </Box>
+
+            {pairingStep === "tunnel" ? (
+              <Stack spacing={1.2}>
+                <Box className="companion-dialog-step-grid">
+                  <TextField
+                    select
+                    size="small"
+                    label="Device type"
+                    value={selectedPresetId}
+                    onChange={(event) => handleDeviceTypeChange(event.target.value)}
+                    disabled={!presets.length}
+                  >
+                    {presets.map((preset) => (
+                      <MenuItem key={preset.id} value={preset.id}>
+                        {preset.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                  <TextField
+                    size="small"
+                    label="Device name"
+                    value={draftName}
+                    onChange={(event) => setDraftName(event.target.value)}
+                  />
+                </Box>
+                <Alert severity="info">
+                  The device must be able to open the generated AgentArk link. Same Wi-Fi is fine if the link is reachable; if your network blocks the tunnel, switch the phone to cellular or use Tailscale/custom domain access.
+                </Alert>
+                <Box className="companion-flow-status">
+                  <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 650 }}>
+                        Companion tunnel
+                      </Typography>
+                      <Typography className="companion-connect-url">
+                        {companionTunnelReady ? companionTunnelWsUrl : "No active companion tunnel yet"}
+                      </Typography>
+                    </Box>
+                    <Chip
+                      size="small"
+                      color={companionTunnelReady ? "success" : "default"}
+                      variant={companionTunnelReady ? "filled" : "outlined"}
+                      label={companionTunnelReady ? "Ready" : "Not ready"}
+                    />
+                  </Stack>
+                  {companionTunnelError ? (
+                    <Typography variant="caption" sx={{ color: "error.main", overflowWrap: "anywhere" }}>
+                      {companionTunnelError}
+                    </Typography>
+                  ) : null}
+                </Box>
+              </Stack>
+            ) : null}
+
+            {pairingStep === "pairing" ? (
+              <Stack spacing={1.2}>
+                <Box className="companion-flow-status">
+                  <Typography variant="subtitle2" sx={{ fontWeight: 650 }}>
+                    {selectedPreset?.label ?? "Companion device"}
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    {draftName.trim() || "Companion device"}
+                  </Typography>
+                  <Stack direction="row" useFlexGap sx={{ flexWrap: "wrap", gap: 0.5, mt: 1 }}>
+                    {(draftCapabilities.length ? draftCapabilities : defaultPresetCapabilities(selectedPreset, capabilities)).map((id) => (
+                      <Chip key={id} size="small" variant="outlined" label={labelForCapability(capabilities, id)} />
+                    ))}
+                    {!draftCapabilities.length && defaultPresetCapabilities(selectedPreset, capabilities).length === 0 ? (
+                      <Chip size="small" variant="outlined" label="No default grants" />
+                    ) : null}
+                  </Stack>
+                </Box>
+                <Alert severity="info">
+                  AgentArk will create a short-lived pairing link. Open it on the device, let it claim the session, then approve the claim here.
+                </Alert>
+              </Stack>
+            ) : null}
+
+            {pairingStep === "approve" ? (
+              <Stack spacing={1.2}>
+                <Box className="companion-flow-status">
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", gap: 1 }}>
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 650 }}>
+                        Open this link on the device
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                        Expires {formatUiDateTime(pairingExpiresAt, { fallback: "soon" })}
+                      </Typography>
+                    </Box>
+                    <Chip size="small" variant="outlined" label={activePairingSession?.status ?? "pending"} sx={{ alignSelf: "flex-start" }} />
+                  </Stack>
+                  <Typography className="companion-connect-url">{webCompanionUrl || "Create the pairing link first"}</Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    startIcon={<ContentCopyRoundedIcon />}
+                    onClick={copyWebCompanionLink}
+                    disabled={!webCompanionUrl}
+                  >
+                    Copy link
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<LaunchRoundedIcon />}
+                    onClick={() => window.open(webCompanionUrl, "_blank", "noopener,noreferrer")}
+                    disabled={!webCompanionUrl}
+                  >
+                    Open
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<SendRoundedIcon />}
+                    onClick={() => window.open(whatsappShareUrl(webCompanionUrl), "_blank", "noopener,noreferrer")}
+                    disabled={!webCompanionUrl}
+                  >
+                    WhatsApp
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<SendRoundedIcon />}
+                    onClick={() => window.open(telegramShareUrl(webCompanionUrl), "_blank", "noopener,noreferrer")}
+                    disabled={!webCompanionUrl}
+                  >
+                    Telegram
+                  </Button>
+                </Stack>
+                {activePairingClaimed ? (
+                  <Alert severity="success">
+                    Device claimed the session. Approve it here only if the identity matches the device you just opened.
+                  </Alert>
+                ) : activePairingStatus === "approved" ? (
+                  <Alert severity="info">Approved. Waiting for the companion page to finish and store its token.</Alert>
+                ) : (
+                  <Alert severity="info">Waiting for the device to open the link and claim this pairing session.</Alert>
+                )}
+                {activePairingSession?.claimed_device_public_key ? (
+                  <Typography variant="caption" sx={{ color: "text.secondary", overflowWrap: "anywhere" }}>
+                    Claimed identity: {shortValue(activePairingSession.claimed_device_public_key)}
+                  </Typography>
+                ) : null}
+              </Stack>
+            ) : null}
+
+            {pairingStep === "connected" ? (
+              <Stack spacing={1.2}>
+                <Alert severity="success" icon={<CheckCircleRoundedIcon />}>
+                  Companion device connected.
+                </Alert>
+                <Box className="companion-flow-status">
+                  <Typography variant="subtitle2" sx={{ fontWeight: 650 }}>
+                    {connectedPairingDevice?.display_name ?? activePairingSession?.display_name ?? draftName}
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    {connectedPairingDevice
+                      ? `${connectedPairingDevice.platform} - ${connectedPairingDevice.state}`
+                      : "Pairing completed"}
+                  </Typography>
+                </Box>
+              </Stack>
+            ) : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPairingDialogOpen(false)}>Close</Button>
+          {pairingStep === "tunnel" ? (
+            companionTunnelReady ? (
+              <Button variant="contained" onClick={() => setPairingStep("pairing")}>
+                Continue
+              </Button>
+            ) : (
+              <Button
+                variant="contained"
+                onClick={startTunnelAndContinue}
+                disabled={startCompanionTunnelMutation.isPending}
+              >
+                {startCompanionTunnelMutation.isPending ? "Opening tunnel..." : "Open companion tunnel"}
+              </Button>
+            )
+          ) : null}
+          {pairingStep === "pairing" ? (
+            <>
+              <Button onClick={() => setPairingStep("tunnel")}>Back</Button>
+              <Button
+                variant="contained"
+                onClick={() => createPairingMutation.mutate()}
+                disabled={createPairingMutation.isPending || !selectedPreset || !companionTunnelReady}
+              >
+                {createPairingMutation.isPending ? "Creating..." : "Create pairing link"}
+              </Button>
+            </>
+          ) : null}
+          {pairingStep === "approve" ? (
+            <Button
+              variant="contained"
+              onClick={() => activePairingSession && approvePairingMutation.mutate(activePairingSession.id)}
+              disabled={!activePairingClaimed || approvePairingMutation.isPending}
+            >
+              {approvePairingMutation.isPending ? "Approving..." : "Approve in AgentArk"}
+            </Button>
+          ) : null}
+        </DialogActions>
+      </Dialog>
 
       <Box className="settings-inline-card companion-guide">
         <Stack

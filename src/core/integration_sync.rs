@@ -17,6 +17,10 @@ const MAX_FEED_ITEMS: usize = 300;
 const MAX_RUN_ITEMS: usize = 400;
 const MAX_RECENT_SOURCE_IDS: usize = 400;
 const MAX_BASELINE_ITEMS: usize = 8;
+const GITHUB_SYNC_REPO_LIMIT: usize = 25;
+const GITHUB_SYNC_EVENT_LIMIT: usize = 30;
+const GITHUB_SYNC_ALERT_REPO_LIMIT: usize = 8;
+const GITHUB_SYNC_ALERT_LIMIT: usize = 5;
 const INTEGRATION_SYNC_STATUS_TIMEOUT_SECS: u64 = 8;
 const INTEGRATION_SYNC_FETCH_TIMEOUT_SECS: u64 = 45;
 const INTEGRATION_SYNC_BUSY_MESSAGE: &str =
@@ -466,6 +470,88 @@ fn recency_importance_boost(at: Option<DateTime<Utc>>) -> f32 {
 
 fn clamp_importance(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
+}
+
+fn github_api_url(path_segments: &[&str], query: &[(&str, String)]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse("https://api.github.com")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("Failed to build GitHub API URL"))?;
+        for segment in path_segments {
+            segments.push(segment);
+        }
+    }
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
+    Ok(url)
+}
+
+fn github_authed_get(
+    client: &reqwest::Client,
+    token: &str,
+    url: reqwest::Url,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", crate::branding::versioned_user_agent())
+        .header("Accept", "application/vnd.github+json")
+}
+
+async fn github_get_json_value(
+    client: &reqwest::Client,
+    token: &str,
+    url: reqwest::Url,
+    label: &str,
+) -> Result<serde_json::Value> {
+    let response = github_authed_get(client, token, url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let error = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GitHub {} failed: {} {}",
+            label,
+            status,
+            short_text(&error, 180)
+        ));
+    }
+    Ok(response.json::<serde_json::Value>().await?)
+}
+
+async fn github_get_json_array(
+    client: &reqwest::Client,
+    token: &str,
+    url: reqwest::Url,
+    label: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let value = github_get_json_value(client, token, url, label).await?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("GitHub {} returned a non-array payload", label))
+}
+
+fn github_after_last_success(
+    cursor: &IntegrationSyncCursor,
+    occurred_at: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(since) = cursor.last_success_at.as_deref().and_then(parse_datetime) else {
+        return true;
+    };
+    occurred_at.map(|value| value > since).unwrap_or(true)
+}
+
+fn github_repo_url(full_name: &str) -> Option<String> {
+    if full_name.trim().is_empty() || full_name == "repository" {
+        None
+    } else {
+        Some(format!("https://github.com/{}", full_name))
+    }
 }
 
 async fn gmail_connected(ctx: &IntegrationSyncContext) -> bool {
@@ -2339,7 +2425,85 @@ async fn fetch_github_items(
 ) -> Result<Vec<NormalizedSyncItem>> {
     let token = crate::integrations::github::GitHubConnector::load_token_from(&ctx.config_dir)
         .ok_or_else(|| anyhow!("GitHub token not configured"))?;
-    let mut url = reqwest::Url::parse("https://api.github.com/notifications")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    let mut successful_fetches = 0usize;
+
+    match fetch_github_notification_items(&client, &token, cursor).await {
+        Ok(mut fetched) => {
+            successful_fetches += 1;
+            items.append(&mut fetched);
+        }
+        Err(error) => errors.push(error.to_string()),
+    }
+
+    match fetch_github_repository_activity_items(&client, &token, cursor, "pushed").await {
+        Ok(mut fetched) => {
+            successful_fetches += 1;
+            items.append(&mut fetched);
+        }
+        Err(error) => errors.push(error.to_string()),
+    }
+
+    match fetch_github_repository_activity_items(&client, &token, cursor, "updated").await {
+        Ok(mut fetched) => {
+            successful_fetches += 1;
+            items.append(&mut fetched);
+        }
+        Err(error) => errors.push(error.to_string()),
+    }
+
+    match fetch_github_issue_activity_items(&client, &token, cursor).await {
+        Ok(mut fetched) => {
+            successful_fetches += 1;
+            items.append(&mut fetched);
+        }
+        Err(error) => errors.push(error.to_string()),
+    }
+
+    match fetch_github_security_alert_items(&client, &token, cursor).await {
+        Ok(mut fetched) => {
+            successful_fetches += 1;
+            items.append(&mut fetched);
+        }
+        Err(error) => errors.push(error.to_string()),
+    }
+
+    match fetch_github_public_event_items(&client, &token, cursor).await {
+        Ok(mut fetched) => {
+            successful_fetches += 1;
+            items.append(&mut fetched);
+        }
+        Err(error) => errors.push(error.to_string()),
+    }
+
+    if successful_fetches == 0 {
+        return Err(anyhow!(
+            "GitHub activity fetch failed: {}",
+            errors.join("; ")
+        ));
+    }
+    if !errors.is_empty() {
+        tracing::warn!(
+            errors = ?errors,
+            "GitHub activity sync completed with partial API coverage"
+        );
+    }
+
+    items.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+    items.truncate(120);
+    Ok(items)
+}
+
+async fn fetch_github_notification_items(
+    client: &reqwest::Client,
+    token: &str,
+    cursor: &IntegrationSyncCursor,
+) -> Result<Vec<NormalizedSyncItem>> {
+    let mut url = github_api_url(&["notifications"], &[])?;
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("all", "false");
@@ -2349,23 +2513,7 @@ async fn fetch_github_items(
             query.append_pair("since", since);
         }
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-    let response = client
-        .get(url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("User-Agent", crate::branding::versioned_user_agent())
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "GitHub notifications failed: {}",
-            response.status()
-        ));
-    }
-    let notifications = response.json::<Vec<serde_json::Value>>().await?;
+    let notifications = github_get_json_array(client, token, url, "notifications").await?;
     Ok(notifications
         .into_iter()
         .map(|item| {
@@ -2391,6 +2539,10 @@ async fn fetch_github_items(
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
             let occurred_at = parse_datetime(updated_at);
+            let raw_id = item
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or(title);
             let reason_boost = match reason {
                 "security_alert" => 0.36,
                 "review_requested" => 0.32,
@@ -2400,11 +2552,7 @@ async fn fetch_github_items(
                 _ => 0.1,
             };
             NormalizedSyncItem {
-                source_id: item
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(title)
-                    .to_string(),
+                source_id: format!("github:notification:{}:{}", raw_id, updated_at),
                 kind: subject
                     .get("type")
                     .and_then(|value| value.as_str())
@@ -2425,6 +2573,577 @@ async fn fetch_github_items(
             }
         })
         .collect())
+}
+
+async fn fetch_github_repository_activity_items(
+    client: &reqwest::Client,
+    token: &str,
+    cursor: &IntegrationSyncCursor,
+    sort: &str,
+) -> Result<Vec<NormalizedSyncItem>> {
+    let url = github_api_url(
+        &["user", "repos"],
+        &[
+            ("visibility", "all".to_string()),
+            (
+                "affiliation",
+                "owner,collaborator,organization_member".to_string(),
+            ),
+            ("sort", sort.to_string()),
+            ("direction", "desc".to_string()),
+            ("per_page", GITHUB_SYNC_REPO_LIMIT.to_string()),
+        ],
+    )?;
+    let repos = github_get_json_array(client, token, url, "repository activity").await?;
+    let timestamp_field = if sort == "updated" {
+        "updated_at"
+    } else {
+        "pushed_at"
+    };
+    let verb = if sort == "updated" {
+        "updated"
+    } else {
+        "pushed"
+    };
+
+    let mut items = Vec::new();
+    for repo in repos {
+        let full_name = repo
+            .get("full_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("repository");
+        let timestamp = repo
+            .get(timestamp_field)
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let occurred_at = parse_datetime(timestamp);
+        if timestamp.is_empty() || !github_after_last_success(cursor, occurred_at) {
+            continue;
+        }
+        let description = repo
+            .get("description")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let visibility = repo
+            .get("visibility")
+            .and_then(|value| value.as_str())
+            .unwrap_or("repository");
+        let private_label = if repo
+            .get("private")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            "private"
+        } else {
+            visibility
+        };
+        items.push(NormalizedSyncItem {
+            source_id: format!(
+                "github:repo:{}:{}:{}",
+                verb,
+                repo.get("id")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| full_name.to_string()),
+                timestamp
+            ),
+            kind: format!("repo_{}", verb),
+            title: format!("{} {}", full_name, verb),
+            summary: if description.trim().is_empty() {
+                format!("{} repository {}", private_label, timestamp)
+            } else {
+                format!(
+                    "{} repository | {} | {}",
+                    private_label,
+                    short_text(description, 90),
+                    timestamp
+                )
+            },
+            url: repo
+                .get("html_url")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .or_else(|| github_repo_url(full_name)),
+            occurred_at,
+            importance: clamp_importance(
+                0.34 + recency_importance_boost(occurred_at) + text_importance_boost(full_name),
+            ),
+        });
+    }
+    Ok(items)
+}
+
+async fn fetch_github_issue_activity_items(
+    client: &reqwest::Client,
+    token: &str,
+    cursor: &IntegrationSyncCursor,
+) -> Result<Vec<NormalizedSyncItem>> {
+    let mut url = github_api_url(
+        &["issues"],
+        &[
+            ("filter", "all".to_string()),
+            ("state", "all".to_string()),
+            ("sort", "updated".to_string()),
+            ("direction", "desc".to_string()),
+            ("per_page", "25".to_string()),
+        ],
+    )?;
+    if let Some(since) = cursor.last_success_at.as_deref() {
+        url.query_pairs_mut().append_pair("since", since);
+    }
+    let issues = github_get_json_array(client, token, url, "issue activity").await?;
+    let mut items = Vec::new();
+    for issue in issues {
+        let title = issue
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or("GitHub issue");
+        let updated_at = issue
+            .get("updated_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let occurred_at = parse_datetime(updated_at);
+        if !github_after_last_success(cursor, occurred_at) {
+            continue;
+        }
+        let repository = issue
+            .get("repository")
+            .and_then(|value| value.get("full_name"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("repository");
+        let number = issue
+            .get("number")
+            .and_then(|value| value.as_i64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let is_pr = issue.get("pull_request").is_some();
+        let kind = if is_pr { "pull_request" } else { "issue" };
+        items.push(NormalizedSyncItem {
+            source_id: format!(
+                "github:{}:{}:{}",
+                kind,
+                issue
+                    .get("id")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| format!("{}#{}", repository, number)),
+                updated_at
+            ),
+            kind: kind.to_string(),
+            title: format!(
+                "{} #{} {}",
+                if is_pr { "PR" } else { "Issue" },
+                number,
+                title
+            ),
+            summary: format!("{} | updated {}", repository, updated_at),
+            url: issue
+                .get("html_url")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .or_else(|| github_repo_url(repository)),
+            occurred_at,
+            importance: clamp_importance(
+                0.4 + recency_importance_boost(occurred_at) + text_importance_boost(title),
+            ),
+        });
+    }
+    Ok(items)
+}
+
+async fn fetch_github_security_alert_items(
+    client: &reqwest::Client,
+    token: &str,
+    cursor: &IntegrationSyncCursor,
+) -> Result<Vec<NormalizedSyncItem>> {
+    let repos = github_get_json_array(
+        client,
+        token,
+        github_api_url(
+            &["user", "repos"],
+            &[
+                ("visibility", "all".to_string()),
+                (
+                    "affiliation",
+                    "owner,collaborator,organization_member".to_string(),
+                ),
+                ("sort", "updated".to_string()),
+                ("direction", "desc".to_string()),
+                ("per_page", GITHUB_SYNC_ALERT_REPO_LIMIT.to_string()),
+            ],
+        )?,
+        "alert repository discovery",
+    )
+    .await?;
+
+    let mut items = Vec::new();
+    let mut attempted = 0usize;
+    for repo in repos {
+        let full_name = repo
+            .get("full_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let Some((owner, repo_name)) = full_name.split_once('/') else {
+            continue;
+        };
+        for alert_surface in ["dependabot", "code-scanning", "secret-scanning"] {
+            attempted += 1;
+            let path = match alert_surface {
+                "dependabot" => vec!["repos", owner, repo_name, "dependabot", "alerts"],
+                "code-scanning" => vec!["repos", owner, repo_name, "code-scanning", "alerts"],
+                _ => vec!["repos", owner, repo_name, "secret-scanning", "alerts"],
+            };
+            let query = match alert_surface {
+                "dependabot" => vec![
+                    ("state", "open".to_string()),
+                    ("per_page", GITHUB_SYNC_ALERT_LIMIT.to_string()),
+                ],
+                _ => vec![
+                    ("state", "open".to_string()),
+                    ("sort", "updated".to_string()),
+                    ("direction", "desc".to_string()),
+                    ("per_page", GITHUB_SYNC_ALERT_LIMIT.to_string()),
+                ],
+            };
+            let url = github_api_url(&path, &query)?;
+            match github_get_json_array(client, token, url, alert_surface).await {
+                Ok(alerts) => {
+                    for alert in alerts {
+                        if let Some(item) =
+                            github_alert_to_sync_item(alert_surface, full_name, &alert, cursor)
+                        {
+                            items.push(item);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        repository = full_name,
+                        surface = alert_surface,
+                        error = %error,
+                        "GitHub security alert surface unavailable"
+                    );
+                }
+            }
+        }
+    }
+
+    if attempted > 0 || !items.is_empty() {
+        Ok(items)
+    } else {
+        Err(anyhow!(
+            "No GitHub repositories were available for alert polling"
+        ))
+    }
+}
+
+fn github_alert_to_sync_item(
+    surface: &str,
+    repository: &str,
+    alert: &serde_json::Value,
+    cursor: &IntegrationSyncCursor,
+) -> Option<NormalizedSyncItem> {
+    let updated_at = alert
+        .get("updated_at")
+        .or_else(|| alert.get("fixed_at"))
+        .or_else(|| alert.get("dismissed_at"))
+        .or_else(|| alert.get("resolved_at"))
+        .or_else(|| alert.get("created_at"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let occurred_at = parse_datetime(updated_at);
+    if updated_at.is_empty() || !github_after_last_success(cursor, occurred_at) {
+        return None;
+    }
+
+    let number = alert
+        .get("number")
+        .or_else(|| alert.get("id"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .map(|number| number.to_string())
+                .or_else(|| value.as_str().map(|raw| raw.to_string()))
+        })
+        .unwrap_or_else(|| hash_id(&[surface, repository, updated_at]));
+    let state = alert
+        .get("state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("open");
+    let title = match surface {
+        "dependabot" => {
+            let package = alert
+                .get("dependency")
+                .and_then(|value| value.get("package"))
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("dependency");
+            let advisory = alert
+                .get("security_advisory")
+                .and_then(|value| value.get("summary"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("Dependabot alert");
+            format!(
+                "Dependabot alert in {}: {} ({})",
+                repository, advisory, package
+            )
+        }
+        "code-scanning" => {
+            let rule = alert
+                .get("rule")
+                .and_then(|value| {
+                    value
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .or_else(|| value.get("id").and_then(|id| id.as_str()))
+                })
+                .unwrap_or("code scanning alert");
+            format!("Code scanning alert in {}: {}", repository, rule)
+        }
+        _ => {
+            let secret_type = alert
+                .get("secret_type_display_name")
+                .or_else(|| alert.get("secret_type"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("secret");
+            format!("Secret scanning alert in {}: {}", repository, secret_type)
+        }
+    };
+
+    Some(NormalizedSyncItem {
+        source_id: format!(
+            "github:alert:{}:{}:{}:{}",
+            surface, repository, number, updated_at
+        ),
+        kind: format!("{}_alert", surface.replace('-', "_")),
+        title: short_text(&title, 120),
+        summary: format!("{} | {} | updated {}", surface, state, updated_at),
+        url: alert
+            .get("html_url")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .or_else(|| github_repo_url(repository)),
+        occurred_at,
+        importance: clamp_importance(
+            0.78 + recency_importance_boost(occurred_at) + text_importance_boost(&title),
+        ),
+    })
+}
+
+async fn fetch_github_public_event_items(
+    client: &reqwest::Client,
+    token: &str,
+    cursor: &IntegrationSyncCursor,
+) -> Result<Vec<NormalizedSyncItem>> {
+    let profile =
+        github_get_json_value(client, token, github_api_url(&["user"], &[])?, "user").await?;
+    let login = profile
+        .get("login")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("GitHub user payload did not include login"))?;
+    let mut events = Vec::new();
+    for (label, segments) in [
+        ("user events", vec!["users", login, "events"]),
+        ("received events", vec!["users", login, "received_events"]),
+    ] {
+        let url = github_api_url(
+            &segments,
+            &[("per_page", GITHUB_SYNC_EVENT_LIMIT.to_string())],
+        )?;
+        match github_get_json_array(client, token, url, label).await {
+            Ok(mut fetched) => events.append(&mut fetched),
+            Err(error) => tracing::warn!(error = %error, "GitHub event surface fetch failed"),
+        }
+    }
+
+    let mut items = Vec::new();
+    for event in events {
+        let occurred_at = event
+            .get("created_at")
+            .and_then(|value| value.as_str())
+            .and_then(parse_datetime);
+        if !github_after_last_success(cursor, occurred_at) {
+            continue;
+        }
+        if let Some(item) = github_event_to_sync_item(&event, occurred_at) {
+            items.push(item);
+        }
+    }
+    Ok(items)
+}
+
+fn github_event_to_sync_item(
+    event: &serde_json::Value,
+    occurred_at: Option<DateTime<Utc>>,
+) -> Option<NormalizedSyncItem> {
+    let event_id = event.get("id").and_then(|value| value.as_str())?;
+    let event_type = event
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("GitHubEvent");
+    let repo = event
+        .get("repo")
+        .and_then(|value| value.get("name"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("repository");
+    let actor = event
+        .get("actor")
+        .and_then(|value| {
+            value
+                .get("display_login")
+                .and_then(|login| login.as_str())
+                .or_else(|| value.get("login").and_then(|login| login.as_str()))
+        })
+        .unwrap_or("someone");
+    let payload = event
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let action = payload
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    let (title, summary, url) = match event_type {
+        "PushEvent" => {
+            let commit_count = payload
+                .get("commits")
+                .and_then(|value| value.as_array())
+                .map(|value| value.len())
+                .unwrap_or(0);
+            let raw_ref = payload
+                .get("ref")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let branch = raw_ref.strip_prefix("refs/heads/").unwrap_or(raw_ref);
+            (
+                format!("Push to {}", repo),
+                format!(
+                    "{} pushed {} commit{}{}",
+                    actor,
+                    commit_count,
+                    if commit_count == 1 { "" } else { "s" },
+                    if branch.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" to {}", branch)
+                    }
+                ),
+                if branch.is_empty() {
+                    github_repo_url(repo)
+                } else {
+                    Some(format!("https://github.com/{}/commits/{}", repo, branch))
+                },
+            )
+        }
+        "PullRequestEvent" => {
+            let pr = payload
+                .get("pull_request")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let pr_title = pr
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or("pull request");
+            (
+                format!("PR {} {}", action, pr_title).trim().to_string(),
+                format!("{} | {}", repo, event_type),
+                pr.get("html_url")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| github_repo_url(repo)),
+            )
+        }
+        "IssuesEvent" => {
+            let issue = payload
+                .get("issue")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let issue_title = issue
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or("issue");
+            (
+                format!("Issue {} {}", action, issue_title)
+                    .trim()
+                    .to_string(),
+                format!("{} | {}", repo, event_type),
+                issue
+                    .get("html_url")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| github_repo_url(repo)),
+            )
+        }
+        "IssueCommentEvent" => {
+            let issue = payload
+                .get("issue")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let issue_title = issue
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or("issue");
+            (
+                format!("Comment on {}", issue_title),
+                format!("{} | {}", repo, event_type),
+                issue
+                    .get("html_url")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| github_repo_url(repo)),
+            )
+        }
+        "ReleaseEvent" => {
+            let release = payload
+                .get("release")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let release_name = release
+                .get("name")
+                .and_then(|value| value.as_str())
+                .or_else(|| release.get("tag_name").and_then(|value| value.as_str()))
+                .unwrap_or("release");
+            (
+                format!("Release {} {}", action, release_name)
+                    .trim()
+                    .to_string(),
+                format!("{} | {}", repo, event_type),
+                release
+                    .get("html_url")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| github_repo_url(repo)),
+            )
+        }
+        _ => {
+            let cleaned = event_type.trim_end_matches("Event");
+            (
+                if action.is_empty() {
+                    format!("{} in {}", cleaned, repo)
+                } else {
+                    format!("{} {} in {}", cleaned, action, repo)
+                },
+                format!("{} | {}", actor, event_type),
+                github_repo_url(repo),
+            )
+        }
+    };
+
+    Some(NormalizedSyncItem {
+        source_id: format!("github:event:{}", event_id),
+        kind: event_type
+            .trim_end_matches("Event")
+            .replace('_', "-")
+            .to_ascii_lowercase(),
+        title: short_text(&title, 120),
+        summary: short_text(&summary, 220),
+        url,
+        occurred_at,
+        importance: clamp_importance(
+            0.36 + recency_importance_boost(occurred_at) + text_importance_boost(&title),
+        ),
+    })
 }
 
 async fn fetch_gmail_items(

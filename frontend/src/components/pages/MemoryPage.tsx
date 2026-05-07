@@ -44,7 +44,15 @@ import {
 const REFRESH_MS = 8000;
 const MEMORY_PAGE_SIZE = 20;
 
-type MemoryCategoryKey = "facts" | "preferences" | "userData" | "knowledge";
+type MemoryCategoryKey =
+  | "facts"
+  | "assistantPreferences"
+  | "workPreferences"
+  | "domainMemory"
+  | "otherMemory"
+  | "preferences"
+  | "userData"
+  | "knowledge";
 
 type RuntimeActionCatalogEntry = {
   actionId: string;
@@ -53,6 +61,29 @@ type RuntimeActionCatalogEntry = {
   summary: string;
   details: string;
 };
+
+type DeleteMemoryTarget =
+  | {
+      kind: "learnedMemory";
+      id: string;
+      label: string;
+    }
+  | {
+      kind: "preference";
+      id: string;
+      label: string;
+      endpoint: string;
+    }
+  | {
+      kind: "userData";
+      id: string;
+      label: string;
+    }
+  | {
+      kind: "knowledge";
+      id: string;
+      label: string;
+    };
 
 function isInternalAgentArkHelpUrl(value: unknown): boolean {
   return str(value, "").trim().toLowerCase().startsWith("agentark://help/");
@@ -179,9 +210,16 @@ export default function MemoryPage({
   const [selectedKnowledge, setSelectedKnowledge] = useState<JsonRecord | null>(
     null,
   );
+  const [deleteTarget, setDeleteTarget] = useState<DeleteMemoryTarget | null>(
+    null,
+  );
   const [memoryTab, setMemoryTab] = useState(0);
   const [memoryPages, setMemoryPages] = useState<Record<MemoryCategoryKey, number>>({
     facts: 0,
+    assistantPreferences: 0,
+    workPreferences: 0,
+    domainMemory: 0,
+    otherMemory: 0,
     preferences: 0,
     userData: 0,
     knowledge: 0,
@@ -201,8 +239,16 @@ export default function MemoryPage({
   const [knowledgeTags, setKnowledgeTags] = useState("");
   const invalidateMemoryQueries = async () => {
     await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["arkmemory-summary"] }),
+      queryClient.invalidateQueries({ queryKey: ["arkmemory-queue"] }),
+      queryClient.invalidateQueries({ queryKey: ["arkmemory-ledger"] }),
+      queryClient.invalidateQueries({ queryKey: ["arkmemory-health"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-stats"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-facts"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-assistant-preferences"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-work-preferences"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-domain-memory"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-other-memory"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-preferences"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-user-data"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-knowledge"] }),
@@ -218,8 +264,52 @@ export default function MemoryPage({
     queryKey: ["memory-facts", memoryPages.facts, MEMORY_PAGE_SIZE],
     queryFn: () =>
       api.rawGet(
-        `/memory/facts?limit=${MEMORY_PAGE_SIZE}&offset=${
+        `/memory/facts?category=profile_fact&limit=${MEMORY_PAGE_SIZE}&offset=${
           memoryPages.facts * MEMORY_PAGE_SIZE
+        }`,
+      ),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+  const assistantPreferencesQ = useQuery({
+    queryKey: [
+      "memory-assistant-preferences",
+      memoryPages.assistantPreferences,
+      MEMORY_PAGE_SIZE,
+    ],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/facts?category=assistant_preference&limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.assistantPreferences * MEMORY_PAGE_SIZE
+        }`,
+      ),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+  const workPreferencesQ = useQuery({
+    queryKey: ["memory-work-preferences", memoryPages.workPreferences, MEMORY_PAGE_SIZE],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/facts?category=work_preference&limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.workPreferences * MEMORY_PAGE_SIZE
+        }`,
+      ),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+  const domainMemoryQ = useQuery({
+    queryKey: ["memory-domain-memory", memoryPages.domainMemory, MEMORY_PAGE_SIZE],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/facts?category=project_domain_memory&limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.domainMemory * MEMORY_PAGE_SIZE
+        }`,
+      ),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+  const otherMemoryQ = useQuery({
+    queryKey: ["memory-other-memory", memoryPages.otherMemory, MEMORY_PAGE_SIZE],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/facts?category=other&limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.otherMemory * MEMORY_PAGE_SIZE
         }`,
       ),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
@@ -262,6 +352,14 @@ export default function MemoryPage({
       await invalidateMemoryQueries();
     },
   });
+  const deleteLearnedMemoryMutation = useMutation({
+    mutationFn: (id: string) =>
+      api.rawDelete(`/memory/facts/${encodeURIComponent(id)}`),
+    onSuccess: async () => {
+      setSelectedFact(null);
+      await invalidateMemoryQueries();
+    },
+  });
   const deletePreferenceMutation = useMutation({
     mutationFn: (endpoint: string) => api.rawDelete(endpoint),
     onSuccess: async () => {
@@ -293,16 +391,37 @@ export default function MemoryPage({
     mutationFn: (id: string) =>
       api.rawDelete(`/memory/knowledge/${encodeURIComponent(id)}`),
     onSuccess: async () => {
+      setSelectedKnowledge(null);
       await invalidateMemoryQueries();
     },
   });
 
   const stats = asRecord(statsQ.data);
   const facts = pickRecords(factsQ.data, "facts");
+  const assistantPreferences = pickRecords(assistantPreferencesQ.data, "facts");
+  const workPreferences = pickRecords(workPreferencesQ.data, "facts");
+  const domainMemory = pickRecords(domainMemoryQ.data, "facts");
+  const otherMemory = pickRecords(otherMemoryQ.data, "facts");
   const preferences = pickRecords(preferencesQ.data, "preferences");
   const userDataItems = pickRecords(userDataQ.data, "items");
   const knowledgeItems = pickRecords(knowledgeQ.data, "items");
   const factsTotal = num(asRecord(factsQ.data).total, num(stats.facts, facts.length));
+  const assistantPreferencesTotal = num(
+    asRecord(assistantPreferencesQ.data).total,
+    num(stats.assistant_preferences, assistantPreferences.length),
+  );
+  const workPreferencesTotal = num(
+    asRecord(workPreferencesQ.data).total,
+    num(stats.work_preferences, workPreferences.length),
+  );
+  const domainMemoryTotal = num(
+    asRecord(domainMemoryQ.data).total,
+    num(stats.project_domain_memory, domainMemory.length),
+  );
+  const otherMemoryTotal = num(
+    asRecord(otherMemoryQ.data).total,
+    num(stats.other_memory, otherMemory.length),
+  );
   const preferencesTotal = num(
     asRecord(preferencesQ.data).total,
     num(stats.preferences, preferences.length),
@@ -328,6 +447,10 @@ export default function MemoryPage({
       let changed = false;
       ([
         ["facts", factsTotal],
+        ["assistantPreferences", assistantPreferencesTotal],
+        ["workPreferences", workPreferencesTotal],
+        ["domainMemory", domainMemoryTotal],
+        ["otherMemory", otherMemoryTotal],
         ["preferences", preferencesTotal],
         ["userData", userDataTotal],
         ["knowledge", knowledgeTotal],
@@ -340,7 +463,16 @@ export default function MemoryPage({
       });
       return changed ? next : prev;
     });
-  }, [factsTotal, knowledgeTotal, preferencesTotal, userDataTotal]);
+  }, [
+    assistantPreferencesTotal,
+    domainMemoryTotal,
+    factsTotal,
+    knowledgeTotal,
+    otherMemoryTotal,
+    preferencesTotal,
+    userDataTotal,
+    workPreferencesTotal,
+  ]);
 
   const parseSources = (value: unknown): string[] => {
     if (Array.isArray(value)) return value.map((v) => String(v));
@@ -378,6 +510,161 @@ export default function MemoryPage({
   const selectedKnowledgeShowsExternalUrl =
     selectedKnowledgeUrl && !isInternalAgentArkHelpUrl(selectedKnowledgeUrl);
   const selectedKnowledgeTags = parseKnowledgeTags(selectedKnowledge?.tags);
+  const deleteBusy =
+    deleteLearnedMemoryMutation.isPending ||
+    deletePreferenceMutation.isPending ||
+    deleteUserDataMutation.isPending ||
+    deleteKnowledgeMutation.isPending;
+  const confirmDeleteTarget = (target: DeleteMemoryTarget) => {
+    setError(null);
+    setDeleteTarget(target);
+  };
+  const runConfirmedDelete = async () => {
+    if (!deleteTarget) return;
+    setError(null);
+    try {
+      if (deleteTarget.kind === "learnedMemory") {
+        await deleteLearnedMemoryMutation.mutateAsync(deleteTarget.id);
+      } else if (deleteTarget.kind === "preference") {
+        await deletePreferenceMutation.mutateAsync(deleteTarget.endpoint);
+      } else if (deleteTarget.kind === "userData") {
+        await deleteUserDataMutation.mutateAsync(deleteTarget.id);
+      } else {
+        await deleteKnowledgeMutation.mutateAsync(deleteTarget.id);
+      }
+      setDeleteTarget(null);
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  };
+  const renderLearnedMemoryTable = (
+    title: string,
+    items: JsonRecord[],
+    total: number,
+    pageKey: MemoryCategoryKey,
+    queryError: unknown,
+    emptyCopy: string,
+  ) => (
+    <Box className="list-shell">
+      <Typography
+        variant="h6"
+        sx={{
+          mb: 1,
+        }}
+      >
+        {title}
+      </Typography>
+      {queryError ? <Alert severity="error">{errMessage(queryError)}</Alert> : null}
+      {items.length === 0 ? (
+        <Typography
+          variant="body2"
+          sx={{
+            color: "text.secondary",
+          }}
+        >
+          {emptyCopy}
+        </Typography>
+      ) : (
+        <>
+          <TableContainer className="table-shell">
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Memory</TableCell>
+                  <TableCell>Topics</TableCell>
+                  <TableCell>Confidence</TableCell>
+                  <TableCell>Updated</TableCell>
+                  <TableCell>Evidence</TableCell>
+                  <TableCell align="right">Ops</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {items.map((f, idx) => {
+                  const id = str(f.id, String(idx));
+                  const sources = parseSources(f.sources);
+                  const evidenceCount = num(f.evidence_count, sources.length);
+                  const factText = str(f.fact, "-");
+                  const topics = Array.isArray(f.topics)
+                    ? f.topics.map((topic) => String(topic)).filter(Boolean)
+                    : [];
+                  const updatedAt = humanTs(str(f.updated_at, str(f.created_at, "-")));
+                  return (
+                    <TableRow
+                      key={id}
+                      hover
+                      tabIndex={0}
+                      aria-label={`Open memory: ${factText}`}
+                      onClick={() => setSelectedFact(asRecord(f))}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedFact(asRecord(f));
+                        }
+                      }}
+                      sx={{
+                        cursor: "pointer",
+                      }}
+                    >
+                      <TableCell sx={{ maxWidth: 560 }}>
+                        <Typography variant="body2" noWrap title={factText}>
+                          {factText}
+                        </Typography>
+                      </TableCell>
+                      <TableCell sx={{ maxWidth: 240 }}>
+                        <Typography
+                          variant="body2"
+                          noWrap
+                          title={topics.join(", ")}
+                          sx={{ color: "text.secondary" }}
+                        >
+                          {topics.length ? topics.join(", ") : "-"}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>{num(f.confidence, 0).toFixed(2)}</TableCell>
+                      <TableCell sx={{ whiteSpace: "nowrap" }} title={updatedAt.tip}>
+                        {updatedAt.label}
+                      </TableCell>
+                      <TableCell>{evidenceCount}</TableCell>
+                      <TableCell
+                        align="right"
+                        onClick={(e) => e.stopPropagation()}
+                        onKeyDown={(e) => e.stopPropagation()}
+                      >
+                        <RowOpsMenu
+                          actions={[
+                            {
+                              label: "Delete",
+                              tone: "error",
+                              divider: true,
+                              onClick: () =>
+                                confirmDeleteTarget({
+                                  kind: "learnedMemory",
+                                  id,
+                                  label: factText,
+                                }),
+                            },
+                          ]}
+                          ariaLabel="Memory options"
+                        />
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </TableContainer>
+          <TablePagination
+            component="div"
+            count={total}
+            page={memoryPages[pageKey]}
+            onPageChange={(_event, nextPage) => setMemoryPage(pageKey, nextPage)}
+            rowsPerPage={MEMORY_PAGE_SIZE}
+            rowsPerPageOptions={[MEMORY_PAGE_SIZE]}
+          />
+        </>
+      )}
+    </Box>
+  );
 
   return (
     <WorkspacePageShell spacing={1.5}>
@@ -395,17 +682,45 @@ export default function MemoryPage({
           gridTemplateColumns: {
             xs: "repeat(2, 1fr)",
             sm: "repeat(3, 1fr)",
-            md: "repeat(5, 1fr)",
+            md: "repeat(auto-fit, minmax(140px, 1fr))",
           },
           gap: 1.5,
         }}
       >
         {[
-          { label: "Facts", value: num(stats.facts), color: "#14f195" },
+          {
+            label: "Profile",
+            value: num(stats.profile_facts, num(stats.facts)),
+            color: "#14f195",
+          },
+          {
+            label: "Assistant",
+            value: num(stats.assistant_preferences),
+            color: "#a78bfa",
+          },
+          {
+            label: "Work Prefs",
+            value: num(stats.work_preferences),
+            color: "#38bdf8",
+          },
+          {
+            label: "Domain",
+            value: num(stats.project_domain_memory),
+            color: "#22c55e",
+          },
+          ...(num(stats.other_memory) > 0
+            ? [
+                {
+                  label: "Other",
+                  value: num(stats.other_memory),
+                  color: "#94a3b8",
+                },
+              ]
+            : []),
           {
             label: "Preferences",
             value: num(stats.preferences),
-            color: "#a78bfa",
+            color: "#c084fc",
           },
           { label: "User Data", value: num(stats.user_data), color: "#f59e0b" },
           { label: "Knowledge", value: num(stats.knowledge), color: "#f472b6" },
@@ -457,7 +772,11 @@ export default function MemoryPage({
           "& .MuiTab-root": { minHeight: 0, py: 0.5, fontSize: "0.8rem" },
         }}
       >
-        <Tab label={`Facts (${factsTotal})`} />
+        <Tab label={`Profile Facts (${factsTotal})`} />
+        <Tab label={`Assistant (${assistantPreferencesTotal})`} />
+        <Tab label={`Work Prefs (${workPreferencesTotal})`} />
+        <Tab label={`Domain (${domainMemoryTotal})`} />
+        <Tab label={`Other (${otherMemoryTotal})`} />
         <Tab label={`Preferences (${preferencesTotal})`} />
         <Tab label={`User Data (${userDataTotal})`} />
         <Tab label={`Knowledge (${knowledgeTotal})`} />
@@ -470,7 +789,7 @@ export default function MemoryPage({
               mb: 1,
             }}
           >
-            Semantic Facts
+            Profile Facts
           </Typography>
           {factsQ.error ? (
             <Alert severity="error">{errMessage(factsQ.error)}</Alert>
@@ -494,6 +813,7 @@ export default function MemoryPage({
                       <TableCell>Confidence</TableCell>
                       <TableCell>Created</TableCell>
                       <TableCell>Evidence</TableCell>
+                      <TableCell align="right">Ops</TableCell>
                     </TableRow>
                   </TableHead>
                   <TableBody>
@@ -536,6 +856,28 @@ export default function MemoryPage({
                             {humanTs(str(f.created_at, "-")).label}
                           </TableCell>
                           <TableCell>{evidenceCount}</TableCell>
+                          <TableCell
+                            align="right"
+                            onClick={(e) => e.stopPropagation()}
+                            onKeyDown={(e) => e.stopPropagation()}
+                          >
+                            <RowOpsMenu
+                              actions={[
+                                {
+                                  label: "Delete",
+                                  tone: "error",
+                                  divider: true,
+                                  onClick: () =>
+                                    confirmDeleteTarget({
+                                      kind: "learnedMemory",
+                                      id,
+                                      label: factText,
+                                    }),
+                                },
+                              ]}
+                              ariaLabel="Memory fact options"
+                            />
+                          </TableCell>
                         </TableRow>
                       );
                     })}
@@ -554,7 +896,47 @@ export default function MemoryPage({
           )}
         </Box>
       ) : null}
-      {memoryTab === 1 ? (
+      {memoryTab === 1
+        ? renderLearnedMemoryTable(
+            "Assistant Preferences",
+            assistantPreferences,
+            assistantPreferencesTotal,
+            "assistantPreferences",
+            assistantPreferencesQ.error,
+            "No assistant preferences yet.",
+          )
+        : null}
+      {memoryTab === 2
+        ? renderLearnedMemoryTable(
+            "Work Preferences",
+            workPreferences,
+            workPreferencesTotal,
+            "workPreferences",
+            workPreferencesQ.error,
+            "No work preferences yet.",
+          )
+        : null}
+      {memoryTab === 3
+        ? renderLearnedMemoryTable(
+            "Project / Domain Memory",
+            domainMemory,
+            domainMemoryTotal,
+            "domainMemory",
+            domainMemoryQ.error,
+            "No project or domain memory yet.",
+          )
+        : null}
+      {memoryTab === 4
+        ? renderLearnedMemoryTable(
+            "Other Memory",
+            otherMemory,
+            otherMemoryTotal,
+            "otherMemory",
+            otherMemoryQ.error,
+            "No uncategorized memory yet.",
+          )
+        : null}
+      {memoryTab === 5 ? (
         <Stack spacing={2}>
           <Box className="list-shell">
             <Typography
@@ -716,16 +1098,13 @@ export default function MemoryPage({
                                     label: "Delete",
                                     tone: "error",
                                     divider: true,
-                                    onClick: async () => {
-                                      setError(null);
-                                      try {
-                                        await deletePreferenceMutation.mutateAsync(
-                                          endpoint,
-                                        );
-                                      } catch (e) {
-                                        setError(errMessage(e));
-                                      }
-                                    },
+                                    onClick: () =>
+                                      confirmDeleteTarget({
+                                        kind: "preference",
+                                        id: key,
+                                        label: key,
+                                        endpoint,
+                                      }),
                                   },
                                 ]}
                                 ariaLabel="Preference options"
@@ -752,7 +1131,7 @@ export default function MemoryPage({
           </Box>
         </Stack>
       ) : null}
-      {memoryTab === 2 ? (
+      {memoryTab === 6 ? (
         <Stack spacing={2}>
           <Box className="list-shell">
             <Typography
@@ -940,16 +1319,12 @@ export default function MemoryPage({
                                     label: "Delete",
                                     tone: "error",
                                     divider: true,
-                                    onClick: async () => {
-                                      setError(null);
-                                      try {
-                                        await deleteUserDataMutation.mutateAsync(
-                                          id,
-                                        );
-                                      } catch (e) {
-                                        setError(errMessage(e));
-                                      }
-                                    },
+                                    onClick: () =>
+                                      confirmDeleteTarget({
+                                        kind: "userData",
+                                        id,
+                                        label: str(item.title, id),
+                                      }),
                                   },
                                 ]}
                                 ariaLabel="User data options"
@@ -976,7 +1351,7 @@ export default function MemoryPage({
           </Box>
         </Stack>
       ) : null}
-      {memoryTab === 3 ? (
+      {memoryTab === 7 ? (
         <Stack spacing={2}>
           <Box className="list-shell">
             <Typography
@@ -1220,16 +1595,12 @@ export default function MemoryPage({
                                     label: "Delete",
                                     tone: "error",
                                     divider: true,
-                                    onClick: async () => {
-                                      setError(null);
-                                      try {
-                                        await deleteKnowledgeMutation.mutateAsync(
-                                          id,
-                                        );
-                                      } catch (e) {
-                                        setError(errMessage(e));
-                                      }
-                                    },
+                                    onClick: () =>
+                                      confirmDeleteTarget({
+                                        kind: "knowledge",
+                                        id,
+                                        label: title,
+                                      }),
                                   },
                                 ]}
                                 ariaLabel="Knowledge options"
@@ -1258,18 +1629,28 @@ export default function MemoryPage({
       ) : null}
       {statsQ.error ||
       factsQ.error ||
+      assistantPreferencesQ.error ||
+      workPreferencesQ.error ||
+      domainMemoryQ.error ||
+      otherMemoryQ.error ||
       preferencesQ.error ||
       userDataQ.error ||
       knowledgeQ.error ||
+      deleteLearnedMemoryMutation.error ||
       error ? (
         <Alert severity="error">
           {error ||
             errMessage(
               statsQ.error ||
                 factsQ.error ||
+                assistantPreferencesQ.error ||
+                workPreferencesQ.error ||
+                domainMemoryQ.error ||
+                otherMemoryQ.error ||
                 preferencesQ.error ||
                 userDataQ.error ||
-                knowledgeQ.error,
+                knowledgeQ.error ||
+                deleteLearnedMemoryMutation.error,
             )}
         </Alert>
       ) : null}
@@ -1326,6 +1707,21 @@ export default function MemoryPage({
           </Stack>
         </DialogContent>
         <DialogActions>
+          <Button
+            color="error"
+            onClick={() => {
+              const id = str(selectedFact?.id, "").trim();
+              if (!id) return;
+              confirmDeleteTarget({
+                kind: "learnedMemory",
+                id,
+                label: str(selectedFact?.fact, id),
+              });
+            }}
+            disabled={!str(selectedFact?.id, "").trim()}
+          >
+            Delete
+          </Button>
           {onViewMemoryEvidence ? (
             <Button
               onClick={() => {
@@ -1505,7 +1901,63 @@ export default function MemoryPage({
           </Stack>
         </DialogContent>
         <DialogActions>
+          <Button
+            color="error"
+            onClick={() => {
+              const id = str(selectedKnowledge?.id, "").trim();
+              if (!id) return;
+              confirmDeleteTarget({
+                kind: "knowledge",
+                id,
+                label: knowledgeDisplayTitle(selectedKnowledge),
+              });
+            }}
+            disabled={!str(selectedKnowledge?.id, "").trim()}
+          >
+            Delete
+          </Button>
           <Button onClick={() => setSelectedKnowledge(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={deleteTarget != null}
+        onClose={() => {
+          if (!deleteBusy) setDeleteTarget(null);
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Delete Memory Forever?</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1}>
+            <Typography variant="body2">
+              This will permanently delete this memory from the backend.
+            </Typography>
+            <Box className="metadata-box">
+              <Typography
+                variant="body2"
+                sx={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}
+              >
+                {deleteTarget?.label || deleteTarget?.id || "Selected memory"}
+              </Typography>
+            </Box>
+            <Typography variant="caption" sx={{ color: "text.secondary" }}>
+              This action does not create a rollback entry and cannot be undone.
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={deleteBusy} onClick={() => setDeleteTarget(null)}>
+            Cancel
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            disabled={deleteBusy || !deleteTarget}
+            onClick={runConfirmedDelete}
+          >
+            Delete forever
+          </Button>
         </DialogActions>
       </Dialog>
     </WorkspacePageShell>

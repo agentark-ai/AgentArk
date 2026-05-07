@@ -243,6 +243,15 @@ const SOURCE_ORDER = [
   "llm_usage",
 ] as const;
 
+const USER_FACING_SOURCE_KINDS = new Set([
+  "conversation",
+  "orbit_chat",
+  "experience_item",
+  "procedural_pattern",
+  "app",
+  "goal",
+]);
+
 function pad(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -588,8 +597,12 @@ function narrativeLines(
     style && Math.abs(style.delta) > 0.08
       ? `${style.label.toLowerCase()} stood out compared with your recent baseline`
       : "your activity stayed close to your recent baseline";
+  const hasUserFacingFocus =
+    focusLabel !== "No activity yet" && focusLabel !== "No clear user-facing focus yet";
   return [
-    `I saw ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} in this range, with ${focusLabel.toLowerCase()} as the clearest focus.`,
+    hasUserFacingFocus
+      ? `ArkReflect grouped ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} in this range. The clearest user-facing thread is ${focusLabel.toLowerCase()}.`
+      : `ArkReflect grouped ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} in this range, but the strongest signals are background or not actionable enough to promote.`,
     `${styleText}.`,
     `AgentArk also captured ${learnedCount} learned signal${learnedCount === 1 ? "" : "s"} and ${backgroundCount} background event${backgroundCount === 1 ? "" : "s"}.`,
     recurringCount > 0
@@ -652,6 +665,24 @@ function dominantSource(cluster: ReflectCluster): string {
     counts.set(unit.source_kind, (counts.get(unit.source_kind) ?? 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "work";
+}
+
+function isUserFacingSource(source: string): boolean {
+  return USER_FACING_SOURCE_KINDS.has(source);
+}
+
+function clusterHasUserFacingSignal(cluster: ReflectCluster): boolean {
+  return cluster.units.some((unit) => isUserFacingSource(unit.source_kind));
+}
+
+function followupHasSourceEvidence(item: ReflectSuggestedFollowup): boolean {
+  return Boolean(item.latest_summary?.trim()) || item.search_results.length > 0;
+}
+
+function isDisplayableOpportunity(item: ReflectSuggestedFollowup): boolean {
+  if (item.kind === "recovery_advice") return true;
+  if (item.kind === "latest_developments") return followupHasSourceEvidence(item);
+  return false;
 }
 
 function hexToHsl(hex: string): { h: number; s: number; l: number } | null {
@@ -1317,11 +1348,14 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   }, [queryClient, reflectQueryKey, suggestedFollowups]);
 
   const totalUnits = allUnits.length;
-  const strongestCluster = clusters[0] ?? null;
   const embeddingCoverage =
     response && response.embedding_status.total_units > 0
       ? response.embedding_status.embedded_units / response.embedding_status.total_units
       : 0;
+  const strongestUserCluster = useMemo(
+    () => clusters.find((cluster) => clusterHasUserFacingSignal(cluster)) ?? null,
+    [clusters],
+  );
 
   const rangeLabel = formatUiDateRange(response?.from || fromIso, response?.to || toIso);
   const status = quietStatus(response, reflectQ.isFetching, refreshMutation.isPending);
@@ -1329,9 +1363,11 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   const todayDigestDetail = digestStatusDetail(todayResponse, todayQ.isFetching);
   const todayMeaningful = meaningfulForSourceCounts(todayResponse?.source_counts);
   const todayTotal = totalForSourceCounts(todayResponse?.source_counts);
-  const focusLabel = strongestCluster
-    ? clusterTopicTitle(strongestCluster)
-    : "No activity yet";
+  const focusLabel = strongestUserCluster
+    ? clusterTopicTitle(strongestUserCluster)
+    : totalUnits > 0
+      ? "No clear user-facing focus yet"
+      : "No activity yet";
   const recurringCount = clusters.filter((cluster) => cluster.related_history.mode === "recurring").length;
   const sourceRows = useMemo(
     () =>
@@ -1719,13 +1755,14 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   const showWeeklyReplay = replayUnits.length >= 3;
   const recoveryFollowups = suggestedFollowups.filter((item) => item.kind === "recovery_advice");
   const latestFollowups = suggestedFollowups.filter((item) => item.kind === "latest_developments");
+  const sourceBackedLatestFollowups = latestFollowups.filter(followupHasSourceEvidence);
+  const opportunityFollowups = suggestedFollowups.filter(isDisplayableOpportunity);
   const selectedFollowup =
-    suggestedFollowups.find((item) => item.id === selectedFollowupId) ?? null;
+    opportunityFollowups.find((item) => item.id === selectedFollowupId) ?? null;
   const latestSourceCount = latestFollowups.reduce((sum, item) => sum + item.search_results.length, 0);
-  const latestReadyCount = latestFollowups.filter((item) => item.status === "ready").length;
+  const latestReadyCount = sourceBackedLatestFollowups.filter((item) => item.status === "ready").length;
   const latestQueuedCount = latestFollowups.filter((item) => item.status === "queued").length;
-  const latestFailedCount = latestFollowups.filter((item) => item.status === "failed").length;
-  const opportunityFollowups = suggestedFollowups;
+  const latestFailedCount = latestFollowups.filter((item) => item.status === "failed" && followupHasSourceEvidence(item)).length;
   const opportunityPageCount = Math.max(1, Math.ceil(opportunityFollowups.length / OPPORTUNITY_PAGE_SIZE));
   const visibleOpportunityFollowups = opportunityFollowups.slice(
     opportunityPage * OPPORTUNITY_PAGE_SIZE,
@@ -1783,9 +1820,9 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   );
   useEffect(() => {
     if (!selectedFollowupId) return;
-    if (suggestedFollowups.some((item) => item.id === selectedFollowupId)) return;
+    if (opportunityFollowups.some((item) => item.id === selectedFollowupId)) return;
     setSelectedFollowupId(null);
-  }, [suggestedFollowups, selectedFollowupId]);
+  }, [opportunityFollowups, selectedFollowupId]);
   useEffect(() => {
     if (topicPage < topicPageCount) return;
     setTopicPage(Math.max(0, topicPageCount - 1));
@@ -1815,7 +1852,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   const hasGroupingStatus =
     (response?.embedding_status.total_units ?? 0) > 0 ||
     Boolean(response?.embedding_status.detail);
-  const hasStudioSide = hasTodayStatus || suggestedFollowups.length > 0 || hasGroupingStatus;
+  const hasStudioSide = hasTodayStatus || opportunityFollowups.length > 0 || hasGroupingStatus;
   const whatWentWrong =
     response?.refresh_status.last_error ||
     recoveryFollowups[0]?.detail ||
@@ -1869,8 +1906,8 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     ...(topClusters.length > 0
       ? [{ value: "topics" as const, label: "Topics", short: "Topics", count: topicRows.length }]
       : []),
-    ...(suggestedFollowups.length > 0
-      ? [{ value: "latest" as const, label: "Opportunities", short: "Opportunities", count: suggestedFollowups.length }]
+    ...(opportunityFollowups.length > 0
+      ? [{ value: "latest" as const, label: "Opportunities", short: "Opportunities", count: opportunityFollowups.length }]
       : []),
     ...(showWeeklyReplay
       ? [{ value: "timeline" as const, label: "Timeline", short: "Timeline", count: replayUnits.length }]
@@ -1912,7 +1949,9 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     const focusTitle =
       focusLabel === "No activity yet"
         ? "ArkReflect is waiting for a clear focus."
-        : `Reflected focus: ${focusLabel}`;
+        : focusLabel === "No clear user-facing focus yet"
+          ? "No user-facing focus yet"
+          : `User-facing focus: ${focusLabel}`;
 
     return (
       <Stack spacing={1.4}>
@@ -1930,7 +1969,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             sx={{ alignItems: { xs: "flex-start", md: "center" }, justifyContent: "space-between" }}
           >
             <Box sx={{ minWidth: 0 }}>
-              <Typography sx={labelSx}>Decision recap</Typography>
+              <Typography sx={labelSx}>Reflection summary</Typography>
               <Typography sx={{ ...titleSx, fontSize: { xs: "1.45rem", md: "2rem" }, mt: 0.45 }}>
                 {focusTitle}
               </Typography>
@@ -1953,11 +1992,11 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                 clickable
                 onClick={() => setStoryTab("topics")}
               />
-              {suggestedFollowups.length > 0 ? (
+              {opportunityFollowups.length > 0 ? (
                 <Chip
                   className="arkreflect-pill"
                   icon={<SearchRoundedIcon />}
-                  label={`${suggestedFollowups.length} opportunities`}
+                  label={`${opportunityFollowups.length} opportunities`}
                   clickable
                   onClick={() => setStoryTab("latest")}
                 />
@@ -2051,7 +2090,11 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                 <Box>
                   <Typography sx={labelSx}>Plain-language recap</Typography>
                   <Typography sx={{ ...titleSx, fontSize: { xs: "1.25rem", md: "1.55rem" }, mt: 0.45 }}>
-                    {focusLabel === "No activity yet" ? "Waiting for a useful story." : focusLabel}
+                    {focusLabel === "No activity yet"
+                      ? "Waiting for a useful story."
+                      : focusLabel === "No clear user-facing focus yet"
+                        ? "No user-facing focus yet"
+                        : focusLabel}
                   </Typography>
                 </Box>
                 <Typography variant="caption" sx={{ alignSelf: { md: "end" } }}>
@@ -2114,23 +2157,23 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                   </Stack>
                 </Box>
               ) : null}
-              {suggestedFollowups.length > 0 ? (
+              {opportunityFollowups.length > 0 ? (
                 <Box sx={{ ...panelSx, p: 1.35 }}>
                   <Typography sx={labelSx}>Next useful action</Typography>
                   <Typography sx={{ ...titleSx, fontSize: "1.35rem", mt: 0.55 }}>
-                    {suggestedFollowups.length}
+                    {opportunityFollowups.length}
                   </Typography>
                   <Typography sx={{ ...bodySx, mt: 0.65 }}>
-                    {suggestedFollowups[0].title}
+                    {opportunityFollowups[0].title}
                   </Typography>
                   <Button
                     size="small"
                     variant="outlined"
                     startIcon={<PlayArrowRoundedIcon />}
-                    onClick={() => openFollowupInChat(suggestedFollowups[0])}
+                    onClick={() => openFollowupInChat(opportunityFollowups[0])}
                     sx={{ mt: 1, borderRadius: "8px" }}
                   >
-                    {followupActionLabel(suggestedFollowups[0].kind)}
+                    {followupActionLabel(opportunityFollowups[0].kind)}
                   </Button>
                 </Box>
               ) : null}
@@ -2261,8 +2304,8 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             </Box>
             <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
               <Chip className="arkreflect-pill" icon={<TaskAltRoundedIcon />} label={`${opportunityFollowups.length} item${opportunityFollowups.length === 1 ? "" : "s"}`} />
-              {latestFollowups.length > 0 ? (
-                <Chip className="arkreflect-pill" icon={<SearchRoundedIcon />} label={`${latestSourceCount || latestFollowups.length} source-backed`} />
+              {sourceBackedLatestFollowups.length > 0 ? (
+                <Chip className="arkreflect-pill" icon={<SearchRoundedIcon />} label={`${latestSourceCount || sourceBackedLatestFollowups.length} source-backed`} />
               ) : null}
               {latestQueuedCount > 0 ? <Chip size="small" variant="outlined" label={`${latestQueuedCount} checking`} /> : null}
               {latestReadyCount > 0 ? <Chip size="small" variant="outlined" label={`${latestReadyCount} ready`} /> : null}

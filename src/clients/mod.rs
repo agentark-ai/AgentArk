@@ -7,7 +7,7 @@ use std::net::IpAddr;
 
 pub use executor_client::{
     AppLifecycleRequest, AppStatusResponse, CodeExecuteFilePayload, CodeExecuteRequest,
-    ExecutorClient, ExecutorClientConfig,
+    ExecutorClient, ExecutorClientConfig, StackMemoryStatsResponse,
 };
 pub(crate) use internal_auth::{
     describe_internal_service_tokens, load_internal_service_token_from_default_config_dir,

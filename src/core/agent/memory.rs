@@ -295,6 +295,45 @@ mod saved_memory_sensitivity_tests {
     }
 
     #[test]
+    fn learned_memory_sanitizer_keeps_semantic_key_out_of_secret_scan() {
+        let sanitized = sanitize_learned_user_memory_content_for_storage(
+            "friend_best_friend_cs_teammate_9_years",
+            "Alex had a best friend of nine years and they played Counter-Strike together.",
+        )
+        .expect("semantic memory keys must not make prose values look secret");
+
+        assert_eq!(
+            sanitized.value,
+            "Alex had a best friend of nine years and they played Counter-Strike together."
+        );
+        assert_eq!(
+            sanitized.content,
+            "friend_best_friend_cs_teammate_9_years: Alex had a best friend of nine years and they played Counter-Strike together."
+        );
+        assert!(!sanitized.redacted_secret);
+    }
+
+    #[test]
+    fn learned_memory_sanitizer_rejects_secret_only_values() {
+        assert!(sanitize_learned_user_memory_content_for_storage(
+            "friend_best_friend_cs_teammate_9_years",
+            "2skdjfkj2wlfrj23kr2rlm"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn memory_operation_candidates_do_not_use_capture_event_as_pattern_fk() {
+        let mut operation = memory_operation_with_type("add");
+        operation.capture_event_id = Some("memory-capture-123".to_string());
+
+        assert_eq!(
+            memory_operation_learning_candidate_pattern_id(&operation),
+            None
+        );
+    }
+
+    #[test]
     fn merged_phrasing_history_is_bounded_and_normalized() {
         let mut metadata = serde_json::Map::new();
         for index in 0..(crate::core::memory_dedup::MAX_MERGED_PHRASINGS + 2) {
@@ -564,45 +603,13 @@ pub(super) fn sanitize_learned_user_memory_content_for_storage(
     key: &str,
     raw_value: &str,
 ) -> Option<SanitizedUserMemoryContent> {
-    let mut value = normalize_user_memory_text(raw_value, 320)?;
-    let structural = redact_structural_opaque_tokens(&value);
-    if structural.mostly_secret {
-        return None;
-    }
-    let mut redacted_secret = structural.redacted_secret;
-    value = structural.text;
-    if user_memory_is_mostly_redaction_marker_payload(&value) {
-        return None;
-    }
-    if user_memory_contains_redaction_marker(&value) {
-        redacted_secret = true;
-    }
-
+    let sanitized_value = sanitize_user_memory_metadata_text_for_storage(raw_value, 320)?;
+    let value = sanitized_value.text;
     let content = format!("{}: {}", key, value);
-    let redaction = crate::security::redact_secret_input(&content);
-    if !redaction.had_secret() {
-        return Some(SanitizedUserMemoryContent {
-            value,
-            content,
-            redacted_secret,
-        });
-    }
-    if redaction.is_mostly_secret_payload() {
-        return None;
-    }
-
-    let prefix = format!("{}: ", key);
-    let redacted_value = redaction
-        .text
-        .strip_prefix(&prefix)
-        .and_then(|raw| normalize_user_memory_text(raw, 320))?;
-    if user_memory_is_mostly_redaction_marker_payload(&redacted_value) {
-        return None;
-    }
     Some(SanitizedUserMemoryContent {
-        content: format!("{}: {}", key, redacted_value),
-        value: redacted_value,
-        redacted_secret: true,
+        value,
+        content,
+        redacted_secret: sanitized_value.redacted_secret,
     })
 }
 
@@ -794,7 +801,13 @@ pub(super) fn normalize_self_memory_lookup_kind(raw: Option<&str>) -> &'static s
         "identity" | "name" | "identity_or_name" => "identity",
         "location" | "address" | "home" | "residence" => "location",
         "timezone" | "time_zone" | "tz" => "timezone",
+        "relationship" => "relationship",
         "preference" | "preferences" | "taste" | "language" | "tone" => "preference",
+        "assistant_preference" => "assistant_preference",
+        "work_preference" => "work_preference",
+        "project_domain_memory" | "domain_memory" => "project_domain_memory",
+        "ephemeral_context" => "ephemeral_context",
+        "knowledge" => "knowledge",
         "constraint" | "rule" | "workflow_constraint" => "constraint",
         "contact" | "email" | "phone" => "contact",
         "" | "any" | "all" | "profile" | "memory" => "any",
@@ -845,6 +858,26 @@ pub(super) fn learned_user_memory_semantic_kind(
     }
     key.map(infer_self_memory_kind_from_internal_key)
         .unwrap_or("other")
+}
+
+pub(super) fn normalize_learned_user_memory_category(
+    raw_category: Option<&str>,
+    semantic_kind: Option<&str>,
+) -> &'static str {
+    crate::core::memory_schema::normalize_memory_category(raw_category, semantic_kind)
+}
+
+pub(super) fn learned_user_memory_category(
+    item: &crate::storage::experience_item::Model,
+) -> &'static str {
+    let semantic_kind = learned_user_memory_lookup_kind(item);
+    crate::core::memory_schema::memory_category_from_metadata(&item.metadata, Some(semantic_kind))
+}
+
+pub(super) fn learned_user_memory_topics(
+    item: &crate::storage::experience_item::Model,
+) -> Vec<String> {
+    crate::core::memory_schema::normalize_memory_topics(item.metadata.get("topics"), 8)
 }
 
 pub(super) fn learned_user_memory_matches_exact_scope(
@@ -969,18 +1002,105 @@ pub(super) fn should_inject_learned_user_memory(
         && saved_memory_is_prompt_safe(learned_user_memory_sensitivity(item))
 }
 
-async fn build_saved_user_facts_context_from_storage(
-    storage: &crate::storage::Storage,
+#[derive(Debug, Clone)]
+struct SavedUserMemoryPromptCandidate {
+    line: String,
+    category: &'static str,
+    score: f32,
+    scope_rank: u8,
+    confidence: f64,
+    support_count: i32,
+    updated_at: String,
+}
+
+fn saved_user_memory_scope_rank(
+    item: &crate::storage::experience_item::Model,
     project_id: Option<&str>,
     conversation_id: Option<&str>,
+) -> u8 {
+    let mut rank = 0u8;
+    if project_id.is_some() && item.project_id.as_deref() == project_id {
+        rank = rank.saturating_add(1);
+    }
+    if conversation_id.is_some() && item.conversation_id.as_deref() == conversation_id {
+        rank = rank.saturating_add(2);
+    }
+    rank
+}
+
+fn saved_user_memory_is_context_scoped(
+    item: &crate::storage::experience_item::Model,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+) -> bool {
+    saved_user_memory_scope_rank(item, project_id, conversation_id) > 0
+}
+
+fn saved_user_memory_dense_score(
+    query_embedding: Option<&PgVector>,
+    item: &crate::storage::experience_item::Model,
+) -> Option<f32> {
+    crate::core::document_search::normalized_embedding_similarity(
+        query_embedding?.as_slice(),
+        item.embedding.as_ref()?.as_slice(),
+    )
+    .map(|score| score.clamp(0.0, 1.0))
+}
+
+fn saved_user_memory_candidate(
+    item: &crate::storage::experience_item::Model,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    query_embedding: Option<&PgVector>,
+) -> Option<SavedUserMemoryPromptCandidate> {
+    if !should_inject_learned_user_memory(item, now) {
+        return None;
+    }
+    let category = learned_user_memory_category(item);
+    let scope_rank = saved_user_memory_scope_rank(item, project_id, conversation_id);
+    if crate::core::memory_schema::memory_category_is_ephemeral(category)
+        && !saved_user_memory_is_context_scoped(item, project_id, conversation_id)
+    {
+        return None;
+    }
+    let dense_score = saved_user_memory_dense_score(query_embedding, item);
+    if crate::core::memory_schema::memory_category_requires_topical_relevance(category)
+        && scope_rank == 0
+        && dense_score.unwrap_or(0.0) < 0.42
+    {
+        return None;
+    }
+    let line = format_learned_user_memory_for_prompt(item, now)?;
+    let score = (0.38 * dense_score.unwrap_or(0.0))
+        + (0.18 * (scope_rank as f32 / 3.0))
+        + (0.26 * item.confidence.clamp(0.0, 1.0) as f32)
+        + (0.10 * ((item.support_count.max(0) as f32) / 6.0).min(1.0));
+    Some(SavedUserMemoryPromptCandidate {
+        line,
+        category,
+        score,
+        scope_rank,
+        confidence: item.confidence,
+        support_count: item.support_count,
+        updated_at: item.updated_at.clone(),
+    })
+}
+
+async fn build_saved_user_facts_context_from_storage(
+    storage: &crate::storage::Storage,
+    embedding_client: Option<&EmbeddingClient>,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+    current_message: &str,
 ) -> Option<String> {
     let now = chrono::Utc::now();
-    let mut learned_items = storage
+    let learned_items = storage
         .list_active_experience_items(
             SAVED_USER_FACT_PROMPT_KINDS,
             project_id,
             conversation_id,
-            20,
+            80,
         )
         .await
         .unwrap_or_default();
@@ -994,17 +1114,62 @@ async fn build_saved_user_facts_context_from_storage(
             tracing::warn!("Failed to expire learned user memory '{}': {}", id, error);
         }
     }
-    learned_items.retain(|item| should_inject_learned_user_memory(item, now));
-    let lines = learned_items
+    let query_embedding = match embedding_client {
+        Some(embedder) => {
+            let query = crate::security::redact_secret_input(current_message).text;
+            let query = query.trim();
+            if query.is_empty() {
+                None
+            } else {
+                embedder
+                    .embed_texts(&[safe_truncate(query, 1_200)])
+                    .await
+                    .ok()
+                    .and_then(|mut embeddings| embeddings.pop())
+            }
+        }
+        None => None,
+    };
+    let mut candidates = learned_items
         .iter()
-        .filter_map(|item| format_learned_user_memory_for_prompt(item, now))
-        .take(8)
+        .filter_map(|item| {
+            saved_user_memory_candidate(
+                item,
+                project_id,
+                conversation_id,
+                now,
+                query_embedding.as_ref(),
+            )
+        })
         .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| right.scope_rank.cmp(&left.scope_rank))
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+            .then_with(|| right.support_count.cmp(&left.support_count))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
+    let mut category_counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut lines = Vec::new();
+    for candidate in candidates {
+        let cap = crate::core::memory_schema::memory_category_prompt_cap(candidate.category);
+        let count = category_counts.entry(candidate.category).or_insert(0);
+        if *count >= cap {
+            continue;
+        }
+        *count += 1;
+        lines.push(candidate.line);
+        if lines.len() >= 8 {
+            break;
+        }
+    }
     if lines.is_empty() {
         None
     } else {
         Some(format!(
-            "## Saved User Facts\nThese are saved facts or operating constraints the user previously shared. Use active temporary memories only within their validity window, and use private memories only when they are relevant to the current user need.\n{}",
+            "## Saved User Memory\nThese are the top relevant saved memories after category caps. Profile facts and assistant preferences may be generally reusable; work, project/domain, knowledge, and ephemeral memories are included only when scoped or semantically relevant. Use active temporary memories only within their validity window.\n{}",
             lines.join("\n")
         ))
     }
@@ -1034,7 +1199,7 @@ pub(super) fn build_user_memory_capture_prompt(
     response_shape: &str,
 ) -> String {
     format!(
-        "Current time:\n{time_context}\n\nRecent dialogue:\n{recent_dialogue}\n\nUser message:\n{message}\n\nCurrent saved user facts:\n{saved_facts}\n\nReturn JSON only with this shape:\n{response_shape}\n\nRules:\n- Always return the full JSON object with both `memories` and `retractions` keys present as arrays. Use empty arrays when nothing applies. Never omit either key and never return `{{}}` or any abbreviated shape.\n- Extract only memories that are useful beyond this turn and beyond any task/session/work item created by this turn: user facts, stable preferences, reusable operating constraints, or durable cross-context workflow rules.\n- Decide semantically from the message and dialogue. Do not use fixed phrases, keyword matching, regular expressions, or literal wording patterns.\n- Treat the message compositionally. A single user message can contain both durable user information and a live question, request, clarification, follow-up, or correction.\n- Capture durable self-information even when the same message also asks for help, asks a question, or contains multiple clauses or intents.\n- If recent dialogue shows the assistant was missing a user fact and the current message supplies that fact, capture the supplied fact even when the message immediately continues with another request.\n- Classify each memory with sensitivity. Use prompt_safe for ordinary preferences and operating style, personal_identifier for identity/contact/location facts, sensitive for private health, finance, legal, relationship, belief, or similarly private facts, and crisis_sensitive for acute distress, self-harm risk, unsafe-place, immediate safety, or coping facts.\n- Sensitive and crisis_sensitive self-memory should still be captured when it is useful beyond this turn; sensitivity controls later prompt injection, not whether the memory may exist.\n- If the user's intent is to stop retaining a previously stored fact, preference, or constraint, emit a retraction for the matching semantic memory instead of a new memory.\n- Do not let interrogative wording, mixed intents, corrections, or extra context suppress a durable memory action the user just expressed.\n- Prefer stable key naming so corrected or updated facts replace stale versions instead of forking into near-duplicate keys.\n- Permanent memories have no expiry unless later contradicted, retracted, or superseded.\n- Temporary memories must include a concrete expires_at when the message gives or strongly implies a time window.\n- Situational memories are useful now but have an uncertain end; include review_at when a later review is appropriate.\n- Use global scope only for information that is generally reusable; task-specific configuration, schedule details, watcher conditions, notification channels for a specific object, execution status, retries, pending setup, and tool-operation state belong to the relevant task/session/work item, not ArkMemory.\n- Set looks_sensitive=true only when the candidate is credential-like, token-like, password/private-key/auth material, or otherwise unsafe to store even as private personal memory; do not use looks_sensitive for ordinary private self-memory, health, distress, identity, or location facts.\n- If looks_sensitive=true, include a concise sensitive_reason and do not rely on redaction markers as useful memory content.\n- Do not capture one-off requests, tool output, transient errors, unsupported guesses, operational setup details, pending/retry status, object-specific task/session/watcher configuration, or sensitive credential material as memories.\n- It is okay to return empty memories and/or retractions arrays, but the keys themselves must be present.\n- Do not invent facts beyond the user message, recent dialogue, current time, or current saved facts.",
+        "Current time:\n{time_context}\n\nRecent dialogue:\n{recent_dialogue}\n\nUser message:\n{message}\n\nCurrent saved user facts:\n{saved_facts}\n\nReturn JSON only with this shape:\n{response_shape}\n\nRules:\n- Always return the full JSON object with both `memories` and `retractions` keys present as arrays. Use empty arrays when nothing applies. Never omit either key and never return `{{}}` or any abbreviated shape.\n- Extract only memories that are useful beyond this turn and beyond any task/session/work item created by this turn: profile facts, assistant preferences, work preferences, reusable project/domain memory, reusable knowledge, or durable cross-context workflow rules.\n- Decide semantically from the message and dialogue. Do not use fixed phrases, keyword matching, regular expressions, literal wording patterns, or manually predicted variants of what the user might say.\n- Classify every memory into exactly one category: profile_fact for identity, location, contact, job, relationships, and stable user details; assistant_preference for how the assistant should address, format, phrase, or interact with the user; work_preference for the user's durable analysis, source, modeling, coding, review, or workflow preferences; project_domain_memory for durable facts, assumptions, principles, and constraints that should only be reused when the current topic or project is semantically related; ephemeral_context for short-lived context that is useful only in the current conversation; knowledge for reusable non-personal knowledge.\n- Add concise `topics` for topical memories so retrieval can use semantic relevance instead of injecting every memory into every prompt. Topics must describe meaning, domain, project, or task family, not surface wording.\n- Do not store every interesting claim. For work_preference and project_domain_memory, save only explicit user preferences, durable reusable principles, or high-confidence recurring patterns, not one-off analysis details.\n- Treat the message compositionally. A single user message can contain both durable user information and a live question, request, clarification, follow-up, or correction.\n- Capture durable self-information even when the same message also asks for help, asks a question, or contains multiple clauses or intents.\n- If recent dialogue shows the assistant was missing a user fact and the current message supplies that fact, capture the supplied fact even when the message immediately continues with another request.\n- Classify each memory with sensitivity. Use prompt_safe for ordinary preferences and operating style, personal_identifier for identity/contact/location facts, sensitive for private health, finance, legal, relationship, belief, or similarly private facts, and crisis_sensitive for acute distress, self-harm risk, unsafe-place, immediate safety, or coping facts.\n- Sensitive and crisis_sensitive self-memory should still be captured when it is useful beyond this turn; sensitivity controls later prompt injection, not whether the memory may exist.\n- If the user's intent is to stop retaining a previously stored fact, preference, or constraint, emit a retraction for the matching semantic memory instead of a new memory.\n- Do not let interrogative wording, mixed intents, corrections, or extra context suppress a durable memory action the user just expressed.\n- Prefer stable semantic key naming so corrected or updated facts replace stale versions instead of forking into near-duplicate keys.\n- Permanent memories have no expiry unless later contradicted, retracted, or superseded.\n- Temporary memories must include a concrete expires_at when the message gives or strongly implies a time window.\n- Situational memories are useful now but have an uncertain end; include review_at when a later review is appropriate.\n- Use global scope only for information that is generally reusable; topic-specific domain memory should usually be project or conversation scoped when a project/conversation owns it, and otherwise must include topics.\n- Task-specific configuration, schedule details, watcher conditions, notification channels for a specific object, execution status, retries, pending setup, and tool-operation state belong to the relevant task/session/work item, not ArkMemory.\n- Set looks_sensitive=true only when the candidate is credential-like, token-like, password/private-key/auth material, or otherwise unsafe to store even as private personal memory; do not use looks_sensitive for ordinary private self-memory, health, distress, identity, or location facts.\n- If looks_sensitive=true, include a concise sensitive_reason and do not rely on redaction markers as useful memory content.\n- Do not capture one-off requests, tool output, transient errors, unsupported guesses, operational setup details, pending/retry status, object-specific task/session/watcher configuration, or sensitive credential material as memories.\n- It is okay to return empty memories and/or retractions arrays, but the keys themselves must be present.\n- Do not invent facts beyond the user message, recent dialogue, current time, or current saved facts.",
         time_context = time_context,
         recent_dialogue = recent_dialogue,
         message = message,
@@ -1532,6 +1697,14 @@ pub(super) fn user_memory_operation_candidate_type(operation_type: &str) -> &'st
     }
 }
 
+pub(super) fn memory_operation_learning_candidate_pattern_id(
+    _operation: &crate::storage::memory_operation::Model,
+) -> Option<String> {
+    // learning_candidates.pattern_id is reserved for procedural_patterns.id.
+    // Memory operation provenance is stored in evidence_refs/proposed_content.
+    None
+}
+
 pub(super) fn user_memory_operation_scope_explicit(
     operation: &crate::storage::memory_operation::Model,
 ) -> bool {
@@ -1650,6 +1823,14 @@ pub(super) fn format_learned_user_memory_for_prompt(
         .and_then(|value| normalize_user_memory_text(value, 32))
         .unwrap_or_else(|| "permanent".to_string());
     let mut qualifiers = vec![label.to_string(), durability];
+    qualifiers.push(
+        crate::core::memory_schema::memory_category_label(learned_user_memory_category(item))
+            .to_string(),
+    );
+    let topics = learned_user_memory_topics(item);
+    if !topics.is_empty() {
+        qualifiers.push(format!("topics: {}", topics.join(", ")));
+    }
     if let Some(expires_at) = ambient_metadata_datetime_field(item, "expires_at") {
         qualifiers.push(format!("valid until {}", expires_at.to_rfc3339()));
     }
@@ -1911,12 +2092,13 @@ impl UserMemoryCaptureWorker {
     pub(super) async fn capture_user_memory_hints(
         &self,
         message: &str,
+        user_message: &str,
         channel: &str,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
         source_message_id: Option<&str>,
     ) {
-        self.capture_user_links_as_user_data(message, channel, conversation_id, project_id)
+        self.capture_user_links_as_user_data(user_message, channel, conversation_id, project_id)
             .await;
         self.capture_user_facts_with_llm(
             message,
@@ -1935,7 +2117,7 @@ impl UserMemoryCaptureWorker {
         conversation_id: Option<&str>,
         project_id: Option<&str>,
     ) {
-        let urls = extract_http_urls(message);
+        let urls = extract_user_supplied_link_user_data_urls(message);
         if urls.is_empty() {
             return;
         }
@@ -2022,6 +2204,7 @@ impl UserMemoryCaptureWorker {
                 Some(serde_json::json!({
                     "id": item.id.clone(),
                     "kind": learned_user_memory_lookup_kind(item),
+                    "category": learned_user_memory_category(item),
                     "content": learned_user_memory_value(item)?,
                     "scope": item.scope.clone(),
                 }))
@@ -2033,6 +2216,7 @@ impl UserMemoryCaptureWorker {
         let payload = serde_json::json!({
             "candidate": {
                 "kind": semantic_kind,
+                "category": crate::core::memory_schema::normalize_memory_category(None, Some(semantic_kind)),
                 "content": safe_truncate(value, 320),
             },
             "existing_memories": existing,
@@ -2152,6 +2336,7 @@ impl UserMemoryCaptureWorker {
                 "candidate": {
                     "key": key,
                     "kind": semantic_kind,
+                    "category": crate::core::memory_schema::normalize_memory_category(None, Some(semantic_kind)),
                     "durability": durability,
                     "scope": scope,
                     "content": safe_truncate(&candidate_content, 320),
@@ -2160,6 +2345,7 @@ impl UserMemoryCaptureWorker {
                     "id": item.id.clone(),
                     "key": existing_key,
                     "kind": learned_user_memory_lookup_kind(&item),
+                    "category": learned_user_memory_category(&item),
                     "durability": learned_user_memory_durability(&item),
                     "scope": item.scope.clone(),
                     "content": safe_truncate(&existing_value, 320),
@@ -2355,7 +2541,7 @@ impl UserMemoryCaptureWorker {
             .map(|value| value.text)
             .unwrap_or_else(|| "## Saved User Facts\n[REDACTED_SECRET]".to_string());
         let time_context = self.build_ambient_time_context().await;
-        let response_shape = r#"{"memories":[{"key":"stable_snake_case_semantic_key","value":"self-contained memory text","kind":"identity|preference|location|workflow|constraint|personal_fact|other","durability":"permanent|temporary|situational","scope":"global|project|conversation","sensitivity":"prompt_safe|personal_identifier|sensitive|crisis_sensitive","valid_from":"RFC3339 UTC timestamp or null","expires_at":"RFC3339 UTC timestamp or null","review_at":"RFC3339 UTC timestamp or null","confidence":0.95,"reason":"brief semantic rationale","looks_sensitive":false,"sensitive_reason":"brief reason or empty"}],"retractions":[{"key":"stable_snake_case_semantic_key","kind":"identity|preference|location|workflow|constraint|personal_fact|other or null","scope":"global|project|conversation","confidence":0.95,"reason":"brief semantic rationale"}]}"#;
+        let response_shape = r#"{"memories":[{"key":"stable_snake_case_semantic_key","value":"self-contained memory text","category":"profile_fact|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|other","topics":["semantic_topic_or_domain"],"kind":"identity|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|preference|location|workflow|constraint|personal_fact|other","durability":"permanent|temporary|situational","scope":"global|project|conversation","sensitivity":"prompt_safe|personal_identifier|sensitive|crisis_sensitive","valid_from":"RFC3339 UTC timestamp or null","expires_at":"RFC3339 UTC timestamp or null","review_at":"RFC3339 UTC timestamp or null","confidence":0.95,"reason":"brief semantic rationale","looks_sensitive":false,"sensitive_reason":"brief reason or empty"}],"retractions":[{"key":"stable_snake_case_semantic_key","kind":"identity|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|preference|location|workflow|constraint|personal_fact|other or null","scope":"global|project|conversation","confidence":0.95,"reason":"brief semantic rationale"}]}"#;
         let prompt = build_user_memory_capture_prompt(
             &time_context,
             &recent_dialogue,
@@ -2658,7 +2844,7 @@ impl UserMemoryCaptureWorker {
             {
                 continue;
             }
-            let scope =
+            let mut scope =
                 normalize_user_memory_scope(item.get("scope").and_then(|value| value.as_str()))
                     .to_string();
             if !seen.insert((
@@ -2688,6 +2874,23 @@ impl UserMemoryCaptureWorker {
             let sensitivity =
                 user_memory_capture_item_sensitivity(item, &key, &value, Some(&raw_kind));
             let semantic_kind = learned_user_memory_semantic_kind(Some(&key), Some(&raw_kind));
+            let category = normalize_learned_user_memory_category(
+                item.get("category").and_then(|value| value.as_str()),
+                Some(semantic_kind),
+            )
+            .to_string();
+            let topics = crate::core::memory_schema::normalize_memory_topics(item.get("topics"), 8);
+            if crate::core::memory_schema::memory_category_is_ephemeral(&category) {
+                if scope == "global" {
+                    scope = "conversation".to_string();
+                }
+                if durability == "permanent" {
+                    durability = "situational".to_string();
+                }
+                if expires_at.is_none() && review_at.is_none() {
+                    expires_at = Some(capture_now + chrono::Duration::days(7));
+                }
+            }
             let (resolved_scope, resolved_project_id, resolved_conversation_id) =
                 learned_user_memory_scope_ids(Some(&scope), project_id, conversation_id);
             let (exact_target_memory_id, _) = learned_user_memory_keys(
@@ -2759,6 +2962,20 @@ impl UserMemoryCaptureWorker {
                 object.insert(
                     "sensitivity".to_string(),
                     serde_json::Value::String(sensitivity.as_str().to_string()),
+                );
+                object.insert(
+                    "memory_category".to_string(),
+                    serde_json::Value::String(category.clone()),
+                );
+                object.insert(
+                    "topics".to_string(),
+                    serde_json::Value::Array(
+                        topics
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
                 );
             }
             let now = chrono::Utc::now().to_rfc3339();
@@ -2942,7 +3159,7 @@ impl UserMemoryCaptureWorker {
             summary: operation.rationale.clone(),
             project_id: operation.project_id.clone(),
             conversation_id: operation.conversation_id.clone(),
-            pattern_id: operation.capture_event_id.clone(),
+            pattern_id: memory_operation_learning_candidate_pattern_id(operation),
             evidence_refs: operation.evidence_refs.clone(),
             proposed_content: serde_json::json!({
                 "operation_id": operation.id.clone(),
@@ -2953,6 +3170,8 @@ impl UserMemoryCaptureWorker {
                 "key": operation.key.clone(),
                 "value": operation.value.clone(),
                 "memory_kind": operation.memory_kind.clone(),
+                "memory_category": operation.model_metadata.get("memory_category").cloned(),
+                "topics": operation.model_metadata.get("topics").cloned(),
                 "durability": operation.durability.clone(),
                 "scope": operation.scope.clone(),
                 "confidence": operation.confidence,
@@ -3066,6 +3285,10 @@ impl UserMemoryCaptureWorker {
                         .ok_or_else(|| anyhow::anyhow!("Memory operation is missing value."))?;
                     let explicit_target_memory_id =
                         memory_operation_explicit_upsert_target_id(operation);
+                    let operation_topics = crate::core::memory_schema::normalize_memory_topics(
+                        operation.model_metadata.get("topics"),
+                        8,
+                    );
                     let memory_id = self
                         .upsert_learned_user_memory(
                             key,
@@ -3095,6 +3318,11 @@ impl UserMemoryCaptureWorker {
                                 .model_metadata
                                 .get("sensitivity")
                                 .and_then(|value| value.as_str()),
+                            operation
+                                .model_metadata
+                                .get("memory_category")
+                                .and_then(|value| value.as_str()),
+                            &operation_topics,
                             explicit_target_memory_id,
                         )
                         .await
@@ -3280,10 +3508,16 @@ impl UserMemoryCaptureWorker {
         &self,
         project_id: Option<&str>,
         conversation_id: Option<&str>,
-        _current_message: &str,
+        current_message: &str,
     ) -> Option<String> {
-        build_saved_user_facts_context_from_storage(&self.storage, project_id, conversation_id)
-            .await
+        build_saved_user_facts_context_from_storage(
+            &self.storage,
+            self.embedding_client.as_deref(),
+            project_id,
+            conversation_id,
+            current_message,
+        )
+        .await
     }
 
     pub(super) async fn build_ambient_time_context(&self) -> String {
@@ -3334,6 +3568,8 @@ impl UserMemoryCaptureWorker {
         review_at: Option<chrono::DateTime<chrono::Utc>>,
         reason: Option<&str>,
         sensitivity: Option<&str>,
+        category: Option<&str>,
+        topics: &[String],
         target_memory_id: Option<&str>,
     ) -> Option<String> {
         let Some(key) = normalize_user_fact_key(key) else {
@@ -3370,6 +3606,11 @@ impl UserMemoryCaptureWorker {
         }
         let normalized_kind = normalize_user_memory_kind(kind);
         let semantic_kind = learned_user_memory_semantic_kind(Some(&key), kind);
+        let memory_category = normalize_learned_user_memory_category(category, Some(semantic_kind));
+        let memory_topics = topics
+            .iter()
+            .map(|topic| serde_json::Value::String(topic.clone()))
+            .collect::<Vec<_>>();
         let sensitivity = saved_memory_sensitivity_from_parts(
             Some(&key),
             &value,
@@ -3487,6 +3728,14 @@ impl UserMemoryCaptureWorker {
         metadata.insert(
             "sensitivity".to_string(),
             serde_json::Value::String(sensitivity.as_str().to_string()),
+        );
+        metadata.insert(
+            "memory_category".to_string(),
+            serde_json::Value::String(memory_category.to_string()),
+        );
+        metadata.insert(
+            "topics".to_string(),
+            serde_json::Value::Array(memory_topics),
         );
         if let Some(dt) = valid_from {
             metadata.insert(
@@ -4904,15 +5153,22 @@ impl Agent {
         &self,
         project_id: Option<&str>,
         conversation_id: Option<&str>,
-        _current_message: &str,
+        current_message: &str,
     ) -> Option<String> {
-        build_saved_user_facts_context_from_storage(&self.storage, project_id, conversation_id)
-            .await
+        build_saved_user_facts_context_from_storage(
+            &self.storage,
+            self.embedding_client.as_deref(),
+            project_id,
+            conversation_id,
+            current_message,
+        )
+        .await
     }
 
     pub(super) async fn mark_user_memory_capture_candidate(
         &self,
         message: &str,
+        user_message_for_link_capture: &str,
         channel: &str,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
@@ -4963,6 +5219,7 @@ impl Agent {
                 "semantic_capture_key": semantic_capture_key,
                 "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
                 "deferred": true,
+                "user_message_for_link_capture": safe_truncate(user_message_for_link_capture, 4000),
             }),
             error_history: serde_json::json!([]),
             replay_count: 0,
@@ -5053,6 +5310,7 @@ impl Agent {
             };
             if self
                 .mark_user_memory_capture_candidate(
+                    &message.content,
                     &message.content,
                     &channel,
                     Some(conversation_id),
@@ -5176,9 +5434,17 @@ impl Agent {
                 continue;
             };
 
+            let user_message_for_link_capture = event
+                .attempt_metadata
+                .get("user_message_for_link_capture")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(source_message.content.as_str());
             worker
                 .capture_user_memory_hints(
                     &source_message.content,
+                    user_message_for_link_capture,
                     event.channel.as_str(),
                     event.conversation_id.as_deref(),
                     event.project_id.as_deref(),

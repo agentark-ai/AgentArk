@@ -745,13 +745,6 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         return meta;
     }
 
-    if capabilities.contains("notify") {
-        meta.role = PlannerActionRole::Delivery;
-        meta.integration_class = PlannerIntegrationClass::Internal;
-        meta.side_effect_level = PlannerSideEffectLevel::Notify;
-        return meta;
-    }
-
     if capabilities.contains("skill_management")
         || capabilities.contains("integration_builder")
         || capabilities.contains("integration_admin")
@@ -760,6 +753,13 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         meta.integration_class = PlannerIntegrationClass::Internal;
         meta.cost = PlannerCostTier::Medium;
         meta.side_effect_level = PlannerSideEffectLevel::Write;
+        return meta;
+    }
+
+    if capabilities.contains("notify") {
+        meta.role = PlannerActionRole::Delivery;
+        meta.integration_class = PlannerIntegrationClass::Internal;
+        meta.side_effect_level = PlannerSideEffectLevel::Notify;
         return meta;
     }
 

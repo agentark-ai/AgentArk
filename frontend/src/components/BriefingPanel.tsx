@@ -66,8 +66,15 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
         ? (obj.result as Record<string, unknown>)
         : obj;
     const kind = String(result.kind || "");
-    if (kind === "daily_brief_now")
-      return "Daily Command Brief generated and pushed to your preferred channel.";
+    if (kind === "daily_brief_now") {
+      const delivery =
+        result.delivery && typeof result.delivery === "object"
+          ? (result.delivery as Record<string, unknown>)
+          : {};
+      return delivery.push_delivered
+        ? "Daily Command Brief generated and pushed to your preferred channel."
+        : "Daily Command Brief generated. No in-app notification was created.";
+    }
     if (kind === "create_task")
       return `Task queued: ${String(result.task_id || "") || "created"}.`;
     if (kind === "delegate") return "Delegation completed. Check Swarm for details.";

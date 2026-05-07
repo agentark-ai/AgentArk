@@ -160,6 +160,11 @@ const USER_FACT_MEMORY_CAPTURE_ALLOW_SENSITIVE_CONTEXT: bool = true;
 const USER_MEMORY_OPERATION_AUTO_APPLY_CONFIDENCE: f64 = 0.80;
 const SAVED_USER_FACT_PROMPT_KINDS: &[&str] = &[
     "identity",
+    "assistant_preference",
+    "work_preference",
+    "project_domain_memory",
+    "ephemeral_context",
+    "knowledge",
     "preference",
     "location",
     "workflow",
@@ -318,6 +323,24 @@ fn extract_http_urls(text: &str) -> Vec<String> {
         }
     }
     urls
+}
+
+fn user_data_autosave_url_allowed(raw: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(raw.trim()) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed
+            .host_str()
+            .map(|host| !crate::clients::host_looks_local_or_internal(host))
+            .unwrap_or(false)
+}
+
+fn extract_user_supplied_link_user_data_urls(text: &str) -> Vec<String> {
+    extract_http_urls(text)
+        .into_iter()
+        .filter(|url| user_data_autosave_url_allowed(url))
+        .collect()
 }
 
 fn action_message_hint(arguments: &serde_json::Value) -> Option<String> {
@@ -1540,6 +1563,7 @@ struct ImmediateExchangeContext<'a> {
     user_message_already_recorded: bool,
     memory_capture_allowed: bool,
     memory_capture_source: Option<&'a str>,
+    user_message_for_link_capture: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -1930,7 +1954,6 @@ enum InboundSecurityPrecheck {
         memory_capture_allowed: bool,
         routing: Option<crate::security::intent_classifier::InboundRoutingSignal>,
         routing_trusted: bool,
-        direct_response: Option<String>,
     },
     Respond(ProcessedMessage),
 }

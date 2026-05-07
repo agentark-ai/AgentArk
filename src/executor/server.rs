@@ -7,7 +7,7 @@ use crate::actions::app::{
 use crate::executor::protocol::{
     AppActionResponse, AppDeployRequest, AppDeployResponse, AppLifecycleRequest,
     CodeExecuteRequest, CodeExecuteResponse, ExecutorStatusResponse, InternalServiceHealth,
-    StackUpdateRequest, StackUpdateResponse,
+    StackMemoryContainerStats, StackMemoryStatsResponse, StackUpdateRequest, StackUpdateResponse,
 };
 use crate::runtime::ActionRuntime;
 use anyhow::{Context, Result};
@@ -37,6 +37,8 @@ use tokio_tungstenite::{
 const CONTROL_CONTAINER_NAME: &str = "agentark-control";
 const EXECUTOR_CONTAINER_NAME: &str = "agentark-executor";
 const WORKSPACE_CONTAINER_NAME: &str = "agentark-workspace";
+const POSTGRES_CONTAINER_NAME: &str = "agentark-postgres";
+const EMBEDDINGS_CONTAINER_NAME: &str = "agentark-embeddings";
 const DEFAULT_STACK_UPDATER_IMAGE: &str = "docker:28-cli";
 const STACK_UPDATE_SCRIPT: &str = r#"set -eu
 if ! command -v git >/dev/null 2>&1; then
@@ -252,6 +254,7 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
         .route("/internal/v1/status", get(status))
         .route("/internal/v1/system/restart-stack", post(restart_stack))
         .route("/internal/v1/system/update-stack", post(update_stack))
+        .route("/internal/v1/system/stack-memory", get(stack_memory))
         .route("/internal/v1/code/execute", post(code_execute))
         .route("/internal/v1/apps/deploy", post(app_deploy))
         .route("/internal/v1/apps/{app_id}/restart", post(app_restart))
@@ -641,6 +644,201 @@ async fn status(State(state): State<ExecutorState>, headers: HeaderMap) -> Respo
         token_configured: state.config.token.is_some(),
     })
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerStatsRow {
+    #[serde(default, rename = "Name")]
+    name: String,
+    #[serde(default, rename = "MemUsage")]
+    memory_usage: String,
+}
+
+async fn stack_memory(State(state): State<ExecutorState>, headers: HeaderMap) -> Response {
+    if let Err(status) = authorize_internal(&headers, state.config.token.as_deref()) {
+        return (
+            status,
+            Json(json!({
+                "status": "error",
+                "source": "docker_stats",
+                "message": "Unauthorized"
+            })),
+        )
+            .into_response();
+    }
+
+    match collect_stack_memory_stats().await {
+        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(StackMemoryStatsResponse {
+                status: "error".to_string(),
+                source: "docker_stats".to_string(),
+                memory_used_bytes: 0,
+                memory_total_bytes: None,
+                memory_pressure_percent: None,
+                container_count: 0,
+                containers: Vec::new(),
+                sampled_at: chrono::Utc::now().to_rfc3339(),
+                message: Some(error.to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn collect_stack_memory_stats() -> Result<StackMemoryStatsResponse> {
+    let container_names = stack_memory_container_names();
+    let mut command = tokio::process::Command::new("docker");
+    command.args(["stats", "--no-stream", "--format", "{{json .}}"]);
+
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .context("Timed out running docker stats for AgentArk stack memory")?
+        .context("Failed to run docker stats for AgentArk stack memory")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "docker stats failed for AgentArk stack memory: {}",
+            if stderr.is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut containers = Vec::new();
+    let mut total_used = 0_u64;
+    let mut memory_total = None::<u64>;
+    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let row: DockerStatsRow =
+            serde_json::from_str(line).context("Failed to decode docker stats JSON")?;
+        if !container_names.iter().any(|name| name == &row.name) {
+            continue;
+        }
+        let Some((used, limit)) = parse_docker_memory_usage(&row.memory_usage) else {
+            continue;
+        };
+        total_used = total_used.saturating_add(used);
+        if let Some(limit) = limit {
+            memory_total = Some(memory_total.map_or(limit, |current| current.max(limit)));
+        }
+        containers.push(StackMemoryContainerStats {
+            name: row.name,
+            memory_used_bytes: used,
+            memory_limit_bytes: limit,
+        });
+    }
+
+    if containers.is_empty() {
+        anyhow::bail!(
+            "docker stats returned no running AgentArk stack containers matching {}",
+            container_names.join(", ")
+        );
+    }
+
+    memory_total = read_docker_daemon_memory_total()
+        .await
+        .ok()
+        .flatten()
+        .or(memory_total);
+    let memory_pressure_percent = memory_total
+        .filter(|total| *total > 0)
+        .map(|total| round_1((total_used as f64 / total as f64 * 100.0).clamp(0.0, 100.0)));
+
+    Ok(StackMemoryStatsResponse {
+        status: "ok".to_string(),
+        source: "docker_stack".to_string(),
+        memory_used_bytes: total_used,
+        memory_total_bytes: memory_total,
+        memory_pressure_percent,
+        container_count: containers.len(),
+        containers,
+        sampled_at: chrono::Utc::now().to_rfc3339(),
+        message: None,
+    })
+}
+
+async fn read_docker_daemon_memory_total() -> Result<Option<u64>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new("docker")
+            .args(["info", "--format", "{{json .MemTotal}}"])
+            .output(),
+    )
+    .await
+    .context("Timed out reading Docker daemon memory total")?
+    .context("Failed to read Docker daemon memory total")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim().trim_matches('"');
+    Ok(trimmed.parse::<u64>().ok())
+}
+
+fn stack_memory_container_names() -> Vec<String> {
+    if let Ok(raw) = std::env::var("AGENTARK_STACK_MEMORY_CONTAINERS") {
+        let names = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+
+    [
+        CONTROL_CONTAINER_NAME,
+        EXECUTOR_CONTAINER_NAME,
+        WORKSPACE_CONTAINER_NAME,
+        POSTGRES_CONTAINER_NAME,
+        EMBEDDINGS_CONTAINER_NAME,
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn parse_docker_memory_usage(value: &str) -> Option<(u64, Option<u64>)> {
+    let mut parts = value.split('/');
+    let used = parse_docker_size_bytes(parts.next()?.trim())?;
+    let limit = parts.next().and_then(|part| parse_docker_size_bytes(part.trim()));
+    Some((used, limit))
+}
+
+fn parse_docker_size_bytes(value: &str) -> Option<u64> {
+    let compact = value.trim().replace(',', "");
+    if compact.is_empty() {
+        return None;
+    }
+    let split_at = compact
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(compact.len());
+    let number = compact[..split_at].trim().parse::<f64>().ok()?;
+    let unit = compact[split_at..].trim().to_ascii_lowercase();
+    let multiplier = match unit.as_str() {
+        "" | "b" => 1_f64,
+        "kb" => 1_000_f64,
+        "mb" => 1_000_000_f64,
+        "gb" => 1_000_000_000_f64,
+        "tb" => 1_000_000_000_000_f64,
+        "kib" => 1024_f64,
+        "mib" => 1024_f64.powi(2),
+        "gib" => 1024_f64.powi(3),
+        "tib" => 1024_f64.powi(4),
+        _ => return None,
+    };
+    Some((number * multiplier).round().max(0.0) as u64)
+}
+
+fn round_1(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
 }
 
 fn is_valid_app_id(app_id: &str) -> bool {

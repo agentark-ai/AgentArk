@@ -173,6 +173,10 @@ function connectorStatusLabel(integration: IntegrationItem): string | null {
   return null;
 }
 
+function customApiAuthRequiresSecret(authMode: string): boolean {
+  return authMode !== "none" && authMode.trim().length > 0;
+}
+
 function parseOperationDraft(value: unknown): OperationDraft {
   const row = asRecord(value);
   return {
@@ -204,6 +208,8 @@ export function IntegrationQuickstartPanel({
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [customApiOpen, setCustomApiOpen] = useState(false);
   const [customApiForm, setCustomApiForm] = useState<CustomApiForm>(defaultCustomApiForm());
+  const [editingCustomApiId, setEditingCustomApiId] = useState<string | null>(null);
+  const [editingCustomApiSecretConfigured, setEditingCustomApiSecretConfigured] = useState(false);
   const customApisQ = useQuery({
     queryKey: ["integrations-quickstart-custom-apis"],
     queryFn: () => api.rawGet("/custom-apis"),
@@ -216,6 +222,13 @@ export function IntegrationQuickstartPanel({
   });
   const createCustomApi = useMutation({
     mutationFn: (payload: JsonRecord) => api.rawPost("/custom-apis", payload),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["integrations-quickstart-custom-apis"] });
+    }
+  });
+  const updateCustomApi = useMutation({
+    mutationFn: ({ id, payload }: { id: string; payload: JsonRecord }) =>
+      api.rawPut(`/custom-apis/${encodeURIComponent(id)}`, payload),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["integrations-quickstart-custom-apis"] });
     }
@@ -321,10 +334,37 @@ export function IntegrationQuickstartPanel({
     }
   }
 
+  function openNewCustomApiDialog() {
+    setEditingCustomApiId(null);
+    setEditingCustomApiSecretConfigured(false);
+    setCustomApiForm(defaultCustomApiForm());
+    setCustomApiOpen(true);
+  }
+
+  function openEditCustomApiDialog(item: JsonRecord) {
+    const configId = str(item.id);
+    setEditingCustomApiId(configId || null);
+    setEditingCustomApiSecretConfigured(toBool(item.secret_configured));
+    setCustomApiForm({
+      ...defaultCustomApiForm(),
+      name: str(item.name, configId),
+      description: str(item.description),
+      base_url: str(item.base_url),
+      auth_mode: str(item.auth_mode, "none"),
+      auth_header: str(item.auth_header),
+      auth_name: str(item.auth_name),
+      auth_username: str(item.auth_username),
+      enabled: item.enabled !== false,
+      operations: asRecords(item.operations).map(parseOperationDraft),
+      notes: []
+    });
+    setCustomApiOpen(true);
+  }
+
   async function handleSaveCustomApi() {
     setNotice(null);
     try {
-      await createCustomApi.mutateAsync({
+      const payload = {
         name: customApiForm.name.trim(),
         description: customApiForm.description.trim(),
         base_url: customApiForm.base_url.trim(),
@@ -335,9 +375,21 @@ export function IntegrationQuickstartPanel({
         auth_username: customApiForm.auth_username.trim() || undefined,
         secret: customApiForm.secret.trim() || undefined,
         operations: customApiForm.operations
+      };
+      if (editingCustomApiId) {
+        await updateCustomApi.mutateAsync({ id: editingCustomApiId, payload });
+      } else {
+        await createCustomApi.mutateAsync(payload);
+      }
+      setNotice({
+        kind: "success",
+        text: editingCustomApiId
+          ? "Custom API integration saved."
+          : "Custom API imported. The selected endpoints are now available as tools."
       });
-      setNotice({ kind: "success", text: "Custom API imported. The selected endpoints are now available as tools." });
       setCustomApiOpen(false);
+      setEditingCustomApiId(null);
+      setEditingCustomApiSecretConfigured(false);
       setCustomApiForm(defaultCustomApiForm());
     } catch (error) {
       setNotice({ kind: "error", text: errMessage(error) });
@@ -492,10 +544,7 @@ export function IntegrationQuickstartPanel({
                   Import approved API endpoints as tools the agent can use safely. Secrets stay encrypted.
                 </Typography>
               </Box>
-              <Button variant="contained" sx={actionButtonSx} onClick={() => {
-                setCustomApiForm(defaultCustomApiForm());
-                setCustomApiOpen(true);
-              }}>
+              <Button variant="contained" sx={actionButtonSx} onClick={openNewCustomApiDialog}>
                 Import API
               </Button>
             </Stack>
@@ -512,6 +561,7 @@ export function IntegrationQuickstartPanel({
                 <TableRow>
                   <TableCell>Name</TableCell>
                   <TableCell>Base URL</TableCell>
+                  <TableCell>Status</TableCell>
                   <TableCell>Actions</TableCell>
                   <TableCell>Last Test</TableCell>
                   <TableCell align="right">Ops</TableCell>
@@ -521,16 +571,32 @@ export function IntegrationQuickstartPanel({
                 {customApis.map((item) => {
                   const config = asRecord(item);
                   const configId = str(config.id);
+                  const authMode = str(config.auth_mode, "none");
+                  const needsSecret =
+                    customApiAuthRequiresSecret(authMode) && !toBool(config.secret_configured);
+                  const enabled = config.enabled !== false;
                   return (
                     <TableRow key={configId}>
                       <TableCell>{str(config.name, configId)}</TableCell>
                       <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>{str(config.base_url)}</TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={!enabled ? "Disabled" : needsSecret ? "Needs secret" : "Ready"}
+                          color={!enabled ? "default" : needsSecret ? "warning" : "success"}
+                          variant="outlined"
+                          sx={{ height: 22, fontSize: "0.68rem" }}
+                        />
+                      </TableCell>
                       <TableCell>{String(Number(config.action_count) || 0)}</TableCell>
                       <TableCell>{str(config.last_test_outcome, "-")}</TableCell>
                       <TableCell align="right">
                         <Stack direction="row" spacing={0.5} sx={{
                           justifyContent: "flex-end"
                         }}>
+                          <Button size="small" variant="text" onClick={() => openEditCustomApiDialog(config)}>
+                            Configure
+                          </Button>
                           <Button
                             size="small"
                             variant="text"
@@ -554,32 +620,36 @@ export function IntegrationQuickstartPanel({
         </Box>
       ) : null}
       <Dialog open={customApiOpen} onClose={() => setCustomApiOpen(false)} fullWidth maxWidth="lg">
-        <DialogTitle>Import Custom API</DialogTitle>
+        <DialogTitle>{editingCustomApiId ? "Configure Custom API" : "Import Custom API"}</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            <Stack direction="row" spacing={0.75} useFlexGap sx={{
-              flexWrap: "wrap"
-            }}>
-              <Chip label="OpenAPI text" color={customApiForm.source_mode === "openapi_text" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_text" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_text" }))} />
-              <Chip label="OpenAPI URL" color={customApiForm.source_mode === "openapi_url" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_url" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_url" }))} />
-              <Chip label="Sample curl" color={customApiForm.source_mode === "curl" ? "primary" : "default"} variant={customApiForm.source_mode === "curl" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "curl" }))} />
-            </Stack>
+            {!editingCustomApiId ? (
+              <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                flexWrap: "wrap"
+              }}>
+                <Chip label="OpenAPI text" color={customApiForm.source_mode === "openapi_text" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_text" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_text" }))} />
+                <Chip label="OpenAPI URL" color={customApiForm.source_mode === "openapi_url" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_url" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_url" }))} />
+                <Chip label="Sample curl" color={customApiForm.source_mode === "curl" ? "primary" : "default"} variant={customApiForm.source_mode === "curl" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "curl" }))} />
+              </Stack>
+            ) : null}
             <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
               <TextField label="Name" fullWidth value={customApiForm.name} onChange={(e) => setCustomApiForm((current) => ({ ...current, name: e.target.value }))} />
               <TextField label="Base URL override" fullWidth value={customApiForm.base_url} onChange={(e) => setCustomApiForm((current) => ({ ...current, base_url: e.target.value }))} />
             </Stack>
-            {customApiForm.source_mode === "openapi_url" ? (
+            {!editingCustomApiId && customApiForm.source_mode === "openapi_url" ? (
               <TextField label="OpenAPI URL" fullWidth value={customApiForm.openapi_url} onChange={(e) => setCustomApiForm((current) => ({ ...current, openapi_url: e.target.value }))} />
             ) : null}
-            {customApiForm.source_mode === "openapi_text" ? (
+            {!editingCustomApiId && customApiForm.source_mode === "openapi_text" ? (
               <TextField label="OpenAPI Document" fullWidth multiline minRows={10} value={customApiForm.openapi_text} onChange={(e) => setCustomApiForm((current) => ({ ...current, openapi_text: e.target.value }))} />
             ) : null}
-            {customApiForm.source_mode === "curl" ? (
+            {!editingCustomApiId && customApiForm.source_mode === "curl" ? (
               <TextField label="Sample curl" fullWidth multiline minRows={6} value={customApiForm.curl_text} onChange={(e) => setCustomApiForm((current) => ({ ...current, curl_text: e.target.value }))} />
             ) : null}
-            <Button variant="contained" onClick={() => void handlePreviewCustomApi()} disabled={previewCustomApi.isPending}>
-              {previewCustomApi.isPending ? "Analyzing..." : "Discover Endpoints"}
-            </Button>
+            {!editingCustomApiId ? (
+              <Button variant="contained" onClick={() => void handlePreviewCustomApi()} disabled={previewCustomApi.isPending}>
+                {previewCustomApi.isPending ? "Analyzing..." : "Discover Endpoints"}
+              </Button>
+            ) : null}
             {customApiForm.notes.length > 0 ? (
               <Alert severity="info">
                 {customApiForm.notes.join(" ")}
@@ -601,7 +671,18 @@ export function IntegrationQuickstartPanel({
                 </Stack>
                 <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
                   <TextField label="Username" fullWidth value={customApiForm.auth_username} onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_username: e.target.value }))} />
-                  <TextField label="Token / Secret" type="password" fullWidth value={customApiForm.secret} onChange={(e) => setCustomApiForm((current) => ({ ...current, secret: e.target.value }))} helperText="Stored encrypted and injected only into API requests." />
+                  <TextField
+                    label="Token / Secret"
+                    type="password"
+                    fullWidth
+                    value={customApiForm.secret}
+                    onChange={(e) => setCustomApiForm((current) => ({ ...current, secret: e.target.value }))}
+                    helperText={
+                      editingCustomApiId && editingCustomApiSecretConfigured
+                        ? "Leave blank to keep the saved secret."
+                        : "Stored encrypted and injected only into API requests."
+                    }
+                  />
                 </Stack>
                 <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto", maxHeight: "none" }}>
                 <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "var(--ui-rgba-112-153-201-120)", py: 0.75 } }}>
@@ -665,25 +746,31 @@ export function IntegrationQuickstartPanel({
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setCustomApiOpen(false)}>Close</Button>
+          <Button onClick={() => {
+            setCustomApiOpen(false);
+            setEditingCustomApiId(null);
+            setEditingCustomApiSecretConfigured(false);
+          }}>Close</Button>
           <Button
             variant="contained"
             onClick={() => void handleSaveCustomApi()}
             disabled={
               createCustomApi.isPending ||
+              updateCustomApi.isPending ||
               customApiForm.operations.length === 0 ||
               !customApiForm.name.trim() ||
               !customApiForm.base_url.trim() ||
-              ((customApiForm.auth_mode === "bearer" ||
-                customApiForm.auth_mode === "api_key_header" ||
-                customApiForm.auth_mode === "api_key_query" ||
-                customApiForm.auth_mode === "oauth2" ||
-                customApiForm.auth_mode === "basic") &&
-                !customApiForm.secret.trim()) ||
+              (customApiAuthRequiresSecret(customApiForm.auth_mode) &&
+                !customApiForm.secret.trim() &&
+                !(editingCustomApiId && editingCustomApiSecretConfigured)) ||
               (customApiForm.auth_mode === "basic" && !customApiForm.auth_username.trim())
             }
           >
-            {createCustomApi.isPending ? "Importing..." : "Import API"}
+            {createCustomApi.isPending || updateCustomApi.isPending
+              ? "Saving..."
+              : editingCustomApiId
+                ? "Save API"
+                : "Import API"}
           </Button>
         </DialogActions>
       </Dialog>

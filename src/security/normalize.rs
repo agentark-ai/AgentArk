@@ -95,8 +95,8 @@ mod tests {
 
     #[test]
     fn ligatures_decompose() {
-        // NFKC decomposes the ligature ﬁ (U+FB01) into "fi".
-        let input = "e\u{FB01}cient";
+        // NFKC decomposes U+FB03 into "ffi".
+        let input = "e\u{FB03}cient";
         assert_eq!(normalize_for_analysis(input), "efficient");
     }
 

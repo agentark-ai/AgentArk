@@ -1,7 +1,6 @@
 use super::*;
 
 const DIRECT_CONVERSATION_VERSION: &str = "direct_conversation_v1";
-const DIRECT_CONTEXT_MODEL_USED: &str = "direct_context";
 const DIRECT_MEMORY_MODEL_USED: &str = "direct_memory";
 const DIRECT_CONVERSATION_MODEL_USED: &str = "direct_conversation";
 const DIRECT_CONVERSATION_TIMEOUT_MS: u64 = 30_000;
@@ -10,8 +9,6 @@ const DIRECT_CONVERSATION_RECENT_ARTIFACTS: usize = 3;
 const INBOUND_CLASSIFIER_RECENT_ARTIFACTS: usize = 4;
 const DIRECT_MEMORY_MAX_ITEMS: u64 = 24;
 const DIRECT_MEMORY_MAX_LIST_ITEMS: usize = 5;
-const DIRECT_LOCAL_ANSWER_MIN_SCORE: f32 = 0.70;
-const DIRECT_LOCAL_ANSWER_MIN_MARGIN: f32 = 0.04;
 const DEFERRED_CHAT_PERSISTENCE_MAX_CONCURRENCY: usize = 8;
 const DEFERRED_CHAT_PERSISTENCE_ATTEMPTS: usize = 3;
 const DEFERRED_CHAT_PERSISTENCE_ATTEMPT_TIMEOUT_SECS: u64 = 45;
@@ -470,8 +467,15 @@ fn should_enqueue_semantic_user_memory_capture(
     state: DirectConversationRuntimeState,
     turn_path: TurnExecutionPath,
 ) -> bool {
-    let _ = (message, state, turn_path);
-    false
+    let _ = message;
+    turn_path == TurnExecutionPath::DirectReply
+        && state.supported_surface
+        && !state.has_attachments
+        && !state.has_secret_offered
+        && !state.has_pending_actions
+        && !state.has_pending_credential_prompt
+        && !state.user_message_already_recorded
+        && !state.skip_inbound_security_precheck
 }
 
 fn routing_is_transient_read_only_lookup(
@@ -492,48 +496,6 @@ enum DirectMemoryLookupKind {
     Contact,
     Constraint,
     Any,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DirectLocalAnswerMode {
-    PreviousUserMessage,
-    PreviousAssistantMessage,
-    RecentConversationSummary,
-}
-
-impl DirectLocalAnswerMode {
-    fn canonical_text(self) -> &'static str {
-        match self {
-            Self::PreviousUserMessage => {
-                "The user asks to recall, quote, restate, identify, or answer with the immediately previous user message or question from this conversation."
-            }
-            Self::PreviousAssistantMessage => {
-                "The user asks to recall, quote, restate, identify, or answer with the assistant's immediately previous response from this conversation."
-            }
-            Self::RecentConversationSummary => {
-                "The user asks for a concise summary, recap, or description of the recent visible conversation history."
-            }
-        }
-    }
-}
-
-fn direct_local_answer_mode_query(
-    routing: &crate::security::intent_classifier::InboundRoutingSignal,
-) -> Option<String> {
-    let mut parts = Vec::new();
-    parts.extend(routing.semantic_queries.iter().map(String::as_str));
-    for goal in &routing.goals {
-        parts.push(goal.intent_summary.as_str());
-        parts.push(goal.capability_query.as_str());
-        parts.push(goal.expected_outcome.as_str());
-    }
-    let query = parts
-        .into_iter()
-        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!query.trim().is_empty()).then_some(query)
 }
 
 impl DirectMemoryLookupKind {
@@ -613,6 +575,7 @@ struct DeferredExchangePersistence {
     user_message_already_recorded: bool,
     memory_capture_allowed: bool,
     memory_capture_source: Option<String>,
+    user_message_for_link_capture: Option<String>,
     user_message_id: String,
     assistant_message_id: String,
     user_timestamp: String,
@@ -913,6 +876,7 @@ fn direct_conversation_system_prompt() -> String {
     format!(
         "You are {name}. This is a no-tool direct conversation path. \
 Answer only from the user message, visible recent conversation, saved user facts, and product identity supplied in this prompt. \
+When the user's meaning is to recall, quote, restate, identify, or summarize previous or recent turns, answer from `recent_messages` without inventing missing history. \
 Your user-facing identity is exactly product_identity.name. For every user-facing self-reference and identity-bearing answer, use only that runtime identity and never the underlying model/provider identity as your name or maker. \
 Do not claim to inspect live state, files, tools, integrations, web pages, documents, apps, logs, clocks, or external systems. \
 When `semantic_memory_capture_requested` is true and the message is otherwise just social chat or a durable personal/profile/preference update, acknowledge it naturally and add one brief, non-invasive follow-up question or useful observation grounded in the meaning. Avoid sterile replies such as a bare acknowledgement. Do not ask whether to remember it, and do not over-explain memory mechanics. \
@@ -1015,54 +979,6 @@ impl Agent {
         recent
     }
 
-    async fn classify_direct_local_answer_mode(
-        &self,
-        routing: &crate::security::intent_classifier::InboundRoutingSignal,
-    ) -> Option<DirectLocalAnswerMode> {
-        let embedder = self.embedding_client.as_deref()?;
-        let query = direct_local_answer_mode_query(routing)?;
-        let query = query.trim();
-        if query.is_empty() {
-            return None;
-        }
-        let modes = [
-            DirectLocalAnswerMode::PreviousUserMessage,
-            DirectLocalAnswerMode::PreviousAssistantMessage,
-            DirectLocalAnswerMode::RecentConversationSummary,
-        ];
-        let mut texts = Vec::with_capacity(modes.len() + 1);
-        texts.push(query.to_string());
-        texts.extend(modes.iter().map(|mode| mode.canonical_text().to_string()));
-        let embeddings = embedder.embed_texts(&texts).await.ok()?;
-        let message_embedding = embeddings.first()?;
-        let mut scored = modes
-            .iter()
-            .zip(embeddings.iter().skip(1))
-            .filter_map(|(mode, embedding)| {
-                let score = crate::core::document_search::normalized_embedding_similarity(
-                    message_embedding.as_slice(),
-                    embedding.as_slice(),
-                )?;
-                Some((*mode, score))
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by(|left, right| {
-            right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let (mode, score) = *scored.first()?;
-        let competing = scored.get(1).map(|(_, score)| *score).unwrap_or(0.0);
-        if score >= DIRECT_LOCAL_ANSWER_MIN_SCORE
-            && score - competing >= DIRECT_LOCAL_ANSWER_MIN_MARGIN
-        {
-            Some(mode)
-        } else {
-            None
-        }
-    }
-
     async fn enrich_agentark_knowledge_routing_doc_ids(
         &self,
         routing: &mut crate::security::intent_classifier::InboundRoutingSignal,
@@ -1144,95 +1060,6 @@ impl Agent {
             return;
         }
         routing.grounding_doc_ids = doc_ids.clone();
-    }
-
-    async fn run_direct_local_conversation_response(
-        &self,
-        routing: &crate::security::intent_classifier::InboundRoutingSignal,
-        message: &str,
-        conversation_key: &str,
-    ) -> Option<String> {
-        let mode = self.classify_direct_local_answer_mode(routing).await?;
-        let history = self.conversation_history.read().await;
-        let messages = history.get(conversation_key)?;
-        let current_message = message.trim();
-        let budget = self.direct_chat_history_budget(message);
-        let message_token_budget = Self::chat_message_token_budget(budget);
-        let previous_for_role = |role: &str| {
-            messages.iter().rev().find_map(|item| {
-                if !item.role.eq_ignore_ascii_case(role) {
-                    return None;
-                }
-                let content = crate::security::redact_secret_input(&item.content).text;
-                let content = content.trim();
-                if content.is_empty() || content == current_message {
-                    return None;
-                }
-                Some(crate::core::context_budget::truncate_to_token_budget(
-                    content,
-                    message_token_budget,
-                ))
-            })
-        };
-        match mode {
-            DirectLocalAnswerMode::PreviousUserMessage => {
-                let previous = previous_for_role("user")?;
-                let label = if previous.trim_end().ends_with('?') {
-                    "question"
-                } else {
-                    "message"
-                };
-                Some(format!("Your previous {label} was: \"{previous}\""))
-            }
-            DirectLocalAnswerMode::PreviousAssistantMessage => {
-                let previous = previous_for_role("assistant")?;
-                Some(format!("My previous response was: \"{previous}\""))
-            }
-            DirectLocalAnswerMode::RecentConversationSummary => {
-                let summary_budget = Self::prompt_recent_token_budget(
-                    budget,
-                    "AGENTARK_DIRECT_LOCAL_SUMMARY_TOKENS",
-                    READ_ONLY_PROMPT_RECENT_HISTORY_RATIO_PERCENT,
-                );
-                let mut used_tokens = 0usize;
-                let mut recent = Vec::new();
-                for item in messages.iter().rev() {
-                    let role = if item.role.eq_ignore_ascii_case("user") {
-                        "You"
-                    } else if item.role.eq_ignore_ascii_case("assistant") {
-                        crate::branding::PRODUCT_NAME
-                    } else {
-                        continue;
-                    };
-                    let content = crate::security::redact_secret_input(&item.content).text;
-                    let content = content.trim();
-                    if content.is_empty() || content == current_message {
-                        continue;
-                    }
-                    let content = crate::core::context_budget::truncate_to_token_budget(
-                        content,
-                        message_token_budget.min(128),
-                    );
-                    let line = format!("{}: {}", role, content);
-                    let line_tokens = crate::core::context_budget::estimate_tokens_from_text(&line);
-                    if !recent.is_empty()
-                        && used_tokens.saturating_add(line_tokens) > summary_budget
-                    {
-                        break;
-                    }
-                    used_tokens = used_tokens.saturating_add(line_tokens);
-                    recent.push(line);
-                    if used_tokens >= summary_budget {
-                        break;
-                    }
-                }
-                if recent.is_empty() {
-                    return None;
-                }
-                let summary = recent.into_iter().rev().collect::<Vec<_>>().join("\n");
-                Some(format!("Recent conversation:\n{summary}"))
-            }
-        }
     }
 
     async fn run_direct_memory_response(
@@ -1424,6 +1251,7 @@ impl Agent {
                             user_message_already_recorded,
                             memory_capture_allowed: false,
                             memory_capture_source: None,
+                            user_message_for_link_capture: Some(stored_user_message),
                         },
                     )
                     .await?;
@@ -1728,7 +1556,6 @@ impl Agent {
         let mut memory_capture_allowed_from_semantic_probe = false;
         let mut inbound_routing_trusted = false;
         let mut inbound_router_unavailable = false;
-        let mut inbound_direct_response: Option<String> = None;
         let turn_started_at = chrono::Utc::now();
         let usage_before_turn = self.turn_pipeline_usage_snapshot().await;
         let stage_started = std::time::Instant::now();
@@ -1780,6 +1607,7 @@ impl Agent {
                             user_message_already_recorded,
                             memory_capture_allowed: false,
                             memory_capture_source: None,
+                            user_message_for_link_capture: Some(message_storage.as_str()),
                         },
                     )
                     .await?;
@@ -1789,7 +1617,7 @@ impl Agent {
             if let Some(tx) = stream_tx.as_ref() {
                 queue_stream_event(
                     tx,
-                    StreamEvent::Thinking("Checking request safety...".to_string()),
+                    StreamEvent::Thinking("Reviewing request intent...".to_string()),
                 );
             }
             match self
@@ -1812,11 +1640,9 @@ impl Agent {
                     memory_capture_allowed: should_capture,
                     routing,
                     routing_trusted,
-                    direct_response,
                 } => {
                     memory_capture_allowed = should_capture;
                     inbound_routing_trusted = routing_trusted;
-                    inbound_direct_response = direct_response;
                     request_hints.routing_trusted = routing_trusted;
                     inbound_router_unavailable = !routing_trusted && routing.is_none();
                     if let Some(routing) = routing {
@@ -1867,26 +1693,6 @@ impl Agent {
             request_hints.routing.as_ref(),
             direct_candidate_state,
         );
-        if !memory_capture_allowed
-            && !secret_redaction.had_secret()
-            && !routing_is_transient_read_only_lookup(request_hints.routing.as_ref())
-            && should_enqueue_semantic_user_memory_capture(
-                message_storage.as_str(),
-                direct_candidate_state,
-                direct_candidate_path,
-            )
-        {
-            memory_capture_allowed = true;
-            memory_capture_allowed_from_semantic_probe = true;
-        }
-        if !memory_capture_allowed
-            && inbound_router_unavailable
-            && !secret_redaction.had_secret()
-            && direct_candidate_path == TurnExecutionPath::DirectReply
-        {
-            memory_capture_allowed = true;
-            memory_capture_allowed_from_semantic_probe = true;
-        }
         let raw_memory_capture_source = if memory_capture_allowed && !secret_redaction.had_secret()
         {
             Some(message_storage.as_str())
@@ -1938,6 +1744,24 @@ impl Agent {
                 turn_execution_path_from_routing(request_hints.routing.as_ref(), direct_state)
                     == TurnExecutionPath::DirectReply;
             if direct_reply_available {
+                if !memory_capture_allowed
+                    && !secret_redaction.had_secret()
+                    && !routing_is_transient_read_only_lookup(request_hints.routing.as_ref())
+                    && (should_enqueue_semantic_user_memory_capture(
+                        message_storage.as_str(),
+                        direct_state,
+                        TurnExecutionPath::DirectReply,
+                    ) || inbound_router_unavailable)
+                {
+                    memory_capture_allowed = true;
+                    memory_capture_allowed_from_semantic_probe = true;
+                }
+                let raw_memory_capture_source =
+                    if memory_capture_allowed && !secret_redaction.had_secret() {
+                        Some(message_storage.as_str())
+                    } else {
+                        None
+                    };
                 if let Some(response) = self
                     .run_direct_memory_response(
                         request_hints.routing.as_ref(),
@@ -1963,77 +1787,7 @@ impl Agent {
                                 user_message_already_recorded,
                                 memory_capture_allowed,
                                 memory_capture_source: raw_memory_capture_source,
-                            },
-                            crate::core::ExecutionRunStatus::Completed.as_str(),
-                            Vec::new(),
-                            Vec::new(),
-                            None,
-                            turn_started_at,
-                            usage_delta,
-                        )
-                        .await;
-                }
-                let direct_local_response = match request_hints.routing.as_ref() {
-                    Some(routing) => {
-                        self.run_direct_local_conversation_response(
-                            routing,
-                            message_storage.as_str(),
-                            &conversation_key,
-                        )
-                        .await
-                    }
-                    None => None,
-                };
-                if let Some(response) = direct_local_response {
-                    let usage_delta = self
-                        .turn_pipeline_usage_snapshot()
-                        .await
-                        .delta_since(usage_before_turn);
-                    return self
-                        .persist_turn_pipeline_exchange(
-                            message_storage.as_str(),
-                            &response,
-                            ImmediateExchangeContext {
-                                channel,
-                                conversation_key: &conversation_key,
-                                is_new_conversation,
-                                project_id,
-                                model_used: DIRECT_CONTEXT_MODEL_USED,
-                                user_message_already_recorded,
-                                memory_capture_allowed,
-                                memory_capture_source: raw_memory_capture_source,
-                            },
-                            crate::core::ExecutionRunStatus::Completed.as_str(),
-                            Vec::new(),
-                            Vec::new(),
-                            None,
-                            turn_started_at,
-                            usage_delta,
-                        )
-                        .await;
-                }
-                if let Some(response) = inbound_direct_response
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    let usage_delta = self
-                        .turn_pipeline_usage_snapshot()
-                        .await
-                        .delta_since(usage_before_turn);
-                    return self
-                        .persist_turn_pipeline_exchange(
-                            message_storage.as_str(),
-                            response,
-                            ImmediateExchangeContext {
-                                channel,
-                                conversation_key: &conversation_key,
-                                is_new_conversation,
-                                project_id,
-                                model_used: "inbound_classifier_direct",
-                                user_message_already_recorded,
-                                memory_capture_allowed,
-                                memory_capture_source: raw_memory_capture_source,
+                                user_message_for_link_capture: Some(message_storage.as_str()),
                             },
                             crate::core::ExecutionRunStatus::Completed.as_str(),
                             Vec::new(),
@@ -2080,6 +1834,7 @@ impl Agent {
                                     user_message_already_recorded,
                                     memory_capture_allowed,
                                     memory_capture_source: raw_memory_capture_source,
+                                    user_message_for_link_capture: Some(message_storage.as_str()),
                                 },
                                 crate::core::ExecutionRunStatus::Completed.as_str(),
                                 Vec::new(),
@@ -2208,6 +1963,7 @@ impl Agent {
                             && (memory_capture_allowed
                                 || visual_attachment_memory_source.is_some()),
                         memory_capture_source,
+                        user_message_for_link_capture: Some(message_storage.as_str()),
                     },
                     processed.run_status.as_deref().unwrap_or("completed"),
                     processed.trace_steps.clone(),
@@ -2243,6 +1999,7 @@ impl Agent {
                         user_message_already_recorded,
                         memory_capture_allowed: false,
                         memory_capture_source: None,
+                        user_message_for_link_capture: Some(message_storage.as_str()),
                     },
                     crate::core::ExecutionRunStatus::PlatformFailed.as_str(),
                     Vec::new(),
@@ -2489,9 +2246,14 @@ impl Agent {
                         .memory_capture_source
                         .as_deref()
                         .unwrap_or(job.message.as_str());
+                    let user_message_for_link_capture = job
+                        .user_message_for_link_capture
+                        .as_deref()
+                        .unwrap_or(job.message.as_str());
                     let queued_memory_capture = self
                         .mark_user_memory_capture_candidate(
                             memory_source,
+                            user_message_for_link_capture,
                             &job.channel,
                             Some(&job.conversation_key),
                             job.project_id.as_deref(),
@@ -2720,6 +2482,9 @@ impl Agent {
             user_message_already_recorded: context.user_message_already_recorded,
             memory_capture_allowed: context.memory_capture_allowed,
             memory_capture_source: context.memory_capture_source.map(str::to_string),
+            user_message_for_link_capture: context
+                .user_message_for_link_capture
+                .map(str::to_string),
             user_message_id: uuid::Uuid::new_v4().to_string(),
             assistant_message_id: uuid::Uuid::new_v4().to_string(),
             user_timestamp: chrono::Utc::now().to_rfc3339(),
@@ -3035,6 +2800,7 @@ impl Agent {
                             user_message_already_recorded,
                             memory_capture_allowed: false,
                             memory_capture_source: None,
+                            user_message_for_link_capture: Some(stored_user_message),
                         },
                     )
                     .await?;
@@ -3227,6 +2993,7 @@ impl Agent {
                                         user_message_already_recorded,
                                         memory_capture_allowed: false,
                                         memory_capture_source: None,
+                                        user_message_for_link_capture: Some(stored_user_message),
                                     },
                                 )
                                 .await?;
@@ -3254,7 +3021,6 @@ impl Agent {
                                 memory_capture_allowed,
                                 routing: Some(routing),
                                 routing_trusted: true,
-                                direct_response: fast.decision.direct_response.clone(),
                             });
                         }
                         crate::security::intent_classifier::IntentVerdict::AllowWithUncheckedTag {
@@ -3279,7 +3045,6 @@ impl Agent {
                                 memory_capture_allowed: false,
                                 routing: Some(routing),
                                 routing_trusted: false,
-                                direct_response: None,
                             });
                         }
                         crate::security::intent_classifier::IntentVerdict::RouterUnavailable {
@@ -3550,6 +3315,7 @@ impl Agent {
                             user_message_already_recorded,
                             memory_capture_allowed: false,
                             memory_capture_source: None,
+                            user_message_for_link_capture: Some(stored_user_message),
                         },
                     )
                     .await?;
@@ -3588,7 +3354,6 @@ impl Agent {
                     memory_capture_allowed: false,
                     routing: Some(routing),
                     routing_trusted: false,
-                    direct_response: None,
                 })
             }
             crate::security::intent_classifier::IntentVerdict::RouterUnavailable { reason } => {
@@ -3616,7 +3381,6 @@ impl Agent {
                     memory_capture_allowed: false,
                     routing: None,
                     routing_trusted: false,
-                    direct_response: None,
                 })
             }
             crate::security::intent_classifier::IntentVerdict::Allow => {
@@ -3633,7 +3397,6 @@ impl Agent {
                     memory_capture_allowed,
                     routing: Some(routing),
                     routing_trusted: true,
-                    direct_response: inbound_decision.direct_response.clone(),
                 })
             }
         }
@@ -3767,6 +3530,9 @@ impl Agent {
             user_message_already_recorded: context.user_message_already_recorded,
             memory_capture_allowed: context.memory_capture_allowed,
             memory_capture_source: context.memory_capture_source.map(str::to_string),
+            user_message_for_link_capture: context
+                .user_message_for_link_capture
+                .map(str::to_string),
             user_message_id: uuid::Uuid::new_v4().to_string(),
             assistant_message_id: uuid::Uuid::new_v4().to_string(),
             user_timestamp: chrono::Utc::now().to_rfc3339(),
@@ -4325,8 +4091,8 @@ mod tests {
     }
 
     #[test]
-    fn speculative_memory_probe_does_not_run_without_router_memory_signal() {
-        assert!(!should_enqueue_semantic_user_memory_capture(
+    fn semantic_memory_probe_runs_for_safe_direct_conversation_turns() {
+        assert!(should_enqueue_semantic_user_memory_capture(
             "I prefer concise status updates.",
             direct_state(),
             TurnExecutionPath::DirectReply
@@ -4335,6 +4101,14 @@ mod tests {
             "what current apps do i have",
             direct_state(),
             TurnExecutionPath::AgentLoop
+        ));
+        assert!(!should_enqueue_semantic_user_memory_capture(
+            "I prefer concise status updates.",
+            DirectConversationRuntimeState {
+                has_pending_actions: true,
+                ..direct_state()
+            },
+            TurnExecutionPath::DirectReply
         ));
     }
 
@@ -4373,29 +4147,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_local_answer_mode_query_uses_routing_signal_not_raw_message() {
-        let routing = crate::security::intent_classifier::InboundRoutingSignal {
-            semantic_queries: vec![
-                "Recall the immediately previous user question in this conversation".to_string(),
-            ],
-            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
-                id: "g1".to_string(),
-                intent_summary: "Identify the previous user turn".to_string(),
-                capability_query: "Visible conversation history lookup".to_string(),
-                expected_outcome: "Answer with the prior user message".to_string(),
-                durability: "none".to_string(),
-                dependencies: Vec::new(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        let query = direct_local_answer_mode_query(&routing).expect("routing query");
-        assert!(query.contains("previous user question"));
-        assert!(query.contains("prior user message"));
-    }
-
-    #[test]
     fn direct_conversation_plain_refusal_is_not_structured_direct_answer() {
         let parsed =
             extract_direct_conversation_json_object("I cannot use live tools from this path.")
@@ -4404,6 +4155,14 @@ mod tests {
                 });
 
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn direct_conversation_prompt_keeps_recent_turn_recall_llm_backed() {
+        let prompt = direct_conversation_system_prompt();
+
+        assert!(prompt.contains("answer from `recent_messages`"));
+        assert!(prompt.contains("without inventing missing history"));
     }
 
     #[test]

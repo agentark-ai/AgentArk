@@ -26,6 +26,8 @@ export type RuntimeHealth = {
   memory_pressure_percent?: number | null;
   memory_used_bytes?: number | null;
   memory_total_bytes?: number | null;
+  memory_source?: string | null;
+  memory_container_count?: number | null;
   disk_read_bytes_per_sec?: number | null;
   disk_write_bytes_per_sec?: number | null;
   temperature_celsius?: number | null;

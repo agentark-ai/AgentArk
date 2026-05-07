@@ -103,10 +103,7 @@ impl Agent {
         }
     }
 
-    fn daily_brief_local_hour(
-        at: chrono::DateTime<chrono::Utc>,
-        tz: Option<chrono_tz::Tz>,
-    ) -> u32 {
+    fn daily_brief_local_hour(at: chrono::DateTime<chrono::Utc>, tz: Option<chrono_tz::Tz>) -> u32 {
         match tz {
             Some(tz) => at.with_timezone(&tz).hour(),
             None => at.hour(),
@@ -135,10 +132,7 @@ impl Agent {
         }
     }
 
-    fn daily_brief_intro(
-        at: chrono::DateTime<chrono::Utc>,
-        tz: Option<chrono_tz::Tz>,
-    ) -> String {
+    fn daily_brief_intro(at: chrono::DateTime<chrono::Utc>, tz: Option<chrono_tz::Tz>) -> String {
         format!(
             "{}. Here's your brief for {}.",
             Self::daily_brief_expected_greeting(at, tz),
@@ -289,10 +283,7 @@ impl Agent {
                 .or_else(|| line.strip_prefix("• "))
                 .or_else(|| {
                     let (prefix, rest) = line.split_once(". ")?;
-                    prefix
-                        .chars()
-                        .all(|c| c.is_ascii_digit())
-                        .then_some(rest)
+                    prefix.chars().all(|c| c.is_ascii_digit()).then_some(rest)
                 })
                 .unwrap_or(line)
                 .trim();
@@ -363,9 +354,8 @@ impl Agent {
             )),
         }
         match input.mail_summary {
-            DailyBriefMailSummary::NotConnected => lines.push(
-                "- Mail is not connected, so unread inbox mail was not checked.".to_string(),
-            ),
+            DailyBriefMailSummary::NotConnected => lines
+                .push("- Mail is not connected, so unread inbox mail was not checked.".to_string()),
             DailyBriefMailSummary::LoadFailed => lines.push(
                 "- Mail is connected, but unread inbox mail could not be loaded.".to_string(),
             ),
@@ -1198,7 +1188,11 @@ impl Agent {
         let knowledge_count = knowledge_count.unwrap_or(0);
         let document_chunk_count = document_chunk_count.unwrap_or(0);
 
-        let learning_queue = self.storage.learning_queue_counts().await.unwrap_or_default();
+        let learning_queue = self
+            .storage
+            .learning_queue_counts()
+            .await
+            .unwrap_or_default();
         let learning_enabled = crate::core::learning::load_learning_enabled(&self.storage).await;
         let self_evolve_enabled_pref = self
             .storage
@@ -1265,11 +1259,7 @@ impl Agent {
                 } else {
                     status
                 };
-                format!(
-                    "{} at {}",
-                    status,
-                    when
-                )
+                format!("{} at {}", status, when)
             })
             .unwrap_or_else(|| "no previous run".to_string());
 
@@ -1577,8 +1567,15 @@ impl Agent {
                 calendar_summary: &calendar_summary,
                 mail_summary: &mail_summary,
             });
-            let body = format!("**Summary**\n{}\n\n**Details**\n{}", summary, detail_lines.join("\n"));
-            return Ok(Self::daily_brief_render(&Self::daily_brief_intro(now, tz), &body));
+            let body = format!(
+                "**Summary**\n{}\n\n**Details**\n{}",
+                summary,
+                detail_lines.join("\n")
+            );
+            return Ok(Self::daily_brief_render(
+                &Self::daily_brief_intro(now, tz),
+                &body,
+            ));
         };
 
         let content = response.content.trim().to_string();
@@ -1610,12 +1607,17 @@ impl Agent {
                 bulletized
             }
         };
-        let body = format!("**Summary**\n{}\n\n**Details**\n{}", summary, detail_lines.join("\n"));
-        Ok(Self::daily_brief_render(&Self::daily_brief_intro(now, tz), &body))
+        let body = format!(
+            "**Summary**\n{}\n\n**Details**\n{}",
+            summary,
+            detail_lines.join("\n")
+        );
+        Ok(Self::daily_brief_render(
+            &Self::daily_brief_intro(now, tz),
+            &body,
+        ))
     }
 
-    /// Generate the daily brief and deliver it via the user's preferred channel.
-    /// Also stores it as a notification (visible in the UI bell).
     async fn dispatch_daily_brief_push_report(
         &self,
         brief: &str,
@@ -1626,15 +1628,17 @@ impl Agent {
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_lowercase());
         let Some(requested) = requested else {
-            return self
+            let attempts = self
                 .notify_preferred_channel_reported_with_hint(brief, None, true)
                 .await;
+            return Self::daily_brief_push_attempts_without_web_fallback(attempts);
         };
 
         if requested == "preferred" {
-            return self
+            let attempts = self
                 .notify_preferred_channel_reported_with_hint(brief, None, true)
                 .await;
+            return Self::daily_brief_push_attempts_without_web_fallback(attempts);
         }
 
         let mut attempts = Vec::new();
@@ -1656,17 +1660,33 @@ impl Agent {
             self.notify_preferred_channel_reported_with_hint(brief, Some(&requested), true)
                 .await,
         );
-        attempts
+        Self::daily_brief_push_attempts_without_web_fallback(attempts)
     }
 
-    pub(super) async fn run_daily_brief_and_notify_reported_with_hint(
+    fn daily_brief_push_attempts_without_web_fallback(
+        attempts: Vec<NotificationDispatchOutcome>,
+    ) -> Vec<NotificationDispatchOutcome> {
+        if attempts
+            .iter()
+            .any(|attempt| attempt.channel != "web" && attempt.channel != "in_app")
+        {
+            return attempts;
+        }
+        vec![NotificationDispatchOutcome::pre_send_failure(
+            "push",
+            "No connected notification integrations available",
+        )]
+    }
+
+    pub(super) async fn run_daily_brief_reported_with_hint(
         &self,
         report_to: Option<&str>,
     ) -> Result<DailyBriefRunResult> {
         let brief = self.build_daily_brief().await?;
-        let in_app = self
-            .emit_notification_with_status("Daily Command Brief", &brief, "info", "daily_brief")
-            .await;
+        let in_app = NotificationDispatchOutcome::pre_send_failure(
+            "web",
+            "Daily brief generation does not create in-app notifications",
+        );
         let push_attempts = self
             .dispatch_daily_brief_push_report(&brief, report_to)
             .await;

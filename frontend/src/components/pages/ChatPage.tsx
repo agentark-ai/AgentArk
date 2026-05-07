@@ -2690,6 +2690,7 @@ type ActivityTimelineCard = {
   detailFull: string;
   summary: string;
   rawDetailFull: string;
+  traceJson?: string;
   payloadView: ActivityPayloadView | null;
   isHeartbeat: boolean;
   time: string;
@@ -3130,6 +3131,15 @@ function compactUnknown(value: unknown, maxLen = 2200): string {
     return `${serialized.slice(0, maxLen)}...`;
   } catch {
     return "";
+  }
+}
+
+function fullTraceJson(value: unknown): string {
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value, null, 2) || "";
+  } catch {
+    return compactUnknown(value, Number.MAX_SAFE_INTEGER);
   }
 }
 
@@ -4263,6 +4273,7 @@ function buildInitialThinkingActivityCard(keyPrefix: string): ActivityTimelineCa
     detailFull: "Understanding the request and preparing the first action.",
     summary: "Understanding the request and preparing the first action.",
     rawDetailFull: "",
+    traceJson: "",
     payloadView: null,
     isHeartbeat: false,
     time: "",
@@ -8499,15 +8510,9 @@ const CHAT_STARTER_DEFAULT_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
   (example) => example.defaultVisible,
 );
 
-const CHAT_STARTER_EXPANDED_SECTIONS = CHAT_STARTER_CATEGORY_ORDER.map(
-  (categoryId) => ({
-    id: categoryId,
-    ...CHAT_STARTER_CATEGORY_META[categoryId],
-    items: CHAT_STARTER_EXAMPLES.filter(
-      (example) => example.category === categoryId && !example.defaultVisible,
-    ),
-  }),
-).filter((section) => section.items.length > 0);
+const CHAT_STARTER_LIBRARY_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
+  (example) => !example.defaultVisible && example.category !== "advanced",
+);
 
 const CHAT_STARTER_ADVANCED_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
   (example) => example.category === "advanced",
@@ -8518,6 +8523,7 @@ const CHAT_SECRET_WARNING =
 const ChatComposerInput = memo(function ChatComposerInput({
   attachedFilesCount,
   composerLocked,
+  deepResearchDisabled,
   deepResearchEnabled,
   isStoppingStream,
   isStreaming,
@@ -8530,6 +8536,7 @@ const ChatComposerInput = memo(function ChatComposerInput({
 }: {
   attachedFilesCount: number;
   composerLocked: boolean;
+  deepResearchDisabled: boolean;
   deepResearchEnabled: boolean;
   isStoppingStream: boolean;
   isStreaming: boolean;
@@ -8598,7 +8605,7 @@ const ChatComposerInput = memo(function ChatComposerInput({
     onAttachFiles();
   };
   const toggleDeepResearchFromMenu = () => {
-    if (isStreaming || composerLocked) return;
+    if (isStreaming || composerLocked || deepResearchDisabled) return;
     onToggleDeepResearch();
     closeComposerOptions();
   };
@@ -8632,7 +8639,7 @@ const ChatComposerInput = memo(function ChatComposerInput({
         <Tooltip title="Options">
           <IconButton
             size="small"
-            className={`chat-composer-action-btn chat-composer-options-btn${optionsOpen || deepResearchEnabled ? " active" : ""}`}
+            className={`chat-composer-action-btn chat-composer-options-btn${optionsOpen || (deepResearchEnabled && !deepResearchDisabled) ? " active" : ""}`}
             aria-label="Composer options"
             aria-controls={optionsOpen ? "chat-composer-options-menu" : undefined}
             aria-haspopup="menu"
@@ -8663,13 +8670,14 @@ const ChatComposerInput = memo(function ChatComposerInput({
           <MenuItem
             className="chat-composer-menu-item"
             onClick={toggleDeepResearchFromMenu}
-            disabled={isStreaming || composerLocked}
+            disabled={isStreaming || composerLocked || deepResearchDisabled}
           >
             <Checkbox
               size="small"
-              checked={deepResearchEnabled}
+              checked={deepResearchEnabled && !deepResearchDisabled}
               tabIndex={-1}
               disableRipple
+              disabled={deepResearchDisabled}
               className="chat-composer-menu-check"
             />
             <span>Deep research</span>
@@ -9361,6 +9369,23 @@ function ChatPageInner({
         : [],
     [shouldPreparePersistedThread, messagesQ.data],
   );
+  const activeConversationMessageCount = Math.max(
+    selectedMessageCount,
+    messages.length,
+  );
+  const activeConversationActivityLoading = Boolean(
+    conversationId && (messagesQ.isLoading || selectedConversationQ.isLoading),
+  );
+  const deepResearchDisabled = Boolean(
+    conversationId &&
+      (activeConversationActivityLoading || activeConversationMessageCount > 0),
+  );
+  useEffect(() => {
+    if (deepResearchDisabled && deepResearchEnabled) {
+      setDeepResearchEnabled(false);
+    }
+  }, [deepResearchDisabled, deepResearchEnabled]);
+
   useEffect(() => {
     const visibleTraceIds = messages
       .map((message) => str(message.trace_id, "").trim())
@@ -11441,6 +11466,7 @@ function ChatPageInner({
       detailFull,
       summary,
       rawDetailFull,
+      traceJson: fullTraceJson(step),
       payloadView,
       isHeartbeat: isHeartbeatStreamingStep(step),
       time,
@@ -11480,6 +11506,7 @@ function ChatPageInner({
         detailFull: "",
         summary: safeDetail,
         rawDetailFull: hideRawPayload ? "" : rawDetail,
+        traceJson: fullTraceJson(record),
         payloadView: hideRawPayload
           ? null
           : buildActivityPayloadViewFromSources(rawDetail, record.data),
@@ -16125,6 +16152,8 @@ function ChatPageInner({
     files: File[] = [],
   ): Promise<boolean> => {
     const trimmed = messageText.trim();
+    const useDeepResearchForSubmit =
+      deepResearchEnabled && !deepResearchDisabled;
     if (
       isStreaming ||
       composerLockedForPlanConfirmation ||
@@ -16145,7 +16174,7 @@ function ChatPageInner({
       }
       clearPlanConfirmationPreviewState();
       setChatNotice(
-        deepResearchEnabled
+        useDeepResearchForSubmit
           ? `Updating the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
           : `Discarding the paused ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()} and sending your message...`,
       );
@@ -16153,7 +16182,7 @@ function ChatPageInner({
 
     setChatError(null);
     void runStreamingChat(trimmed, files, {
-      deepResearch: deepResearchEnabled,
+      deepResearch: useDeepResearchForSubmit,
     });
     return true;
   };
@@ -16976,7 +17005,7 @@ function ChatPageInner({
 
   const applyStarterExample = (example: ChatStarterExample) => {
     queueComposerPrefill(example.prompt);
-    setDeepResearchEnabled(Boolean(example.deepResearch));
+    setDeepResearchEnabled(Boolean(example.deepResearch) && !deepResearchDisabled);
     setChatError(null);
     setChatNotice(null);
   };
@@ -19085,6 +19114,7 @@ function ChatPageInner({
     <ChatComposerInput
       attachedFilesCount={attachedFiles.length}
       composerLocked={composerLockedForPlanConfirmation}
+      deepResearchDisabled={deepResearchDisabled}
       deepResearchEnabled={deepResearchEnabled}
       isStoppingStream={isStoppingStream}
       isStreaming={canStopCurrentRun}
@@ -19369,59 +19399,46 @@ function ChatPageInner({
                     </Box>
                     {starterLibraryExpanded ? (
                       <Box className="chat-starter-library">
-                        {CHAT_STARTER_EXPANDED_SECTIONS.map((section) => (
-                          <Box
-                            key={section.id}
-                            className="chat-starter-section"
-                          >
-                            <Box className="chat-starter-section-head">
-                              <Typography
-                                variant="overline"
-                                className="chat-starter-section-title"
+                        <Box className="chat-starter-grid chat-starter-grid-expanded">
+                          {CHAT_STARTER_LIBRARY_EXAMPLES.map((item) => {
+                            const categoryMeta =
+                              CHAT_STARTER_CATEGORY_META[item.category];
+                            return (
+                              <Button
+                                key={item.id}
+                                variant="outlined"
+                                className="chat-starter-card"
+                                onClick={() => applyStarterExample(item)}
                               >
-                                {section.label}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                className="chat-starter-section-copy"
-                              >
-                                {section.description}
-                              </Typography>
-                            </Box>
-                            <Box className="chat-starter-grid chat-starter-grid-expanded">
-                              {section.items.map((item) => (
-                                <Button
-                                  key={item.id}
-                                  variant="outlined"
-                                  className="chat-starter-card"
-                                  onClick={() => applyStarterExample(item)}
-                                >
-                                  <Box className="chat-starter-card-body">
-                                    {item.deepResearch ? (
-                                      <Box className="chat-starter-card-meta">
-                                        <span className="chat-starter-tag research">
-                                          Deep research
-                                        </span>
-                                      </Box>
+                                <Box className="chat-starter-card-body">
+                                  <Box className="chat-starter-card-meta">
+                                    <span className="chat-starter-tag">
+                                      {categoryMeta.label}
+                                    </span>
+                                    {item.deepResearch &&
+                                    item.category !== "research" ? (
+                                      <span className="chat-starter-tag research">
+                                        Deep research
+                                      </span>
                                     ) : null}
-                                    <Typography
-                                      component="span"
-                                      className="chat-starter-card-title"
-                                    >
-                                      {item.title}
-                                    </Typography>
-                                    <Typography
-                                      component="span"
-                                      className="chat-starter-card-copy"
-                                    >
-                                      {item.summary}
-                                    </Typography>
                                   </Box>
-                                </Button>
-                              ))}
-                            </Box>
-                          </Box>
-                        ))}
+                                  <Typography
+                                    component="span"
+                                    className="chat-starter-card-title"
+                                  >
+                                    {item.title}
+                                  </Typography>
+                                  <Typography
+                                    component="span"
+                                    className="chat-starter-card-copy"
+                                  >
+                                    {item.summary}
+                                  </Typography>
+                                </Box>
+                              </Button>
+                            );
+                          })}
+                        </Box>
                         {CHAT_STARTER_ADVANCED_EXAMPLES.length > 0 ? (
                           <Box className="chat-starter-advanced">
                             <Box className="chat-starter-section-head">

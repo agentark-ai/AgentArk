@@ -4532,7 +4532,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "capability_acquire".to_string(),
-            description: "Scaffold a reusable integration/action when the needed capability does not already exist. Generates a reviewable custom SKILL.md backed by connector_request and/or browser_auto, registers it immediately, and returns the new action plus any remaining auth/config requirements. Do not use this for extension-pack integrations or connector installs; use the extension_pack_* actions for those.".to_string(),
+            description: "Scaffold a reusable capability when the needed capability does not already exist. HTTP/API capabilities are saved as custom API integrations so they appear in Settings > Integrations and register generated API actions. Do not create user skills for API integrations; use skill import/create only when the user is explicitly working with a skill source. Do not use this for extension-pack integrations or connector installs; use the extension_pack_* actions for those.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5148,7 +5148,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "list_integrations".to_string(),
-            description: "List registered integrations, their enablement/connectivity status, and any integration-backed tools currently available. Use when the user asks what integrations are connected, enabled, configured, or available.".to_string(),
+            description: "Return a compact inventory of every AgentArk external surface: built-in integrations, messaging channels, notification channels, custom APIs, webhooks, companion devices, extension packs, plugins, and MCP servers. Use for overview or lightweight connected/authenticated checks; use inspect_integration for one detailed surface record.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5160,6 +5160,42 @@ print(json.dumps({
                     "only_connected": {
                         "type": "boolean",
                         "description": "Only show integrations that are currently connected. Default false."
+                    },
+                    "include_details": {
+                        "type": "boolean",
+                        "description": "Include full per-surface records. Default false; prefer inspect_integration for detail."
+                    }
+                }
+            }),
+            capabilities: vec!["integration_inventory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "inspect_integration".to_string(),
+            description: "Inspect one AgentArk external surface by structured surface id and item id from list_integrations. Supports companion devices, built-in integrations, messaging/notification channels, custom APIs, webhooks, extension packs, plugins, and MCP servers. Returns detailed status without broad catalog output.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "surface": {
+                        "type": "string",
+                        "description": "Surface id from list_integrations, such as companion_devices, integrations, messaging_channels, notification_channels, custom_apis, webhook_sources, extension_packs, plugins, or mcp_servers."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Item id from list_integrations."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional generic fallback search across ids and display names when id is not known."
+                    },
+                    "run_check": {
+                        "type": "boolean",
+                        "description": "Run a safe live/readiness check when the surface supports one. Default false."
                     }
                 }
             }),
@@ -9414,6 +9450,7 @@ print(json.dumps({
                 self.execute_agentark_capability_lookup(arguments).await
             }
             "list_integrations" => self.execute_list_integrations(arguments).await,
+            "inspect_integration" => self.execute_inspect_integration(arguments).await,
             "postgres_schema_inspect" => self.execute_postgres_schema_inspect(arguments).await,
             "postgres_query_readonly" => self.execute_postgres_query_readonly(arguments).await,
             "capability_acquire" => self.execute_capability_acquire(arguments).await,
@@ -10289,31 +10326,1251 @@ print(result["text"])
         }
     }
 
+    fn companion_device_is_connected(state: &crate::core::CompanionDeviceState) -> bool {
+        matches!(
+            state,
+            crate::core::CompanionDeviceState::Online
+                | crate::core::CompanionDeviceState::Idle
+                | crate::core::CompanionDeviceState::Busy
+        )
+    }
+
+    fn connected_surface_item(
+        surface: &str,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        status: impl Into<String>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "surface": surface,
+            "id": id.into(),
+            "name": name.into(),
+            "kind": kind.into(),
+            "status": status.into(),
+        })
+    }
+
+    fn integration_inventory_section_counts(value: &serde_json::Value) -> serde_json::Value {
+        fn array_len(value: &serde_json::Value, key: &str) -> usize {
+            value
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(Vec::len)
+                .unwrap_or(0)
+        }
+
+        serde_json::json!({
+            "builtin_integrations": array_len(value, "integrations"),
+            "gateway_channels": array_len(value, "channels"),
+            "notification_channels": array_len(value, "channels"),
+            "custom_apis": array_len(value, "custom_apis"),
+            "webhook_sources": array_len(value, "sources"),
+            "companion_devices": array_len(value, "devices"),
+        })
+    }
+
+    async fn companion_device_inventory(
+        &self,
+        only_connected: bool,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let Some(storage) = self.storage() else {
+            return (
+                serde_json::json!({
+                    "available": false,
+                    "error": "AgentArk storage is not available in this runtime"
+                }),
+                Vec::new(),
+            );
+        };
+        let plane = crate::core::CompanionControlPlane::new(storage);
+        let devices = match plane.list_devices().await {
+            Ok(devices) => devices,
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                        "available": false,
+                        "error": error.to_string()
+                    }),
+                    Vec::new(),
+                );
+            }
+        };
+        let overview = match plane.overview().await {
+            Ok(overview) => Some(overview),
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                        "available": false,
+                        "error": error.to_string()
+                    }),
+                    Vec::new(),
+                );
+            }
+        };
+        let total = devices.len();
+        let connected_total = devices
+            .iter()
+            .filter(|device| Self::companion_device_is_connected(&device.state))
+            .count();
+        let mut connected_items = Vec::new();
+        let visible_devices = devices
+            .into_iter()
+            .filter(|device| !only_connected || Self::companion_device_is_connected(&device.state))
+            .map(|device| {
+                let connected = Self::companion_device_is_connected(&device.state);
+                if connected {
+                    connected_items.push(Self::connected_surface_item(
+                        "companion_devices",
+                        device.id.clone(),
+                        device.display_name.clone(),
+                        device.platform.clone(),
+                        format!("{:?}", device.state).to_ascii_lowercase(),
+                    ));
+                }
+                serde_json::json!({
+                    "id": device.id,
+                    "display_name": device.display_name,
+                    "preset_id": device.preset_id,
+                    "platform": device.platform,
+                    "model": device.model,
+                    "state": device.state,
+                    "connected": connected,
+                    "transport": device.transport,
+                    "available_capabilities": device.available_capabilities,
+                    "granted_capabilities": device.granted_capabilities,
+                    "token_capabilities": device.token_capabilities,
+                    "paired_at": device.paired_at,
+                    "last_seen_at": device.last_seen_at,
+                    "owner": device.owner,
+                    "command_count": device.command_count,
+                    "attestation": {
+                        "verified": device.attestation.verified,
+                        "provider": device.attestation.provider,
+                        "platform": device.attestation.platform,
+                        "verified_at": device.attestation.verified_at,
+                        "reason": device.attestation.reason,
+                    },
+                    "trusted_unattested": device.trusted_unattested,
+                })
+            })
+            .collect::<Vec<_>>();
+        (
+            serde_json::json!({
+                "available": true,
+                "surface": "companion_devices",
+                "overview": overview,
+                "total": total,
+                "connected_total": connected_total,
+                "filtered_to_connected": only_connected,
+                "devices": visible_devices,
+            }),
+            connected_items,
+        )
+    }
+
+    fn integration_status_label(status: &crate::integrations::IntegrationStatus) -> String {
+        match status {
+            crate::integrations::IntegrationStatus::NotConfigured => "not_configured".to_string(),
+            crate::integrations::IntegrationStatus::NeedsAuth => "needs_auth".to_string(),
+            crate::integrations::IntegrationStatus::Connected => "connected".to_string(),
+            crate::integrations::IntegrationStatus::Error(_) => "error".to_string(),
+        }
+    }
+
+    async fn builtin_integrations_inventory(
+        &self,
+        only_connected: bool,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
+        let mut rows = Vec::new();
+        let mut connected_items = Vec::new();
+        for info in manager.list().await {
+            let enabled = manager.is_enabled(&info.id);
+            let connected = enabled
+                && matches!(
+                    info.status,
+                    crate::integrations::IntegrationStatus::Connected
+                );
+            if connected {
+                connected_items.push(Self::connected_surface_item(
+                    "integrations",
+                    info.id.clone(),
+                    info.name.clone(),
+                    "builtin",
+                    "connected",
+                ));
+            }
+            if only_connected && !connected {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "id": info.id,
+                "name": info.name,
+                "description": info.description,
+                "icon": info.icon,
+                "capabilities": info.capabilities,
+                "status": info.status,
+                "status_label": Self::integration_status_label(&info.status),
+                "enabled_for_agent": enabled,
+                "connected": connected,
+            }));
+        }
+        let total = rows.len();
+        (
+            serde_json::json!({
+                "available": true,
+                "surface": "builtin_integrations",
+                "filtered_to_connected": only_connected,
+                "visible_total": total,
+                "connected_total": connected_items.len(),
+                "integrations": rows,
+            }),
+            connected_items,
+        )
+    }
+
+    fn email_notification_configured_from_config(&self, config: &crate::core::AgentConfig) -> bool {
+        let mut backends = Vec::new();
+        if crate::integrations::effective_integration_enabled(&self.config_dir, "gmail")
+            && self
+                .settings_manager()
+                .ok()
+                .and_then(|manager| manager.get_custom_secret("gmail_tokens").ok().flatten())
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GMAIL.to_string());
+        }
+        if crate::integrations::effective_integration_enabled(&self.config_dir, "google_workspace")
+            && crate::actions::google_workspace::granted_bundles(&self.config_dir)
+                .map(|bundles| bundles.iter().any(|bundle| bundle == "gmail"))
+                .unwrap_or(false)
+        {
+            backends.push(crate::core::email_delivery::EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string());
+        }
+        if crate::core::email_delivery::external_email_delivery_is_ready(&config.email) {
+            if let Some(provider_id) =
+                crate::core::email_delivery::external_email_provider_id(&config.email)
+            {
+                if !backends.iter().any(|existing| existing == &provider_id) {
+                    backends.push(provider_id);
+                }
+            }
+        }
+        crate::core::email_delivery::email_channel_is_ready(&config.email.provider, &backends)
+    }
+
+    async fn gateway_channels_inventory(
+        &self,
+        only_connected: bool,
+    ) -> (
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        BTreeMap<String, bool>,
+    ) {
+        let Some(storage) = self.storage() else {
+            return (
+                serde_json::json!({
+                    "available": false,
+                    "error": "AgentArk storage is not available in this runtime"
+                }),
+                Vec::new(),
+                BTreeMap::new(),
+            );
+        };
+        let config = match self.settings_manager().and_then(|manager| manager.load()) {
+            Ok(config) => config,
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                        "available": false,
+                        "error": error.to_string()
+                    }),
+                    Vec::new(),
+                    BTreeMap::new(),
+                );
+            }
+        };
+        let payload = match crate::core::load_gateway_channels(&storage, &config).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                        "available": false,
+                        "error": error.to_string()
+                    }),
+                    Vec::new(),
+                    BTreeMap::new(),
+                );
+            }
+        };
+        let mut configured = BTreeMap::new();
+        let mut connected_items = Vec::new();
+        let mut channels = Vec::new();
+        for channel in payload.channels {
+            let connected = channel.enabled
+                && (matches!(
+                    channel.status.as_str(),
+                    "connected" | "ready" | "configured"
+                ) || channel.connected_account_count > 0);
+            configured.insert(channel.id.clone(), channel.configured || connected);
+            if connected {
+                connected_items.push(Self::connected_surface_item(
+                    "messaging_channels",
+                    channel.id.clone(),
+                    channel.name.clone(),
+                    channel.kind.clone(),
+                    channel.status.clone(),
+                ));
+            }
+            if only_connected && !connected {
+                continue;
+            }
+            let mut value = serde_json::to_value(channel).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert("connected".to_string(), serde_json::json!(connected));
+            }
+            channels.push(value);
+        }
+        let accounts = if only_connected {
+            payload
+                .accounts
+                .into_iter()
+                .filter(|account| {
+                    account.enabled
+                        && matches!(
+                            account.status.trim().to_ascii_lowercase().as_str(),
+                            "connected" | "ready" | "syncing"
+                        )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            payload.accounts
+        };
+        (
+            serde_json::json!({
+                "available": true,
+                "surface": "gateway_channels",
+                "summary": payload.summary,
+                "filtered_to_connected": only_connected,
+                "channels": channels,
+                "accounts": accounts,
+            }),
+            connected_items,
+            configured,
+        )
+    }
+
+    async fn messaging_channels_inventory(
+        &self,
+        only_connected: bool,
+        bundled_configured: &BTreeMap<String, bool>,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let Some(storage) = self.storage() else {
+            return (
+                serde_json::json!({
+                    "available": false,
+                    "error": "AgentArk storage is not available in this runtime"
+                }),
+                Vec::new(),
+            );
+        };
+        let Some(registry) = self.extension_pack_registry.clone() else {
+            return (
+                serde_json::json!({
+                    "available": false,
+                    "error": "Extension-pack registry is not available in this runtime"
+                }),
+                Vec::new(),
+            );
+        };
+        let config = self
+            .settings_manager()
+            .and_then(|manager| manager.load())
+            .ok();
+        let email_configured = config
+            .as_ref()
+            .is_some_and(|config| self.email_notification_configured_from_config(config));
+        let config_manager = self.settings_manager().ok();
+        let packs_guard = registry.read().await;
+        let bundled_check = |channel_id: &str| -> bool {
+            let normalized = channel_id.trim().to_ascii_lowercase();
+            if normalized == "email" {
+                return email_configured;
+            }
+            bundled_configured
+                .get(&normalized)
+                .copied()
+                .unwrap_or(false)
+        };
+        let ctx = crate::channels::messaging_registry::ChannelQueryContext {
+            bundled_configured: &bundled_check,
+            extension_packs: &*packs_guard,
+            storage: &storage,
+            config_dir: &self.config_dir,
+            data_dir: self.data_dir(),
+            config_manager: config_manager.as_ref(),
+        };
+        let descriptors = match crate::channels::messaging_registry::MessagingChannelRegistry::new()
+            .list(&ctx)
+            .await
+        {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                        "available": false,
+                        "error": error.to_string()
+                    }),
+                    Vec::new(),
+                );
+            }
+        };
+        let mut connected_items = Vec::new();
+        let mut channels = Vec::new();
+        for descriptor in descriptors {
+            if descriptor.configured {
+                connected_items.push(Self::connected_surface_item(
+                    "notification_channels",
+                    descriptor.id.clone(),
+                    descriptor.display_name.clone(),
+                    match &descriptor.source {
+                        crate::channels::messaging_registry::ChannelSource::Bundled => "bundled",
+                        crate::channels::messaging_registry::ChannelSource::ExtensionPack { .. } => {
+                            "extension_pack"
+                        }
+                        crate::channels::messaging_registry::ChannelSource::CustomMessagingChannel {
+                            ..
+                        } => "custom_messaging_channel",
+                    },
+                    "configured",
+                ));
+            }
+            if only_connected && !descriptor.configured {
+                continue;
+            }
+            let mut value = serde_json::to_value(descriptor).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "connected".to_string(),
+                    object
+                        .get("configured")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!(false)),
+                );
+            }
+            channels.push(value);
+        }
+        (
+            serde_json::json!({
+                "available": true,
+                "surface": "notification_channels",
+                "filtered_to_connected": only_connected,
+                "connected_total": connected_items.len(),
+                "channels": channels,
+            }),
+            connected_items,
+        )
+    }
+
+    async fn custom_apis_inventory(
+        &self,
+        only_connected: bool,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let Some(storage) = self.storage() else {
+            return (
+                serde_json::json!({
+                    "available": false,
+                    "error": "AgentArk storage is not available in this runtime"
+                }),
+                Vec::new(),
+            );
+        };
+        let apis =
+            match crate::custom_apis::list_custom_apis(&storage, &self.config_dir, self.data_dir())
+                .await
+            {
+                Ok(apis) => apis,
+                Err(error) => {
+                    return (
+                        serde_json::json!({
+                            "available": false,
+                            "error": error.to_string()
+                        }),
+                        Vec::new(),
+                    );
+                }
+            };
+        let total = apis.len();
+        let mut rows = Vec::new();
+        let mut connected_items = Vec::new();
+        for api in apis {
+            let connected = api.config.enabled
+                && api.action_count > 0
+                && (matches!(
+                    api.config.auth_mode,
+                    crate::custom_apis::CustomApiAuthMode::None
+                ) || api.secret_configured);
+            if connected {
+                connected_items.push(Self::connected_surface_item(
+                    "custom_apis",
+                    api.config.id.clone(),
+                    api.config.name.clone(),
+                    "custom_api",
+                    "connected",
+                ));
+            }
+            if only_connected && !connected {
+                continue;
+            }
+            let mut value = serde_json::to_value(api).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert("connected".to_string(), serde_json::json!(connected));
+            }
+            rows.push(value);
+        }
+        (
+            serde_json::json!({
+                "available": true,
+                "surface": "custom_apis",
+                "total": total,
+                "connected_total": connected_items.len(),
+                "filtered_to_connected": only_connected,
+                "custom_apis": rows,
+            }),
+            connected_items,
+        )
+    }
+
+    async fn webhook_sources_inventory(
+        &self,
+        only_connected: bool,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let Some(storage) = self.storage() else {
+            return (
+                serde_json::json!({
+                    "available": false,
+                    "error": "AgentArk storage is not available in this runtime"
+                }),
+                Vec::new(),
+            );
+        };
+        let payload = match crate::channels::http::webhooks::list_webhook_source_inventory(
+            &storage,
+            &self.config_dir,
+            self.data_dir(),
+            only_connected,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                        "available": false,
+                        "error": error.to_string()
+                    }),
+                    Vec::new(),
+                );
+            }
+        };
+        let connected_items = payload
+            .get("sources")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|source| {
+                source
+                    .get("connected")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            })
+            .map(|source| {
+                Self::connected_surface_item(
+                    "webhook_sources",
+                    source
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    source
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    source
+                        .get("provider")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("webhook"),
+                    "connected",
+                )
+            })
+            .collect::<Vec<_>>();
+        (payload, connected_items)
+    }
+
+    fn plugin_connected(plugin: &crate::plugins::registry::PluginView) -> bool {
+        plugin.plugin.enabled
+            && plugin.plugin.last_error.is_none()
+            && (matches!(
+                plugin.plugin.auth_mode,
+                crate::plugins::registry::PluginAuthMode::None
+            ) || plugin.token_configured)
+    }
+
+    async fn plugins_inventory(
+        &self,
+        only_connected: bool,
+    ) -> (
+        Option<Vec<crate::plugins::registry::PluginView>>,
+        Vec<serde_json::Value>,
+    ) {
+        let Some(registry) = self.plugin_registry.clone() else {
+            return (None, Vec::new());
+        };
+        let guard = registry.read().await;
+        let plugins = match guard.list_plugins().await {
+            Ok(plugins) => plugins,
+            Err(_) => return (None, Vec::new()),
+        };
+        let mut visible = Vec::new();
+        let mut connected_items = Vec::new();
+        for plugin in plugins {
+            let connected = Self::plugin_connected(&plugin);
+            if connected {
+                connected_items.push(Self::connected_surface_item(
+                    "plugins",
+                    plugin.plugin.id.clone(),
+                    plugin.plugin.name.clone(),
+                    "plugin",
+                    "connected",
+                ));
+            }
+            if !only_connected || connected {
+                visible.push(plugin);
+            }
+        }
+        (Some(visible), connected_items)
+    }
+
+    fn mcp_server_connected(server: &crate::mcp::registry::McpServerView) -> bool {
+        server.enabled
+            && server.last_error.is_none()
+            && (server.tool_count > 0 || (server.resources_enabled && server.resource_count > 0))
+    }
+
+    async fn mcp_servers_inventory(
+        &self,
+        only_connected: bool,
+    ) -> (
+        Option<Vec<crate::mcp::registry::McpServerView>>,
+        Vec<serde_json::Value>,
+    ) {
+        let Some(registry) = self.mcp_registry.clone() else {
+            return (None, Vec::new());
+        };
+        let guard = registry.read().await;
+        let servers = match guard.list_servers(false).await {
+            Ok(servers) => servers,
+            Err(_) => return (None, Vec::new()),
+        };
+        let mut visible = Vec::new();
+        let mut connected_items = Vec::new();
+        for server in servers {
+            let connected = Self::mcp_server_connected(&server);
+            if connected {
+                connected_items.push(Self::connected_surface_item(
+                    "mcp_servers",
+                    server.id.clone(),
+                    server.name.clone(),
+                    "mcp_server",
+                    "connected",
+                ));
+            }
+            if !only_connected || connected {
+                visible.push(server);
+            }
+        }
+        (Some(visible), connected_items)
+    }
+
     async fn execute_list_integrations(&self, arguments: &serde_json::Value) -> Result<String> {
         let query = arguments.get("query").and_then(|value| value.as_str());
         let kind = arguments.get("kind").and_then(|value| value.as_str());
+        let only_connected = arguments
+            .get("only_connected")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let include_details = arguments
+            .get("include_details")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         let packs = if let Some(registry) = self.extension_pack_registry.clone() {
             let guard = registry.read().await;
             Some(guard.search_packs(query, kind).await?)
         } else {
             None
         };
-        let plugins = if let Some(registry) = self.plugin_registry.clone() {
-            let guard = registry.read().await;
-            Some(guard.list_plugins().await?)
-        } else {
-            None
+        let mut connected_items = Vec::new();
+        if let Some(packs) = packs.as_ref() {
+            for pack in &packs.installed {
+                let connected =
+                    pack.enabled && matches!(pack.status.as_str(), "ready" | "connected");
+                if connected && (!only_connected || connected) {
+                    connected_items.push(Self::connected_surface_item(
+                        "extension_packs",
+                        pack.manifest.id.clone(),
+                        pack.manifest.name.clone(),
+                        "extension_pack",
+                        pack.status.clone(),
+                    ));
+                }
+            }
+        }
+        let (plugins, plugin_connected) = self.plugins_inventory(only_connected).await;
+        connected_items.extend(plugin_connected);
+        let (mcp_servers, mcp_connected) = self.mcp_servers_inventory(only_connected).await;
+        connected_items.extend(mcp_connected);
+        let (builtin_integrations, builtin_connected) =
+            self.builtin_integrations_inventory(only_connected).await;
+        connected_items.extend(builtin_connected);
+        let (gateway_channels, gateway_connected, bundled_configured) =
+            self.gateway_channels_inventory(only_connected).await;
+        connected_items.extend(gateway_connected);
+        let (messaging_channels, messaging_connected) = self
+            .messaging_channels_inventory(only_connected, &bundled_configured)
+            .await;
+        connected_items.extend(messaging_connected);
+        let (custom_apis, custom_api_connected) = self.custom_apis_inventory(only_connected).await;
+        connected_items.extend(custom_api_connected);
+        let (webhook_sources, webhook_connected) =
+            self.webhook_sources_inventory(only_connected).await;
+        connected_items.extend(webhook_connected);
+        let (companion_devices, companion_connected) =
+            self.companion_device_inventory(only_connected).await;
+        connected_items.extend(companion_connected);
+        connected_items.sort_by(|left, right| {
+            let left_key = format!(
+                "{}:{}",
+                left.get("surface")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                left.get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+            );
+            let right_key = format!(
+                "{}:{}",
+                right
+                    .get("surface")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                right
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+            );
+            left_key.cmp(&right_key)
+        });
+        let mut section_counts = serde_json::Map::new();
+        section_counts.insert(
+            "builtin_integrations".to_string(),
+            Self::integration_inventory_section_counts(&builtin_integrations)
+                .get("builtin_integrations")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(0)),
+        );
+        section_counts.insert(
+            "gateway_channels".to_string(),
+            Self::integration_inventory_section_counts(&gateway_channels)
+                .get("gateway_channels")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(0)),
+        );
+        section_counts.insert(
+            "notification_channels".to_string(),
+            Self::integration_inventory_section_counts(&messaging_channels)
+                .get("notification_channels")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(0)),
+        );
+        section_counts.insert(
+            "custom_apis".to_string(),
+            Self::integration_inventory_section_counts(&custom_apis)
+                .get("custom_apis")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(0)),
+        );
+        section_counts.insert(
+            "webhook_sources".to_string(),
+            Self::integration_inventory_section_counts(&webhook_sources)
+                .get("webhook_sources")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(0)),
+        );
+        section_counts.insert(
+            "companion_devices".to_string(),
+            Self::integration_inventory_section_counts(&companion_devices)
+                .get("companion_devices")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(0)),
+        );
+        section_counts.insert(
+            "extension_packs_installed".to_string(),
+            serde_json::json!(packs
+                .as_ref()
+                .map(|packs| packs.installed.len())
+                .unwrap_or_default()),
+        );
+        section_counts.insert(
+            "plugins".to_string(),
+            serde_json::json!(plugins.as_ref().map(Vec::len).unwrap_or_default()),
+        );
+        section_counts.insert(
+            "mcp_servers".to_string(),
+            serde_json::json!(mcp_servers.as_ref().map(Vec::len).unwrap_or_default()),
+        );
+
+        let mut payload = serde_json::json!({
+            "connected_agentark_surfaces": {
+                "total": connected_items.len(),
+                "items": connected_items,
+            },
+            "section_counts": section_counts,
+            "detail_available_via": "inspect_integration",
+        });
+        if include_details {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("builtin_integrations".to_string(), builtin_integrations);
+                object.insert("gateway_channels".to_string(), gateway_channels);
+                object.insert("notification_channels".to_string(), messaging_channels);
+                object.insert("custom_apis".to_string(), custom_apis);
+                object.insert("webhook_sources".to_string(), webhook_sources);
+                object.insert("companion_devices".to_string(), companion_devices);
+                object.insert("extension_packs".to_string(), serde_json::to_value(packs)?);
+                object.insert("plugins".to_string(), serde_json::to_value(plugins)?);
+                object.insert(
+                    "mcp_servers".to_string(),
+                    serde_json::to_value(mcp_servers)?,
+                );
+            }
+        }
+        Ok(serde_json::to_string_pretty(&payload)?)
+    }
+
+    fn integration_inspect_terms(value: Option<&str>) -> Vec<String> {
+        value
+            .unwrap_or_default()
+            .split(|ch: char| !ch.is_alphanumeric())
+            .map(|part| part.trim().to_ascii_lowercase())
+            .filter(|part| part.chars().count() >= 2)
+            .collect()
+    }
+
+    fn integration_value_text(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+            serde_json::Value::String(text) => {
+                out.push(' ');
+                out.push_str(&text.to_ascii_lowercase());
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::integration_value_text(item, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    out.push(' ');
+                    out.push_str(&key.to_ascii_lowercase());
+                    Self::integration_value_text(item, out);
+                }
+            }
+        }
+    }
+
+    fn integration_value_matches(
+        value: &serde_json::Value,
+        id: Option<&str>,
+        query_terms: &[String],
+    ) -> bool {
+        if let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) {
+            let id_lower = id.to_ascii_lowercase();
+            if let Some(map) = value.as_object() {
+                for key in [
+                    "id",
+                    "name",
+                    "display_name",
+                    "runtime_channel_id",
+                    "channel_id",
+                    "pack_id",
+                ] {
+                    if map
+                        .get(key)
+                        .and_then(|item| item.as_str())
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(id))
+                    {
+                        return true;
+                    }
+                }
+                if let Some(manifest) = map.get("manifest").and_then(|item| item.as_object()) {
+                    for key in ["id", "name"] {
+                        if manifest
+                            .get(key)
+                            .and_then(|item| item.as_str())
+                            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(id))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                if let Some(connection) = map.get("connection").and_then(|item| item.as_object()) {
+                    for key in ["id", "name", "pack_id"] {
+                        if connection
+                            .get(key)
+                            .and_then(|item| item.as_str())
+                            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(id))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            let mut text = String::new();
+            Self::integration_value_text(value, &mut text);
+            if text.split_whitespace().any(|part| part == id_lower) {
+                return true;
+            }
+        }
+
+        if query_terms.is_empty() {
+            return false;
+        }
+        let mut text = String::new();
+        Self::integration_value_text(value, &mut text);
+        query_terms.iter().all(|term| text.contains(term))
+    }
+
+    fn integration_find_matches(
+        items: impl IntoIterator<Item = serde_json::Value>,
+        id: Option<&str>,
+        query_terms: &[String],
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        items
+            .into_iter()
+            .filter(|item| Self::integration_value_matches(item, id, query_terms))
+            .take(limit)
+            .collect()
+    }
+
+    fn requested_surface_matches(requested: Option<&str>, candidates: &[&str]) -> bool {
+        let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+            return true;
         };
-        let mcp_servers = if let Some(registry) = self.mcp_registry.clone() {
-            let guard = registry.read().await;
-            Some(guard.list_servers(false).await?)
-        } else {
-            None
-        };
+        candidates
+            .iter()
+            .any(|candidate| requested.eq_ignore_ascii_case(candidate))
+    }
+
+    async fn execute_inspect_integration(&self, arguments: &serde_json::Value) -> Result<String> {
+        let surface = arguments
+            .get("surface")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let id = arguments
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let run_check = arguments
+            .get("run_check")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if id.is_none() && query.is_none() {
+            anyhow::bail!("inspect_integration requires an id or query");
+        }
+        let query_terms = Self::integration_inspect_terms(query);
+        let mut matches = Vec::new();
+        let mut checks = Vec::new();
+
+        if Self::requested_surface_matches(surface, &["companion_devices", "companion_device"]) {
+            let (payload, _) = self.companion_device_inventory(false).await;
+            let devices = payload
+                .get("devices")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for record in Self::integration_find_matches(devices, id, &query_terms, 8) {
+                matches.push(serde_json::json!({
+                    "surface": "companion_devices",
+                    "record": record,
+                    "safe_check": {
+                        "ran": true,
+                        "kind": "stored_websocket_presence",
+                        "connected": record.get("connected").and_then(|value| value.as_bool()).unwrap_or(false),
+                        "state": record.get("state"),
+                        "last_seen_at": record.get("last_seen_at"),
+                    }
+                }));
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["integrations", "builtin_integrations"]) {
+            let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
+            for info in manager.list().await {
+                let value = serde_json::json!({
+                    "id": info.id,
+                    "name": info.name,
+                    "description": info.description,
+                    "icon": info.icon,
+                    "capabilities": info.capabilities,
+                    "status": info.status,
+                    "status_label": Self::integration_status_label(&info.status),
+                    "enabled_for_agent": manager.is_enabled(&info.id),
+                });
+                if !Self::integration_value_matches(&value, id, &query_terms) {
+                    continue;
+                }
+                let safe_check = if run_check {
+                    Some(serde_json::json!({
+                        "ran": true,
+                        "kind": "readiness_status",
+                        "ready_for_agent": manager.is_ready(&info.id).await,
+                    }))
+                } else {
+                    None
+                };
+                matches.push(serde_json::json!({
+                    "surface": "integrations",
+                    "record": value,
+                    "safe_check": safe_check,
+                }));
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["gateway_channels", "messaging_channels"]) {
+            let (payload, _, _) = self.gateway_channels_inventory(false).await;
+            let channels = payload
+                .get("channels")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for record in Self::integration_find_matches(channels, id, &query_terms, 8) {
+                matches.push(serde_json::json!({
+                    "surface": "gateway_channels",
+                    "record": record,
+                    "safe_check": {
+                        "ran": true,
+                        "kind": "stored_channel_status",
+                        "connected": record.get("connected").and_then(|value| value.as_bool()).unwrap_or(false),
+                        "status": record.get("status"),
+                    }
+                }));
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["notification_channels"]) {
+            let (_, _, bundled_configured) = self.gateway_channels_inventory(false).await;
+            let (payload, _) = self
+                .messaging_channels_inventory(false, &bundled_configured)
+                .await;
+            let channels = payload
+                .get("channels")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for record in Self::integration_find_matches(channels, id, &query_terms, 8) {
+                matches.push(serde_json::json!({
+                    "surface": "notification_channels",
+                    "record": record,
+                    "safe_check": {
+                        "ran": true,
+                        "kind": "configured_state",
+                        "connected": record.get("connected").and_then(|value| value.as_bool()).unwrap_or(false),
+                    }
+                }));
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["custom_apis", "custom_api"]) {
+            let (payload, _) = self.custom_apis_inventory(false).await;
+            let apis = payload
+                .get("custom_apis")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for record in Self::integration_find_matches(apis, id, &query_terms, 8) {
+                let mut safe_check = serde_json::json!({
+                    "ran": false,
+                    "kind": "custom_api_test",
+                    "reason": "run_check was false",
+                });
+                if run_check {
+                    if let (Some(storage), Some(api_id)) = (
+                        self.storage(),
+                        record.get("id").and_then(|value| value.as_str()),
+                    ) {
+                        safe_check = match Box::pin(crate::custom_apis::test_custom_api(
+                            &storage,
+                            &self.config_dir,
+                            self.data_dir(),
+                            self,
+                            api_id,
+                        ))
+                        .await
+                        {
+                            Ok(result) => serde_json::json!({
+                                "ran": true,
+                                "kind": "custom_api_test",
+                                "ok": result.ok,
+                                "action_name": result.action_name,
+                                "detail": result.detail,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "ran": true,
+                                "kind": "custom_api_test",
+                                "ok": false,
+                                "error": error.to_string(),
+                            }),
+                        };
+                    }
+                }
+                matches.push(serde_json::json!({
+                    "surface": "custom_apis",
+                    "record": record,
+                    "safe_check": safe_check,
+                }));
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["webhook_sources", "webhooks"]) {
+            let (payload, _) = self.webhook_sources_inventory(false).await;
+            let sources = payload
+                .get("sources")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for record in Self::integration_find_matches(sources, id, &query_terms, 8) {
+                matches.push(serde_json::json!({
+                    "surface": "webhook_sources",
+                    "record": record,
+                    "safe_check": {
+                        "ran": true,
+                        "kind": "stored_secret_and_enabled_state",
+                        "connected": record.get("connected").and_then(|value| value.as_bool()).unwrap_or(false),
+                        "secret_configured": record.get("secret_configured"),
+                    }
+                }));
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["extension_packs", "extension_pack"]) {
+            if let Some(registry) = self.extension_pack_registry.clone() {
+                let guard = registry.read().await;
+                let packs = guard.search_packs(None, None).await?;
+                let installed = packs
+                    .installed
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for record in Self::integration_find_matches(installed, id, &query_terms, 8) {
+                    let pack_id = record
+                        .get("manifest")
+                        .and_then(|manifest| manifest.get("id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    let connections = guard
+                        .list_connections(pack_id)
+                        .await
+                        .ok()
+                        .and_then(|value| serde_json::to_value(value).ok())
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    let events = guard
+                        .list_events(pack_id, 10)
+                        .await
+                        .ok()
+                        .and_then(|value| serde_json::to_value(value).ok());
+                    matches.push(serde_json::json!({
+                        "surface": "extension_packs",
+                        "record": record,
+                        "connections": connections,
+                        "recent_events": events,
+                        "safe_check": {
+                            "ran": true,
+                            "kind": "connection_state",
+                        }
+                    }));
+                }
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["plugins"]) {
+            if let Some(registry) = self.plugin_registry.clone() {
+                let guard = registry.read().await;
+                let plugins = guard
+                    .list_plugins()
+                    .await?
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for record in Self::integration_find_matches(plugins, id, &query_terms, 8) {
+                    matches.push(serde_json::json!({
+                        "surface": "plugins",
+                        "record": record,
+                        "safe_check": {
+                            "ran": true,
+                            "kind": "stored_plugin_status",
+                            "connected": record.get("enabled").and_then(|value| value.as_bool()).unwrap_or(false)
+                                && record.get("last_error").is_none(),
+                        }
+                    }));
+                }
+            }
+        }
+
+        if Self::requested_surface_matches(surface, &["mcp_servers", "mcp"]) {
+            if let Some(registry) = self.mcp_registry.clone() {
+                let guard = registry.read().await;
+                let servers = guard
+                    .list_servers(true)
+                    .await?
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for record in Self::integration_find_matches(servers, id, &query_terms, 8) {
+                    matches.push(serde_json::json!({
+                        "surface": "mcp_servers",
+                        "record": record,
+                        "safe_check": {
+                            "ran": true,
+                            "kind": "registered_tool_resource_state",
+                            "connected": record.get("enabled").and_then(|value| value.as_bool()).unwrap_or(false)
+                                && record.get("last_error").is_none(),
+                        }
+                    }));
+                }
+            }
+        }
+
+        checks.push(serde_json::json!({
+            "run_check_requested": run_check,
+            "matches_returned": matches.len(),
+            "truncation_avoidance": "list_integrations returns compact overview by default; this action returns targeted detail.",
+        }));
+
         Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "extension_packs": packs,
-            "plugins": plugins,
-            "mcp_servers": mcp_servers,
+            "status": if matches.is_empty() { "not_found" } else { "ok" },
+            "surface": surface,
+            "id": id,
+            "query": query,
+            "matches": matches,
+            "diagnostics": checks,
         }))?)
     }
 
@@ -12812,6 +14069,56 @@ print(result["text"])
             .extension_pack_registry
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        let requested_pack_id = request
+            .pack_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let has_explicit_source = request
+            .source_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || request
+                .source_path
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || request
+                .manifest_text
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || request.manifest.is_some();
+        if let Some(pack_id) = requested_pack_id.as_deref().filter(|_| !has_explicit_source) {
+            let existing_or_catalog = {
+                let guard = registry.read().await;
+                guard.get_pack(pack_id).await?
+            };
+            match existing_or_catalog {
+                Some(view) if view.installed => {
+                    return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "already_installed",
+                        "installed": true,
+                        "pack_id": view.manifest.id,
+                        "message": "Extension pack is already installed.",
+                        "pack": view,
+                    }))?);
+                }
+                None => {
+                    return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "catalog_miss",
+                        "installed": false,
+                        "pack_id": pack_id,
+                        "message": "No bundled extension pack matched this id, so no pack was installed from the catalog.",
+                        "next_steps": [
+                            "Install from source_url, source_path, manifest_text, or manifest when a pack source exists.",
+                            "Use extension_pack_scaffold for a draft manifest-based pack.",
+                            "Use capability_acquire for HTTP/API integrations that should be saved as custom API integrations."
+                        ]
+                    }))?);
+                }
+                _ => {}
+            }
+        }
         let pack = {
             let mut guard = registry.write().await;
             guard.install(request).await?
@@ -13527,57 +14834,370 @@ print(result["text"])
                 "Generated action name is empty after normalization"
             ));
         }
-        let content = self.render_capability_action_markdown(&arguments, &name, description);
-        let force = arguments
-            .get("force")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let verdict = self.create_action(&name, &content, force).await?;
-        let mut lines = vec![
-            format!("Capability scaffolded as action `{}`.", name),
-            "It is now available immediately in the action catalog.".to_string(),
-        ];
-        if let Some(kind) = arguments.get("kind").and_then(|value| value.as_str()) {
-            lines.push(format!("Mode: {}", kind));
+        if Self::capability_acquire_has_http_endpoint(&arguments) {
+            return self
+                .execute_capability_acquire_custom_api(&arguments, &name, description)
+                .await;
         }
-        if let Some(base_url) = arguments.get("base_url").and_then(|value| value.as_str()) {
-            lines.push(format!("Base URL: {}", base_url));
+        Err(anyhow::anyhow!(
+            "capability_acquire only saves API integrations. Use the explicit Skills import/create flow for user skills, or extension-pack actions for manifest-based integrations."
+        ))
+    }
+
+    fn capability_acquire_has_http_endpoint(arguments: &serde_json::Value) -> bool {
+        let kind = Self::capability_string_argument(arguments, "kind")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if kind == "web_automation" {
+            return false;
         }
-        if let Some(path) = arguments.get("path").and_then(|value| value.as_str()) {
-            lines.push(format!("Primary endpoint: {}", path));
-        }
-        if let Some(method) = arguments.get("method").and_then(|value| value.as_str()) {
-            lines.push(format!("Method: {}", method.to_ascii_uppercase()));
-        }
-        if let Some(secret_name) = arguments
-            .get("auth_secret_name")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
+        Self::capability_string_argument(arguments, "base_url").is_some()
+            || Self::capability_string_argument(arguments, "path")
+                .as_deref()
+                .is_some_and(|path| path.starts_with("http://") || path.starts_with("https://"))
+            || Self::capability_string_argument(arguments, "openapi_url").is_some()
+            || Self::capability_string_argument(arguments, "openapi_text").is_some()
+    }
+
+    fn capability_auth_mode(
+        arguments: &serde_json::Value,
+    ) -> Option<crate::custom_apis::CustomApiAuthMode> {
+        match Self::capability_string_argument(arguments, "auth_type")?
+            .to_ascii_lowercase()
+            .as_str()
         {
-            lines.push(format!(
-                "Expected secret/config key for auth: `{}`.",
-                secret_name
-            ));
+            "bearer" => Some(crate::custom_apis::CustomApiAuthMode::Bearer),
+            "api_key_header" => Some(crate::custom_apis::CustomApiAuthMode::ApiKeyHeader),
+            "api_key_query" => Some(crate::custom_apis::CustomApiAuthMode::ApiKeyQuery),
+            "oauth2" => Some(crate::custom_apis::CustomApiAuthMode::OAuth2),
+            "basic" => Some(crate::custom_apis::CustomApiAuthMode::Basic),
+            "none" => Some(crate::custom_apis::CustomApiAuthMode::None),
+            _ => None,
         }
-        if let Some(source_notes) = arguments
-            .get("source_notes")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-        {
-            lines.push(format!("Derived from: {}", source_notes));
-        }
-        if let Some(verdict) = verdict {
-            if !verdict.warnings.is_empty() {
-                lines.push(format!(
-                    "Security review notes: {}",
-                    verdict.warnings.join(", ")
+    }
+
+    fn capability_object_to_string_map(
+        value: Option<&serde_json::Value>,
+    ) -> BTreeMap<String, String> {
+        value
+            .and_then(|value| value.as_object())
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        Self::value_to_http_string(value)
+                            .map(|value| (key.trim().to_string(), value.trim().to_string()))
+                    })
+                    .filter(|(key, _)| !key.is_empty())
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn capability_endpoint_parts(
+        arguments: &serde_json::Value,
+    ) -> Result<(String, String, BTreeMap<String, String>)> {
+        let raw_base = Self::capability_string_argument(arguments, "base_url");
+        let raw_path = Self::capability_string_argument(arguments, "path");
+        let endpoint = match (raw_base.as_deref(), raw_path.as_deref()) {
+            (_, Some(path)) if path.starts_with("http://") || path.starts_with("https://") => {
+                path.to_string()
+            }
+            (Some(base), Some(path)) if !path.trim().is_empty() => {
+                format!(
+                    "{}/{}",
+                    base.trim_end_matches('/'),
+                    path.trim_start_matches('/')
+                )
+            }
+            (Some(base), _) => base.to_string(),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "HTTP/API capability acquisition requires a base_url or absolute path"
                 ));
             }
-            if !verdict.allow_load {
-                lines.push(
-                    "The scaffold was blocked by security policy and was not loaded.".to_string(),
-                );
+        };
+        let parsed = reqwest::Url::parse(endpoint.as_str())
+            .with_context(|| format!("Invalid API endpoint '{}'", endpoint))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("API endpoint must include a host"))?;
+        let mut base_url = format!("{}://{}", parsed.scheme(), host);
+        if let Some(port) = parsed.port() {
+            base_url.push(':');
+            base_url.push_str(&port.to_string());
+        }
+        let path = if parsed.path().trim().is_empty() {
+            "/".to_string()
+        } else {
+            parsed.path().to_string()
+        };
+        let mut query = BTreeMap::new();
+        for (key, value) in parsed.query_pairs() {
+            query.insert(key.to_string(), value.to_string());
+        }
+        Ok((base_url, path, query))
+    }
+
+    fn capability_operation_draft(
+        arguments: &serde_json::Value,
+        name: &str,
+        description: &str,
+    ) -> Result<(
+        String,
+        crate::custom_apis::CustomApiOperationDraft,
+        BTreeMap<String, String>,
+    )> {
+        let (base_url, path, mut default_query) = Self::capability_endpoint_parts(arguments)?;
+        default_query.extend(Self::capability_object_to_string_map(
+            arguments.get("default_query"),
+        ));
+        let method = Self::capability_string_argument(arguments, "method")
+            .unwrap_or_else(|| "get".to_string())
+            .to_ascii_uppercase();
+        let read_only = method == "GET";
+        let required_inputs = Self::capability_acquire_required_inputs(arguments);
+        let mut parameters = Vec::new();
+        let mut body_required = false;
+        for input in required_inputs {
+            if input.eq_ignore_ascii_case("body") {
+                body_required = true;
+                continue;
             }
+            let location = if path.contains(&format!("{{{}}}", input))
+                || path.contains(&format!(":{}", input))
+            {
+                crate::custom_apis::CustomApiParameterLocation::Path
+            } else if read_only {
+                crate::custom_apis::CustomApiParameterLocation::Query
+            } else {
+                body_required = true;
+                continue;
+            };
+            parameters.push(crate::custom_apis::CustomApiParameter {
+                name: input,
+                location,
+                required: true,
+                description: None,
+                schema_type: Some("string".to_string()),
+            });
+        }
+        if !read_only && method != "DELETE" {
+            let has_body_template = arguments
+                .get("body_template")
+                .is_some_and(|value| !value.is_null());
+            body_required = body_required || has_body_template;
+            parameters.push(crate::custom_apis::CustomApiParameter {
+                name: "body".to_string(),
+                location: crate::custom_apis::CustomApiParameterLocation::Body,
+                required: body_required,
+                description: Some("JSON request body for this endpoint".to_string()),
+                schema_type: Some("object".to_string()),
+            });
+        }
+        let operation_id = Self::normalize_generated_action_name(&format!("{} {}", method, path));
+        let response_notes = Self::capability_string_argument(arguments, "response_notes");
+        let operation_description = response_notes
+            .filter(|notes| !notes.eq_ignore_ascii_case(description))
+            .map(|notes| format!("{} {}", description.trim(), notes.trim()))
+            .unwrap_or_else(|| description.trim().to_string());
+        Ok((
+            base_url,
+            crate::custom_apis::CustomApiOperationDraft {
+                id: if operation_id.is_empty() {
+                    format!("{}-request", name)
+                } else {
+                    operation_id
+                },
+                name: format!("{} {}", method, path),
+                method,
+                path,
+                description: operation_description,
+                read_only,
+                enabled: true,
+                default_headers: Self::capability_object_to_string_map(
+                    arguments.get("default_headers"),
+                ),
+                default_query,
+                parameters,
+                body_required,
+            },
+            Self::capability_object_to_string_map(arguments.get("default_headers")),
+        ))
+    }
+
+    fn capability_auth_fields(
+        arguments: &serde_json::Value,
+    ) -> (
+        crate::custom_apis::CustomApiAuthMode,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        let mode =
+            Self::capability_auth_mode(arguments).unwrap_or(crate::custom_apis::CustomApiAuthMode::None);
+        let header = Self::capability_string_argument(arguments, "auth_header_name");
+        match mode {
+            crate::custom_apis::CustomApiAuthMode::Bearer
+            | crate::custom_apis::CustomApiAuthMode::OAuth2 => (
+                mode,
+                Some(header.unwrap_or_else(|| "Authorization".to_string())),
+                None,
+                None,
+            ),
+            crate::custom_apis::CustomApiAuthMode::ApiKeyHeader => (
+                mode,
+                None,
+                Some(header.unwrap_or_else(|| "X-API-Key".to_string())),
+                None,
+            ),
+            crate::custom_apis::CustomApiAuthMode::ApiKeyQuery => (mode, None, header, None),
+            crate::custom_apis::CustomApiAuthMode::Basic => (mode, None, None, None),
+            crate::custom_apis::CustomApiAuthMode::None => (mode, None, None, None),
+        }
+    }
+
+    async fn execute_capability_acquire_custom_api(
+        &self,
+        arguments: &serde_json::Value,
+        name: &str,
+        description: &str,
+    ) -> Result<String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Storage is required to save custom integrations"))?;
+        let allow_duplicate = arguments
+            .get("allow_duplicate")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let (mut request, operation_count) =
+            if Self::capability_string_argument(arguments, "openapi_url").is_some()
+                || Self::capability_string_argument(arguments, "openapi_text").is_some()
+            {
+                let preview = crate::custom_apis::preview_custom_api(
+                    crate::custom_apis::CustomApiPreviewRequest {
+                        name: Some(name.to_string()),
+                        base_url: Self::capability_string_argument(arguments, "base_url"),
+                        openapi_url: Self::capability_string_argument(arguments, "openapi_url"),
+                        openapi_text: Self::capability_string_argument(arguments, "openapi_text"),
+                        curl_text: None,
+                    },
+                )
+                .await?;
+                let auth_mode = Self::capability_auth_mode(arguments).unwrap_or(preview.auth_mode);
+                let auth_header = Self::capability_string_argument(arguments, "auth_header_name")
+                    .or(preview.auth_header);
+                let auth_name = if matches!(
+                    auth_mode,
+                    crate::custom_apis::CustomApiAuthMode::ApiKeyHeader
+                        | crate::custom_apis::CustomApiAuthMode::ApiKeyQuery
+                ) {
+                    auth_header.clone().or(preview.auth_name)
+                } else {
+                    preview.auth_name
+                };
+                let operation_count = preview.operations.len();
+                (
+                    crate::custom_apis::CustomApiUpsertRequest {
+                        id: Some(name.to_string()),
+                        name: preview.suggested_name,
+                        description: Some(description.to_string()),
+                        base_url: preview.base_url,
+                        enabled: Some(true),
+                        auth_mode: Some(auth_mode),
+                        auth_profile_id: None,
+                        auth_header,
+                        auth_name,
+                        auth_username: preview.auth_username,
+                        secret: None,
+                        clear_secret: None,
+                        allow_missing_secret: Some(true),
+                        operations: preview.operations,
+                    },
+                    operation_count,
+                )
+            } else {
+                let (base_url, operation, _) =
+                    Self::capability_operation_draft(arguments, name, description)?;
+                let (auth_mode, auth_header, auth_name, auth_username) =
+                    Self::capability_auth_fields(arguments);
+                (
+                    crate::custom_apis::CustomApiUpsertRequest {
+                        id: Some(name.to_string()),
+                        name: name.to_string(),
+                        description: Some(description.to_string()),
+                        base_url,
+                        enabled: Some(true),
+                        auth_mode: Some(auth_mode),
+                        auth_profile_id: None,
+                        auth_header,
+                        auth_name,
+                        auth_username,
+                        secret: None,
+                        clear_secret: None,
+                        allow_missing_secret: Some(true),
+                        operations: vec![operation],
+                    },
+                    1,
+                )
+            };
+
+        if allow_duplicate {
+            let existing = crate::custom_apis::list_custom_apis(
+                storage,
+                &self.config_dir,
+                self.data_dir(),
+            )
+            .await?;
+            if existing.iter().any(|item| item.config.id == name) {
+                request.id = Some(format!("{}-{}", name, uuid::Uuid::new_v4().simple()));
+            }
+        }
+        let request_id = request.id.clone().unwrap_or_else(|| name.to_string());
+        let existing = crate::custom_apis::list_custom_apis(
+            storage,
+            &self.config_dir,
+            self.data_dir(),
+        )
+        .await?
+        .into_iter()
+        .any(|item| item.config.id == request_id);
+        let path_id = if existing && !allow_duplicate {
+            Some(request_id.as_str())
+        } else {
+            None
+        };
+        let view = crate::custom_apis::upsert_custom_api(
+            storage,
+            &self.config_dir,
+            self.data_dir(),
+            self,
+            request,
+            path_id,
+        )
+        .await?;
+        let mut lines = vec![
+            format!("Custom API integration `{}` saved.", view.config.name),
+            "It is available in Settings > Integrations under custom API integrations.".to_string(),
+            format!("Registered API actions: {}", view.action_count),
+            format!("Endpoint base URL: {}", view.config.base_url),
+        ];
+        if operation_count != view.action_count {
+            lines.push(format!(
+                "Imported {} operation(s); {} are enabled.",
+                operation_count, view.action_count
+            ));
+        }
+        if !matches!(
+            view.config.auth_mode,
+            crate::custom_apis::CustomApiAuthMode::None
+        ) && !view.secret_configured
+        {
+            lines.push(
+                "Authentication still needs to be configured from the custom API integration settings."
+                    .to_string(),
+            );
         }
         Ok(lines.join("\n"))
     }
@@ -15151,78 +16771,7 @@ print(result["text"])
                 }
             }
             "capability_acquire" => {
-                let arguments = Self::enrich_capability_acquisition_arguments(arguments).await;
-                let raw_name = arguments
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'name' for capability acquisition"))?;
-                let description = arguments
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Missing 'description' for capability acquisition")
-                    })?;
-                let name = Self::normalize_generated_action_name(raw_name);
-                if name.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "Generated action name is empty after normalization"
-                    ));
-                }
-                let content =
-                    self.render_capability_action_markdown(&arguments, &name, description);
-                let force = arguments
-                    .get("force")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                let verdict = self.create_action(&name, &content, force).await?;
-                let mut lines = vec![
-                    format!("Capability scaffolded as action `{}`.", name),
-                    "It is now available immediately in the action catalog.".to_string(),
-                ];
-                if let Some(kind) = arguments.get("kind").and_then(|value| value.as_str()) {
-                    lines.push(format!("Mode: {}", kind));
-                }
-                if let Some(base_url) = arguments.get("base_url").and_then(|value| value.as_str()) {
-                    lines.push(format!("Base URL: {}", base_url));
-                }
-                if let Some(path) = arguments.get("path").and_then(|value| value.as_str()) {
-                    lines.push(format!("Primary endpoint: {}", path));
-                }
-                if let Some(method) = arguments.get("method").and_then(|value| value.as_str()) {
-                    lines.push(format!("Method: {}", method.to_ascii_uppercase()));
-                }
-                if let Some(secret_name) = arguments
-                    .get("auth_secret_name")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    lines.push(format!(
-                        "Expected secret/config key for auth: `{}`.",
-                        secret_name
-                    ));
-                }
-                if let Some(source_notes) = arguments
-                    .get("source_notes")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    lines.push(format!("Derived from: {}", source_notes));
-                }
-                if let Some(verdict) = verdict {
-                    if !verdict.warnings.is_empty() {
-                        lines.push(format!(
-                            "Security review notes: {}",
-                            verdict.warnings.join(", ")
-                        ));
-                    }
-                    if !verdict.allow_load {
-                        lines.push(
-                            "The scaffold was blocked by security policy and was not loaded."
-                                .to_string(),
-                        );
-                    }
-                }
-                Ok(lines.join("\n"))
+                self.execute_capability_acquire(arguments).await
             }
             _ => {
                 // Check if we have a WASM module for this action
@@ -18441,228 +19990,6 @@ print(result["text"])
         out.trim_matches('-').to_string()
     }
 
-    fn render_capability_action_markdown(
-        &self,
-        arguments: &serde_json::Value,
-        name: &str,
-        description: &str,
-    ) -> String {
-        let kind = arguments
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .unwrap_or("rest_api");
-        let method = arguments
-            .get("method")
-            .and_then(|value| value.as_str())
-            .unwrap_or("get")
-            .to_ascii_uppercase();
-        let base_url = arguments
-            .get("base_url")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let path = arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let auth_type = arguments
-            .get("auth_type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("none");
-        let auth_secret_name = arguments
-            .get("auth_secret_name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let auth_header_name = arguments
-            .get("auth_header_name")
-            .and_then(|value| value.as_str())
-            .unwrap_or(if auth_type == "api_key_header" {
-                "X-API-Key"
-            } else {
-                "Authorization"
-            });
-        let response_notes = arguments
-            .get("response_notes")
-            .and_then(|value| value.as_str())
-            .unwrap_or(
-                "Return a concise user-facing summary plus any stable identifiers and links.",
-            );
-        let source_notes = arguments
-            .get("source_notes")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let required_inputs = Self::capability_acquire_required_inputs(arguments);
-        let required_block = if required_inputs.is_empty() {
-            " []".to_string()
-        } else {
-            format!(
-                "\n{}",
-                required_inputs
-                    .iter()
-                    .map(|item| format!("  - {}", item))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        };
-
-        let connector_template = serde_json::json!({
-            "url": if path.is_empty() { base_url.to_string() } else { format!("{}{}", base_url, path) },
-            "method": method.to_ascii_lowercase(),
-            "headers": arguments
-                .get("default_headers")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-            "query": arguments
-                .get("default_query")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-            "body": arguments
-                .get("body_template")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "pagination": arguments
-                .get("pagination")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null)
-        });
-        let connector_template =
-            serde_json::to_string_pretty(&connector_template).unwrap_or_else(|_| "{}".to_string());
-
-        let auth_notes = match auth_type {
-            "bearer" => format!(
-                "- Read the bearer token from secret storage key `{}`.\n- Send it in the `{}` header as `Bearer <token>`.\n- If the token is unavailable, report that auth still needs to be configured.",
-                if auth_secret_name.is_empty() {
-                    format!("{}_token", name)
-                } else {
-                    auth_secret_name.to_string()
-                },
-                auth_header_name
-            ),
-            "api_key_header" => format!(
-                "- Read the API key from secret storage key `{}`.\n- Send it in the `{}` header.\n- If the key is unavailable, report that auth still needs to be configured.",
-                if auth_secret_name.is_empty() {
-                    format!("{}_api_key", name)
-                } else {
-                    auth_secret_name.to_string()
-                },
-                auth_header_name
-            ),
-            "api_key_query" => format!(
-                "- Read the API key from secret storage key `{}`.\n- Add it to the provider query params before calling `connector_request`.\n- If the key is unavailable, report that auth still needs to be configured.",
-                if auth_secret_name.is_empty() {
-                    format!("{}_api_key", name)
-                } else {
-                    auth_secret_name.to_string()
-                }
-            ),
-            "oauth2" => format!(
-                "- Prefer an existing connected integration if one already covers this provider.\n- Otherwise use secret/config key `{}` for OAuth credentials or refresh tokens.\n- If OAuth is not connected yet, say that the capability is scaffolded but still needs OAuth setup.",
-                if auth_secret_name.is_empty() {
-                    format!("{}_oauth", name)
-                } else {
-                    auth_secret_name.to_string()
-                }
-            ),
-            "basic" => format!(
-                "- Read credentials from secret storage key `{}`.\n- Use HTTP Basic auth when calling `connector_request`.\n- If credentials are unavailable, report that auth still needs to be configured.",
-                if auth_secret_name.is_empty() {
-                    format!("{}_basic_auth", name)
-                } else {
-                    auth_secret_name.to_string()
-                }
-            ),
-            _ => "- No provider auth is required for this capability.".to_string(),
-        };
-
-        let acquisition_mode = match kind {
-            "web_automation" => {
-                "If the provider has no stable API, use `browser_auto` as the fallback execution path after trying the connector flow."
-            }
-            "oauth_api" => {
-                "Prefer the direct API path, but explicitly report missing OAuth setup when credentials are not connected yet."
-            }
-            "openapi" => {
-                "Preserve the documented API structure from the supplied spec/notes and keep request/response handling predictable."
-            }
-            _ => "Use the documented HTTP surface directly with `connector_request`.",
-        };
-
-        let required_inputs_section = if required_inputs.is_empty() {
-            "- No additional required inputs beyond optional `query`.".to_string()
-        } else {
-            required_inputs
-                .iter()
-                .map(|item| format!("- `{}`", item))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        format!(
-            r#"---
-name: {name}
-description: {description}
-version: "1.0.0"
-permissions: [network]
-required:{required_block}
----
-
-# {name}
-
-## Purpose
-{description}
-
-## Required Inputs
-{required_inputs_section}
-
-## Capability Acquisition Context
-- Kind: `{kind}`
-- Base URL: `{base_url}`
-- Path: `{path}`
-- Method: `{method}`
-- {acquisition_mode}
-
-## Authentication
-{auth_notes}
-
-## Execution
-1. Gather any missing required inputs before making a request.
-2. Prefer a direct `connector_request` call using this template:
-
-```json
-{connector_template}
-```
-
-3. Merge user-provided inputs into the request path, query, and body instead of ignoring them.
-4. Preserve pagination, retries, and auth requirements when the provider needs them.
-5. If the capability cannot run yet because auth/config is missing, say exactly what must be connected or stored next.
-
-## Response Contract
-- {response_notes}
-- Include stable IDs, URLs, and next steps when available.
-- Never reveal raw secrets or credential values.
-
-## Source Notes
-{source_notes}
-"#,
-            name = name,
-            description = description,
-            required_block = required_block,
-            required_inputs_section = required_inputs_section,
-            kind = kind,
-            base_url = if base_url.is_empty() { "-" } else { base_url },
-            path = if path.is_empty() { "-" } else { path },
-            method = method,
-            acquisition_mode = acquisition_mode,
-            auth_notes = auth_notes,
-            connector_template = connector_template,
-            response_notes = response_notes,
-            source_notes = if source_notes.trim().is_empty() {
-                "- No additional provider notes supplied.".to_string()
-            } else {
-                source_notes.to_string()
-            },
-        )
-    }
-
     /// Delete/disable an action.
     /// - Custom actions: deleted from disk and runtime.
     /// - Bundled actions: deleted from runtime-owned bundled directories for this install.
@@ -20781,29 +22108,40 @@ version: "1.2.3"
     async fn document_lookup_has_native_executor() {
         let runtime = runtime_for_authorization_tests().await;
         let error = runtime
-            .execute_action(
+            .execute_action_with_context(
                 "document_lookup",
                 &serde_json::json!({"query": "uploaded document"}),
+                &trusted_chat_context("native-document-lookup", false),
             )
             .await
             .unwrap_err()
             .to_string();
 
         assert!(!error.contains("Unknown native action"));
-        assert!(error.contains("storage") || error.contains("not available"));
+        assert!(
+            error.contains("storage") || error.contains("not available"),
+            "unexpected document_lookup error: {error}"
+        );
     }
 
     #[tokio::test]
     async fn list_watchers_has_native_executor() {
         let runtime = runtime_for_authorization_tests().await;
         let error = runtime
-            .execute_action("list_watchers", &serde_json::json!({"filter": "all"}))
+            .execute_action_with_context(
+                "list_watchers",
+                &serde_json::json!({"filter": "all"}),
+                &trusted_chat_context("native-list-watchers", false),
+            )
             .await
             .unwrap_err()
             .to_string();
 
         assert!(!error.contains("Unknown native action"));
-        assert!(error.contains("Storage not available") || error.contains("not available"));
+        assert!(
+            error.contains("Storage not available") || error.contains("not available"),
+            "unexpected list_watchers error: {error}"
+        );
     }
 
     #[tokio::test]

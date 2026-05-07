@@ -8,6 +8,11 @@ import {
   Box,
   Button,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
   IconButton,
   Stack,
   Tab,
@@ -215,6 +220,7 @@ export default function ArkMemoryPage({
   );
   const [notice, setNotice] = useState<string | null>(null);
   const [healthDetailsOpen, setHealthDetailsOpen] = useState(false);
+  const [captureDetailsOpen, setCaptureDetailsOpen] = useState(false);
   const invalidateArkMemory = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["arkmemory-summary"] }),
@@ -294,6 +300,7 @@ export default function ArkMemoryPage({
   const summary = asRecord(summaryQ.data);
   const currentMemory = asRecord(summary.current_memory);
   const capturePipeline = asRecord(summary.capture_pipeline);
+  const pendingCaptureEvents = pickRecords(capturePipeline, "pending_events");
   const queueItems = pickRecords(queueQ.data, "items");
   const ledgerEvents = pickRecords(ledgerQ.data, "events");
   const healthFindings = pickRecords(healthQ.data, "findings");
@@ -326,10 +333,16 @@ export default function ArkMemoryPage({
   const showQueueTab = queueItems.length > 0;
   const memoryTotal =
     num(currentMemory.facts) +
+    num(currentMemory.assistant_preferences) +
+    num(currentMemory.work_preferences) +
+    num(currentMemory.project_domain_memory) +
+    num(currentMemory.ephemeral_context) +
+    num(currentMemory.other_memory) +
     num(currentMemory.preferences) +
     num(currentMemory.user_data) +
     num(currentMemory.knowledge);
-  const pendingConsolidation = num(capturePipeline.pending);
+  const pendingConsolidation =
+    pendingCaptureEvents.length || num(capturePipeline.pending);
   const failedCaptureCount = num(capturePipeline.failed);
   useEffect(() => {
     if (!showQueueTab && memoryTab === "queue") {
@@ -358,7 +371,12 @@ export default function ArkMemoryPage({
   const memoryTabValue =
     memoryTab === "current" ? 0 : memoryTab === "queue" ? 1 : showQueueTab ? 2 : 1;
 
-  const statItems = [
+  const statItems: Array<{
+    label: string;
+    value: number;
+    helper: string;
+    onClick?: () => void;
+  }> = [
     { label: "Current Memory", value: memoryTotal, helper: "Stored items" },
     ...(showQueueTab
       ? [
@@ -375,6 +393,7 @@ export default function ArkMemoryPage({
             label: "Queued",
             value: pendingConsolidation,
             helper: "Consolidating",
+            onClick: () => setCaptureDetailsOpen(true),
           },
         ]
       : []),
@@ -395,7 +414,7 @@ export default function ArkMemoryPage({
           <>
             ArkMemory is what the agent remembers about you and your work.
             <br />
-            ArkMemory stores facts, preferences, recurring patterns, and useful knowledge gathered from chats and background signals.
+            ArkMemory separates profile facts, assistant preferences, work preferences, domain memory, user data, and useful knowledge gathered from chats and background signals.
           </>
         }
       />
@@ -430,7 +449,18 @@ export default function ArkMemoryPage({
         </Typography>
       </Stack>
       {pendingConsolidation > 0 ? (
-        <Alert severity="info">
+        <Alert
+          severity="info"
+          action={
+            <Button
+              color="inherit"
+              size="small"
+              onClick={() => setCaptureDetailsOpen(true)}
+            >
+              Details
+            </Button>
+          }
+        >
           {pendingConsolidation === 1
             ? "1 memory signal is queued for ArkMemory consolidation."
             : `${pendingConsolidation} memory signals are queued for ArkMemory consolidation.`}
@@ -678,14 +708,153 @@ export default function ArkMemoryPage({
       ) : null}
 
       <Box className="list-shell stat-strip">
-        {statItems.map((item) => (
-          <div key={item.label} className="stat-strip-item">
-            <span className="stat-strip-label">{item.label}</span>
-            <span className="stat-strip-value">{item.value}</span>
-            <span className="stat-strip-helper">{item.helper}</span>
-          </div>
-        ))}
+        {statItems.map((item) =>
+          item.onClick ? (
+            <button
+              key={item.label}
+              type="button"
+              className="stat-strip-item stat-strip-button"
+              onClick={item.onClick}
+            >
+              <span className="stat-strip-label">{item.label}</span>
+              <span className="stat-strip-value">{item.value}</span>
+              <span className="stat-strip-helper">{item.helper}</span>
+            </button>
+          ) : (
+            <div key={item.label} className="stat-strip-item">
+              <span className="stat-strip-label">{item.label}</span>
+              <span className="stat-strip-value">{item.value}</span>
+              <span className="stat-strip-helper">{item.helper}</span>
+            </div>
+          ),
+        )}
       </Box>
+
+      <Dialog
+        open={captureDetailsOpen}
+        onClose={() => setCaptureDetailsOpen(false)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>ArkMemory Consolidation</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.25}>
+            {summaryQ.isLoading ? (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                Loading queued memory signals...
+              </Typography>
+            ) : null}
+            {!summaryQ.isLoading && pendingCaptureEvents.length === 0 ? (
+              <Alert severity="info">
+                No memory signals are currently queued or processing.
+              </Alert>
+            ) : null}
+            {pendingCaptureEvents.map((event, index) => {
+              const id = str(event.id, `pending-${index}`);
+              const sourceContext = asRecord(event.source_context);
+              const sourceTime = humanTs(str(sourceContext.source_message_at, ""));
+              const sourcePreview = str(
+                sourceContext.source_message_preview,
+                "",
+              ).trim();
+              const statuses = Array.isArray(event.statuses)
+                ? event.statuses
+                    .map((status) => tokenLabel(status))
+                    .filter((status) => status.trim().length > 0)
+                : [];
+              const created = humanTs(str(event.created_at, ""));
+              const updated = humanTs(str(event.updated_at, ""));
+              const backendEvents = pickRecords(event, "events");
+              return (
+                <Box key={id} className="metadata-box">
+                  <Stack spacing={0.85}>
+                    <Stack
+                      direction="row"
+                      spacing={0.75}
+                      useFlexGap
+                      sx={{ alignItems: "center", flexWrap: "wrap" }}
+                    >
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        color="info"
+                        label={statuses[0] || tokenLabel(event.status, "Queued")}
+                      />
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        {healthSourceTitle(sourceContext)}
+                      </Typography>
+                    </Stack>
+                    {sourcePreview ? (
+                      <Typography
+                        variant="body2"
+                        sx={{ color: "text.secondary", overflowWrap: "anywhere" }}
+                      >
+                        {sourcePreview}
+                      </Typography>
+                    ) : null}
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      useFlexGap
+                      sx={{ flexWrap: "wrap", color: "text.secondary" }}
+                    >
+                      <Typography variant="caption" title={created.tip}>
+                        Queued: {created.label}
+                      </Typography>
+                      <Typography variant="caption" title={updated.tip}>
+                        Updated: {updated.label}
+                      </Typography>
+                      {sourceTime.label !== "-" ? (
+                        <Typography variant="caption" title={sourceTime.tip}>
+                          Source: {sourceTime.label}
+                        </Typography>
+                      ) : null}
+                      <Typography variant="caption">
+                        Backend events: {num(event.event_count, backendEvents.length)}
+                      </Typography>
+                    </Stack>
+                    {backendEvents.length > 0 ? (
+                      <>
+                        <Divider />
+                        <Stack spacing={0.45}>
+                          {backendEvents.map((backendEvent, eventIndex) => {
+                            const backendId = str(
+                              backendEvent.id,
+                              `event-${eventIndex}`,
+                            );
+                            const backendUpdated = humanTs(
+                              str(backendEvent.updated_at, ""),
+                            );
+                            return (
+                              <Typography
+                                key={backendId}
+                                variant="caption"
+                                sx={{
+                                  color: "text.secondary",
+                                  fontFamily:
+                                    "JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace",
+                                  overflowWrap: "anywhere",
+                                }}
+                              >
+                                {backendId} -{" "}
+                                {tokenLabel(backendEvent.status, "Queued")} -{" "}
+                                {backendUpdated.label}
+                              </Typography>
+                            );
+                          })}
+                        </Stack>
+                      </>
+                    ) : null}
+                  </Stack>
+                </Box>
+              );
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCaptureDetailsOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
 
       <Tabs
         value={memoryTabValue}

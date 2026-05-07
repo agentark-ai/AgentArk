@@ -109,6 +109,16 @@ impl ExecutorClient {
             .json()
             .await?)
     }
+
+    pub async fn stack_memory_stats(&self) -> Result<StackMemoryStatsResponse> {
+        Ok(self
+            .request(reqwest::Method::GET, "/internal/v1/system/stack-memory")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,3 +198,5 @@ pub struct AppLogsResponse {
     #[serde(default)]
     pub raw: Value,
 }
+
+pub use crate::executor::protocol::StackMemoryStatsResponse;

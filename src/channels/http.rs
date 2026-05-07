@@ -86,7 +86,7 @@ mod trace;
 mod tunnel;
 mod tunnel_auth;
 mod ui_control;
-mod webhooks;
+pub(crate) mod webhooks;
 
 pub(crate) use analytics_control::estimate_cost_from_pricing_cache;
 pub(crate) use autonomy_control::run_autonomy_analysis_tick;
@@ -1410,6 +1410,7 @@ pub async fn serve(
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/channels/http.rs:3796", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => break,
@@ -2315,6 +2316,10 @@ pub async fn serve(
         // Memory
         .route("/memory/stats", get(memory_stats))
         .route("/memory/facts", get(list_facts))
+        .route(
+            "/memory/facts/{id}",
+            axum::routing::delete(delete_memory_fact),
+        )
         .route("/channels/available", get(list_available_channels))
         .route("/memory/preferences", get(list_user_preferences))
         .route("/memory/preferences", post(upsert_user_preference))
@@ -2340,6 +2345,10 @@ pub async fn serve(
         )
         // ArkMemory operations
         .route("/arkmemory/summary", get(arkmemory_summary))
+        .route(
+            "/arkmemory/memories/{id}",
+            axum::routing::delete(delete_memory_fact),
+        )
         .route("/arkmemory/queue", get(arkmemory_queue))
         .route(
             "/arkmemory/queue/{id}/approve",
@@ -2363,6 +2372,10 @@ pub async fn serve(
         .route("/arkmemory/cleanup/apply", post(arkmemory_apply_cleanup))
         // Legacy /arkrecall route aliases retained for old browser tabs.
         .route("/arkrecall/summary", get(arkmemory_summary))
+        .route(
+            "/arkrecall/memories/{id}",
+            axum::routing::delete(delete_memory_fact),
+        )
         .route("/arkrecall/queue", get(arkmemory_queue))
         .route(
             "/arkrecall/queue/{id}/approve",
@@ -2789,6 +2802,7 @@ pub async fn serve(
         let state_for_bridge = state.clone();
         crate::spawn_logged!("src/channels/http.rs:4915", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
 

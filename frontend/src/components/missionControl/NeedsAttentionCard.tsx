@@ -99,6 +99,10 @@ export function NeedsAttentionCard({
   );
 
   const count = items.length;
+  const urgentCount = waitingCount + failedCount + unreadAlerts;
+  const setupOnly = Boolean(setupItem && actionableItems.length === 0);
+  const tag = urgentCount > 0 ? `! ${count}` : setupItem ? "SETUP" : "CLEAR";
+  const tagTone = urgentCount > 0 ? "warn" : setupItem ? "cyan" : "good";
 
   function renderActionButtonsForKind(item: AttentionItem) {
     if (item.kind === "approval") {
@@ -152,52 +156,55 @@ export function NeedsAttentionCard({
   return (
     <NeuralPanel
       title="Needs Attention"
-      tag={count > 0 ? `! ${count}` : "CLEAR"}
-      tagTone={count > 0 ? "warn" : "good"}
-      alert={count > 0}
-      className="nw-panel--attention"
+      tag={tag}
+      tagTone={tagTone}
+      alert={urgentCount > 0}
+      className={`nw-panel--attention${setupOnly ? " nw-panel--attention-setup" : ""}`}
+      bodyClassName="nw-attention-body"
       dataTourTarget="overview-attention"
     >
-      <div className="nw-alert-row">
-        <span className="nw-alert-name">Waiting</span>
-        <span
-          className={
-            waitingCount === 0
-              ? "nw-alert-val nw-alert-val--zero"
-              : "nw-alert-val nw-alert-val--warn"
-          }
-        >
-          {waitingCount}
-        </span>
-      </div>
-      <div className="nw-alert-row">
-        <span className="nw-alert-name">Failed</span>
-        <span
-          className={
-            failedCount === 0
-              ? "nw-alert-val nw-alert-val--zero"
-              : "nw-alert-val nw-alert-val--crit"
-          }
-        >
-          {failedCount}
-        </span>
-      </div>
-      <div className="nw-alert-row">
-        <span className="nw-alert-name">Unread alerts</span>
-        <span
-          className={
-            unreadAlerts === 0
-              ? "nw-alert-val nw-alert-val--zero"
-              : "nw-alert-val nw-alert-val--warn"
-          }
-        >
-          {unreadAlerts}
-        </span>
+      <div className="nw-attention-counts">
+        <div className="nw-alert-row">
+          <span className="nw-alert-name">Waiting</span>
+          <span
+            className={
+              waitingCount === 0
+                ? "nw-alert-val nw-alert-val--zero"
+                : "nw-alert-val nw-alert-val--warn"
+            }
+          >
+            {waitingCount}
+          </span>
+        </div>
+        <div className="nw-alert-row">
+          <span className="nw-alert-name">Failed</span>
+          <span
+            className={
+              failedCount === 0
+                ? "nw-alert-val nw-alert-val--zero"
+                : "nw-alert-val nw-alert-val--crit"
+            }
+          >
+            {failedCount}
+          </span>
+        </div>
+        <div className="nw-alert-row">
+          <span className="nw-alert-name">Unread alerts</span>
+          <span
+            className={
+              unreadAlerts === 0
+                ? "nw-alert-val nw-alert-val--zero"
+                : "nw-alert-val nw-alert-val--warn"
+            }
+          >
+            {unreadAlerts}
+          </span>
+        </div>
       </div>
 
       {setupItem ? (
         <div className="nw-setup-card">
-          <div className="nw-activity-ic nw-activity-ic--warn">!</div>
+          <div className="nw-activity-ic nw-activity-ic--cyan">!</div>
           <div className="nw-setup-body">
             <div className="nw-setup-title">{setupItem.title}</div>
             {setupItem.detail ? (

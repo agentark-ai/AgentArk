@@ -134,7 +134,7 @@ impl SecurityGuard {
     /// detect semantic leakage; that is the job of `output_guard`.
     pub fn filter_output(&self, output: &str) -> FilteredOutput {
         let redacted = redact_secret_input(output);
-        let text = if redacted.primary_kind() == Some(SecretInputType::ApiKeyOrToken) {
+        let text = if redacted.uses_specific_api_key_placeholder() {
             redacted
                 .text
                 .replace("[REDACTED_SECRET]", "[REDACTED_API_KEY]")
@@ -171,6 +171,26 @@ impl SecretRedactionResult {
 
     pub fn primary_kind(&self) -> Option<SecretInputType> {
         self.kinds.first().cloned()
+    }
+
+    pub fn uses_specific_api_key_placeholder(&self) -> bool {
+        self.primary_kind() == Some(SecretInputType::ApiKeyOrToken)
+            && self.redactions.iter().any(|redaction| {
+                redaction.starts_with("openai_key ")
+                    || redaction.starts_with("github_token ")
+                    || redaction.starts_with("notion_token ")
+                    || redaction.starts_with("google_api_key ")
+                    || redaction.starts_with("google_oauth_token ")
+                    || redaction.starts_with("slack_token ")
+                    || redaction.starts_with("moltbook_token ")
+            })
+            && !self.redactions.iter().any(|redaction| {
+                redaction.starts_with("bearer_token ")
+                    || redaction.starts_with("secret_assignment ")
+                    || redaction.starts_with("env_secret_assignment ")
+                    || redaction.starts_with("secret_query_param ")
+                    || redaction.starts_with("opaque_token ")
+            })
     }
 
     pub fn is_mostly_secret_payload(&self) -> bool {
@@ -231,7 +251,7 @@ static URL_SECRET_QUERY_PATTERN: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 static PAYMENT_NUMBER_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b\d(?:[\s.-]?\d){11,18}\b").unwrap());
+    Lazy::new(|| Regex::new(r"\b(?:\d{12,19}|\d{3,4}(?:[\s.-]\d{3,6}){2,4})\b").unwrap());
 static SHORT_NUMERIC_CODE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\d{3,4}\b").unwrap());
 const OPAQUE_TOKEN_MIN_CHARS: usize = 20;
 const OPAQUE_TOKEN_ENTROPY_BITS_PER_CHAR: f64 = 3.0;
@@ -383,6 +403,7 @@ fn is_likely_code_expression_token(value: &str) -> bool {
 fn is_opaque_token_shape(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.chars().count() >= OPAQUE_TOKEN_MIN_CHARS
+        && !is_redaction_placeholder_token(trimmed)
         && !trimmed.chars().any(char::is_whitespace)
         && trimmed.chars().all(opaque_token_shape_char)
         && !is_likely_identifier_slug(trimmed)
@@ -390,6 +411,10 @@ fn is_opaque_token_shape(value: &str) -> bool {
         && !is_likely_code_expression_token(trimmed)
         && opaque_token_has_secret_signal(trimmed)
         && shannon_entropy_bits_per_char(trimmed) >= OPAQUE_TOKEN_ENTROPY_BITS_PER_CHAR
+}
+
+fn is_redaction_placeholder_token(value: &str) -> bool {
+    value.starts_with("REDACTED_") && value.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
 }
 
 fn apply_opaque_token_redaction(
@@ -657,6 +682,42 @@ pub fn redact_secret_input(text: &str) -> SecretRedactionResult {
         &mut redacted,
         &mut redactions,
         &mut kinds,
+        &URL_SECRET_QUERY_PATTERN,
+        "${1}[REDACTED_SECRET]",
+        "secret_query_param",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &SECRET_ASSIGNMENT_PATTERN,
+        "${1}[REDACTED_SECRET]${2}",
+        "secret_assignment",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &ENV_STYLE_SECRET_ASSIGNMENT_PATTERN,
+        "${1}[REDACTED_SECRET]",
+        "env_secret_assignment",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &BEARER_TOKEN_PATTERN,
+        "Bearer [REDACTED_SECRET]",
+        "bearer_token",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
         &OPENAI_KEY_PATTERN,
         "[REDACTED_SECRET]",
         "openai_key",
@@ -714,42 +775,6 @@ pub fn redact_secret_input(text: &str) -> SecretRedactionResult {
         &MOLTBOOK_TOKEN_PATTERN,
         "[REDACTED_SECRET]",
         "moltbook_token",
-        SecretInputType::ApiKeyOrToken,
-    );
-    apply_secret_redaction(
-        &mut redacted,
-        &mut redactions,
-        &mut kinds,
-        &BEARER_TOKEN_PATTERN,
-        "Bearer [REDACTED_SECRET]",
-        "bearer_token",
-        SecretInputType::ApiKeyOrToken,
-    );
-    apply_secret_redaction(
-        &mut redacted,
-        &mut redactions,
-        &mut kinds,
-        &SECRET_ASSIGNMENT_PATTERN,
-        "${1}[REDACTED_SECRET]${2}",
-        "secret_assignment",
-        SecretInputType::ApiKeyOrToken,
-    );
-    apply_secret_redaction(
-        &mut redacted,
-        &mut redactions,
-        &mut kinds,
-        &ENV_STYLE_SECRET_ASSIGNMENT_PATTERN,
-        "${1}[REDACTED_SECRET]",
-        "env_secret_assignment",
-        SecretInputType::ApiKeyOrToken,
-    );
-    apply_secret_redaction(
-        &mut redacted,
-        &mut redactions,
-        &mut kinds,
-        &URL_SECRET_QUERY_PATTERN,
-        "${1}[REDACTED_SECRET]",
-        "secret_query_param",
         SecretInputType::ApiKeyOrToken,
     );
     apply_payment_credential_redaction(&mut redacted, &mut redactions, &mut kinds);

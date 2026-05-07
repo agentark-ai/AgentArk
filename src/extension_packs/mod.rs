@@ -972,6 +972,46 @@ fn pack_supports_connect_url_manifest(manifest: &ExtensionPackManifest) -> bool 
         && (manifest.id.eq_ignore_ascii_case("google_workspace") || manifest.auth.oauth2.is_some())
 }
 
+fn manifest_uses_connection_secret(manifest: &ExtensionPackManifest) -> bool {
+    if !manifest.auth.required_secrets.is_empty() {
+        return true;
+    }
+    if manifest
+        .auth
+        .metadata
+        .get("secret_field")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+    if value_contains_secret_template(&serde_json::to_value(&manifest.auth.exports).unwrap_or_default()) {
+        return true;
+    }
+    manifest.features.iter().any(|feature| {
+        let Some(binding) = feature.binding.as_ref() else {
+            return false;
+        };
+        if value_contains_secret_template(&binding.config) {
+            return true;
+        }
+        let Some(auth) = binding.config.get("auth").and_then(Value::as_object) else {
+            return false;
+        };
+        let auth_type = auth
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if auth_type.eq_ignore_ascii_case("basic") {
+            return true;
+        }
+        auth.get("secret_path")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
 fn pack_supports_webhook_manifest(manifest: &ExtensionPackManifest) -> bool {
     manifest.features.iter().any(|feature| {
         feature.kind.eq_ignore_ascii_case(FEATURE_KIND_EVENT)
@@ -2851,8 +2891,11 @@ impl ExtensionPackRegistry {
             feature_id: "health.test".to_string(),
             connection_id: Some(connection.id),
             message: Some(
-                "Connection saved, but this pack does not declare a runnable health probe yet."
-                    .to_string(),
+                if pack.manifest.draft {
+                    "Connection saved. This draft pack does not declare a runnable live test yet, so provider health was not verified.".to_string()
+                } else {
+                    "Connection saved. This pack does not declare a runnable live test yet, so provider health was not verified.".to_string()
+                },
             ),
             data: None,
             error: None,
@@ -3150,16 +3193,10 @@ impl ExtensionPackRegistry {
             runtime_status,
             ExtensionPackRuntimeStatus::NotRequired | ExtensionPackRuntimeStatus::Ready
         );
-        let needs_auth = matches!(
-            pack.manifest.auth.mode,
-            ExtensionPackAuthMode::ApiKey
-                | ExtensionPackAuthMode::Basic
-                | ExtensionPackAuthMode::OAuth2External
-        ) && !has_ready;
+        let needs_auth =
+            !matches!(pack.manifest.auth.mode, ExtensionPackAuthMode::None) && !has_ready;
         let status = if !pack.enabled {
             "disabled"
-        } else if pack.manifest.draft {
-            "draft"
         } else if !runtime_ready {
             "runtime_missing"
         } else if has_ready {
@@ -3171,15 +3208,15 @@ impl ExtensionPackRegistry {
         } else {
             "ready"
         };
-        let status_detail = if pack.manifest.draft {
-            Some("Installed as a draft pack. Review bindings before depending on it for production workflows.".to_string())
-        } else if !runtime_ready {
+        let status_detail = if !runtime_ready {
             runtime_detail.clone()
         } else if needs_auth {
             Some(
                 "Install completed, but this pack still needs a connected account or secret."
                     .to_string(),
             )
+        } else if pack.manifest.draft {
+            Some("Installed as a draft pack. Review bindings before depending on it for production workflows.".to_string())
         } else {
             None
         };
@@ -3310,7 +3347,16 @@ impl ExtensionPackRegistry {
                     Ok(ExtensionConnectionState::NeedsAuth)
                 }
             }
-            ExtensionPackAuthMode::OAuth2External => Ok(ExtensionConnectionState::NeedsAuth),
+            ExtensionPackAuthMode::OAuth2External => {
+                if manifest.auth.oauth2.is_none()
+                    && manifest_uses_connection_secret(manifest)
+                    && has_secret
+                {
+                    Ok(ExtensionConnectionState::Ready)
+                } else {
+                    Ok(ExtensionConnectionState::NeedsAuth)
+                }
+            }
         }
     }
 
@@ -5688,8 +5734,9 @@ fn scalar_to_string(value: &Value) -> Option<String> {
 mod tests {
     use super::{
         auth_profile_material_for_secret_backed_pack, connection_secret_key,
-        imported_auth_contract, required_secrets_for_auth_mode, ExtensionPackAuthMode,
-        ExtensionPackAuthSpec, ExtensionPackBinding, ExtensionPackConnection,
+        imported_auth_contract, manifest_uses_connection_secret, required_secrets_for_auth_mode,
+        ExtensionConnectionState, ExtensionPackAuthMode, ExtensionPackAuthSpec,
+        ExtensionPackBinding, ExtensionPackConnection, ExtensionPackConnectionUpsertRequest,
         ExtensionPackEventRecord, ExtensionPackManifest, ExtensionPackRegistry,
         ExtensionPackRuntimeStateRecord, ExtensionPackSourceKind, ExtensionPackTrustLevel,
         InstalledExtensionPack, PackFeatureManifest,
@@ -5802,6 +5849,184 @@ mod tests {
             }
             other => panic!("expected bearer auth material, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn secret_backed_external_oauth_pack_without_oauth_spec_can_be_ready() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::connect(DatabaseConfig::for_tests().expect("database config"))
+            .await
+            .expect("storage");
+        let mut registry = ExtensionPackRegistry::new(
+            storage,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        let manifest = ExtensionPackManifest {
+            id: "issue_tracker".to_string(),
+            name: "Issue Tracker".to_string(),
+            version: "0.1.0".to_string(),
+            kind: "integration".to_string(),
+            auth: ExtensionPackAuthSpec {
+                mode: ExtensionPackAuthMode::OAuth2External,
+                required_secrets: vec!["access_token".to_string()],
+                required_scopes: Vec::new(),
+                oauth2: None,
+                exports: Default::default(),
+                metadata: json!({
+                    "secret_field": "access_token",
+                    "auth_binding_type": "bearer"
+                }),
+            },
+            features: vec![PackFeatureManifest {
+                id: "items.list".to_string(),
+                kind: "capability".to_string(),
+                title: "List items".to_string(),
+                description: "List items from the connected service.".to_string(),
+                read_only: true,
+                experimental: false,
+                input_schema: json!({ "type": "object" }),
+                output_schema: json!({}),
+                binding: Some(ExtensionPackBinding {
+                    kind: "http".to_string(),
+                    config: json!({
+                        "method": "GET",
+                        "url": "https://api.example.com/items",
+                        "auth": {
+                            "type": "bearer",
+                            "secret_path": "access_token"
+                        }
+                    }),
+                }),
+            }],
+            ..ExtensionPackManifest::default()
+        };
+        assert!(manifest_uses_connection_secret(&manifest));
+        registry.installed.insert(
+            manifest.id.clone(),
+            InstalledExtensionPack {
+                manifest: manifest.clone(),
+                trust_level: ExtensionPackTrustLevel::Unverified,
+                verification_status: "unverified".to_string(),
+                verification_detail: Some("draft".to_string()),
+                source_kind: ExtensionPackSourceKind::Scaffolded,
+                source_url: None,
+                enabled: true,
+                runtime_state: ExtensionPackRuntimeStateRecord::default(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+
+        let view = registry
+            .upsert_connection(
+                &manifest.id,
+                ExtensionPackConnectionUpsertRequest {
+                    name: Some("Default connection".to_string()),
+                    secret: Some(json!({ "access_token": "token-value" })),
+                    ..ExtensionPackConnectionUpsertRequest::default()
+                },
+            )
+            .await
+            .expect("connection saved");
+
+        assert_eq!(view.state, ExtensionConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn draft_pack_with_ready_connection_registers_runtime_actions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::connect(DatabaseConfig::for_tests().expect("database config"))
+            .await
+            .expect("storage");
+        let mut registry = ExtensionPackRegistry::new(
+            storage,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        let manifest = ExtensionPackManifest {
+            id: "work_items".to_string(),
+            name: "Work Items".to_string(),
+            version: "0.1.0".to_string(),
+            kind: "integration".to_string(),
+            draft: true,
+            auth: ExtensionPackAuthSpec {
+                mode: ExtensionPackAuthMode::ApiKey,
+                required_secrets: vec!["api_key".to_string()],
+                required_scopes: Vec::new(),
+                oauth2: None,
+                exports: Default::default(),
+                metadata: json!({
+                    "secret_field": "api_key",
+                    "auth_binding_type": "header",
+                    "auth_header": "X-API-Key"
+                }),
+            },
+            features: vec![PackFeatureManifest {
+                id: "items.list".to_string(),
+                kind: "capability".to_string(),
+                title: "List items".to_string(),
+                description: "List work items.".to_string(),
+                read_only: true,
+                experimental: false,
+                input_schema: json!({ "type": "object" }),
+                output_schema: json!({}),
+                binding: Some(ExtensionPackBinding {
+                    kind: "http".to_string(),
+                    config: json!({
+                        "method": "GET",
+                        "url": "https://api.example.com/items",
+                        "auth": {
+                            "type": "header",
+                            "name": "X-API-Key",
+                            "secret_path": "api_key"
+                        }
+                    }),
+                }),
+            }],
+            ..ExtensionPackManifest::default()
+        };
+        registry.installed.insert(
+            manifest.id.clone(),
+            InstalledExtensionPack {
+                manifest: manifest.clone(),
+                trust_level: ExtensionPackTrustLevel::Unverified,
+                verification_status: "unverified".to_string(),
+                verification_detail: Some("draft".to_string()),
+                source_kind: ExtensionPackSourceKind::Scaffolded,
+                source_url: None,
+                enabled: true,
+                runtime_state: ExtensionPackRuntimeStateRecord::default(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        registry
+            .upsert_connection(
+                &manifest.id,
+                ExtensionPackConnectionUpsertRequest {
+                    name: Some("Default connection".to_string()),
+                    secret: Some(json!({ "api_key": "secret-value" })),
+                    ..ExtensionPackConnectionUpsertRequest::default()
+                },
+            )
+            .await
+            .expect("connection saved");
+
+        let view = registry
+            .get_pack(&manifest.id)
+            .await
+            .expect("pack lookup")
+            .expect("installed pack");
+        assert_eq!(view.status, "connected");
+
+        let specs = registry
+            .runtime_action_specs()
+            .await
+            .expect("runtime action specs");
+        assert!(specs.iter().any(|spec| {
+            spec.binding.pack_id == manifest.id && spec.binding.feature_id == "items.list"
+        }));
     }
 
     #[tokio::test]

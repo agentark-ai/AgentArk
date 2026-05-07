@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{redact_pii, redact_secret_input, SecretInputType};
+use super::{redact_pii, redact_secret_input};
 
 const EXECUTION_TARGET_BLOCK_START: &str = "<agentark_current_turn_execution_targets>";
 const EXECUTION_TARGET_BLOCK_END: &str = "</agentark_current_turn_execution_targets>";
@@ -175,7 +175,7 @@ fn has_strong_identity_material(text: &str, reasons: &mut Vec<String>) -> bool {
 }
 
 fn render_secret_sanitized_text(result: &super::SecretRedactionResult) -> String {
-    if result.primary_kind() == Some(SecretInputType::ApiKeyOrToken) {
+    if result.uses_specific_api_key_placeholder() {
         result
             .text
             .replace("[REDACTED_SECRET]", "[REDACTED_API_KEY]")

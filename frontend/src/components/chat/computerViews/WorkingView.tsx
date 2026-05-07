@@ -3,8 +3,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import Box from "@mui/material/Box";
+import IconButton from "@mui/material/IconButton";
+import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
+import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 
 export interface WorkingViewProps {
   phaseLabel?: string;
@@ -18,10 +21,12 @@ export interface WorkingViewProps {
   /** Structural phase label for the reasoning stream: "classifier" or
    * "planner". Drives the small label pill above the preview. */
   reasoningPhase?: string;
+  /** True when rendering saved reasoning from a completed run. */
+  persisted?: boolean;
 }
 
 const REASONING_PHASE_LABELS: Record<string, string> = {
-  classifier: "Classifying",
+  classifier: "Reviewing intent",
   planner: "Planning",
   model: "Reasoning",
 };
@@ -59,9 +64,11 @@ export function WorkingView({
   tokenPreview,
   reasoningPreview,
   reasoningPhase,
+  persisted = false,
 }: WorkingViewProps) {
   const startedAtMs = normalizeStartedAt(startedAt);
   const [now, setNow] = useState<number>(() => Date.now());
+  const [copied, setCopied] = useState(false);
   const previewRef = useRef<HTMLPreElement | null>(null);
   const followPreviewRef = useRef(true);
   const previewModeRef = useRef("");
@@ -70,9 +77,14 @@ export function WorkingView({
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
+  useEffect(() => {
+    if (!copied) return;
+    const id = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(id);
+  }, [copied]);
 
   const elapsedLabel =
-    startedAtMs !== null ? formatElapsed(now - startedAtMs) : "...";
+    persisted ? "saved" : startedAtMs !== null ? formatElapsed(now - startedAtMs) : "...";
   const assistantContent =
     typeof tokenPreview === "string" && tokenPreview.length > 0
       ? tokenPreview
@@ -103,6 +115,16 @@ export function WorkingView({
       ? "No further steps are running."
       : "Preparing the next step..."
     : "Preparing the response...";
+
+  const handleCopyPreview = async () => {
+    if (!previewContent) return;
+    try {
+      await navigator.clipboard.writeText(previewContent);
+      setCopied(true);
+    } catch {
+      // Clipboard access can be unavailable outside secure browser contexts.
+    }
+  };
 
   useEffect(() => {
     if (previewModeRef.current !== previewMode) {
@@ -141,6 +163,20 @@ export function WorkingView({
         >
           {elapsedLabel}
         </Typography>
+        {previewContent ? (
+          <Tooltip title={copied ? "Copied" : "Copy thinking"} placement="top" arrow>
+            <span>
+              <IconButton
+                size="small"
+                className="cview-working-copy"
+                onClick={handleCopyPreview}
+                aria-label="Copy thinking"
+              >
+                <ContentCopyRoundedIcon fontSize="inherit" />
+              </IconButton>
+            </span>
+          </Tooltip>
+        ) : null}
       </Box>
       {detail ? (
         <Typography variant="body2" className="cview-working-detail">

@@ -374,27 +374,32 @@ pub fn load_saved_bundles(config_dir: &Path) -> Result<Vec<String>> {
                     return Ok(tokens.granted_bundles);
                 }
             }
-            let manager = manager(config_dir)?;
-            let mut inferred = BTreeSet::new();
-            for (bundle, key) in [("gmail", "gmail_tokens"), ("calendar", "calendar_tokens")] {
-                if let Some(raw) = manager.get_custom_secret(key)? {
-                    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
-                    if parsed
-                        .get("refresh_token")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|value| !value.trim().is_empty())
-                    {
-                        inferred.insert(bundle.to_string());
-                    }
-                }
-            }
+            let inferred = legacy_connected_bundles(config_dir)?;
             if inferred.is_empty() {
                 Ok(default_bundles())
             } else {
-                Ok(inferred.into_iter().collect())
+                Ok(inferred)
             }
         }
     }
+}
+
+fn legacy_connected_bundles(config_dir: &Path) -> Result<Vec<String>> {
+    let manager = manager(config_dir)?;
+    let mut inferred = BTreeSet::new();
+    for (bundle, key) in [("gmail", "gmail_tokens"), ("calendar", "calendar_tokens")] {
+        if let Some(raw) = manager.get_custom_secret(key)? {
+            let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+            if parsed
+                .get("refresh_token")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                inferred.insert(bundle.to_string());
+            }
+        }
+    }
+    Ok(inferred.into_iter().collect())
 }
 
 pub fn save_selected_bundles(config_dir: &Path, bundles: &[String]) -> Result<()> {
@@ -1144,9 +1149,12 @@ async fn refresh_workspace_token(
 }
 
 pub fn granted_bundles(config_dir: &Path) -> Result<Vec<String>> {
-    Ok(load_workspace_tokens(config_dir)?
-        .map(|tokens| tokens.granted_bundles)
-        .unwrap_or_default())
+    if let Some(tokens) = load_workspace_tokens(config_dir)? {
+        if !tokens.granted_bundles.is_empty() {
+            return Ok(tokens.granted_bundles);
+        }
+    }
+    legacy_connected_bundles(config_dir)
 }
 
 pub fn missing_selected_bundles(config_dir: &Path) -> Result<Vec<String>> {
@@ -1191,6 +1199,13 @@ pub async fn ensure_access_token_for_bundles(
             "Google Workspace needs additional access for {}. Reconnect the integration to grant those bundles.",
             requested
         ));
+    }
+
+    if normalized.len() == 1
+        && normalized[0] == "gmail"
+        && load_workspace_tokens(config_dir)?.is_none()
+    {
+        return crate::actions::gmail::ensure_legacy_access_token(config_dir).await;
     }
 
     current_workspace_access_token(config_dir).await

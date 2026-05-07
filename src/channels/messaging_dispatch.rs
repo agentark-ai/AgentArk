@@ -846,8 +846,8 @@ mod tests {
 
         let escaped =
             render_template("{{safe:text}}", &inputs, &cfg, TemplateEscape::None).expect("render");
-        assert!(!escaped.contains('"'));
-        assert!(escaped.contains("\\\""));
+        assert!(!escaped.contains("\"quoted\""));
+        assert!(escaped.contains("\\\"quoted\\\""));
     }
 
     #[test]

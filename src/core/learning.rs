@@ -522,6 +522,67 @@ fn experience_run_has_procedure_evidence(
         || run.success_state == "failed"
 }
 
+fn experience_item_memory_kind(item: &experience_item::Model) -> Option<String> {
+    item.metadata
+        .get("memory_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn reconciled_memory_category(item: &experience_item::Model) -> Option<&'static str> {
+    let semantic_kind = experience_item_memory_kind(item);
+    let existing = item
+        .metadata
+        .get("memory_category")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let fallback =
+        crate::core::memory_schema::normalize_memory_category(None, semantic_kind.as_deref());
+    let normalized =
+        crate::core::memory_schema::normalize_memory_category(existing, semantic_kind.as_deref());
+    if existing.is_none() && fallback != crate::core::memory_schema::MEMORY_CATEGORY_OTHER {
+        return Some(fallback);
+    }
+    if existing == Some(crate::core::memory_schema::MEMORY_CATEGORY_OTHER)
+        && fallback != crate::core::memory_schema::MEMORY_CATEGORY_OTHER
+    {
+        return Some(fallback);
+    }
+    if existing.is_some_and(|raw| raw != normalized) {
+        return Some(normalized);
+    }
+    None
+}
+
+async fn reconcile_memory_categories(storage: &Storage, cap: u64) -> Result<usize> {
+    let items = storage
+        .list_active_experience_items_any_scope(&["constraint", "personal_fact"], cap)
+        .await?
+        .into_iter()
+        .filter(|item| !experience_item_is_external_source(item))
+        .collect::<Vec<_>>();
+    let mut changed = 0usize;
+    for item in items {
+        let Some(category) = reconciled_memory_category(&item) else {
+            continue;
+        };
+        let mut updated = item.clone();
+        let mut metadata = item.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert(
+            "memory_category".to_string(),
+            serde_json::Value::String(category.to_string()),
+        );
+        updated.metadata = serde_json::Value::Object(metadata);
+        updated.updated_at = chrono::Utc::now().to_rfc3339();
+        storage.upsert_experience_item(&updated).await?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 pub async fn sync_user_preference_to_experience_item(
     storage: &Storage,
     key: &str,
@@ -575,6 +636,16 @@ pub async fn sync_user_preference_to_experience_item(
                 "source": source,
                 "user_preference_key": key.trim(),
                 "user_preference_value": safe_truncate(value.trim(), 220),
+                "memory_category": if kind == "constraint" {
+                    crate::core::memory_schema::MEMORY_CATEGORY_WORK_PREFERENCE
+                } else {
+                    crate::core::memory_schema::MEMORY_CATEGORY_ASSISTANT_PREFERENCE
+                },
+                "memory_kind": if kind == "constraint" {
+                    "constraint"
+                } else {
+                    "assistant_preference"
+                },
                 "sensitivity": sensitivity,
             }),
             last_supported_at: Some(now.clone()),
@@ -1286,6 +1357,32 @@ fn memory_merge_sort_key(item: &experience_item::Model) -> (i32, i32, String, St
     )
 }
 
+fn memory_items_share_reconciliation_scope(
+    left: &experience_item::Model,
+    right: &experience_item::Model,
+) -> bool {
+    left.kind == right.kind
+        && left.scope == right.scope
+        && left.project_id == right.project_id
+        && left.conversation_id == right.conversation_id
+}
+
+fn memory_pair_similarity(left: &experience_item::Model, right: &experience_item::Model) -> f32 {
+    crate::core::document_search::normalized_embedding_similarity(
+        left.embedding
+            .as_ref()
+            .map(|embedding| embedding.as_slice())
+            .unwrap_or(&[]),
+        right
+            .embedding
+            .as_ref()
+            .map(|embedding| embedding.as_slice())
+            .unwrap_or(&[]),
+    )
+    .unwrap_or(0.0)
+    .clamp(0.0, 1.0)
+}
+
 fn metadata_marks_external_source(metadata: &Value) -> bool {
     let Some(object) = metadata.as_object() else {
         return false;
@@ -1817,6 +1914,10 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
             .filter(|pattern| !procedural_pattern_is_external_source(pattern))
             .collect::<Vec<_>>();
         let mut generated = 0usize;
+        generated += reconcile_memory_categories(storage, cap).await.unwrap_or_else(|error| {
+            tracing::warn!("Memory category reconciliation skipped: {}", error);
+            0
+        });
         for pattern in patterns {
             if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!(
@@ -2388,6 +2489,104 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                     &lease_alive,
                 ) {
                     break;
+                }
+            }
+        }
+
+        let semantic_mergeable_items = storage
+            .list_active_experience_items_any_scope(
+                &["constraint", "personal_fact"],
+                cap.min(256),
+            )
+            .await?
+            .into_iter()
+            .filter(|item| !experience_item_is_external_source(item))
+            .filter(|item| item.embedding.is_some())
+            .collect::<Vec<_>>();
+        let mut proposed_semantic_pairs = HashSet::new();
+        'semantic_pairs: for (left_index, left) in semantic_mergeable_items.iter().enumerate() {
+            for right in semantic_mergeable_items.iter().skip(left_index + 1) {
+                if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "Stopping learning candidate generation after lease ownership was lost"
+                    );
+                    break 'semantic_pairs;
+                }
+                if generated >= cap as usize {
+                    break 'semantic_pairs;
+                }
+                if !memory_items_share_reconciliation_scope(left, right) {
+                    continue;
+                }
+                if canonical_memory_merge_signature(left)
+                    .zip(canonical_memory_merge_signature(right))
+                    .is_some_and(|(left_sig, right_sig)| left_sig == right_sig)
+                {
+                    continue;
+                }
+                let similarity = memory_pair_similarity(left, right);
+                if similarity < 0.94 {
+                    continue;
+                }
+                let (target, source) =
+                    if memory_merge_sort_key(left) >= memory_merge_sort_key(right) {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                let pair_key = if source.id < target.id {
+                    format!("{}::{}", source.id, target.id)
+                } else {
+                    format!("{}::{}", target.id, source.id)
+                };
+                if !proposed_semantic_pairs.insert(pair_key) {
+                    continue;
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                if !apply_candidate_write_outcome(
+                    upsert_generated_learning_candidate(
+                        storage,
+                        &lease_guard,
+                        learning_candidate::Model {
+                            id: stable_id(
+                                "candidate",
+                                &[
+                                    "memory_semantic_merge",
+                                    source.id.as_str(),
+                                    target.id.as_str(),
+                                ],
+                            ),
+                            candidate_type: "memory_merge".to_string(),
+                            subject_key: target.id.clone(),
+                            title: format!("Combine a near-duplicate note into '{}'", target.title),
+                            summary: Some(
+                                "Two notes are semantically very close. Review and merge them if keeping both would duplicate memory."
+                                    .to_string(),
+                            ),
+                            project_id: None,
+                            conversation_id: None,
+                            pattern_id: None,
+                            evidence_refs: json!([target.id.clone(), source.id.clone()]),
+                            proposed_content: json!({
+                                "target_item_id": target.id.clone(),
+                                "source_item_id": source.id.clone(),
+                                "reason": "semantic_near_duplicate",
+                                "similarity": similarity,
+                            }),
+                            confidence: similarity as f64,
+                            approval_status: "draft".to_string(),
+                            review_notes: None,
+                            reviewed_at: None,
+                            approved_ref: None,
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
+                        },
+                    )
+                    .await?,
+                    &mut generated,
+                    &lease_alive,
+                ) {
+                    break 'semantic_pairs;
                 }
             }
         }

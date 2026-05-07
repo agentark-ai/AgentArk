@@ -724,7 +724,7 @@ mod tests {
             .any(|item| item.title == "Custom integrations and extension packs"));
         assert!(items
             .iter()
-            .any(|item| item.title == "Plugins, webhooks, and custom APIs"));
+            .any(|item| item.title == "MCP servers, plugins, webhooks, and custom APIs"));
         assert!(items
             .iter()
             .any(|item| item.title == "Runtime environment and investigation"));

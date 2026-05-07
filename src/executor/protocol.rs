@@ -24,6 +24,31 @@ pub struct ExecutorStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackMemoryContainerStats {
+    pub name: String,
+    pub memory_used_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackMemoryStatsResponse {
+    pub status: String,
+    pub source: String,
+    pub memory_used_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure_percent: Option<f64>,
+    pub container_count: usize,
+    #[serde(default)]
+    pub containers: Vec<StackMemoryContainerStats>,
+    pub sampled_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StackUpdateRequest {
     pub release_tag: String,
     pub release_version: String,

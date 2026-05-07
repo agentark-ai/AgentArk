@@ -3955,6 +3955,18 @@ pub(super) fn humanize_trace_channel(channel: &str) -> String {
 
 pub(super) fn summarize_daily_brief_delivery(result: &serde_json::Value) -> String {
     let delivery = result.get("delivery");
+    let in_app_notification_suppressed = delivery
+        .and_then(|value| value.get("in_app_notification_suppressed"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let notification_suppressed = delivery
+        .and_then(|value| value.get("notification_suppressed"))
+        .or_else(|| delivery.and_then(|value| value.get("suppressed")))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if notification_suppressed {
+        return "No notification sent.".to_string();
+    }
     let in_app_success = delivery
         .and_then(|value| value.get("in_app"))
         .and_then(|value| value.get("success"))
@@ -3965,10 +3977,17 @@ pub(super) fn summarize_daily_brief_delivery(result: &serde_json::Value) -> Stri
         .and_then(|value| value.as_array());
 
     if let Some(attempts) = attempts {
-        if let Some(successful) = attempts
-            .iter()
-            .find(|attempt| attempt.get("success").and_then(|value| value.as_bool()) == Some(true))
-        {
+        if let Some(successful) = attempts.iter().find(|attempt| {
+            attempt.get("success").and_then(|value| value.as_bool()) == Some(true)
+                && attempt
+                    .get("channel")
+                    .and_then(|value| value.as_str())
+                    .map(|channel| {
+                        let normalized = channel.trim().to_ascii_lowercase();
+                        normalized != "web" && normalized != "in_app"
+                    })
+                    .unwrap_or(false)
+        }) {
             let channel = successful
                 .get("channel")
                 .and_then(|value| value.as_str())
@@ -3997,12 +4016,17 @@ pub(super) fn summarize_daily_brief_delivery(result: &serde_json::Value) -> Stri
             if in_app_success {
                 return format!("Saved in-app only. {}", failure);
             }
+            if in_app_notification_suppressed {
+                return format!("No in-app notification created. {}", failure);
+            }
             return failure;
         }
     }
 
     if in_app_success {
         "Saved in-app only.".to_string()
+    } else if in_app_notification_suppressed {
+        "No in-app notification created.".to_string()
     } else {
         "Delivery status unavailable.".to_string()
     }

@@ -185,6 +185,8 @@ impl DatabaseConfig {
 
     pub fn from_env() -> Result<Self> {
         let url = std::env::var("AGENTARK_DATABASE_URL")
+            .ok()
+            .or_else(database_url_from_postgres_secret_env)
             .context("AGENTARK_DATABASE_URL must be set for Postgres-backed storage")?;
         let mut config = Self::new(url);
         config.apply_optional_env_overrides();
@@ -193,10 +195,10 @@ impl DatabaseConfig {
 
     #[cfg(test)]
     pub fn for_tests() -> Result<Self> {
-        let base = std::env::var("AGENTARK_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://agentark:agentark@127.0.0.1:5432/agentark".to_string());
+        let base = test_database_url()?;
         let mut config = Self::new(base);
-        config.max_connections = 4;
+        config.max_connections = 2;
+        config.connect_timeout_secs = 15;
         Ok(config)
     }
 
@@ -248,6 +250,185 @@ impl DatabaseConfig {
             options.set_schema_search_path(schema);
         }
         options
+    }
+}
+
+fn database_url_from_postgres_secret_env() -> Option<String> {
+    let password = std::env::var("AGENTARK_POSTGRES_PASSWORD")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AGENTARK_POSTGRES_PASSWORD_FILE")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })?;
+    let user = std::env::var("AGENTARK_POSTGRES_USER").unwrap_or_else(|_| "agentark".to_string());
+    let host = std::env::var("AGENTARK_POSTGRES_HOST").unwrap_or_else(|_| "postgres".to_string());
+    let port = std::env::var("AGENTARK_POSTGRES_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(5432);
+    let database = std::env::var("AGENTARK_POSTGRES_DB").unwrap_or_else(|_| "agentark".to_string());
+    postgres_url_from_parts(&user, &password, &host, port, &database).ok()
+}
+
+fn postgres_url_from_parts(
+    user: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    database: &str,
+) -> Result<String> {
+    let mut url = url::Url::parse("postgres://localhost/agentark")?;
+    url.set_username(user)
+        .map_err(|_| anyhow::anyhow!("invalid Postgres user for database URL"))?;
+    url.set_password(Some(password))
+        .map_err(|_| anyhow::anyhow!("invalid Postgres password for database URL"))?;
+    url.set_host(Some(host))
+        .map_err(|_| anyhow::anyhow!("invalid Postgres host for database URL"))?;
+    url.set_port(Some(port))
+        .map_err(|_| anyhow::anyhow!("invalid Postgres port for database URL"))?;
+    url.set_path(&format!("/{database}"));
+    Ok(url.to_string())
+}
+
+#[cfg(test)]
+fn test_database_url() -> Result<String> {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| {
+        explicit_test_database_url()
+            .or_else(test_database_url_from_compose_postgres)
+            .unwrap_or_else(|| {
+                "postgres://agentark:agentark@127.0.0.1:5432/agentark_test".to_string()
+            })
+    });
+    let url = URL
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "postgres://agentark:agentark@127.0.0.1:5432/agentark_test".to_string());
+    ensure_database_url_is_test_scoped(&url)?;
+    Ok(url)
+}
+
+#[cfg(test)]
+fn explicit_test_database_url() -> Option<String> {
+    std::env::var("AGENTARK_TEST_DATABASE_URL")
+        .ok()
+        .filter(|value| ensure_database_url_is_test_scoped(value).is_ok())
+        .or_else(|| {
+            std::env::var("AGENTARK_DATABASE_URL")
+                .ok()
+                .filter(|value| ensure_database_url_is_test_scoped(value).is_ok())
+        })
+}
+
+#[cfg(test)]
+fn ensure_database_url_is_test_scoped(raw: &str) -> Result<()> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|error| anyhow::anyhow!("test database URL is invalid: {}", error))?;
+    let database = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .unwrap_or_default();
+    if database_is_test_scoped(database) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Refusing to run tests against non-test Postgres database '{}'. Set AGENTARK_TEST_DATABASE_URL or AGENTARK_TEST_POSTGRES_DB to an isolated database such as agentark_test_<id>.",
+            database
+        )
+    }
+}
+
+#[cfg(test)]
+fn database_is_test_scoped(database: &str) -> bool {
+    let normalized = database.trim().to_ascii_lowercase();
+    normalized.starts_with("agentark_test")
+        || normalized.starts_with("test_agentark")
+        || normalized.ends_with("_test")
+        || normalized.contains("_test_")
+}
+
+#[cfg(test)]
+fn test_database_url_from_compose_postgres() -> Option<String> {
+    let output = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "agentark-postgres",
+            "sh",
+            "-lc",
+            "cat /run/secrets/pg_pw",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let password = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if password.is_empty() {
+        return None;
+    }
+    let user = std::env::var("AGENTARK_POSTGRES_USER").unwrap_or_else(|_| "agentark".to_string());
+    let host =
+        std::env::var("AGENTARK_TEST_POSTGRES_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("AGENTARK_POSTGRES_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(5432);
+    let database = test_compose_postgres_database_name()?;
+    ensure_compose_test_database(&database);
+    postgres_url_from_parts(&user, &password, &host, port, &database).ok()
+}
+
+#[cfg(test)]
+fn test_compose_postgres_database_name() -> Option<String> {
+    let raw = std::env::var("AGENTARK_TEST_POSTGRES_DB")
+        .unwrap_or_else(|_| format!("agentark_test_{}", std::process::id()));
+    let database = raw.trim();
+    if database.is_empty()
+        || !database
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || !database_is_test_scoped(database)
+    {
+        return None;
+    }
+    Some(database.to_string())
+}
+
+#[cfg(test)]
+fn ensure_compose_test_database(database: &str) {
+    let script = format!(
+        "PGPASSWORD=\"$(cat /run/secrets/pg_pw)\" createdb -h 127.0.0.1 -U \"${{POSTGRES_USER:-agentark}}\" {} 2>/dev/null || true",
+        database
+    );
+    let _ = std::process::Command::new("docker")
+        .args(["exec", "agentark-postgres", "sh", "-lc", &script])
+        .status();
+}
+
+#[cfg(test)]
+mod database_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_database_guard_rejects_live_agentark_database() {
+        assert!(ensure_database_url_is_test_scoped(
+            "postgres://agentark:secret@127.0.0.1/agentark"
+        )
+        .is_err());
+        assert!(!database_is_test_scoped("agentark"));
+    }
+
+    #[test]
+    fn test_database_guard_accepts_isolated_test_database() {
+        assert!(ensure_database_url_is_test_scoped(
+            "postgres://agentark:secret@127.0.0.1/agentark_test_123"
+        )
+        .is_ok());
+        assert!(database_is_test_scoped("agentark_test_123"));
     }
 }
 
@@ -662,9 +843,11 @@ fn learned_fact_from_experience_item(item: experience_item::Model) -> LearnedFac
         })
         .unwrap_or_else(|| "[]".to_string());
     let memory_kind = learned_fact_kind_from_metadata(&item.metadata);
-    let memory_category =
-        crate::core::memory_schema::memory_category_from_metadata(&item.metadata, memory_kind.as_deref())
-            .to_string();
+    let memory_category = crate::core::memory_schema::memory_category_from_metadata(
+        &item.metadata,
+        memory_kind.as_deref(),
+    )
+    .to_string();
     let topics = learned_fact_topics_from_metadata(&item.metadata);
     LearnedFactRecord {
         id: item.id,
@@ -1442,6 +1625,28 @@ impl Storage {
                     .unwrap_or_else(|_| row.content.clone()),
             )?;
             knowledge_item::ActiveModel {
+                id: Unchanged(row.id),
+                title: Set(title),
+                content: Set(content),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let experience_items = experience_item::Entity::find().all(&txn).await?;
+        for row in experience_items {
+            let title = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.title)
+                    .unwrap_or_else(|_| row.title.clone()),
+            )?;
+            let content = new_key.encrypt_string(
+                &old_key
+                    .decrypt_string(&row.content)
+                    .unwrap_or_else(|_| row.content.clone()),
+            )?;
+            experience_item::ActiveModel {
                 id: Unchanged(row.id),
                 title: Set(title),
                 content: Set(content),
@@ -3282,6 +3487,25 @@ impl Storage {
         Ok(())
     }
 
+    async fn existing_execution_trace_id(&self, trace_id: Option<&str>) -> Result<Option<String>> {
+        let Some(trace_id) = trace_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let exists = execution_trace::Entity::find_by_id(trace_id.to_string())
+            .count(&self.db)
+            .await?
+            > 0;
+        if exists {
+            Ok(Some(trace_id.to_string()))
+        } else {
+            tracing::debug!(
+                trace_id,
+                "Skipping execution run trace_id link because the execution trace is not persisted yet"
+            );
+            Ok(None)
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn insert_execution_run(&self, run: &crate::core::ExecutionRun) -> Result<()> {
         let degradation = encrypt_storage_string(&serde_json::to_string(&run.degradation)?)?;
@@ -3290,6 +3514,9 @@ impl Storage {
         let request_message = encrypt_optional_storage_string(run.request_message.as_deref())?;
         let attempted_models =
             encrypt_storage_string(&serde_json::to_string(&run.attempted_models)?)?;
+        let trace_id = self
+            .existing_execution_trace_id(run.trace_id.as_deref())
+            .await?;
 
         let insert_result = execution_run::Entity::insert(execution_run::ActiveModel {
             id: Set(run.id.clone()),
@@ -3305,7 +3532,7 @@ impl Storage {
             degradation: Set(degradation.clone()),
             last_error: Set(last_error.clone()),
             result_summary: Set(result_summary.clone()),
-            trace_id: Set(run.trace_id.clone()),
+            trace_id: Set(trace_id.clone()),
             conversation_id: Set(run.conversation_id.clone()),
             channel: Set(run.channel.clone()),
             request_message: Set(request_message.clone()),
@@ -3339,7 +3566,7 @@ impl Storage {
         .exec(&self.db)
         .await;
         if let Err(error) = insert_result {
-            if run.trace_id.is_some() && is_foreign_key_constraint_error(&error) {
+            if trace_id.is_some() && is_foreign_key_constraint_error(&error) {
                 tracing::warn!(
                     "Retrying execution run upsert '{}' without trace_id after FK failure: {}",
                     run.id,
@@ -4583,6 +4810,99 @@ impl Storage {
 
     pub async fn get_experience_item(&self, id: &str) -> Result<Option<experience_item::Model>> {
         Self::get_experience_item_conn(&self.db, id).await
+    }
+
+    pub async fn hard_delete_experience_item_memory(&self, id: &str) -> Result<bool> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Ok(false);
+        }
+        let txn = self.db.begin().await?;
+        let Some(_) = experience_item::Entity::find_by_id(id.to_string())
+            .one(&txn)
+            .await?
+        else {
+            txn.commit().await?;
+            return Ok(false);
+        };
+        let operation_rows = memory_operation::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(memory_operation::Column::TargetMemoryId.eq(id.to_string()))
+                    .add(memory_operation::Column::AppliedMemoryId.eq(id.to_string())),
+            )
+            .all(&txn)
+            .await?;
+        let operation_ids = operation_rows
+            .iter()
+            .map(|operation| operation.id.clone())
+            .collect::<Vec<_>>();
+        memory_evidence_link::Entity::delete_many()
+            .filter(memory_evidence_link::Column::MemoryId.eq(id.to_string()))
+            .exec(&txn)
+            .await?;
+        if !operation_ids.is_empty() {
+            memory_evidence_link::Entity::delete_many()
+                .filter(memory_evidence_link::Column::OperationId.is_in(operation_ids.clone()))
+                .exec(&txn)
+                .await?;
+        }
+        memory_operation::Entity::delete_many()
+            .filter(
+                Condition::any()
+                    .add(memory_operation::Column::TargetMemoryId.eq(id.to_string()))
+                    .add(memory_operation::Column::AppliedMemoryId.eq(id.to_string())),
+            )
+            .exec(&txn)
+            .await?;
+        learning_candidate::Entity::delete_many()
+            .filter(learning_candidate::Column::ApprovedRef.eq(id.to_string()))
+            .exec(&txn)
+            .await?;
+        if !operation_ids.is_empty() {
+            let candidate_ids = operation_ids
+                .iter()
+                .map(|operation_id| format!("memory-candidate-{operation_id}"))
+                .collect::<Vec<_>>();
+            learning_candidate::Entity::delete_many()
+                .filter(learning_candidate::Column::Id.is_in(candidate_ids))
+                .exec(&txn)
+                .await?;
+        }
+        experience_edge::Entity::delete_many()
+            .filter(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(experience_edge::Column::SourceKind.eq("experience_item"))
+                            .add(experience_edge::Column::SourceRef.eq(id.to_string())),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(experience_edge::Column::TargetKind.eq("experience_item"))
+                            .add(experience_edge::Column::TargetRef.eq(id.to_string())),
+                    ),
+            )
+            .exec(&txn)
+            .await?;
+        recall_event::Entity::delete_many()
+            .filter(
+                Condition::any()
+                    .add(recall_event::Column::MemoryId.eq(id.to_string()))
+                    .add(recall_event::Column::RelatedMemoryId.eq(id.to_string()))
+                    .add(
+                        Condition::all()
+                            .add(recall_event::Column::SourceKind.eq("experience_item"))
+                            .add(recall_event::Column::SourceRef.eq(id.to_string())),
+                    ),
+            )
+            .exec(&txn)
+            .await?;
+        let result = experience_item::Entity::delete_by_id(id.to_string())
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn insert_recall_event(&self, event: &recall_event::Model) -> Result<()> {

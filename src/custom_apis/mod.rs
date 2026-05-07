@@ -168,6 +168,8 @@ pub struct CustomApiUpsertRequest {
     #[serde(default)]
     pub clear_secret: Option<bool>,
     #[serde(default)]
+    pub allow_missing_secret: Option<bool>,
+    #[serde(default)]
     pub operations: Vec<CustomApiOperationDraft>,
 }
 
@@ -315,7 +317,11 @@ pub async fn upsert_custom_api(
             .as_ref()
             .and_then(|item| item.auth_profile_id.clone())
     });
-    if matches!(auth_mode, CustomApiAuthMode::OAuth2) && auth_profile_id.is_none() {
+    let allow_missing_secret = request.allow_missing_secret.unwrap_or(false);
+    if matches!(auth_mode, CustomApiAuthMode::OAuth2)
+        && auth_profile_id.is_none()
+        && !allow_missing_secret
+    {
         anyhow::bail!(
             "OAuth2 custom APIs require an auth_profile_id bound to a real OAuth auth profile."
         );
@@ -364,6 +370,7 @@ pub async fn upsert_custom_api(
     if auth_profile_id.is_none()
         && !matches!(auth_mode, CustomApiAuthMode::None)
         && !secret_configured
+        && !allow_missing_secret
     {
         anyhow::bail!("This auth mode requires a secret or token.");
     }

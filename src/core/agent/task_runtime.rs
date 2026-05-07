@@ -1354,13 +1354,15 @@ impl Agent {
         match action_kind {
             "daily_brief_now" => {
                 let result = self
-                    .run_daily_brief_and_notify_reported_with_hint(None)
+                    .run_daily_brief_reported_with_hint(None)
                     .await
                     .map_err(|e| e.to_string())?;
                 let delivered_channel = result
                     .push_attempts
                     .iter()
-                    .find(|outcome| outcome.success)
+                    .find(|outcome| {
+                        outcome.success && is_external_notification_channel(&outcome.channel)
+                    })
                     .map(|outcome| outcome.channel.clone());
                 let summarize_outcome = |outcome: &NotificationDispatchOutcome| {
                     serde_json::json!({
@@ -1375,6 +1377,7 @@ impl Agent {
                     "kind":"daily_brief_now",
                     "brief": crate::security::redact_pii(&result.brief),
                     "delivery": {
+                        "in_app_notification_suppressed": true,
                         "stored_in_app": result.in_app.success,
                         "in_app": summarize_outcome(&result.in_app),
                         "push_delivered": delivered_channel.is_some(),
@@ -1634,7 +1637,7 @@ impl Agent {
                 .and_then(|value| value.as_str())
                 .filter(|value| !value.trim().is_empty());
             let result = self
-                .run_daily_brief_and_notify_reported_with_hint(preferred_channel)
+                .run_daily_brief_reported_with_hint(preferred_channel)
                 .await?;
             return Ok(result.brief);
         }
@@ -2327,7 +2330,7 @@ impl Agent {
     ) {
         if task.action == "daily_brief" {
             tracing::debug!(
-                "Scheduled daily_brief delivery already handled inside run_daily_brief_and_notify"
+                "Skipping task report notification for scheduled daily_brief generation"
             );
             return;
         }

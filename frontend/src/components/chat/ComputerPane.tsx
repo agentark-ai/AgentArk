@@ -16,6 +16,7 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import IconButton from "@mui/material/IconButton";
 import Tooltip from "@mui/material/Tooltip";
+import Collapse from "@mui/material/Collapse";
 import CloseIcon from "@mui/icons-material/Close";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
@@ -23,6 +24,7 @@ import FiberManualRecordRoundedIcon from "@mui/icons-material/FiberManualRecordR
 import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownRounded";
 import KeyboardArrowUpRoundedIcon from "@mui/icons-material/KeyboardArrowUpRounded";
 import TerminalRoundedIcon from "@mui/icons-material/TerminalRounded";
+import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 
 import type { ChatStepCard, ComputerPaneFile, ComputerPaneTab, SurfaceStatus } from "./types";
 import { extractFilePath, pickComputerView, prepareChipCards } from "./dispatch";
@@ -114,12 +116,21 @@ function safePaneText(value: string, fallback = ""): string {
 function ActivityList({
   cards,
   activeStepId,
-  onActivate,
 }: {
   cards: ChatStepCard[];
   activeStepId: string | null;
-  onActivate: (id: string) => void;
 }) {
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
+
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   if (!cards || cards.length === 0) {
     return (
       <Box className="computer-pane-activity-empty">
@@ -135,15 +146,22 @@ function ActivityList({
         const isActive = card.id === activeStepId;
         const time = card.time || "";
         const detail = safePaneText(card.summary || card.detail || "");
+        const expanded = expandedIds.has(card.id);
+        const detailsId = `computer-pane-activity-details-${card.id}`.replace(
+          /[^a-zA-Z0-9_-]+/g,
+          "-",
+        );
         return (
           <li
             key={`activity-${card.id}`}
-            className={`computer-pane-activity-row tone-${card.tone}${isActive ? " is-active" : ""}`}
+            className={`computer-pane-activity-row tone-${card.tone}${isActive ? " is-active" : ""}${expanded ? " is-expanded" : ""}`}
           >
             <button
               type="button"
               className="computer-pane-activity-button"
-              onClick={() => onActivate(card.id)}
+              aria-expanded={expanded}
+              aria-controls={detailsId}
+              onClick={() => toggleExpanded(card.id)}
             >
               <span className="computer-pane-activity-kind">
                 {card.kind || "Update"}
@@ -157,11 +175,232 @@ function ActivityList({
               {time ? (
                 <span className="computer-pane-activity-time">{time}</span>
               ) : null}
+              <KeyboardArrowDownRoundedIcon
+                fontSize="small"
+                className={`computer-pane-activity-chevron${expanded ? " is-expanded" : ""}`}
+                aria-hidden="true"
+              />
             </button>
+            <Collapse in={expanded} mountOnEnter unmountOnExit>
+              <ActivityExpandedDetails card={card} detailsId={detailsId} />
+            </Collapse>
           </li>
         );
       })}
     </ol>
+  );
+}
+
+type ActivityDisplayField = {
+  label: string;
+  value: string;
+};
+
+function formatActivityFieldLabel(value: string): string {
+  const normalized = (value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "Value";
+  return normalized
+    .split(" ")
+    .map((part) =>
+      part.length <= 3 && part === part.toLowerCase()
+        ? part.toUpperCase()
+        : `${part.charAt(0).toUpperCase()}${part.slice(1)}`,
+    )
+    .join(" ");
+}
+
+function activityDisplayText(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "None";
+    const scalarItems = value
+      .slice(0, 6)
+      .map(activityDisplayText)
+      .filter(Boolean);
+    if (scalarItems.length === Math.min(value.length, 6)) {
+      const suffix = value.length > scalarItems.length ? ` +${value.length - scalarItems.length} more` : "";
+      return `${scalarItems.join(", ")}${suffix}`;
+    }
+    return `${value.length} item${value.length === 1 ? "" : "s"}`;
+  }
+  const record = asPaneRecord(value);
+  const keys = Object.keys(record);
+  if (keys.length === 0) return "";
+  return `${keys.slice(0, 5).map(formatActivityFieldLabel).join(", ")}${keys.length > 5 ? ` +${keys.length - 5} more` : ""}`;
+}
+
+function collectActivityFields(
+  value: unknown,
+  options?: { prefix?: string; depth?: number; limit?: number },
+): ActivityDisplayField[] {
+  const prefix = options?.prefix || "";
+  const depth = options?.depth ?? 0;
+  const limit = options?.limit ?? 18;
+  const record = asPaneRecord(value);
+  const fields: ActivityDisplayField[] = [];
+  for (const [key, fieldValue] of Object.entries(record)) {
+    if (fields.length >= limit) break;
+    const fieldLabel = prefix
+      ? `${prefix} ${formatActivityFieldLabel(key)}`
+      : formatActivityFieldLabel(key);
+    const child = asPaneRecord(fieldValue);
+    const shouldFlatten =
+      depth < 2 &&
+      Object.keys(child).length > 0 &&
+      ["data", "payload", "arguments", "args", "input", "output", "result"].includes(
+        key.trim().toLowerCase(),
+      );
+    if (shouldFlatten) {
+      const nested = collectActivityFields(child, {
+        prefix,
+        depth: depth + 1,
+        limit: limit - fields.length,
+      });
+      fields.push(...nested);
+      continue;
+    }
+    const text = activityDisplayText(fieldValue);
+    if (!text) continue;
+    fields.push({ label: fieldLabel, value: text });
+  }
+  return fields;
+}
+
+function buildActivityDetails(card: ChatStepCard) {
+  const record = tryParseRecord(card.traceJson || "") || {};
+  const data = asPaneRecord(record.data);
+  const overview =
+    str(data.content_snapshot, "") ||
+    str(data.content, "") ||
+    str(record.detail, "") ||
+    card.rawDetailFull ||
+    card.detailFull ||
+    card.summary ||
+    card.detail ||
+    "Activity update.";
+  const statusFields: ActivityDisplayField[] = [
+    { label: "Status", value: card.kind || "Update" },
+    { label: "Title", value: card.label || card.rawTitle || "Activity update" },
+    { label: "Step Type", value: card.stepType },
+    { label: "Time", value: card.time },
+  ].filter((field) => field.value.trim());
+  const traceFields = collectActivityFields(record, { limit: 20 });
+  const displayFields = [
+    ...statusFields,
+    ...traceFields.filter(
+      (field) =>
+        !statusFields.some(
+          (existing) =>
+            existing.label === field.label && existing.value === field.value,
+        ),
+    ),
+  ];
+  const traceJson = (card.traceJson || "").trim();
+  const copyText = [
+    `Overview:\n${overview}`,
+    displayFields
+      .map((field) => `${field.label}:\n${field.value}`)
+      .join("\n\n"),
+    traceJson ? `Raw Trace JSON:\n${traceJson}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  return { overview, displayFields, traceJson, copyText };
+}
+
+function ActivityExpandedDetails({
+  card,
+  detailsId,
+}: {
+  card: ChatStepCard;
+  detailsId: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const details = useMemo(() => buildActivityDetails(card), [card]);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const copyActivity = async () => {
+    if (!details.copyText) return;
+    try {
+      await navigator.clipboard.writeText(details.copyText);
+      setCopied(true);
+    } catch {
+      // Clipboard access can be unavailable outside secure browser contexts.
+    }
+  };
+
+  return (
+    <Box id={detailsId} className="computer-pane-activity-expanded">
+      <Stack
+        direction="row"
+        spacing={0.5}
+        className="computer-pane-activity-expanded-head"
+        sx={{ alignItems: "center", justifyContent: "space-between" }}
+      >
+        <span className="computer-pane-activity-expanded-title">
+          Activity details
+        </span>
+        <Tooltip
+          title={copied ? "Copied" : "Copy activity"}
+          placement="top"
+          arrow
+        >
+          <span>
+            <IconButton
+              size="small"
+              className="computer-pane-activity-copy"
+              disabled={!details.copyText}
+              onClick={copyActivity}
+              aria-label="Copy activity details"
+            >
+              <ContentCopyRoundedIcon fontSize="inherit" />
+            </IconButton>
+          </span>
+        </Tooltip>
+      </Stack>
+      <Box className="computer-pane-activity-readable">
+        <Box className="computer-pane-activity-overview">
+          <span className="computer-pane-activity-overview-label">
+            What happened
+          </span>
+          <p>{details.overview}</p>
+        </Box>
+        {details.displayFields.length > 0 ? (
+          <Box className="computer-pane-activity-field-grid">
+            {details.displayFields.map((field, index) => (
+              <Box
+                key={`${detailsId}-field-${index}`}
+                className="computer-pane-activity-field"
+              >
+                <span className="computer-pane-activity-field-label">
+                  {field.label}
+                </span>
+                <span className="computer-pane-activity-field-value">
+                  {field.value}
+                </span>
+              </Box>
+            ))}
+          </Box>
+        ) : null}
+        {details.traceJson ? (
+          <details className="computer-pane-activity-raw">
+            <summary>Raw trace JSON</summary>
+            <pre className="computer-pane-activity-full">{details.traceJson}</pre>
+          </details>
+        ) : null}
+      </Box>
+    </Box>
   );
 }
 
@@ -190,12 +429,43 @@ function tryParseRecord(raw: string): Record<string, unknown> | null {
   }
 }
 
+function asPaneRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
 function structuredCardRecord(card: ChatStepCard): Record<string, unknown> | null {
   return (
     tryParseRecord(card.payloadView?.body || "") ||
     tryParseRecord(card.rawDetailFull || "") ||
     tryParseRecord(card.detailFull || "") ||
+    tryParseRecord(card.traceJson || "") ||
     null
+  );
+}
+
+function reasoningCardPhase(card: ChatStepCard): string {
+  const record = structuredCardRecord(card);
+  const data = asPaneRecord(record?.data);
+  return str(record?.phase, str(data.phase, "")).trim();
+}
+
+function reasoningCardContent(card: ChatStepCard): string {
+  const record = structuredCardRecord(card);
+  const data = asPaneRecord(record?.data);
+  return (
+    str(record?.content_snapshot, "") ||
+    str(data.content_snapshot, "") ||
+    str(record?.content, "") ||
+    str(data.content, "") ||
+    str(record?.content_delta, "") ||
+    str(data.content_delta, "") ||
+    card.rawDetailFull ||
+    card.detailFull ||
+    card.detail ||
+    card.summary ||
+    ""
   );
 }
 
@@ -490,8 +760,8 @@ function ComputerPaneInner({
     [activityCards],
   );
   const navPool = useMemo(
-    () =>
-      prepareChipCards(cardsForRun).filter(
+    () => {
+      const workspaceSurfaceCards = prepareChipCards(cardsForRun).filter(
         (card) => {
           const rendererId = rendererIdForCard(card);
           return (
@@ -499,8 +769,13 @@ function ComputerPaneInner({
             rendererId !== AGENTARK_RENDERERS.FILE
           );
         },
-      ),
-    [cardsForRun],
+      );
+      const reasoningCards = activityCards.filter(isReasoningOnlyCard);
+      return [...reasoningCards, ...workspaceSurfaceCards].sort(
+        (left, right) => left.index - right.index,
+      );
+    },
+    [activityCards, cardsForRun],
   );
   const headerFilePath =
     followedLiveWritePath ||
@@ -545,6 +820,7 @@ function ComputerPaneInner({
   const canPrev = activeIndex > 0;
   const canNext = activeIndex >= 0 && activeIndex < navPool.length - 1;
   const view = activeCard ? pickComputerView(activeCard) : AGENTARK_RENDERERS.GENERIC;
+  const activeCardIsReasoning = activeCard ? isReasoningOnlyCard(activeCard) : false;
   const activeSurfaceStatus = activeCard ? surfaceStatus(activeCard, Boolean(isStreaming)) : null;
   const fileHeaderText =
     liveWriteActive && headerFilePath
@@ -935,6 +1211,15 @@ function ComputerPaneInner({
                   detail="When AgentArk runs a tool, its live output will land here."
                 />
               )
+            ) : activeCardIsReasoning ? (
+              <WorkingView
+                phaseLabel={activeCard.label || "Thinking"}
+                detail={activeCard.summary || activeCard.detail || ""}
+                startedAt={activeCard.time || startedAt}
+                reasoningPreview={reasoningCardContent(activeCard)}
+                reasoningPhase={reasoningCardPhase(activeCard)}
+                persisted
+              />
             ) : (
               <SurfaceRenderer
                 card={activeCard}
@@ -1075,10 +1360,6 @@ function ComputerPaneInner({
             <ActivityList
               cards={activityCards}
               activeStepId={activeStepId}
-              onActivate={(id) => {
-                onActivate(id);
-                setTab("computer");
-              }}
             />
           )}
         </Box>

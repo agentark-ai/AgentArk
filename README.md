@@ -674,6 +674,7 @@ RUST_LOG=info,agentark=debug ./scripts/start.sh     # agent internals only
 - Support multiple accounts per provider across integrations, channels, and reasoning, with workspace-level account management and selection. Project-specific selection can be revisited in phase 2.
 - Let users refine an active chat run with extra instructions while AgentArk is still working.
 - Add external database support through a dedicated Databases page with read-only schema inspection and conversational querying. Planned providers: Postgres, Supabase, MySQL, Snowflake, and Databricks SQL.
+- Add local-only message history querying through user-approved companion devices. Planned flow: a user asks AgentArk to search messages, AgentArk sends a typed `messages.search` command to a paired local companion, the user approves the exact query/scope/time range, and only bounded results return to AgentArk. Initial target is macOS iMessage via a local companion because iOS cannot expose Messages history to browser or app companions; WhatsApp, Telegram, SMS, and other local app stores require separate companion support where the platform permits it.
 - ArkOrbit is in development for a future release as a dynamic app and widget deployment surface.
 - Optional GPU-accelerated learning for power users. Entirely opt-in and self-hosted - your data never leaves your machine, and any improvement is gated by AgentArk's existing rollout-and-promotion pipeline so your live agent only changes when a candidate clearly beats it.
   - Phase 1 (consumer GPU): lightweight on-device learning that makes routine decisions and evaluation faster and cheaper.
@@ -762,6 +763,7 @@ AgentArk stands on the shoulders of a large open-source ecosystem. None of this 
 | [Hyper](https://hyper.rs/) + [Axum](https://github.com/tokio-rs/axum) + [Tower](https://github.com/tower-rs/tower)    | HTTP stack, server, router, middleware                           |
 | [Tokio-Tungstenite](https://github.com/snapview/tokio-tungstenite)                                                    | WebSocket implementation (channels + companion devices)          |
 | [Reqwest](https://github.com/seanmonstar/reqwest)                                                                     | HTTP client for every outbound API call                          |
+| [Futures](https://github.com/rust-lang/futures-rs)                                                                    | Async streams, combinators, and background pipeline plumbing      |
 | [Serde](https://serde.rs/) + [serde_json](https://github.com/serde-rs/json) + [TOML](https://github.com/toml-rs/toml) | Serialization across the entire codebase                         |
 | [Tracing](https://github.com/tokio-rs/tracing)                                                                        | Structured logging and diagnostics                               |
 | [Clap](https://github.com/clap-rs/clap)                                                                               | CLI argument parsing                                             |
@@ -774,9 +776,11 @@ AgentArk stands on the shoulders of a large open-source ecosystem. None of this 
 | [PostgreSQL](https://www.postgresql.org/) + [pgvector](https://github.com/pgvector/pgvector)                         | Primary database and vector embedding store      |
 | [SeaORM](https://www.sea-ql.org/SeaORM/) + [SQLx](https://github.com/launchbadge/sqlx)                               | Database ORM and query layer                     |
 | [Chrono](https://github.com/chronotope/chrono) + [chrono-tz](https://github.com/chronotope/chrono-tz)                | Time and timezone handling                       |
-| [cron](https://github.com/zslayton/cron) + [tokio-cron-scheduler](https://github.com/mvniekerk/tokio-cron-scheduler) | Task scheduling and watchers                     |
+| [cron](https://github.com/zslayton/cron)                                                                              | Cron expression parsing for scheduled tasks      |
 | [FastEmbed](https://github.com/Anush008/fastembed-rs)                                                                | Local embedding generation for memory and search |
 | [pdf-extract](https://github.com/jrmuizel/pdf-extract)                                                               | PDF text extraction for documents                |
+| [notify](https://github.com/notify-rs/notify) + [walkdir](https://github.com/BurntSushi/walkdir)                     | Filesystem watching and safe directory scans     |
+| [zip](https://github.com/zip-rs/zip2)                                                                                 | Extension-pack, DOCX, and archive handling       |
 
 **Security and cryptography**
 
@@ -796,6 +800,7 @@ AgentArk stands on the shoulders of a large open-source ecosystem. None of this 
 | [Docker](https://www.docker.com/) + [Bollard](https://github.com/fussybeaver/bollard) | Container runtime and Rust Docker client            |
 | [Playwright](https://playwright.dev/)                                                 | Interactive browser automation and operator handoff |
 | [Lightpanda](https://github.com/lightpanda-io/browser)                                | Fast headless browser for content extraction        |
+| [scraper](https://github.com/rust-scraper/scraper)                                   | HTML parsing for search, app inspection, and guards |
 | [russh](https://github.com/warp-tech/russh)                                           | SSH client for remote-action flows                  |
 | [SearXNG](https://github.com/searxng/searxng)                                         | Self-hosted metasearch (optional research backend)  |
 | [Model Context Protocol](https://modelcontextprotocol.io/)                            | Open standard for pluggable tool surfaces           |
@@ -807,7 +812,9 @@ AgentArk stands on the shoulders of a large open-source ecosystem. None of this 
 | Project                                                                                                                       | Used for                   |
 | :---------------------------------------------------------------------------------------------------------------------------- | :------------------------- |
 | [Teloxide](https://github.com/teloxide/teloxide)                                                                              | Telegram bot framework     |
-| Community channel SDKs (Slack, Discord, Matrix, WhatsApp, Signal, iMessage, Google Chat, Teams, LINE, WeChat, QQ, and others) | Messaging-channel adapters |
+| [Baileys](https://github.com/WhiskeySockets/Baileys)                                                                          | Embedded WhatsApp bridge   |
+| Platform HTTP/WebSocket APIs (Slack, Discord, Matrix, Signal, iMessage, Google Chat, Teams, LINE, WeChat, QQ, and others)     | Messaging-channel adapters |
+| [Lettre](https://github.com/lettre/lettre)                                                                                    | SMTP email delivery        |
 
 **Frontend and visualization**
 

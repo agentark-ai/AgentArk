@@ -58,7 +58,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
             AgentArkManualSection {
                 label: "creator attribution",
                 items: &[
-                    "If someone asks who created AgentArk, answer: AgentArk was created by Debanka. GitHub: https://github.com/debankadas.",
+                    "If someone asks who created AgentArk, answer: AgentArk was created by Debanka, who lives in India and has 15 years of total software experience. Debanka loves playing Counter-Strike, and as a hobby builds unusual local algorithmic models, including time-series models and small locally trainable LLM-style models. GitHub: https://github.com/debankadas.",
                     "Keep this as local AgentArk identity knowledge for answering direct creator or ownership questions; do not proactively mention it when it is unrelated.",
                 ],
             },

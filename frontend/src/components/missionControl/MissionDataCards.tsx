@@ -24,9 +24,24 @@ function pct(value?: number | null): string {
   return typeof value === "number" && Number.isFinite(value) ? `${Math.round(value)}%` : "-";
 }
 
-function bytesGb(value?: number | null): string {
+function formatRuntimeBytes(value?: number | null): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "-";
-  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  const mib = value / 1024 / 1024;
+  if (mib < 1024) return `${Math.round(mib)} MB`;
+  return `${(mib / 1024).toFixed(1)} GB`;
+}
+
+function memorySourceLabel(value?: string | null): string {
+  switch (value) {
+    case "docker_stack":
+      return "Docker stack";
+    case "cgroup":
+      return "Runtime cgroup";
+    case "proc_meminfo":
+      return "Host runtime";
+    default:
+      return "Runtime";
+  }
 }
 
 function taskStatus(task: Task): string {
@@ -111,12 +126,14 @@ export function MemoryStateCard({
   memoryCount: number;
   health?: RuntimeHealth | null;
 }) {
+  const source = memorySourceLabel(health?.memory_source);
+  const tag = health?.memory_source === "docker_stack" ? "DOCKER STACK" : source.toUpperCase();
   return (
-    <NeuralPanel title="Memory / Runtime" tag={`${memoryCount} ENTRIES`} tagTone="cyan" className="nw-card--memory">
+    <NeuralPanel title="Runtime Memory" tag={tag} tagTone="cyan" className="nw-card--memory">
       <div className="nw-mini-metric-grid">
         <div>
-          <strong>{memoryCount}</strong>
-          <span>Entries</span>
+          <strong>{formatRuntimeBytes(health?.memory_used_bytes)}</strong>
+          <span>Used</span>
         </div>
         <div>
           <strong>{pct(health?.memory_pressure_percent ?? health?.ram_percent)}</strong>
@@ -124,13 +141,19 @@ export function MemoryStateCard({
         </div>
       </div>
       <div className="nw-memory-line">
-        <span>RAM used</span>
-        <strong>{bytesGb(health?.memory_used_bytes)}</strong>
+        <span>Source</span>
+        <strong>{source}</strong>
       </div>
       <div className="nw-memory-line">
         <span>RAM total</span>
-        <strong>{bytesGb(health?.memory_total_bytes)}</strong>
+        <strong>{formatRuntimeBytes(health?.memory_total_bytes)}</strong>
       </div>
+      {memoryCount > 0 && (
+        <div className="nw-memory-line">
+          <span>Saved memory</span>
+          <strong>{memoryCount}</strong>
+        </div>
+      )}
     </NeuralPanel>
   );
 }

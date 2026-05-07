@@ -9,8 +9,12 @@ const AGENT_TURN_LOOP_VERSION: &str = "agent_turn_loop_v1";
 const AGENT_TURN_LOOP_PROGRESS_NAME: &str = "agent_turn_loop";
 const AGENT_TURN_LOOP_MAX_ITERATIONS_DEFAULT: usize = 6;
 const AGENT_TURN_LOOP_MAX_CANDIDATES_DEFAULT: usize = 5;
-const AGENT_TURN_LOOP_TOOL_RESULT_CHARS: usize = 1_200;
-const AGENT_TURN_LOOP_CONTEXT_TOOL_RESULT_CHARS: usize = 900;
+const AGENT_TURN_LOOP_TOOL_RESULT_TEXT_TOKENS: usize = 1_500;
+const AGENT_TURN_LOOP_TOOL_RESULT_CONTEXT_TOKENS: usize = 12_000;
+const AGENT_TURN_LOOP_TOOL_RESULT_ARRAY_ITEMS: usize = 48;
+const AGENT_TURN_LOOP_TOOL_RESULT_OBJECT_KEYS: usize = 96;
+const AGENT_TURN_LOOP_TOOL_RESULT_NESTING: usize = 8;
+const AGENT_TURN_LOOP_UNSTRUCTURED_VISIBLE_LINES: usize = 32;
 const AGENT_TURN_LOOP_CONTEXT_ARGUMENT_CHARS: usize = 480;
 const AGENT_TURN_LOOP_FINAL_RESPONSE_CHARS: usize = 12_000;
 const AGENT_TURN_LOOP_MAX_READ_ONLY_ITERATIONS_BEFORE_COMMIT: usize = 2;
@@ -2021,6 +2025,15 @@ fn should_use_app_delivery_stream_blocks_mode(
     {
         return false;
     }
+    if explicit_pending_app_actions
+        .iter()
+        .any(|action| action_is_app_delivery_candidate(action))
+        && explicit_pending_app_actions.iter().any(|action| {
+            action_is_app_write_candidate(action) && !action_is_app_delivery_candidate(action)
+        })
+    {
+        return false;
+    }
     let explicit_pending_non_app_writes = turn_plan
         .map(|plan| {
             plan.goals
@@ -4007,6 +4020,7 @@ fn build_agent_loop_followup_prompt(
             None
         },
         "tool_history": tool_history,
+        "tool_history_policy": "Tool history is compacted by structure. If a result marks omitted content and the current answer depends on that missing content, call the relevant focused read or inspect action exposed by the result instead of guessing from partial data.",
         "current_state": {
             "attachments": attachment_hints_for_prompt(request_hints),
             "arkorbit_context": request_hints.arkorbit_context.as_ref(),
@@ -4065,7 +4079,7 @@ fn build_agent_loop_read_only_followup_prompt(
         .collect::<Vec<_>>();
     let include_memory_context = should_include_saved_user_facts_context(request_hints);
     let final_synthesis = actions.is_empty();
-    let active_guidance = agent_loop_prompt_fragment_selection_with_bundle(
+    let mut active_guidance = agent_loop_prompt_fragment_selection_with_bundle(
         prompt_fragment_bundle,
         actions,
         request_hints,
@@ -4074,6 +4088,19 @@ fn build_agent_loop_read_only_followup_prompt(
         true,
         false,
     );
+    if final_synthesis {
+        active_guidance.fragments.retain(|fragment| {
+            matches!(
+                fragment.id.as_str(),
+                "fragment.baseline.turn_contract" | "fragment.read_only.synthesis"
+            )
+        });
+        active_guidance.estimated_tokens = active_guidance
+            .fragments
+            .iter()
+            .map(|fragment| fragment.est_tokens)
+            .sum();
+    }
     let payload = serde_json::json!({
         "protocol": {
             "version": AGENT_TURN_LOOP_VERSION,
@@ -4111,6 +4138,7 @@ fn build_agent_loop_read_only_followup_prompt(
             None
         },
         "tool_history": tool_history,
+        "tool_history_policy": "Tool history is compacted by structure. If a result marks omitted content and the current answer depends on that missing content, call the relevant focused read or inspect action exposed by the result instead of guessing from partial data.",
         "action_scope": if final_synthesis {
             None
         } else {
@@ -5160,10 +5188,25 @@ fn compact_tool_arguments_for_context(
     }
 }
 
+fn compact_tool_text_line_for_display(line: &str, max_tokens: usize) -> String {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let estimated_tokens = crate::core::context_budget::estimate_tokens_from_text(trimmed);
+    if estimated_tokens <= max_tokens {
+        return trimmed.to_string();
+    }
+    let word_count = trimmed.split_whitespace().count();
+    format!("[large line omitted: estimated {estimated_tokens} tokens across {word_count} word(s)]")
+}
+
 fn compact_unstructured_tool_excerpt(result: &str) -> String {
     let mut out = String::new();
     let mut in_fence = false;
     let mut omitted_code_blocks = 0usize;
+    let mut omitted_lines = 0usize;
+    let mut visible_lines = 0usize;
     for line in result.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
@@ -5176,29 +5219,45 @@ fn compact_unstructured_tool_excerpt(result: &str) -> String {
         if in_fence {
             continue;
         }
+        if visible_lines >= AGENT_TURN_LOOP_UNSTRUCTURED_VISIBLE_LINES {
+            omitted_lines = omitted_lines.saturating_add(1);
+            continue;
+        }
+        let display_line =
+            compact_tool_text_line_for_display(line, AGENT_TURN_LOOP_TOOL_RESULT_TEXT_TOKENS);
+        if display_line.is_empty() {
+            continue;
+        }
         if !out.is_empty() {
-            out.push(' ');
+            out.push('\n');
         }
-        out.push_str(line.trim());
-        if out.chars().count() >= AGENT_TURN_LOOP_TOOL_RESULT_CHARS {
-            break;
-        }
+        out.push_str(&display_line);
+        visible_lines = visible_lines.saturating_add(1);
     }
     let collapsed = collapse_for_agent_loop(&out);
     let excerpt = if collapsed.trim().is_empty() {
         "The action returned unstructured generated content that was omitted from the chat response."
             .to_string()
     } else {
-        safe_truncate(&collapsed, AGENT_TURN_LOOP_TOOL_RESULT_CHARS)
+        collapsed
     };
+    let mut notes = Vec::new();
     if omitted_code_blocks > 0 {
-        format!(
-            "{}\n\n[{} code/content block(s) omitted from this excerpt.]",
-            excerpt, omitted_code_blocks
-        )
-    } else {
-        excerpt
+        notes.push(format!(
+            "{} code/content block(s) omitted from this excerpt",
+            omitted_code_blocks
+        ));
     }
+    if omitted_lines > 0 {
+        notes.push(format!(
+            "{} additional line(s) omitted from this excerpt",
+            omitted_lines
+        ));
+    }
+    if notes.is_empty() {
+        return excerpt;
+    }
+    format!("{}\n\n[{}.]", excerpt, notes.join("; "))
 }
 
 fn first_tool_completion_value(result: &str) -> Option<serde_json::Value> {
@@ -5726,34 +5785,249 @@ fn collapse_for_agent_loop(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn compact_tool_result_for_context(result: &str) -> serde_json::Value {
-    let value = tool_result_value(result);
-    compact_tool_result_value(&value, 0)
+#[derive(Debug, Default)]
+struct ToolResultCompactionStats {
+    original_estimated_tokens: usize,
+    compact_estimated_tokens: usize,
+    omitted_large_text_values: usize,
+    omitted_array_items: usize,
+    omitted_object_keys: usize,
+    omitted_nested_values: usize,
 }
 
-fn compact_tool_result_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
-    if depth >= 4 {
-        return serde_json::Value::String(safe_truncate(
-            &collapse_for_agent_loop(&value.to_string()),
-            180,
-        ));
+impl ToolResultCompactionStats {
+    fn has_omissions(&self) -> bool {
+        self.omitted_large_text_values > 0
+            || self.omitted_array_items > 0
+            || self.omitted_object_keys > 0
+            || self.omitted_nested_values > 0
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "policy": "structure_preserving",
+            "complete": !self.has_omissions(),
+            "original_estimated_tokens": self.original_estimated_tokens,
+            "compact_estimated_tokens": self.compact_estimated_tokens,
+            "omitted_large_text_values": self.omitted_large_text_values,
+            "omitted_array_items": self.omitted_array_items,
+            "omitted_object_keys": self.omitted_object_keys,
+            "omitted_nested_values": self.omitted_nested_values,
+            "followup_rule": "If the omitted content is required for the user's request, call the relevant focused read or inspect action from the observed result instead of guessing.",
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ToolResultCompactionLimits {
+    max_depth: usize,
+    array_items: usize,
+    object_keys: usize,
+    text_tokens: usize,
+    visible_lines: usize,
+}
+
+fn default_tool_result_compaction_limits() -> ToolResultCompactionLimits {
+    ToolResultCompactionLimits {
+        max_depth: AGENT_TURN_LOOP_TOOL_RESULT_NESTING,
+        array_items: AGENT_TURN_LOOP_TOOL_RESULT_ARRAY_ITEMS,
+        object_keys: AGENT_TURN_LOOP_TOOL_RESULT_OBJECT_KEYS,
+        text_tokens: AGENT_TURN_LOOP_TOOL_RESULT_TEXT_TOKENS,
+        visible_lines: AGENT_TURN_LOOP_UNSTRUCTURED_VISIBLE_LINES,
+    }
+}
+
+fn tight_tool_result_compaction_limits() -> ToolResultCompactionLimits {
+    ToolResultCompactionLimits {
+        max_depth: AGENT_TURN_LOOP_TOOL_RESULT_NESTING.saturating_sub(2).max(3),
+        array_items: AGENT_TURN_LOOP_TOOL_RESULT_ARRAY_ITEMS / 3,
+        object_keys: AGENT_TURN_LOOP_TOOL_RESULT_OBJECT_KEYS / 2,
+        text_tokens: AGENT_TURN_LOOP_TOOL_RESULT_TEXT_TOKENS / 3,
+        visible_lines: AGENT_TURN_LOOP_UNSTRUCTURED_VISIBLE_LINES / 2,
+    }
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn compact_tool_result_for_context(result: &str) -> serde_json::Value {
+    let value = tool_result_value(result);
+    let original_estimated_tokens = crate::core::context_budget::estimate_json_tokens(&value);
+    let mut stats = ToolResultCompactionStats {
+        original_estimated_tokens,
+        ..Default::default()
+    };
+    let mut compact = compact_tool_result_value(
+        &value,
+        0,
+        default_tool_result_compaction_limits(),
+        &mut stats,
+    );
+    stats.compact_estimated_tokens = crate::core::context_budget::estimate_json_tokens(&compact);
+
+    if stats.compact_estimated_tokens > AGENT_TURN_LOOP_TOOL_RESULT_CONTEXT_TOKENS {
+        stats = ToolResultCompactionStats {
+            original_estimated_tokens,
+            ..Default::default()
+        };
+        compact =
+            compact_tool_result_value(&value, 0, tight_tool_result_compaction_limits(), &mut stats);
+        stats.compact_estimated_tokens =
+            crate::core::context_budget::estimate_json_tokens(&compact);
+    }
+
+    if !stats.has_omissions() {
+        return compact;
+    }
+
+    serde_json::json!({
+        "compaction": stats.to_json(),
+        "value": compact,
+    })
+}
+
+fn compact_text_line_for_context(line: &str, max_tokens: usize) -> serde_json::Value {
+    let trimmed = line.trim();
+    let estimated_tokens = crate::core::context_budget::estimate_tokens_from_text(trimmed);
+    if estimated_tokens <= max_tokens {
+        return serde_json::Value::String(trimmed.to_string());
+    }
+    serde_json::json!({
+        "kind": "large_line_omitted",
+        "estimated_tokens": estimated_tokens,
+        "word_count": trimmed.split_whitespace().count(),
+    })
+}
+
+fn compact_large_tool_text_for_context(
+    text: &str,
+    limits: ToolResultCompactionLimits,
+) -> serde_json::Value {
+    let estimated_tokens = crate::core::context_budget::estimate_tokens_from_text(text);
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let word_count = text.split_whitespace().count();
+    if lines.is_empty() {
+        return serde_json::json!({
+            "kind": "large_text_omitted",
+            "estimated_tokens": estimated_tokens,
+            "word_count": word_count,
+        });
+    }
+
+    let edge_lines = (limits.visible_lines / 2).max(1);
+    let first_lines = lines
+        .iter()
+        .take(edge_lines)
+        .map(|line| compact_text_line_for_context(line, limits.text_tokens / 4))
+        .collect::<Vec<_>>();
+    let mut last_lines = lines
+        .iter()
+        .rev()
+        .take(edge_lines)
+        .map(|line| compact_text_line_for_context(line, limits.text_tokens / 4))
+        .collect::<Vec<_>>();
+    last_lines.reverse();
+    let visible_line_count = if lines.len() <= edge_lines {
+        lines.len()
+    } else {
+        edge_lines.saturating_mul(2).min(lines.len())
+    };
+
+    serde_json::json!({
+        "kind": "large_text_compacted",
+        "estimated_tokens": estimated_tokens,
+        "line_count": lines.len(),
+        "word_count": word_count,
+        "first_lines": first_lines,
+        "last_lines": if lines.len() > edge_lines { last_lines } else { Vec::<serde_json::Value>::new() },
+        "omitted_middle_lines": lines.len().saturating_sub(visible_line_count),
+        "note": "Full text was not injected into the next model prompt. Use a focused read or inspect action if the omitted text is required.",
+    })
+}
+
+fn compact_tool_result_value(
+    value: &serde_json::Value,
+    depth: usize,
+    limits: ToolResultCompactionLimits,
+    stats: &mut ToolResultCompactionStats,
+) -> serde_json::Value {
+    if depth >= limits.max_depth {
+        stats.omitted_nested_values = stats.omitted_nested_values.saturating_add(1);
+        return serde_json::json!({
+            "kind": "nested_value_omitted",
+            "value_type": json_value_kind(value),
+            "estimated_tokens": crate::core::context_budget::estimate_json_tokens(value),
+        });
     }
     match value {
-        serde_json::Value::String(text) => serde_json::Value::String(safe_truncate(
-            &collapse_for_agent_loop(text),
-            AGENT_TURN_LOOP_CONTEXT_TOOL_RESULT_CHARS,
-        )),
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .iter()
-                .take(6)
-                .map(|item| compact_tool_result_value(item, depth + 1))
-                .collect(),
-        ),
+        serde_json::Value::String(text) => {
+            if crate::core::context_budget::estimate_tokens_from_text(text) <= limits.text_tokens {
+                serde_json::Value::String(text.clone())
+            } else {
+                stats.omitted_large_text_values = stats.omitted_large_text_values.saturating_add(1);
+                compact_large_tool_text_for_context(text, limits)
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if items.len() <= limits.array_items {
+                return serde_json::Value::Array(
+                    items
+                        .iter()
+                        .map(|item| compact_tool_result_value(item, depth + 1, limits, stats))
+                        .collect(),
+                );
+            }
+            let keep = limits.array_items;
+            stats.omitted_array_items = stats
+                .omitted_array_items
+                .saturating_add(items.len().saturating_sub(keep));
+            serde_json::json!({
+                "kind": "array_compacted",
+                "total_items": items.len(),
+                "visible_items": items
+                    .iter()
+                    .take(keep)
+                    .map(|item| compact_tool_result_value(item, depth + 1, limits, stats))
+                    .collect::<Vec<_>>(),
+                "omitted_items": items.len().saturating_sub(keep),
+            })
+        }
         serde_json::Value::Object(map) => {
             let mut out = serde_json::Map::new();
-            for (key, item) in map.iter().take(24) {
-                out.insert(key.clone(), compact_tool_result_value(item, depth + 1));
+            let mut omitted_keys = Vec::new();
+            for (key, item) in map {
+                if out.len() >= limits.object_keys {
+                    omitted_keys.push(key.clone());
+                    continue;
+                }
+                out.insert(
+                    key.clone(),
+                    compact_tool_result_value(item, depth + 1, limits, stats),
+                );
+            }
+            if !omitted_keys.is_empty() {
+                stats.omitted_object_keys =
+                    stats.omitted_object_keys.saturating_add(omitted_keys.len());
+                out.insert(
+                    "__compaction".to_string(),
+                    serde_json::json!({
+                        "kind": "object_keys_omitted",
+                        "total_keys": map.len(),
+                        "omitted_keys": omitted_keys,
+                    }),
+                );
             }
             serde_json::Value::Object(out)
         }
@@ -5873,10 +6147,15 @@ fn action_is_capability_management_candidate(action: &crate::actions::ActionDef)
 }
 
 fn action_is_setup_delivery_candidate(action: &crate::actions::ActionDef) -> bool {
-    if action_is_capability_management_candidate(action) {
+    let metadata = action.planner_metadata();
+    if action_is_capability_management_candidate(action)
+        && matches!(
+            metadata.side_effect_level,
+            crate::actions::PlannerSideEffectLevel::Write
+        )
+    {
         return true;
     }
-    let metadata = action.planner_metadata();
     matches!(
         metadata.integration_class,
         crate::actions::PlannerIntegrationClass::Messaging
@@ -5884,6 +6163,24 @@ fn action_is_setup_delivery_candidate(action: &crate::actions::ActionDef) -> boo
         metadata.side_effect_level,
         crate::actions::PlannerSideEffectLevel::Write
     )
+}
+
+fn goal_has_structured_setup_delivery_shape(goal: &AgentLoopGoalState) -> bool {
+    matches!(normalized_goal_durability(goal).as_str(), "integration")
+}
+
+fn setup_delivery_structural_score_for_goal(
+    goal: &AgentLoopGoalState,
+    action: &crate::actions::ActionDef,
+) -> f32 {
+    if goal_has_structured_setup_delivery_shape(goal)
+        && action_is_setup_delivery_candidate(action)
+        && goal_delivery_mode_allows_action(goal, action)
+    {
+        AGENT_TURN_LOOP_APP_DELIVERY_SCORE_THRESHOLD
+    } else {
+        0.0
+    }
 }
 
 fn action_is_setup_resolution_candidate(action: &crate::actions::ActionDef) -> bool {
@@ -6121,6 +6418,46 @@ where
         .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+fn best_app_delivery_goal_context_score<'a, I>(goal: &AgentLoopGoalState, actions: I) -> Option<f32>
+where
+    I: IntoIterator<Item = &'a crate::actions::ActionDef>,
+{
+    actions
+        .into_iter()
+        .filter(|action| action_is_app_delivery_candidate(action))
+        .map(|action| raw_goal_action_match_score(goal, action))
+        .filter(|score| *score > 0.0)
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn best_durable_orchestration_goal_context_score<'a, I>(
+    goal: &AgentLoopGoalState,
+    actions: I,
+) -> Option<f32>
+where
+    I: IntoIterator<Item = &'a crate::actions::ActionDef>,
+{
+    actions
+        .into_iter()
+        .filter(|action| {
+            let metadata = action.planner_metadata();
+            matches!(
+                metadata.role,
+                crate::actions::PlannerActionRole::Orchestration
+            ) && matches!(
+                metadata.integration_class,
+                crate::actions::PlannerIntegrationClass::Internal
+            ) && matches!(
+                metadata.delivery_mode,
+                crate::actions::PlannerDeliveryMode::Async
+                    | crate::actions::PlannerDeliveryMode::Conditional
+            )
+        })
+        .map(|action| raw_goal_action_match_score(goal, action))
+        .filter(|score| *score > 0.0)
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
 fn best_durable_orchestration_score_for_goal<'a, I>(
     goal: &AgentLoopGoalState,
     actions: I,
@@ -6157,12 +6494,78 @@ where
         .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+fn best_setup_delivery_action_for_goal_with_scores<'a, I>(
+    goal: &AgentLoopGoalState,
+    actions: I,
+    semantic_scores: &HashMap<String, f32>,
+) -> Option<(crate::actions::ActionDef, f32)>
+where
+    I: IntoIterator<Item = &'a crate::actions::ActionDef>,
+{
+    actions
+        .into_iter()
+        .filter(|action| action_is_setup_delivery_candidate(action))
+        .filter(|action| goal_delivery_mode_allows_action(goal, action))
+        .map(|action| {
+            let lexical = goal_action_match_score(goal, action);
+            let semantic = semantic_scores
+                .get(&action.name)
+                .copied()
+                .unwrap_or_default();
+            let structural = setup_delivery_structural_score_for_goal(goal, action);
+            (action, lexical.max(semantic).max(structural))
+        })
+        .filter(|(_, score)| *score > 0.0)
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(action, score)| (action.clone(), score))
+}
+
+fn setup_delivery_required_for_goal_with_scores(
+    goal: &AgentLoopGoalState,
+    actions: &[crate::actions::ActionDef],
+    semantic_scores: &HashMap<String, f32>,
+) -> bool {
+    if matches!(normalized_goal_durability(goal).as_str(), "deployment") {
+        return false;
+    }
+    let structured_setup_goal = goal_has_structured_setup_delivery_shape(goal);
+    let Some((_, setup_score)) =
+        best_setup_delivery_action_for_goal_with_scores(goal, actions.iter(), semantic_scores)
+    else {
+        return false;
+    };
+    if setup_score < AGENT_TURN_LOOP_DIRECT_ACTION_SCORE_THRESHOLD {
+        return false;
+    }
+    if !goal_requires_durable_commit(goal)
+        && setup_score < AGENT_TURN_LOOP_APP_DELIVERY_SCORE_THRESHOLD
+    {
+        return false;
+    }
+    if structured_setup_goal {
+        return true;
+    }
+    let app_score =
+        best_app_context_score_for_goal(goal, actions.iter(), semantic_scores).unwrap_or_default();
+    if app_score >= AGENT_TURN_LOOP_APP_CONTEXT_SCORE_THRESHOLD && setup_score < app_score * 0.65 {
+        return false;
+    }
+    true
+}
+
 fn goal_has_scored_app_delivery_intent(
     goal: &AgentLoopGoalState,
     actions: &[crate::actions::ActionDef],
     semantic_scores: &HashMap<String, f32>,
 ) -> bool {
     if matches!(normalized_goal_durability(goal).as_str(), "integration") {
+        return false;
+    }
+    if setup_delivery_required_for_goal_with_scores(goal, actions, semantic_scores) {
         return false;
     }
     let app_score =
@@ -6174,6 +6577,17 @@ fn goal_has_scored_app_delivery_intent(
         normalized_goal_durability(goal).as_str(),
         "scheduled_time" | "recurring_monitor" | "watcher"
     ) {
+        let app_goal_context =
+            best_app_delivery_goal_context_score(goal, actions.iter()).unwrap_or_default();
+        if app_goal_context < AGENT_TURN_LOOP_APP_DELIVERY_SCORE_THRESHOLD {
+            return false;
+        }
+        let orchestration_goal_context =
+            best_durable_orchestration_goal_context_score(goal, actions.iter()).unwrap_or_default();
+        if orchestration_goal_context > 0.0 && app_goal_context < orchestration_goal_context * 0.65
+        {
+            return false;
+        }
         let orchestration_score =
             best_durable_orchestration_score_for_goal(goal, actions.iter(), semantic_scores)
                 .unwrap_or_default();
@@ -6299,13 +6713,16 @@ fn app_delivery_required_for_goal(
     goal: &AgentLoopGoalState,
     actions: &[crate::actions::ActionDef],
 ) -> bool {
+    let empty_scores = HashMap::new();
+    if setup_delivery_required_for_goal_with_scores(goal, actions, &empty_scores) {
+        return false;
+    }
     if !goal_has_app_delivery_intent(goal, actions) {
         return false;
     }
     let Some((_, score)) = best_app_delivery_action_for_goal(goal, actions.iter()) else {
         return false;
     };
-    let empty_scores = HashMap::new();
     let generic_filesystem_score =
         best_generic_filesystem_write_score_for_goal(goal, actions.iter(), &empty_scores);
     let structured_deployment_goal = normalized_goal_durability(goal) == "deployment";
@@ -6372,6 +6789,9 @@ fn app_delivery_required_for_goal_with_scores(
     actions: &[crate::actions::ActionDef],
     semantic_scores: &HashMap<String, f32>,
 ) -> bool {
+    if setup_delivery_required_for_goal_with_scores(goal, actions, semantic_scores) {
+        return false;
+    }
     let scored_app_delivery_intent =
         goal_has_scored_app_delivery_intent(goal, actions, semantic_scores);
     if !goal_has_app_delivery_intent(goal, actions) && !scored_app_delivery_intent {
@@ -6578,8 +6998,8 @@ fn direct_write_action_available_for_plan_with_scores(
     })
 }
 
-fn goal_action_match_score(goal: &AgentLoopGoalState, action: &crate::actions::ActionDef) -> f32 {
-    let goal_text = [
+fn goal_action_match_text(goal: &AgentLoopGoalState) -> String {
+    [
         goal.intent_summary.as_str(),
         goal.capability_query.as_str(),
         goal.expected_outcome.as_str(),
@@ -6588,8 +7008,18 @@ fn goal_action_match_score(goal: &AgentLoopGoalState, action: &crate::actions::A
     .into_iter()
     .filter(|value| !value.trim().is_empty())
     .collect::<Vec<_>>()
-    .join("\n");
-    let mut score = crate::core::capability_router::score_action_intent(&goal_text, action);
+    .join("\n")
+}
+
+fn raw_goal_action_match_score(
+    goal: &AgentLoopGoalState,
+    action: &crate::actions::ActionDef,
+) -> f32 {
+    crate::core::capability_router::score_action_intent(&goal_action_match_text(goal), action)
+}
+
+fn goal_action_match_score(goal: &AgentLoopGoalState, action: &crate::actions::ActionDef) -> f32 {
+    let mut score = raw_goal_action_match_score(goal, action);
     let metadata = action.planner_metadata();
     let action_side_effect = !matches!(
         metadata.side_effect_level,
@@ -6707,6 +7137,13 @@ where
             first_app_delivery_action(all_actions.iter())
                 .map(|action| (action, AGENT_TURN_LOOP_APP_DELIVERY_SCORE_THRESHOLD))
         });
+    }
+    if setup_delivery_required_for_goal_with_scores(goal, all_actions, semantic_scores) {
+        return best_setup_delivery_action_for_goal_with_scores(
+            goal,
+            candidates.into_iter(),
+            semantic_scores,
+        );
     }
 
     candidates
@@ -6945,6 +7382,8 @@ fn action_can_fulfill_any_pending_goal(
                     | crate::core::planner::PlanStepStatus::Running
             ) && if app_delivery_required_for_goal_with_scores(goal, actions, semantic_scores) {
                 action_is_app_delivery_candidate(action)
+            } else if setup_delivery_required_for_goal_with_scores(goal, actions, semantic_scores) {
+                action_is_setup_delivery_candidate(action)
             } else {
                 action_can_directly_fulfill_goal(goal, action, actions)
             }
@@ -7625,7 +8064,7 @@ fn tool_result_value(result: &str) -> serde_json::Value {
         return value;
     }
     serde_json::from_str::<serde_json::Value>(result)
-        .unwrap_or_else(|_| serde_json::json!({ "raw": safe_truncate(result, 2000) }))
+        .unwrap_or_else(|_| serde_json::json!({ "raw": result }))
 }
 
 fn tool_result_completion_success(result: &str) -> Option<bool> {
@@ -12411,6 +12850,23 @@ mod tests {
         }
     }
 
+    fn setup_goal(durability: &str) -> AgentLoopGoalState {
+        AgentLoopGoalState {
+            id: "g1".to_string(),
+            intent_summary: "Add a reusable connected service capability".to_string(),
+            capability_query: "Set up a durable external capability for later agent use"
+                .to_string(),
+            expected_outcome: "The capability is installed, enabled, or ready for credentials"
+                .to_string(),
+            durability: durability.to_string(),
+            dependencies: Vec::new(),
+            status: crate::core::planner::PlanStepStatus::Pending,
+            action_name: None,
+            result_ref: None,
+            reason: None,
+        }
+    }
+
     fn code_goal() -> AgentLoopGoalState {
         AgentLoopGoalState {
             id: "g1".to_string(),
@@ -14018,6 +14474,42 @@ mod tests {
     }
 
     #[test]
+    fn tool_history_compaction_preserves_structured_summary_and_marks_omissions() {
+        let result = serde_json::json!({
+            "connected_agentark_surfaces": {
+                "total": 1,
+                "items": [{
+                    "surface": "companion_devices",
+                    "id": "surface-item-1",
+                    "name": "Connected companion",
+                    "kind": "companion",
+                    "status": "connected"
+                }]
+            },
+            "detail_available_via": "inspect_integration",
+            "large_catalog": (0..80).map(|index| serde_json::json!({
+                "id": format!("integration-{index}"),
+                "status": "available"
+            })).collect::<Vec<_>>(),
+            "debug_log": "long diagnostic line ".repeat(10_000),
+        })
+        .to_string();
+
+        let compact = compact_tool_result_for_context(&result);
+        let value = compact.get("value").unwrap_or(&compact);
+
+        assert_eq!(
+            value["connected_agentark_surfaces"]["items"][0]["name"],
+            "Connected companion"
+        );
+        assert_eq!(value["detail_available_via"], "inspect_integration");
+        assert_eq!(value["large_catalog"]["kind"], "array_compacted");
+        assert_eq!(value["debug_log"]["kind"], "large_text_compacted");
+        assert_eq!(compact["compaction"]["policy"], "structure_preserving");
+        assert_eq!(compact["compaction"]["complete"], false);
+    }
+
+    #[test]
     fn embedded_app_result_is_rendered_as_user_safe_summary() {
         let response = tool_result_grounded_response(
             r#"Deployment done: {"status":"deployed","app_id":"abc123","title":"Demo","url":"/apps/abc123/","access_guard_enabled":false,"expose_public":false}"#,
@@ -15312,6 +15804,117 @@ mod tests {
 
         assert!(execution_plan_has_setup_substeps(&plan));
         assert!(!execution_plan_has_app_delivery_substeps(&plan));
+    }
+
+    #[test]
+    fn setup_delivery_candidates_require_write_capable_setup_metadata() {
+        let inventory = action(
+            "extension_pack_list",
+            "List installed and available extension packs.",
+            &["integration_inventory"],
+        );
+        let custom_channel = action(
+            "custom_messaging_channel_upsert",
+            "Create or update an outbound messaging channel.",
+            &["integration_admin", "notify"],
+        );
+
+        assert!(!action_is_setup_delivery_candidate(&inventory));
+        assert!(matches!(
+            custom_channel.planner_metadata().side_effect_level,
+            crate::actions::PlannerSideEffectLevel::Write
+        ));
+        assert!(action_is_setup_delivery_candidate(&custom_channel));
+    }
+
+    #[test]
+    fn structured_integration_goal_prefers_setup_action_over_app_score_dominance() {
+        let app_deploy = app_delivery_action();
+        let setup = integration_builder_action("extension_pack_install");
+        let actions = vec![app_deploy.clone(), setup.clone()];
+        let mut plan = turn_plan(setup_goal("integration"));
+        let semantic_scores = HashMap::from([(app_deploy.name.clone(), 0.95)]);
+
+        assign_direct_actions_to_pending_goals(Some(&mut plan), &actions, &semantic_scores);
+
+        assert_eq!(
+            plan.goals[0].action_name.as_deref(),
+            Some(setup.name.as_str())
+        );
+        assert!(setup_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &actions,
+            &semantic_scores
+        ));
+        assert!(!app_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &actions,
+            &semantic_scores
+        ));
+    }
+
+    #[test]
+    fn semantic_setup_action_anchors_capability_install_over_app_delivery() {
+        let app_deploy = app_delivery_action();
+        let setup = integration_builder_action("extension_pack_install");
+        let actions = vec![app_deploy.clone(), setup.clone()];
+        let mut plan = turn_plan(setup_goal("persistent_work"));
+        let semantic_scores =
+            HashMap::from([(app_deploy.name.clone(), 0.59), (setup.name.clone(), 0.62)]);
+
+        assign_direct_actions_to_pending_goals(Some(&mut plan), &actions, &semantic_scores);
+
+        assert_eq!(
+            plan.goals[0].action_name.as_deref(),
+            Some(setup.name.as_str())
+        );
+        assert!(setup_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &actions,
+            &semantic_scores
+        ));
+        assert!(!app_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &actions,
+            &semantic_scores
+        ));
+
+        let mut scoped_actions = vec![app_deploy];
+        assert!(anchor_scope_to_required_direct_actions(
+            &mut scoped_actions,
+            &actions,
+            Some(&plan),
+            &semantic_scores
+        ));
+        assert_eq!(scoped_actions.len(), 1);
+        assert_eq!(scoped_actions[0].name, setup.name);
+    }
+
+    #[test]
+    fn semantic_setup_candidate_does_not_steal_structured_app_deployment() {
+        let app_deploy = app_delivery_action();
+        let setup = integration_builder_action("extension_pack_install");
+        let actions = vec![app_deploy.clone(), setup.clone()];
+        let mut plan = turn_plan(goal("deployment"));
+        let semantic_scores =
+            HashMap::from([(app_deploy.name.clone(), 0.70), (setup.name.clone(), 0.80)]);
+
+        assign_direct_actions_to_pending_goals(Some(&mut plan), &actions, &semantic_scores);
+
+        assert_eq!(
+            plan.goals[0].action_name.as_deref(),
+            Some(app_deploy.name.as_str())
+        );
+        assert!(!setup_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &actions,
+            &semantic_scores
+        ));
+        assert!(app_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &actions,
+            &semantic_scores
+        ));
     }
 
     #[test]
