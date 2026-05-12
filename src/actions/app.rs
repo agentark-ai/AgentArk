@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::Sender;
 
-use crate::core::runtime_image;
 use crate::core::StreamEvent;
+use crate::core::runtime_image;
 
 /// Port range for dynamic apps (localhost only)
 const PORT_RANGE_START: u16 = 9100;
@@ -3349,11 +3349,7 @@ async fn discover_current_agent_image() -> Option<String> {
         return None;
     }
     let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if image.is_empty() {
-        None
-    } else {
-        Some(image)
-    }
+    if image.is_empty() { None } else { Some(image) }
 }
 
 fn current_container_ref_from_env() -> Option<String> {
@@ -3376,11 +3372,7 @@ async fn discover_current_container_ref() -> Option<String> {
         return None;
     }
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
+    if id.is_empty() { None } else { Some(id) }
 }
 
 async fn resolve_runtime_image(runtime_image: Option<&str>) -> String {
@@ -4327,10 +4319,14 @@ fn required_runtimes_for_command(args: &[String]) -> Vec<(&'static str, Vec<&'st
 
 fn runtime_install_hint(canonical: &str) -> &'static str {
     match canonical {
-        "python3" => "install Python 3 (e.g. `apt-get install -y python3 python3-venv` on Debian/Ubuntu, `brew install python` on macOS)",
+        "python3" => {
+            "install Python 3 (e.g. `apt-get install -y python3 python3-venv` on Debian/Ubuntu, `brew install python` on macOS)"
+        }
         "node" => "install Node.js 20+ (e.g. `apt-get install -y nodejs npm`, or via nvm/fnm)",
         "bun" => "install Bun (https://bun.sh) - `curl -fsSL https://bun.sh/install | bash`",
-        "deno" => "install Deno (https://deno.land) - `curl -fsSL https://deno.land/install.sh | sh`",
+        "deno" => {
+            "install Deno (https://deno.land) - `curl -fsSL https://deno.land/install.sh | sh`"
+        }
         "cargo" => "install Rust + cargo (https://rustup.rs)",
         "go" => "install Go 1.21+ (https://go.dev/dl)",
         "ruby" => "install Ruby 3+ (e.g. `apt-get install -y ruby` or via rbenv)",
@@ -6222,6 +6218,7 @@ async fn app_deploy_apply(
     })
 }
 
+#[allow(dead_code)]
 pub async fn app_deploy_preflight(
     data_dir: &Path,
     arguments: &serde_json::Value,
@@ -6418,8 +6415,7 @@ pub fn generate_access_key() -> String {
     format!("ak_{}", uuid::Uuid::new_v4().simple())
 }
 
-pub const APP_DEPLOY_CONTROL_HINT: &str =
-    "Open the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls.";
+pub const APP_DEPLOY_CONTROL_HINT: &str = "Open the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls.";
 
 fn app_unix_now_ts() -> i64 {
     chrono::Utc::now().timestamp()
@@ -10016,9 +10012,10 @@ mod tests {
             "npm run start".to_string(),
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair[0] == "--network" && pair[1] == "container:executor-container-id"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--network" && pair[1] == "container:executor-container-id")
+        );
         assert!(
             !args.iter().any(|arg| arg == "-p"),
             "shared-network app containers should not publish host-loopback ports"
@@ -10039,9 +10036,10 @@ mod tests {
             "npm run start".to_string(),
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh")
+        );
         let image_index = args
             .iter()
             .position(|arg| arg == DEFAULT_FALLBACK_APP_RUNTIME_IMAGE)
@@ -10057,9 +10055,11 @@ mod tests {
             None,
             "npm install".to_string(),
         );
-        assert!(install_args
-            .windows(2)
-            .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh"));
+        assert!(
+            install_args
+                .windows(2)
+                .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh")
+        );
         let image_index = install_args
             .iter()
             .position(|arg| arg == DEFAULT_FALLBACK_APP_RUNTIME_IMAGE)

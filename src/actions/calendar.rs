@@ -1,7 +1,7 @@
 //! Google Calendar integration (list, create, find free time)
 //! Mirrors the Gmail OAuth pattern for token management.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::Path;
 
 const CALENDAR_SECRET_KEY: &str = "calendar_tokens";

@@ -198,6 +198,14 @@ pub(super) struct ChatAutomationSuggestion {
     pub(super) last_run_completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) accepted_outcomes: Vec<suggestions::ChatSuggestionOutcome>,
+    #[serde(default)]
+    pub(super) resolution_checked_at: Option<String>,
+    #[serde(default)]
+    pub(super) resolution_check_signature: Option<String>,
+    #[serde(default)]
+    pub(super) resolved_at: Option<String>,
+    #[serde(default)]
+    pub(super) resolution_summary: Option<String>,
 }
 
 pub(super) fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -970,6 +978,10 @@ pub(super) fn build_chat_automation_suggestion_from_inference(
         last_run_started_at: None,
         last_run_completed_at: None,
         accepted_outcomes: Vec::new(),
+        resolution_checked_at: None,
+        resolution_check_signature: None,
+        resolved_at: None,
+        resolution_summary: None,
     })
 }
 
@@ -1139,6 +1151,10 @@ mod tests {
             last_run_started_at: None,
             last_run_completed_at: None,
             accepted_outcomes: Vec::new(),
+            resolution_checked_at: None,
+            resolution_check_signature: None,
+            resolved_at: None,
+            resolution_summary: None,
         }
     }
 

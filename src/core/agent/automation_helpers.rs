@@ -324,35 +324,35 @@ pub(super) fn watcher_delivery_label(notify_channel: &str) -> String {
     }
 }
 
-pub(super) fn planner_integration_class_name(
-    class: &crate::actions::PlannerIntegrationClass,
+pub(super) fn action_integration_class_name(
+    class: &crate::actions::ActionIntegrationClass,
 ) -> &'static str {
     match class {
-        crate::actions::PlannerIntegrationClass::Internal => "internal",
-        crate::actions::PlannerIntegrationClass::Messaging => "messaging",
-        crate::actions::PlannerIntegrationClass::Workspace => "workspace",
-        crate::actions::PlannerIntegrationClass::Search => "search",
-        crate::actions::PlannerIntegrationClass::Browser => "browser",
-        crate::actions::PlannerIntegrationClass::Filesystem => "filesystem",
-        crate::actions::PlannerIntegrationClass::App => "app",
-        crate::actions::PlannerIntegrationClass::Code => "code",
-        crate::actions::PlannerIntegrationClass::Network => "network",
-        crate::actions::PlannerIntegrationClass::Commerce => "commerce",
-        crate::actions::PlannerIntegrationClass::Analytics => "analytics",
-        crate::actions::PlannerIntegrationClass::Media => "media",
-        crate::actions::PlannerIntegrationClass::Unknown => "unknown",
+        crate::actions::ActionIntegrationClass::Internal => "internal",
+        crate::actions::ActionIntegrationClass::Messaging => "messaging",
+        crate::actions::ActionIntegrationClass::Workspace => "workspace",
+        crate::actions::ActionIntegrationClass::Search => "search",
+        crate::actions::ActionIntegrationClass::Browser => "browser",
+        crate::actions::ActionIntegrationClass::Filesystem => "filesystem",
+        crate::actions::ActionIntegrationClass::App => "app",
+        crate::actions::ActionIntegrationClass::Code => "code",
+        crate::actions::ActionIntegrationClass::Network => "network",
+        crate::actions::ActionIntegrationClass::Commerce => "commerce",
+        crate::actions::ActionIntegrationClass::Analytics => "analytics",
+        crate::actions::ActionIntegrationClass::Media => "media",
+        crate::actions::ActionIntegrationClass::Unknown => "unknown",
     }
 }
 
-pub(super) fn planner_action_role_name(role: &crate::actions::PlannerActionRole) -> &'static str {
+pub(super) fn action_role_name(role: &crate::actions::ActionRole) -> &'static str {
     match role {
-        crate::actions::PlannerActionRole::Trigger => "trigger",
-        crate::actions::PlannerActionRole::Delivery => "delivery",
-        crate::actions::PlannerActionRole::DataSource => "data_source",
-        crate::actions::PlannerActionRole::Mutation => "mutation",
-        crate::actions::PlannerActionRole::Inspection => "inspection",
-        crate::actions::PlannerActionRole::Orchestration => "orchestration",
-        crate::actions::PlannerActionRole::Unknown => "unknown",
+        crate::actions::ActionRole::Trigger => "trigger",
+        crate::actions::ActionRole::Delivery => "delivery",
+        crate::actions::ActionRole::DataSource => "data_source",
+        crate::actions::ActionRole::Mutation => "mutation",
+        crate::actions::ActionRole::Inspection => "inspection",
+        crate::actions::ActionRole::Orchestration => "orchestration",
+        crate::actions::ActionRole::Unknown => "unknown",
     }
 }
 
@@ -470,99 +470,6 @@ pub(super) fn build_notify_user_action_arguments(
         );
     }
     serde_json::Value::Object(payload)
-}
-
-pub(super) fn schedule_task_should_default_to_notify_user(
-    task_desc: &str,
-    explicit_action: Option<&str>,
-    scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
-    existing_arguments: &serde_json::Value,
-) -> bool {
-    if scheduled_for.is_none() {
-        return false;
-    }
-    if explicit_action
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        return false;
-    }
-
-    if let Some(arguments) = existing_arguments.as_object() {
-        let has_non_notification_keys = arguments.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "query" | "report_to" | "title" | "message" | "_automation"
-            )
-        });
-        if has_non_notification_keys {
-            return false;
-        }
-    }
-
-    let normalized = task_desc.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-    if [
-        "remind",
-        "notify",
-        "meeting",
-        "appointment",
-        "birthday",
-        "anniversary",
-        "interview",
-        "doctor",
-        "dentist",
-        "reservation",
-        "flight",
-        "train",
-        "call with",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token))
-    {
-        return true;
-    }
-
-    let words = normalized
-        .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '\'' && ch != '-')
-        })
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    if words.is_empty() || words.len() > 8 {
-        return false;
-    }
-
-    let first = words[0];
-    if matches!(
-        first,
-        "run"
-            | "generate"
-            | "create"
-            | "send"
-            | "check"
-            | "scan"
-            | "sync"
-            | "backup"
-            | "deploy"
-            | "research"
-            | "review"
-            | "summarize"
-            | "fetch"
-            | "refresh"
-            | "update"
-            | "call"
-            | "email"
-            | "draft"
-            | "write"
-    ) {
-        return false;
-    }
-
-    true
 }
 
 pub(super) fn build_current_time_action_arguments(

@@ -76,8 +76,12 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY .cargo ./.cargo
 
-# Create dummy main to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create dummy binary targets to cache dependencies. These paths must match
+# Cargo.toml because autobin discovery is disabled for predictable test builds.
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "fn main() {}" > src/bin/agentark_embed_server.rs && \
+    echo "fn main() {}" > src/bin/prefetch_embeddings.rs
 
 # Low-memory release builds intentionally override Cargo.toml's release LTO
 # settings. Local dev builds can instead select the dev-fast profile through

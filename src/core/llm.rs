@@ -423,15 +423,20 @@ fn sanitize_model_request_bundle(
         attach_runtime_temporal_context(system_prompt, user_message, runtime_timezone);
     let system_prompt = attach_runtime_identity_contract(mode, &system_prompt);
 
+    let system_prompt = sanitize_model_request_text(
+        &system_prompt,
+        system_context,
+        policy,
+        allow_sensitive_context,
+    );
+    let user_message =
+        sanitize_model_request_text(&user_message, user_context, policy, allow_sensitive_context);
+    let history = sanitize_model_request_history(history, policy, allow_sensitive_context);
+
     (
-        sanitize_model_request_text(
-            &system_prompt,
-            system_context,
-            policy,
-            allow_sensitive_context,
-        ),
-        sanitize_model_request_text(&user_message, user_context, policy, allow_sensitive_context),
-        sanitize_model_request_history(history, policy, allow_sensitive_context),
+        crate::core::llm_context_sanitizer::sanitize_prompt_text(&system_prompt),
+        crate::core::llm_context_sanitizer::sanitize_prompt_text(&user_message),
+        crate::core::llm_context_sanitizer::sanitize_conversation_history(&history),
     )
 }
 
@@ -692,8 +697,16 @@ fn queue_stream_event(token_tx: &Sender<StreamEvent>, event: StreamEvent) {
     }
 }
 
+fn reasoning_phase_is_user_visible(phase: &str) -> bool {
+    let normalized = phase.trim().to_ascii_lowercase();
+    normalized.ends_with("_summary") || normalized.contains("summary")
+}
+
 fn queue_reasoning_delta(token_tx: &Sender<StreamEvent>, phase: &str, content_delta: String) {
     if content_delta.is_empty() {
+        return;
+    }
+    if !reasoning_phase_is_user_visible(phase) {
         return;
     }
     queue_stream_event(
@@ -1109,15 +1122,17 @@ fn build_openai_responses_input(
 }
 
 fn build_openai_responses_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
-    actions
-        .iter()
+    let mut sorted = actions.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    sorted
+        .into_iter()
         .map(|action| {
             serde_json::json!({
                 "type": "function",
                 "name": action.name,
-                "description": action.description,
+                "description": compact_openai_tool_description(&action.description),
                 "strict": false,
-                "parameters": normalize_openai_tool_schema(&action.input_schema),
+                "parameters": compact_openai_tool_schema(&action.input_schema),
             })
         })
         .collect()
@@ -1133,11 +1148,9 @@ fn build_openai_responses_request(
     prompt_cache_key: Option<String>,
     prompt_cache_retention: Option<String>,
 ) -> serde_json::Value {
-    let tools = build_openai_responses_tools(actions);
     let mut request = serde_json::json!({
         "model": model,
         "instructions": system_prompt,
-        "input": build_openai_responses_input(user_message, history),
         "stream": stream,
         "store": false,
     });
@@ -1147,12 +1160,15 @@ fn build_openai_responses_request(
     if let Some(prompt_cache_retention) = prompt_cache_retention {
         request["prompt_cache_retention"] = serde_json::Value::String(prompt_cache_retention);
     }
+    let tools = build_openai_responses_tools(actions);
     if !tools.is_empty() {
         request["tools"] = serde_json::Value::Array(tools);
         request["tool_choice"] = openai_responses_tool_choice_for_actions(actions)
             .unwrap_or_else(|| serde_json::Value::String("auto".to_string()));
         request["parallel_tool_calls"] = serde_json::Value::Bool(true);
     }
+    request["input"] =
+        serde_json::Value::Array(build_openai_responses_input(user_message, history));
     request
 }
 
@@ -1270,21 +1286,21 @@ fn should_request_openai_stream_usage(
 }
 
 fn action_requires_native_tool_choice(action: &crate::actions::ActionDef) -> bool {
-    let metadata = action.planner_metadata();
+    let metadata = action.action_metadata();
     matches!(
         metadata.side_effect_level,
-        crate::actions::PlannerSideEffectLevel::Notify
-            | crate::actions::PlannerSideEffectLevel::Write
+        crate::actions::ActionSideEffectLevel::Notify
+            | crate::actions::ActionSideEffectLevel::Write
     ) || matches!(
         metadata.role,
-        crate::actions::PlannerActionRole::Delivery
-            | crate::actions::PlannerActionRole::Mutation
-            | crate::actions::PlannerActionRole::Orchestration
+        crate::actions::ActionRole::Delivery
+            | crate::actions::ActionRole::Mutation
+            | crate::actions::ActionRole::Orchestration
     ) || matches!(
         metadata.delivery_mode,
-        crate::actions::PlannerDeliveryMode::Async
-            | crate::actions::PlannerDeliveryMode::Conditional
-            | crate::actions::PlannerDeliveryMode::Either
+        crate::actions::ActionDeliveryMode::Async
+            | crate::actions::ActionDeliveryMode::Conditional
+            | crate::actions::ActionDeliveryMode::Either
     )
 }
 
@@ -1332,11 +1348,17 @@ fn openai_prompt_cache_key(
     hasher.update(b"agentark-llm-cache-v1");
     hasher.update(scope.as_bytes());
     hasher.update(system_prompt.as_bytes());
-    for action in actions {
+    let mut sorted_actions = actions.iter().collect::<Vec<_>>();
+    sorted_actions.sort_by(|left, right| left.name.cmp(&right.name));
+    for action in sorted_actions {
         hasher.update(action.name.as_bytes());
         hasher.update(action.version.as_bytes());
-        hasher.update(action.description.as_bytes());
-        hasher.update(action.input_schema.to_string().as_bytes());
+        hasher.update(compact_openai_tool_description(&action.description).as_bytes());
+        hasher.update(
+            compact_openai_tool_schema(&action.input_schema)
+                .to_string()
+                .as_bytes(),
+        );
     }
     let digest = hasher.finalize().to_hex();
     format!("agentark-{scope}-{}", &digest[..32])
@@ -1569,6 +1591,109 @@ fn normalize_openai_tool_schema(schema: &serde_json::Value) -> serde_json::Value
     };
     normalize_openai_tool_schema_in_place(&mut normalized, true);
     normalized
+}
+
+fn compact_openai_tool_description(description: &str) -> String {
+    truncate_for_llm_schema(description.trim(), openai_tool_description_budget())
+}
+
+fn truncate_for_llm_schema(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        format!("{}...", value.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn openai_tool_description_budget() -> usize {
+    std::env::var("AGENTARK_OPENAI_TOOL_DESCRIPTION_CHARS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(220)
+        .clamp(80, 2_000)
+}
+
+fn openai_tool_field_description_budget() -> usize {
+    std::env::var("AGENTARK_OPENAI_TOOL_FIELD_DESCRIPTION_CHARS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(64)
+        .clamp(0, 1_000)
+}
+
+fn compact_openai_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut compact = normalize_openai_tool_schema(schema);
+    compact_openai_tool_schema_in_place(&mut compact, 0);
+    compact
+}
+
+fn compact_openai_tool_schema_in_place(node: &mut serde_json::Value, depth: usize) {
+    match node {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "$comment",
+                "examples",
+                "example",
+                "default",
+                "title",
+                "markdownDescription",
+            ] {
+                map.remove(key);
+            }
+
+            if let Some(description) = map
+                .get("description")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            {
+                let budget = if depth <= 1 {
+                    openai_tool_field_description_budget()
+                } else {
+                    0
+                };
+                if budget == 0 {
+                    map.remove("description");
+                } else {
+                    map.insert(
+                        "description".to_string(),
+                        serde_json::Value::String(truncate_for_llm_schema(&description, budget)),
+                    );
+                }
+            }
+
+            for key in ["properties", "$defs", "definitions"] {
+                if let Some(value) = map.get_mut(key) {
+                    if let Some(children) = value.as_object_mut() {
+                        for child in children.values_mut() {
+                            compact_openai_tool_schema_in_place(child, depth + 1);
+                        }
+                    } else {
+                        compact_openai_tool_schema_in_place(value, depth + 1);
+                    }
+                }
+            }
+            for key in ["items", "additionalProperties", "contains", "not"] {
+                if let Some(value) = map.get_mut(key) {
+                    compact_openai_tool_schema_in_place(value, depth + 1);
+                }
+            }
+            for key in ["oneOf", "anyOf", "allOf", "prefixItems"] {
+                if let Some(items) = map.get_mut(key).and_then(|value| value.as_array_mut()) {
+                    for item in items {
+                        compact_openai_tool_schema_in_place(item, depth + 1);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                compact_openai_tool_schema_in_place(item, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn append_schema_description_note(
@@ -3484,20 +3609,20 @@ impl LlmClient {
         struct OpenAIRequest {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
-            max_tokens: Option<u32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            reasoning: Option<serde_json::Value>,
-            #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_key: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_retention: Option<String>,
-            messages: Vec<OpenAIMessage>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            cache_control: Option<serde_json::Value>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
             #[serde(skip_serializing_if = "Option::is_none")]
             tool_choice: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<serde_json::Value>,
+            messages: Vec<OpenAIMessage>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_tokens: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning: Option<serde_json::Value>,
         }
 
         #[derive(Clone, Serialize)]
@@ -3602,15 +3727,17 @@ impl LlmClient {
                 .await;
         }
 
-        let mut tools: Vec<OpenAITool> = actions
-            .iter()
+        let mut sorted_actions = actions.iter().collect::<Vec<_>>();
+        sorted_actions.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut tools: Vec<OpenAITool> = sorted_actions
+            .into_iter()
             .map(|s| OpenAITool {
                 tool_type: "function".to_string(),
                 cache_control: None,
                 function: OpenAIFunction {
                     name: s.name.clone(),
-                    description: s.description.clone(),
-                    parameters: normalize_openai_tool_schema(&s.input_schema),
+                    description: compact_openai_tool_description(&s.description),
+                    parameters: compact_openai_tool_schema(&s.input_schema),
                 },
             })
             .collect();
@@ -3648,14 +3775,6 @@ impl LlmClient {
         let endpoint = format!("{}/chat/completions", request_config.base_url);
         let request = OpenAIRequest {
             model: model.to_string(),
-            max_tokens: max_output_tokens,
-            reasoning: if request_config.is_openrouter && max_output_tokens.is_some() {
-                Some(serde_json::json!({
-                    "effort": "none"
-                }))
-            } else {
-                None
-            },
             prompt_cache_key: openai_prompt_cache_key_for_config(
                 &request_config,
                 "chat",
@@ -3665,13 +3784,21 @@ impl LlmClient {
             prompt_cache_retention: openai_prompt_cache_retention(
                 request_config.prompt_cache_capability,
             ),
-            messages,
-            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
             tools,
             tool_choice: openai_chat_tool_choice_for_actions(
                 actions,
                 !request_config.is_openrouter,
             ),
+            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
+            messages,
+            max_tokens: max_output_tokens,
+            reasoning: if request_config.is_openrouter && max_output_tokens.is_some() {
+                Some(serde_json::json!({
+                    "effort": "none"
+                }))
+            } else {
+                None
+            },
         };
 
         let mut last_err: Option<anyhow::Error> = None;
@@ -4708,7 +4835,7 @@ impl LlmClient {
                     "response.reasoning_summary_text.delta" => {
                         if let Some(delta) = parsed.get("delta").and_then(|value| value.as_str()) {
                             reasoning.get_or_insert_with(String::new).push_str(delta);
-                            queue_reasoning_delta(&token_tx, "model", delta.to_string());
+                            queue_reasoning_delta(&token_tx, "model_summary", delta.to_string());
                         }
                     }
                     "response.completed" => {
@@ -4735,7 +4862,7 @@ impl LlmClient {
             queue_stream_event(
                 &token_tx,
                 StreamEvent::ReasoningDelta {
-                    phase: "model".to_string(),
+                    phase: "model_summary".to_string(),
                     content_delta: String::new(),
                     done: true,
                 },
@@ -4791,20 +4918,20 @@ impl LlmClient {
         struct OpenAIRequest {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
-            max_tokens: Option<u32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            reasoning: Option<serde_json::Value>,
-            #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_key: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_retention: Option<String>,
-            messages: Vec<OpenAIMessage>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            cache_control: Option<serde_json::Value>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
             #[serde(skip_serializing_if = "Option::is_none")]
             tool_choice: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<serde_json::Value>,
+            messages: Vec<OpenAIMessage>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_tokens: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning: Option<serde_json::Value>,
             stream: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             stream_options: Option<OpenAIStreamOptions>,
@@ -4927,15 +5054,17 @@ impl LlmClient {
                 .await;
         }
 
-        let mut tools: Vec<OpenAITool> = actions
-            .iter()
+        let mut sorted_actions = actions.iter().collect::<Vec<_>>();
+        sorted_actions.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut tools: Vec<OpenAITool> = sorted_actions
+            .into_iter()
             .map(|s| OpenAITool {
                 tool_type: "function".to_string(),
                 cache_control: None,
                 function: OpenAIFunction {
                     name: s.name.clone(),
-                    description: s.description.clone(),
-                    parameters: normalize_openai_tool_schema(&s.input_schema),
+                    description: compact_openai_tool_description(&s.description),
+                    parameters: compact_openai_tool_schema(&s.input_schema),
                 },
             })
             .collect();
@@ -4991,14 +5120,6 @@ impl LlmClient {
         };
         let request = OpenAIRequest {
             model: model.to_string(),
-            max_tokens: None,
-            reasoning: if request_config.is_openrouter
-                && matches!(params.mode, ModelRequestMode::AppDelivery)
-            {
-                Some(serde_json::json!({ "effort": "none" }))
-            } else {
-                None
-            },
             prompt_cache_key: openai_prompt_cache_key_for_config(
                 &request_config,
                 "chat-stream",
@@ -5008,13 +5129,21 @@ impl LlmClient {
             prompt_cache_retention: openai_prompt_cache_retention(
                 request_config.prompt_cache_capability,
             ),
-            messages,
-            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
             tools,
             tool_choice: openai_chat_tool_choice_for_actions(
                 actions,
                 !request_config.is_openrouter,
             ),
+            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
+            messages,
+            max_tokens: None,
+            reasoning: if request_config.is_openrouter
+                && matches!(params.mode, ModelRequestMode::AppDelivery)
+            {
+                Some(serde_json::json!({ "effort": "none" }))
+            } else {
+                None
+            },
             stream: true,
             stream_options,
         };

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::*;
 
 fn automation_delivery_channel_requires_connection(channel: &str) -> bool {
@@ -23,7 +25,7 @@ pub(super) enum PendingConversationActionKind {
 }
 
 impl PendingConversationActionKind {
-    pub(super) fn as_router_kind(&self) -> &'static str {
+    pub(super) fn as_pending_action_kind(&self) -> &'static str {
         match self {
             Self::ForceImportSkill => "force_import_skill",
             Self::ResumeResilienceFollowup => "resume_resilience_followup",
@@ -313,18 +315,18 @@ impl Agent {
         Some(lines.join("\n"))
     }
 
-    pub(super) fn action_planner_metadata_for_name(
+    pub(super) fn action_action_metadata_for_name(
         all_actions: &[crate::actions::ActionDef],
         action_name: &str,
-    ) -> crate::actions::ActionPlannerMetadata {
+    ) -> crate::actions::ActionMetadata {
         if let Some(action) = all_actions
             .iter()
             .find(|candidate| candidate.name == action_name)
         {
-            return action.planner_metadata();
+            return action.action_metadata();
         }
 
-        crate::actions::planner_metadata_for_action(&crate::actions::ActionDef {
+        crate::actions::action_metadata_for_action(&crate::actions::ActionDef {
             name: action_name.to_string(),
             ..crate::actions::ActionDef::default()
         })
@@ -336,7 +338,7 @@ impl Agent {
         _action_name: &str,
         _delivery_channel: &str,
         trigger_kind_hint: Option<&str>,
-        action_meta: &crate::actions::ActionPlannerMetadata,
+        action_meta: &crate::actions::ActionMetadata,
     ) -> AutomationIntentAssessment {
         let trigger_kind = trigger_kind_hint
             .map(str::trim)
@@ -356,7 +358,7 @@ impl Agent {
                 AutomationSurface::Watch => "external_state",
             });
         let integration_class =
-            planner_integration_class_name(&action_meta.integration_class).to_string();
+            action_integration_class_name(&action_meta.integration_class).to_string();
 
         AutomationIntentAssessment {
             trigger_kind: trigger_kind.to_string(),
@@ -384,7 +386,7 @@ impl Agent {
         delivery_channel: String,
         all_actions: &[crate::actions::ActionDef],
     ) -> AutomationPlanValidationResult {
-        let action_meta = Self::action_planner_metadata_for_name(all_actions, &action_name);
+        let action_meta = Self::action_action_metadata_for_name(all_actions, &action_name);
         let assessment = Self::heuristic_automation_intent_assessment(
             surface,
             request_text,
@@ -454,8 +456,8 @@ impl Agent {
             );
         }
 
-        let current_meta = Self::action_planner_metadata_for_name(all_actions, &action_name);
-        let current_class = planner_integration_class_name(&current_meta.integration_class);
+        let current_meta = Self::action_action_metadata_for_name(all_actions, &action_name);
+        let current_class = action_integration_class_name(&current_meta.integration_class);
         let avoids_workspace = assessment
             .avoid_integration_classes
             .iter()

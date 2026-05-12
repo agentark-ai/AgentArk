@@ -38,6 +38,37 @@ export function isOneShotReminderTask(task: Task | null | undefined): boolean {
   return taskKind(task) === "reminder" && !cron && scheduledFor.length > 0;
 }
 
+export function isSystemManagedTask(task: Task | null | undefined): boolean {
+  if (!task) return false;
+  const action = String(task.action || "").trim().toLowerCase();
+  return action === "daily_brief";
+}
+
+export function isForegroundChatTask(task: Task | null | undefined): boolean {
+  if (!task) return false;
+  return taskKind(task) === "chat_request";
+}
+
+export function isTerminalTask(task: Task | null | undefined): boolean {
+  if (!task) return false;
+  const status = String(task.status || "").trim().toLowerCase();
+  if (!status) return false;
+  return (
+    status === "completed" ||
+    status === "cancelled" ||
+    status === "canceled" ||
+    status.startsWith("failed")
+  );
+}
+
+export function isStandaloneBackgroundWorkTask(task: Task | null | undefined): boolean {
+  if (!task) return false;
+  if (isSystemManagedTask(task)) return false;
+  if (isForegroundChatTask(task)) return false;
+  if (isTerminalTask(task)) return false;
+  return true;
+}
+
 export function isOneShotReminderSession(session: BackgroundSessionSummary): boolean {
   return String(session.ui_kind || "").trim().toLowerCase() === "one_shot_reminder";
 }

@@ -115,6 +115,111 @@ function normalizeWidgetModuleName(widget: OrbitWidgetRegistryEntry): string | n
   return normalizeOrbitModulePath(moduleName);
 }
 
+function titleFromModuleName(value: string): string {
+  return value
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function widgetIdentityLabel(widget: OrbitWidgetRegistryEntry): string | null {
+  const direct =
+    stringField(widget.title) ||
+    stringField(widget.name) ||
+    stringField(widget.label);
+  if (direct) return direct;
+  const spec =
+    widget.spec && typeof widget.spec === "object" && !Array.isArray(widget.spec)
+      ? (widget.spec as Record<string, unknown>)
+      : null;
+  const fromSpec =
+    stringField(spec?.title) ||
+    stringField(spec?.name) ||
+    stringField(spec?.label);
+  if (fromSpec) return fromSpec;
+  const moduleName = normalizeWidgetModuleName(widget);
+  if (moduleName) return titleFromModuleName(moduleName);
+  return stringField(widget.id);
+}
+
+function normalizeWidgetIdentityText(value: string): string {
+  return value
+    .replace(/[^a-z0-9]+/gi, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function widgetIdentityTokens(value: string): Set<string> {
+  return new Set(value.split(/\s+/).filter((token) => token.length >= 2));
+}
+
+function widgetsRepresentSameArtifact(
+  left: OrbitWidgetRegistryEntry,
+  right: OrbitWidgetRegistryEntry,
+): boolean {
+  const leftId = stringField(left.id);
+  const rightId = stringField(right.id);
+  if (leftId && rightId && leftId === rightId) return true;
+  const leftModule = normalizeWidgetModuleName(left);
+  const rightModule = normalizeWidgetModuleName(right);
+  if (leftModule && rightModule && leftModule === rightModule) {
+    return !leftId || !rightId || leftId === rightId;
+  }
+  const leftLabel = widgetIdentityLabel(left);
+  const rightLabel = widgetIdentityLabel(right);
+  if (!leftLabel || !rightLabel) return false;
+  const leftNormalized = normalizeWidgetIdentityText(leftLabel);
+  const rightNormalized = normalizeWidgetIdentityText(rightLabel);
+  if (!leftNormalized || !rightNormalized) return false;
+  if (leftNormalized === rightNormalized) return true;
+  const leftTokens = widgetIdentityTokens(leftNormalized);
+  const rightTokens = widgetIdentityTokens(rightNormalized);
+  if (Math.min(leftTokens.size, rightTokens.size) < 2) return false;
+  let shared = 0;
+  leftTokens.forEach((token) => {
+    if (rightTokens.has(token)) shared += 1;
+  });
+  if (shared < 2) return false;
+  return (shared * 2) / (leftTokens.size + rightTokens.size) >= 0.72;
+}
+
+function preserveWidgetLayout(
+  existing: OrbitWidgetRegistryEntry,
+  replacement: OrbitWidgetRegistryEntry,
+): OrbitWidgetRegistryEntry {
+  const next = { ...replacement };
+  (["left", "top", "width", "height"] as const).forEach((field) => {
+    if (typeof next[field] === "number" && Number.isFinite(next[field])) return;
+    const value = existing[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      next[field] = value;
+    }
+  });
+  return next;
+}
+
+function collapseWidgetRegistryEntries(
+  widgets: OrbitWidgetRegistryEntry[],
+): OrbitWidgetRegistryEntry[] {
+  const collapsed: OrbitWidgetRegistryEntry[] = [];
+  widgets.forEach((candidate) => {
+    const existingIndex = collapsed.findIndex((existing) =>
+      widgetsRepresentSameArtifact(existing, candidate),
+    );
+    if (existingIndex >= 0) {
+      collapsed[existingIndex] = preserveWidgetLayout(collapsed[existingIndex], candidate);
+    } else {
+      collapsed.push(candidate);
+    }
+  });
+  return collapsed;
+}
+
 async function fetchOrbitText(orbitId: OrbitId, path: string): Promise<string> {
   const normalizedPath = normalizeOrbitModulePath(path);
   if (!normalizedPath) throw new Error("Rejected unsafe orbit module path.");
@@ -154,10 +259,11 @@ function parseRegistry(raw: string): OrbitWidgetRegistryEntry[] {
         ? (parsed as { widgets?: unknown }).widgets
         : [];
   if (!Array.isArray(list)) return [];
-  return list.filter(
+  const widgets = list.filter(
     (entry): entry is OrbitWidgetRegistryEntry =>
       !!entry && typeof entry === "object",
   );
+  return collapseWidgetRegistryEntries(widgets);
 }
 
 async function fetchWidgetRegistry(
@@ -168,6 +274,9 @@ async function fetchWidgetRegistry(
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
     if (text.includes("404") || text.includes("not found")) return [];
+    if (error instanceof SyntaxError) {
+      throw new Error("Orbit widget registry is invalid JSON; visible widgets are paused until it is repaired.");
+    }
     throw error;
   }
 }

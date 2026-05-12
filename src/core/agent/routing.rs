@@ -324,13 +324,13 @@ impl Agent {
         let preferred_action: Option<&crate::actions::ActionDef> = None;
         let (primary_agent_type, primary_task, primary_role) = preferred_action
             .map(|action| {
-                let metadata = action.planner_metadata();
+                let metadata = action.action_metadata();
                 if matches!(
                     metadata.integration_class,
-                    crate::actions::PlannerIntegrationClass::Code
-                        | crate::actions::PlannerIntegrationClass::Filesystem
-                        | crate::actions::PlannerIntegrationClass::App
-                ) || matches!(metadata.role, crate::actions::PlannerActionRole::Mutation)
+                    crate::actions::ActionIntegrationClass::Code
+                        | crate::actions::ActionIntegrationClass::Filesystem
+                        | crate::actions::ActionIntegrationClass::App
+                ) || matches!(metadata.role, crate::actions::ActionRole::Mutation)
                 {
                     (
                         "Coder".to_string(),
@@ -342,10 +342,10 @@ impl Agent {
                     )
                 } else if matches!(
                     metadata.integration_class,
-                    crate::actions::PlannerIntegrationClass::Search
-                        | crate::actions::PlannerIntegrationClass::Analytics
-                        | crate::actions::PlannerIntegrationClass::Network
-                ) || matches!(metadata.role, crate::actions::PlannerActionRole::DataSource)
+                    crate::actions::ActionIntegrationClass::Search
+                        | crate::actions::ActionIntegrationClass::Analytics
+                        | crate::actions::ActionIntegrationClass::Network
+                ) || matches!(metadata.role, crate::actions::ActionRole::DataSource)
                 {
                     (
                         "Researcher".to_string(),
@@ -357,9 +357,9 @@ impl Agent {
                     )
                 } else if matches!(
                     metadata.integration_class,
-                    crate::actions::PlannerIntegrationClass::Messaging
-                        | crate::actions::PlannerIntegrationClass::Workspace
-                ) || matches!(metadata.role, crate::actions::PlannerActionRole::Delivery)
+                    crate::actions::ActionIntegrationClass::Messaging
+                        | crate::actions::ActionIntegrationClass::Workspace
+                ) || matches!(metadata.role, crate::actions::ActionRole::Delivery)
                 {
                     (
                         "Writer".to_string(),

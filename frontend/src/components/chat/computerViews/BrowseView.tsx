@@ -7,6 +7,7 @@ import Link from "@mui/material/Link";
 
 import type { ChatStepCard } from "../types";
 import { extractSurfaceBody, extractUrl } from "../dispatch";
+import { LinkifiedText } from "./LinkifiedText";
 import { buildReadableToolPresentation } from "./presentation";
 
 export interface BrowseViewProps {
@@ -55,7 +56,9 @@ export function BrowseView({ card }: BrowseViewProps) {
       </Box>
       <Box className="cview-browse-body">
         {snapshot ? (
-          <pre className="cview-browse-snapshot">{snapshot}</pre>
+          <pre className="cview-browse-snapshot">
+            <LinkifiedText text={snapshot} />
+          </pre>
         ) : (
           <Typography variant="body2" className="cview-browse-empty">
             No page snapshot captured for this step.

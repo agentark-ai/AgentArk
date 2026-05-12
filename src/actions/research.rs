@@ -4,7 +4,7 @@
 //! 2. Fetching and extracting content from URLs
 //! 3. Synthesizing information into a coherent report
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -248,11 +248,7 @@ fn trim_research_list_marker(line: &str) -> Option<&str> {
     }
 
     let rest = after_chars.as_str().trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest)
-    }
+    if rest.is_empty() { None } else { Some(rest) }
 }
 
 fn compact_research_query_text(text: &str, max_chars: usize) -> String {
@@ -2831,18 +2827,26 @@ mod tests {
         let client = test_client();
         let queries = client.generate_research_queries("rust agent framework", true);
 
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("primary sources")));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("recent coverage")));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("comparison alternatives")));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("risks limitations open questions")));
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("primary sources"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("recent coverage"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("comparison alternatives"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("risks limitations open questions"))
+        );
     }
 
     #[test]
@@ -2852,18 +2856,26 @@ mod tests {
         let queries = client.generate_research_queries(request, true);
 
         assert!(queries.len() > 8);
-        assert!(queries
-            .iter()
-            .all(|query| query.text.chars().count() <= 240));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("compute access")));
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("open-source AI")));
-        assert!(!queries
-            .iter()
-            .any(|query| query.text.contains("Focus on:\n-")));
+        assert!(
+            queries
+                .iter()
+                .all(|query| query.text.chars().count() <= 240)
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("compute access"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("open-source AI"))
+        );
+        assert!(
+            !queries
+                .iter()
+                .any(|query| query.text.contains("Focus on:\n-"))
+        );
     }
 
     #[test]
@@ -2908,12 +2920,16 @@ mod tests {
             client.effective_freshness_window_days(&args, &args.query),
             None
         );
-        assert!(queries
-            .iter()
-            .any(|query| query.text.contains("period coverage")));
-        assert!(!queries
-            .iter()
-            .any(|query| query.text.contains("recent coverage")));
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("period coverage"))
+        );
+        assert!(
+            !queries
+                .iter()
+                .any(|query| query.text.contains("recent coverage"))
+        );
     }
 
     #[test]
@@ -2975,18 +2991,22 @@ mod tests {
         let query_terms =
             client.normalized_query_terms("India AI publications startups compute infrastructure");
 
-        assert!(client
-            .text_relevance_score(
-                "Access 160 million publication pages and gain visibility by uploading work.",
-                &query_terms,
-            )
-            .is_none());
-        assert!(client
-            .text_relevance_score(
-                "India AI compute infrastructure is shaping startup and publication output.",
-                &query_terms,
-            )
-            .is_some());
+        assert!(
+            client
+                .text_relevance_score(
+                    "Access 160 million publication pages and gain visibility by uploading work.",
+                    &query_terms,
+                )
+                .is_none()
+        );
+        assert!(
+            client
+                .text_relevance_score(
+                    "India AI compute infrastructure is shaping startup and publication output.",
+                    &query_terms,
+                )
+                .is_some()
+        );
     }
 
     #[test]

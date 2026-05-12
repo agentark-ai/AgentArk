@@ -822,6 +822,7 @@ impl Agent {
         })
     }
 
+    #[allow(dead_code)]
     pub(super) fn sanitize_mcp_output(&self, output: &str) -> String {
         // All external content is wrapped unconditionally in a structural envelope
         // and normalized + secret-scrubbed by `trust_boundary::sanitize_untrusted_output`.

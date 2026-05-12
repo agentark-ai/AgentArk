@@ -15,6 +15,7 @@ import {
   surfaceFromCard,
   surfacePayloads,
 } from "../surface";
+import { LinkifiedText } from "./LinkifiedText";
 
 export interface GenericSurfaceViewProps {
   card: ChatStepCard;
@@ -186,7 +187,7 @@ function SurfacePayloadPager({ rows }: { rows: SurfaceRow[] }) {
         </Box>
       </Box>
       <pre className="cview-generic-body cview-generic-page-body" tabIndex={0}>
-        {row.body}
+        <LinkifiedText text={row.body} />
       </pre>
     </Box>
   );

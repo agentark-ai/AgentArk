@@ -17,10 +17,13 @@ use crate::storage::{
 use super::routing_canonical_evolution::{
     parse_routing_canonical_candidate, ROUTING_CANONICAL_CANDIDATE_TYPE,
 };
+use super::router_learning::{
+    validate_router_learning_candidate, RouterLearningCandidatePayload,
+    ROUTER_LEARNING_CANDIDATE_TYPE,
+};
 
 const DEFAULT_MIN_EVIDENCE_SAMPLES: usize = 2;
 const DEFAULT_MIN_CONFIDENCE: f64 = 0.35;
-const DEFAULT_MIN_SUPPORT_SCORE: f64 = 0.50;
 const DEFAULT_MAX_CORRECTION_RATE: f64 = 0.45;
 
 #[derive(Debug, Clone, Serialize)]
@@ -353,6 +356,9 @@ fn evaluate_candidate_with_evidence(
         ROUTING_CANONICAL_CANDIDATE_TYPE => {
             evaluate_routing_canonical_candidate(candidate, evidence, confidence)
         }
+        ROUTER_LEARNING_CANDIDATE_TYPE => {
+            evaluate_router_learning_candidate(candidate, evidence, confidence)
+        }
         other => gate_result(
             candidate,
             evidence,
@@ -365,6 +371,40 @@ fn evaluate_candidate_with_evidence(
             ),
         ),
     }
+}
+
+fn evaluate_router_learning_candidate(
+    candidate: &learning_candidate::Model,
+    evidence: EvidenceBundle,
+    confidence: f64,
+) -> CandidateReplayGateResult {
+    let payload = serde_json::from_value::<RouterLearningCandidatePayload>(
+        candidate.proposed_content.clone(),
+    );
+    let payload = match payload {
+        Ok(payload) => payload,
+        Err(error) => {
+            return gate_result(
+                candidate,
+                evidence,
+                confidence,
+                "blocked",
+                false,
+                format!("router learning candidate payload is invalid: {error}"),
+            );
+        }
+    };
+    if let Err(error) = validate_router_learning_candidate(&payload) {
+        return gate_result(
+            candidate,
+            evidence,
+            confidence,
+            "blocked",
+            false,
+            format!("router learning candidate failed validation: {error}"),
+        );
+    }
+    evaluate_turn_decision_candidate(candidate, evidence, confidence)
 }
 
 fn evaluate_routing_canonical_candidate(
@@ -391,7 +431,6 @@ fn evaluate_turn_decision_candidate(
     confidence: f64,
 ) -> CandidateReplayGateResult {
     let turn_decision_samples = evidence.turn_decision_run_count;
-    let support_score = support_score(&evidence, confidence);
     if turn_decision_samples < DEFAULT_MIN_EVIDENCE_SAMPLES {
         return gate_result(
             candidate,
@@ -422,14 +461,14 @@ fn evaluate_turn_decision_candidate(
             "correction rate in turn-decision evidence is too high".to_string(),
         );
     }
-    if support_score < DEFAULT_MIN_SUPPORT_SCORE {
+    if evidence.successes == 0 {
         return gate_result(
             candidate,
             evidence,
             confidence,
             "blocked",
             false,
-            "turn-decision support score is below threshold".to_string(),
+            "turn-decision evidence has no accepted successful run".to_string(),
         );
     }
     gate_result(
@@ -447,7 +486,6 @@ fn evaluate_structured_candidate(
     evidence: EvidenceBundle,
     confidence: f64,
 ) -> CandidateReplayGateResult {
-    let support_score = support_score(&evidence, confidence);
     if evidence.samples < DEFAULT_MIN_EVIDENCE_SAMPLES {
         return gate_result(
             candidate,
@@ -478,14 +516,14 @@ fn evaluate_structured_candidate(
             "correction rate in supporting evidence is too high".to_string(),
         );
     }
-    if support_score < DEFAULT_MIN_SUPPORT_SCORE {
+    if evidence.successes == 0 {
         return gate_result(
             candidate,
             evidence,
             confidence,
             "blocked",
             false,
-            "structured evidence support score is below threshold".to_string(),
+            "structured evidence has no accepted successful run".to_string(),
         );
     }
     gate_result(
@@ -768,7 +806,7 @@ fn gate_result(
         support_score: round4(support_score(&evidence, confidence)),
         min_samples: DEFAULT_MIN_EVIDENCE_SAMPLES,
         min_confidence: DEFAULT_MIN_CONFIDENCE,
-        min_support_score: DEFAULT_MIN_SUPPORT_SCORE,
+        min_support_score: 0.0,
         max_correction_rate: DEFAULT_MAX_CORRECTION_RATE,
         usage_samples: evidence.usage.samples,
         avg_input_tokens: round4(evidence.usage.avg_input_tokens()),
@@ -781,10 +819,16 @@ fn gate_result(
 }
 
 fn support_score(evidence: &EvidenceBundle, confidence: f64) -> f64 {
-    let sample_score = (evidence.samples as f64 / 8.0).clamp(0.0, 1.0);
-    let success_score = evidence.success_rate();
-    let correction_penalty = evidence.correction_rate() * 0.35;
-    (confidence * 0.45 + success_score * 0.35 + sample_score * 0.20 - correction_penalty)
+    let sample_support = if evidence.samples >= DEFAULT_MIN_EVIDENCE_SAMPLES {
+        1.0
+    } else {
+        ratio(evidence.samples, DEFAULT_MIN_EVIDENCE_SAMPLES)
+    };
+    let correction_support = 1.0 - evidence.correction_rate().clamp(0.0, 1.0);
+    confidence
+        .min(evidence.success_rate())
+        .min(sample_support)
+        .min(correction_support)
         .clamp(0.0, 1.0)
 }
 
@@ -940,7 +984,7 @@ mod tests {
             strategy_version: None,
             policy_version: None,
             prompt_version: None,
-            model_slot: Some("direct_memory".to_string()),
+            model_slot: Some("model_tool_loop".to_string()),
             success_state: "accepted".to_string(),
             correction_state: "none".to_string(),
             outcome_summary: None,
@@ -949,7 +993,7 @@ mod tests {
                 "turn_decision": {
                     "schema_version": 1,
                     "objective_order": ["accuracy", "safety", "tokens_latency_cost"],
-                    "path": "direct_memory",
+                    "path": "model_tool_loop",
                     "task_type": "conversation",
                     "usage_delta": {
                         "input_tokens": 1200,

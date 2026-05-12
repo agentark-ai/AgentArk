@@ -281,6 +281,7 @@ export type TraceSummary = {
 
 export type TraceOperationalEvent = {
   id: string;
+  source: string;
   trace_id?: string | null;
   created_at: string;
   channel: string;
@@ -289,12 +290,16 @@ export type TraceOperationalEvent = {
   outcome: string;
   tool_name?: string | null;
   latency_ms?: number | null;
+  details?: unknown;
 };
 
 export type TraceResponse = {
   history: TraceSummary[];
   history_total?: number;
   recent_events?: TraceOperationalEvent[];
+  recent_events_total?: number;
+  recent_events_offset?: number;
+  recent_events_limit?: number;
 };
 
 export type AutonomyActionExecutionResponse = {
@@ -1219,6 +1224,7 @@ export type SkillImportRequest = {
   model?: string;
   preview_only?: boolean;
   selected_urls?: string[];
+  enabled?: boolean;
 };
 
 export type SkillImportResponse = {
@@ -1226,6 +1232,16 @@ export type SkillImportResponse = {
   name: string;
   message: string;
   source_url?: string;
+  enabled?: boolean;
+  visible_in_catalog?: boolean;
+  enabled_by_default?: boolean;
+  catalog_index_status?: "queued" | "refreshed" | "unmodified" | "unavailable" | string;
+  compatibility?: {
+    mode?: "workflow_only" | "cli_skill" | "bundle_references" | string;
+    install_route?: "workflow" | "cli_skill" | "extension_pack" | string;
+    unsupported_references?: string[];
+    warnings?: string[];
+  };
   imported_count?: number;
   failed_count?: number;
   imported?: Array<{ url?: string; result?: SkillImportResponse }>;

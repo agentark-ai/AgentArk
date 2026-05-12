@@ -132,7 +132,7 @@ impl Agent {
         )
     }
 
-    pub(super) fn direct_chat_history_budget(
+    pub(super) fn conversation_history_budget(
         &self,
         user_message: &str,
     ) -> crate::core::context_budget::HistoryTokenBudget {
@@ -165,6 +165,7 @@ impl Agent {
             .clamp(32, 512)
     }
 
+    #[allow(dead_code)]
     pub(super) fn prompt_recent_token_budget(
         budget: crate::core::context_budget::HistoryTokenBudget,
         env_name: &str,
@@ -1203,6 +1204,7 @@ impl Agent {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn persist_last_deployed_app_context(
         &self,
         conversation_id: &str,

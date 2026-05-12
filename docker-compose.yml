@@ -119,11 +119,16 @@ services:
       timeout: 2s
       retries: 30
       start_period: 1s
+    # Hard cap so the whole AgentArk stack stays inside a 4 GB / 2.4-core
+    # budget (~10% of a 24-core host). Postgres gets the heaviest share
+    # after control because it carries every write the agent loop emits.
+    cpus: 0.5
+    mem_limit: 768m
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 1G
+          cpus: "0.5"
+          memory: 768M
         reservations:
           cpus: "0.25"
           memory: 256M
@@ -137,7 +142,9 @@ services:
     image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-control
     restart: unless-stopped
-    cpus: "${AGENTARK_CONTROL_CPUS:-1}"
+    # Main worker: largest share of the 4 GB / 2.4-core stack budget.
+    cpus: "${AGENTARK_CONTROL_CPUS:-1.2}"
+    mem_limit: "${AGENTARK_CONTROL_MEMORY:-1500m}"
     security_opt:
       - no-new-privileges:true
     ports:
@@ -213,9 +220,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
+          cpus: "${AGENTARK_CONTROL_CPUS:-1.2}"
+          memory: "${AGENTARK_CONTROL_MEMORY:-1500M}"
         reservations:
           cpus: "0.25"
+          memory: 256M
     logging:
       driver: json-file
       options:
@@ -226,7 +235,9 @@ services:
     image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-embeddings
     restart: unless-stopped
-    cpus: "${AGENTARK_EMBEDDINGS_CPUS:-1}"
+    # Embedding model load is memory-bound, not CPU-bound — keep the
+    # 768 MB headroom but tighten CPU since scoring runs in bursts.
+    cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.2}"
     mem_limit: "${AGENTARK_EMBEDDINGS_MEMORY:-768M}"
     security_opt:
       - no-new-privileges:true
@@ -263,10 +274,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${AGENTARK_EMBEDDINGS_CPUS:-1}"
+          cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.2}"
           memory: "${AGENTARK_EMBEDDINGS_MEMORY:-768M}"
         reservations:
-          cpus: "0.25"
+          cpus: "0.1"
           memory: 128M
     logging:
       driver: json-file
@@ -278,6 +289,8 @@ services:
     image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-executor
     restart: unless-stopped
+    cpus: 0.3
+    mem_limit: 512m
     security_opt:
       - no-new-privileges:true
     volumes:
@@ -339,6 +352,14 @@ services:
       timeout: 2s
       retries: 30
       start_period: 1s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
     logging:
       driver: json-file
       options:
@@ -349,6 +370,8 @@ services:
     image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-workspace
     restart: unless-stopped
+    cpus: 0.2
+    mem_limit: 512m
     security_opt:
       - no-new-privileges:true
     volumes:
@@ -384,6 +407,14 @@ services:
       timeout: 2s
       retries: 30
       start_period: 1s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
     logging:
       driver: json-file
       options:

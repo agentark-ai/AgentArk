@@ -92,7 +92,13 @@ pub(super) struct ImportActionRequest {
     /// Used by Bulk Import confirmation flow after previewing a collection URL.
     #[serde(default)]
     pub selected_urls: Option<Vec<String>>,
+    /// Whether successfully imported skills should be enabled immediately.
+    /// Defaults to true for small imports and false for large bulk imports.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
+
+const BULK_IMPORT_ENABLE_THRESHOLD: usize = 25;
 
 fn action_review_status_label(status: &crate::runtime::ActionReviewStatus) -> String {
     match status {
@@ -124,6 +130,18 @@ fn action_review_info(review: crate::runtime::ActionReviewSnapshot) -> ActionRev
         notes: review.notes,
         reviewed_at: review.reviewed_at,
     }
+}
+
+async fn refresh_action_catalog_after_skill_mutation(state: &AppState, reason: &'static str) {
+    let agent = { state.agent.read().await.clone() };
+    refresh_action_catalog_after_skill_mutation_for_agent(&agent, reason).await;
+}
+
+async fn refresh_action_catalog_after_skill_mutation_for_agent(
+    agent: &Agent,
+    reason: &'static str,
+) {
+    agent.refresh_action_catalog_index(reason).await;
 }
 
 /// List available actions
@@ -335,6 +353,8 @@ pub(super) async fn update_action_content(
         Ok(Some(review)) => {
             let needs_secrets = !review.missing_env.is_empty();
             let review = action_review_info(review);
+            refresh_action_catalog_after_skill_mutation_for_agent(&agent_guard, "skill_update")
+                .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -379,11 +399,18 @@ pub(super) async fn set_action_enabled_endpoint(
         .set_action_enabled(&name, req.enabled)
         .await
     {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status":"ok","name":name,"enabled":req.enabled})),
-        )
-            .into_response(),
+        Ok(true) => {
+            refresh_action_catalog_after_skill_mutation_for_agent(
+                &agent_guard,
+                "skill_enabled_changed",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status":"ok","name":name,"enabled":req.enabled})),
+            )
+                .into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -473,6 +500,167 @@ fn extract_skill_name_from_frontmatter(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn yaml_string_field<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a str> {
+    mapping
+        .get(serde_yaml::Value::String(key.to_string()))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn yaml_string_vec_field(mapping: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    let Some(value) = mapping.get(serde_yaml::Value::String(key.to_string())) else {
+        return Vec::new();
+    };
+    match value {
+        serde_yaml::Value::Sequence(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        serde_yaml::Value::String(text) => text
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn cli_skill_mapping<'a>(root: &'a serde_yaml::Mapping) -> Option<&'a serde_yaml::Mapping> {
+    root.get(serde_yaml::Value::String("cli".to_string()))
+        .or_else(|| root.get(serde_yaml::Value::String("local_cli".to_string())))
+        .and_then(|value| value.as_mapping())
+}
+
+fn extract_cli_manifest_from_frontmatter(
+    content: &str,
+    action_name: &str,
+    source_url: &str,
+) -> Option<crate::runtime::InstalledCliSkillManifest> {
+    let frontmatter = extract_frontmatter_text(content)?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(frontmatter).ok()?;
+    let root = parsed.as_mapping()?;
+    let cli_mapping = cli_skill_mapping(root)?;
+    let executable_path = yaml_string_field(cli_mapping, "executable_path")
+        .or_else(|| yaml_string_field(cli_mapping, "command"))?
+        .to_string();
+    let verify_args = yaml_string_vec_field(cli_mapping, "verify_args");
+    let description = yaml_string_field(root, "description")
+        .unwrap_or("Imported CLI-backed skill")
+        .to_string();
+    let version = yaml_string_field(root, "version")
+        .unwrap_or("1.0.0")
+        .to_string();
+
+    Some(crate::runtime::InstalledCliSkillManifest {
+        name: action_name.to_string(),
+        description,
+        version,
+        executable_path,
+        verify_args,
+        source_url: Some(source_url.to_string()),
+    })
+}
+
+fn extract_relative_skill_references(content: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    for raw_token in content.split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'')) {
+        let mut token = raw_token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '*' | '_' | '[' | ']' | '(' | ')' | '<' | '>' | ',' | ';' | ':'
+            )
+        });
+        if let Some((_, link_target)) = token.rsplit_once("](") {
+            token = link_target.trim_matches(|ch: char| matches!(ch, ')' | '<' | '>'));
+        }
+        let normalized = token.replace('\\', "/");
+        let normalized = normalized.trim_matches('/');
+        if normalized.is_empty()
+            || normalized.starts_with('#')
+            || normalized.starts_with("http://")
+            || normalized.starts_with("https://")
+            || normalized.contains("://")
+        {
+            continue;
+        }
+        let last_segment = normalized.rsplit('/').next().unwrap_or(normalized);
+        let has_file_extension = last_segment
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| {
+                !ext.is_empty()
+                    && ext.len() <= 8
+                    && ext
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_alphabetic())
+                    && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+            });
+        let has_relative_prefix = normalized.starts_with("./") || normalized.starts_with("../");
+        let has_structural_path_shape = normalized.contains('/')
+            && (has_relative_prefix
+                || has_file_extension
+                || normalized.chars().all(|ch| {
+                    ch.is_ascii_lowercase()
+                        || ch.is_ascii_digit()
+                        || matches!(ch, '/' | '.' | '-' | '_')
+                }));
+        let has_path_separator = normalized.contains('/') && has_structural_path_shape;
+        if has_path_separator || has_file_extension {
+            unique_push(&mut references, normalized.to_string());
+        }
+    }
+    references
+}
+
+fn skill_compatibility_json(content: &str) -> serde_json::Value {
+    let workflow_body = split_frontmatter_block(content)
+        .map(|(_, body)| body)
+        .unwrap_or(content);
+    let unsupported_references = extract_relative_skill_references(workflow_body);
+    let has_cli_manifest = extract_frontmatter_text(content)
+        .and_then(|frontmatter| serde_yaml::from_str::<serde_yaml::Value>(frontmatter).ok())
+        .is_some_and(|value| {
+            value
+                .as_mapping()
+                .and_then(cli_skill_mapping)
+                .is_some_and(|mapping| {
+                    yaml_string_field(mapping, "executable_path")
+                        .or_else(|| yaml_string_field(mapping, "command"))
+                        .is_some()
+                })
+        });
+    let mode = if has_cli_manifest {
+        "cli_skill"
+    } else if unsupported_references.is_empty() {
+        "workflow_only"
+    } else {
+        "bundle_references"
+    };
+    let install_route = if mode == "cli_skill" {
+        "cli_skill"
+    } else {
+        "workflow"
+    };
+    let mut warnings = Vec::new();
+    if !unsupported_references.is_empty() {
+        warnings.push("AgentArk imports the SKILL.md body as the active markdown workflow. Relative file references should be inlined, explicitly read by the workflow, or packaged through the CLI/extension-pack path.".to_string());
+    }
+    serde_json::json!({
+        "mode": mode,
+        "install_route": install_route,
+        "unsupported_references": unsupported_references,
+        "warnings": warnings,
+    })
 }
 
 fn unique_push(out: &mut Vec<String>, s: String) {
@@ -885,6 +1073,7 @@ pub(super) async fn set_action_secrets(
         }
     }
     drop(agent);
+    refresh_action_catalog_after_skill_mutation(&state, "skill_secrets_update").await;
 
     // Return fresh status
     get_action_secrets(State(state), Path(name)).await
@@ -1119,8 +1308,10 @@ pub(super) async fn create_action(
             .into_response();
     }
 
+    let content = request.content.clone();
+
     let agent_guard = state.agent.read().await;
-    if let Some(declared_name) = extract_skill_name_from_frontmatter(&request.content) {
+    if let Some(declared_name) = extract_skill_name_from_frontmatter(&content) {
         if declared_name != request.name {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1140,13 +1331,13 @@ pub(super) async fn create_action(
         &agent_guard.config_dir,
         "local://skills",
         &request.name,
-        &request.content,
+        &content,
     )
     .await;
     let blocked = semantic_review.policy.blocked;
     let mut status = if blocked { "blocked" } else { "ok" };
 
-    let required_env = extract_frontmatter_text(&request.content)
+    let required_env = extract_frontmatter_text(&content)
         .map(extract_required_envs_from_frontmatter)
         .unwrap_or_default();
     let (missing_env, bindings) = if !required_env.is_empty() {
@@ -1189,20 +1380,51 @@ pub(super) async fn create_action(
         status = "needs_secrets";
     }
 
+    let compatibility = skill_compatibility_json(&content);
     let mut persisted_review = None;
     if !blocked {
-        match agent_guard
-            .runtime
-            .install_semantically_reviewed_action(
-                &request.name,
-                &request.content,
-                &semantic_review,
-                request.force,
-            )
-            .await
+        let install_result = if let Some(cli_manifest) =
+            extract_cli_manifest_from_frontmatter(&content, &request.name, "local://skills")
         {
+            match agent_guard
+                .runtime
+                .install_cli_skill_action(cli_manifest, &content)
+                .await
+            {
+                Ok(()) => agent_guard
+                    .runtime
+                    .refresh_action_review_state(&request.name)
+                    .await
+                    .and_then(|review| {
+                        review.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "CLI skill '{}' installed without a persisted security review",
+                                request.name
+                            )
+                        })
+                    }),
+                Err(e) => Err(e),
+            }
+        } else {
+            agent_guard
+                .runtime
+                .install_semantically_reviewed_action(
+                    &request.name,
+                    &content,
+                    &semantic_review,
+                    request.force,
+                )
+                .await
+        };
+        match install_result {
             Ok(review) => {
-                if !review.missing_env.is_empty() {
+                if matches!(review.status, crate::runtime::ActionReviewStatus::Blocked) {
+                    status = "blocked";
+                } else if matches!(
+                    review.status,
+                    crate::runtime::ActionReviewStatus::NeedsSecrets
+                ) || !review.missing_env.is_empty()
+                {
                     status = "needs_secrets";
                 }
                 persisted_review = Some(action_review_info(review));
@@ -1218,13 +1440,16 @@ pub(super) async fn create_action(
             }
         }
     }
+    if !blocked {
+        refresh_action_catalog_after_skill_mutation_for_agent(&agent_guard, "skill_create").await;
+    }
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": status,
-            "message": if blocked {
-                format!("Skill '{}' blocked by semantic security policy", request.name)
+            "message": if blocked || status == "blocked" {
+                format!("Skill '{}' blocked by security policy", request.name)
             } else if status == "needs_secrets" {
                 format!("Skill '{}' created, but needs secrets configured", request.name)
             } else {
@@ -1236,6 +1461,8 @@ pub(super) async fn create_action(
                 "missing_env": missing_env,
                 "bindings": bindings,
             },
+            "compatibility": compatibility,
+            "catalog_index_status": if blocked { "unmodified" } else { "queued" },
             "security": semantic_review_security_json(&semantic_review)
         })),
     )
@@ -1953,6 +2180,7 @@ pub(crate) async fn import_action_from_content_with_agent(
     force: bool,
     model_override: Option<&str>,
     preview_only: bool,
+    enable_after_import: bool,
 ) -> Result<serde_json::Value, String> {
     let name_from_content = extract_skill_name_from_frontmatter(&content);
 
@@ -2007,6 +2235,7 @@ pub(crate) async fn import_action_from_content_with_agent(
                 .to_string(),
         );
     }
+    let compatibility = skill_compatibility_json(&content);
 
     // Inject model into frontmatter if specified
     if let Some(model_str) = model_override {
@@ -2085,22 +2314,65 @@ pub(crate) async fn import_action_from_content_with_agent(
         status = "needs_secrets";
     }
 
+    let mut enabled = false;
+    let mut visible_in_catalog = false;
     if !preview_only && !blocked {
-        let review = agent
-            .runtime
-            .install_semantically_reviewed_action(&action_name, &content, &semantic_review, force)
-            .await
-            .map_err(|e| e.to_string())?;
-        if !review.missing_env.is_empty() {
+        let review = if let Some(cli_manifest) =
+            extract_cli_manifest_from_frontmatter(&content, &action_name, source_url)
+        {
+            agent
+                .runtime
+                .install_cli_skill_action(cli_manifest, &content)
+                .await
+                .map_err(|e| e.to_string())?;
+            agent
+                .runtime
+                .refresh_action_review_state(&action_name)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "CLI skill '{}' installed without a persisted security review",
+                        action_name
+                    )
+                })?
+        } else {
+            agent
+                .runtime
+                .install_semantically_reviewed_action(
+                    &action_name,
+                    &content,
+                    &semantic_review,
+                    force,
+                )
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        if matches!(review.status, crate::runtime::ActionReviewStatus::Blocked) {
+            status = "blocked";
+        } else if matches!(
+            review.status,
+            crate::runtime::ActionReviewStatus::NeedsSecrets
+        ) || !review.missing_env.is_empty()
+        {
             status = "needs_secrets";
         }
+        if !enable_after_import {
+            agent
+                .runtime
+                .set_action_enabled(&action_name, false)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        enabled = enable_after_import && review.allow_execute;
+        visible_in_catalog = enabled && review.visible_in_catalog;
     }
 
     Ok(serde_json::json!({
         "status": status,
         "name": action_name,
-        "message": if blocked {
-            format!("Skill '{}' blocked by semantic security policy", action_name)
+        "message": if blocked || status == "blocked" {
+            format!("Skill '{}' blocked by security policy", action_name)
         } else if preview_only {
             if !missing_env.is_empty() {
                 format!("Preview ready for '{}'. Required secrets detected.", action_name)
@@ -2117,6 +2389,10 @@ pub(crate) async fn import_action_from_content_with_agent(
             "missing_env": missing_env,
             "bindings": bindings,
         },
+        "enabled": enabled,
+        "visible_in_catalog": visible_in_catalog,
+        "compatibility": compatibility,
+        "catalog_index_status": if preview_only || blocked { "unmodified" } else { "queued" },
         "security": {
             "threat_level": threat_level,
             "warnings": warnings,
@@ -2143,6 +2419,7 @@ async fn import_action_from_content(
     force: bool,
     model_override: Option<&str>,
     preview_only: bool,
+    enable_after_import: bool,
 ) -> Result<serde_json::Value, String> {
     let agent_guard = state.agent.read().await;
     import_action_from_content_with_agent(
@@ -2153,6 +2430,7 @@ async fn import_action_from_content(
         force,
         model_override,
         preview_only,
+        enable_after_import,
     )
     .await
 }
@@ -2308,6 +2586,7 @@ pub(crate) async fn import_action_from_url_shared(
     force: bool,
     model: Option<&str>,
     preview_only: bool,
+    enable_after_import: bool,
 ) -> Result<serde_json::Value, String> {
     let fetched = fetch_skill_markdown_from_url_shared(agent, url).await?;
     import_action_from_content_with_agent(
@@ -2318,6 +2597,7 @@ pub(crate) async fn import_action_from_url_shared(
         force,
         model,
         preview_only,
+        enable_after_import,
     )
     .await
 }
@@ -2385,6 +2665,9 @@ pub(super) async fn import_action(
 
         let mut imported: Vec<serde_json::Value> = Vec::new();
         let mut failed: Vec<serde_json::Value> = Vec::new();
+        let enable_after_import = request
+            .enabled
+            .unwrap_or(selected_urls.len() <= BULK_IMPORT_ENABLE_THRESHOLD);
 
         for file_url in selected_urls {
             let validated = match validate_import_fetch_url(&file_url).await {
@@ -2415,6 +2698,7 @@ pub(super) async fn import_action(
                 request.force,
                 request.model.as_deref(),
                 request.preview_only,
+                enable_after_import,
             )
             .await
             {
@@ -2462,6 +2746,9 @@ pub(super) async fn import_action(
             .clone()
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| "bulk-import".to_string());
+        if !request.preview_only {
+            refresh_action_catalog_after_skill_mutation(&state, "skill_bulk_import").await;
+        }
 
         return (
             StatusCode::OK,
@@ -2490,6 +2777,8 @@ pub(super) async fn import_action(
                 "source_url": url,
                 "imported_count": imported.len(),
                 "failed_count": failed.len(),
+                "enabled_by_default": enable_after_import,
+                "catalog_index_status": if request.preview_only { "unmodified" } else { "queued" },
                 "imported": imported,
                 "failed": failed,
             })),
@@ -2508,6 +2797,9 @@ pub(super) async fn import_action(
                     if discovered.len() > 1 {
                         let mut imported: Vec<serde_json::Value> = Vec::new();
                         let mut failed: Vec<serde_json::Value> = Vec::new();
+                        let enable_after_import = request
+                            .enabled
+                            .unwrap_or(discovered.len() <= BULK_IMPORT_ENABLE_THRESHOLD);
 
                         for file_url in discovered {
                             let validated = match validate_import_fetch_url(&file_url).await {
@@ -2539,6 +2831,7 @@ pub(super) async fn import_action(
                                 request.force,
                                 request.model.as_deref(),
                                 request.preview_only,
+                                enable_after_import,
                             )
                             .await
                             {
@@ -2577,6 +2870,13 @@ pub(super) async fn import_action(
                             .clone()
                             .filter(|n| !n.trim().is_empty())
                             .unwrap_or_else(|| "bulk-import".to_string());
+                        if !request.preview_only {
+                            refresh_action_catalog_after_skill_mutation(
+                                &state,
+                                "skill_collection_import",
+                            )
+                            .await;
+                        }
 
                         return (
                             StatusCode::OK,
@@ -2605,6 +2905,8 @@ pub(super) async fn import_action(
                                 "source_url": url,
                                 "imported_count": imported.len(),
                                 "failed_count": failed.len(),
+                                "enabled_by_default": enable_after_import,
+                                "catalog_index_status": if request.preview_only { "unmodified" } else { "queued" },
                                 "imported": imported,
                                 "failed": failed,
                             })),
@@ -2629,18 +2931,33 @@ pub(super) async fn import_action(
     }
 
     let effective_url = single_url_override.as_deref().unwrap_or(url);
-    let agent_guard = state.agent.read().await;
-    match import_action_from_url_shared(
-        &agent_guard,
-        effective_url,
-        request.name.as_deref(),
-        request.force,
-        request.model.as_deref(),
-        request.preview_only,
-    )
-    .await
-    {
-        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+    let enable_after_import = request.enabled.unwrap_or(true);
+    let result = {
+        let agent_guard = state.agent.read().await;
+        import_action_from_url_shared(
+            &agent_guard,
+            effective_url,
+            request.name.as_deref(),
+            request.force,
+            request.model.as_deref(),
+            request.preview_only,
+            enable_after_import,
+        )
+        .await
+    };
+    match result {
+        Ok(payload) => {
+            if !request.preview_only
+                && !payload
+                    .get("security")
+                    .and_then(|security| security.get("blocked"))
+                    .and_then(|blocked| blocked.as_bool())
+                    .unwrap_or(false)
+            {
+                refresh_action_catalog_after_skill_mutation(&state, "skill_import").await;
+            }
+            (StatusCode::OK, Json(payload)).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
     }
 }
@@ -2702,6 +3019,8 @@ pub(super) async fn delete_action(
                 Some(crate::actions::ActionSource::Custom) => "Custom skill deleted",
                 _ => "Skill updated",
             };
+            refresh_action_catalog_after_skill_mutation_for_agent(&agent_guard, "skill_delete")
+                .await;
             tracing::info!(
                 action = name.as_str(),
                 source = source_label,

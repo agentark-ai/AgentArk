@@ -1415,8 +1415,8 @@ impl TaskRouter {
         };
 
         // Do not recover omitted tool calls from message/action scores here.
-        // The Semantic DAG Router owns executable intent; delegated synthesis
-        // may summarize completed sub-agent results but cannot revive actions.
+        // The model tool loop owns executable intent; delegated synthesis may
+        // summarize completed sub-agent results but cannot revive actions.
 
         let total_time_ms = start.elapsed().as_millis() as u64;
         let completion_status = if degradation.is_empty() {
@@ -1751,7 +1751,7 @@ impl TaskRouter {
             .iter()
             .take(6)
             .map(|action| {
-                let meta = action.planner_metadata();
+                let meta = action.action_metadata();
                 DelegatedActionPacket {
                     name: action.name.clone(),
                     description: action.description.clone(),

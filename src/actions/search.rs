@@ -5,7 +5,7 @@
 //! - Brave Search API
 //! - DuckDuckGo (scraping, no API key needed)
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -2106,9 +2106,11 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "India AI policy outlook 2026");
         assert_eq!(results[0].url, "https://example.com/policy/india-ai");
-        assert!(results[0]
-            .snippet
-            .contains("Government strategy, compute constraints"));
+        assert!(
+            results[0]
+                .snippet
+                .contains("Government strategy, compute constraints")
+        );
     }
 
     #[test]

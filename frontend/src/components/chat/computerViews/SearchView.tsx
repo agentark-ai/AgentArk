@@ -6,6 +6,7 @@ import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 
 import type { ChatStepCard } from "../types";
 import { extractSurfaceBody } from "../dispatch";
+import { LinkifiedText } from "./LinkifiedText";
 import { buildReadableToolPresentation } from "./presentation";
 
 export interface SearchViewProps {
@@ -14,10 +15,18 @@ export interface SearchViewProps {
 
 function splitResults(body: string): string[] {
   if (!body) return [];
-  const parts = body
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  body
     .split(/\r?\n\r?\n+|^\s*\d+[.)]\s+/m)
     .map((s) => s.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .forEach((entry) => {
+      const key = entry.replace(/\s+/g, " ").trim().toLowerCase();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      parts.push(entry);
+    });
   return parts.slice(0, 12);
 }
 
@@ -56,7 +65,9 @@ export function SearchView({ card }: SearchViewProps) {
         <ol className="cview-search-results">
           {results.map((entry, idx) => (
             <li key={idx} className="cview-search-result">
-              <pre className="cview-search-result-body">{entry}</pre>
+              <pre className="cview-search-result-body">
+                <LinkifiedText text={entry} />
+              </pre>
             </li>
           ))}
         </ol>

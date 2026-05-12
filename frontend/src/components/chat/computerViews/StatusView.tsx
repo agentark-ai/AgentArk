@@ -3,6 +3,7 @@
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
+import { LinkifiedText } from "./LinkifiedText";
 
 export interface StatusViewProps {
   title: string;
@@ -20,7 +21,7 @@ export function StatusView({ title, detail }: StatusViewProps) {
       </Typography>
       {detail ? (
         <Typography variant="body2" className="cview-status-detail">
-          {detail}
+          <LinkifiedText text={detail} />
         </Typography>
       ) : null}
     </Box>

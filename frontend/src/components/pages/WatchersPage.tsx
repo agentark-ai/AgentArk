@@ -22,6 +22,7 @@ import {
   formatUiDateTimeMeta,
   formatUiRelativeDateTimeMeta,
 } from "../../lib/dateFormat";
+import { isStandaloneBackgroundWorkTask } from "../../lib/backgroundSessions";
 import type { BackgroundSessionSummary, Task } from "../../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
@@ -248,9 +249,33 @@ function watcherMetaLine(watcher: JsonRecord): string {
   const lastPoll = str(watcher.last_poll_at, "").trim()
     ? formatTimestampForHumans(str(watcher.last_poll_at, "")).label
     : "never";
-  return `${str(watcher.poll_action, "poller")} - every ${interval} - notify ${notificationChannelLabel(
+  const lastStatus = watcherLatestStatusLine(watcher);
+  const notification = watcherNotificationLine(watcher);
+  return `${str(watcher.poll_action, "poller")} - every ${interval} - last poll ${lastPoll} - last status ${lastStatus} - notify ${notificationChannelLabel(
     watcher.notify_channel,
-  )} - last ${lastPoll}`;
+  )}${notification ? ` - ${notification}` : ""}`;
+}
+
+function watcherLatestStatusLine(watcher: JsonRecord): string {
+  const outcome = str(watcher.last_poll_outcome, "").trim();
+  if (outcome) return statusLabel(outcome);
+  if (str(watcher.last_error, "").trim() || str(watcher.status_error, "").trim()) {
+    return "Error";
+  }
+  if (!str(watcher.last_poll_at, "").trim()) return "Not run yet";
+  return "Completed";
+}
+
+function watcherNotificationLine(watcher: JsonRecord): string {
+  const attempts = pickRecords(watcher.notification_attempts);
+  const latest = attempts[attempts.length - 1];
+  if (!latest) return "";
+  const channel = notificationChannelLabel(latest.channel);
+  const status = toBool(latest.success) ? "sent" : "failed";
+  const when = str(latest.attempted_at, "").trim()
+    ? formatTimestampForHumans(str(latest.attempted_at, "")).label
+    : "unknown time";
+  return `${channel} ${status} ${when}`;
 }
 
 function payloadText(raw: unknown): string {
@@ -405,6 +430,18 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [selectedWatcherId, setSelectedWatcherId] = useState<string | null>(null);
+  const [expandedSessionIds, setExpandedSessionIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+
+  const toggleSession = (sessionId: string) => {
+    setExpandedSessionIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+  };
 
   const invalidateBackgroundWork = async () => {
     await Promise.all([
@@ -603,11 +640,13 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
           childWatchers.set(id, watcher);
         }
       }
+      const liveTasks = Array.from(childTasks.values());
+      const liveWatchers = Array.from(childWatchers.values());
       map.set(session.id, {
-        tasks: Array.from(childTasks.values()),
-        watchers: Array.from(childWatchers.values()),
-        missingTaskIds,
-        missingWatcherIds,
+        tasks: liveTasks,
+        watchers: liveWatchers,
+        missingTaskIds: liveTasks.length > 0 ? [] : missingTaskIds,
+        missingWatcherIds: liveWatchers.length > 0 ? [] : missingWatcherIds,
       });
     }
     return map;
@@ -627,7 +666,11 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
     () =>
       tasks.filter((task) => {
         const sessionId = taskAutomationSessionId(task);
-        return !linkedTaskIds.has(task.id) && (!sessionId || !sessionIds.has(sessionId));
+        return (
+          isStandaloneBackgroundWorkTask(task) &&
+          !linkedTaskIds.has(task.id) &&
+          (!sessionId || !sessionIds.has(sessionId))
+        );
       }),
     [linkedTaskIds, sessionIds, tasks],
   );
@@ -822,6 +865,17 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
       children.watchers.length +
       children.missingTaskIds.length +
       children.missingWatcherIds.length;
+    const expanded = expandedSessionIds.has(session.id);
+    const watcherNotificationChannels = Array.from(
+      new Set(
+        children.watchers
+          .map((watcher) => notificationChannelLabel(watcher.notify_channel))
+          .filter((label) => label && label !== "-"),
+      ),
+    );
+    const notificationLabel = watcherNotificationChannels.length
+      ? watcherNotificationChannels.join(", ")
+      : notificationChannelLabel(session.preferred_delivery_channel || "preferred");
     return (
       <Box
         key={session.id}
@@ -842,7 +896,18 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
             <Stack
               direction="row"
               spacing={0.75}
-              sx={{ alignItems: "center", minWidth: 0, flexWrap: "wrap" }}
+              onClick={() => toggleSession(session.id)}
+              sx={{
+                alignItems: "center",
+                minWidth: 0,
+                flexWrap: "wrap",
+                cursor: "pointer",
+                borderRadius: 1,
+                px: 0.5,
+                py: 0.35,
+                mx: -0.5,
+                "&:hover": { background: "var(--ui-rgba-57-208-255-040)" },
+              }}
             >
               <Typography
                 variant="body2"
@@ -874,22 +939,9 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
               variant="caption"
               sx={{ color: "text.secondary", display: "block", mt: 0.2 }}
             >
-              {`${children.watchers.length} monitor${children.watchers.length === 1 ? "" : "s"} - ${children.tasks.length} task${children.tasks.length === 1 ? "" : "s"} - notifications ${notificationChannelLabel(session.preferred_delivery_channel || "preferred")}`}
+              {`${children.watchers.length} monitor${children.watchers.length === 1 ? "" : "s"} - ${children.tasks.length} task${children.tasks.length === 1 ? "" : "s"} - notifications ${notificationLabel}`}
             </Typography>
-            <Box
-              component="details"
-              sx={{
-                mt: 0.85,
-                "& summary": {
-                  cursor: "pointer",
-                  color: "text.secondary",
-                  fontSize: "0.78rem",
-                },
-              }}
-            >
-              <summary>
-                Details{childCount ? ` (${childCount})` : ""}
-              </summary>
+            {expanded ? (
               <Stack spacing={0.65} sx={{ mt: 0.75 }}>
                 {children.watchers.map((watcher) => (
                   <BackgroundWorkChildRow
@@ -919,7 +971,7 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
                     title={`Missing monitor ${id.slice(0, 8)}`}
                     status="Missing"
                     rowStatusColor="warning"
-                    meta="Linked record was not found in the active watcher list"
+                    meta="No live or historical monitor record is available for this linked id"
                   />
                 ))}
                 {children.missingTaskIds.map((id) => (
@@ -938,7 +990,14 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
                   </Typography>
                 ) : null}
               </Stack>
-            </Box>
+            ) : childCount ? (
+              <Typography
+                variant="caption"
+                sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+              >
+                Click row to show {childCount} linked item{childCount === 1 ? "" : "s"}.
+              </Typography>
+            ) : null}
           </Box>
           <Box sx={{ flexShrink: 0 }}>
             <RowOpsMenu actions={sessionActions(session)} ariaLabel="Background work actions" />
@@ -1124,6 +1183,15 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
                   value: notificationChannelLabel(selectedWatcher?.notify_channel),
                 },
                 { label: "Polls", value: String(num(selectedWatcher?.poll_count, 0)) },
+                { label: "Last status", value: watcherLatestStatusLine(selectedWatcher || {}) },
+                ...(watcherNotificationLine(selectedWatcher || {})
+                  ? [
+                      {
+                        label: "Latest notify",
+                        value: watcherNotificationLine(selectedWatcher || {}),
+                      },
+                    ]
+                  : []),
                 {
                   label: "Created",
                   value: humanTs(str(selectedWatcher?.created_at, "-")).label,

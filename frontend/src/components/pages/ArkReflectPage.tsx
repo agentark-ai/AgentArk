@@ -3,6 +3,7 @@ import {
   Box,
   Button,
   Chip,
+  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
@@ -43,6 +44,12 @@ import {
   formatUiDateTime,
 } from "../../lib/dateFormat";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
+import ReflectHero from "../arkReflect/ReflectHero";
+import {
+  NarrativeCluster,
+  NarrativeFollowup,
+  NarrativeInput,
+} from "../arkReflect/reflectNarrative";
 import { asRecord, errMessage, num, pickRecords, str } from "./pageHelpers";
 
 type ArkReflectPageProps = {
@@ -179,6 +186,8 @@ type ReflectResponse = {
     running: boolean;
     status: string;
     trigger: string;
+    requested_at: string;
+    started_at: string;
     completed_at: string;
     last_error: string;
   };
@@ -207,6 +216,14 @@ type ReflectResponse = {
   suggested_followups: ReflectSuggestedFollowup[];
   clusters: ReflectCluster[];
   unclustered_units: ReflectUnit[];
+};
+
+type ReflectRefreshStartResponse = {
+  accepted: boolean;
+  running: boolean;
+  status: string;
+  detail: string;
+  refresh_status: ReflectResponse["refresh_status"];
 };
 
 const PERIOD_OPTIONS: { value: ReflectPeriod; label: string }[] = [
@@ -463,6 +480,8 @@ function parseReflectResponse(value: unknown, period: ReflectPeriod): ReflectRes
       running: Boolean(asRecord(raw.refresh_status).running),
       status: str(asRecord(raw.refresh_status).status, "idle"),
       trigger: str(asRecord(raw.refresh_status).trigger, ""),
+      requested_at: str(asRecord(raw.refresh_status).requested_at, ""),
+      started_at: str(asRecord(raw.refresh_status).started_at, ""),
       completed_at: str(asRecord(raw.refresh_status).completed_at, ""),
       last_error: str(asRecord(raw.refresh_status).last_error, ""),
     },
@@ -497,6 +516,26 @@ function parseReflectResponse(value: unknown, period: ReflectPeriod): ReflectRes
     unclustered_units: pickRecords(raw, "unclustered_units")
       .map(asReflectUnit)
       .filter((unit): unit is ReflectUnit => unit !== null),
+  };
+}
+
+function parseReflectRefreshStartResponse(value: unknown): ReflectRefreshStartResponse {
+  const raw = asRecord(value);
+  const refresh = asRecord(raw.refresh_status);
+  return {
+    accepted: Boolean(raw.accepted),
+    running: Boolean(raw.running),
+    status: str(raw.status, ""),
+    detail: str(raw.detail, ""),
+    refresh_status: {
+      running: Boolean(refresh.running),
+      status: str(refresh.status, "idle"),
+      trigger: str(refresh.trigger, ""),
+      requested_at: str(refresh.requested_at, ""),
+      started_at: str(refresh.started_at, ""),
+      completed_at: str(refresh.completed_at, ""),
+      last_error: str(refresh.last_error, ""),
+    },
   };
 }
 
@@ -1152,6 +1191,11 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   const [selectedFollowupId, setSelectedFollowupId] = useState<string | null>(null);
   const [topicPage, setTopicPage] = useState(0);
   const [opportunityPage, setOpportunityPage] = useState(0);
+  const [localRefreshRunning, setLocalRefreshRunning] = useState(false);
+  const [refreshNotice, setRefreshNotice] = useState("");
+  // Default-closed so novice users see only the narrative hero. The
+  // existing analytics view stays one click away for power users.
+  const [showDetails, setShowDetails] = useState(false);
   const bounds = useMemo(() => periodBounds(period, anchor), [period, anchor]);
   const fromIso = bounds.from.toISOString();
   const toIso = bounds.to.toISOString();
@@ -1183,13 +1227,33 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
 
   const refreshMutation = useMutation({
     mutationFn: async () => {
-      await api.rawPost(
+      const raw = await api.rawPost(
         `/reflect/refresh?period=${encodeURIComponent(period)}&from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`,
       );
+      return parseReflectRefreshStartResponse(raw);
     },
-    onSuccess: () => {
+    onMutate: () => {
+      setLocalRefreshRunning(true);
+      setRefreshNotice(
+        "ArkReflect is running. This page is locked until the current refresh finishes.",
+      );
+    },
+    onSuccess: (result) => {
+      if (result.running || result.refresh_status.running) {
+        setLocalRefreshRunning(true);
+        setRefreshNotice(
+          result.detail ||
+            "ArkReflect is running. This page is locked until the current refresh finishes.",
+        );
+      } else {
+        setLocalRefreshRunning(false);
+        setRefreshNotice(result.detail);
+      }
       void queryClient.invalidateQueries({ queryKey: reflectQueryKey });
       void queryClient.invalidateQueries({ queryKey: todayQueryKey });
+    },
+    onError: () => {
+      setLocalRefreshRunning(false);
     },
   });
 
@@ -1205,14 +1269,43 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     refetchInterval: autoRefresh ? 120000 : false,
   });
   const todayResponse = todayQ.data;
+  const backendRefreshRunning = Boolean(response?.refresh_status.running);
+  const isReflectRunning =
+    refreshMutation.isPending || localRefreshRunning || backendRefreshRunning;
+  const refreshStartedAt =
+    refreshMutation.data?.refresh_status.started_at ||
+    refreshMutation.data?.refresh_status.requested_at ||
+    "";
+  const runArkReflectNow = () => {
+    if (isReflectRunning) return;
+    refreshMutation.mutate();
+  };
 
   useEffect(() => {
-    if (!response?.refresh_status.running && !refreshMutation.isPending) return undefined;
+    if (backendRefreshRunning) {
+      setLocalRefreshRunning(true);
+      setRefreshNotice(
+        "ArkReflect is running. This page is locked until the current refresh finishes.",
+      );
+      return;
+    }
+    const completedAt = response?.refresh_status.completed_at || "";
+    const canClearLocalLock =
+      Boolean(completedAt) &&
+      (!refreshStartedAt || completedAt >= refreshStartedAt);
+    if (!refreshMutation.isPending && canClearLocalLock) {
+      setLocalRefreshRunning(false);
+      setRefreshNotice("");
+    }
+  }, [backendRefreshRunning, refreshMutation.isPending, refreshStartedAt, response]);
+
+  useEffect(() => {
+    if (!isReflectRunning) return undefined;
     const id = window.setInterval(() => {
       void queryClient.invalidateQueries({ queryKey: reflectQueryKey });
     }, 5000);
     return () => window.clearInterval(id);
-  }, [queryClient, reflectQueryKey, refreshMutation.isPending, response?.refresh_status.running]);
+  }, [isReflectRunning, queryClient, reflectQueryKey]);
 
   const clusters = response?.clusters ?? [];
   const clusterLabelById = useMemo(() => buildClusterLabelMap(clusters), [clusters]);
@@ -1244,6 +1337,60 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     if (!result.url || typeof window === "undefined") return;
     window.open(result.url, "_blank", "noopener,noreferrer");
   };
+  // Reused by the narrative hero's "Try this in Chat" CTA. Same
+  // sessionStorage handoff pattern as the existing followup launcher
+  // so the chat surface picks it up without any extra plumbing.
+  const launchHeroPrompt = (prompt: string, source: string) => {
+    const message = prompt.trim();
+    if (!message) return;
+    storeChatPendingLaunch({
+      createdAt: Date.now(),
+      launchMode: "message",
+      message,
+      newConversation: true,
+      source,
+    });
+    onNavigateToView?.("chat");
+    if (!onNavigateToView && typeof window !== "undefined") {
+      window.location.href = "/ui/chat";
+    }
+  };
+  // Map the technical ReflectResponse into the novice-friendly narrative
+  // shape. Pure mapping — no decisions, no string composition. The
+  // narrative module owns all plain-English copy generation.
+  const narrativeInput = useMemo<NarrativeInput | null>(() => {
+    if (!response) return null;
+    const clustersForNarrative: NarrativeCluster[] = clusters.map((cluster) => ({
+      id: cluster.id,
+      label: cluster.label,
+      plain_summary: cluster.plain_summary,
+      unit_count: cluster.unit_count,
+      message_count: cluster.message_count,
+      color: cluster.color,
+      source_mix: cluster.source_mix,
+    }));
+    const followupsForNarrative: NarrativeFollowup[] = suggestedFollowups.map(
+      (item) => ({
+        id: item.id,
+        title: item.title,
+        detail: item.detail,
+        prompt: item.prompt,
+        source_label: item.source_label,
+        rank_score: item.rank_score,
+      }),
+    );
+    const embeddingMode = response.embedding_status?.mode ?? "";
+    const embeddingsReady =
+      embeddingMode === "ready" || embeddingMode === "available";
+    return {
+      period,
+      source_counts: response.source_counts,
+      clusters: clustersForNarrative,
+      suggested_followups: followupsForNarrative,
+      has_activity: clusters.length > 0 || allUnits.length > 0,
+      embeddings_ready: embeddingsReady,
+    };
+  }, [response, clusters, suggestedFollowups, allUnits, period]);
   const feedbackMutation = useMutation({
     mutationFn: async ({ item, action }: { item: ReflectSuggestedFollowup; action: "useful" | "snooze" | "dismiss" }) => {
       await api.rawPost(`/reflect/followups/${encodeURIComponent(item.id)}/feedback`, {
@@ -1358,7 +1505,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   );
 
   const rangeLabel = formatUiDateRange(response?.from || fromIso, response?.to || toIso);
-  const status = quietStatus(response, reflectQ.isFetching, refreshMutation.isPending);
+  const status = quietStatus(response, reflectQ.isFetching, isReflectRunning);
   const todayDigestTitle = digestStatusTitle(todayResponse);
   const todayDigestDetail = digestStatusDetail(todayResponse, todayQ.isFetching);
   const todayMeaningful = meaningfulForSourceCounts(todayResponse?.source_counts);
@@ -1391,7 +1538,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     () => narrativeLines(response, focusLabel, totalUnits, learnedCount, backgroundCount, recurringCount),
     [backgroundCount, focusLabel, learnedCount, recurringCount, response, totalUnits],
   );
-  const hasReflectContent = Boolean(response) || reflectQ.isFetching || refreshMutation.isPending;
+  const hasReflectContent = Boolean(response) || reflectQ.isFetching || isReflectRunning;
   const selectedRangeLabel = rangeLabel || formatUiDateRange(fromIso, toIso);
   const sourceSignalCount = totalForSourceCounts(response?.source_counts);
   const emptyStateDetail = response
@@ -1402,7 +1549,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
       : "No reflected work units are cached for this range yet. Keep working normally; this panel will turn into the recap after chat, ArkOrbit, apps, goals, watchers, or background systems produce activity."
     : status.detail;
   const emptyStateChip =
-    reflectQ.isFetching || refreshMutation.isPending || Boolean(response?.refresh_status.running)
+    reflectQ.isFetching || isReflectRunning
       ? "Collecting"
       : "Waiting for activity";
 
@@ -1953,62 +2100,13 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
 
     return (
       <Stack spacing={1.4}>
-        <Box
-          sx={{
-            ...panelSx,
-            p: { xs: 1.5, md: 2 },
-            background:
-              "linear-gradient(90deg, var(--ui-rgba-57-208-255-060), transparent 68%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
-          }}
-        >
-          <Stack
-            direction={{ xs: "column", md: "row" }}
-            spacing={1.4}
-            sx={{ alignItems: { xs: "flex-start", md: "center" }, justifyContent: "space-between" }}
-          >
-            <Box sx={{ minWidth: 0 }}>
-              <Typography sx={labelSx}>Reflection summary</Typography>
-              <Typography sx={{ ...titleSx, fontSize: { xs: "1.45rem", md: "2rem" }, mt: 0.45 }}>
-                {focusTitle}
-              </Typography>
-              <Typography sx={{ ...bodySx, mt: 0.7, maxWidth: 880 }}>
-                {narrative[0] || "ArkReflect will summarize the period once enough activity is available."}
-              </Typography>
-            </Box>
-            <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap", rowGap: 0.75 }}>
-              <Chip
-                className="arkreflect-pill"
-                icon={<WorkHistoryRoundedIcon />}
-                label={`${totalUnits} reflected`}
-                clickable
-                onClick={() => setStoryTab("overview")}
-              />
-              <Chip
-                className="arkreflect-pill"
-                icon={<BubbleChartRoundedIcon />}
-                label={`${topicRows.length} topics`}
-                clickable
-                onClick={() => setStoryTab("topics")}
-              />
-              <Chip
-                className="arkreflect-pill"
-                icon={<SearchRoundedIcon />}
-                label={`${opportunityFollowups.length} opportunities`}
-                clickable
-                onClick={() => setStoryTab("latest")}
-              />
-              <Chip
-                className="arkreflect-pill"
-                icon={<RefreshRoundedIcon />}
-                label={response?.refresh_status.running || refreshMutation.isPending ? "Running ArkReflect" : "Run ArkReflect now"}
-                clickable
-                disabled={refreshMutation.isPending || response?.refresh_status.running}
-                onClick={() => refreshMutation.mutate()}
-              />
-            </Stack>
-          </Stack>
-        </Box>
-
+        {/* The "Reflection summary" hero-style panel that used to live here
+            was duplicating the narrative hero shown above the Collapse —
+            same focus label, same narrative line, plus four floating
+            chips for stats that are already in the tabs below. Removed
+            entirely. The tab strip beneath is now the first visible
+            element inside "Show details", which is the right job for it
+            (navigate between overview/topics/opportunities/timeline). */}
         <Box
           className="arkreflect-motion-panel"
           sx={{
@@ -2082,18 +2180,14 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             }}
           >
             <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: { xs: 1.4, md: 1.8 }, minHeight: 430 }}>
-              <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ justifyContent: "space-between", mb: 1.5 }}>
-                <Box>
-                  <Typography sx={labelSx}>Plain-language recap</Typography>
-                  <Typography sx={{ ...titleSx, fontSize: { xs: "1.25rem", md: "1.55rem" }, mt: 0.45 }}>
-                    {focusLabel === "No activity yet"
-                      ? "Waiting for a useful story."
-                      : focusLabel === "No clear user-facing focus yet"
-                        ? "No user-facing focus yet"
-                        : focusLabel}
-                  </Typography>
-                </Box>
-                <Typography variant="caption" sx={{ alignSelf: { md: "end" } }}>
+              {/* "Plain-language recap" sub-header dropped: the narrative
+                  hero above already states the focus in plain English, and
+                  repeating the user's literal message ("can you check my
+                  google drive ?") as a section title felt like the page
+                  echoing them. Only the date range stays as a quiet
+                  context line at the top of the stats. */}
+              <Stack direction="row" sx={{ justifyContent: "flex-end", mb: 1 }}>
+                <Typography variant="caption" sx={{ color: "var(--text-secondary)" }}>
                   {rangeLabel}
                 </Typography>
               </Stack>
@@ -2142,17 +2236,10 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
           {hasStudioSide ? (
           <Grid2 size={{ xs: 12, lg: 3 }}>
             <Stack spacing={1.4}>
-              {hasTodayStatus ? (
-                <Box sx={{ ...panelSx, p: 1.35 }}>
-                  <Typography sx={labelSx}>Today</Typography>
-                  <Typography sx={{ ...titleSx, fontSize: "1rem", mt: 0.55 }}>{todayDigestTitle}</Typography>
-                  <Typography sx={{ ...bodySx, mt: 0.65 }}>{todayDigestDetail}</Typography>
-                  <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7, mt: 1 }}>
-                    {todayTotal > 0 ? <Chip size="small" label={`${todayTotal} cached`} variant="outlined" /> : null}
-                    {todayMeaningful > 0 ? <Chip size="small" label={`${todayMeaningful} meaningful`} variant="outlined" /> : null}
-                  </Stack>
-                </Box>
-              ) : null}
+              {/* Today digest status panel removed: misleading "off" flag
+                  read from the wrong field and the cached/meaningful chips
+                  were operator-only telemetry. The hero now answers
+                  "what's going on today" without the jargon side car. */}
               {opportunityFollowups.length > 0 ? (
                 <Box sx={{ ...panelSx, p: 1.35 }}>
                   <Typography sx={labelSx}>Next useful action</Typography>
@@ -2173,17 +2260,9 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                   </Button>
                 </Box>
               ) : null}
-              {hasGroupingStatus ? (
-                <Box sx={{ ...panelSx, p: 1.35 }}>
-                  <Typography sx={labelSx}>Grouping</Typography>
-                  <Typography sx={{ ...titleSx, fontSize: "1.35rem", mt: 0.55 }}>
-                    {Math.round(embeddingCoverage * 100)}%
-                  </Typography>
-                  {response?.embedding_status.detail ? (
-                    <Typography sx={{ ...bodySx, mt: 0.65 }}>{response.embedding_status.detail}</Typography>
-                  ) : null}
-                </Box>
-              ) : null}
+              {/* "Grouping 100%" embedding-coverage panel removed: pure
+                  operator telemetry ("Semantic grouping is based on local
+                  derived work-unit embeddings…") with no novice value. */}
             </Stack>
           </Grid2>
           ) : null}
@@ -2326,12 +2405,12 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                     <SearchRoundedIcon />
                   </Box>
                   <Typography sx={{ ...titleSx, fontSize: { xs: "1.15rem", md: "1.35rem" } }}>
-                    {response?.refresh_status.running || refreshMutation.isPending
+                    {isReflectRunning
                       ? "Finding opportunities"
                       : "No opportunities ready for this range"}
                   </Typography>
                   <Typography sx={bodySx}>
-                    {response?.refresh_status.running || refreshMutation.isPending
+                    {isReflectRunning
                       ? "ArkReflect is refreshing this range. Any useful source check, recovery path, or follow-up will appear here."
                       : totalUnits > 0
                         ? "This range has reflected activity, but nothing is actionable enough to show as an opportunity yet."
@@ -2340,11 +2419,11 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                   <Button
                     variant="outlined"
                     startIcon={<RefreshRoundedIcon />}
-                    disabled={refreshMutation.isPending || response?.refresh_status.running}
-                    onClick={() => refreshMutation.mutate()}
+                    disabled={isReflectRunning}
+                    onClick={runArkReflectNow}
                     sx={{ alignSelf: "flex-start", borderRadius: "8px" }}
                   >
-                    {response?.refresh_status.running || refreshMutation.isPending ? "Running ArkReflect" : "Run ArkReflect now"}
+                    {isReflectRunning ? "Running ArkReflect" : "Run ArkReflect now"}
                   </Button>
                 </Stack>
               </Box>
@@ -2552,6 +2631,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
               size="small"
               value={period}
               onChange={(_, value) => value && setPeriod(value)}
+              disabled={isReflectRunning}
               aria-label="ArkReflect period"
               sx={{
                 bgcolor: "rgba(255,255,255,0.06)",
@@ -2579,6 +2659,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
               type="date"
               value={anchor}
               onChange={(event) => setAnchor(event.target.value)}
+              disabled={isReflectRunning}
               sx={{ minWidth: 164 }}
               slotProps={{
                 input: {
@@ -2593,12 +2674,12 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             <Tooltip title="Run ArkReflect for this date range now">
               <Button
                 variant="outlined"
-                onClick={() => refreshMutation.mutate()}
-                disabled={refreshMutation.isPending || response?.refresh_status.running}
+                onClick={runArkReflectNow}
+                disabled={isReflectRunning}
                 startIcon={<RefreshRoundedIcon />}
                 sx={{ minHeight: 40 }}
               >
-                {response?.refresh_status.running || refreshMutation.isPending ? "Running ArkReflect" : "Run ArkReflect now"}
+                {isReflectRunning ? "Running ArkReflect" : "Run ArkReflect now"}
               </Button>
             </Tooltip>
           </Box>
@@ -2607,8 +2688,40 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
 
       {reflectQ.error ? <Alert severity="error">{errMessage(reflectQ.error)}</Alert> : null}
       {refreshMutation.error ? <Alert severity="error">{errMessage(refreshMutation.error)}</Alert> : null}
+      {isReflectRunning ? (
+        <Alert
+          severity="info"
+          icon={<RefreshRoundedIcon fontSize="inherit" />}
+          sx={{
+            border: "1px solid var(--surface-border)",
+            bgcolor: "var(--ui-rgba-57-208-255-060)",
+          }}
+        >
+          <Stack spacing={1}>
+            <Box>
+              {refreshNotice ||
+                "ArkReflect is running. This page is locked until the current refresh finishes."}
+            </Box>
+            <LinearProgress sx={{ borderRadius: 999 }} />
+          </Stack>
+        </Alert>
+      ) : null}
+
+      {/* Narrative hero: novice-friendly summary of what happened this
+          period. Wraps the technical ReflectResponse in plain English
+          (heroSentence + headlineNumber + topMoments + nextStep) and
+          exposes a "Show details" toggle that controls the analytics
+          view below. */}
+      <ReflectHero
+        input={narrativeInput}
+        loading={reflectQ.isLoading || reflectQ.isFetching}
+        showDetails={showDetails}
+        onToggleDetails={() => setShowDetails((value) => !value)}
+        onLaunchPrompt={launchHeroPrompt}
+      />
 
       {/* === ARKREFLECT STORY VIEW === */}
+      <Collapse in={showDetails} mountOnEnter timeout={240}>
       {!hasReflectContent ? (
         <Box
           className="arkreflect-status"
@@ -2740,6 +2853,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             : ""}
         </Typography>
       ) : null}
+      </Collapse>
 
       <Dialog
         open={Boolean(selectedFollowup)}

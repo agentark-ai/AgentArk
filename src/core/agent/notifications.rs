@@ -145,6 +145,7 @@ pub struct NotificationStore {
 }
 
 impl NotificationStore {
+    #[allow(dead_code)]
     pub fn broadcast_event(&self, event: NotificationEvent) {
         let _ = self.notification_events.send(event);
     }

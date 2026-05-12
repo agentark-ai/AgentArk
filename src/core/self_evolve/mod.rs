@@ -14,6 +14,7 @@ pub mod promotion_gate;
 pub mod prompt_evolution;
 pub(crate) mod prompt_fragment_evolution;
 pub mod replay_gate;
+pub mod router_learning;
 pub mod routing_canonical_evolution;
 pub mod security_review;
 pub mod skill_evolution;
@@ -34,6 +35,13 @@ pub use prompt_evolution::{
 pub use routing_canonical_evolution::{
     RoutingCanonicalCandidatePayload, RoutingCanonicalOverlayEntry,
     ROUTING_CANONICAL_CANDIDATE_TYPE, ROUTING_CANONICAL_SUBJECT_KEY,
+};
+pub(crate) use router_learning::maybe_upsert_router_replay_candidate_from_trace;
+pub use router_learning::{
+    router_learning_benchmark_profile, trace_evidence_from_semantic_steps,
+    validate_router_learning_candidate, RouterLearningCandidatePayload, RouterLearningLayer,
+    RouterLearningMetric, RouterLearningMetricDelta, RouterLearningTraceEvidence,
+    ROUTER_LEARNING_CANDIDATE_TYPE, ROUTER_LEARNING_SUBJECT_KEY,
 };
 pub use specialist_prompt_evolution::{
     SpecialistPromptBundleDiffSummary, SpecialistPromptBundleProfile,

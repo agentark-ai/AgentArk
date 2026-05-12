@@ -918,9 +918,18 @@ pub(super) async fn sync_mcp_registry(agent: &Agent, secrets: &crate::core::conf
         ..
     } = agent;
     let mut registry = mcp.write().await;
-    let _ = registry
+    match registry
         .sync_from_config(config, secrets, runtime, safety)
-        .await;
+        .await
+    {
+        Ok(()) => {
+            drop(registry);
+            agent.refresh_action_catalog_index("mcp_registry_sync").await;
+        }
+        Err(error) => {
+            tracing::warn!("MCP registry sync failed: {}", error);
+        }
+    }
 }
 
 pub(super) fn mcp_sync_timeout_for_config(
@@ -989,7 +998,10 @@ pub(super) fn schedule_mcp_server_refresh(agent_ref: SharedAgent, id: String) {
         };
         let timeout = mcp_sync_timeout_for_config(config);
         match tokio::time::timeout(timeout, refresh_future).await {
-            Ok(Ok(())) => tracing::info!("MCP server refresh succeeded for {}", id),
+            Ok(Ok(())) => {
+                tracing::info!("MCP server refresh succeeded for {}", id);
+                agent.refresh_action_catalog_index("mcp_server_refresh").await;
+            }
             Ok(Err(e)) => tracing::warn!("MCP server refresh failed for {}: {}", id, e),
             Err(_) => tracing::warn!(
                 "MCP server refresh timed out after {:?} for {}",

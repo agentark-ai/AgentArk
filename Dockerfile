@@ -74,8 +74,12 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY .cargo ./.cargo
 
-# Create dummy main to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create dummy binary targets to cache dependencies. These paths must match
+# Cargo.toml because autobin discovery is disabled for predictable test builds.
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "fn main() {}" > src/bin/agentark_embed_server.rs && \
+    echo "fn main() {}" > src/bin/prefetch_embeddings.rs
 
 # Default release builds use Cargo.toml's size-optimized profile.
 # Use 2 cargo jobs for better build speed without assuming high-memory Docker

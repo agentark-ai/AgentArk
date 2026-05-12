@@ -342,6 +342,7 @@ Rules:\n\
         crate::core::self_evolve::specialist_prompt_evolution::parse_specialist_prompt_bundle_profile(&raw)
     }
 
+    #[allow(dead_code)]
     async fn load_prompt_fragment_bundle_by_key(
         &self,
         key: &str,
@@ -554,6 +555,7 @@ Rules:\n\
         selected
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn active_prompt_fragment_bundle_for_message(
         &self,
         message: &str,

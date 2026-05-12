@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/agentark-ai/AgentArk"
 keywords = ["ai", "assistant", "autonomous", "automation", "self-improving"]
 categories = ["development-tools", "command-line-utilities"]
+autobins = false
 autotests = false
 
 [features]
@@ -85,7 +86,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
-bincode = "1"
 
 # Database ORM (SeaORM with PostgreSQL)
 sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "postgres-vector"] }
@@ -149,6 +149,18 @@ tokio-test = "0.4"
 [[bin]]
 name = "agentark"
 path = "src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "agentark_embed_server"
+path = "src/bin/agentark_embed_server.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "prefetch_embeddings"
+path = "src/bin/prefetch_embeddings.rs"
 test = false
 bench = false
 

@@ -948,14 +948,14 @@ pub(super) fn app_runtime_action_allowed_by_meta(
 }
 
 pub(super) fn app_runtime_action_is_bridge_safe(action: &crate::actions::ActionDef) -> bool {
-    let metadata = action.planner_metadata();
+    let metadata = action.action_metadata();
     matches!(
         metadata.role,
-        crate::actions::PlannerActionRole::DataSource
-            | crate::actions::PlannerActionRole::Inspection
+        crate::actions::ActionRole::DataSource
+            | crate::actions::ActionRole::Inspection
     ) && matches!(
         metadata.side_effect_level,
-        crate::actions::PlannerSideEffectLevel::None
+        crate::actions::ActionSideEffectLevel::None
     ) && action.authorization.outbound.read_only
         && !action.authorization.outbound.outbound_write
         && !action.authorization.outbound.public_publish

@@ -5,9 +5,9 @@ import {
   Alert,
   Box,
   Button,
-  ButtonBase,
   Chip,
   CircularProgress,
+  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
@@ -32,6 +32,7 @@ import { useEffect, useMemo, useState } from "react";
 import ReactECharts from "echarts-for-react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
+import EvolveHero from "../arkEvolve/EvolveHero";
 import {
   asRecord,
   errMessage,
@@ -205,44 +206,93 @@ function EvolutionLifecycle({
   steps: string[];
   activeIndex: number;
 }) {
+  // Connected-dot progress strip. Past steps and the current step are
+  // filled in AgentArk green; future steps are hollow. Connecting lines
+  // between dots are tinted green up to the active step, then muted —
+  // makes the "where we are in the lifecycle" reading instant. Replaces
+  // the previous 5-chip grid that looked like clickable buttons.
+  const ACTIVE_COLOR = "#78f2b0";
+  const MUTED_COLOR = "var(--ui-rgba-145-170-205-380)";
   return (
     <Box
       sx={{
-        display: "grid",
-        gridTemplateColumns: {
-          xs: "1fr",
-          sm: `repeat(${Math.min(steps.length, 3)}, minmax(0, 1fr))`,
-          lg: `repeat(${steps.length}, minmax(0, 1fr))`,
-        },
-        gap: 0.6,
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 0,
+        py: 0.5,
+        px: 0.5,
+        // Responsive horizontal scroll on narrow widths so the dots stay
+        // on one line; the user can still scan left-to-right.
+        overflowX: "auto",
+        scrollbarWidth: "none",
+        "&::-webkit-scrollbar": { display: "none" },
       }}
     >
       {steps.map((step, idx) => {
         const isActive = idx === activeIndex;
         const isPast = idx < activeIndex;
+        const isReached = isActive || isPast;
+        const isLast = idx === steps.length - 1;
         return (
           <Box
             key={`${step}-${idx}`}
             sx={{
-              minWidth: 0,
-              px: 0.85,
-              py: 0.65,
-              borderRadius: 1,
-              border: "1px solid var(--ui-rgba-145-170-205-120)",
-              bgcolor: isActive
-                ? "rgba(20, 241, 149, 0.12)"
-                : isPast
-                  ? "rgba(84, 198, 255, 0.08)"
-                  : "rgba(8, 14, 24, 0.34)",
+              flex: isLast ? "0 0 auto" : 1,
+              minWidth: 88,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "flex-start",
+              gap: 0.6,
             }}
           >
+            <Box
+              sx={{
+                position: "relative",
+                width: "100%",
+                height: 14,
+                display: "flex",
+                alignItems: "center",
+              }}
+            >
+              <Box
+                sx={{
+                  width: 14,
+                  height: 14,
+                  borderRadius: "50%",
+                  background: isReached ? ACTIVE_COLOR : "transparent",
+                  border: `2px solid ${isReached ? ACTIVE_COLOR : MUTED_COLOR}`,
+                  boxShadow: isActive
+                    ? "0 0 12px rgba(120, 242, 176, 0.5)"
+                    : "none",
+                  flex: "0 0 auto",
+                  zIndex: 1,
+                }}
+              />
+              {!isLast ? (
+                <Box
+                  sx={{
+                    flex: 1,
+                    height: 2,
+                    ml: 0.5,
+                    background: isPast ? ACTIVE_COLOR : MUTED_COLOR,
+                    opacity: isPast ? 0.85 : 0.45,
+                  }}
+                />
+              ) : null}
+            </Box>
             <Typography
               variant="caption"
               sx={{
-                color: isActive ? "#8ee3b1" : "text.secondary",
-                display: "block",
-                fontWeight: isActive ? 700 : 500,
-                lineHeight: 1.35,
+                color: isActive
+                  ? ACTIVE_COLOR
+                  : isPast
+                    ? "var(--text-primary)"
+                    : "var(--text-secondary)",
+                fontWeight: isActive ? 600 : 500,
+                lineHeight: 1.3,
+                whiteSpace: "nowrap",
+                fontSize: "0.72rem",
+                letterSpacing: 0.2,
               }}
             >
               {step}
@@ -593,6 +643,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   >(null);
   const [readinessDialog, setReadinessDialog] =
     useState<ReadinessDialogState | null>(null);
+  // Default-closed so novice users see the narrative hero first. The
+  // existing tabs and analytics stay one click away for power users.
+  const [showDetails, setShowDetails] = useState(false);
 
   useEffect(() => {
     const refreshDeveloperMode = () =>
@@ -851,7 +904,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const confirmedLineageRows = lineageRows.filter((row) => toBool(row.promoted));
   const confirmedRecentChangeCount =
     confirmedLineageRows.length + skillHelpedItems.length;
-  const hasActiveRoutingCanary = toBool(canary.enabled);
   const routingRollbackAvailable = toBool(evolution.routing_rollback_available);
   const promptRollbackAvailable = toBool(evolution.prompt_rollback_available);
   const specialistPromptRollbackAvailable = toBool(
@@ -1325,13 +1377,16 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     promptFragmentRollbackAvailable,
   ].filter(Boolean).length;
   const anyRollbackAvailable = rollbackAvailableCount > 0;
-  const hasLiveOrStableChange = activeTests > 0 || anyRollbackAvailable;
+  const reviewItemNoun = needsApprovalCount === 1 ? "suggestion" : "suggestions";
+  const reviewVerb = needsApprovalCount === 1 ? "needs" : "need";
+  const reviewDecisionSubject =
+    needsApprovalCount === 1 ? "this idea" : "these ideas";
   const primaryStatusTitle = needsApprovalCount > 0
-    ? "Needs your decision"
+    ? `${needsApprovalCount} ${reviewItemNoun} ${reviewVerb} your review`
     : activeTests > 0
-      ? "Testing a change safely"
+      ? "A limited test is running"
       : anyRollbackAvailable
-        ? "Stable change active"
+        ? "A stable change is active"
         : gepaRunningJobs > 0
           ? "Running background check"
           : gepaPendingJobs > 0
@@ -1340,11 +1395,11 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               ? "Waiting for model setup"
               : latestGepaCandidateCount > 0
                 ? "Checking candidate safety"
-                : "No action needed";
+                : "Nothing needs you now";
   const primaryStatusDetail = needsApprovalCount > 0
-    ? `${needsApprovalCount} item${needsApprovalCount === 1 ? "" : "s"} need your decision before anything lasting happens.`
+    ? `Nothing has changed yet. Open the review queue to decide whether ArkEvolve should keep going with ${reviewDecisionSubject}.`
     : activeTests > 0
-      ? "A candidate is live only for limited traffic. You can accept it as stable or stop the live test from this page."
+      ? "A small live test is active. You can view it, stop it, or make it stable from Live tests."
       : anyRollbackAvailable
         ? `${rollbackAvailableCount} stable change${rollbackAvailableCount === 1 ? "" : "s"} can be rolled back from Live tests.`
         : gepaRunningJobs > 0
@@ -1355,19 +1410,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               ? "Background improvement needs a working primary model before it can run."
               : latestGepaCandidateCount > 0
                 ? "Candidate improvements were created and are going through safety checks."
-                : "No ArkEvolve behavior change is active right now.";
-  const deploymentStateLabel = hasActiveRoutingCanary
-    ? "Live test"
-    : activeTests > 0
-      ? "Live test"
-      : anyRollbackAvailable
-      ? "Stable change active"
-      : "No deployed change";
-  const rollbackStateLabel = anyRollbackAvailable
-    ? "Rollback available"
-    : activeTests > 0
-      ? "Stop test available"
-      : "No rollback needed";
+                : "ArkEvolve is watching completed work and will ask before it changes behavior.";
   const reviewLifecycleSteps = [
     "Suggested",
     "Saved for follow-up",
@@ -1402,6 +1445,16 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     } catch (e) {
       setError(errMessage(e));
     }
+  }
+
+  function openReviewQueue() {
+    setTab("review");
+    window.setTimeout(() => {
+      const target = document.getElementById("ark-evolve-review-queue");
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      target.focus({ preventScroll: true });
+    }, 0);
   }
 
   const statusError = evolutionQ.error ? errMessage(evolutionQ.error) : "";
@@ -1527,48 +1580,37 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         title="ArkEvolve"
         description={
           <>
-            ArkEvolve shows what AgentArk is trying to improve, what is being tested, and what can be rolled back.
-            <br />
-            ArkEvolve quietly learns from completed work and asks before lasting behavior changes.
+            How AgentArk is learning to work better for you. ArkEvolve watches
+            completed work, proposes improvements, and asks before anything
+            lasting changes.
           </>
-        }
-        actions={
-          <Stack
-            direction="row"
-            spacing={1}
-            useFlexGap
-            sx={{
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
-            <Chip
-              size="small"
-              color={
-                toBool(evolution.self_evolve_enabled) ? "success" : "default"
-              }
-              label={
-                statusLoading
-                  ? "Self-evolve loading"
-                  : toBool(evolution.self_evolve_enabled)
-                    ? "Self-evolve on"
-                    : "Self-evolve off"
-              }
-            />
-            <Chip
-              size="small"
-              color={activeTests > 0 ? "warning" : "default"}
-              label={
-                statusLoading
-                  ? "Experiments loading"
-                  : `${activeTests} active experiment${activeTests === 1 ? "" : "s"}`
-              }
-            />
-          </Stack>
         }
       />
       {success ? <Alert severity="success">{success}</Alert> : null}
       {activeError ? <Alert severity="error">{activeError}</Alert> : null}
+
+      {/* Narrative hero. Headline number prioritizes what's actually on
+          the user: pending reviews > live tests > steady > paused. The
+          existing dense analytics view is hidden behind "Show details"
+          so non-technical users see the gist first. */}
+      <EvolveHero
+        loading={statusLoading}
+        title={primaryStatusTitle}
+        detail={primaryStatusDetail}
+        needsApprovalCount={needsApprovalCount}
+        activeTests={activeTests}
+        rollbackAvailableCount={rollbackAvailableCount}
+        selfEvolveEnabled={toBool(evolution.self_evolve_enabled)}
+        showDetails={showDetails}
+        onToggleDetails={() => setShowDetails((value) => !value)}
+        onOpenReviewQueue={openReviewQueue}
+        onOpenLiveTests={() => setTab("tests")}
+        onOpenRollback={
+          anyRollbackAvailable ? () => setTab("tests") : undefined
+        }
+      />
+
+      <Collapse in={showDetails} mountOnEnter timeout={240}>
       <Box className="list-shell" sx={{ p: 1.5 }}>
         <Stack spacing={1.15}>
           <Stack
@@ -1580,25 +1622,12 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             }}
           >
             <Box sx={{ minWidth: 0 }}>
-              <Stack
-                direction="row"
-                spacing={0.75}
-                useFlexGap
-                sx={{ alignItems: "center", flexWrap: "wrap" }}
+              <Typography
+                variant="h6"
+                sx={{ color: "#e8f4ff", fontWeight: 800 }}
               >
-                <Typography
-                  variant="h6"
-                  sx={{ color: "#e8f4ff", fontWeight: 800 }}
-                >
-                  {primaryStatusTitle}
-                </Typography>
-                <Chip size="small" label={deploymentStateLabel} />
-                <Chip
-                  size="small"
-                  color={hasLiveOrStableChange ? "warning" : "success"}
-                  label={rollbackStateLabel}
-                />
-              </Stack>
+                {primaryStatusTitle}
+              </Typography>
               <Typography
                 variant="body2"
                 sx={{ color: "text.secondary", mt: 0.4, lineHeight: 1.6 }}
@@ -1619,9 +1648,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   <Button
                     size="small"
                     variant="contained"
-                    onClick={() => setTab("review")}
+                    onClick={openReviewQueue}
                   >
-                    Review items
+                    Open review queue
                   </Button>
                 ) : null}
                 {activeTests > 0 ? (
@@ -1660,112 +1689,19 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               </Stack>
             ) : null}
           </Stack>
-          <EvolutionLifecycle
-            steps={[
-              "Watching",
-              "Your decision",
-              "Safety check",
-              "Limited test",
-              "Stable",
-            ]}
-            activeIndex={
-              needsApprovalCount > 0
-                ? 1
-                : activeTests > 0
-                  ? 3
-                  : anyRollbackAvailable
-                    ? 4
-                    : latestGepaCandidateCount > 0
-                      ? 2
-                      : 0
-            }
-          />
         </Stack>
       </Box>
-      <EvolutionStatStrip
-        items={[
-          {
-            label: "ArkEvolve mode",
-            value: toBool(evolution.self_evolve_enabled) ? "On" : "Off",
-            helper: "Learns quietly; asks before lasting changes",
-            tone: toBool(evolution.self_evolve_enabled) ? "good" : "default",
-          },
-          {
-            label: "Live tests",
-            value: activeTests,
-            helper:
-              activeTests > 0
-                ? `${maxRollout.toFixed(0)}% of traffic in test`
-                : "Nothing running",
-            tone: activeTests > 0 ? "warn" : "info",
-          },
-          {
-            label: "Needs you",
-            value: needsApprovalCount,
-            helper:
-              needsApprovalCount > 0
-                ? "Waiting on you"
-                : promotedChangeCount > 0
-                  ? `${promotedChangeCount} confirmed so far`
-                  : "Nothing waiting",
-            tone:
-              needsApprovalCount > 0
-                ? "warn"
-                : promotedChangeCount > 0
-                  ? "good"
-                  : "default",
-          },
-        ]}
-      />
-      <Box className="list-shell" sx={{ p: 1.25 }}>
-        <Stack spacing={1.15}>
-          <Stack
-            direction={{ xs: "column", lg: "row" }}
-            spacing={1}
-            sx={{
-              alignItems: { xs: "flex-start", lg: "center" },
-              justifyContent: "space-between",
-            }}
-          >
-            <Box sx={{ minWidth: 0 }}>
-              <Stack
-                direction="row"
-                spacing={0.75}
-                useFlexGap
-                sx={{ alignItems: "center", flexWrap: "wrap" }}
-              >
-                <Typography
-                  variant="subtitle1"
-                  sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                >
-                  Background learning
-                </Typography>
-                <Chip
-                  size="small"
-                  color={backgroundImprovementColor}
-                  label={backgroundImprovementLabel}
-                />
-              </Stack>
-              <Typography
-                variant="body2"
-                sx={{ color: "text.secondary", mt: 0.25 }}
-              >
-                Runs when AgentArk is quiet. It uses completed work to find
-                useful ideas, then sends anything risky through review or a
-                limited test.
-              </Typography>
-            </Box>
-          </Stack>
-
-          {!gepaReady && !backgroundImprovementPaused ? (
-            <Alert severity="info" sx={{ borderRadius: 1 }}>
-              Background improvement starts automatically after Models has a working primary
-              model{gepaIssues[0] ? `: ${gepaIssues[0]}` : "."}
-            </Alert>
-          ) : null}
-
-        </Stack>
-      </Box>
+      {/* The status strip and the background-learning section were
+          retired here — the EvolveHero above already presents the same
+          mode / live-test / needs-you state in one place. Only the
+          startup-readiness Alert stays, because it surfaces an actionable
+          blocker (no primary model configured) the hero can't convey. */}
+      {!gepaReady && !backgroundImprovementPaused ? (
+        <Alert severity="info" sx={{ borderRadius: 1 }}>
+          Background improvement starts automatically after Models has a working
+          primary model{gepaIssues[0] ? `: ${gepaIssues[0]}` : "."}
+        </Alert>
+      ) : null}
       <Box className="list-shell" sx={{ p: 0.75 }}>
         <Tabs
           value={tab}
@@ -2144,6 +2080,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           ) : null}
         </Stack>
       ) : null}
+      </Collapse>
       <Dialog
         open={selectedPatternCard != null}
         onClose={() => setSelectedPatternCard(null)}
@@ -2435,9 +2372,11 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   label={resultSummaryTitle}
                 />
               </Stack>
-              <Alert severity={resultSummarySeverity} sx={{ borderRadius: 1 }}>
-                {resultSummaryDetail}
-              </Alert>
+              {/* Long "ArkEvolve has not found enough measured evidence…"
+                  Alert removed. The four stat cards already say "Confirmed
+                  wins: 0", "Still measuring: 0", etc. — adding a paragraph
+                  saying the same in prose was double-billing. Stat helpers
+                  carry the same information in tighter form. */}
               <Box
                 sx={{
                   display: "grid",
@@ -2462,6 +2401,12 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             </Stack>
           </Box>
           <Grid2 container spacing={1.5} sx={{ alignItems: "flex-start" }}>
+          {/* "What helped" section is hidden entirely when there's no
+              impact data yet. Showing a section header + a long info
+              banner saying "no impact yet" + three 0.0-pt metric cards
+              was the loudest version of "nothing to show" possible.
+              Render nothing instead. */}
+          {!detailLoading && !detailError && skillHelpedItems.length === 0 && helpedLines.length === 0 ? null : (
           <Grid2 size={{ xs: 12, lg: 7 }}>
             <Box className="list-shell" sx={{ p: 1.6 }}>
               <Typography
@@ -2501,12 +2446,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               ) : detailError ? (
                 <Alert severity="warning" sx={{ borderRadius: 1 }}>
                   Impact details are unavailable: {detailError}
-                </Alert>
-              ) : skillHelpedItems.length === 0 && helpedLines.length === 0 ? (
-                <Alert severity="info" sx={{ borderRadius: 1 }}>
-                  No improvement is being claimed yet. ArkEvolve needs enough
-                  recent traffic to compare a change against stable behavior
-                  before it calls the change helpful.
                 </Alert>
               ) : (
                 <Stack spacing={1}>
@@ -2658,8 +2597,14 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               </Box>
             </Box>
           </Grid2>
+          )}
           <Grid2 size={{ xs: 12, lg: 5 }}>
             <Stack spacing={1.5}>
+              {/* "Still observing" section is hidden entirely when no
+                  approved skill change is waiting on more evidence — the
+                  long info banner saying "No approved skill changes are
+                  waiting" was an empty state pretending to be content. */}
+              {!detailLoading && !detailError && skillObservedItems.length === 0 ? null : (
               <Box className="list-shell" sx={{ p: 1.6 }}>
                 <Typography
                   variant="h6"
@@ -2694,10 +2639,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 ) : detailError ? (
                   <Alert severity="warning" sx={{ borderRadius: 1 }}>
                     Observed skill metrics are unavailable: {detailError}
-                  </Alert>
-                ) : skillObservedItems.length === 0 ? (
-                  <Alert severity="info" sx={{ borderRadius: 1 }}>
-                    No approved skill changes are waiting on more evidence.
                   </Alert>
                 ) : (
                   <Stack spacing={1}>
@@ -2773,6 +2714,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   </Stack>
                 )}
               </Box>
+              )}
               <Box className="list-shell" sx={{ p: 1.6 }}>
                 <Typography
                   variant="h6"
@@ -2831,36 +2773,90 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                       The graph is still forming. There are not enough connected
                       runs and learned items to draw a useful network yet.
                     </Alert>
-                    <Stack spacing={0.7}>
-                      {experienceNodePreview.map((node, idx) => (
-                        <Box
-                          key={`experience-node-preview-${str(node.id, String(idx))}`}
-                          sx={{
-                            p: 0.9,
-                            border: "1px solid var(--ui-rgba-145-170-205-120)",
-                            borderRadius: 1,
-                            bgcolor: "rgba(8, 14, 24, 0.28)",
-                          }}
-                        >
-                          <Typography
-                            variant="body2"
-                            sx={{ color: "#e8f4ff", fontWeight: 650 }}
-                            noWrap
-                            title={str(node.label, str(node.id, "Node"))}
-                          >
-                            {str(node.label, str(node.id, "Node"))}
-                          </Typography>
-                          <Typography
-                            variant="caption"
-                            sx={{ color: "text.secondary", display: "block" }}
-                          >
-                            {titleCaseLabel(
-                              str(node.kind, "item").replace(/_/g, " "),
-                            )}
-                          </Typography>
-                        </Box>
-                      ))}
-                    </Stack>
+                    {(() => {
+                      // Try to pull actual node content from common field
+                      // names so the row says WHAT this experience item
+                      // contains, not just "Learned user memory" repeated
+                      // five times. Rows without any meaningful preview
+                      // are dropped — they were the source of the user's
+                      // "I don't know for what" complaint.
+                      const previewFor = (node: JsonRecord): string => {
+                        const candidates = [
+                          str(node.text, ""),
+                          str(node.body, ""),
+                          str(node.summary, ""),
+                          str(node.description, ""),
+                          str(node.content, ""),
+                          str(node.detail, ""),
+                          str(node.value, ""),
+                        ];
+                        for (const candidate of candidates) {
+                          const trimmed = candidate.trim();
+                          if (trimmed && trimmed.length > 6) return trimmed;
+                        }
+                        // Fallback: only return label if it differs from
+                        // the generic kind label — otherwise we'd show
+                        // "Learned user memory" over and over.
+                        const rawLabel = str(node.label, "").trim();
+                        const kindLabel = titleCaseLabel(
+                          str(node.kind, "").replace(/_/g, " "),
+                        );
+                        if (rawLabel && rawLabel.toLowerCase() !== kindLabel.toLowerCase()) {
+                          return rawLabel;
+                        }
+                        return "";
+                      };
+                      const useful = experienceNodePreview
+                        .map((node) => ({ node, preview: previewFor(node) }))
+                        .filter((item) => item.preview.length > 0);
+                      if (useful.length === 0) return null;
+                      return (
+                        <Stack spacing={0.7}>
+                          {useful.map(({ node, preview }, idx) => (
+                            <Box
+                              key={`experience-node-preview-${str(node.id, String(idx))}`}
+                              sx={{
+                                p: 0.9,
+                                border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                borderRadius: 1,
+                                bgcolor: "rgba(8, 14, 24, 0.28)",
+                              }}
+                            >
+                              <Typography
+                                variant="body2"
+                                sx={{
+                                  color: "#e8f4ff",
+                                  fontWeight: 600,
+                                  display: "-webkit-box",
+                                  WebkitLineClamp: 2,
+                                  WebkitBoxOrient: "vertical",
+                                  overflow: "hidden",
+                                }}
+                                title={preview}
+                              >
+                                {preview}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                sx={{
+                                  color: "text.secondary",
+                                  display: "block",
+                                  fontFamily: "var(--font-mono)",
+                                  fontSize: "0.66rem",
+                                  letterSpacing: 0.4,
+                                  textTransform: "uppercase",
+                                  mt: 0.3,
+                                }}
+                              >
+                                {titleCaseLabel(
+                                  str(node.kind, "item").replace(/_/g, " "),
+                                )}
+                              </Typography>
+                            </Box>
+                          ))}
+                        </Stack>
+                      );
+                    })()}
                   </Stack>
                 ) : (
                   <Stack spacing={1}>
@@ -3330,7 +3326,16 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       ) : null}
       {tab === "review" ? (
         <Stack spacing={1.5}>
-          <Box className="list-shell" sx={{ p: 1.6 }}>
+          <Box
+            id="ark-evolve-review-queue"
+            tabIndex={-1}
+            className="list-shell"
+            sx={{
+              p: 1.6,
+              scrollMarginTop: 16,
+              "&:focus": { outline: "none" },
+            }}
+          >
             <Stack
               direction={{ xs: "column", md: "row" }}
               spacing={1}
@@ -3683,76 +3688,72 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                 },
                               }}
                             >
-                              <Typography
-                                variant="subtitle2"
-                                sx={{
-                                  color: "#e8f4ff",
-                                  fontWeight: 600,
-                                  flex: 1,
-                                  minWidth: 0,
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                }}
-                              >
-                                {str(row.title, "Suggested improvement")}
-                              </Typography>
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                color={promptProposalRiskColor(riskLevel)}
-                                label={`${riskLevel || "unknown"} risk`}
-                              />
-                            </AccordionSummary>
-                            <AccordionDetails sx={{ pt: 0, px: 1.5, pb: 1.5 }}>
-                              <Stack spacing={1}>
-                                <Box
+                              <Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0.2 }}>
+                                <Typography
+                                  variant="subtitle2"
                                   sx={{
-                                    display: "grid",
-                                    gridTemplateColumns: {
-                                      xs: "1fr",
-                                      md: "minmax(0, 1fr) minmax(0, 1fr)",
-                                    },
-                                    gap: 1,
+                                    color: "#e8f4ff",
+                                    fontWeight: 600,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
                                   }}
                                 >
-                                  <Box
-                                    sx={{
-                                      p: 1,
-                                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                      borderRadius: 1,
-                                      bgcolor: "rgba(20, 241, 149, 0.08)",
-                                    }}
-                                  >
-                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
-                                      Current state
-                                    </Typography>
-                                    <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 700 }}>
-                                      {proposalStateLabel}
-                                    </Typography>
-                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", lineHeight: 1.4 }}>
-                                      AgentArk behavior has not changed.
-                                    </Typography>
-                                  </Box>
-                                  <Box
-                                    sx={{
-                                      p: 1,
-                                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                      borderRadius: 1,
-                                      bgcolor: "rgba(8, 14, 24, 0.34)",
-                                    }}
-                                  >
-                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
-                                      Rollback
-                                    </Typography>
-                                    <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 700 }}>
-                                      No rollback needed
-                                    </Typography>
-                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", lineHeight: 1.4 }}>
-                                      Rollback appears only after a live test or stable change exists.
-                                    </Typography>
-                                  </Box>
-                                </Box>
+                                  {str(row.title, "Suggested improvement")}
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "var(--text-secondary)" }}
+                                >
+                                  Suggested change to how AgentArk writes its instructions to itself
+                                </Typography>
+                              </Box>
+                              {/* Inline risk indicator — coloured dot + label,
+                                  no chip background. Reads as part of the row,
+                                  not as a clickable element. */}
+                              <Box
+                                sx={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  gap: 0.6,
+                                  flex: "0 0 auto",
+                                  pr: 1,
+                                }}
+                              >
+                                <Box
+                                  sx={{
+                                    width: 8,
+                                    height: 8,
+                                    borderRadius: "50%",
+                                    background:
+                                      riskLevel === "high"
+                                        ? "#ff9b9b"
+                                        : riskLevel === "medium"
+                                          ? "#ffbe63"
+                                          : "#78f2b0",
+                                  }}
+                                />
+                                <Typography
+                                  variant="caption"
+                                  sx={{
+                                    color: "var(--text-secondary)",
+                                    fontFamily: "var(--font-mono)",
+                                    fontSize: "0.7rem",
+                                    letterSpacing: 0.4,
+                                    textTransform: "uppercase",
+                                  }}
+                                >
+                                  {`${riskLevel || "unknown"} risk`}
+                                </Typography>
+                              </Box>
+                            </AccordionSummary>
+                            <AccordionDetails sx={{ pt: 0, px: 1.5, pb: 1.5 }}>
+                              <Stack spacing={1.2}>
+                                {/* The two "Current state" / "Rollback" info
+                                    boxes that used to sit here duplicated the
+                                    lifecycle progress bar below. Dropped them.
+                                    The progress bar IS the state, and rollback
+                                    isn't relevant until a live test exists. */}
                                 <EvolutionLifecycle
                                   steps={reviewLifecycleSteps}
                                   activeIndex={canApprove ? 0 : 1}
@@ -3762,15 +3763,14 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                 </Typography>
                                 {expectedBenefit[0] ? (
                                   <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Potential benefit: {expectedBenefit[0]}
+                                    <strong style={{ color: "var(--text-primary)" }}>Benefit:</strong>{" "}
+                                    {expectedBenefit[0]}
                                   </Typography>
                                 ) : null}
-                                <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                  Saving this for follow-up records the idea. A future safety check or live test is required before behavior can change.
-                                </Typography>
                                 {caveats[0] ? (
                                   <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Watch out for: {caveats[0]}
+                                    <strong style={{ color: "var(--text-primary)" }}>Watch out:</strong>{" "}
+                                    {caveats[0]}
                                   </Typography>
                                 ) : null}
                                 {reviewedAt ? (

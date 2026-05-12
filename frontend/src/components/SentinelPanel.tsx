@@ -447,28 +447,30 @@ export function SentinelPanel({
   const currentModeLabel = settingsQ.data?.agent_paused ? "Paused" : modeLabel(currentAutonomyMode);
   const connectedServicesCount = num(stats?.connected_services, 0);
   const inAppEventCount = num(stats?.in_app_events, 0);
+  // When there are open proposals, the cards below show the actual
+  // follow-ups with content + actions; a headline saying "1 follow-up
+  // waiting for you" + a generic "review or leave them for later" line
+  // adds no signal. Fall through to the steady-state copy so the hero
+  // describes ArkSentinel itself, not just re-state the proposal count
+  // that the hero stat strip already shows.
   const sentinelHeroHeadline =
     settingsQ.data?.agent_paused
       ? "ArkSentinel is paused."
       : currentAutonomyMode === "off"
         ? "ArkSentinel is turned off."
-        : openProposals.length > 0
-          ? `${openProposals.length} follow-up${openProposals.length === 1 ? "" : "s"} waiting for you.`
-          : "No follow-ups right now.";
+        : "ArkSentinel is watching quietly.";
   const sentinelHeroDetail =
     settingsQ.data?.agent_paused
       ? "Turn autonomy back on to resume background checks, suggestions, and learning."
       : currentAutonomyMode === "off"
         ? "ArkSentinel is not scanning for follow-ups while this mode is off."
-        : openProposals.length > 0
-          ? "Review the suggested next steps below or leave them for later."
-          : connectedServicesCount === 0 && inAppEventCount === 0
-            ? "ArkSentinel is watching and learning quietly in the background. Anything worth your attention will show up here."
-            : connectedServicesCount === 0
-              ? `ArkSentinel has noticed ${inAppEventCount} thing${inAppEventCount === 1 ? "" : "s"} so far, but nothing needs you right now. Connect an account or app and it will start watching that too.`
-            : currentAutonomyMode === "auto"
-              ? `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and can handle lightweight routine work for you.`
-              : `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and will ask before it acts.`;
+        : connectedServicesCount === 0 && inAppEventCount === 0
+          ? "ArkSentinel is watching and learning quietly in the background. Anything worth your attention will show up here."
+          : connectedServicesCount === 0
+            ? `ArkSentinel has noticed ${inAppEventCount} thing${inAppEventCount === 1 ? "" : "s"} so far. Connect an account or app and it will start watching that too.`
+          : currentAutonomyMode === "auto"
+            ? `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and can handle lightweight routine work for you.`
+            : `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and will ask before it acts.`;
   const heroStats = [
     {
       label: "Waiting for you",

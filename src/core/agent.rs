@@ -2,7 +2,7 @@
 use crate::{
     actions::{
         ActionAuthorizationContext, ActionCallerPrincipal, ActionDef, ActionExecutionSurface,
-        PlannerActionRole, PlannerCostTier, PlannerIntegrationClass, PlannerSideEffectLevel,
+        ActionRole, ActionCostTier, ActionIntegrationClass, ActionSideEffectLevel,
     },
     identity::IdentityManager,
     proofs::ProofEngine,
@@ -77,9 +77,12 @@ mod agent_loop;
 mod argument_repair;
 mod automation_helpers;
 mod background_sessions;
+mod capability_health;
 mod chat_approvals;
 mod conversation_context;
+mod context_ledger;
 mod daily_brief;
+mod failure_repair;
 mod memory;
 mod message_processing;
 mod model_runtime;
@@ -87,21 +90,27 @@ mod notifications;
 mod operational;
 mod pending_flows;
 mod prompt_builder;
-#[cfg(test)]
-pub(crate) mod reasoning_stream;
 mod request_context;
+mod resource_locks;
 mod resilience_followups;
 mod routing;
+mod semantic_turn;
 mod skill_import;
 mod startup;
 mod streaming;
 mod task_runtime;
+mod tool_contracts;
 mod tool_execution;
+mod tool_facts;
 mod tool_responses;
+mod turn_loop;
 mod watcher_followup;
 
 use automation_helpers::*;
 use background_sessions::*;
+pub(crate) use chat_approvals::{
+    parse_direct_chat_approval_submit_text, DirectChatApprovalSubmitDecision,
+};
 pub use conversation_context::ConversationMessage;
 use memory::*;
 pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
@@ -118,8 +127,6 @@ pub(crate) use streaming::queue_stream_event;
 use tool_responses::*;
 pub(crate) use watcher_followup::{WatcherFollowupPreparation, WatcherFollowupWorker};
 
-const MOLTBOOK_ACTIVITY_LOG_KEY: &str = "moltbook_activity_log_v1";
-const MOLTBOOK_ACTIVITY_LOG_LIMIT: usize = 500;
 const TOOL_INTEGRATION_ALIASES_KEY: &str = "tool_integration_aliases_v1";
 const HOOKS_STORAGE_KEY: &str = "hooks_v1";
 const CONTEXT_FETCH_LIMIT: u64 = 240;
@@ -134,7 +141,6 @@ const MAX_CHAT_MESSAGE_TOKEN_BUDGET: usize = 1_200;
 const DEFAULT_CHAT_DIGEST_POINT_TOKENS: usize = 96;
 const CONTEXT_DIGEST_PAGE_SIZE: u64 = 64;
 const CONTEXT_DIGEST_VERSION: u8 = 3;
-const PROMPT_RECENT_HISTORY_RATIO_PERCENT: usize = 45;
 const CONVERSATION_RECENT_ARTIFACT_KEY_PREFIX: &str = "conversation_recent_artifact_v1:";
 const CONVERSATION_RECENT_ARTIFACT_LIMIT: usize = 8;
 const BACKGROUND_SESSION_IDLE_CONSOLIDATION_AFTER_MINS: i64 = 10;
@@ -339,19 +345,6 @@ fn extract_user_supplied_link_user_data_urls(text: &str) -> Vec<String> {
         .into_iter()
         .filter(|url| user_data_autosave_url_allowed(url))
         .collect()
-}
-
-fn action_message_hint(arguments: &serde_json::Value) -> Option<String> {
-    let keys = ["query", "task", "prompt", "message", "description", "title"];
-    for key in keys {
-        if let Some(value) = arguments.get(key).and_then(|v| v.as_str()) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(safe_truncate(trimmed, 500));
-            }
-        }
-    }
-    None
 }
 
 fn is_sensitive_tool_call_argument_key(key: &str) -> bool {
@@ -648,381 +641,6 @@ fn tokenize_lower(text: &str) -> Vec<String> {
         .filter(|w| w.len() >= 3)
         .map(|w| w.to_string())
         .collect()
-}
-
-fn moltbook_action_kind(sub_action: &str) -> &'static str {
-    match sub_action {
-        "feed" | "search" | "status" | "me" => "read",
-        "create_post" | "comment" | "upvote_post" => "write",
-        "register" => "setup",
-        _ => "other",
-    }
-}
-
-fn push_labeled_url(
-    urls: &mut Vec<serde_json::Value>,
-    seen: &mut HashSet<String>,
-    label: &str,
-    url: &str,
-) {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return;
-    }
-    let key = format!("{}|{}", label, url);
-    if !seen.insert(key) {
-        return;
-    }
-    urls.push(serde_json::json!({
-        "label": label,
-        "url": url
-    }));
-}
-
-fn collect_moltbook_urls(
-    sub_action: &str,
-    args: &serde_json::Value,
-    result: Option<&serde_json::Value>,
-) -> Vec<serde_json::Value> {
-    let mut urls: Vec<serde_json::Value> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let base_api = "https://www.moltbook.com/api/v1";
-
-    match sub_action {
-        "register" => {
-            push_labeled_url(
-                &mut urls,
-                &mut seen,
-                "API register",
-                "https://www.moltbook.com/api/v1/agents/register",
-            );
-            if let Some(claim_url) = result
-                .and_then(|r| r.get("claim_url"))
-                .and_then(|v| v.as_str())
-            {
-                push_labeled_url(&mut urls, &mut seen, "Claim URL", claim_url);
-            }
-        }
-        "status" => {
-            push_labeled_url(
-                &mut urls,
-                &mut seen,
-                "API status",
-                "https://www.moltbook.com/api/v1/agents/status",
-            );
-        }
-        "me" => {
-            push_labeled_url(
-                &mut urls,
-                &mut seen,
-                "API me",
-                "https://www.moltbook.com/api/v1/agents/me",
-            );
-        }
-        "feed" => {
-            let sort = args.get("sort").and_then(|v| v.as_str()).unwrap_or("new");
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10)
-                .min(25);
-            let feed_url = format!("{}/feed?sort={}&limit={}", base_api, sort, limit);
-            push_labeled_url(&mut urls, &mut seen, "API feed", &feed_url);
-            if let Some(posts) = result
-                .and_then(|r| r.get("posts"))
-                .and_then(|v| v.as_array())
-            {
-                for (idx, post) in posts.iter().take(10).enumerate() {
-                    if let Some(post_id) = post.get("id").and_then(|v| v.as_str()) {
-                        let api_url = format!("{}/posts/{}", base_api, post_id);
-                        push_labeled_url(
-                            &mut urls,
-                            &mut seen,
-                            &format!("Read API #{}", idx + 1),
-                            &api_url,
-                        );
-                    }
-                    if let Some(content_url) = post.get("url").and_then(|v| v.as_str()) {
-                        push_labeled_url(
-                            &mut urls,
-                            &mut seen,
-                            &format!("Read URL #{}", idx + 1),
-                            content_url,
-                        );
-                    }
-                }
-            }
-        }
-        "search" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10)
-                .min(25);
-            let search_url = format!(
-                "{}/search?q={}&limit={}",
-                base_api,
-                urlencoding::encode(query),
-                limit
-            );
-            push_labeled_url(&mut urls, &mut seen, "API search", &search_url);
-        }
-        "create_post" => {
-            push_labeled_url(
-                &mut urls,
-                &mut seen,
-                "API create_post",
-                "https://www.moltbook.com/api/v1/posts",
-            );
-            if let Some(post_id) = result
-                .and_then(|r| r.get("post"))
-                .and_then(|p| p.get("id"))
-                .and_then(|v| v.as_str())
-            {
-                let api_url = format!("{}/posts/{}", base_api, post_id);
-                push_labeled_url(&mut urls, &mut seen, "Created post API", &api_url);
-            }
-        }
-        "comment" => {
-            if let Some(post_id) = args.get("post_id").and_then(|v| v.as_str()) {
-                let comment_url = format!("{}/posts/{}/comments", base_api, post_id);
-                push_labeled_url(&mut urls, &mut seen, "API comment", &comment_url);
-                let post_url = format!("{}/posts/{}", base_api, post_id);
-                push_labeled_url(&mut urls, &mut seen, "Comment target post API", &post_url);
-            }
-        }
-        "upvote_post" => {
-            if let Some(post_id) = args.get("post_id").and_then(|v| v.as_str()) {
-                let upvote_url = format!("{}/posts/{}/upvote", base_api, post_id);
-                push_labeled_url(&mut urls, &mut seen, "API upvote", &upvote_url);
-                let post_url = format!("{}/posts/{}", base_api, post_id);
-                push_labeled_url(&mut urls, &mut seen, "Upvote target post API", &post_url);
-            }
-        }
-        _ => {}
-    }
-
-    urls
-}
-
-fn compact_preview_text(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    safe_truncate(compact.trim(), max_chars)
-}
-
-fn json_preview_value(value: &serde_json::Value, max_chars: usize) -> Option<String> {
-    match value {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(text) => {
-            let compact = compact_preview_text(text, max_chars);
-            if compact.is_empty() {
-                None
-            } else {
-                Some(compact)
-            }
-        }
-        other => Some(safe_truncate(&other.to_string(), max_chars)),
-    }
-}
-
-fn maybe_insert_json_preview(
-    map: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: Option<&serde_json::Value>,
-    max_chars: usize,
-) {
-    if let Some(preview) = value.and_then(|v| json_preview_value(v, max_chars)) {
-        map.insert(key.to_string(), serde_json::json!(preview));
-    }
-}
-
-fn maybe_insert_text_preview(
-    map: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: Option<&str>,
-    max_chars: usize,
-) {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return;
-    };
-    map.insert(
-        key.to_string(),
-        serde_json::json!(compact_preview_text(value, max_chars)),
-    );
-}
-
-fn build_moltbook_trace_result_step(
-    sub_action: &str,
-    args: &serde_json::Value,
-    result: Option<&serde_json::Value>,
-    error: Option<&str>,
-) -> (String, String, String, Option<String>) {
-    let action_label = humanize_tool_name(sub_action);
-    let mut data = serde_json::Map::new();
-    data.insert("action".to_string(), serde_json::json!(sub_action));
-    maybe_insert_text_preview(
-        &mut data,
-        "query_preview",
-        args.get("query").and_then(|v| v.as_str()),
-        140,
-    );
-    maybe_insert_text_preview(
-        &mut data,
-        "title_preview",
-        args.get("title").and_then(|v| v.as_str()),
-        140,
-    );
-    maybe_insert_text_preview(
-        &mut data,
-        "content_preview",
-        args.get("content").and_then(|v| v.as_str()),
-        220,
-    );
-    maybe_insert_text_preview(
-        &mut data,
-        "submolt",
-        args.get("submolt").and_then(|v| v.as_str()),
-        60,
-    );
-    maybe_insert_text_preview(
-        &mut data,
-        "post_id",
-        args.get("post_id").and_then(|v| v.as_str()),
-        80,
-    );
-
-    if let Some(error_text) = error {
-        data.insert(
-            "error".to_string(),
-            serde_json::json!(compact_preview_text(error_text, 280)),
-        );
-        let detail = format!(
-            "{} failed: {}",
-            action_label,
-            compact_preview_text(error_text, 180)
-        );
-        return (
-            format!("Moltbook failed: {}", action_label),
-            detail,
-            "error".to_string(),
-            Some(
-                serde_json::to_string_pretty(&serde_json::Value::Object(data)).unwrap_or_default(),
-            ),
-        );
-    }
-
-    let detail = match sub_action {
-        "feed" => {
-            let count = result
-                .and_then(|value| value.get("posts"))
-                .and_then(|value| value.as_array())
-                .map(|posts| posts.len())
-                .unwrap_or(0);
-            data.insert("post_count".to_string(), serde_json::json!(count));
-            format!(
-                "Fetched {} Moltbook post{} from the feed",
-                count,
-                if count == 1 { "" } else { "s" }
-            )
-        }
-        "search" => {
-            let count = result
-                .and_then(|value| value.get("posts"))
-                .and_then(|value| value.as_array())
-                .map(|posts| posts.len())
-                .unwrap_or(0);
-            data.insert("post_count".to_string(), serde_json::json!(count));
-            if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                format!(
-                    "Search returned {} post{} for \"{}\"",
-                    count,
-                    if count == 1 { "" } else { "s" },
-                    compact_preview_text(query, 120)
-                )
-            } else {
-                format!(
-                    "Search returned {} Moltbook post{}",
-                    count,
-                    if count == 1 { "" } else { "s" }
-                )
-            }
-        }
-        "create_post" => {
-            let result_post_id = result
-                .and_then(|value| value.get("post"))
-                .and_then(|value| value.get("id"))
-                .and_then(|value| value.as_str());
-            maybe_insert_text_preview(&mut data, "result_post_id", result_post_id, 80);
-            if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-                format!(
-                    "Created Moltbook post \"{}\"",
-                    compact_preview_text(title, 100)
-                )
-            } else if let Some(post_id) = result_post_id {
-                format!("Created Moltbook post {}", safe_truncate(post_id, 80))
-            } else {
-                "Created a Moltbook post".to_string()
-            }
-        }
-        "comment" => {
-            if let Some(post_id) = args.get("post_id").and_then(|v| v.as_str()) {
-                format!(
-                    "Posted a comment on Moltbook post {}",
-                    safe_truncate(post_id, 80)
-                )
-            } else {
-                "Posted a Moltbook comment".to_string()
-            }
-        }
-        "upvote_post" => {
-            if let Some(post_id) = args.get("post_id").and_then(|v| v.as_str()) {
-                format!("Upvoted Moltbook post {}", safe_truncate(post_id, 80))
-            } else {
-                "Upvoted a Moltbook post".to_string()
-            }
-        }
-        "status" => {
-            maybe_insert_json_preview(
-                &mut data,
-                "status",
-                result.and_then(|value| value.get("status")),
-                80,
-            );
-            "Loaded Moltbook status".to_string()
-        }
-        "register" => {
-            maybe_insert_json_preview(
-                &mut data,
-                "claim_url",
-                result.and_then(|value| value.get("claim_url")),
-                200,
-            );
-            "Registered the Moltbook agent".to_string()
-        }
-        "me" => {
-            maybe_insert_json_preview(
-                &mut data,
-                "username",
-                result.and_then(|value| value.get("username")),
-                80,
-            );
-            "Loaded Moltbook profile details".to_string()
-        }
-        _ => {
-            maybe_insert_json_preview(&mut data, "result_preview", result, 260);
-            format!("Completed Moltbook {}", action_label)
-        }
-    };
-
-    (
-        format!("Moltbook completed: {}", action_label),
-        detail,
-        "success".to_string(),
-        Some(serde_json::to_string_pretty(&serde_json::Value::Object(data)).unwrap_or_default()),
-    )
 }
 
 fn extract_model_failure_tool_name(error: &str) -> Option<String> {
@@ -1519,11 +1137,11 @@ fn tool_batch_has_successful_persistent_artifact(
             file_path: None,
             authorization: Default::default(),
         };
-        let metadata = inferred_action.planner_metadata();
+        let metadata = inferred_action.action_metadata();
         let content_lower = output.content.to_ascii_lowercase();
-        matches!(metadata.role, PlannerActionRole::Orchestration)
-            || (matches!(metadata.integration_class, PlannerIntegrationClass::App)
-                && matches!(metadata.side_effect_level, PlannerSideEffectLevel::Write)
+        matches!(metadata.role, ActionRole::Orchestration)
+            || (matches!(metadata.integration_class, ActionIntegrationClass::App)
+                && matches!(metadata.side_effect_level, ActionSideEffectLevel::Write)
                 && (content_lower.contains("http://")
                     || content_lower.contains("https://")
                     || content_lower.contains("access_url")
@@ -1896,6 +1514,14 @@ pub struct Agent {
     /// Non-fatal startup degradations that should be surfaced through health/readiness.
     startup_issues: Arc<RwLock<Vec<StartupIssue>>>,
 
+    /// Short-lived immutable capability snapshot used by the semantic router.
+    capability_snapshot: Arc<RwLock<Option<semantic_turn::CapabilitySnapshot>>>,
+    capability_snapshot_refresh: Arc<tokio::sync::Mutex<()>>,
+    capability_snapshot_generation: Arc<AtomicUsize>,
+    capability_health_snapshot: Arc<RwLock<Option<capability_health::CapabilityHealthSnapshot>>>,
+    capability_health_refresh: Arc<tokio::sync::Mutex<()>>,
+    capability_health_generation: Arc<AtomicUsize>,
+
     /// Deployed app registry (static files + dynamic server processes)
     pub app_registry: crate::actions::app::AppRegistry,
 }
@@ -1930,6 +1556,7 @@ impl Default for AutomationIntentAssessment {
 #[derive(Debug, Clone, Copy)]
 enum AutomationSurface {
     Watch,
+    #[allow(dead_code)]
     Schedule,
 }
 
@@ -1972,9 +1599,6 @@ pub struct RequestExecutionHints {
     pub caller_principal: Option<ActionCallerPrincipal>,
     pub execution_surface: ActionExecutionSurface,
     pub direct_user_intent: bool,
-    pub routing: Option<crate::security::intent_classifier::InboundRoutingSignal>,
-    pub routing_trusted: bool,
-    pub force_agent_loop: bool,
     pub secret_offered: Option<SecretOfferedHint>,
     pub attachments: Vec<ChatAttachmentHint>,
     pub saved_user_facts_context: Option<String>,
@@ -1992,9 +1616,6 @@ pub struct RequestExecutionHints {
 enum InboundSecurityPrecheck {
     Continue {
         memory_capture_allowed: bool,
-        routing: Option<crate::security::intent_classifier::InboundRoutingSignal>,
-        routing_trusted: bool,
-        direct_response: Option<String>,
     },
     Respond(ProcessedMessage),
 }

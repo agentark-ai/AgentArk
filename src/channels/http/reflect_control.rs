@@ -659,18 +659,6 @@ fn query_time(
     params.get(key).and_then(|value| parse_time(value))
 }
 
-fn parse_bool_param(params: &HashMap<String, String>, key: &str) -> bool {
-    params
-        .get(key)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     let trimmed = value.trim();
     if trimmed.chars().count() <= max_chars {
@@ -4662,7 +4650,33 @@ async fn spawn_reflect_refresh(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        let refresh_status = current_refresh_status().await;
+        let refresh_status = update_refresh_status(|status| {
+            status.running = true;
+            if status.status != "running" {
+                status.status = "already_running".to_string();
+            }
+            status.trigger = status
+                .trigger
+                .clone()
+                .or_else(|| Some(trigger.to_string()));
+            status.period = status
+                .period
+                .clone()
+                .or_else(|| Some(request.period.as_str().to_string()));
+            status.from = status
+                .from
+                .clone()
+                .or_else(|| Some(request.from.to_rfc3339()));
+            status.to = status
+                .to
+                .clone()
+                .or_else(|| Some(request.to.to_rfc3339()));
+            status.requested_at = status
+                .requested_at
+                .clone()
+                .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
+        })
+        .await;
         return ReflectRefreshStartResponse {
             accepted: false,
             running: true,
@@ -4686,7 +4700,17 @@ async fn spawn_reflect_refresh(
         Ok(Ok(Some(guard))) => guard,
         Ok(Ok(None)) => {
             REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-            let refresh_status = current_refresh_status().await;
+            let refresh_status = update_refresh_status(|status| {
+                status.running = true;
+                status.status = "already_running".to_string();
+                status.trigger = Some(trigger.to_string());
+                status.period = Some(request.period.as_str().to_string());
+                status.from = Some(request.from.to_rfc3339());
+                status.to = Some(request.to.to_rfc3339());
+                status.requested_at = Some(chrono::Utc::now().to_rfc3339());
+                status.last_error = None;
+            })
+            .await;
             return ReflectRefreshStartResponse {
                 accepted: false,
                 running: true,
@@ -4856,7 +4880,7 @@ fn cache_status_for_units(
         "ready".to_string()
     };
     let detail = match mode.as_str() {
-        "empty" => "No cached reflection rows exist for this range yet. A background refresh can prepare them.".to_string(),
+        "empty" => "No cached reflection rows exist for this range yet. A scheduled refresh or manual run can prepare them.".to_string(),
         "refreshing" => "Showing cached reflection rows while a background refresh updates this range.".to_string(),
         "stale" => "Showing cached reflection rows. A background refresh can update recent changes.".to_string(),
         _ => "Showing cached reflection rows for this range.".to_string(),
@@ -5369,20 +5393,12 @@ pub(super) async fn ark_reflect_endpoint(
         Ok(request) => request,
         Err(response) => return response,
     };
-    if parse_bool_param(&params, "refresh") {
-        let _ = spawn_reflect_refresh(state.clone(), request.clone(), "query", false).await;
-    }
     let from_s = request.from.to_rfc3339();
     let to_s = request.to.to_rfc3339();
 
-    let (storage, profile_arc, embedding_client, llm) = {
+    let (storage, profile_arc) = {
         let agent = state.agent.read().await;
-        (
-            agent.storage.clone(),
-            agent.user_profile.clone(),
-            agent.embedding_client.clone(),
-            agent.llm.clone(),
-        )
+        (agent.storage.clone(), agent.user_profile.clone())
     };
     let profile = profile_arc.read().await.clone();
     let tz = reflect_timezone_from_profile(&profile);
@@ -5417,10 +5433,6 @@ pub(super) async fn ark_reflect_endpoint(
     };
 
     let refresh_status = current_refresh_status().await;
-    if units.is_empty() && !refresh_status.running {
-        let _ = spawn_reflect_refresh(state.clone(), request.clone(), "cache_miss", true).await;
-    }
-    let refresh_status = current_refresh_status().await;
     let source_counts = source_counts_from_units(&units);
     let baseline_source_counts = baseline_source_counts(&storage, request.from).await;
     let cache_status = cache_status_for_units(&units, &refresh_status);
@@ -5435,11 +5447,7 @@ pub(super) async fn ark_reflect_endpoint(
     {
         tracing::debug!(target: "arkreflect", "related history enrichment timed out");
     }
-    let suggested_followups =
-        build_suggested_followups(&storage, &clusters, embedding_client.as_deref(), Some(&llm))
-            .await;
-    let _ = maybe_spawn_reflect_followup_search(state.clone(), suggested_followups.clone(), "page")
-        .await;
+    let suggested_followups = build_suggested_followups(&storage, &clusters, None, None).await;
     (
         StatusCode::OK,
         Json(ReflectResponse {

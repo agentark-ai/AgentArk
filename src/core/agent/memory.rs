@@ -1,4 +1,4 @@
-use super::action_selection::format_recent_dialogue_for_fast_path;
+use super::action_selection::format_recent_dialogue_for_memory_context;
 use super::*;
 use crate::storage::entities::user_preference::{
     MemorySensitivity, classify_saved_memory_sensitivity, normalize_memory_sensitivity,
@@ -3066,7 +3066,8 @@ impl UserMemoryCaptureWorker {
             let history = self
                 .recent_messages_for_intent_gating(id, &prompt_message)
                 .await;
-            format_recent_dialogue_for_fast_path(&history).unwrap_or_else(|| "(none)".to_string())
+            format_recent_dialogue_for_memory_context(&history)
+                .unwrap_or_else(|| "(none)".to_string())
         } else {
             "(none)".to_string()
         };

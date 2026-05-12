@@ -475,7 +475,7 @@ pub(super) fn analytics_purpose_kind(channel: &str, purpose: &str) -> &'static s
 
     let helper_exact = [
         "title",
-        "user_fact_fast_path",
+        "user_fact_quick_capture",
         "user_fact_memory_capture",
         "argument_inference",
         "custom_condition",

@@ -74,6 +74,7 @@ impl MissingSecretPlaceholder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn prompt_storage_key(&self) -> String {
         match self.kind {
             MissingSecretPlaceholderKind::Secret => self.key.clone(),
@@ -700,6 +701,7 @@ pub fn parse_workflow_missing_inputs_marker(output: &str) -> Option<WorkflowMiss
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct StructuredToolCompletion {
     pub tool: String,
     pub status: String,
@@ -707,6 +709,7 @@ pub struct StructuredToolCompletion {
     pub detail: Option<String>,
 }
 
+#[allow(dead_code)]
 fn parse_structured_tool_completion(output: &str) -> Option<StructuredToolCompletion> {
     if let Some(payload) = output.trim_start().strip_prefix(TOOL_COMPLETION_MARKER) {
         let payload = payload.lines().next().unwrap_or(payload).trim();
@@ -715,14 +718,17 @@ fn parse_structured_tool_completion(output: &str) -> Option<StructuredToolComple
     serde_json::from_str::<StructuredToolCompletion>(output.trim()).ok()
 }
 
+#[allow(dead_code)]
 pub fn parse_schedule_task_completion(output: &str) -> Option<StructuredToolCompletion> {
     parse_structured_tool_completion(output).filter(|completion| completion.tool == "schedule_task")
 }
 
+#[allow(dead_code)]
 pub fn parse_watch_completion(output: &str) -> Option<StructuredToolCompletion> {
     parse_structured_tool_completion(output).filter(|completion| completion.tool == "watch")
 }
 
+#[allow(dead_code)]
 pub fn parse_delegate_completion(output: &str) -> Option<StructuredToolCompletion> {
     parse_structured_tool_completion(output).filter(|completion| completion.tool == "delegate")
 }
@@ -3723,27 +3729,26 @@ print(json.dumps({
     async fn unapproved_permissions_for_action(
         &self,
         action: &ActionDef,
+        arguments: &serde_json::Value,
         auth_context: &ActionAuthorizationContext,
     ) -> Vec<crate::security::action_guard::Permission> {
         let action_name = action.name.as_str();
         if self.action_is_auto_approved(action_name) {
             return Vec::new();
         }
-        if auth_context.direct_user_intent
+        if auth_context.current_turn_is_explicit_approval
+            && auth_context.direct_user_intent
+            && matches!(
+                auth_context.surface,
+                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+            )
             && auth_context
                 .principal
                 .as_ref()
                 .is_some_and(|principal| principal.trusted)
-            && (matches!(
-                auth_context.surface,
-                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
-            ) || Self::is_background_surface(&auth_context.surface))
         {
             return Vec::new();
         }
-        let Some(guard) = self.action_guard.as_ref() else {
-            return Vec::new();
-        };
         let mut requested = Self::builtin_dangerous_permissions(action);
         requested.extend(
             action
@@ -3752,12 +3757,10 @@ print(json.dumps({
                 .permission_ids
                 .iter()
                 .map(|permission| {
-                    crate::security::action_guard::Permission::Custom(
-                        permission.trim().to_ascii_lowercase(),
-                    )
+                    crate::security::action_guard::ActionGuard::parse_permission(permission)
                 }),
         );
-        if !action.authorization.access.channel_targets.is_empty() {
+        if Self::action_requests_external_channel_target(action, arguments) {
             requested.push(crate::security::action_guard::Permission::Custom(
                 "messaging_send".to_string(),
             ));
@@ -3788,9 +3791,15 @@ print(json.dumps({
                     .any(|value| value.eq_ignore_ascii_case(permission.to_string().as_str()))
             });
         }
+        requested.retain(|permission| {
+            Self::permission_needs_agent_approval_for_action(action, permission, auth_context)
+        });
         if requested.is_empty() {
             return Vec::new();
         }
+        let Some(guard) = self.action_guard.as_ref() else {
+            return requested;
+        };
         guard.check_permissions(action_name, &requested).await
     }
 
@@ -3800,18 +3809,27 @@ print(json.dumps({
     ) -> String {
         let perm_names = permissions
             .iter()
-            .map(|perm| perm.to_string())
+            .map(Self::permission_display_label)
             .collect::<Vec<_>>()
             .join(", ");
         let guidance = if crate::core::config::AUTO_APPROVE_BLOCKED.contains(&action_name) {
-            "This action is always approval-gated."
+            "This permission always requires an explicit approval for the current run."
         } else {
-            "If this action is part of your trusted workflow, add its name to Settings > Advanced > Auto-Approve Skills."
+            "Approve the prompt to continue this run."
         };
         format!(
             "Action '{}' requires approval before execution because it needs unapproved permissions: {}. {}",
             action_name, perm_names, guidance
         )
+    }
+
+    fn permission_display_label(permission: &crate::security::action_guard::Permission) -> String {
+        permission
+            .to_string()
+            .split(|ch: char| ch == '_' || ch == '-')
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Load all actions (builtin + user). Call AFTER set_action_guard.
@@ -3843,6 +3861,62 @@ print(json.dumps({
         }
 
         Ok(())
+    }
+
+    fn research_report_composer_workflow() -> &'static str {
+        r#"---
+name: research_report_compose
+description: Turn gathered research evidence into a polished, citation-backed report with clean sections, tables, and chart blocks when useful.
+version: "1.0.0"
+---
+
+# Deep Research Report Composer
+
+search: none
+
+Use this workflow after evidence has already been gathered by deep research, document review, or user-provided source notes. Do not invent facts, citations, dates, statistics, source titles, or URLs. If the evidence is thin or contradictory, say so plainly and preserve the uncertainty.
+
+## Inputs Required
+- `evidence`: source notes, excerpts, prior research output, or structured evidence to synthesize.
+
+Optional inputs:
+- `audience`: who will read the report.
+- `report_type`: policy brief, market landscape, technical comparison, implementation plan, investment memo, literature review, or another user-implied type.
+- `output_format`: markdown, report, or brief.
+- `include_charts`: whether to include `agentark-chart` JSON fences when the evidence supports useful charts.
+
+## Workflow
+1. Infer the user's underlying decision or knowledge need from the evidence and optional fields.
+2. Choose report sections by meaning, not by anticipated wording. Adapt to the domain instead of using a fixed template.
+3. Group related evidence into a small number of themes. Remove duplicate points.
+4. Use Markdown tables for comparisons, phased plans, risk allocations, scoring matrices, or evidence summaries when they make the report easier to scan.
+5. Include chart fences only when the evidence contains concrete comparable values. Use `agentark-chart` JSON with `title`, `type`, `x`, `series`, `data`, and `height`.
+6. Cite material claims with the source numbers, names, or identifiers present in the evidence. Do not fabricate citations.
+7. End with evidence gaps or verification needs when support is incomplete.
+
+## Output Format
+# Research: [clear report title]
+
+[Executive summary in 1-3 short paragraphs.]
+
+## 1. [Section based on the evidence]
+
+[Synthesis with citations.]
+
+[Table or chart only when it clarifies the report.]
+
+## 2. [Next meaningful section]
+
+[Continue with concise, cited analysis.]
+
+## Recommendations or Next Steps
+
+[Actionable options or decisions, grounded in evidence.]
+
+## Evidence Gaps
+
+[Missing, uncertain, or conflicting evidence.]
+"#
     }
 
     /// Load built-in actions
@@ -4465,6 +4539,7 @@ print(json.dumps({
                         "description": "Structured trigger condition authored by the model. Include a human-readable `description` and an explicit matcher. Prefer `json_predicate` or `json_logic` for structured poll outputs; use `llm` only when the trigger cannot be expressed safely as a deterministic contract.",
                         "properties": {
                             "description": { "type": "string", "description": "Human-readable summary of what counts as a match. For change-detection watchers, state the material difference to compare against the previous successful poll." },
+                            "evaluation_mode": { "type": "string", "enum": ["current_state", "change"], "description": "Use current_state when the present poll result alone should trigger. Use change when the watcher should first establish a baseline and only trigger when a later successful poll materially differs while still satisfying the matcher." },
                             "type": { "type": "string", "enum": ["not_empty", "text_contains", "regex", "json_predicate", "json_logic", "llm"] },
                             "text": { "type": "string", "description": "Used by `text_contains`" },
                             "case_sensitive": { "type": "boolean", "description": "Optional flag for `text_contains`" },
@@ -4487,7 +4562,7 @@ print(json.dumps({
                                 }
                             }
                         },
-                        "required": ["description", "type"]
+                        "required": ["description", "evaluation_mode", "type"]
                     },
                     "on_trigger": { "type": "string", "description": "What to do when condition is met - natural language instructions for the agent" },
                     "interval_secs": { "type": "integer", "description": "Seconds between polls, including sub-minute monitoring intervals (default: 60)" },
@@ -4876,6 +4951,32 @@ print(json.dumps({
             file_path: None,
         authorization: Default::default(),
         }).await;
+
+        self.register_workflow_action(
+            ActionDef {
+                name: "research_report_compose".to_string(),
+                description: "Compose gathered research evidence into a polished report with clean sections, citations, tables, and chart blocks when the evidence supports them. Use after sources or evidence have already been collected, when the user wants a formal report, brief, memo, landscape, or implementation analysis rather than another search.".to_string(),
+                version: "1.0.0".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "evidence": { "type": "string", "description": "Source notes, excerpts, prior research output, or structured evidence to synthesize into a report." },
+                        "audience": { "type": "string", "description": "Optional reader or stakeholder group for tone and detail level." },
+                        "report_type": { "type": "string", "description": "Optional report type such as policy brief, market landscape, technical comparison, implementation plan, investment memo, or literature review." },
+                        "output_format": { "type": "string", "enum": ["markdown", "report", "brief"], "description": "Preferred output shape. Defaults to report." },
+                        "include_charts": { "type": "boolean", "description": "Include agentark-chart blocks when the evidence contains comparable numeric values." }
+                    },
+                    "required": ["evidence"]
+                }),
+                capabilities: vec!["document_generation".to_string()],
+                sandbox_mode: Some(SandboxMode::Native),
+                source: ActionSource::System,
+                file_path: None,
+                authorization: Default::default(),
+            },
+            Self::research_report_composer_workflow().to_string(),
+        )
+        .await;
 
         // Code execution sandbox
         self.register_builtin_action(ActionDef {
@@ -6246,12 +6347,12 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_drive_search".to_string(),
-            description: "Search Google Drive files using the connected Google Workspace account with read-only Drive access. Use when the user asks to find a file, document, folder, spreadsheet, or deck in Drive.".to_string(),
+            description: "Search or list Google Drive files using the connected Google Workspace account with read-only Drive access. Use when the requested outcome depends on visible Drive file metadata or contents. If the user has not provided a narrower target, omit `query` and return a small default/recent listing instead of asking them to restate the source.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Optional Google Drive query, such as name contains 'roadmap' or mimeType='application/vnd.google-apps.spreadsheet'." },
+                    "query": { "type": "string", "description": "Optional Google Drive query, such as name contains 'roadmap' or mimeType='application/vnd.google-apps.spreadsheet'. Omit when a general/default file listing is the useful read-only outcome." },
                     "page_size": { "type": "integer", "description": "Max number of files to return (default 10)." }
                 }
             }),
@@ -6337,7 +6438,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_help".to_string(),
-            description: "Show Google Workspace CLI help output for the currently connected Workspace integration. Use when you need to inspect gws syntax for a granted service or discover generic commands. Pass argv as the command parts after `gws`, for example [\"gmail\",\"users\",\"messages\",\"list\",\"--help\"] or [\"drive\",\"--help\"].".to_string(),
+            description: "Inspect help text for the underlying Google Workspace CLI. This is a support tool for understanding CLI syntax when a direct typed action does not cover the requested Workspace operation.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -6349,7 +6450,7 @@ print(json.dumps({
                     }
                 }
             }),
-            capabilities: vec!["google_workspace".to_string()],
+            capabilities: vec!["google_workspace".to_string(), "tool_documentation".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -6358,19 +6459,19 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_schema".to_string(),
-            description: "Inspect the request and response schema for a Google Workspace CLI method. Use when you need the exact shape for a gws command within the currently granted Workspace bundles before executing it. Example target: gmail.users.messages.list or drive.files.list.".to_string(),
+            description: "Inspect request and response schema metadata for an underlying Google Workspace CLI method. This is a support tool for preparing advanced CLI operations when a direct typed action does not cover the requested Workspace operation.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "The gws schema target, such as drive.files.list or sheets.spreadsheets.values.get."
+                        "description": "The CLI method path whose request and response schema should be inspected."
                     }
                 },
                 "required": ["target"]
             }),
-            capabilities: vec!["google_workspace".to_string()],
+            capabilities: vec!["google_workspace".to_string(), "schema_inspection".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -6379,14 +6480,14 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_skills".to_string(),
-            description: "List or read the generated Google Workspace CLI skill docs available for the currently granted Workspace bundles. Use this when you want exact gws examples before calling google_workspace_gws_schema or google_workspace_gws_command. If name is provided, returns the full SKILL.md content for that visible skill.".to_string(),
+            description: "List or read generated Google Workspace CLI skill documentation for the currently granted Workspace bundles. This is a support tool that returns documentation about available CLI helpers, not user Workspace data.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Optional generated gws skill name to open, for example gws-docs, gws-gmail-triage, recipe-label-and-archive-emails, or persona-team-lead."
+                        "description": "Optional generated CLI skill name to open."
                     },
                     "filter": {
                         "type": "string",
@@ -6398,7 +6499,7 @@ print(json.dumps({
                     }
                 }
             }),
-            capabilities: vec!["google_workspace".to_string()],
+            capabilities: vec!["google_workspace".to_string(), "tool_documentation".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -6407,7 +6508,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_command".to_string(),
-            description: "Execute a non-auth Google Workspace CLI command against the connected Google Workspace account, but only within the currently granted Workspace bundles. Use this when you need broader coverage than the built-in Gmail, Calendar, or granted bundle helpers provide. Prefer google_workspace_gws_skills for granted examples and google_workspace_gws_schema for exact method shapes before executing unfamiliar commands. Provide argv as the command parts after `gws`, for example [\"gmail\",\"users\",\"messages\",\"list\",\"--params\",\"{\\\"maxResults\\\":5,\\\"labelIds\\\":[\\\"INBOX\\\"]}\"] , [\"calendar\",\"+agenda\"], or [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"] . Set required_bundles when you know which Workspace bundles this command needs, such as [\"drive\"] or [\"gmail\",\"calendar\"].".to_string(),
+            description: "Execute an advanced Google Workspace CLI command against the connected account within granted Workspace bundles. This is a generic executor for Workspace operations that are not covered by a direct typed action and may require approval.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -6420,12 +6521,12 @@ print(json.dumps({
                     "required_bundles": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional Workspace bundles needed by the command, such as [\"drive\"] or [\"gmail\",\"calendar\"]."
+                        "description": "Optional canonical Workspace bundle IDs required by the command."
                     }
                 },
                 "required": ["argv"]
             }),
-            capabilities: vec!["google_workspace".to_string()],
+            capabilities: vec!["google_workspace".to_string(), "generic_tool_executor".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -6967,17 +7068,6 @@ print(json.dumps({
                 .is_some_and(|principal| principal.trusted)
     }
 
-    fn direct_trusted_user_request(auth_context: &ActionAuthorizationContext) -> bool {
-        matches!(
-            auth_context.surface,
-            ActionExecutionSurface::Chat | ActionExecutionSurface::Api
-        ) && auth_context.direct_user_intent
-            && auth_context
-                .principal
-                .as_ref()
-                .is_some_and(|principal| principal.trusted)
-    }
-
     fn risk_rank(level: &ActionRiskLevel) -> u8 {
         match level {
             ActionRiskLevel::None => 0,
@@ -7107,27 +7197,34 @@ print(json.dumps({
         action_name: &str,
         decision: &crate::security::capabilities::CapabilityCorrelationDecision,
     ) -> String {
-        let detail = decision.message.as_deref().unwrap_or(match decision.effect {
-            crate::security::capabilities::CapabilityCorrelationEffect::Block => {
-                "Blocked by cross-layer capability policy."
-            }
-            crate::security::capabilities::CapabilityCorrelationEffect::RequireApproval => {
-                "This action requires explicit approval because it combines sensitive access with external delivery."
-            }
-            crate::security::capabilities::CapabilityCorrelationEffect::Allow => {
-                "Allowed by capability policy."
-            }
-        });
+        let matched_rule_message = decision
+            .report
+            .as_ref()
+            .and_then(|report| report.matched_rules.first())
+            .map(|rule| rule.message.as_str());
+        let detail = matched_rule_message
+            .or(decision.message.as_deref())
+            .unwrap_or(match decision.effect {
+                crate::security::capabilities::CapabilityCorrelationEffect::Block => {
+                    "This combination is not allowed by the active safety policy."
+                }
+                crate::security::capabilities::CapabilityCorrelationEffect::RequireApproval => {
+                    "This combination needs approval before it can run."
+                }
+                crate::security::capabilities::CapabilityCorrelationEffect::Allow => {
+                    "Allowed by capability policy."
+                }
+            });
         match decision.effect {
             crate::security::capabilities::CapabilityCorrelationEffect::Block => {
                 format!(
-                    "Tool '{}' is blocked by security policy. {}",
+                    "This action is blocked by security policy before running `{}`. {}",
                     action_name, detail
                 )
             }
             crate::security::capabilities::CapabilityCorrelationEffect::RequireApproval => {
                 format!(
-                    "Tool '{}' requires explicit approval before it can run. {}",
+                    "This action needs your approval before running `{}`. {}",
                     action_name, detail
                 )
             }
@@ -7286,9 +7383,7 @@ print(json.dumps({
                 ))
             }
             crate::security::capabilities::CapabilityCorrelationEffect::RequireApproval => {
-                let approved_by_direct_request = auth_context.current_turn_is_explicit_approval
-                    || Self::direct_trusted_user_request(auth_context);
-                if approved_by_direct_request {
+                if auth_context.current_turn_is_explicit_approval {
                     record.context.extend(candidate);
                     record
                         .context
@@ -7298,11 +7393,22 @@ print(json.dumps({
                     self.record_capability_correlation_decision(
                         action_name,
                         &context_key,
-                        if auth_context.current_turn_is_explicit_approval {
-                            "approved"
-                        } else {
-                            "approved_by_direct_request"
-                        },
+                        "approved",
+                        &decision,
+                    )
+                    .await;
+                    None
+                } else if Self::is_direct_trusted_user_request(auth_context) {
+                    record.context.extend(candidate);
+                    record
+                        .context
+                        .retain_recent(CAPABILITY_CONTEXT_OBSERVATION_LIMIT);
+                    record.updated_at = chrono::Utc::now();
+                    drop(contexts);
+                    self.record_capability_correlation_decision(
+                        action_name,
+                        &context_key,
+                        "direct_user_intent",
                         &decision,
                     )
                     .await;
@@ -7408,7 +7514,7 @@ print(json.dumps({
                 && !auth_context.current_turn_is_explicit_approval =>
             {
                 ActionAuthorizationDecision::require_explicit_approval(format!(
-                    "Tool '{}' requires explicit user approval before it can run.",
+                    "This action needs your approval before running `{}`.",
                     action_name
                 ))
             }
@@ -7535,10 +7641,10 @@ print(json.dumps({
             }
 
             let unapproved_permissions = self
-                .unapproved_permissions_for_action(action_def, auth_context)
+                .unapproved_permissions_for_action(action_def, arguments, auth_context)
                 .await;
             if !unapproved_permissions.is_empty() {
-                let denied = ActionAuthorizationDecision::deny(
+                let denied = ActionAuthorizationDecision::require_explicit_approval(
                     Self::build_permission_requirement_error(action_name, &unapproved_permissions),
                 );
                 self.log_authorization_audit(
@@ -7788,7 +7894,6 @@ print(json.dumps({
         }
     }
 
-    #[cfg(test)]
     pub async fn install_cli_skill_action(
         &self,
         manifest: InstalledCliSkillManifest,
@@ -11570,10 +11675,12 @@ print(result["text"])
         );
         section_counts.insert(
             "extension_packs_installed".to_string(),
-            serde_json::json!(packs
-                .as_ref()
-                .map(|packs| packs.installed.len())
-                .unwrap_or_default()),
+            serde_json::json!(
+                packs
+                    .as_ref()
+                    .map(|packs| packs.installed.len())
+                    .unwrap_or_default()
+            ),
         );
         section_counts.insert(
             "plugins".to_string(),
@@ -13736,7 +13843,7 @@ print(result["text"])
                     }
                 }
             }
-            let metadata = action.planner_metadata();
+            let metadata = action.action_metadata();
             *integration_counts
                 .entry(format!("{:?}", metadata.integration_class))
                 .or_default() += 1;
@@ -13774,7 +13881,7 @@ print(result["text"])
     }
 
     fn credential_state_for_enabled_action(action: &ActionDef) -> &'static str {
-        if action.authorization.requires_auth || action.planner_metadata().requires_auth {
+        if action.authorization.requires_auth || action.action_metadata().requires_auth {
             "auth_config_satisfied"
         } else {
             "not_required"
@@ -13790,7 +13897,7 @@ print(result["text"])
             .filter(|(_, raw_score, _)| *raw_score > 0)
             .take(limit.max(1))
             .map(|(action, _, score)| {
-                let metadata = action.planner_metadata();
+                let metadata = action.action_metadata();
                 serde_json::json!({
                     "action_name": action.name,
                     "description": action.description,
@@ -13834,7 +13941,7 @@ print(result["text"])
         score: f64,
         match_reason: &str,
     ) -> serde_json::Value {
-        let metadata = action.planner_metadata();
+        let metadata = action.action_metadata();
         let caps = if action.capabilities.is_empty() {
             "none".to_string()
         } else {
@@ -13862,7 +13969,7 @@ print(result["text"])
             "version": action.version.clone(),
             "capabilities": action.capabilities.clone(),
             "action_source": action.source.clone(),
-            "planner_metadata": metadata.clone(),
+            "action_metadata": metadata.clone(),
             "availability": {
                 "ready_for_agent": true,
                 "source": "enabled_runtime_action_catalog",
@@ -13892,7 +13999,7 @@ print(result["text"])
         let mut scored = actions
             .iter()
             .map(|action| {
-                let metadata = action.planner_metadata();
+                let metadata = action.action_metadata();
                 let searchable = format!(
                     "{}\n{}\n{}\n{:?}\n{:?}\n{:?}\n{:?}",
                     action.name,
@@ -16522,6 +16629,26 @@ print(result["text"])
         outbound.outbound_write || outbound.public_publish
     }
 
+    fn action_requests_external_channel_target(
+        action: &ActionDef,
+        arguments: &serde_json::Value,
+    ) -> bool {
+        action
+            .authorization
+            .access
+            .channel_targets
+            .iter()
+            .any(|target| {
+                !Self::normalize_scope_channel_target(
+                    arguments
+                        .get(target.argument_key.as_str())
+                        .and_then(|value| value.as_str()),
+                    target.default_target.as_str(),
+                )
+                .is_empty()
+            })
+    }
+
     fn builtin_dangerous_permissions(
         action: &ActionDef,
     ) -> Vec<crate::security::action_guard::Permission> {
@@ -16543,6 +16670,85 @@ print(result["text"])
     ) -> bool {
         crate::security::action_guard::ActionGuard::permission_risk(permission)
             == crate::security::action_guard::PermissionRisk::Dangerous
+    }
+
+    fn is_direct_trusted_user_request(auth_context: &ActionAuthorizationContext) -> bool {
+        auth_context.direct_user_intent
+            && matches!(
+                auth_context.surface,
+                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+            )
+            && auth_context
+                .principal
+                .as_ref()
+                .is_some_and(|principal| principal.trusted)
+    }
+
+    fn is_trusted_user_originated_background_request(
+        auth_context: &ActionAuthorizationContext,
+    ) -> bool {
+        auth_context.direct_user_intent
+            && Self::is_background_surface(&auth_context.surface)
+            && auth_context
+                .principal
+                .as_ref()
+                .is_some_and(|principal| principal.trusted)
+    }
+
+    fn direct_trusted_request_covers_permission(
+        action: &ActionDef,
+        permission: &crate::security::action_guard::Permission,
+    ) -> bool {
+        use crate::actions::{
+            ActionCostTier, ActionDeliveryMode, ActionIntegrationClass, ActionRole,
+            ActionSideEffectLevel, ActionToolRole,
+        };
+        let metadata = action.action_metadata();
+        let low_operational_risk = metadata.cost == ActionCostTier::Low
+            && metadata.integration_class == ActionIntegrationClass::Internal
+            && metadata.tool_role == ActionToolRole::DirectOutcome
+            && !action.authorization.human_approval.required
+            && Self::risk_rank(&action.authorization.risk_level)
+                < Self::risk_rank(&ActionRiskLevel::High);
+        if !low_operational_risk {
+            return false;
+        }
+        match permission {
+            crate::security::action_guard::Permission::Scheduler => matches!(
+                metadata.delivery_mode,
+                ActionDeliveryMode::Async
+                    | ActionDeliveryMode::Conditional
+                    | ActionDeliveryMode::Either
+            ),
+            crate::security::action_guard::Permission::Custom(_) => {
+                matches!(
+                    metadata.role,
+                    ActionRole::Orchestration | ActionRole::Delivery
+                ) && !matches!(metadata.side_effect_level, ActionSideEffectLevel::None)
+            }
+            _ => false,
+        }
+    }
+
+    fn permission_needs_agent_approval_for_action(
+        action: &ActionDef,
+        permission: &crate::security::action_guard::Permission,
+        auth_context: &ActionAuthorizationContext,
+    ) -> bool {
+        if !Self::permission_needs_agent_approval(permission) {
+            return false;
+        }
+        if Self::is_direct_trusted_user_request(auth_context)
+            && Self::direct_trusted_request_covers_permission(action, permission)
+        {
+            return false;
+        }
+        if Self::is_trusted_user_originated_background_request(auth_context)
+            && Self::direct_trusted_request_covers_permission(action, permission)
+        {
+            return false;
+        }
+        true
     }
 
     pub fn action_permission_ids(action: &ActionDef) -> Vec<String> {
@@ -16722,17 +16928,20 @@ print(result["text"])
         None
     }
 
-    pub async fn action_integration_ready_for_planning(&self, action: &ActionDef) -> bool {
-        self.is_action_integration_ready(action).await
+    async fn is_action_integration_ready(&self, action: &ActionDef) -> bool {
+        self.action_integration_unready_reason(action)
+            .await
+            .is_none()
     }
 
-    async fn is_action_integration_ready(&self, action: &ActionDef) -> bool {
+    async fn action_integration_unready_reason(&self, action: &ActionDef) -> Option<String> {
         let access = &action.authorization.access;
         let integration_ids = &access.integration_ids;
         let extension_pack_ids = &access.extension_pack_ids;
         if integration_ids.is_empty() && extension_pack_ids.is_empty() {
-            return true;
+            return None;
         }
+        let mut reasons = Vec::new();
         if !integration_ids.is_empty() {
             let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
             let workspace_granted_bundles =
@@ -16746,13 +16955,17 @@ print(result["text"])
                 };
             for integration_id in integration_ids {
                 if !manager.is_ready(integration_id).await {
+                    reasons.push(format!(
+                        "required integration '{}' is not connected or authenticated",
+                        integration_id
+                    ));
                     continue;
                 }
                 let Some(features) = access.integration_features.get(integration_id) else {
-                    return true;
+                    return None;
                 };
                 if features.is_empty() {
-                    return true;
+                    return None;
                 }
                 let features_ready = match integration_id.as_str() {
                     "google_workspace" => {
@@ -16770,28 +16983,76 @@ print(result["text"])
                     _ => true,
                 };
                 if features_ready {
-                    return true;
+                    return None;
+                }
+                let missing_features = match integration_id.as_str() {
+                    "google_workspace" => {
+                        let granted = workspace_granted_bundles.as_deref().unwrap_or(&[]);
+                        features
+                            .iter()
+                            .filter_map(|feature| {
+                                crate::actions::google_workspace::normalize_bundle_id(feature)
+                                    .or_else(|| Some(feature.trim().to_string()))
+                            })
+                            .filter(|feature| {
+                                !feature.is_empty()
+                                    && !granted
+                                        .iter()
+                                        .any(|granted_bundle| granted_bundle == feature)
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                    _ => features
+                        .iter()
+                        .map(|feature| feature.trim().to_string())
+                        .filter(|feature| !feature.is_empty())
+                        .collect::<Vec<_>>(),
+                };
+                if missing_features.is_empty() {
+                    reasons.push(format!(
+                        "required integration '{}' is connected but required feature grants are not available",
+                        integration_id
+                    ));
+                } else {
+                    reasons.push(format!(
+                        "required integration '{}' is connected but missing feature grant(s): {}",
+                        integration_id,
+                        missing_features.join(", ")
+                    ));
                 }
             }
         }
         if !extension_pack_ids.is_empty() {
             let Some(registry) = self.extension_pack_registry.as_ref() else {
-                return false;
+                reasons.push("required extension pack registry is not available".to_string());
+                return Some(reasons.join("; "));
             };
             let guard = registry.read().await;
             for pack_id in extension_pack_ids {
                 let Ok(Some(pack)) = guard.get_pack(pack_id).await else {
+                    reasons.push(format!(
+                        "required extension pack '{}' is not installed",
+                        pack_id
+                    ));
                     continue;
                 };
                 if pack.enabled
                     && pack.installed
                     && matches!(pack.status.as_str(), "ready" | "connected")
                 {
-                    return true;
+                    return None;
                 }
+                reasons.push(format!(
+                    "required extension pack '{}' is not ready (status: {})",
+                    pack_id, pack.status
+                ));
             }
         }
-        false
+        Some(if reasons.is_empty() {
+            "required integration or extension capability is not ready".to_string()
+        } else {
+            reasons.join("; ")
+        })
     }
 
     fn pipeline_key_slug(input: &str) -> String {
@@ -17393,7 +17654,7 @@ print(result["text"])
                     }
                 }
                 drop(actions); // Release lock before async call
-                               // Fall back to native
+                // Fall back to native
                 self.execute_native(action_name, arguments).await
             }
         }
@@ -19361,11 +19622,12 @@ print(result["text"])
             .collect())
     }
 
-    /// List only actions that are currently executable by the agent.
-    /// Non-system actions honor the disabled set; integration-backed system actions honor
-    /// the integration enable/disable toggle.
+    /// List actions the model may call this turn.
+    /// System actions stay visible unless explicitly disabled; auth, bundle,
+    /// integration, and policy preconditions are surfaced by the action at
+    /// execution time as structured errors.
     pub async fn list_enabled_actions(&self) -> Result<Vec<ActionDef>> {
-        let disabled = self.disabled_actions.read().await;
+        let disabled = self.disabled_actions.read().await.clone();
         let actions = self
             .actions
             .read()
@@ -19373,9 +19635,11 @@ print(result["text"])
             .values()
             .map(|loaded| loaded.info.clone())
             .collect::<Vec<_>>();
-        drop(disabled);
         let mut enabled = Vec::new();
         for action in actions {
+            if disabled.contains(action.name.as_str()) {
+                continue;
+            }
             if action
                 .capabilities
                 .iter()
@@ -19389,18 +19653,12 @@ print(result["text"])
                 continue;
             }
             if action.source == ActionSource::System {
-                if self.is_action_integration_ready(&action).await {
-                    enabled.push(action);
-                }
-                continue;
-            }
-
-            if self
-                .disabled_actions
-                .read()
-                .await
-                .contains(action.name.as_str())
-            {
+                // Catalog returns all enabled system actions regardless of integration
+                // readiness. Each tool surfaces its own preconditions at execution
+                // time via structured ActionError envelopes the model relays. Load-time
+                // filtering by integration state was the silent failure surface where
+                // users saw "scope is empty" without any explanation of why.
+                enabled.push(action);
                 continue;
             }
 
@@ -19437,7 +19695,10 @@ print(result["text"])
             };
         }
         if action.source == ActionSource::System {
-            return self.is_action_integration_ready(&action).await;
+            // System actions are always enabled at the catalog level. Integration
+            // readiness is checked at execution time, where the failure surfaces
+            // as a structured ActionError::NotConnected the model can relay.
+            return true;
         }
 
         let disabled = self.disabled_actions.read().await;
@@ -20761,13 +21022,13 @@ print(result["text"])
 
 ## IMPORTANT RULES
 1. Follow the "Output Format" section EXACTLY - use the same structure, headings, and formatting
-2. Fill in all placeholder sections with actual content based on the search results
-3. The LinkedIn post must be 800-1200 characters as specified
-4. Include real data, trends, and insights from the search results
-5. If search results are insufficient, note this but still produce the best output possible
+2. Fill in all placeholder sections with actual content based on the search results or user-supplied evidence
+3. Respect any length, style, audience, evidence, or format constraints specified in the workflow
+4. Include real data, trends, and insights from the available evidence
+5. If evidence is insufficient, note this but still produce the best output possible
 6. Use today's date where [Date] is specified: {}
 
-## SEARCH RESULTS TO ANALYZE
+## SEARCH RESULTS OR SUPPORTING EVIDENCE TO ANALYZE
 {}
 "#,
             workflow_content,
@@ -21137,6 +21398,10 @@ print(result["text"])
         let mut queries = Vec::new();
         let year = chrono::Utc::now().format("%Y");
         let month = chrono::Utc::now().format("%B");
+        let search_disabled = workflow.lines().any(|line| {
+            let normalized = line.trim().to_ascii_lowercase();
+            normalized == "search: none" || normalized == "search: false"
+        });
 
         // Look for search queries in the workflow (lines starting with - "...")
         for line in workflow.lines() {
@@ -21149,6 +21414,10 @@ print(result["text"])
                     .replace("February", &month.to_string());
                 queries.push(query.to_string());
             }
+        }
+
+        if search_disabled {
+            return queries;
         }
 
         // If the workflow does not declare explicit queries, fall back to a
@@ -21714,6 +21983,21 @@ mod tests {
         assert_eq!(structured.status, "completed");
     }
 
+    #[test]
+    fn permission_requirement_error_uses_redaction_safe_labels() {
+        let message = ActionRuntime::build_permission_requirement_error(
+            "workspace_executor",
+            &[crate::security::action_guard::Permission::Custom(
+                "google_workspace_command".to_string(),
+            )],
+        );
+        let redacted = crate::security::redact_secret_input(&message).text;
+
+        assert!(!redacted.contains("[REDACTED_SECRET]"));
+        assert!(redacted.contains("google workspace command"));
+        assert!(!redacted.contains("Auto-Approve Skills"));
+    }
+
     #[tokio::test]
     async fn watch_action_rejects_incomplete_single_watcher() {
         let temp = tempfile::tempdir().unwrap();
@@ -22063,10 +22347,12 @@ mod tests {
 
         assert_eq!(action.source, ActionSource::System);
         assert!(action.capabilities.iter().any(|cap| cap == "file_read"));
-        assert!(action
-            .capabilities
-            .iter()
-            .any(|cap| cap == "capability_inventory"));
+        assert!(
+            action
+                .capabilities
+                .iter()
+                .any(|cap| cap == "capability_inventory")
+        );
     }
 
     #[tokio::test]
@@ -22077,10 +22363,12 @@ mod tests {
         let action = action_def_by_name(&runtime, "manage_actions").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert!(action
-            .capabilities
-            .iter()
-            .any(|cap| cap == "skill_management"));
+        assert!(
+            action
+                .capabilities
+                .iter()
+                .any(|cap| cap == "skill_management")
+        );
     }
 
     #[tokio::test]
@@ -22094,14 +22382,11 @@ mod tests {
         assert!(action.capabilities.iter().any(|cap| cap == "multi_agent"));
         assert!(action.capabilities.iter().any(|cap| cap == "swarm"));
         assert_eq!(action.input_schema["required"], serde_json::json!(["task"]));
-        let metadata = crate::actions::planner_metadata_for_action(&action);
-        assert_eq!(
-            metadata.role,
-            crate::actions::PlannerActionRole::Orchestration
-        );
+        let metadata = crate::actions::action_metadata_for_action(&action);
+        assert_eq!(metadata.role, crate::actions::ActionRole::Orchestration);
         assert_eq!(
             metadata.side_effect_level,
-            crate::actions::PlannerSideEffectLevel::Write
+            crate::actions::ActionSideEffectLevel::Write
         );
     }
 
@@ -22113,9 +22398,11 @@ mod tests {
         let action = action_def_by_name(&runtime, "capability_acquire").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert!(ActionRuntime::action_required_agent_permission_ids(&action)
-            .iter()
-            .any(|permission| permission == "capability_acquire"));
+        assert!(
+            ActionRuntime::action_required_agent_permission_ids(&action)
+                .iter()
+                .any(|permission| permission == "capability_acquire")
+        );
     }
 
     #[tokio::test]
@@ -22144,7 +22431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_enabled_actions_autoheals_connected_google_workspace() {
+    async fn list_enabled_actions_exposes_connected_google_workspace_without_load_time_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
         manager
@@ -22184,18 +22471,22 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(enabled
-            .iter()
-            .any(|action| action.name == "google_workspace_gws_command"));
-        assert!(enabled
-            .iter()
-            .any(|action| action.name == "google_workspace_gws_skills"));
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_workspace_gws_command")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_workspace_gws_skills")
+        );
         assert_eq!(
             manager
                 .get_custom_secret(&integration_enabled_key("google_workspace"))
                 .unwrap()
                 .as_deref(),
-            Some("true")
+            Some("false")
         );
     }
 
@@ -22261,16 +22552,20 @@ mod tests {
             .find(|item| item.get("id").and_then(|id| id.as_str()) == Some("google_workspace"))
             .expect("workspace action-backed surface should be visible");
 
-        assert!(gmail["available_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action.as_str() == Some("gmail_scan")));
-        assert!(workspace["available_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action.as_str() == Some("google_workspace_gws_command")));
+        assert!(
+            gmail["available_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str() == Some("gmail_scan"))
+        );
+        assert!(
+            workspace["available_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str() == Some("google_workspace_gws_command"))
+        );
     }
 
     #[tokio::test]
@@ -22319,11 +22614,13 @@ mod tests {
             .expect("inspect should find Gmail from enabled action metadata");
 
         assert_eq!(gmail["safe_check"]["ready_for_agent"], true);
-        assert!(gmail["safe_check"]["available_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action.as_str() == Some("gmail_scan")));
+        assert!(
+            gmail["safe_check"]["available_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str() == Some("gmail_scan"))
+        );
     }
 
     #[tokio::test]
@@ -22406,45 +22703,61 @@ mod tests {
             "auth_config_satisfied"
         );
         assert_eq!(live_action["authorization"]["requires_auth"], true);
-        assert!(live_action["content"]
-            .as_str()
-            .unwrap()
-            .contains("ready_for_agent_now"));
+        assert!(
+            live_action["content"]
+                .as_str()
+                .unwrap()
+                .contains("ready_for_agent_now")
+        );
     }
 
     #[tokio::test]
-    async fn list_enabled_actions_hides_disconnected_workspace_tools() {
+    async fn list_enabled_actions_exposes_system_workspace_tools_for_execution_time_errors() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         runtime.load_builtin_actions().await.unwrap();
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
-        assert!(!enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "calendar_create"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_drive_search"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_docs_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_sheets_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_chat_list_spaces"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_admin_list_users"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_workspace_gws_command"));
+        assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "calendar_create")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_drive_search")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_docs_read")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_sheets_read")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_chat_list_spaces")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_admin_list_users")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_workspace_gws_command")
+        );
     }
 
     #[tokio::test]
-    async fn list_enabled_actions_exposes_granted_gmail_without_calendar() {
+    async fn list_enabled_actions_exposes_workspace_system_tools_without_bundle_filtering() {
         let temp = tempfile::tempdir().unwrap();
         let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
         manager
@@ -22478,29 +22791,41 @@ mod tests {
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
         assert!(enabled.iter().any(|action| action.name == "gmail_reply"));
-        assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "calendar_create"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_drive_search"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_docs_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_sheets_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_chat_list_spaces"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_admin_list_users"));
+        assert!(enabled.iter().any(|action| action.name == "calendar_today"));
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "calendar_create")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_drive_search")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_docs_read")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_sheets_read")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_chat_list_spaces")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_admin_list_users")
+        );
     }
 
     #[tokio::test]
-    async fn list_enabled_actions_exposes_only_granted_workspace_bundle_tools() {
+    async fn list_enabled_actions_exposes_all_workspace_system_tools_with_partial_grants() {
         let temp = tempfile::tempdir().unwrap();
         let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
         manager
@@ -22534,35 +22859,64 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(enabled
-            .iter()
-            .any(|action| action.name == "google_drive_search"));
-        assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_docs_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_sheets_read"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_chat_list_spaces"));
-        assert!(!enabled
-            .iter()
-            .any(|action| action.name == "google_admin_list_users"));
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_drive_search")
+        );
+        assert!(enabled.iter().any(|action| action.name == "calendar_today"));
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_docs_read")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_sheets_read")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_chat_list_spaces")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|action| action.name == "google_admin_list_users")
+        );
     }
 
     #[tokio::test]
-    async fn list_enabled_actions_hides_unconfigured_external_connector_tools() {
+    async fn list_enabled_actions_exposes_unconfigured_system_connectors_for_execution_time_errors()
+    {
         let temp = tempfile::tempdir().unwrap();
         let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         runtime.load_builtin_actions().await.unwrap();
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
-        assert!(!enabled.iter().any(|action| action.name == "places"));
-        assert!(!enabled.iter().any(|action| action.name == "twilio"));
-        assert!(!enabled.iter().any(|action| action.name == "github"));
+        assert!(enabled.iter().any(|action| action.name == "places"));
+        assert!(enabled.iter().any(|action| action.name == "twilio"));
+        assert!(enabled.iter().any(|action| action.name == "github"));
         assert!(enabled.iter().any(|action| action.name == "moltbook"));
+        let places_error = runtime
+            .execute_action(
+                "places",
+                &serde_json::json!({ "action": "search", "query": "coffee" }),
+            )
+            .await
+            .unwrap_err();
+        let places_action_error = places_error
+            .downcast_ref::<crate::actions::ActionError>()
+            .expect("unconfigured connector should return a typed action error");
+        assert_eq!(
+            places_action_error.domain(),
+            crate::actions::ActionErrorDomain::Integration
+        );
+        assert_eq!(
+            places_action_error.reason(),
+            crate::actions::ActionErrorReason::NotConnected
+        );
         let status = runtime
             .execute_action("moltbook", &serde_json::json!({ "action": "status" }))
             .await
@@ -22757,9 +23111,11 @@ version: "1.2.3"
         let reloaded = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         reloaded.load_all_actions().await.unwrap();
         let reloaded_actions = reloaded.list_actions().await.unwrap();
-        assert!(reloaded_actions
-            .iter()
-            .any(|action| action.name == "officecli"));
+        assert!(
+            reloaded_actions
+                .iter()
+                .any(|action| action.name == "officecli")
+        );
     }
 
     #[tokio::test]
@@ -22849,9 +23205,11 @@ version: "1.2.3"
         let action = action_def_by_name(&runtime, "vision_ocr").await;
 
         assert!(action.capabilities.contains(&"vision_ocr".to_string()));
-        assert!(!action
-            .capabilities
-            .contains(&"image_generation".to_string()));
+        assert!(
+            !action
+                .capabilities
+                .contains(&"image_generation".to_string())
+        );
         assert!(action.authorization.access.integration_ids.is_empty());
     }
 
@@ -22907,9 +23265,11 @@ version: "1.2.3"
 
         assert_eq!(candidates[0].model, "primary-model");
         assert_eq!(candidates[0].provider_label(), "openrouter");
-        assert!(candidates
-            .iter()
-            .any(|candidate| candidate.model == "legacy-model"));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.model == "legacy-model")
+        );
     }
 
     #[test]
@@ -23017,21 +23377,31 @@ version: "1.2.3"
         let background_session_manage =
             action_def_by_name(&runtime, "background_session_manage").await;
 
-        assert!(app_deploy
-            .description
-            .contains("implement that behavior inside the artifact"));
-        assert!(schedule_task
-            .description
-            .contains("cadence that belongs inside a generated app"));
-        assert!(watch
-            .description
-            .contains("inside a generated app, dashboard, page, or tool's own UI"));
-        assert!(background_session_manage
-            .description
-            .contains("durable AgentArk background session"));
-        assert!(background_session_manage
-            .description
-            .contains("not app-internal refresh/poll cadence"));
+        assert!(
+            app_deploy
+                .description
+                .contains("implement that behavior inside the artifact")
+        );
+        assert!(
+            schedule_task
+                .description
+                .contains("cadence that belongs inside a generated app")
+        );
+        assert!(
+            watch
+                .description
+                .contains("inside a generated app, dashboard, page, or tool's own UI")
+        );
+        assert!(
+            background_session_manage
+                .description
+                .contains("durable AgentArk background session")
+        );
+        assert!(
+            background_session_manage
+                .description
+                .contains("not app-internal refresh/poll cadence")
+        );
     }
 
     fn trusted_chat_context(
@@ -23050,7 +23420,7 @@ version: "1.2.3"
     }
 
     #[tokio::test]
-    async fn trusted_chat_allows_high_risk_builtin_actions() {
+    async fn trusted_chat_requires_approval_for_high_risk_builtin_actions() {
         let runtime = runtime_for_authorization_tests().await;
         let action = action_def_by_name(&runtime, "code_execute").await;
         let decision = runtime
@@ -23071,17 +23441,20 @@ version: "1.2.3"
             .await
             .unwrap();
 
-        assert!(decision.allowed);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("permission"));
     }
 
     #[tokio::test]
     async fn lan_discover_requires_explicit_approval_for_trusted_chat() {
         let runtime = runtime_for_authorization_tests().await;
         let action = action_def_by_name(&runtime, "lan_discover").await;
-        assert!(action
-            .capabilities
-            .iter()
-            .any(|cap| cap == "local_network_discovery"));
+        assert!(
+            action
+                .capabilities
+                .iter()
+                .any(|cap| cap == "local_network_discovery")
+        );
 
         let decision = runtime
             .authorize_action_invocation(
@@ -23102,7 +23475,35 @@ version: "1.2.3"
             .unwrap();
 
         assert!(!decision.allowed);
-        assert!(decision.reason.contains("explicit user approval"));
+        assert!(decision.requires_explicit_approval);
+    }
+
+    #[tokio::test]
+    async fn custom_permission_requires_inline_approval_for_trusted_chat() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "google_workspace_gws_command").await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "google_workspace_gws_command",
+                Some(&action),
+                &serde_json::json!({ "argv": ["about"] }),
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
+                    capability_context_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(decision.requires_explicit_approval);
+        let redacted = crate::security::redact_secret_input(&decision.reason).text;
+        assert!(!redacted.contains("[REDACTED_SECRET]"));
     }
 
     #[tokio::test]
@@ -23131,7 +23532,7 @@ version: "1.2.3"
     }
 
     #[tokio::test]
-    async fn trusted_api_allows_high_risk_builtin_actions() {
+    async fn trusted_api_requires_approval_for_high_risk_builtin_actions() {
         let runtime = runtime_for_authorization_tests().await;
         let action = action_def_by_name(&runtime, "shell").await;
         let decision = runtime
@@ -23152,7 +23553,8 @@ version: "1.2.3"
             .await
             .unwrap();
 
-        assert!(decision.allowed);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("permission"));
     }
 
     #[tokio::test]
@@ -23233,12 +23635,13 @@ version: "1.2.3"
     }
 
     #[tokio::test]
-    async fn trusted_chat_bypasses_permission_gate_for_code_execute() {
+    async fn trusted_chat_does_not_bypass_permission_gate_for_code_execute() {
         let runtime = runtime_for_permission_gate_tests().await;
         let action = action_def_by_name(&runtime, "code_execute").await;
         let unapproved = runtime
             .unapproved_permissions_for_action(
                 &action,
+                &serde_json::json!({}),
                 &ActionAuthorizationContext {
                     principal: Some(ActionCallerPrincipal::local_admin("test")),
                     surface: ActionExecutionSurface::Chat,
@@ -23251,7 +23654,7 @@ version: "1.2.3"
             )
             .await;
 
-        assert!(unapproved.is_empty());
+        assert!(!unapproved.is_empty());
     }
 
     #[tokio::test]
@@ -23283,6 +23686,7 @@ version: "1.2.3"
             let unapproved = runtime
                 .unapproved_permissions_for_action(
                     &action,
+                    &serde_json::json!({}),
                     &ActionAuthorizationContext {
                         surface: surface.clone(),
                         ..ActionAuthorizationContext::default()
@@ -23300,20 +23704,23 @@ version: "1.2.3"
         let unapproved_api = runtime
             .unapproved_permissions_for_action(
                 &action,
+                &serde_json::json!({}),
                 &ActionAuthorizationContext {
                     surface: ActionExecutionSurface::Api,
                     ..ActionAuthorizationContext::default()
                 },
             )
             .await;
-        assert!(unapproved_api
-            .iter()
-            .any(|permission| { permission.to_string().eq_ignore_ascii_case("broad_network") }));
+        assert!(
+            unapproved_api
+                .iter()
+                .any(|permission| { permission.to_string().eq_ignore_ascii_case("broad_network") })
+        );
     }
 
     #[tokio::test]
-    async fn runtime_correlation_requires_approval_for_non_direct_sensitive_read_then_external_send(
-    ) {
+    async fn runtime_correlation_requires_approval_for_non_direct_sensitive_read_then_external_send()
+     {
         let runtime = runtime_for_authorization_tests().await;
         let memory = action_def_by_name(&runtime, "memory_lookup").await;
         let schedule = action_def_by_name(&runtime, "schedule_task").await;
@@ -23350,7 +23757,8 @@ version: "1.2.3"
     }
 
     #[tokio::test]
-    async fn runtime_correlation_allows_direct_trusted_sensitive_read_then_external_send() {
+    async fn runtime_correlation_allows_direct_trusted_sensitive_read_then_external_send()
+     {
         let runtime = runtime_for_authorization_tests().await;
         let memory = action_def_by_name(&runtime, "memory_lookup").await;
         let schedule = action_def_by_name(&runtime, "schedule_task").await;
@@ -23396,12 +23804,14 @@ version: "1.2.3"
         let mut context = trusted_chat_context("test-sensitive-notify-send", false);
         context.direct_user_intent = false;
 
-        assert!(notify
-            .authorization
-            .access
-            .channel_targets
-            .iter()
-            .any(|target| target.argument_key == "delivery_channel"));
+        assert!(
+            notify
+                .authorization
+                .access
+                .channel_targets
+                .iter()
+                .any(|target| target.argument_key == "delivery_channel")
+        );
 
         let read_decision = runtime
             .authorize_action_invocation(
@@ -23432,7 +23842,32 @@ version: "1.2.3"
     }
 
     #[tokio::test]
-    async fn watch_authorization_allows_direct_trusted_nested_poll_action_and_delivery() {
+    async fn runtime_allows_user_originated_background_notify_delivery() {
+        let runtime = runtime_for_authorization_tests().await;
+        let notify = action_def_by_name(&runtime, "notify_user").await;
+        let mut context = trusted_chat_context("test-background-notify-send", false);
+        context.surface = ActionExecutionSurface::Background;
+
+        let send_decision = runtime
+            .authorize_action_invocation(
+                "notify_user",
+                Some(&notify),
+                &serde_json::json!({
+                    "message": "Send the matched update",
+                    "delivery_channel": "telegram"
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(send_decision.allowed);
+        assert!(!send_decision.requires_explicit_approval);
+    }
+
+    #[tokio::test]
+    async fn watch_authorization_allows_direct_trusted_nested_poll_action_and_delivery()
+     {
         let runtime = runtime_for_authorization_tests().await;
         let watch = action_def_by_name(&runtime, "watch").await;
         let context = trusted_chat_context("test-watch-read-send", false);
@@ -23678,9 +24113,11 @@ version: "1.2.3"
             .await
             .expect_err("read-only GraphQL mutation should be rejected");
 
-        assert!(error
-            .to_string()
-            .contains("Read-only GraphQL custom API actions only accept GraphQL query"));
+        assert!(
+            error
+                .to_string()
+                .contains("Read-only GraphQL custom API actions only accept GraphQL query")
+        );
     }
 
     #[tokio::test]
@@ -23688,12 +24125,18 @@ version: "1.2.3"
         let runtime = runtime_for_permission_gate_tests().await;
         let action = action_def_by_name(&runtime, "code_execute").await;
         let unapproved = runtime
-            .unapproved_permissions_for_action(&action, &ActionAuthorizationContext::default())
+            .unapproved_permissions_for_action(
+                &action,
+                &serde_json::json!({}),
+                &ActionAuthorizationContext::default(),
+            )
             .await;
 
-        assert!(unapproved
-            .iter()
-            .any(|perm| matches!(perm, crate::security::action_guard::Permission::CodeExecute)));
+        assert!(
+            unapproved
+                .iter()
+                .any(|perm| matches!(perm, crate::security::action_guard::Permission::CodeExecute))
+        );
     }
 
     #[tokio::test]

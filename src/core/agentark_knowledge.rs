@@ -591,7 +591,7 @@ fn build_runtime_action_catalog_docs(actions: &[ActionDef]) -> Vec<SeedKnowledge
             } else {
                 action.capabilities.join(", ")
             };
-            let metadata = action.planner_metadata();
+            let metadata = action.action_metadata();
             let auth = if metadata.requires_auth || action.authorization.requires_auth {
                 "auth/config satisfied"
             } else {

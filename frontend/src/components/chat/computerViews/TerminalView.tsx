@@ -10,6 +10,7 @@ import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import type { ChatStepCard } from "../types";
 import { extractCommand, extractSurfaceBody } from "../dispatch";
 import { surfaceFromCard } from "../surface";
+import { LinkifiedText } from "./LinkifiedText";
 import { buildReadableToolPresentation } from "./presentation";
 
 export interface TerminalViewProps {
@@ -108,12 +109,12 @@ export function TerminalView({ card, live = false }: TerminalViewProps) {
         </Tooltip>
       </Box>
       <pre className="cview-terminal-body">
-        {body || (live ? "..." : "(no output captured)")}
+        {body ? <LinkifiedText text={body} /> : live ? "..." : "(no output captured)"}
         {live ? <span className="cview-terminal-caret" aria-hidden="true">|</span> : null}
       </pre>
       {card.detail && card.detail !== body ? (
         <Typography variant="caption" className="cview-terminal-detail">
-          {card.detail}
+          <LinkifiedText text={card.detail} />
         </Typography>
       ) : null}
     </Box>

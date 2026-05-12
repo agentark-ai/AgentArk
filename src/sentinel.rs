@@ -4754,7 +4754,11 @@ async fn run_watchers(agent: &SharedAgent) {
                     continue;
                 }
                 let matched = if let Some(outcome) =
-                    Agent::evaluate_watch_condition_without_llm(&watcher.condition, &result)
+                    Agent::evaluate_watch_condition_without_llm(
+                        &watcher.condition,
+                        &result,
+                        watcher.last_result.as_deref(),
+                    )
                 {
                     match outcome {
                         Ok(matched) => matched,

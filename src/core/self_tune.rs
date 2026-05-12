@@ -3,6 +3,8 @@
 //! adjusts autonomy confidence, and generates prompt hints —
 //! all automatically from usage patterns.
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

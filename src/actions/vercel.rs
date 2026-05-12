@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 

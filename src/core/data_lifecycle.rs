@@ -5,6 +5,7 @@ use crate::storage::Storage;
 
 const DATA_LIFECYCLE_SETTINGS_KEY: &str = "data_lifecycle_settings_v1";
 const MAX_RETENTION_DAYS: u64 = 36_500;
+const MAX_OPERATIONAL_LOG_RETENTION_DAYS: u64 = 14;
 const LEGACY_MEMORY_RETENTION_DAYS: u64 = 365;
 const MAX_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 const MIN_NOTIFICATION_INTERVAL_SECS: u64 = 300;
@@ -93,7 +94,7 @@ fn default_execution_proof_retention_days() -> u64 {
 }
 
 fn default_operational_log_retention_days() -> u64 {
-    30
+    MAX_OPERATIONAL_LOG_RETENTION_DAYS
 }
 
 fn default_security_log_retention_days() -> u64 {
@@ -219,8 +220,9 @@ impl DataLifecycleSettings {
             self.execution_trace_retention_days.min(MAX_RETENTION_DAYS);
         self.execution_proof_retention_days =
             self.execution_proof_retention_days.min(MAX_RETENTION_DAYS);
-        self.operational_log_retention_days =
-            self.operational_log_retention_days.min(MAX_RETENTION_DAYS);
+        self.operational_log_retention_days = self
+            .operational_log_retention_days
+            .min(MAX_OPERATIONAL_LOG_RETENTION_DAYS);
         self.security_log_retention_days = self.security_log_retention_days.min(MAX_RETENTION_DAYS);
         self.approval_log_retention_days = self.approval_log_retention_days.min(MAX_RETENTION_DAYS);
         self.swarm_delegation_retention_days =

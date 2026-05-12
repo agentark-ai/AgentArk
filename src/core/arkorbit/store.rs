@@ -487,6 +487,7 @@ fn canonicalize_existing_under(root: &Path, candidate: &Path) -> Result<PathBuf>
 }
 
 fn validate_orbit_file_content(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    validate_orbit_json_content(rel, content)?;
     if !is_browser_javascript_path(rel) {
         return Ok(());
     }
@@ -494,6 +495,65 @@ fn validate_orbit_file_content(root: &Path, rel: &Path, content: &[u8]) -> Resul
         .with_context(|| format!("arkorbit: {} must be valid UTF-8", rel.display()))?;
     validate_widget_module_contract(rel, source)?;
     validate_browser_javascript_syntax(root, rel, content)
+}
+
+fn validate_orbit_json_content(rel: &Path, content: &[u8]) -> Result<()> {
+    let normalized = rel.to_string_lossy().replace('\\', "/");
+    if normalized != "data/widgets.json" {
+        return Ok(());
+    }
+    let source = std::str::from_utf8(content)
+        .with_context(|| format!("arkorbit: {} must be valid UTF-8", rel.display()))?;
+    validate_widget_registry_json(source)
+}
+
+fn validate_widget_registry_json(source: &str) -> Result<()> {
+    let parsed = serde_json::from_str::<serde_json::Value>(source)
+        .context("arkorbit: data/widgets.json must be valid JSON")?;
+    let widgets = parsed
+        .as_array()
+        .or_else(|| parsed.get("widgets").and_then(|value| value.as_array()))
+        .ok_or_else(|| {
+            anyhow!("arkorbit: data/widgets.json must be an array or an object with a widgets array")
+        })?;
+    for (index, widget) in widgets.iter().enumerate() {
+        let object = widget.as_object().ok_or_else(|| {
+            anyhow!(
+                "arkorbit: data/widgets.json widget at index {} must be an object",
+                index
+            )
+        })?;
+        for key in ["id", "module", "title"] {
+            if let Some(value) = object.get(key) {
+                if !value.is_string() {
+                    bail!(
+                        "arkorbit: data/widgets.json widget {} field '{}' must be a string",
+                        index,
+                        key
+                    );
+                }
+            }
+        }
+        for key in ["left", "top", "width", "height"] {
+            if let Some(value) = object.get(key) {
+                let Some(number) = value.as_f64() else {
+                    bail!(
+                        "arkorbit: data/widgets.json widget {} field '{}' must be a finite number",
+                        index,
+                        key
+                    );
+                };
+                if !number.is_finite() || number < 0.0 || number > 1_000_000.0 {
+                    bail!(
+                        "arkorbit: data/widgets.json widget {} field '{}' must be between 0 and 1000000",
+                        index,
+                        key
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_browser_javascript_path(rel: &Path) -> bool {
@@ -1061,6 +1121,59 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.layer, ModuleLayer::L2);
         assert_eq!(resolved.content_type, "application/json; charset=utf-8");
+    }
+
+    #[test]
+    fn widget_registry_write_rejects_invalid_json() {
+        let tmp = TempDir::new().unwrap();
+        let store = LayeredStore::new(tmp.path());
+        let orbit_id = Uuid::new_v4().to_string();
+
+        let err = store
+            .write_orbit_file(&orbit_id, "data/widgets.json", br#"[{"id":"demo"}"#)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("must be valid JSON"));
+        assert!(!store
+            .orbit_dir(&orbit_id)
+            .join("data")
+            .join("widgets.json")
+            .exists());
+    }
+
+    #[test]
+    fn widget_registry_write_accepts_array_or_wrapped_widgets() {
+        let tmp = TempDir::new().unwrap();
+        let store = LayeredStore::new(tmp.path());
+        let orbit_id = Uuid::new_v4().to_string();
+
+        store
+            .write_orbit_file(
+                &orbit_id,
+                "data/widgets.json",
+                br#"[{"id":"demo","module":"demo","left":12}]"#,
+            )
+            .unwrap();
+        store
+            .write_orbit_file(
+                &orbit_id,
+                "data/widgets.json",
+                br#"{"widgets":[{"id":"demo","module":"demo","top":16}]}"#,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn widget_registry_write_rejects_non_widget_shapes() {
+        let tmp = TempDir::new().unwrap();
+        let store = LayeredStore::new(tmp.path());
+        let orbit_id = Uuid::new_v4().to_string();
+
+        let err = store
+            .write_orbit_file(&orbit_id, "data/widgets.json", br#"{"items":[]}"#)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("widgets array"));
     }
 
     #[test]

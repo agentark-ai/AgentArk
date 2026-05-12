@@ -3,7 +3,7 @@
 //! Allows the agent to execute commands on configured remote servers.
 //! Private keys are stored encrypted via SecureConfigManager.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use std::path::Path;
 use std::sync::Arc;
 

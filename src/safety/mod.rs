@@ -91,6 +91,19 @@ pub enum RuleAction {
     LogAndAllow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SafetyPolicyDecision {
+    Allow,
+    RequireApproval { reason: String },
+    Block { reason: String },
+}
+
+impl SafetyPolicyDecision {
+    pub fn allowed(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
 /// The safety policy engine
 pub struct SafetyEngine {
     rules: RwLock<Vec<SafetyRule>>,
@@ -180,14 +193,18 @@ impl SafetyEngine {
         arguments: &serde_json::Value,
         auth_context: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Result<bool> {
-        if direct_trusted_chat_overrides_safety(auth_context) {
-            tracing::debug!(
-                "Safety policy bypassed for direct trusted chat action: {}",
-                action_name
-            );
-            return Ok(true);
-        }
+        Ok(self
+            .evaluate_with_authorization(action_name, arguments, auth_context)
+            .await?
+            .allowed())
+    }
 
+    pub async fn evaluate_with_authorization(
+        &self,
+        action_name: &str,
+        arguments: &serde_json::Value,
+        auth_context: Option<&crate::actions::ActionAuthorizationContext>,
+    ) -> Result<SafetyPolicyDecision> {
         // Clone rules to avoid borrow issues with rate limiting
         let rules = self
             .rules
@@ -221,7 +238,9 @@ impl SafetyEngine {
                                 action_name,
                                 message
                             );
-                            return Ok(false);
+                            return Ok(SafetyPolicyDecision::Block {
+                                reason: message.clone(),
+                            });
                         }
                         RuleAction::RequireApproval => {
                             // Check if user has auto-approved this action in settings
@@ -238,6 +257,14 @@ impl SafetyEngine {
                                 );
                                 continue; // User explicitly approved — skip this rule
                             }
+                            if explicit_approval_satisfies_safety_rule(auth_context) {
+                                tracing::info!(
+                                    "Safety rule '{}' approved by explicit approval turn for action: {}",
+                                    rule.name,
+                                    action_name
+                                );
+                                continue;
+                            }
                             tracing::info!(
                                 "Safety rule '{}' requires approval for action: {}",
                                 rule.name,
@@ -253,7 +280,12 @@ impl SafetyEngine {
                                     requested_at: std::time::Instant::now(),
                                 });
                             }
-                            return Ok(false);
+                            return Ok(SafetyPolicyDecision::RequireApproval {
+                                reason: format!(
+                                    "Safety rule '{}' requires explicit approval for action '{}'.",
+                                    rule.name, action_name
+                                ),
+                            });
                         }
                         RuleAction::Delay { seconds } => {
                             tracing::info!(
@@ -270,7 +302,7 @@ impl SafetyEngine {
             }
         }
 
-        Ok(true)
+        Ok(SafetyPolicyDecision::Allow)
     }
 
     fn rule_matches_static(trigger: &RuleTrigger, action_name: &str) -> bool {
@@ -529,12 +561,16 @@ impl SafetyEngine {
     }
 }
 
-fn direct_trusted_chat_overrides_safety(
+fn explicit_approval_satisfies_safety_rule(
     auth_context: Option<&crate::actions::ActionAuthorizationContext>,
 ) -> bool {
     auth_context.is_some_and(|ctx| {
-        matches!(ctx.surface, crate::actions::ActionExecutionSurface::Chat)
-            && ctx.direct_user_intent
+        matches!(
+            ctx.surface,
+            crate::actions::ActionExecutionSurface::Chat
+                | crate::actions::ActionExecutionSurface::Api
+        ) && ctx.direct_user_intent
+            && ctx.current_turn_is_explicit_approval
             && ctx
                 .principal
                 .as_ref()
@@ -553,7 +589,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_trusted_chat_overrides_safety_rules() {
+    fn normal_trusted_chat_does_not_satisfy_safety_approval() {
         let ctx = crate::actions::ActionAuthorizationContext {
             principal: Some(crate::actions::ActionCallerPrincipal {
                 user_id: "local-user".to_string(),
@@ -568,7 +604,26 @@ mod tests {
             agent_access_scope: None,
             capability_context_id: None,
         };
-        assert!(direct_trusted_chat_overrides_safety(Some(&ctx)));
+        assert!(!explicit_approval_satisfies_safety_rule(Some(&ctx)));
+    }
+
+    #[test]
+    fn explicit_trusted_approval_satisfies_safety_approval() {
+        let ctx = crate::actions::ActionAuthorizationContext {
+            principal: Some(crate::actions::ActionCallerPrincipal {
+                user_id: "local-user".to_string(),
+                role: "owner".to_string(),
+                trusted: true,
+                auth_source: "web".to_string(),
+            }),
+            surface: crate::actions::ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: true,
+            agent_name: None,
+            agent_access_scope: None,
+            capability_context_id: None,
+        };
+        assert!(explicit_approval_satisfies_safety_rule(Some(&ctx)));
     }
 
     #[test]
@@ -587,11 +642,11 @@ mod tests {
             agent_access_scope: None,
             capability_context_id: None,
         };
-        assert!(!direct_trusted_chat_overrides_safety(Some(&ctx)));
+        assert!(!explicit_approval_satisfies_safety_rule(Some(&ctx)));
     }
 
     #[tokio::test]
-    async fn direct_trusted_chat_allows_blocked_rule_actions() {
+    async fn direct_trusted_chat_does_not_bypass_blocked_rule_actions() {
         let temp = tempfile::tempdir().unwrap();
         let safety = SafetyEngine::new(temp.path()).unwrap();
         safety.add_rule(SafetyRule {
@@ -619,7 +674,7 @@ mod tests {
             capability_context_id: None,
         };
 
-        assert!(safety
+        assert!(!safety
             .is_allowed_with_authorization("http_get", &serde_json::json!({}), Some(&ctx))
             .await
             .unwrap());

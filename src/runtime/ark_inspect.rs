@@ -1297,9 +1297,11 @@ mod tests {
         let action = action_def();
         let rendered = serde_json::to_string(&action.input_schema).expect("schema should render");
 
-        assert!(action
-            .description
-            .contains("current model/provider selection"));
+        assert!(
+            action
+                .description
+                .contains("current model/provider selection")
+        );
         assert!(action.capabilities.contains(&"model_runtime".to_string()));
         assert!(rendered.contains("\"models\""));
         assert!(rendered.contains("current model/provider selection"));

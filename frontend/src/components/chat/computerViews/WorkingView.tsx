@@ -8,6 +8,7 @@ import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import { LinkifiedText } from "./LinkifiedText";
 
 export interface WorkingViewProps {
   phaseLabel?: string;
@@ -29,6 +30,7 @@ const REASONING_PHASE_LABELS: Record<string, string> = {
   classifier: "Reviewing intent",
   planner: "Planning",
   model: "Reasoning",
+  model_summary: "Reasoning summary",
 };
 const WORKING_PREVIEW_MAX_CHARS = 12_000;
 
@@ -183,7 +185,7 @@ export function WorkingView({
       </Box>
       {detail ? (
         <Typography variant="body2" className="cview-working-detail">
-          {detail}
+          <LinkifiedText text={detail} />
         </Typography>
       ) : null}
       {reasoningPill ? (
@@ -201,7 +203,7 @@ export function WorkingView({
         <Box className="cview-working-preview-fade" aria-hidden="true" />
         {previewContent ? (
           <pre ref={previewRef} onScroll={handlePreviewScroll}>
-            {previewContent}
+            <LinkifiedText text={previewContent} />
           </pre>
         ) : (
           <Typography variant="body2" className="cview-working-preview-empty">

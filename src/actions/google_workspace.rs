@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -449,32 +449,9 @@ pub fn load_saved_bundles(config_dir: &Path) -> Result<Vec<String>> {
                     return Ok(tokens.granted_bundles);
                 }
             }
-            let inferred = legacy_connected_bundles(config_dir)?;
-            if inferred.is_empty() {
-                Ok(default_bundles())
-            } else {
-                Ok(inferred)
-            }
+            Ok(default_bundles())
         }
     }
-}
-
-fn legacy_connected_bundles(config_dir: &Path) -> Result<Vec<String>> {
-    let manager = manager(config_dir)?;
-    let mut inferred = BTreeSet::new();
-    for (bundle, key) in [("gmail", "gmail_tokens"), ("calendar", "calendar_tokens")] {
-        if let Some(raw) = manager.get_custom_secret(key)? {
-            let parsed: serde_json::Value = serde_json::from_str(&raw)?;
-            if parsed
-                .get("refresh_token")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                inferred.insert(bundle.to_string());
-            }
-        }
-    }
-    Ok(inferred.into_iter().collect())
 }
 
 pub fn save_selected_bundles(config_dir: &Path, bundles: &[String]) -> Result<()> {
@@ -1229,7 +1206,7 @@ pub fn granted_bundles(config_dir: &Path) -> Result<Vec<String>> {
             return Ok(tokens.granted_bundles);
         }
     }
-    legacy_connected_bundles(config_dir)
+    Ok(Vec::new())
 }
 
 pub fn missing_selected_bundles(config_dir: &Path) -> Result<Vec<String>> {
@@ -1270,17 +1247,15 @@ pub async fn ensure_access_token_for_bundles(
             .map(|bundle| bundle_label(bundle))
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(anyhow!(
-            "Google Workspace needs additional access for {}. Reconnect the integration to grant those bundles.",
-            requested
-        ));
-    }
-
-    if normalized.len() == 1
-        && normalized[0] == "gmail"
-        && load_workspace_tokens(config_dir)?.is_none()
-    {
-        return crate::actions::gmail::ensure_legacy_access_token(config_dir).await;
+        return Err(crate::actions::ActionError::new(
+            crate::actions::ActionErrorDomain::Integration,
+            crate::actions::ActionErrorReason::BundleNotGranted,
+            format!(
+                "Google Workspace needs additional access for {}. Reconnect the integration to grant those bundles.",
+                requested
+            ),
+        )
+        .into_anyhow());
     }
 
     current_workspace_access_token(config_dir).await
@@ -1370,7 +1345,7 @@ pub async fn gws_command(config_dir: &Path, arguments: &serde_json::Value) -> Re
     if args.argv.is_empty() {
         return Err(anyhow!(
             "{}",
-            "Missing gws argv. Provide the arguments after `gws`, for example [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"]"
+            "Missing gws argv. Provide the command arguments after the `gws` binary."
         ));
     }
     if args
@@ -2114,7 +2089,7 @@ pub async fn test_selected_bundles(config_dir: &Path) -> Result<HashMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{http::StatusCode, routing::get, Router};
+    use axum::{Router, http::StatusCode, routing::get};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 
@@ -2298,7 +2273,7 @@ metadata:
     }
 
     #[tokio::test]
-    async fn falls_back_to_legacy_gmail_tokens_for_workspace_bundle() {
+    async fn workspace_bundle_access_does_not_fall_back_to_legacy_gmail_tokens() {
         let dir = tempdir().unwrap();
         let manager = crate::core::config::SecureConfigManager::new(dir.path()).unwrap();
         manager
@@ -2315,10 +2290,10 @@ metadata:
             )
             .unwrap();
 
-        let token = ensure_access_token_for_bundles(dir.path(), &["gmail"])
+        let error = ensure_access_token_for_bundles(dir.path(), &["gmail"])
             .await
-            .unwrap();
-        assert_eq!(token, "legacy-gmail-token");
+            .expect_err("workspace bundle access must require workspace bundle grants");
+        assert!(error.to_string().contains("needs additional access"));
     }
 
     #[tokio::test]

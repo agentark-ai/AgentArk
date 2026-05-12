@@ -1,9 +1,5 @@
-import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import {
-  Accordion,
-  AccordionDetails,
-  AccordionSummary,
   Alert,
   Box,
   Button,
@@ -133,6 +129,37 @@ function arkmemoryHistoryDetail(event: JsonRecord): string {
   return arkmemoryHistoryTitle(event);
 }
 
+// Pull the actual memory body (the thing the user remembers as "what was
+// saved") from either snapshot, trying common field names. Falls back to
+// the event-level summary. Returns empty string when no meaningful
+// content exists — used both for filtering useless rows and for the row
+// preview line. No structural decisions depend on phrasing; field names
+// are canonical.
+function arkmemoryHistoryPreview(event: JsonRecord): string {
+  const next = asRecord(event.new_snapshot);
+  const old = asRecord(event.old_snapshot);
+  const candidates = [
+    str(next.body, ""),
+    str(next.text, ""),
+    str(next.content, ""),
+    str(next.value, ""),
+    str(next.note, ""),
+    str(next.summary, ""),
+    str(old.body, ""),
+    str(old.text, ""),
+    str(old.content, ""),
+    str(old.value, ""),
+    str(old.note, ""),
+    str(old.summary, ""),
+    str(event.summary, ""),
+  ];
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
 function arkmemoryHistoryCanRestore(event: JsonRecord): boolean {
   return (
     toBool(event.reversible) && str(event.reverted_at, "").trim().length === 0
@@ -216,6 +243,9 @@ export default function ArkMemoryPage({
   onNavigateToView,
 }: ArkMemoryPageProps) {
   const queryClient = useQueryClient();
+  const [historyPage, setHistoryPage] = useState(0);
+  const [historyDialogEvent, setHistoryDialogEvent] = useState<JsonRecord | null>(null);
+  const HISTORY_PAGE_SIZE = 10;
   const [memoryTab, setMemoryTab] = useState<"current" | "queue" | "history">(
     "current",
   );
@@ -1206,169 +1236,343 @@ export default function ArkMemoryPage({
                 technical detail.
               </Typography>
             </Stack>
-            {historyEvents.length === 0 ? (
-              emptyState(
-                "No memory changes yet. Once ArkMemory adds, updates, or retires a saved fact, preference, or note, the change shows up here so you can review or undo it.",
-              )
-            ) : (
-              <Stack spacing={1}>
-                {historyEvents.map((event, idx) => {
-                  const id = str(event.id, `history-${idx}`);
-                  const created = humanTs(str(event.created_at, "-"));
-                  const type = str(event.event_type, "").trim();
-                  const relatedMemoryId = str(event.related_memory_id, "").trim();
-                  const revertedAt = str(event.reverted_at, "").trim();
-                  const directRestoreId = arkmemoryHistoryCanRestore(event) ? id : "";
-                  const linkedRestoreId =
-                    type === "queue_memory_merged" && relatedMemoryId
-                      ? (historyRestoreByMemoryId.get(relatedMemoryId) ?? "")
-                      : "";
-                  const restoreTargetId = directRestoreId || linkedRestoreId;
-                  const restoreLabel =
-                    type === "queue_memory_merged" && linkedRestoreId
-                      ? "Restore merged memory"
-                      : "Restore previous version";
-                  return (
-                    <Accordion
-                      key={id}
-                      disableGutters
-                      sx={{
-                        background: "transparent",
-                        border: "1px solid var(--ui-rgba-148-163-184-160)",
-                        borderRadius: 1,
-                        overflow: "hidden",
-                        "&:before": { display: "none" },
-                      }}
-                    >
-                      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                        <Stack spacing={0.75} sx={{ width: "100%", minWidth: 0 }}>
-                          <Stack
-                            direction="row"
-                            spacing={0.75}
-                            useFlexGap
-                            sx={{ alignItems: "center", flexWrap: "wrap", pr: 1 }}
-                          >
+            {(() => {
+              // Drop rows we have no actual content to show — "Learned user
+              // memory added to memory" with no body is noise to a novice.
+              // The detail dialog stays available; we just hide entries
+              // that have nothing to reveal inside it either.
+              const usefulHistory = historyEvents.filter(
+                (event) => arkmemoryHistoryPreview(event).trim().length > 0,
+              );
+              if (usefulHistory.length === 0) {
+                return emptyState(
+                  "No memory changes to show yet. Once ArkMemory adds, updates, or retires a saved fact, preference, or note, the change shows up here so you can review or undo it.",
+                );
+              }
+              const pageCount = Math.max(
+                1,
+                Math.ceil(usefulHistory.length / HISTORY_PAGE_SIZE),
+              );
+              const page = Math.min(historyPage, pageCount - 1);
+              const start = page * HISTORY_PAGE_SIZE;
+              const slice = usefulHistory.slice(start, start + HISTORY_PAGE_SIZE);
+              return (
+                <>
+                  <Stack spacing={0.4}>
+                    {slice.map((event, idx) => {
+                      const id = str(event.id, `history-${start + idx}`);
+                      const created = humanTs(str(event.created_at, "-"));
+                      const type = str(event.event_type, "").trim();
+                      const relatedMemoryId = str(
+                        event.related_memory_id,
+                        "",
+                      ).trim();
+                      const revertedAt = str(event.reverted_at, "").trim();
+                      const directRestoreId = arkmemoryHistoryCanRestore(event)
+                        ? id
+                        : "";
+                      const linkedRestoreId =
+                        type === "queue_memory_merged" && relatedMemoryId
+                          ? (historyRestoreByMemoryId.get(relatedMemoryId) ?? "")
+                          : "";
+                      const restoreTargetId = directRestoreId || linkedRestoreId;
+                      const preview = arkmemoryHistoryPreview(event);
+                      return (
+                        <Box
+                          key={id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => setHistoryDialogEvent(event)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setHistoryDialogEvent(event);
+                            }
+                          }}
+                          sx={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 1,
+                            px: 1.25,
+                            py: 0.9,
+                            borderRadius: 1,
+                            border: "1px solid transparent",
+                            cursor: "pointer",
+                            transition:
+                              "background 0.16s ease, border-color 0.16s ease",
+                            "&:hover": {
+                              background: "var(--ui-rgba-255-255-255-035)",
+                              borderColor: "var(--ui-rgba-255-255-255-080)",
+                            },
+                            "&:focus-visible": {
+                              outline: "2px solid #78f2b0",
+                              outlineOffset: "-2px",
+                            },
+                          }}
+                        >
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            label={arkmemoryHistoryTypeLabel(event)}
+                            sx={{ flex: "0 0 auto" }}
+                          />
+                          {revertedAt ? (
                             <Chip
                               size="small"
                               variant="outlined"
-                              label={arkmemoryHistoryTypeLabel(event)}
+                              label="Restored"
+                              sx={{ flex: "0 0 auto" }}
                             />
-                            {revertedAt ? (
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                label="Restored"
-                              />
-                            ) : restoreTargetId ? (
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                label="Restorable"
-                              />
-                            ) : null}
-                            <Typography
-                              variant="caption"
-                              sx={{ color: "text.secondary" }}
-                            >
-                              {created.label}
-                            </Typography>
-                          </Stack>
-                          <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-                            {arkmemoryHistoryTitle(event)}
+                          ) : restoreTargetId ? (
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              label="Restorable"
+                              sx={{ flex: "0 0 auto" }}
+                            />
+                          ) : null}
+                          <Typography
+                            sx={{
+                              flex: 1,
+                              minWidth: 0,
+                              fontSize: "0.84rem",
+                              color: "var(--text-primary)",
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}
+                          >
+                            {preview}
                           </Typography>
                           <Typography
                             variant="caption"
                             sx={{
                               color: "text.secondary",
-                              display: "-webkit-box",
-                              WebkitBoxOrient: "vertical",
-                              WebkitLineClamp: 2,
-                              overflow: "hidden",
+                              flex: "0 0 auto",
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "0.7rem",
                             }}
+                            title={created.tip}
                           >
-                            {arkmemoryHistoryDetail(event)}
+                            {created.label}
                           </Typography>
-                        </Stack>
-                      </AccordionSummary>
-                      <AccordionDetails>
-                        <Stack spacing={1}>
-                          <Box className="metadata-box">
-                            <Stack spacing={0.6}>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Event: {type || "-"}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Memory: {str(event.memory_id, "-")}
-                              </Typography>
-                              {relatedMemoryId ? (
-                                <Typography
-                                  variant="caption"
-                                  sx={{ color: "text.secondary" }}
-                                >
-                                  Related memory: {relatedMemoryId}
-                                </Typography>
-                              ) : null}
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Actor: {str(event.actor, "-")}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Recorded: {created.tip}
-                              </Typography>
-                            </Stack>
-                          </Box>
-                          {restoreTargetId ? (
-                            <Stack
-                              direction={{ xs: "column", sm: "row" }}
-                              spacing={1}
-                              sx={{
-                                justifyContent: "space-between",
-                                alignItems: { xs: "stretch", sm: "center" },
-                              }}
-                            >
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                {type === "queue_memory_merged" &&
-                                linkedRestoreId
-                                  ? "Restores the archived source memory behind this consolidation."
-                                  : "Restores the previous memory snapshot recorded for this change."}
-                              </Typography>
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                color="warning"
-                                disabled={busy}
-                                onClick={() =>
-                                  rollbackMutation.mutate(restoreTargetId)
-                                }
-                              >
-                                {restoreLabel}
-                              </Button>
-                            </Stack>
-                          ) : null}
-                        </Stack>
-                      </AccordionDetails>
-                    </Accordion>
-                  );
-                })}
-              </Stack>
-            )}
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      mt: 1,
+                      px: 0.25,
+                    }}
+                  >
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary" }}
+                    >
+                      {usefulHistory.length} change
+                      {usefulHistory.length === 1 ? "" : "s"} · Page {page + 1} /{" "}
+                      {pageCount}
+                    </Typography>
+                    <Stack direction="row" spacing={1}>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={page <= 0}
+                        onClick={() =>
+                          setHistoryPage((value) => Math.max(0, value - 1))
+                        }
+                      >
+                        Previous
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={page >= pageCount - 1}
+                        onClick={() =>
+                          setHistoryPage((value) =>
+                            Math.min(pageCount - 1, value + 1),
+                          )
+                        }
+                      >
+                        Next
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </>
+              );
+            })()}
           </Stack>
         </Box>
       ) : null}
+
+      {/* History detail dialog. Opens when a row is clicked; shows the
+          full saved content, all event metadata, and the restore action
+          if the change is reversible. */}
+      <Dialog
+        open={historyDialogEvent !== null}
+        onClose={() => setHistoryDialogEvent(null)}
+        maxWidth="sm"
+        fullWidth
+      >
+        {historyDialogEvent ? (
+          (() => {
+            const event = historyDialogEvent;
+            const eventId = str(event.id, "");
+            const created = humanTs(str(event.created_at, "-"));
+            const type = str(event.event_type, "").trim();
+            const relatedMemoryId = str(event.related_memory_id, "").trim();
+            const revertedAt = str(event.reverted_at, "").trim();
+            const directRestoreId = arkmemoryHistoryCanRestore(event)
+              ? eventId
+              : "";
+            const linkedRestoreId =
+              type === "queue_memory_merged" && relatedMemoryId
+                ? (historyRestoreByMemoryId.get(relatedMemoryId) ?? "")
+                : "";
+            const restoreTargetId = directRestoreId || linkedRestoreId;
+            const restoreLabel =
+              type === "queue_memory_merged" && linkedRestoreId
+                ? "Restore merged memory"
+                : "Restore previous version";
+            const restoreHelp =
+              type === "queue_memory_merged" && linkedRestoreId
+                ? "Restores the archived source memory behind this consolidation."
+                : "Restores the previous memory snapshot recorded for this change.";
+            const preview = arkmemoryHistoryPreview(event);
+            return (
+              <>
+                <DialogTitle
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 1,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={arkmemoryHistoryTypeLabel(event)}
+                  />
+                  {revertedAt ? (
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label="Restored"
+                    />
+                  ) : restoreTargetId ? (
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label="Restorable"
+                    />
+                  ) : null}
+                  <Typography
+                    variant="subtitle1"
+                    sx={{ flex: 1, fontWeight: 600 }}
+                  >
+                    {arkmemoryHistoryTitle(event)}
+                  </Typography>
+                </DialogTitle>
+                <DialogContent dividers>
+                  <Stack spacing={1.5}>
+                    {preview ? (
+                      <Box
+                        sx={{
+                          p: 1.25,
+                          borderRadius: 1,
+                          border: "1px solid var(--surface-border)",
+                          background: "var(--surface-bg-elevated-stronger, rgba(255,255,255,0.02))",
+                        }}
+                      >
+                        <Typography
+                          sx={{
+                            fontSize: "0.88rem",
+                            lineHeight: 1.6,
+                            color: "var(--text-primary)",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          {preview}
+                        </Typography>
+                      </Box>
+                    ) : null}
+                    <Box className="metadata-box">
+                      <Stack spacing={0.6}>
+                        <Typography
+                          variant="caption"
+                          sx={{ color: "text.secondary" }}
+                        >
+                          Event: {type || "-"}
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          sx={{ color: "text.secondary" }}
+                        >
+                          Memory: {str(event.memory_id, "-")}
+                        </Typography>
+                        {relatedMemoryId ? (
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary" }}
+                          >
+                            Related memory: {relatedMemoryId}
+                          </Typography>
+                        ) : null}
+                        <Typography
+                          variant="caption"
+                          sx={{ color: "text.secondary" }}
+                        >
+                          Actor: {str(event.actor, "-")}
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          sx={{ color: "text.secondary" }}
+                        >
+                          Recorded: {created.tip}
+                        </Typography>
+                      </Stack>
+                    </Box>
+                    {restoreTargetId ? (
+                      <Typography
+                        variant="caption"
+                        sx={{ color: "text.secondary" }}
+                      >
+                        {restoreHelp}
+                      </Typography>
+                    ) : null}
+                  </Stack>
+                </DialogContent>
+                <DialogActions>
+                  {restoreTargetId ? (
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="warning"
+                      disabled={busy}
+                      onClick={() => {
+                        rollbackMutation.mutate(restoreTargetId);
+                        setHistoryDialogEvent(null);
+                      }}
+                    >
+                      {restoreLabel}
+                    </Button>
+                  ) : null}
+                  <Button onClick={() => setHistoryDialogEvent(null)}>
+                    Close
+                  </Button>
+                </DialogActions>
+              </>
+            );
+          })()
+        ) : null}
+      </Dialog>
     </WorkspacePageShell>
   );
 }

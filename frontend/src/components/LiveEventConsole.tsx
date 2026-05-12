@@ -247,7 +247,9 @@ function buildEventEntry(event: TraceOperationalEvent): ConsoleEntry {
     ? `${formatLabel(event.event_type)} / ${event.tool_name}`
     : formatLabel(event.event_type);
   const detail = event.outcome ? formatLabel(event.outcome) : "Live operational signal";
+  const source = event.source ? formatChannelSource(event.source) : "";
   const meta = [
+    source ? `Source: ${source}` : "",
     event.channel ? `${formatChannelSource(event.channel)} channel` : "",
     event.latency_ms != null ? formatDuration(event.latency_ms) : "",
   ].filter(Boolean);
@@ -285,13 +287,14 @@ function buildTraceEntry(trace: TraceSummary): ConsoleEntry {
 export function LiveEventConsole({ history, events = [], compact = false, onHideAdvanced }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [shouldStickToBottom, setShouldStickToBottom] = useState(true);
-  const visibleEvents = events.slice(0, compact ? 4 : 6).reverse();
-  const visibleHistory = history.slice(0, compact ? 4 : 6).reverse();
+  const visibleEvents = events.slice(0, compact ? 4 : 6);
+  const visibleHistory = history.slice(0, compact ? 4 : 6);
   const latestEvent = pickLatestByTime(events, (item) => item.created_at);
   const latestTrace = pickLatestByTime(history, (item) => item.started_at);
   const stage = latestEvent ? stageFromEvent(latestEvent) : stageFromTrace(latestTrace);
-  const sourceLabel = latestEvent?.channel || latestTrace?.channel
-    ? formatChannelSource(latestEvent?.channel || latestTrace?.channel)
+  const sourceValue = latestEvent?.source || latestEvent?.channel || latestTrace?.channel;
+  const sourceLabel = sourceValue
+    ? formatChannelSource(sourceValue)
     : "Standby";
   const updatedLabel = latestEvent?.created_at || latestTrace?.started_at
     ? shortTimestamp(latestEvent?.created_at || latestTrace?.started_at)
@@ -306,7 +309,7 @@ export function LiveEventConsole({ history, events = [], compact = false, onHide
     if (!container || !shouldStickToBottom) return;
 
     const frame = window.requestAnimationFrame(() => {
-      container.scrollTop = container.scrollHeight;
+      container.scrollTop = 0;
     });
 
     return () => window.cancelAnimationFrame(frame);
@@ -315,9 +318,8 @@ export function LiveEventConsole({ history, events = [], compact = false, onHide
   function handleFeedScroll() {
     const container = scrollRef.current;
     if (!container) return;
-    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    const isNearBottom = distanceFromBottom <= 28;
-    setShouldStickToBottom((current) => (current === isNearBottom ? current : isNearBottom));
+    const isNearTop = container.scrollTop <= 28;
+    setShouldStickToBottom((current) => (current === isNearTop ? current : isNearTop));
   }
 
   return (

@@ -282,6 +282,61 @@ pub(super) fn clarification_choices_from_operational_payload(
     .unwrap_or_default()
 }
 
+fn direct_chat_approval_id_from_choice(choice: &crate::core::ClarificationChoice) -> Option<String> {
+    choice
+        .approval
+        .as_ref()
+        .map(|approval| approval.id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            crate::core::parse_direct_chat_approval_submit_text(&choice.submit_text)
+                .map(|(id, _)| id)
+        })
+}
+
+fn choice_is_direct_chat_approval_protocol(choice: &crate::core::ClarificationChoice) -> bool {
+    if direct_chat_approval_id_from_choice(choice).is_some() {
+        return true;
+    }
+    choice
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let normalized = value.to_ascii_lowercase();
+            normalized.contains("direct_chat") && normalized.contains("approval")
+        })
+        .unwrap_or(false)
+}
+
+async fn retain_active_clarification_choices(
+    storage: &crate::storage::Storage,
+    choices: Vec<crate::core::ClarificationChoice>,
+) -> Vec<crate::core::ClarificationChoice> {
+    let mut retained = Vec::with_capacity(choices.len());
+    for choice in choices {
+        let Some(approval_id) = direct_chat_approval_id_from_choice(&choice) else {
+            if !choice_is_direct_chat_approval_protocol(&choice) {
+                retained.push(choice);
+            }
+            continue;
+        };
+        let is_pending = storage
+            .get_approval_request(&approval_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.status == "pending")
+            .unwrap_or(false);
+        if is_pending {
+            retained.push(choice);
+        }
+    }
+    retained
+}
+
 pub(super) async fn get_conversation_messages(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -349,8 +404,11 @@ pub(super) async fn get_conversation_messages(
                         if by_trace_id.contains_key(trace_id) {
                             continue;
                         }
-                        let choices =
-                            clarification_choices_from_operational_payload(row.payload.as_deref());
+                        let choices = retain_active_clarification_choices(
+                            &storage,
+                            clarification_choices_from_operational_payload(row.payload.as_deref()),
+                        )
+                        .await;
                         if choices.is_empty() {
                             continue;
                         }

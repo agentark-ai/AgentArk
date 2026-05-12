@@ -1,5 +1,7 @@
 use super::*;
 
+const TRACE_RUNTIME_SOURCE: &str = "Runtime";
+
 pub(super) async fn persist_live_trace_snapshot(
     trace_history: &Arc<RwLock<Vec<ExecutionTrace>>>,
     trace_ref: &Arc<RwLock<ExecutionTrace>>,
@@ -72,6 +74,9 @@ pub(super) struct TraceResponse {
     pub history_total: Option<usize>,
     pub history: Vec<TraceSummary>,
     pub recent_events: Vec<TraceOperationalEvent>,
+    pub recent_events_total: usize,
+    pub recent_events_offset: usize,
+    pub recent_events_limit: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +97,7 @@ pub(super) struct TraceSummary {
 #[derive(Debug, Serialize)]
 pub(super) struct TraceOperationalEvent {
     pub id: String,
+    pub source: String,
     pub trace_id: Option<String>,
     pub created_at: String,
     pub channel: String,
@@ -100,6 +106,8 @@ pub(super) struct TraceOperationalEvent {
     pub outcome: String,
     pub tool_name: Option<String>,
     pub latency_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1053,7 +1061,7 @@ fn build_step_from_operational_log(
             &row.created_at,
             row.latency_ms.map(|value| value.max(0) as u64),
         ),
-        source: Some("operational_log".to_string()),
+        source: Some(TRACE_RUNTIME_SOURCE.to_string()),
         status: Some(if row.success {
             "info".to_string()
         } else {
@@ -1203,6 +1211,7 @@ fn format_operational_event(
 ) -> TraceOperationalEvent {
     TraceOperationalEvent {
         id: row.id.clone(),
+        source: TRACE_RUNTIME_SOURCE.to_string(),
         trace_id: row.trace_id.clone(),
         created_at: row.created_at.clone(),
         channel: row.channel.clone(),
@@ -1211,7 +1220,343 @@ fn format_operational_event(
         outcome: row.outcome.clone(),
         tool_name: row.tool_name.clone(),
         latency_ms: row.latency_ms,
+        details: Some(serde_json::json!({
+            "channel": row.channel.clone(),
+            "event_type": row.event_type.clone(),
+            "success": row.success,
+            "outcome": row.outcome.clone(),
+            "tool_name": row.tool_name.clone(),
+            "latency_ms": row.latency_ms,
+            "trace_id": row.trace_id.clone(),
+            "conversation_id": row.conversation_id.clone(),
+            "arguments": row.arguments.clone(),
+            "payload": row.payload.clone(),
+            "strategy_version": row.strategy_version.clone(),
+            "policy_version": row.policy_version.clone(),
+            "prompt_version": row.prompt_version.clone(),
+            "model_slot": row.model_slot.clone(),
+        })),
     }
+}
+
+fn automation_run_status_label(status: &crate::core::AutomationRunStatus) -> &'static str {
+    match status {
+        crate::core::AutomationRunStatus::Running => "running",
+        crate::core::AutomationRunStatus::Succeeded => "succeeded",
+        crate::core::AutomationRunStatus::Failed => "failed",
+        crate::core::AutomationRunStatus::Retrying => "retrying",
+        crate::core::AutomationRunStatus::TimedOut => "timed_out",
+        crate::core::AutomationRunStatus::Triggered => "triggered",
+    }
+}
+
+fn automation_run_success(status: &crate::core::AutomationRunStatus) -> bool {
+    matches!(
+        status,
+        crate::core::AutomationRunStatus::Succeeded
+            | crate::core::AutomationRunStatus::Triggered
+            | crate::core::AutomationRunStatus::Running
+            | crate::core::AutomationRunStatus::Retrying
+    )
+}
+
+fn trace_automation_channel(run: &crate::core::automation::AutomationRunRecord) -> String {
+    run.origin
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let trigger = run.trigger.trim();
+            (!trigger.is_empty()).then_some(trigger)
+        })
+        .unwrap_or("agentark")
+        .to_string()
+}
+
+fn format_automation_event(
+    run: &crate::core::automation::AutomationRunRecord,
+) -> TraceOperationalEvent {
+    let status = automation_run_status_label(&run.status);
+    let automation_kind = run.automation_kind.trim();
+    let outcome = run
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            run.output_preview
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            let summary = run.critique.summary.trim();
+            (!summary.is_empty()).then_some(summary)
+        })
+        .map(|value| truncate_trace_text(value, 220))
+        .unwrap_or_else(|| {
+            if run.title.trim().is_empty() {
+                format!(
+                    "{} {}",
+                    title_case_trace_label(&run.automation_kind),
+                    status
+                )
+            } else {
+                format!(
+                    "{}: {}",
+                    title_case_trace_label(status),
+                    truncate_trace_text(&run.title, 180)
+                )
+            }
+        });
+    TraceOperationalEvent {
+        id: run.id.clone(),
+        source: TRACE_RUNTIME_SOURCE.to_string(),
+        trace_id: None,
+        created_at: run
+            .completed_at
+            .clone()
+            .unwrap_or_else(|| run.started_at.clone()),
+        channel: trace_automation_channel(run),
+        event_type: if automation_kind.is_empty() {
+            "automation_run".to_string()
+        } else {
+            format!("{}_run", automation_kind)
+        },
+        success: automation_run_success(&run.status),
+        outcome,
+        tool_name: (!run.action.trim().is_empty()).then(|| run.action.clone()),
+        latency_ms: run
+            .duration_ms
+            .map(|value| value.min(i64::MAX as u64) as i64),
+        details: Some(serde_json::json!({
+            "automation_kind": run.automation_kind.clone(),
+            "status": status,
+            "trigger": run.trigger.clone(),
+            "title": run.title.clone(),
+            "action": run.action.clone(),
+            "started_at": run.started_at.clone(),
+            "completed_at": run.completed_at.clone(),
+            "duration_ms": run.duration_ms,
+            "error": run.error.clone(),
+            "output_preview": run.output_preview.clone(),
+            "critique": run.critique.clone(),
+        })),
+    }
+}
+
+fn trace_event_matches_since(
+    event: &TraceOperationalEvent,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    let Some(since) = since else {
+        return true;
+    };
+    chrono::DateTime::parse_from_rfc3339(&event.created_at)
+        .map(|value| value.with_timezone(&chrono::Utc) >= *since)
+        .unwrap_or(false)
+}
+
+fn trace_event_sort_key(event: &TraceOperationalEvent) -> String {
+    chrono::DateTime::parse_from_rfc3339(&event.created_at)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+        .unwrap_or_else(|_| event.created_at.clone())
+}
+
+fn insert_trace_activity_event(
+    events_by_key: &mut std::collections::BTreeMap<String, TraceOperationalEvent>,
+    namespace: &str,
+    event: TraceOperationalEvent,
+) {
+    events_by_key.insert(format!("{}:{}", namespace, event.id), event);
+}
+
+fn heartbeat_label_from_key(key: &str) -> &'static str {
+    match key {
+        crate::sentinel::SENTINEL_SCHEDULER_HEARTBEAT_KEY => "scheduler",
+        crate::sentinel::SENTINEL_WATCHER_HEARTBEAT_KEY => "watcher",
+        crate::sentinel::SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY => "integration_sync",
+        crate::sentinel::SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY => "approval_expiry",
+        crate::sentinel::SENTINEL_ARKPULSE_HEARTBEAT_KEY => "arkpulse",
+        crate::sentinel::SENTINEL_AUTO_ANALYSIS_HEARTBEAT_KEY => "auto_analysis",
+        _ => "background",
+    }
+}
+
+async fn load_trace_background_ping_events(
+    storage: &crate::storage::Storage,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
+) -> Vec<TraceOperationalEvent> {
+    let heartbeat_keys = [
+        crate::sentinel::SENTINEL_SCHEDULER_HEARTBEAT_KEY,
+        crate::sentinel::SENTINEL_WATCHER_HEARTBEAT_KEY,
+        crate::sentinel::SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY,
+        crate::sentinel::SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY,
+        crate::sentinel::SENTINEL_ARKPULSE_HEARTBEAT_KEY,
+        crate::sentinel::SENTINEL_AUTO_ANALYSIS_HEARTBEAT_KEY,
+    ];
+    let mut events = Vec::new();
+    for key in heartbeat_keys {
+        let Some(created_at) = storage
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok())
+        else {
+            continue;
+        };
+        let label = heartbeat_label_from_key(key);
+        let event = TraceOperationalEvent {
+            id: format!("heartbeat:{label}"),
+            source: TRACE_RUNTIME_SOURCE.to_string(),
+            trace_id: None,
+            created_at: created_at.clone(),
+            channel: label.to_string(),
+            event_type: "background_ping".to_string(),
+            success: true,
+            outcome: format!("{} heartbeat recorded", title_case_trace_label(label)),
+            tool_name: Some(label.to_string()),
+            latency_ms: None,
+            details: Some(serde_json::json!({
+                "heartbeat": label,
+                "created_at": created_at,
+            })),
+        };
+        if trace_event_matches_since(&event, since) {
+            events.push(event);
+        }
+    }
+    events
+}
+
+fn cleanup_event_from_timestamp(
+    id: &str,
+    created_at: Option<String>,
+    channel: &str,
+    tool_name: &str,
+    outcome: &str,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
+) -> Option<TraceOperationalEvent> {
+    let event = TraceOperationalEvent {
+        id: id.to_string(),
+        source: TRACE_RUNTIME_SOURCE.to_string(),
+        trace_id: None,
+        created_at: created_at?,
+        channel: channel.to_string(),
+        event_type: "cleanup".to_string(),
+        success: true,
+        outcome: outcome.to_string(),
+        tool_name: Some(tool_name.to_string()),
+        latency_ms: None,
+        details: Some(serde_json::json!({
+            "channel": channel,
+            "tool_name": tool_name,
+            "outcome": outcome,
+        })),
+    };
+    trace_event_matches_since(&event, since).then_some(event)
+}
+
+async fn load_trace_cleanup_events(
+    storage: &crate::storage::Storage,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
+) -> Vec<TraceOperationalEvent> {
+    let housekeeping = storage.housekeeping_status().await.ok().unwrap_or_default();
+    let mut events = Vec::new();
+    if let Some(event) = cleanup_event_from_timestamp(
+        "cleanup:housekeeping",
+        housekeeping.housekeeping_last_run_at,
+        "storage",
+        "housekeeping",
+        "Housekeeping retention cleanup ran",
+        since,
+    ) {
+        events.push(event);
+    }
+    if let Some(event) = cleanup_event_from_timestamp(
+        "cleanup:notifications",
+        housekeeping.notification_last_run_at,
+        "notifications",
+        "notification_retention",
+        "Notification retention cleanup ran",
+        since,
+    ) {
+        events.push(event);
+    }
+    events
+}
+
+async fn load_trace_activity_page(
+    storage: &crate::storage::Storage,
+    since_raw: Option<&str>,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
+    limit: usize,
+    offset: usize,
+) -> (usize, Vec<TraceOperationalEvent>) {
+    let fetch_limit = limit.saturating_add(offset).max(limit).max(1) as u64;
+    let mut events_by_key = std::collections::BTreeMap::<String, TraceOperationalEvent>::new();
+
+    for row in storage
+        .list_recent_operational_logs(since_raw, fetch_limit, 0)
+        .await
+        .unwrap_or_default()
+    {
+        insert_trace_activity_event(
+            &mut events_by_key,
+            "operational",
+            format_operational_event(&row),
+        );
+    }
+
+    for run in storage
+        .list_automation_runs_since(since_raw, fetch_limit as usize)
+        .await
+        .unwrap_or_default()
+    {
+        insert_trace_activity_event(
+            &mut events_by_key,
+            "automation",
+            format_automation_event(&run),
+        );
+    }
+
+    for event in load_trace_background_ping_events(storage, since).await {
+        insert_trace_activity_event(&mut events_by_key, "heartbeat", event);
+    }
+    for event in load_trace_cleanup_events(storage, since).await {
+        insert_trace_activity_event(&mut events_by_key, "cleanup", event);
+    }
+
+    let base_total = storage
+        .count_operational_logs(since_raw)
+        .await
+        .unwrap_or(0)
+        .saturating_add(storage.count_automation_runs(since_raw).await.unwrap_or(0))
+        as usize;
+    let synthetic_total = events_by_key
+        .iter()
+        .filter(|(key, _)| key.starts_with("heartbeat:") || key.starts_with("cleanup:"))
+        .count();
+
+    let mut events = events_by_key.into_values().collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        trace_event_sort_key(right)
+            .cmp(&trace_event_sort_key(left))
+            .then(left.id.cmp(&right.id))
+    });
+    let page = events
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    (base_total.saturating_add(synthetic_total), page)
 }
 
 fn format_trace_detail_from_memory(
@@ -1339,6 +1684,8 @@ pub(super) async fn get_trace(
 ) -> Json<TraceResponse> {
     const TRACE_HISTORY_BUFFER: u64 = 100;
     const TRACE_HISTORY_MAX_LIMIT: usize = 200;
+    const TRACE_ACTIVITY_DEFAULT_LIMIT: usize = 20;
+    const TRACE_ACTIVITY_MAX_LIMIT: usize = 50;
     const SQLITE_MAX_INTEGER: u64 = i64::MAX as u64;
     let history_limit = params
         .get("limit")
@@ -1347,6 +1694,15 @@ pub(super) async fn get_trace(
         .clamp(1, TRACE_HISTORY_MAX_LIMIT);
     let history_offset = params
         .get("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0usize);
+    let activity_limit = params
+        .get("activity_limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TRACE_ACTIVITY_DEFAULT_LIMIT)
+        .clamp(1, TRACE_ACTIVITY_MAX_LIMIT);
+    let activity_offset = params
+        .get("activity_offset")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0usize);
     let normalized_since =
@@ -1445,14 +1801,14 @@ pub(super) async fn get_trace(
         .take(history_limit)
         .map(|(_, summary)| summary)
         .collect();
-    let history_trace_ids: Vec<String> = history.iter().map(|summary| summary.id.clone()).collect();
-    let recent_events = storage
-        .list_operational_logs_for_trace_ids(&history_trace_ids, 40)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|row| format_operational_event(&row))
-        .collect();
+    let (recent_events_total, recent_events) = load_trace_activity_page(
+        &storage,
+        normalized_since.as_deref(),
+        parsed_since.as_ref(),
+        activity_limit,
+        activity_offset,
+    )
+    .await;
 
     Json(TraceResponse {
         trace,
@@ -1460,6 +1816,9 @@ pub(super) async fn get_trace(
         history,
         history_total: Some(history_total),
         recent_events,
+        recent_events_total,
+        recent_events_offset: activity_offset,
+        recent_events_limit: activity_limit,
     })
 }
 
@@ -1575,5 +1934,67 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         assert!(!trace_matches_since_memory(&trace, Some(&since)));
+    }
+
+    #[test]
+    fn operational_events_are_sourced_from_agentark() {
+        let event = format_operational_event(&crate::storage::entities::operational_log::Model {
+            id: "log-1".to_string(),
+            created_at: "2026-04-02T20:00:00Z".to_string(),
+            trace_id: None,
+            conversation_id: None,
+            channel: "scheduler".to_string(),
+            event_type: "tool_call".to_string(),
+            success: true,
+            outcome: "ok".to_string(),
+            tool_name: Some("notify_user".to_string()),
+            latency_ms: Some(42),
+            arguments: None,
+            payload: None,
+            strategy_version: None,
+            policy_version: None,
+            prompt_version: None,
+            model_slot: None,
+        });
+
+        assert_eq!(event.source, "Runtime");
+        assert_eq!(event.channel, "scheduler");
+    }
+
+    #[test]
+    fn automation_events_are_latest_sortable_agentark_activity() {
+        let run = crate::core::automation::AutomationRunRecord {
+            id: "run-1".to_string(),
+            automation_id: "task-1".to_string(),
+            automation_kind: "task".to_string(),
+            title: "Send reminder".to_string(),
+            action: "notify_user".to_string(),
+            trigger: "scheduler".to_string(),
+            status: crate::core::AutomationRunStatus::Succeeded,
+            attempt: 1,
+            started_at: "2026-04-02T19:59:00Z".to_string(),
+            completed_at: Some("2026-04-02T20:00:00Z".to_string()),
+            duration_ms: Some(1000),
+            origin: crate::core::automation::AutomationOriginContext {
+                channel: Some("scheduler".to_string()),
+                ..Default::default()
+            },
+            policy: crate::core::automation::AutomationExecutionPolicy::default(),
+            critique: crate::core::automation::AutomationCritique {
+                summary: "completed".to_string(),
+                retryable: false,
+                validation_passed: true,
+            },
+            output_preview: None,
+            error: None,
+            next_retry_at: None,
+        };
+
+        let event = format_automation_event(&run);
+
+        assert_eq!(event.source, "Runtime");
+        assert_eq!(event.channel, "scheduler");
+        assert_eq!(event.created_at, "2026-04-02T20:00:00Z");
+        assert_eq!(trace_event_sort_key(&event), "2026-04-02T20:00:00Z");
     }
 }

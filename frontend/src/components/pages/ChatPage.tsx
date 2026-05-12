@@ -374,14 +374,22 @@ type CodePreviewOpenRequest = {
 };
 
 type ResearchReportPreview = {
+  kind: "research" | "deep";
   title: string;
   summary: string;
   summaryPreview: string;
   keyFindings: string[];
   keyFindingCount: number;
+  openQuestions: string[];
+  contradictions: string[];
+  highlights: string[];
   sourceCount: number;
+  tableCount: number;
+  chartCount: number;
   openQuestionCount: number;
   contradictionCount: number;
+  mainContent: string;
+  evidenceBrief: string;
   content: string;
 };
 
@@ -468,6 +476,53 @@ type ChatApprovalStep = {
   actionName: string;
   argumentsPreview?: unknown;
 };
+
+function parseInternalApprovalSubmitToken(
+  value: string,
+): ChatClarificationChoice["approval"] | null {
+  const parts = value
+    .trim()
+    .split(":")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length < 3) return null;
+
+  const approvalId = parts[parts.length - 1] ?? "";
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      approvalId,
+    )
+  ) {
+    return null;
+  }
+
+  const protocol = parts.slice(0, -1).join(":").toLowerCase();
+  if (!protocol.includes("direct_chat") || !protocol.includes("approval")) {
+    return null;
+  }
+
+  const decision = parts
+    .slice(0, -1)
+    .map((part) => part.toLowerCase())
+    .find((part) => part === "approve" || part === "reject");
+  if (decision !== "approve" && decision !== "reject") return null;
+
+  return {
+    id: approvalId,
+    decision,
+    actionName: "",
+  };
+}
+
+function isDirectChatApprovalChoice(choice: ChatClarificationChoice): boolean {
+  return Boolean(
+    choice.approval ||
+      choice.kind === "direct_chat_approval" ||
+      choice.kind === "direct_chat_chain_approval" ||
+      parseInternalApprovalSubmitToken(choice.submitText),
+  );
+}
+
 type ChatRunMetrics = {
   inputTokens?: number | null;
   outputTokens?: number | null;
@@ -1902,12 +1957,20 @@ function clarificationChoices(value: unknown): ChatClarificationChoice[] {
       if (!label || !submitText) return null;
       const kind = str(choice.kind, "").trim();
       const approval = asRecord(choice.approval);
-      const approvalId = str(approval.id, "").trim();
-      const approvalDecision = str(approval.decision, "").trim().toLowerCase();
+      const submitApproval = parseInternalApprovalSubmitToken(submitText);
+      const effectiveKind =
+        kind ||
+        (submitApproval ? "direct_chat_chain_approval" : "");
+      const approvalId =
+        str(approval.id, "").trim() || submitApproval?.id || "";
+      const approvalDecision =
+        str(approval.decision, "").trim().toLowerCase() ||
+        submitApproval?.decision ||
+        "";
       const approvalActionName = str(
         approval.action_name,
         str(approval.actionName, ""),
-      ).trim();
+      ).trim() || submitApproval?.actionName || "";
       const approvalSteps = asRecords(approval.steps)
         .map<ChatApprovalStep | null>((step) => {
           const actionName = str(
@@ -1924,8 +1987,8 @@ function clarificationChoices(value: unknown): ChatClarificationChoice[] {
         })
         .filter((step): step is ChatApprovalStep => step !== null);
       const isToolApprovalKind =
-        kind === "direct_chat_approval" ||
-        kind === "direct_chat_chain_approval";
+        effectiveKind === "direct_chat_approval" ||
+        effectiveKind === "direct_chat_chain_approval";
       const parsedApproval: ChatClarificationChoice["approval"] =
         isToolApprovalKind &&
         approvalId &&
@@ -1940,7 +2003,7 @@ function clarificationChoices(value: unknown): ChatClarificationChoice[] {
       return {
         label,
         submitText,
-        ...(kind ? { kind } : {}),
+        ...(effectiveKind ? { kind: effectiveKind } : {}),
         ...(parsedApproval ? { approval: parsedApproval } : {}),
       };
     })
@@ -2905,6 +2968,31 @@ function formatActivityToolName(name: string): string {
     .replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
 
+function isStandaloneActivityStatusLabel(label: string): boolean {
+  const normalized = (label || "").trim().replace(/\s+/g, " ");
+  if (!normalized) return false;
+  const words = normalized.split(" ");
+  if (words.length > 3) return false;
+  if (/\bin progress$/i.test(normalized)) return true;
+  return words.every((word) => /ing$/i.test(word));
+}
+
+function runningActivityTitleForToolName(name: string): string {
+  const toolLabel = formatActivityToolName(name || "tool");
+  if (/^running\b/i.test(toolLabel)) return toolLabel;
+  return isStandaloneActivityStatusLabel(toolLabel)
+    ? toolLabel
+    : `Running ${toolLabel}`;
+}
+
+function startingActivitySentenceForToolName(name: string): string {
+  const toolLabel = formatActivityToolName(name || "tool");
+  if (/^starting\b/i.test(toolLabel)) return `${toolLabel}.`;
+  return isStandaloneActivityStatusLabel(toolLabel)
+    ? `${toolLabel}.`
+    : `Starting ${toolLabel}.`;
+}
+
 function tryParseActivityJson(raw: string): unknown | null {
   const trimmed = (raw || "").trim();
   if (!trimmed) return null;
@@ -3767,9 +3855,10 @@ function buildToolProgressPresentation(
   if (agentLoopPresentation) return agentLoopPresentation;
 
   if (isToolEnvelope) {
-    const toolLabel = formatActivityToolName(str(payloadObj.name, name || "tool"));
+    const toolName = str(payloadObj.name, name || "tool");
+    const toolLabel = formatActivityToolName(toolName);
     return {
-      title: `Running ${toolLabel}`,
+      title: runningActivityTitleForToolName(toolName),
       detail: "Preparing action input.",
       streamKey: str(payloadObj.run_id, `tool-envelope:${toolLabel}`),
     };
@@ -3956,7 +4045,7 @@ function buildToolProgressPresentation(
   }
 
   return {
-    title: `Running ${formatActivityToolName(name || "tool")}`,
+    title: runningActivityTitleForToolName(name || "tool"),
     detail: detail || preview,
   };
 }
@@ -7605,6 +7694,57 @@ function extractMarkdownSection(text: string, heading: string): string {
   return collected.join("\n").trim();
 }
 
+function normalizeMarkdownHeadingText(value: string): string {
+  return stripMarkdownDecorations(value)
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function extractMarkdownSectionMatching(
+  text: string,
+  matchesHeading: (heading: string) => boolean,
+): string {
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  let collecting = false;
+  let headingLevel = 0;
+  const collected: string[] = [];
+  for (const line of lines) {
+    const headingMatch = line.trim().match(/^(#{2,6})\s+(.+)$/);
+    if (headingMatch) {
+      const currentLevel = headingMatch[1].length;
+      const heading = normalizeMarkdownHeadingText(headingMatch[2]);
+      if (collecting && currentLevel <= headingLevel) break;
+      if (!collecting && matchesHeading(heading)) {
+        collecting = true;
+        headingLevel = currentLevel;
+        continue;
+      }
+    }
+    if (collecting) collected.push(line);
+  }
+  return collected.join("\n").trim();
+}
+
+function extractMarkdownBulletSummaries(section: string, limit = 3): string[] {
+  const lines = (section || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const items = lines
+    .filter((line) => !line.includes("|") && !line.startsWith("```"))
+    .map((line) => line.replace(/^\s*(?:[-+*]|\d+[.)])\s+/, "").trim())
+    .map((line) => stripMarkdownDecorations(line).replace(/\s+/g, " ").trim())
+    .filter((line) => line.length > 20);
+  if (items.length > 0) return items.slice(0, limit);
+  return stripMarkdownDecorations(section)
+    .split(/\n{2,}/)
+    .map((block) => block.replace(/\s+/g, " ").trim())
+    .filter((block) => block.length > 40)
+    .slice(0, limit);
+}
+
 function countMarkdownItems(section: string): number {
   const lines = (section || "")
     .split("\n")
@@ -7615,6 +7755,60 @@ function countMarkdownItems(section: string): number {
   ).length;
   if (itemCount > 0) return itemCount;
   return lines.length > 0 ? lines.filter((line) => line.length > 20).length : 0;
+}
+
+function metricCountFromMarkdown(text: string, label: string): number {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = (text || "").match(
+    new RegExp(`\\*\\*\\s*${escaped}\\s*:\\s*\\*\\*\\s*(\\d+)`, "i"),
+  );
+  return match ? Math.max(0, Number.parseInt(match[1], 10) || 0) : 0;
+}
+
+const RESEARCH_EVIDENCE_BRIEF_HEADING = "## Evidence Brief Used For Synthesis";
+
+function splitResearchEvidenceBrief(text: string): {
+  mainContent: string;
+  evidenceBrief: string;
+} {
+  const normalized = (text || "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) return { mainContent: "", evidenceBrief: "" };
+  const markerPattern = new RegExp(
+    `\\n\\s*-{3,}\\s*\\n\\s*${RESEARCH_EVIDENCE_BRIEF_HEADING.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    )}`,
+    "i",
+  );
+  const markerMatch = normalized.match(markerPattern);
+  if (!markerMatch || markerMatch.index == null) {
+    return { mainContent: normalized, evidenceBrief: "" };
+  }
+  const mainContent = normalized.slice(0, markerMatch.index).trim();
+  const evidenceStart = markerMatch.index + markerMatch[0].lastIndexOf("##");
+  const evidenceBrief = normalized.slice(evidenceStart).trim();
+  return { mainContent, evidenceBrief };
+}
+
+function countAgentArkChartBlocks(text: string): number {
+  const matches = (text || "").match(/```agentark-chart\s*[\s\S]*?```/gi);
+  return matches?.length ?? 0;
+}
+
+function countMarkdownTables(text: string): number {
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  let count = 0;
+  for (let idx = 1; idx < lines.length; idx += 1) {
+    const previous = lines[idx - 1] || "";
+    const current = lines[idx] || "";
+    if (
+      previous.includes("|") &&
+      /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(current)
+    ) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function isPlaceholderResearchReportContent(
@@ -7676,38 +7870,92 @@ function parseResearchReport(text: string): ResearchReportPreview | null {
   const firstHeadingIndex = lines.findIndex((line) => line.trim().length > 0);
   if (firstHeadingIndex < 0) return null;
   const headingLine = lines[firstHeadingIndex].trim();
-  const titleMatch = headingLine.match(/^#\s*Research(?: Summary)?:\s*(.+)$/i);
+  const titleMatch = headingLine.match(
+    /^#\s*(Deep Research|Research(?: Summary)?):\s*(.+)$/i,
+  );
   if (!titleMatch) return null;
+  const kind = /^deep/i.test(titleMatch[1] || "") ? "deep" : "research";
+  const { mainContent, evidenceBrief } = splitResearchEvidenceBrief(normalized);
+  const previewContent = mainContent || normalized;
+  const previewLines = previewContent.split("\n");
 
-  const firstSectionIndex = lines.findIndex(
+  const firstSectionIndex = previewLines.findIndex(
     (line, idx) => idx > firstHeadingIndex && /^##\s+/.test(line.trim()),
   );
-  const summaryBlock = lines
+  const summaryBlock = previewLines
     .slice(
       firstHeadingIndex + 1,
-      firstSectionIndex >= 0 ? firstSectionIndex : lines.length,
+      firstSectionIndex >= 0 ? firstSectionIndex : previewLines.length,
     )
     .join("\n")
     .trim();
-  const summary = stripMarkdownDecorations(summaryBlock);
-  const summaryPreview =
-    summary.length > 520 ? `${summary.slice(0, 517).trimEnd()}...` : summary;
-  const keyFindingsSection = extractMarkdownSection(normalized, "Key Findings");
-  const keyFindingCount = countMarkdownItems(keyFindingsSection);
-  const keyFindings = keyFindingsSection
+  const executiveSummarySection = extractMarkdownSectionMatching(
+    previewContent,
+    (heading) => heading === "executive summary",
+  );
+  const fallbackSummaryBlock = summaryBlock
     .split("\n")
-    .map((line) => stripMarkdownDecorations(line).trim())
-    .filter(Boolean)
-    .slice(0, 3);
-  const sourceCount = countMarkdownItems(
-    extractMarkdownSection(normalized, "Sources"),
+    .filter((line) => {
+      const normalizedLine = stripMarkdownDecorations(line)
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+      return (
+        normalizedLine &&
+        normalizedLine !== "---" &&
+        !normalizedLine.startsWith("analyst research report")
+      );
+    })
+    .join("\n")
+    .trim();
+  const summary = stripMarkdownDecorations(
+    executiveSummarySection || fallbackSummaryBlock,
   );
-  const openQuestionCount = countMarkdownItems(
-    extractMarkdownSection(normalized, "Open Questions"),
+  const summaryPreview =
+    summary.length > 700 ? `${summary.slice(0, 697).trimEnd()}...` : summary;
+  const keyFindingsSection =
+    extractMarkdownSection(previewContent, "Key Findings") ||
+    extractMarkdownSectionMatching(
+      previewContent,
+      (heading) => heading.includes("key finding") || heading.includes("finding"),
+    );
+  const keyFindingCount = countMarkdownItems(keyFindingsSection);
+  const keyFindings = extractMarkdownBulletSummaries(keyFindingsSection, 3);
+  const sourceSection = extractMarkdownSection(normalized, "Sources");
+  const sourceCount = Math.max(
+    countMarkdownItems(sourceSection),
+    metricCountFromMarkdown(normalized, "Sources analyzed"),
   );
-  const contradictionCount = countMarkdownItems(
-    extractMarkdownSection(normalized, "Contradictions To Verify"),
+  const openQuestionsSection =
+    extractMarkdownSection(normalized, "Open Questions") ||
+    extractMarkdownSectionMatching(normalized, (heading) =>
+      heading.includes("open question"),
+    );
+  const openQuestions = extractMarkdownBulletSummaries(openQuestionsSection, 3);
+  const openQuestionCount = Math.max(
+    countMarkdownItems(openQuestionsSection),
+    openQuestions.length,
   );
+  const contradictionsSection =
+    extractMarkdownSection(normalized, "Contradictions To Verify") ||
+    extractMarkdownSectionMatching(normalized, (heading) =>
+      heading.includes("contradiction") || heading.includes("conflict"),
+    );
+  const contradictions = extractMarkdownBulletSummaries(
+    contradictionsSection,
+    3,
+  );
+  const contradictionCount = Math.max(
+    countMarkdownItems(contradictionsSection),
+    contradictions.length,
+    normalizeMarkdownHeadingText(previewContent).includes("contradiction")
+      ? 1
+      : 0,
+  );
+  const highlights =
+    keyFindings.length > 0
+      ? keyFindings
+      : extractMarkdownBulletSummaries(executiveSummarySection || summary, 3);
   if (
     isPlaceholderResearchReportContent(
       normalized,
@@ -7720,14 +7968,22 @@ function parseResearchReport(text: string): ResearchReportPreview | null {
   }
 
   return {
-    title: str(titleMatch[1], "Research report").trim() || "Research report",
+    kind,
+    title: str(titleMatch[2], "Research report").trim() || "Research report",
     summary,
     summaryPreview,
     keyFindings,
     keyFindingCount,
+    openQuestions,
+    contradictions,
+    highlights,
     sourceCount,
+    tableCount: countMarkdownTables(normalized),
+    chartCount: countAgentArkChartBlocks(normalized),
     openQuestionCount,
     contradictionCount,
+    mainContent: mainContent || normalized,
+    evidenceBrief,
     content: normalized,
   };
 }
@@ -7869,6 +8125,86 @@ function formatAssistantExportBody(content: string, heading: string): string {
     .trim();
 }
 
+function escapeMarkdownTableCell(value: string): string {
+  return (value || "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+}
+
+function markdownTableFromRecords(records: JsonRecord[]): string {
+  if (records.length === 0) return "";
+  const columns = Array.from(
+    records.reduce((set, record) => {
+      Object.keys(record).forEach((key) => set.add(key));
+      return set;
+    }, new Set<string>()),
+  ).slice(0, 8);
+  if (columns.length === 0) return "";
+  const lines = [
+    `| ${columns.map(escapeMarkdownTableCell).join(" | ")} |`,
+    `| ${columns.map(() => "---").join(" | ")} |`,
+  ];
+  records.slice(0, 12).forEach((record) => {
+    lines.push(
+      `| ${columns
+        .map((column) => {
+          const value = record[column];
+          if (value == null) return "";
+          if (
+            typeof value === "string" ||
+            typeof value === "number" ||
+            typeof value === "boolean"
+          ) {
+            return escapeMarkdownTableCell(String(value));
+          }
+          return escapeMarkdownTableCell(JSON.stringify(value));
+        })
+        .join(" | ")} |`,
+    );
+  });
+  return lines.join("\n");
+}
+
+function convertAgentArkChartFencesForExport(content: string): string {
+  return (content || "").replace(
+    /```agentark-chart\s*([\s\S]*?)```/gi,
+    (_match, rawJson: string) => {
+      const raw = (rawJson || "").trim();
+      if (!raw) return "";
+      try {
+        const parsed = JSON.parse(raw);
+        const record = asRecord(parsed);
+        const title = str(record.title, "Chart").trim() || "Chart";
+        const data = Array.isArray(record.data)
+          ? asRecords(record.data)
+          : [];
+        const table = markdownTableFromRecords(data);
+        return table ? `**${title}**\n\n${table}` : `**${title}**`;
+      } catch {
+        return "**Chart data omitted from Markdown export.**";
+      }
+    },
+  );
+}
+
+function cleanResearchReportMarkdownForExport(
+  report: ResearchReportPreview,
+): string {
+  let body = (report.mainContent || report.content || "").trim();
+  body = body.replace(
+    /^#\s*(?:Deep Research|Research(?: Summary)?):\s*/i,
+    "# ",
+  );
+  body = body.replace(
+    /^##\s+\*\*(.+?)\*\*\s*(?:-|:|\u2013|\u2014)+\s*(.+)$/gm,
+    "## $1\n\n$2",
+  );
+  body = convertAgentArkChartFencesForExport(body);
+  const sources = extractMarkdownSection(report.evidenceBrief, "Sources");
+  if (sources && !/^##\s+Sources\b/im.test(body)) {
+    body = `${body.trim()}\n\n## Sources\n\n${sources.trim()}`;
+  }
+  return body.replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function formatExecutionPlanStatusLabel(status: string): string {
   const normalized = str(status, "").trim().toLowerCase();
   if (!normalized) return "pending";
@@ -7919,10 +8255,20 @@ function buildExecutionPlanExportSection(
 }
 
 function researchReportMetaLabel(report: ResearchReportPreview): string {
-  const parts = ["Research report"];
+  const parts = [report.kind === "deep" ? "Deep research report" : "Research report"];
   if (report.sourceCount > 0) {
     parts.push(
       `${report.sourceCount} source${report.sourceCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (report.tableCount > 0) {
+    parts.push(
+      `${report.tableCount} table${report.tableCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (report.chartCount > 0) {
+    parts.push(
+      `${report.chartCount} chart${report.chartCount === 1 ? "" : "s"}`,
     );
   }
   if (report.keyFindingCount > 0) {
@@ -10665,12 +11011,13 @@ function ChatPageInner({
       return;
     }
 
+    const runningTitle = runningActivityTitleForToolName(name).toLowerCase();
     const message = (
       progressPresentation.detail ||
       simplifyConsoleDetail(
         summarizeActivityDetail(content.trim().slice(0, 1600)),
       ) ||
-      `I'm still running ${toHumanToolName(name).toLowerCase()}.`
+      `I'm still ${runningTitle}.`
     ).trim();
     if (!message || /^working\.{0,3}$/i.test(message)) return;
     pushStreamingProgressBubble(message, {
@@ -10967,7 +11314,9 @@ function ChatPageInner({
       const choicesByTrace = new Map<string, ChatClarificationChoice[]>();
       const choicesByContent = new Map<string, ChatClarificationChoice[]>();
       for (const record of previousRecords) {
-        const choices = clarificationChoices(record.choices);
+        const choices = clarificationChoices(record.choices).filter(
+          (choice) => !isDirectChatApprovalChoice(choice),
+        );
         if (choices.length === 0) continue;
         const traceId = str(record.trace_id, str(record.traceId, "")).trim();
         const content = stripAgentInternalReasoningLeaks(
@@ -11013,7 +11362,7 @@ function ChatPageInner({
         records.filter(
           (message) => str(message.role, "").trim().toLowerCase() === "assistant",
         ).length >= minAssistantMessages;
-      for (const settleDelayMs of [0, 200, 600, 1200]) {
+      for (const settleDelayMs of [0, 250, 750, 1500, 3000, 6000]) {
         if (settleDelayMs > 0) {
           await delay(settleDelayMs);
         }
@@ -11032,6 +11381,9 @@ function ChatPageInner({
       }
       if (!fetched && lastError) {
         throw lastError;
+      }
+      if (minAssistantMessages != null) {
+        throw new Error("The final assistant message has not been persisted yet.");
       }
     },
     [fetchConversationMessagesIntoCache],
@@ -11054,7 +11406,7 @@ function ChatPageInner({
       queryClient.setQueryData(["chat-messages", id], (previous: unknown) => {
         const previousObj = asRecord(previous);
         const records = pickRecords(previous, "messages");
-        const alreadyPresent = records.some((message) => {
+        const alreadyPresentIndex = records.findIndex((message) => {
           const role = str(message.role, "").trim().toLowerCase();
           if (role !== "assistant") return false;
           if (
@@ -11067,7 +11419,26 @@ function ChatPageInner({
           const messageTraceId = str(message.trace_id, str(message.traceId, "")).trim();
           return Boolean(traceId && messageTraceId === traceId);
         });
-        if (alreadyPresent) return previous;
+        if (alreadyPresentIndex >= 0) {
+          if (choices.length === 0) return previous;
+          const existing = asRecord(records[alreadyPresentIndex]);
+          if (clarificationChoices(existing.choices).length > 0) return previous;
+          const nextRecords = records.map((record, idx) =>
+            idx === alreadyPresentIndex
+              ? {
+                  ...record,
+                  ...(traceId ? { trace_id: traceId } : {}),
+                  choices,
+                }
+              : record,
+          );
+          return Array.isArray(previous)
+            ? nextRecords
+            : {
+                ...previousObj,
+                messages: nextRecords,
+              };
+        }
         const nextMessage: JsonRecord = {
           id: `stream:${runId || traceId || timestamp}`,
           conversation_id: id,
@@ -11086,6 +11457,44 @@ function ChatPageInner({
           ...previousObj,
           messages: [...records, nextMessage],
         };
+      });
+    },
+    [queryClient],
+  );
+
+  const removeApprovalChoicesFromConversationCache = useCallback(
+    (targetConversationId: string, approvalId: string) => {
+      const id = targetConversationId.trim();
+      const normalizedApprovalId = approvalId.trim();
+      if (!id || !normalizedApprovalId) return;
+      queryClient.setQueryData(["chat-messages", id], (previous: unknown) => {
+        const previousObj = asRecord(previous);
+        const records = pickRecords(previous, "messages");
+        if (records.length === 0) return previous;
+        let changed = false;
+        const nextRecords = records.map((record) => {
+          const choices = clarificationChoices(record.choices);
+          if (choices.length === 0) return record;
+          const nextChoices = choices.filter((choice) => {
+            const approval =
+              choice.approval ?? parseInternalApprovalSubmitToken(choice.submitText);
+            return approval?.id !== normalizedApprovalId;
+          });
+          if (nextChoices.length === choices.length) return record;
+          changed = true;
+          return nextChoices.length > 0
+            ? { ...record, choices: nextChoices }
+            : Object.fromEntries(
+                Object.entries(record).filter(([key]) => key !== "choices"),
+              );
+        });
+        if (!changed) return previous;
+        return Array.isArray(previous)
+          ? nextRecords
+          : {
+              ...previousObj,
+              messages: nextRecords,
+            };
       });
     },
     [queryClient],
@@ -11397,9 +11806,8 @@ function ChatPageInner({
     }
     if (t.startsWith("tool started:")) {
       const rawName = title.split(":").slice(1).join(":").trim();
-      const humanName = toHumanToolName(rawName);
       return {
-        label: `Running ${humanName}`,
+        label: runningActivityTitleForToolName(rawName),
         detail: detail || "",
         kind: "Running",
         tone: "tone-action",
@@ -11435,9 +11843,12 @@ function ChatPageInner({
     }
     if (t.startsWith("tool progress:")) {
       const rawName = title.split(":").slice(1).join(":").trim();
+      const statusOnly = isStandaloneActivityStatusLabel(
+        formatActivityToolName(rawName),
+      );
       return {
-        label: `Running ${toHumanToolName(rawName)}`,
-        detail: detail || "Working...",
+        label: runningActivityTitleForToolName(rawName),
+        detail: detail || (statusOnly ? "" : "Working..."),
         kind: "Running",
         tone: "tone-action",
       };
@@ -13114,6 +13525,23 @@ function ChatPageInner({
         prompt,
         conversationTitle,
       );
+      if (report) {
+        const cleanReportBody = cleanResearchReportMarkdownForExport(report);
+        const safe =
+          heading
+            .replace(/[^\w.-]+/g, "_")
+            .replace(/^_+|_+$/g, "")
+            .toLowerCase()
+            .slice(0, 96) || "research";
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        downloadTextFile(
+          `${safe}-${stamp}.md`,
+          cleanReportBody || normalizedContent,
+          "text/markdown;charset=utf-8",
+        );
+        setChatNotice("Report exported.");
+        return;
+      }
       const summaryBullets = buildAssistantExportSummaryBullets(
         normalizedContent,
         report,
@@ -13246,8 +13674,11 @@ function ChatPageInner({
       : researchReportMetaLabel(report);
     const summaryText =
       report.summaryPreview ||
-      report.keyFindings[0] ||
+      report.highlights[0] ||
       "Open the report to review the full research write-up.";
+    const visibleHighlights = report.highlights.slice(0, 3);
+    const visibleOpenQuestions = report.openQuestions.slice(0, 2);
+    const visibleContradictions = report.contradictions.slice(0, 2);
     return (
       <Box className="chat-research-report-shell">
         <Typography variant="caption" className="chat-research-report-meta">
@@ -13255,29 +13686,6 @@ function ChatPageInner({
         </Typography>
         <Box
           className="chat-research-report-card"
-          role="button"
-          tabIndex={0}
-          onClick={() =>
-            openResearchReportPreview({
-              report,
-              previousUserPrompt,
-              messageId,
-              timestamp,
-              traceId,
-            })
-          }
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              openResearchReportPreview({
-                report,
-                previousUserPrompt,
-                messageId,
-                timestamp,
-                traceId,
-              });
-            }
-          }}
         >
           <Stack
             direction="row"
@@ -13359,10 +13767,20 @@ function ChatPageInner({
           <Typography variant="body2" className="chat-research-report-summary">
             {summaryText}
           </Typography>
-          <Box className="chat-research-report-pills">
+          <Box className="chat-research-report-statbar" aria-label="Report coverage">
             {report.sourceCount > 0 ? (
-              <span className="chat-research-report-pill">
+              <span className="chat-research-report-pill strong">
                 {report.sourceCount} source{report.sourceCount === 1 ? "" : "s"}
+              </span>
+            ) : null}
+            {report.tableCount > 0 ? (
+              <span className="chat-research-report-pill">
+                {report.tableCount} table{report.tableCount === 1 ? "" : "s"}
+              </span>
+            ) : null}
+            {report.chartCount > 0 ? (
+              <span className="chat-research-report-pill">
+                {report.chartCount} chart{report.chartCount === 1 ? "" : "s"}
               </span>
             ) : null}
             {report.openQuestionCount > 0 ? (
@@ -13378,19 +13796,107 @@ function ChatPageInner({
               </span>
             ) : null}
           </Box>
-          {report.keyFindings.length > 0 ? (
-            <Stack spacing={0.35} className="chat-research-report-findings">
-              {report.keyFindings.map((finding, index) => (
-                <Typography
-                  key={`${report.title}-finding-${index}`}
-                  variant="body2"
-                  className="chat-research-report-finding"
-                >
-                  {index + 1}. {finding}
-                </Typography>
-              ))}
-            </Stack>
+          {visibleHighlights.length > 0 ? (
+            <Box className="chat-research-report-section">
+              <Typography
+                variant="caption"
+                className="chat-research-report-section-title"
+              >
+                Key findings
+              </Typography>
+              <Stack component="ol" spacing={0.35} className="chat-research-report-list">
+                {visibleHighlights.map((finding, index) => (
+                  <Typography
+                    component="li"
+                    key={`${report.title}-finding-${index}`}
+                    variant="body2"
+                    className="chat-research-report-finding"
+                  >
+                    {finding}
+                  </Typography>
+                ))}
+              </Stack>
+            </Box>
           ) : null}
+          {visibleOpenQuestions.length > 0 || visibleContradictions.length > 0 ? (
+            <Box className="chat-research-report-callouts">
+              {visibleOpenQuestions.length > 0 ? (
+                <Box className="chat-research-report-callout">
+                  <Typography
+                    variant="caption"
+                    className="chat-research-report-section-title"
+                  >
+                    Open questions
+                  </Typography>
+                  {visibleOpenQuestions.map((item, index) => (
+                    <Typography
+                      key={`${report.title}-question-${index}`}
+                      variant="body2"
+                      className="chat-research-report-finding"
+                    >
+                      {item}
+                    </Typography>
+                  ))}
+                </Box>
+              ) : null}
+              {visibleContradictions.length > 0 ? (
+                <Box className="chat-research-report-callout warning">
+                  <Typography
+                    variant="caption"
+                    className="chat-research-report-section-title"
+                  >
+                    Contradictions
+                  </Typography>
+                  {visibleContradictions.map((item, index) => (
+                    <Typography
+                      key={`${report.title}-contradiction-${index}`}
+                      variant="body2"
+                      className="chat-research-report-finding"
+                    >
+                      {item}
+                    </Typography>
+                  ))}
+                </Box>
+              ) : null}
+            </Box>
+          ) : null}
+          <Box className="chat-research-report-footer">
+            <Button
+              size="small"
+              variant="contained"
+              className="chat-research-report-primary-action"
+              onClick={(event) => {
+                event.stopPropagation();
+                openResearchReportPreview({
+                  report,
+                  previousUserPrompt,
+                  messageId,
+                  timestamp,
+                  traceId,
+                });
+              }}
+            >
+              Open full report
+            </Button>
+            <Button
+              size="small"
+              variant="outlined"
+              className="chat-research-report-secondary-action"
+              startIcon={<FileDownloadRoundedIcon fontSize="small" />}
+              onClick={(event) => {
+                event.stopPropagation();
+                void exportAssistantMarkdown({
+                  content: report.content,
+                  headingHint: report.title,
+                  previousUserPrompt,
+                  timestamp,
+                  traceId,
+                });
+              }}
+            >
+              Download Markdown
+            </Button>
+          </Box>
         </Box>
       </Box>
     );
@@ -14031,17 +14537,31 @@ function ChatPageInner({
     const id = str(conv.id, "");
     const active = conversationId === id;
     const starred = toBool(conv.starred);
+    const running = active && isStreaming;
     const title =
       str(conv.title, "Untitled").replace(/\s+/g, " ").trim() || "Untitled";
+    const updatedAt = str(conv.updated_at, "");
+    const updatedAtTooltip = updatedAt
+      ? formatChatTimestamp(updatedAt).tooltip
+      : "";
+    const cardClassName = [
+      "conversation-card",
+      active ? "active" : "",
+      starred ? "conversation-card-starred" : "",
+      running ? "is-running" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
     return (
       <Box
         key={id}
-        className={`${active ? "conversation-card active" : "conversation-card"}${starred ? " conversation-card-starred" : ""}`}
+        className={cardClassName}
         onClick={() => {
           openConversationById(id);
         }}
         role="button"
         tabIndex={0}
+        title={updatedAtTooltip || undefined}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             openConversationById(id);
@@ -14050,34 +14570,30 @@ function ChatPageInner({
       >
         <Stack
           direction="row"
-          spacing={0.5}
+          spacing={1}
           sx={{
-            justifyContent: "space-between",
             alignItems: "center",
           }}
         >
+          {/* Left-aligned status slot. Running = spinner in AgentArk green,
+              otherwise a low-contrast dot that brightens on the active row.
+              Reserved width keeps every title aligned regardless of state. */}
+          <Box
+            className="conversation-card-status"
+            aria-label={
+              running ? "Conversation is running" : active ? "Active conversation" : ""
+            }
+            aria-hidden={!running && !active}
+          >
+            {running ? (
+              <CircularProgress size={12} thickness={5} color="inherit" />
+            ) : (
+              <span className="conversation-card-status-dot" />
+            )}
+          </Box>
           <Tooltip title={title} placement="top-start" enterDelay={250}>
             <Box sx={{ minWidth: 0, flex: 1 }}>
               <div className="conversation-card-title">{title}</div>
-              {(() => {
-                const updatedAt = str(conv.updated_at, "");
-                if (!updatedAt) return null;
-                const parsed = formatChatTimestamp(updatedAt);
-                return (
-                  <Typography
-                    variant="caption"
-                    title={parsed.tooltip}
-                    sx={{
-                      color: "text.secondary",
-                      display: "block",
-                      mt: 0.15,
-                      opacity: 0.88,
-                    }}
-                  >
-                    {parsed.label}
-                  </Typography>
-                );
-              })()}
             </Box>
           </Tooltip>
           <Stack
@@ -14343,7 +14859,7 @@ function ChatPageInner({
       }
     }
     const compact = compactUnknown(payload, 320);
-    if (!compact) return `Starting ${toHumanToolName(name)}.`;
+    if (!compact) return startingActivitySentenceForToolName(name);
     return simplifyConsoleDetail(compact);
   };
 
@@ -14595,7 +15111,7 @@ function ChatPageInner({
     pushStreamingStep({
       step_type: "tool_start",
       title: `Tool started: ${name}`,
-      detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
+      detail: payloadSummary || startingActivitySentenceForToolName(name),
       data:
         Object.keys(payloadObj).length > 0
           ? { ...payloadObj, tool_name: name }
@@ -14784,6 +15300,7 @@ function ChatPageInner({
     const payloadObj = asRecord(payload);
     const phase = normalizeReasoningPhase(payloadObj.phase);
     const streamKey = str(payloadObj.stream_key, `reasoning:${phase || "active"}`);
+    const snapshot = str(payloadObj.content_snapshot, "");
     const delta = str(
       payloadObj.content_delta,
       str(payloadObj.content, fallbackContent),
@@ -14793,7 +15310,7 @@ function ChatPageInner({
 
     const current = reasoningProgressByPhaseRef.current[phase] || "";
     const nextContent = trimReasoningPreview(
-      done ? current : `${current}${delta}`,
+      snapshot || (done ? current : `${current}${delta}`),
     );
     reasoningProgressByPhaseRef.current[phase] = nextContent;
     setReasoningPreviewBuffered(phase, nextContent, done);
@@ -14830,6 +15347,9 @@ function ChatPageInner({
   ) => {
     followActivityConsole();
     const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    if (str(payloadObj.kind, "").trim().toLowerCase() === "turn_completed") {
+      return;
+    }
     // Backward compatibility for older streams that carried reasoning deltas
     // as tool progress. Current streams use dedicated `reasoning_delta` events.
     // Identification is by event kind only, never by phrasing.
@@ -15432,6 +15952,7 @@ function ChatPageInner({
           refreshConversationMessagesFromStreamPayload(
             payload,
             resolvedConversationId || targetConversationId,
+            initialAssistantMessageCount + 1,
           );
         }
         return;
@@ -15545,6 +16066,7 @@ function ChatPageInner({
                   refreshConversationMessagesFromStreamPayload(
                     payload,
                     resolvedConversationId || targetConversationId,
+                    initialAssistantMessageCount + 1,
                   );
                 }
                 if (!taskId || !status) return;
@@ -15600,6 +16122,11 @@ function ChatPageInner({
               },
               onDone: (payload) => {
                 absorbConversationId(payload);
+                refreshConversationMessagesFromStreamPayload(
+                  payload,
+                  resolvedConversationId || targetConversationId,
+                  initialAssistantMessageCount + 1,
+                );
               },
               onError: (messageText) => {
                 streamError = normalizeChatError(messageText);
@@ -15682,6 +16209,7 @@ function ChatPageInner({
                   refreshConversationMessagesFromStreamPayload(
                     payload,
                     resolvedConversationId || targetConversationId,
+                    initialAssistantMessageCount + 1,
                   );
                 }
                 if (!taskId || !status) return;
@@ -15737,6 +16265,11 @@ function ChatPageInner({
               },
               onDone: (payload) => {
                 absorbConversationId(payload);
+                refreshConversationMessagesFromStreamPayload(
+                  payload,
+                  resolvedConversationId || targetConversationId,
+                  initialAssistantMessageCount + 1,
+                );
               },
               onError: (messageText) => {
                 streamError = normalizeChatError(messageText);
@@ -15874,9 +16407,7 @@ function ChatPageInner({
           try {
             await refreshConversationMessagesAfterStream(
               resolvedConversationId,
-              latestStreamingResponse.trim()
-                ? initialAssistantMessageCount + 1
-                : undefined,
+              initialAssistantMessageCount + 1,
             );
           } catch {
             await queryClient.invalidateQueries({
@@ -16586,20 +17117,24 @@ function ChatPageInner({
       ...prev,
       [choiceKey]: true,
     }));
+    const approval =
+      choice.approval ?? parseInternalApprovalSubmitToken(trimmed);
     if (
       (choice.kind === "direct_chat_approval" ||
-        choice.kind === "direct_chat_chain_approval") &&
-      choice.approval
+        choice.kind === "direct_chat_chain_approval" ||
+        approval) &&
+      approval
     ) {
       try {
         const result = asRecord(
           await api.rawPost(
-            `/chat/tool-approvals/${encodeURIComponent(choice.approval.id)}/decision`,
-            { decision: choice.approval.decision },
+            `/chat/tool-approvals/${encodeURIComponent(approval.id)}/decision`,
+            { decision: approval.decision },
           ),
         );
         const response = str(result.response, "").trim();
         if (response && conversationId) {
+          removeApprovalChoicesFromConversationCache(conversationId, approval.id);
           appendAssistantContentToConversationCache(conversationId, {
             content: response,
             model_used: "approval",
@@ -16630,6 +17165,13 @@ function ChatPageInner({
   ) => {
     if (choices.length === 0) return null;
     const disabled = forceDisabled || isStreaming;
+    const approvalChoice = choices.find(
+      (choice) =>
+        (choice.kind === "direct_chat_approval" ||
+          choice.kind === "direct_chat_chain_approval") &&
+        choice.approval,
+    );
+    const isApprovalGroup = Boolean(approvalChoice?.approval);
     const approvalSteps =
       choices.find(
         (choice) =>
@@ -16637,21 +17179,68 @@ function ChatPageInner({
           (choice.approval?.steps?.length ?? 0) > 0,
       )?.approval?.steps ?? [];
     return (
-      <Stack spacing={0.85} sx={{ mt: 1.25 }}>
-        {approvalSteps.length > 1 ? (
+      <Stack
+        spacing={isApprovalGroup ? 1.1 : 0.85}
+        sx={
+          isApprovalGroup
+            ? {
+                mt: 1.4,
+                p: 1.35,
+                borderRadius: 1.25,
+                border: "1px solid rgba(245, 158, 11, 0.58)",
+                background:
+                  "linear-gradient(135deg, rgba(245, 158, 11, 0.17), rgba(15, 23, 42, 0.42))",
+                boxShadow:
+                  "0 16px 38px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.08)",
+              }
+            : { mt: 1.25 }
+        }
+      >
+        {isApprovalGroup ? (
+          <Stack spacing={0.35}>
+            <Typography
+              variant="overline"
+              sx={{
+                color: "warning.light",
+                fontWeight: 800,
+                letterSpacing: 0,
+                lineHeight: 1.2,
+              }}
+            >
+              Approval required
+            </Typography>
+            <Typography
+              variant="body2"
+              sx={{ color: "text.primary", fontWeight: 700, lineHeight: 1.35 }}
+            >
+              {approvalSteps.length > 1
+                ? `${approvalSteps.length} actions are waiting to run`
+                : approvalChoice?.approval?.actionName
+                  ? `Run ${approvalChoice.approval.actionName}`
+                  : "Run this action"}
+            </Typography>
+          </Stack>
+        ) : null}
+        {approvalSteps.length > 0 ? (
           <Box
             sx={{
-              border: "1px solid rgba(148, 163, 184, 0.24)",
+              border: isApprovalGroup
+                ? "1px solid rgba(245, 158, 11, 0.28)"
+                : "1px solid rgba(148, 163, 184, 0.24)",
               borderRadius: 1,
               p: 1,
-              background: "rgba(15, 23, 42, 0.18)",
+              background: isApprovalGroup
+                ? "rgba(2, 6, 23, 0.34)"
+                : "rgba(15, 23, 42, 0.18)",
             }}
           >
             <Typography
               variant="caption"
               sx={{ color: "text.secondary", display: "block", mb: 0.5 }}
             >
-              Approval covers {approvalSteps.length} actions
+              {approvalSteps.length > 1
+                ? `Approval covers ${approvalSteps.length} actions`
+                : "Approval action"}
             </Typography>
             <Stack spacing={0.4}>
               {approvalSteps.map((step, idx) => (
@@ -16683,8 +17272,19 @@ function ChatPageInner({
             return (
               <Button
                 key={`${messageKey}-${choice.submitText}-${idx}`}
-                size="small"
-                variant="outlined"
+                size={isApprovalGroup ? "medium" : "small"}
+                variant={
+                  isApprovalGroup && choice.approval?.decision === "approve"
+                    ? "contained"
+                    : "outlined"
+                }
+                color={
+                  isApprovalGroup && choice.approval?.decision === "reject"
+                    ? "error"
+                    : isApprovalGroup
+                      ? "warning"
+                      : "primary"
+                }
                 disabled={disabled || Boolean(submittedClarificationChoices[choiceKey])}
                 onClick={() => {
                   void submitClarificationChoice(messageKey, choice, choiceKey);
@@ -16692,6 +17292,9 @@ function ChatPageInner({
                 sx={{
                   borderRadius: 1,
                   textTransform: "none",
+                  fontWeight: isApprovalGroup ? 800 : 500,
+                  minHeight: isApprovalGroup ? 38 : undefined,
+                  px: isApprovalGroup ? 1.65 : undefined,
                 }}
               >
                 {choice.label}
@@ -17270,7 +17873,15 @@ function ChatPageInner({
     [],
   );
   const messageRenderBundle = useMemo(() => {
-    let firstChoicesSeen = false;
+    let latestChoiceMessageIndex = -1;
+    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+      const candidate = asRecord(messages[idx]);
+      if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      if (clarificationChoices(candidate.choices).length > 0) {
+        latestChoiceMessageIndex = idx;
+        break;
+      }
+    }
     return messages.map((raw, idx) => {
       const message = asRecord(raw);
       const role = str(message.role, "").toLowerCase();
@@ -17288,13 +17899,12 @@ function ChatPageInner({
         ? clarificationChoices(message.choices)
         : [];
       // Only render choice buttons on the FIRST assistant message in the
-      // thread that carries choices from the original clarification. Choices
-      // attached to later assistant messages (e.g., via over-permissive
-      // trace_id persistence) are treated as stale and suppressed.
+      // latest assistant message that currently carries choices. Older
+      // approvals can remain in history, but only the current pending choice
+      // should be actionable in the chat lane.
       let messageChoices: ChatClarificationChoice[] = [];
-      if (rawMessageChoices.length > 0 && !firstChoicesSeen) {
+      if (rawMessageChoices.length > 0 && idx === latestChoiceMessageIndex) {
         messageChoices = rawMessageChoices;
-        firstChoicesSeen = true;
       }
       const researchReport = isAssistant
         ? parseResearchReport(renderedContent)
@@ -18630,6 +19240,14 @@ function ChatPageInner({
     }
     return <RadioButtonUncheckedRoundedIcon className={className} />;
   };
+  const executionPlanStepStatusLabel = (status: string) => {
+    const normalized = str(status, "").trim().toLowerCase();
+    if (normalized === "completed") return "Done";
+    if (normalized === "running") return "Running";
+    if (normalized === "failed") return "Failed";
+    if (normalized === "skipped") return "Skipped";
+    return "Pending";
+  };
 
   const renderConversationSidebarContent = (drawer = false) => (
     <Box
@@ -18695,10 +19313,11 @@ function ChatPageInner({
                   <Typography
                     variant="caption"
                     className="conversation-group-label"
+                    sx={{ px: 0.25 }}
                   >
                     Starred
                   </Typography>
-                  <Stack spacing={0.9}>
+                  <Stack spacing={0.4}>
                     {starredConversations.map((conv) =>
                       renderConversationCard(conv),
                     )}
@@ -18707,28 +19326,14 @@ function ChatPageInner({
               ) : null}
               {conversations.length > 0 ? (
                 <Box className="conversation-group">
-                  <Stack
-                    direction="row"
-                    sx={{
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      px: 0.25,
-                    }}
+                  <Typography
+                    variant="caption"
+                    className="conversation-group-label"
+                    sx={{ px: 0.25 }}
                   >
-                    <Typography
-                      variant="caption"
-                      className="conversation-group-label"
-                    >
-                      All Chats
-                    </Typography>
-                    <Typography
-                      variant="caption"
-                      className="conversation-page-indicator"
-                    >
-                      Page {conversationPageLabel}
-                    </Typography>
-                  </Stack>
-                  <Stack spacing={0.9}>
+                    Recents
+                  </Typography>
+                  <Stack spacing={0.4}>
                     {conversations.map((conv) => renderConversationCard(conv))}
                   </Stack>
                 </Box>
@@ -19739,7 +20344,7 @@ function ChatPageInner({
                 type="button"
                 className="chat-session-pill"
                 disabled={!onNavigateToView}
-                onClick={() => onNavigateToView?.("sessions")}
+                onClick={() => onNavigateToView?.("background-work")}
                 title={`Session: ${str(activeConversationSession.title, "Background session")}`}
               >
                 <span className="chat-session-pill-dot" aria-hidden="true" />
@@ -20952,27 +21557,34 @@ function ChatPageInner({
                         step,
                         `Step ${step.id}`,
                       );
+                      const stepStatusLabel = executionPlanStepStatusLabel(
+                        step.status,
+                      );
                       return (
                         <Box
                           key={step.id}
                           className={`chat-plan-step${isCompleted ? " done" : ""}${isRunning ? " running" : ""}${isFailed ? " failed" : ""}`}
                         >
                           <Box className="chat-plan-step-marker">
-                            {isCompleted ? (
-                              "\u2713"
-                            ) : isFailed ? (
-                              "\u2715"
-                            ) : (
-                              <span className="chat-plan-step-dot" />
+                            {renderExecutionPlanStatusIcon(
+                              step.status,
+                              isRunning ? "spin" : "",
                             )}
                           </Box>
                           <Box sx={{ minWidth: 0, flex: 1 }}>
-                            <Typography
-                              variant="body2"
-                              className="chat-plan-step-title"
-                            >
-                              {step.id}. {stepCopy.title}
-                            </Typography>
+                            <Box className="chat-plan-step-title-row">
+                              <Typography
+                                variant="body2"
+                                className="chat-plan-step-title"
+                              >
+                                {step.id}. {stepCopy.title}
+                              </Typography>
+                              <span
+                                className={`chat-plan-step-state status-${step.status || "pending"}`}
+                              >
+                                {stepStatusLabel}
+                              </span>
+                            </Box>
                             {stepCopy.description ? (
                               <Typography
                                 variant="caption"
@@ -20993,26 +21605,34 @@ function ChatPageInner({
                                     substep.status === "running";
                                   const isSubFailed =
                                     substep.status === "failed";
+                                  const substepStatusLabel =
+                                    executionPlanStepStatusLabel(
+                                      substep.status,
+                                    );
                                   return (
                                     <Box
                                       key={`${step.id}:${substep.id}`}
                                       className={`chat-plan-substep${isSubCompleted ? " done" : ""}${isSubRunning ? " running" : ""}${isSubFailed ? " failed" : ""}`}
                                     >
                                       <Box className="chat-plan-substep-marker">
-                                        {isSubCompleted ? (
-                                          "\u2713"
-                                        ) : isSubFailed ? (
-                                          "\u2715"
-                                        ) : (
-                                          <span className="chat-plan-substep-dot" />
+                                        {renderExecutionPlanStatusIcon(
+                                          substep.status,
+                                          isSubRunning ? "spin" : "",
                                         )}
                                       </Box>
-                                      <Typography
-                                        variant="caption"
-                                        className="chat-plan-substep-title"
-                                      >
-                                        {step.id}.{substep.id} {substep.title}
-                                      </Typography>
+                                      <Box className="chat-plan-substep-copy">
+                                        <Typography
+                                          variant="caption"
+                                          className="chat-plan-substep-title"
+                                        >
+                                          {step.id}.{substep.id} {substep.title}
+                                        </Typography>
+                                        <span
+                                          className={`chat-plan-step-state chat-plan-substep-state status-${substep.status || "pending"}`}
+                                        >
+                                          {substepStatusLabel}
+                                        </span>
+                                      </Box>
                                     </Box>
                                   );
                                 })}
@@ -21324,12 +21944,47 @@ function ChatPageInner({
           </Stack>
         </DialogTitle>
         <DialogContent dividers className="chat-research-report-dialog-content">
-          {researchReportDialog
-            ? renderChatMarkdown(researchReportDialog.report.content, {
-                snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}`,
-                onOpenSnippet: openCodePreviewInWorkspace,
-              })
-            : null}
+          {researchReportDialog ? (
+            <Stack spacing={1.5}>
+              <Box className="chat-research-report-paper">
+                {renderChatMarkdown(
+                  researchReportDialog.report.mainContent ||
+                    researchReportDialog.report.content,
+                  {
+                    snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-main`,
+                    onOpenSnippet: openCodePreviewInWorkspace,
+                  },
+                )}
+              </Box>
+              {researchReportDialog.report.evidenceBrief ? (
+                <Accordion className="chat-research-report-evidence">
+                  <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                    <Box>
+                      <Typography
+                        variant="subtitle2"
+                        className="chat-research-report-evidence-title"
+                      >
+                        Evidence brief and source checks
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        className="chat-research-report-evidence-meta"
+                      >
+                        Raw evidence used for the synthesis, including source
+                        reliability charts when available.
+                      </Typography>
+                    </Box>
+                  </AccordionSummary>
+                  <AccordionDetails>
+                    {renderChatMarkdown(researchReportDialog.report.evidenceBrief, {
+                      snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-evidence`,
+                      onOpenSnippet: openCodePreviewInWorkspace,
+                    })}
+                  </AccordionDetails>
+                </Accordion>
+              ) : null}
+            </Stack>
+          ) : null}
         </DialogContent>
         <DialogActions className="chat-research-report-dialog-actions">
           <Button

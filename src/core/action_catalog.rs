@@ -223,14 +223,14 @@ fn descriptor_hash(text: &str) -> String {
 }
 
 pub(crate) fn build_action_catalog_descriptor(action: &ActionDef) -> ActionCatalogDescriptor {
-    let planner_metadata = action.planner_metadata();
+    let action_metadata = action.action_metadata();
     let schema_fields = action_schema_field_descriptions(&action.input_schema, 32);
     let source = action_source_key(&action.source).to_string();
     let metadata_json = json!({
         "source": source.clone(),
         "version": action.version.clone(),
         "capabilities": action.capabilities.clone(),
-        "planner_metadata": planner_metadata,
+        "action_metadata": action_metadata,
         "authorization": {
             "requires_auth": action.authorization.requires_auth,
             "risk_level": action.authorization.risk_level.clone(),
@@ -252,8 +252,8 @@ pub(crate) fn build_action_catalog_descriptor(action: &ActionDef) -> ActionCatal
         ));
     }
     descriptor.push_str(&format!(
-        "planner_metadata: {}\n",
-        serde_json::to_string(&planner_metadata).unwrap_or_default()
+        "action_metadata: {}\n",
+        serde_json::to_string(&action_metadata).unwrap_or_default()
     ));
     if !schema_fields.is_empty() {
         descriptor.push_str("schema_fields:\n");
@@ -301,6 +301,73 @@ pub(crate) fn action_catalog_entry_needs_embedding(
                     .unwrap_or(true)
         })
         .unwrap_or(true)
+}
+
+fn lexical_tokens(text: &str) -> HashSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| token.len() >= 2)
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn lexical_overlap_score(tokens: &HashSet<String>, text: &str, weight: i64) -> i64 {
+    lexical_tokens(text)
+        .into_iter()
+        .filter(|token| tokens.contains(token))
+        .count() as i64
+        * weight
+}
+
+pub(crate) fn rank_action_names_lexically(
+    actions: &[ActionDef],
+    probes: &[String],
+) -> Vec<String> {
+    if actions.is_empty() {
+        return Vec::new();
+    }
+    let probe_text = probes.join("\n").to_ascii_lowercase();
+    let probe_tokens = lexical_tokens(&probe_text);
+    if probe_tokens.is_empty() {
+        return actions.iter().map(|action| action.name.clone()).collect();
+    }
+
+    let mut scored = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let mut score = 0_i64;
+            score += lexical_overlap_score(&probe_tokens, &action.name, 45);
+            score += lexical_overlap_score(&probe_tokens, &action.description, 18);
+            score += lexical_overlap_score(&probe_tokens, &action.capabilities.join(" "), 30);
+            let metadata = action.action_metadata();
+            score += lexical_overlap_score(&probe_tokens, &format!("{:?}", metadata.role), 18);
+            score += lexical_overlap_score(
+                &probe_tokens,
+                &format!("{:?}", metadata.integration_class),
+                18,
+            );
+            for field in action_schema_field_descriptions(&action.input_schema, 24) {
+                score += lexical_overlap_score(&probe_tokens, &field, 12);
+            }
+            (index, score, action.name.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if scored.iter().all(|(_, score, _)| *score <= 0) {
+        return actions.iter().map(|action| action.name.clone()).collect();
+    }
+
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    scored
+        .into_iter()
+        .map(|(_, _, action_name)| action_name)
+        .collect()
 }
 
 #[cfg(test)]

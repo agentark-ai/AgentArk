@@ -215,6 +215,10 @@ export function rendererIdForCard(card: ChatStepCard | null | undefined): string
 }
 
 export function isRegisteredWorkspaceSurface(card: ChatStepCard): boolean {
+  const payload = payloadRecord(card);
+  if (str(payload?.kind).trim().toLowerCase() === "turn_completed") {
+    return false;
+  }
   const surface = surfaceFromCard(card);
   if (!surface) return false;
   if ((surface.tool?.id || "").trim().toLowerCase() === "agent_turn_loop") {

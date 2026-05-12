@@ -36,7 +36,6 @@ mod security;
 mod sentinel;
 mod storage;
 mod workspace;
-pub(crate) mod router;
 
 #[cfg(feature = "gui")]
 mod gui;
@@ -296,9 +295,6 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         caller_principal: Some(actions::ActionCallerPrincipal::local_admin("cli")),
         execution_surface: actions::ActionExecutionSurface::Chat,
         direct_user_intent: true,
-        routing: None,
-        routing_trusted: false,
-        force_agent_loop: false,
         secret_offered: None,
         attachments: Vec::new(),
         saved_user_facts_context: None,

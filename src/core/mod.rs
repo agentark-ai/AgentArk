@@ -12,7 +12,6 @@ pub mod autonomy;
 pub mod background_session;
 pub mod browser_profiles;
 pub mod browser_session;
-pub mod capability_router;
 pub mod companion;
 pub mod config;
 pub mod connect_flow;
@@ -32,6 +31,7 @@ pub mod integration_sync;
 pub mod learning;
 pub mod live_run;
 mod llm;
+pub(crate) mod llm_context_sanitizer;
 pub(crate) mod llm_provider;
 pub mod memory_dedup;
 pub mod memory_schema;
@@ -59,9 +59,10 @@ pub mod task_router;
 pub mod watcher;
 
 pub(crate) use agent::chat_model_is_configured;
+pub(crate) use agent::{
+    parse_direct_chat_approval_submit_text, DirectChatApprovalSubmitDecision,
+};
 pub(crate) use agent::queue_stream_event;
-#[cfg(test)]
-pub(crate) use agent::reasoning_stream;
 pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
 pub(crate) use agent::USER_SELECTED_MODEL_SLOT_KEY;
 pub use agent::{

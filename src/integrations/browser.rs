@@ -380,6 +380,7 @@ impl BrowserIntegration {
     }
 
     /// Press a keyboard key
+    #[allow(dead_code)]
     pub async fn press_key(&self, session_id: &str, key: &str) -> Result<()> {
         self.client
             .post(format!("{}/session/{}/press", self.bridge_url, session_id))

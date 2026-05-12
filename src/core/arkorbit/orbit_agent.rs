@@ -1,11 +1,12 @@
 //! Thin ArkOrbit agent path.
 //!
 //! This path performs a direct streaming model call with orbit-scoped context.
-//! It never invokes the main agent turn loop, intent planner, semantic router,
+//! It never invokes the main agent turn loop, legacy intent planner,
 //! or tool-call envelope path.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -275,7 +276,7 @@ async fn run_orbit_inbound_security_guard(
         crate::security::intent_classifier::IntentVerdict::Block { message, .. } => {
             Some(message.clone())
         }
-        crate::security::intent_classifier::IntentVerdict::RouterUnavailable { reason } => {
+        crate::security::intent_classifier::IntentVerdict::ClassifierUnavailable { reason } => {
             tracing::warn!(
                 target: "arkorbit.chat.security",
                 reason = %reason,
@@ -393,10 +394,6 @@ fn normalize_orbit_scope_classifier_output(
     let label = normalize_orbit_scope_label(&output.decision);
     match label.as_str() {
         "orbit_ui_work" => OrbitScopeDecisionKind::Proceed,
-        // Older classifier outputs may still use this label. It is not a
-        // blocking scope decision; the Orbit agent can handle a greeting or
-        // lightweight in-surface chat without bypassing substantive requests.
-        "direct_reply" => OrbitScopeDecisionKind::Proceed,
         "out_of_scope" => OrbitScopeDecisionKind::Decline,
         _ => OrbitScopeDecisionKind::Decline,
     }
@@ -626,10 +623,10 @@ mod orbit_agent_extra_tests {
         );
         assert_eq!(
             normalize_orbit_scope_classifier_output(OrbitScopeClassifierOutput {
-                decision: "direct-reply".to_string(),
+                decision: "conversational".to_string(),
                 rationale: None,
             }),
-            OrbitScopeDecisionKind::Proceed
+            OrbitScopeDecisionKind::Decline
         );
         assert_eq!(
             normalize_orbit_scope_classifier_output(OrbitScopeClassifierOutput {
@@ -664,10 +661,12 @@ mod orbit_agent_extra_tests {
             context.get("surface_kind").and_then(|value| value.as_str()),
             Some("workspace_overview")
         );
-        assert!(context
-            .get("scope")
-            .and_then(|value| value.as_str())
-            .is_some_and(|scope| scope.contains("Broader AgentArk support")));
+        assert!(
+            context
+                .get("scope")
+                .and_then(|value| value.as_str())
+                .is_some_and(|scope| scope.contains("Broader AgentArk support"))
+        );
     }
 
     #[test]
@@ -724,6 +723,31 @@ mod orbit_agent_extra_tests {
             OrbitStructuredOperationKind::CreateWidget
         );
         assert!(parsed.operations[0].path.is_empty());
+    }
+
+    #[test]
+    fn parses_operation_json_string_with_trailing_text() {
+        let parsed = parse_orbit_tool_arguments(&serde_json::Value::String(
+            r#"{"operations":[{"operation":"write","path":"mod/demo/index.js","content":"export function render(el) { el.textContent = 'ok'; }"}]} Completed."#
+                .to_string(),
+        ))
+        .expect("operation payload");
+
+        assert_eq!(parsed.operations.len(), 1);
+        assert_eq!(parsed.operations[0].operation, "write");
+        assert_eq!(parsed.operations[0].path, "mod/demo/index.js");
+    }
+
+    #[test]
+    fn parses_first_payload_when_tool_string_contains_following_json() {
+        let parsed = parse_orbit_tool_arguments(&serde_json::Value::String(
+            r#"{"operations":[{"operation":"read","path":"data/widgets.json"}]} {"ignored":true}"#
+                .to_string(),
+        ))
+        .expect("operation payload");
+
+        assert_eq!(parsed.operations.len(), 1);
+        assert_eq!(parsed.operations[0].operation, "read");
     }
 
     #[test]
@@ -792,6 +816,52 @@ mod orbit_agent_extra_tests {
         let right = serde_json::json!({
             "id": "second",
             "module": "app-shell"
+        });
+
+        assert!(!widget_registry_entries_match(&left, &right));
+    }
+
+    #[test]
+    fn widget_registry_collapses_structurally_similar_replacements() {
+        let mut widgets = vec![
+            serde_json::json!({
+                "id": "sales-dashboard",
+                "module": "sales-dashboard",
+                "title": "Sales Dashboard",
+                "left": 44,
+                "top": 88,
+                "width": 360
+            }),
+            serde_json::json!({
+                "id": "animated-sales-dashboard",
+                "module": "animated-sales-dashboard",
+                "title": "Animated Sales Dashboard"
+            }),
+        ];
+
+        let removed = collapse_duplicate_widget_registry_entries(&mut widgets);
+
+        assert_eq!(removed, 1);
+        assert_eq!(widgets.len(), 1);
+        assert_eq!(
+            widgets[0].get("module").and_then(|value| value.as_str()),
+            Some("animated-sales-dashboard")
+        );
+        assert_eq!(widgets[0].get("left").and_then(|value| value.as_i64()), Some(44));
+        assert_eq!(widgets[0].get("top").and_then(|value| value.as_i64()), Some(88));
+    }
+
+    #[test]
+    fn widget_registry_keeps_distinct_partial_token_matches() {
+        let left = serde_json::json!({
+            "id": "sales-dashboard",
+            "module": "sales-dashboard",
+            "title": "Sales Dashboard"
+        });
+        let right = serde_json::json!({
+            "id": "sales-forecast",
+            "module": "sales-forecast",
+            "title": "Sales Forecast"
         });
 
         assert!(!widget_registry_entries_match(&left, &right));
@@ -2086,7 +2156,19 @@ fn parse_json_payload_text(text: &str) -> Option<serde_json::Value> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
         return Some(value);
     }
+    if let Some(value) = parse_first_json_value(trimmed) {
+        return Some(value);
+    }
     parse_fenced_json_payload(trimmed)
+}
+
+fn parse_first_json_value(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim_start();
+    if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+        return None;
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(trimmed);
+    serde_json::Value::deserialize(&mut deserializer).ok()
 }
 
 fn parse_fenced_json_payload(text: &str) -> Option<serde_json::Value> {
@@ -2110,8 +2192,10 @@ fn parse_orbit_tool_arguments(value: &serde_json::Value) -> Result<OrbitToolArgu
 
 fn normalize_orbit_tool_arguments_value(value: &serde_json::Value) -> Result<serde_json::Value> {
     if let Some(raw) = value.as_str() {
-        return serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|error| anyhow!("Invalid ArkOrbit operation JSON string: {}", error));
+        let parsed = parse_json_payload_text(raw).ok_or_else(|| {
+            anyhow!("Invalid ArkOrbit operation JSON string: expected a JSON object")
+        })?;
+        return normalize_orbit_tool_arguments_value(&parsed);
     }
     if value.get("operations").and_then(|v| v.as_array()).is_some() {
         return Ok(value.clone());
@@ -2598,12 +2682,15 @@ fn upsert_widget_registry_entry(
         .iter_mut()
         .find(|widget| widget_registry_entries_match(widget, &entry_value))
         .map(|widget| {
-            *widget = entry_value.clone();
+            let mut next = entry_value.clone();
+            preserve_widget_layout(widget, &mut next);
+            *widget = next;
         })
         .is_some();
     if !replaced {
         widgets.push(entry_value);
     }
+    let removed_duplicates = collapse_duplicate_widget_registry_entries(&mut widgets);
 
     let next_value = if let Some(root) = root.as_mut() {
         root.insert("widgets".to_string(), serde_json::Value::Array(widgets));
@@ -2616,7 +2703,7 @@ fn upsert_widget_registry_entry(
     service.write_orbit_file(orbit_id, "data/widgets.json", &next)?;
     Ok((
         bytes,
-        if replaced {
+        if replaced || removed_duplicates > 0 {
             OrbitFileOperation::Edited
         } else {
             OrbitFileOperation::Wrote
@@ -2627,12 +2714,139 @@ fn upsert_widget_registry_entry(
 fn widget_registry_entries_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     let left_id = left.get("id").and_then(|value| value.as_str());
     let right_id = right.get("id").and_then(|value| value.as_str());
-    if right_id.is_some() {
-        return left_id == right_id;
+    if left_id.is_some() && left_id == right_id {
+        return true;
     }
     let left_module = left.get("module").and_then(|value| value.as_str());
     let right_module = right.get("module").and_then(|value| value.as_str());
-    left_module.is_some() && left_module == right_module
+    if left_module.is_some() && left_module == right_module {
+        return left_id.is_none() || right_id.is_none() || left_id == right_id;
+    }
+    widget_registry_identity_similarity(left, right)
+}
+
+fn widget_registry_identity_similarity(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> bool {
+    let Some(left_label) = widget_registry_identity_label(left) else {
+        return false;
+    };
+    let Some(right_label) = widget_registry_identity_label(right) else {
+        return false;
+    };
+    let left_normalized = normalize_widget_identity_text(&left_label);
+    let right_normalized = normalize_widget_identity_text(&right_label);
+    if left_normalized.is_empty() || right_normalized.is_empty() {
+        return false;
+    }
+    if left_normalized == right_normalized {
+        return true;
+    }
+    let left_tokens = widget_identity_tokens(&left_normalized);
+    let right_tokens = widget_identity_tokens(&right_normalized);
+    if left_tokens.len().min(right_tokens.len()) < 2 {
+        return false;
+    }
+    let shared = left_tokens.intersection(&right_tokens).count();
+    if shared < 2 {
+        return false;
+    }
+    let score = (shared * 2) as f64 / (left_tokens.len() + right_tokens.len()) as f64;
+    score >= 0.72
+}
+
+fn widget_registry_identity_label(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("title")
+        .or_else(|| value.get("name"))
+        .or_else(|| value.get("label"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("spec")
+                .and_then(|spec| {
+                    spec.get("title")
+                        .or_else(|| spec.get("name"))
+                        .or_else(|| spec.get("label"))
+                })
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("module")
+                .or_else(|| value.get("id"))
+                .and_then(|value| value.as_str())
+                .map(title_from_module)
+        })
+}
+
+fn normalize_widget_identity_text(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn widget_identity_tokens(value: &str) -> BTreeSet<String> {
+    value
+        .split_whitespace()
+        .filter(|token| token.chars().count() >= 2)
+        .map(str::to_string)
+        .collect()
+}
+
+fn preserve_widget_layout(existing: &serde_json::Value, replacement: &mut serde_json::Value) {
+    let Some(existing_object) = existing.as_object() else {
+        return;
+    };
+    let Some(replacement_object) = replacement.as_object_mut() else {
+        return;
+    };
+    for field in ["left", "top", "width", "height"] {
+        if replacement_object.contains_key(field) {
+            continue;
+        }
+        if let Some(value) = existing_object.get(field).and_then(|value| value.as_f64()) {
+            if value.is_finite() {
+                replacement_object.insert(field.to_string(), serde_json::json!(value));
+            }
+        }
+    }
+}
+
+fn collapse_duplicate_widget_registry_entries(widgets: &mut Vec<serde_json::Value>) -> usize {
+    let original_len = widgets.len();
+    let mut collapsed: Vec<serde_json::Value> = Vec::with_capacity(widgets.len());
+    for candidate in widgets.drain(..) {
+        if let Some(index) = collapsed
+            .iter()
+            .position(|existing| widget_registry_entries_match(existing, &candidate))
+        {
+            let mut next = candidate;
+            preserve_widget_layout(&collapsed[index], &mut next);
+            collapsed[index] = next;
+        } else {
+            collapsed.push(candidate);
+        }
+    }
+    let removed = original_len.saturating_sub(collapsed.len());
+    *widgets = collapsed;
+    removed
 }
 
 fn upsert_widget_registry_for_module(
@@ -2666,14 +2880,41 @@ fn upsert_widget_registry_for_module(
         })
         .unwrap_or_default();
 
-    let exists = widgets.iter().any(|widget| {
+    let exact_module_registered = widgets.iter().any(|widget| {
         widget
             .get("module")
             .and_then(|value| value.as_str())
             .map(|value| value == module)
             .unwrap_or(false)
     });
-    if !exists {
+    if exact_module_registered {
+        let removed_duplicates = collapse_duplicate_widget_registry_entries(&mut widgets);
+        if removed_duplicates == 0 {
+            return Ok(());
+        }
+        return service.write_orbit_file(
+            orbit_id,
+            "data/widgets.json",
+            &serde_json::to_string_pretty(&widgets)?,
+        );
+    }
+
+    let candidate = serde_json::json!({
+        "id": module,
+        "module": module,
+        "title": title_from_module(module),
+        "left": 100 + widgets.len() as i64 * 380,
+        "top": 80 + widgets.len() as i64 * 40,
+        "width": 340
+    });
+    if let Some(existing) = widgets
+        .iter_mut()
+        .find(|widget| widget_registry_entries_match(widget, &candidate))
+    {
+        let mut next = candidate;
+        preserve_widget_layout(existing, &mut next);
+        *existing = next;
+    } else {
         let offset = widgets.len() as i64;
         widgets.push(serde_json::json!({
             "id": module,
@@ -2684,6 +2925,7 @@ fn upsert_widget_registry_for_module(
             "width": 340
         }));
     }
+    collapse_duplicate_widget_registry_entries(&mut widgets);
     service.write_orbit_file(
         orbit_id,
         "data/widgets.json",

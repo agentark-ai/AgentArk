@@ -6,7 +6,7 @@ const SENTINEL_SCAN_STATE_KEY: &str = "sentinel_scan_state_v1";
 const SENTINEL_OBSERVATIONS_KEY: &str = "sentinel_observations_v1";
 const SENTINEL_PROPOSALS_KEY: &str = "sentinel_proposals_v1";
 const SENTINEL_DAILY_AUTO_RUNS_KEY: &str = "sentinel_daily_auto_runs_v1";
-const SENTINEL_DAILY_OPPORTUNITY_NUDGE_KEY: &str = "sentinel_daily_opportunity_nudge_v1";
+const SENTINEL_DAILY_REVIEW_NOTICE_KEY: &str = "sentinel_daily_review_notice_v1";
 const BACKGROUND_LEARNING_STATE_KEY: &str = "sentinel_background_learning_state_v1";
 const BACKGROUND_LEARNING_STATE_LEASE_KEY: &str = "sentinel_background_learning_state_lease_v1";
 const BACKGROUND_LEARNING_STATE_LEASE_TTL_SECS: i64 = 15;
@@ -17,6 +17,7 @@ const SENTINEL_RETENTION_DAYS: i64 = 30;
 const SENTINEL_PROPOSAL_RECREATE_HOURS: i64 = 24;
 const IN_APP_EXECUTION_SCAN_LIMIT: u64 = 48;
 const IN_APP_STALE_RUN_MINUTES: i64 = 15;
+const SENTINEL_PROPOSAL_SEMANTIC_DEDUP_TIMEOUT_SECS: u64 = 8;
 const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 5] = [
     ("reflection_pass", "Reflection pass"),
     ("experience_consolidation", "Experience consolidation"),
@@ -131,15 +132,11 @@ struct SentinelDailyAutoRuns {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct SentinelDailyOpportunityNudgeState {
+struct SentinelDailyReviewNoticeState {
     #[serde(default)]
     last_day: Option<String>,
     #[serde(default)]
-    last_signature: Option<String>,
-    #[serde(default)]
     last_sent_at: Option<String>,
-    #[serde(default)]
-    seen_signatures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,26 +237,26 @@ async fn save_daily_auto_runs(storage: &crate::storage::Storage, counter: &Senti
     }
 }
 
-async fn load_daily_opportunity_nudge_state(
+async fn load_daily_review_notice_state(
     storage: &crate::storage::Storage,
-) -> SentinelDailyOpportunityNudgeState {
-    match storage.get(SENTINEL_DAILY_OPPORTUNITY_NUDGE_KEY).await {
-        Ok(Some(raw)) => serde_json::from_slice::<SentinelDailyOpportunityNudgeState>(&raw)
-            .unwrap_or_else(|_| SentinelDailyOpportunityNudgeState {
+) -> SentinelDailyReviewNoticeState {
+    match storage.get(SENTINEL_DAILY_REVIEW_NOTICE_KEY).await {
+        Ok(Some(raw)) => serde_json::from_slice::<SentinelDailyReviewNoticeState>(&raw)
+            .unwrap_or_else(|_| SentinelDailyReviewNoticeState {
                 last_day: String::from_utf8(raw).ok(),
-                ..SentinelDailyOpportunityNudgeState::default()
+                ..SentinelDailyReviewNoticeState::default()
             }),
-        _ => SentinelDailyOpportunityNudgeState::default(),
+        _ => SentinelDailyReviewNoticeState::default(),
     }
 }
 
-async fn save_daily_opportunity_nudge_state(
+async fn save_daily_review_notice_state(
     storage: &crate::storage::Storage,
-    state: &SentinelDailyOpportunityNudgeState,
+    state: &SentinelDailyReviewNoticeState,
 ) -> Result<(), anyhow::Error> {
     let raw = serde_json::to_vec(state)?;
     storage
-        .set(SENTINEL_DAILY_OPPORTUNITY_NUDGE_KEY, &raw)
+        .set(SENTINEL_DAILY_REVIEW_NOTICE_KEY, &raw)
         .await
 }
 
@@ -646,6 +643,69 @@ fn refresh_snoozed_proposals(
     }
 }
 
+fn text_contains_direct_chat_approval_submit_text(text: &str) -> bool {
+    text.split_whitespace().any(|part| {
+        let candidate = part.trim_matches(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-'))
+        });
+        crate::core::parse_direct_chat_approval_submit_text(candidate).is_some()
+    })
+}
+
+fn json_contains_direct_chat_approval_control(value: &serde_json::Value, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        serde_json::Value::String(text) => text_contains_direct_chat_approval_submit_text(text),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| json_contains_direct_chat_approval_control(item, depth + 1)),
+        serde_json::Value::Object(map) => {
+            let kind_is_direct_chat_approval = map
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .map(|value| {
+                    let normalized = value.to_ascii_lowercase();
+                    normalized.contains("direct_chat") && normalized.contains("approval")
+                })
+                .unwrap_or(false);
+            let submit_text_is_direct_chat_approval = map
+                .get("submit_text")
+                .or_else(|| map.get("submitText"))
+                .and_then(|value| value.as_str())
+                .map(text_contains_direct_chat_approval_submit_text)
+                .unwrap_or(false);
+            if kind_is_direct_chat_approval || submit_text_is_direct_chat_approval {
+                return true;
+            }
+            map.values()
+                .any(|item| json_contains_direct_chat_approval_control(item, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+fn sentinel_observation_is_control_plane_artifact(observation: &SentinelObservation) -> bool {
+    matches!(observation.source_kind.as_str(), "execution_run" | "chat_suggestion")
+        && (json_contains_direct_chat_approval_control(&observation.metadata, 0)
+            || text_contains_direct_chat_approval_submit_text(&observation.title)
+            || text_contains_direct_chat_approval_submit_text(&observation.detail))
+}
+
+fn sentinel_proposal_is_control_plane_artifact(proposal: &SentinelProposal) -> bool {
+    matches!(proposal.source_kind.as_str(), "execution_run" | "chat_suggestion")
+        && (json_contains_direct_chat_approval_control(&proposal.metadata, 0)
+            || text_contains_direct_chat_approval_submit_text(&proposal.title)
+            || text_contains_direct_chat_approval_submit_text(&proposal.detail)
+            || text_contains_direct_chat_approval_submit_text(&proposal.rationale)
+            || proposal
+                .action
+                .as_ref()
+                .map(|action| json_contains_direct_chat_approval_control(&action.payload, 0))
+                .unwrap_or(false))
+}
+
 fn prune_observations(
     observations: Vec<SentinelObservation>,
     now: chrono::DateTime<chrono::Utc>,
@@ -653,6 +713,7 @@ fn prune_observations(
     let cutoff = retention_cutoff(now);
     let mut retained = observations
         .into_iter()
+        .filter(|item| !sentinel_observation_is_control_plane_artifact(item))
         .filter(|item| {
             parse_optional_utc(Some(&item.updated_at))
                 .map(|updated| updated >= cutoff)
@@ -677,6 +738,7 @@ fn prune_proposals(
     let cutoff = retention_cutoff(now);
     let mut retained = proposals
         .into_iter()
+        .filter(|item| !sentinel_proposal_is_control_plane_artifact(item))
         .filter(|item| {
             parse_optional_utc(Some(&item.updated_at))
                 .map(|updated| updated >= cutoff)
@@ -717,7 +779,7 @@ fn open_proposal_count(proposals: &[SentinelProposal]) -> usize {
         .count()
 }
 
-fn daily_opportunity_local_day(
+fn sentinel_daily_review_local_day(
     now: chrono::DateTime<chrono::Utc>,
     timezone: Option<&str>,
 ) -> String {
@@ -727,202 +789,50 @@ fn daily_opportunity_local_day(
         .unwrap_or_else(|| now.with_timezone(&chrono::Local).date_naive().to_string())
 }
 
-async fn agent_daily_opportunity_local_day(
+async fn agent_sentinel_daily_review_local_day(
     agent: &Agent,
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
     let timezone = agent.user_profile.read().await.timezone.clone();
-    daily_opportunity_local_day(now, timezone.as_deref())
+    sentinel_daily_review_local_day(now, timezone.as_deref())
 }
 
-fn daily_opportunity_context(
-    observations: &[SentinelObservation],
-    proposals: &[SentinelProposal],
-    open_proposals: usize,
-    created_proposals: usize,
-    chat_suggestions: usize,
-) -> serde_json::Value {
-    let open = proposals
-        .iter()
-        .filter(|proposal| matches!(proposal.status.as_str(), "open" | "queued_for_approval"))
-        .take(8)
-        .map(|proposal| {
-            serde_json::json!({
-                "title": proposal.title,
-                "detail": proposal.detail,
-                "rationale": proposal.rationale,
-                "source_kind": proposal.source_kind,
-                "confidence": proposal.confidence,
-                "priority": proposal.priority,
-                "status": proposal.status,
-            })
-        })
-        .collect::<Vec<_>>();
-    let recent_observations = observations
-        .iter()
-        .take(12)
-        .map(|observation| {
-            serde_json::json!({
-                "kind": observation.kind,
-                "title": observation.title,
-                "detail": observation.detail,
-                "source_kind": observation.source_kind,
-                "confidence": observation.confidence,
-                "priority": observation.priority,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::json!({
-        "open_proposal_count": open_proposals,
-        "new_proposals_this_scan": created_proposals,
-        "chat_suggestion_count": chat_suggestions,
-        "open_proposals": open,
-        "recent_observations": recent_observations,
-    })
+fn sentinel_daily_review_body() -> &'static str {
+    "Daily automation review is ready. Sentinel found reviewable opportunities from recent activity; open Mission Control to approve, dismiss, or refine them."
 }
 
-fn sentinel_new_work_notification_body(created_proposals: usize) -> String {
-    format!(
-        "Sentinel prepared {} new proposal{} from recent signals.",
-        created_proposals,
-        if created_proposals == 1 { "" } else { "s" }
-    )
-}
-
-fn fallback_daily_opportunity_nudge_body(
-    open_proposals: usize,
-    created_proposals: usize,
-) -> String {
-    if open_proposals > 0 || created_proposals > 0 {
-        "Daily automation review is ready. Sentinel found reviewable opportunities from recent activity; open Mission Control to approve, dismiss, or refine them.".to_string()
-    } else {
-        "Daily automation review is ready. Open Mission Control to review the current Sentinel state.".to_string()
-    }
-}
-
-fn daily_opportunity_signature(proposals: &[SentinelProposal]) -> Option<String> {
-    let mut parts = proposals
-        .iter()
-        .filter(|proposal| matches!(proposal.status.as_str(), "open" | "queued_for_approval"))
-        .map(|proposal| {
-            format!(
-                "{}:{}:{}:{}",
-                proposal.fingerprint,
-                proposal.source_kind,
-                proposal.source_id.as_deref().unwrap_or_default(),
-                proposal.proposal_kind
-            )
-        })
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return None;
-    }
-    parts.sort();
-    parts.dedup();
-    let refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
-    Some(normalize_fingerprint(&refs))
-}
-
-fn sanitize_daily_opportunity_nudge(raw: &str) -> Option<String> {
-    let compact = raw
-        .trim()
-        .trim_matches('"')
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.is_empty() {
-        return None;
-    }
-    Some(compact.chars().take(900).collect())
-}
-
-async fn generate_daily_opportunity_nudge_body(
-    agent: &Agent,
-    observations: &[SentinelObservation],
-    proposals: &[SentinelProposal],
-    open_proposals: usize,
-    created_proposals: usize,
-    chat_suggestions: usize,
-) -> String {
-    let context = daily_opportunity_context(
-        observations,
-        proposals,
-        open_proposals,
-        created_proposals,
-        chat_suggestions,
-    );
-    let system_prompt = "You write one proactive daily AgentArk notification. Infer the user's underlying automation opportunity from structured system signals. Do not match keywords or rely on exact phrasing. Do not invent facts. If there is a concrete opportunity, name it and ask one concise review question. If there is no strong signal, say that no high-confidence opportunity was found and invite the user to share repeated work. Keep it under 80 words.";
-    let user_message = format!(
-        "Structured Sentinel context:\n{}\n\nWrite only the notification body.",
-        serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string())
-    );
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        agent.llm.chat_with_system(system_prompt, &user_message),
-    )
-    .await
-    {
-        Ok(Ok(response)) => {
-            sanitize_daily_opportunity_nudge(&response.content).unwrap_or_else(|| {
-                fallback_daily_opportunity_nudge_body(open_proposals, created_proposals)
-            })
-        }
-        Ok(Err(error)) => {
-            tracing::debug!("Daily automation check-in generation failed: {}", error);
-            fallback_daily_opportunity_nudge_body(open_proposals, created_proposals)
-        }
-        Err(_) => {
-            tracing::debug!("Daily automation check-in generation timed out");
-            fallback_daily_opportunity_nudge_body(open_proposals, created_proposals)
-        }
-    }
-}
-
-async fn claim_daily_opportunity_nudge(
+async fn maybe_send_sentinel_daily_review_notice(
     storage: &crate::storage::Storage,
     agent: &Agent,
     settings: &AutonomySettings,
     now: chrono::DateTime<chrono::Utc>,
-    signature: Option<&str>,
-) -> Option<String> {
-    if !settings.sentinel.enabled
+    open_proposals: usize,
+) -> bool {
+    if open_proposals == 0
+        || !settings.sentinel.enabled
         || !settings.sentinel.infer_new_automations
         || settings.agent_paused
         || settings.autonomy_mode.eq_ignore_ascii_case("off")
         || is_quiet_hours_active(settings)
     {
-        return None;
+        return false;
     }
 
-    let signature = signature.map(str::trim).filter(|value| !value.is_empty())?;
-    let day = agent_daily_opportunity_local_day(agent, now).await;
-    let mut state = load_daily_opportunity_nudge_state(storage).await;
-    let seen_before = state.last_signature.as_deref() == Some(signature)
-        || state
-            .seen_signatures
-            .iter()
-            .any(|seen| seen.as_str() == signature);
-    if state.last_day.as_deref() == Some(day.as_str()) || seen_before {
-        return None;
+    let day = agent_sentinel_daily_review_local_day(agent, now).await;
+    let mut state = load_daily_review_notice_state(storage).await;
+    if state.last_day.as_deref() == Some(day.as_str()) {
+        return false;
     }
 
-    state.last_day = Some(day.clone());
-    state.last_signature = Some(signature.to_string());
+    state.last_day = Some(day);
     state.last_sent_at = Some(now.to_rfc3339());
-    state.seen_signatures.retain(|seen| seen != signature);
-    state.seen_signatures.insert(0, signature.to_string());
-    state.seen_signatures.truncate(64);
-
-    if let Err(error) = save_daily_opportunity_nudge_state(storage, &state).await {
-        tracing::warn!(
-            "Failed to record daily Sentinel automation check-in state: {}",
-            error
-        );
-        return None;
+    if let Err(error) = save_daily_review_notice_state(storage, &state).await {
+        tracing::warn!("Failed to record Sentinel daily review notice: {}", error);
+        return false;
     }
 
-    Some(day)
+    agent.notify_preferred_channel(sentinel_daily_review_body()).await;
+    true
 }
 
 fn sentinel_channel_for_action(action_kind: &str) -> bool {
@@ -1219,24 +1129,53 @@ fn run_degradation_summary(run: &crate::core::ExecutionRun) -> Option<String> {
     }
 }
 
+fn clarification_choice_is_direct_chat_approval(
+    choice: &crate::core::ClarificationChoice,
+) -> bool {
+    if choice.approval.is_some() {
+        return true;
+    }
+    if crate::core::parse_direct_chat_approval_submit_text(&choice.submit_text).is_some() {
+        return true;
+    }
+    choice
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let normalized = value.to_ascii_lowercase();
+            normalized.contains("direct_chat") && normalized.contains("approval")
+        })
+        .unwrap_or(false)
+}
+
+fn clarification_choice_is_sentinel_reviewable(
+    choice: &crate::core::ClarificationChoice,
+) -> bool {
+    !clarification_choice_is_direct_chat_approval(choice)
+        && !choice.label.trim().is_empty()
+        && !choice.submit_text.trim().is_empty()
+}
+
+fn run_is_direct_chat_approval_control_flow(
+    run: &crate::core::ExecutionRun,
+    choices: &[crate::core::ClarificationChoice],
+) -> bool {
+    run.request_message
+        .as_deref()
+        .and_then(crate::core::parse_direct_chat_approval_submit_text)
+        .is_some()
+        || choices
+            .iter()
+            .any(clarification_choice_is_direct_chat_approval)
+}
+
 fn run_attention_detail(run: &crate::core::ExecutionRun, default_detail: &str) -> String {
     run_nonempty_field(run.result_summary.as_deref())
         .or_else(|| run_nonempty_field(run.last_error.as_deref()))
         .or_else(|| run_degradation_summary(run))
         .unwrap_or_else(|| default_detail.to_string())
-}
-
-fn run_text_matches_any(run: &crate::core::ExecutionRun, needles: &[&str]) -> bool {
-    let haystack = [
-        run.result_summary.as_deref().unwrap_or(""),
-        run.last_error.as_deref().unwrap_or(""),
-        run.request_message.as_deref().unwrap_or(""),
-        run.current_stage.as_str(),
-        run.channel.as_deref().unwrap_or(""),
-    ]
-    .join("\n")
-    .to_ascii_lowercase();
-    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn run_is_transient_router_failure(run: &crate::core::ExecutionRun, detail: &str) -> bool {
@@ -1266,24 +1205,32 @@ fn should_create_in_app_execution_proposal(
     if run_is_transient_router_failure(run, detail) {
         return false;
     }
+    if run_is_direct_chat_approval_control_flow(run, choices) {
+        return false;
+    }
 
     match run.status {
-        ExecutionRunStatus::NeedsInput => !choices.is_empty(),
+        ExecutionRunStatus::NeedsInput => choices
+            .iter()
+            .any(clarification_choice_is_sentinel_reviewable),
         ExecutionRunStatus::NeedsStrongerModel => true,
-        ExecutionRunStatus::Blocked => run_text_matches_any(
-            run,
-            &[
-                "waiting for your approval",
-                "waiting for approval",
-                "needs credentials",
-                "credential",
-                "api key",
-                "permission",
-            ],
-        ),
-        ExecutionRunStatus::PlatformFailed => false,
         _ => false,
     }
+}
+
+fn in_app_execution_run_is_sentinel_material(
+    run: &crate::core::ExecutionRun,
+    attention: &InAppRunAttention,
+    choices: &[crate::core::ClarificationChoice],
+) -> bool {
+    let detail = run_attention_detail(run, attention.default_detail);
+    if run_is_transient_router_failure(run, &detail) {
+        return false;
+    }
+    if run_is_direct_chat_approval_control_flow(run, choices) {
+        return false;
+    }
+    should_create_in_app_execution_proposal(run, &detail, choices)
 }
 
 fn execution_run_is_stale(
@@ -1594,6 +1541,257 @@ fn build_chat_suggestion_candidates(
     (observation, proposal)
 }
 
+fn sentinel_proposal_can_block_duplicate(proposal: &SentinelProposal) -> bool {
+    matches!(
+        proposal.status.as_str(),
+        "open" | "running" | "queued_for_approval" | "snoozed" | "completed" | "dismissed"
+            | "failed"
+    )
+}
+
+fn sentinel_proposal_is_removable_duplicate(proposal: &SentinelProposal) -> bool {
+    matches!(proposal.status.as_str(), "open" | "snoozed")
+}
+
+fn sentinel_proposal_representative_rank(proposal: &SentinelProposal) -> (u8, u8, f32, i64) {
+    let status_rank = if sentinel_proposal_is_removable_duplicate(proposal) {
+        1
+    } else {
+        0
+    };
+    let updated_at = parse_optional_utc(Some(&proposal.updated_at))
+        .map(|value| value.timestamp())
+        .unwrap_or(0);
+    (
+        status_rank,
+        proposal.priority,
+        proposal.confidence,
+        updated_at,
+    )
+}
+
+fn compact_json_for_semantic_payload(value: &serde_json::Value, max_chars: usize) -> String {
+    serde_json::to_string(value)
+        .map(|raw| compact_for_prompt(&raw, max_chars))
+        .unwrap_or_default()
+}
+
+fn sentinel_proposal_semantic_payload(proposal: &SentinelProposal) -> serde_json::Value {
+    let action_payload = proposal.action.as_ref().map(|action| {
+        serde_json::json!({
+            "action_kind": action.action_kind,
+            "title": compact_for_prompt(&action.title, 240),
+            "description": compact_for_prompt(&action.description, 480),
+            "payload": compact_json_for_semantic_payload(&action.payload, 1200),
+        })
+    });
+
+    serde_json::json!({
+        "id": proposal.id,
+        "status": proposal.status,
+        "kind": proposal.proposal_kind,
+        "title": compact_for_prompt(&proposal.title, 240),
+        "detail": compact_for_prompt(&proposal.detail, 700),
+        "rationale": compact_for_prompt(&proposal.rationale, 700),
+        "source_kind": proposal.source_kind,
+        "source_label": proposal.source_label,
+        "trace_id": proposal.trace_id,
+        "run_status": proposal.run_status,
+        "last_run_summary": proposal
+            .last_run_summary
+            .as_deref()
+            .map(|value| compact_for_prompt(value, 700)),
+        "chat_suggestion_id": proposal.chat_suggestion_id,
+        "action": action_payload,
+        "metadata": compact_json_for_semantic_payload(&proposal.metadata, 1200),
+    })
+}
+
+fn extract_json_value(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
+}
+
+fn parse_sentinel_proposal_duplicate_groups(
+    text: &str,
+    valid_ids: &std::collections::HashSet<String>,
+) -> Vec<Vec<String>> {
+    let Some(payload) = extract_json_value(text) else {
+        return Vec::new();
+    };
+    let groups = payload
+        .get("duplicate_groups")
+        .or_else(|| payload.get("groups"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut parsed = Vec::new();
+    let mut seen_groups = std::collections::HashSet::new();
+    for group in groups {
+        let Some(items) = group.as_array() else {
+            continue;
+        };
+        let mut ids = items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|id| valid_ids.contains(*id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        if ids.len() < 2 {
+            continue;
+        }
+        let signature = ids.join("\u{1f}");
+        if seen_groups.insert(signature) {
+            parsed.push(ids);
+        }
+    }
+    parsed
+}
+
+fn apply_sentinel_proposal_duplicate_groups(
+    proposals: &mut Vec<SentinelProposal>,
+    groups: &[Vec<String>],
+    now: &str,
+) -> usize {
+    if proposals.len() < 2 || groups.is_empty() {
+        return 0;
+    }
+
+    let mut index_by_id = std::collections::HashMap::new();
+    for (idx, proposal) in proposals.iter().enumerate() {
+        index_by_id.insert(proposal.id.clone(), idx);
+    }
+
+    let mut remove_ids = std::collections::HashSet::new();
+    for group in groups {
+        let indices = group
+            .iter()
+            .filter_map(|id| index_by_id.get(id).copied())
+            .collect::<Vec<_>>();
+        if indices.len() < 2 {
+            continue;
+        }
+
+        let Some(representative_idx) = indices.iter().copied().min_by(|left, right| {
+            let left_rank = sentinel_proposal_representative_rank(&proposals[*left]);
+            let right_rank = sentinel_proposal_representative_rank(&proposals[*right]);
+            left_rank
+                .0
+                .cmp(&right_rank.0)
+                .then_with(|| right_rank.1.cmp(&left_rank.1))
+                .then_with(|| right_rank.2.total_cmp(&left_rank.2))
+                .then_with(|| right_rank.3.cmp(&left_rank.3))
+                .then_with(|| proposals[*left].id.cmp(&proposals[*right].id))
+        }) else {
+            continue;
+        };
+
+        for duplicate_idx in indices {
+            if duplicate_idx == representative_idx {
+                continue;
+            }
+            if !sentinel_proposal_is_removable_duplicate(&proposals[duplicate_idx]) {
+                continue;
+            }
+            remove_ids.insert(proposals[duplicate_idx].id.clone());
+        }
+
+        if let Some(representative) = proposals.get_mut(representative_idx) {
+            representative.updated_at = now.to_string();
+        }
+    }
+
+    if remove_ids.is_empty() {
+        return 0;
+    }
+    let before = proposals.len();
+    proposals.retain(|proposal| !remove_ids.contains(&proposal.id));
+    before.saturating_sub(proposals.len())
+}
+
+fn build_sentinel_proposal_dedup_prompt(proposals: &[SentinelProposal]) -> Option<String> {
+    let items = proposals
+        .iter()
+        .filter(|proposal| sentinel_proposal_can_block_duplicate(proposal))
+        .map(sentinel_proposal_semantic_payload)
+        .collect::<Vec<_>>();
+    if items.len() < 2 {
+        return None;
+    }
+
+    Some(format!(
+        "You are deduplicating ArkSentinel proposals before they are shown to the user.\n\
+         Cluster proposals only when they represent the same underlying user intent or same useful next action, and resolving one would make the others redundant.\n\
+         Judge by intended outcome, target, constraints, schedule, recipient, external system, and required user decision. \
+         Wording, order, casing, punctuation, grammar, abbreviations, typos, and source type are irrelevant. \
+         Do not use keyword matching or phrase templates; decide from meaning.\n\
+         Keep proposals separate when they require materially different decisions, deliverables, targets, constraints, schedules, recipients, or external systems.\n\n\
+         Proposals:\n{}\n\n\
+         Return strict JSON only with this shape: {{\"duplicate_groups\":[[\"id-a\",\"id-b\"]]}}. \
+         Include only groups with two or more ids. Return an empty array when nothing is redundant.",
+        serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string())
+    ))
+}
+
+async fn collapse_semantically_equivalent_sentinel_proposals(
+    llm: &crate::core::LlmClient,
+    proposals: &mut Vec<SentinelProposal>,
+    now: &str,
+) -> usize {
+    let valid_ids = proposals
+        .iter()
+        .filter(|proposal| sentinel_proposal_can_block_duplicate(proposal))
+        .map(|proposal| proposal.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    if valid_ids.len() < 2 {
+        return 0;
+    }
+    let Some(prompt) = build_sentinel_proposal_dedup_prompt(proposals) else {
+        return 0;
+    };
+    let system =
+        "You are a strict semantic deduplication checker for Sentinel proposals. Return JSON only.";
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(SENTINEL_PROPOSAL_SEMANTIC_DEDUP_TIMEOUT_SECS),
+        llm.chat_with_system_bounded(system, &prompt, 420),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                "sentinel_proposal_dedup: LLM clustering unavailable: {}",
+                error
+            );
+            return 0;
+        }
+        Err(_) => {
+            tracing::debug!(
+                "sentinel_proposal_dedup: LLM clustering timed out after {}s",
+                SENTINEL_PROPOSAL_SEMANTIC_DEDUP_TIMEOUT_SECS
+            );
+            return 0;
+        }
+    };
+    let groups = parse_sentinel_proposal_duplicate_groups(&response.content, &valid_ids);
+    apply_sentinel_proposal_duplicate_groups(proposals, &groups, now)
+}
+
 async fn build_in_app_candidates(
     storage: &crate::storage::Storage,
     settings: &AutonomySettings,
@@ -1631,6 +1829,9 @@ async fn build_in_app_candidates(
             .and_then(|trace_id| choices_by_trace_id.get(&trace_id))
             .map(|choices| choices.as_slice())
             .unwrap_or(&[]);
+        if !in_app_execution_run_is_sentinel_material(&run, &attention, choices) {
+            continue;
+        }
         let (observation, proposal) = build_in_app_execution_candidates(
             &run,
             &attention,
@@ -2096,6 +2297,15 @@ pub(crate) async fn run_sentinel_scan_tick(
 
     if settings.sentinel.watch_in_app && settings.sentinel.infer_new_automations {
         let mut chat_suggestions = super::load_chat_suggestions(&storage).await;
+        if agent_snapshot.is_none() {
+            agent_snapshot = Some(Agent::snapshot(&shared).await);
+        }
+        let mut reconciled_suggestion_updates =
+            super::suggestions::reconcile_open_chat_suggestions_with_durable_work(
+                agent_snapshot.as_ref().expect("agent snapshot"),
+                &mut chat_suggestions,
+            )
+            .await;
         if chat_suggestions
             .iter()
             .filter(|suggestion| suggestion.status == "open")
@@ -2113,13 +2323,16 @@ pub(crate) async fn run_sentinel_scan_tick(
             )
             .await;
             if removed_duplicates > 0 {
-                super::save_chat_suggestions(&storage, &chat_suggestions).await;
                 tracing::info!(
                     trigger = trigger,
                     removed_duplicate_suggestions = removed_duplicates,
                     "Sentinel collapsed semantically duplicate chat suggestions"
                 );
+                reconciled_suggestion_updates += removed_duplicates;
             }
+        }
+        if reconciled_suggestion_updates > 0 {
+            super::save_chat_suggestions(&storage, &chat_suggestions).await;
         }
     }
 
@@ -2129,13 +2342,44 @@ pub(crate) async fn run_sentinel_scan_tick(
     let important_service_events = candidate_batch.important_service_events;
     let in_app_events = candidate_batch.in_app_events;
     let chat_suggestions = candidate_batch.chat_suggestions;
-    let (created_observations, created_proposals, new_proposal_ids) = reconcile_sentinel_candidates(
-        &mut observations,
-        &mut proposals,
-        candidate_batch,
-        &now,
-        true,
-    );
+    let (created_observations, mut created_proposals, mut new_proposal_ids) =
+        reconcile_sentinel_candidates(
+            &mut observations,
+            &mut proposals,
+            candidate_batch,
+            &now,
+            true,
+        );
+    if proposals
+        .iter()
+        .filter(|proposal| sentinel_proposal_can_block_duplicate(proposal))
+        .take(2)
+        .count()
+        > 1
+    {
+        if agent_snapshot.is_none() {
+            agent_snapshot = Some(Agent::snapshot(&shared).await);
+        }
+        let removed_duplicates = collapse_semantically_equivalent_sentinel_proposals(
+            &agent_snapshot.as_ref().expect("agent snapshot").llm,
+            &mut proposals,
+            &now.to_rfc3339(),
+        )
+        .await;
+        if removed_duplicates > 0 {
+            let live_ids = proposals
+                .iter()
+                .map(|proposal| proposal.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            new_proposal_ids.retain(|id| live_ids.contains(id));
+            created_proposals = new_proposal_ids.len();
+            tracing::info!(
+                trigger = trigger,
+                removed_duplicate_proposals = removed_duplicates,
+                "Sentinel collapsed semantically duplicate proposals"
+            );
+        }
+    }
     tracing::info!(
         trigger = trigger,
         connected_services = connected_services,
@@ -2191,52 +2435,22 @@ pub(crate) async fn run_sentinel_scan_tick(
         "Sentinel scan tick completed"
     );
 
-    let opportunity_signature = daily_opportunity_signature(&proposals);
-    let daily_opportunity_nudge = {
+    let daily_review_notice_sent = if scan_state.open_proposals > 0 {
         if agent_snapshot.is_none() {
             agent_snapshot = Some(Agent::snapshot(&shared).await);
         }
         let agent = agent_snapshot.as_ref().expect("agent snapshot");
-        if claim_daily_opportunity_nudge(
+        maybe_send_sentinel_daily_review_notice(
             &storage,
             agent,
             &settings,
             now,
-            opportunity_signature.as_deref(),
+            scan_state.open_proposals,
         )
         .await
-        .is_some()
-        {
-            let body = generate_daily_opportunity_nudge_body(
-                agent,
-                &observations,
-                &proposals,
-                scan_state.open_proposals,
-                created_proposals,
-                chat_suggestions,
-            )
-            .await;
-            agent
-                .emit_notification("Daily automation check-in", &body, "info", "sentinel")
-                .await;
-            agent.notify_preferred_channel(&body).await;
-            true
-        } else {
-            false
-        }
+    } else {
+        false
     };
-
-    if created_proposals > 0 && !daily_opportunity_nudge {
-        let body = sentinel_new_work_notification_body(created_proposals);
-        if agent_snapshot.is_none() {
-            agent_snapshot = Some(Agent::snapshot(&shared).await);
-        }
-        let agent = agent_snapshot.as_ref().expect("agent snapshot");
-        agent
-            .emit_notification("Sentinel queued new work", &body, "info", "sentinel")
-            .await;
-        agent.notify_preferred_channel(&body).await;
-    }
 
     serde_json::json!({
         "status": "ok",
@@ -2249,7 +2463,7 @@ pub(crate) async fn run_sentinel_scan_tick(
         "important_service_events": important_service_events,
         "in_app_events": in_app_events,
         "chat_suggestions": chat_suggestions,
-        "daily_opportunity_nudge": daily_opportunity_nudge,
+        "daily_review_notice_sent": daily_review_notice_sent,
         "open_proposals": scan_state.open_proposals,
     })
 }
@@ -2349,11 +2563,13 @@ pub(super) async fn update_sentinel_settings(
 }
 
 pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response {
-    let (storage, ctx) = {
-        let agent = state.agent.read().await;
+    let agent_snapshot = Agent::snapshot(&state.agent).await;
+    let (storage, ctx, llm) = {
+        let agent = &agent_snapshot;
         (
             agent.storage.clone(),
-            crate::core::integration_sync::context_from_agent(&agent, None),
+            crate::core::integration_sync::context_from_agent(agent, None),
+            agent.llm.clone(),
         )
     };
     let settings = super::load_autonomy_settings_from_storage(&storage).await;
@@ -2379,6 +2595,16 @@ pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response
         && !settings.agent_paused
         && !settings.autonomy_mode.eq_ignore_ascii_case("off")
     {
+        let mut chat_suggestions = super::load_chat_suggestions(&storage).await;
+        let reconciled_suggestion_updates =
+            super::suggestions::reconcile_open_chat_suggestions_with_durable_work(
+                &agent_snapshot,
+                &mut chat_suggestions,
+            )
+            .await;
+        if reconciled_suggestion_updates > 0 {
+            super::save_chat_suggestions(&storage, &chat_suggestions).await;
+        }
         let in_app_batch = build_in_app_candidates(&storage, &settings, now).await;
         let _ = reconcile_sentinel_candidates(
             &mut observations,
@@ -2387,6 +2613,27 @@ pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response
             &now,
             true,
         );
+    }
+    if settings.sentinel.enabled
+        && proposals
+            .iter()
+            .filter(|proposal| sentinel_proposal_can_block_duplicate(proposal))
+            .take(2)
+            .count()
+            > 1
+    {
+        let removed_duplicates = collapse_semantically_equivalent_sentinel_proposals(
+            &llm,
+            &mut proposals,
+            &now.to_rfc3339(),
+        )
+        .await;
+        if removed_duplicates > 0 {
+            tracing::info!(
+                removed_duplicate_proposals = removed_duplicates,
+                "Sentinel feed collapsed semantically duplicate proposals"
+            );
+        }
     }
     observations = prune_observations(observations, now);
     proposals = prune_proposals(proposals, now);
@@ -2655,4 +2902,89 @@ pub(super) async fn snooze_sentinel_proposal(
         Json(serde_json::json!({ "status": "ok", "snoozed_until": until })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proposal(id: &str, status: &str, priority: u8, confidence: f32) -> SentinelProposal {
+        SentinelProposal {
+            id: id.to_string(),
+            fingerprint: format!("fingerprint-{id}"),
+            proposal_kind: "recommended_action".to_string(),
+            status: status.to_string(),
+            title: format!("Proposal {id}"),
+            detail: format!("Detail {id}"),
+            rationale: format!("Rationale {id}"),
+            source_kind: "test".to_string(),
+            source_id: Some(id.to_string()),
+            source_label: Some("Test".to_string()),
+            confidence,
+            priority,
+            created_at: "2026-05-11T00:00:00Z".to_string(),
+            updated_at: "2026-05-11T00:00:00Z".to_string(),
+            snoozed_until: None,
+            approved_at: None,
+            dismissed_at: None,
+            trace_id: None,
+            run_status: None,
+            last_run_summary: None,
+            action: None,
+            chat_suggestion_id: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn parse_sentinel_proposal_duplicate_groups_ignores_invalid_or_singleton_ids() {
+        let valid_ids = ["a".to_string(), "b".to_string(), "c".to_string()]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        let groups = parse_sentinel_proposal_duplicate_groups(
+            r#"prefix {"duplicate_groups":[["a","b","missing"],["c"],["b","a"]]} suffix"#,
+            &valid_ids,
+        );
+
+        assert_eq!(groups, vec![vec!["a".to_string(), "b".to_string()]]);
+    }
+
+    #[test]
+    fn apply_sentinel_proposal_duplicate_groups_keeps_most_useful_open_representative() {
+        let mut proposals = vec![
+            proposal("lower", "open", 3, 0.95),
+            proposal("higher", "open", 5, 0.80),
+            proposal("distinct", "open", 4, 0.70),
+        ];
+
+        let removed = apply_sentinel_proposal_duplicate_groups(
+            &mut proposals,
+            &[vec!["lower".to_string(), "higher".to_string()]],
+            "2026-05-11T00:01:00Z",
+        );
+
+        assert_eq!(removed, 1);
+        assert!(proposals.iter().any(|item| item.id == "higher"));
+        assert!(proposals.iter().any(|item| item.id == "distinct"));
+        assert!(!proposals.iter().any(|item| item.id == "lower"));
+    }
+
+    #[test]
+    fn apply_sentinel_proposal_duplicate_groups_lets_resolved_item_block_open_repeat() {
+        let mut proposals = vec![
+            proposal("dismissed", "dismissed", 1, 0.20),
+            proposal("open", "open", 5, 0.99),
+        ];
+
+        let removed = apply_sentinel_proposal_duplicate_groups(
+            &mut proposals,
+            &[vec!["dismissed".to_string(), "open".to_string()]],
+            "2026-05-11T00:01:00Z",
+        );
+
+        assert_eq!(removed, 1);
+        assert!(proposals.iter().any(|item| item.id == "dismissed"));
+        assert!(!proposals.iter().any(|item| item.id == "open"));
+    }
 }

@@ -3,6 +3,7 @@
 //! Sessions are long-running background tasks that control the Playwright bridge,
 //! pause for explicit operator handoff when the browser needs a human, and keep
 //! enough durable state to survive restarts.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;

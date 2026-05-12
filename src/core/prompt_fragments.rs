@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+#![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 pub const PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY: &str = "prompt_fragment_bundle_profile_v1";
@@ -160,15 +161,27 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
 - Keep retries bounded and report the last error plus the next safe recovery step when blocked."#,
             ),
             fragment(
-                "fragment.baseline.semantic_dag_contract",
+                "fragment.baseline.model_tool_loop",
                 "agent_loop",
                 &[],
                 true,
                 950,
-                r#"- Treat the Semantic DAG Router trace, action capability contracts, and current state snapshot as the execution contract for this turn.
-- Use prior conversation only to resolve clear references, continuations, corrections, approvals, and dependencies that the route graph already preserves.
-- Use only actions emitted by the ExecutionDAG. Do not invent tool results, IDs, links, schedules, objects, credentials, or notifications.
-- User-facing text should be concise, concrete, and operationally honest. Do not emit control JSON, scope sentinels, or chain-of-thought into final prose."#,
+                r#"- The model chooses among available actions when a tool is useful, and answers directly when no tool is needed.
+- Use prior conversation to resolve clear references, continuations, corrections, approvals, and dependencies, while allowing the current message to change intent.
+- Do not invent tool results, IDs, links, schedules, objects, credentials, or notifications.
+- User-facing text should be concise, concrete, and operationally honest. Do not emit control JSON, scope sentinels, routing telemetry, or chain-of-thought into final prose."#,
+            ),
+            fragment(
+                "fragment.baseline.semantic_dag_contract",
+                "agent_loop",
+                &[],
+                true,
+                940,
+                r#"- Treat every user turn as a possible set of independent or dependent outcomes, not as a single intent by default.
+- Preserve all outcomes the current turn asks for: direct answers, workspace changes, app delivery, durable watchers, scheduled reminders, integration work, browser actions, and local inspections can coexist in one turn.
+- Use recent conversation, memories, active artifacts, background sessions, watchers, and pending actions only to resolve references, continuations, corrections, approvals, and dependencies. If the current turn changes topic or reverses earlier intent, follow the current turn.
+- Build the smallest implicit goal graph needed: run independent reads or mutations together when safe, sequence dependent work only when one result is needed by the next, and ask a concise clarification only for the missing detail that blocks a specific outcome.
+- Multiple tool calls are allowed when the user asks for multiple outcomes. Do not drop a requested outcome just because another tool call already succeeded."#,
             ),
             fragment(
                 "fragment.secret.sidecar",
@@ -250,7 +263,7 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
                 &["evidence_lookup", "role_data_source", "role_inspection"],
                 false,
                 780,
-                r#"- For evidence-gathering nodes, call the minimum needed data-source or inspection action, then continue according to the Semantic DAG contract.
+                r#"- For evidence gathering, call the minimum needed data-source or inspection action, then answer from the observed result.
 - If the intended result is an in-chat report, synthesis, or analysis, use prose and tables for exact values. Include fenced `agentark-chart` JSON only when a chart materially clarifies quantitative comparisons, trends, distributions, proportions, uncertainty, evidence coverage, or grouped breakdowns.
 - Use app delivery only when the requested final object is a managed browser-runnable, reusable, hosted, or previewable experience."#,
             ),
@@ -377,27 +390,27 @@ pub fn add_action_prompt_tags(tags: &mut BTreeSet<String>, action: &crate::actio
     for capability in &action.capabilities {
         insert_prompt_tag(tags, capability);
     }
-    let metadata = action.planner_metadata();
-    insert_prompt_tag(tags, &format!("role_{}", planner_role_tag(&metadata.role)));
+    let metadata = action.action_metadata();
+    insert_prompt_tag(tags, &format!("role_{}", action_role_tag(&metadata.role)));
     insert_prompt_tag(
         tags,
         &format!(
             "integration_{}",
-            planner_integration_class_tag(&metadata.integration_class)
+            action_integration_class_tag(&metadata.integration_class)
         ),
     );
     insert_prompt_tag(
         tags,
         &format!(
             "delivery_{}",
-            planner_delivery_mode_tag(&metadata.delivery_mode)
+            action_delivery_mode_tag(&metadata.delivery_mode)
         ),
     );
     insert_prompt_tag(
         tags,
         &format!(
             "side_effect_{}",
-            planner_side_effect_tag(&metadata.side_effect_level)
+            action_side_effect_tag(&metadata.side_effect_level)
         ),
     );
     if metadata.requires_auth {
@@ -405,50 +418,50 @@ pub fn add_action_prompt_tags(tags: &mut BTreeSet<String>, action: &crate::actio
     }
 }
 
-fn planner_role_tag(role: &crate::actions::PlannerActionRole) -> &'static str {
+fn action_role_tag(role: &crate::actions::ActionRole) -> &'static str {
     match role {
-        crate::actions::PlannerActionRole::Trigger => "trigger",
-        crate::actions::PlannerActionRole::Delivery => "delivery",
-        crate::actions::PlannerActionRole::DataSource => "data_source",
-        crate::actions::PlannerActionRole::Mutation => "mutation",
-        crate::actions::PlannerActionRole::Inspection => "inspection",
-        crate::actions::PlannerActionRole::Orchestration => "orchestration",
-        crate::actions::PlannerActionRole::Unknown => "unknown",
+        crate::actions::ActionRole::Trigger => "trigger",
+        crate::actions::ActionRole::Delivery => "delivery",
+        crate::actions::ActionRole::DataSource => "data_source",
+        crate::actions::ActionRole::Mutation => "mutation",
+        crate::actions::ActionRole::Inspection => "inspection",
+        crate::actions::ActionRole::Orchestration => "orchestration",
+        crate::actions::ActionRole::Unknown => "unknown",
     }
 }
 
-fn planner_integration_class_tag(class: &crate::actions::PlannerIntegrationClass) -> &'static str {
+fn action_integration_class_tag(class: &crate::actions::ActionIntegrationClass) -> &'static str {
     match class {
-        crate::actions::PlannerIntegrationClass::Internal => "internal",
-        crate::actions::PlannerIntegrationClass::Messaging => "messaging",
-        crate::actions::PlannerIntegrationClass::Workspace => "workspace",
-        crate::actions::PlannerIntegrationClass::Search => "search",
-        crate::actions::PlannerIntegrationClass::Browser => "browser",
-        crate::actions::PlannerIntegrationClass::Filesystem => "filesystem",
-        crate::actions::PlannerIntegrationClass::App => "app",
-        crate::actions::PlannerIntegrationClass::Code => "code",
-        crate::actions::PlannerIntegrationClass::Network => "network",
-        crate::actions::PlannerIntegrationClass::Commerce => "commerce",
-        crate::actions::PlannerIntegrationClass::Analytics => "analytics",
-        crate::actions::PlannerIntegrationClass::Media => "media",
-        crate::actions::PlannerIntegrationClass::Unknown => "unknown",
+        crate::actions::ActionIntegrationClass::Internal => "internal",
+        crate::actions::ActionIntegrationClass::Messaging => "messaging",
+        crate::actions::ActionIntegrationClass::Workspace => "workspace",
+        crate::actions::ActionIntegrationClass::Search => "search",
+        crate::actions::ActionIntegrationClass::Browser => "browser",
+        crate::actions::ActionIntegrationClass::Filesystem => "filesystem",
+        crate::actions::ActionIntegrationClass::App => "app",
+        crate::actions::ActionIntegrationClass::Code => "code",
+        crate::actions::ActionIntegrationClass::Network => "network",
+        crate::actions::ActionIntegrationClass::Commerce => "commerce",
+        crate::actions::ActionIntegrationClass::Analytics => "analytics",
+        crate::actions::ActionIntegrationClass::Media => "media",
+        crate::actions::ActionIntegrationClass::Unknown => "unknown",
     }
 }
 
-fn planner_delivery_mode_tag(mode: &crate::actions::PlannerDeliveryMode) -> &'static str {
+fn action_delivery_mode_tag(mode: &crate::actions::ActionDeliveryMode) -> &'static str {
     match mode {
-        crate::actions::PlannerDeliveryMode::Immediate => "immediate",
-        crate::actions::PlannerDeliveryMode::Async => "async",
-        crate::actions::PlannerDeliveryMode::Conditional => "conditional",
-        crate::actions::PlannerDeliveryMode::Either => "either",
+        crate::actions::ActionDeliveryMode::Immediate => "immediate",
+        crate::actions::ActionDeliveryMode::Async => "async",
+        crate::actions::ActionDeliveryMode::Conditional => "conditional",
+        crate::actions::ActionDeliveryMode::Either => "either",
     }
 }
 
-fn planner_side_effect_tag(effect: &crate::actions::PlannerSideEffectLevel) -> &'static str {
+fn action_side_effect_tag(effect: &crate::actions::ActionSideEffectLevel) -> &'static str {
     match effect {
-        crate::actions::PlannerSideEffectLevel::None => "none",
-        crate::actions::PlannerSideEffectLevel::Notify => "notify",
-        crate::actions::PlannerSideEffectLevel::Write => "write",
+        crate::actions::ActionSideEffectLevel::None => "none",
+        crate::actions::ActionSideEffectLevel::Notify => "notify",
+        crate::actions::ActionSideEffectLevel::Write => "write",
     }
 }
 
@@ -538,6 +551,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(ids.contains(&"fragment.baseline.identity_security"));
+        assert!(ids.contains(&"fragment.baseline.semantic_dag_contract"));
         assert!(ids.contains(&"fragment.app_delivery.protocol"));
         assert!(!ids.contains(&"fragment.attachments.vision_documents"));
     }

@@ -203,6 +203,20 @@ function orbitStatusActivity(status?: OrbitChatMessageStatus): string {
   }
 }
 
+function OrbitRunningDots({ className = "" }: { className?: string }) {
+  return (
+    <span
+      className={`orbit-chat-running-dots${className ? ` ${className}` : ""}`}
+      aria-label="Running"
+      role="status"
+    >
+      <i />
+      <i />
+      <i />
+    </span>
+  );
+}
+
 function orbitPanelStateLabel(state: OrbitChatPanelState): string {
   switch (state) {
     case "loading":
@@ -884,7 +898,11 @@ export function OrbitChat({
             Orbit chat
           </Typography>
           <Typography variant="caption" className="orbit-chat-subtitle">
-            {visibleTurnStatus}
+            {visibleTurnState === "running" ? (
+              <OrbitRunningDots className="orbit-chat-running-dots-subtitle" />
+            ) : (
+              visibleTurnStatus
+            )}
           </Typography>
         </Stack>
         <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
@@ -1038,6 +1056,13 @@ export function OrbitChat({
               const statusLabel = msg.role === "assistant" ? orbitStatusLabel(msg.status) : "";
               const displayActivity =
                 msg.activity || (msg.role === "assistant" ? orbitStatusActivity(msg.status) : "");
+              // Token usage metric items are still computed for backwards
+              // compat but no longer rendered. They're operator telemetry
+              // (total/input/output token counts) that competed for
+              // attention with the actual message. The data is still
+              // available via `msg.usage` for anyone wiring an explicit
+              // dev-mode toggle later.
+              void usageMetricItems;
               return (
                 <Box
                   key={msg.id}
@@ -1045,8 +1070,17 @@ export function OrbitChat({
                     msg.active && displayActivity ? " orbit-chat-msg-active" : ""
                   }${msg.status ? ` orbit-chat-msg-status-${msg.status}` : ""}`}
                 >
-                  <span className="orbit-chat-msg-role">
-                    <span className="orbit-chat-role-avatar" aria-hidden="true">
+                  {/* HUD glyph — small icon in the top-left that says who
+                      is talking. No "YOU" / "ORBIT" text label (those
+                      were noisy); the glyph plus the left-edge accent
+                      stripe carry identity together. Running status is
+                      rendered inline next to the glyph so the user
+                      knows when Orbit is mid-thought without a separate
+                      status row. */}
+                  <span className="orbit-chat-msg-glyph-row" aria-hidden="true">
+                    <span
+                      className={`orbit-chat-msg-glyph orbit-chat-msg-glyph-${msg.role}`}
+                    >
                       {msg.role === "user" ? (
                         <PersonRoundedIcon className="orbit-chat-role-user-icon" />
                       ) : (
@@ -1057,9 +1091,12 @@ export function OrbitChat({
                         />
                       )}
                     </span>
-                    <span>{msg.role === "user" ? "You" : "Orbit"}</span>
-                    {statusLabel ? (
-                      <span className="orbit-chat-status-chip">{statusLabel}</span>
+                    {msg.status === "running" ? (
+                      <OrbitRunningDots className="orbit-chat-running-dots-chip" />
+                    ) : statusLabel ? (
+                      <span className="orbit-chat-status-chip">
+                        {statusLabel}
+                      </span>
                     ) : null}
                   </span>
                   {msg.text ? (
@@ -1088,27 +1125,6 @@ export function OrbitChat({
                         </span>
                       ))}
                     </Stack>
-                  ) : null}
-                  {usageMetricItems.length > 0 ? (
-                    <Box
-                      className="orbit-chat-run-metrics"
-                      aria-label="Orbit run metrics"
-                      title={orbitUsageTitle(msg.usage)}
-                    >
-                      {usageMetricItems.map((item) => (
-                        <span
-                          key={`${msg.id}:${item.label}`}
-                          className="orbit-chat-run-metric"
-                        >
-                          <span className="orbit-chat-run-metric-label">
-                            {item.label}
-                          </span>
-                          <span className="orbit-chat-run-metric-value">
-                            {item.value}
-                          </span>
-                        </span>
-                      ))}
-                    </Box>
                   ) : null}
                 </Box>
               );

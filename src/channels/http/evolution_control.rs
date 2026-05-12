@@ -469,6 +469,30 @@ pub(super) fn build_learning_candidate_summary(
                     .join(" | ")
             })
             .filter(|value| !value.is_empty()),
+        crate::core::self_evolve::ROUTER_LEARNING_CANDIDATE_TYPE => {
+            let layer = candidate
+                .proposed_content
+                .get("router_layer")
+                .and_then(|value| value.as_str())
+                .unwrap_or("router");
+            let objective = candidate
+                .proposed_content
+                .get("objective")
+                .and_then(|value| value.as_str())
+                .unwrap_or("router learning candidate");
+            let evidence_count = candidate
+                .proposed_content
+                .get("evidence")
+                .and_then(|value| value.as_array())
+                .map(Vec::len)
+                .unwrap_or_default();
+            Some(format!(
+                "{}: {} ({} evidence item(s))",
+                layer,
+                truncate_candidate_preview(objective, 180),
+                evidence_count
+            ))
+        }
         _ => serde_json::to_string(&candidate.proposed_content).ok(),
     };
     let skill_name = candidate
@@ -646,6 +670,41 @@ pub(super) fn build_learning_candidate_content_preview(
             "source_item_id": candidate.proposed_content.get("source_item_id").and_then(|value| value.as_str()),
             "reason": candidate.proposed_content.get("reason").and_then(|value| value.as_str()),
         }),
+        crate::core::self_evolve::ROUTER_LEARNING_CANDIDATE_TYPE => {
+            let evidence_count = candidate
+                .proposed_content
+                .get("evidence")
+                .and_then(|value| value.as_array())
+                .map(Vec::len)
+                .unwrap_or_default();
+            let metrics = candidate
+                .proposed_content
+                .get("metric_deltas")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(4)
+                        .filter_map(|item| {
+                            let metric = item.get("metric")?.as_str()?;
+                            let delta = item.get("delta")?.as_f64()?;
+                            Some(format!("{metric}: {delta:+.3}"))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "router_layer": candidate.proposed_content.get("router_layer").and_then(|value| value.as_str()),
+                "objective": candidate.proposed_content.get("objective").and_then(|value| value.as_str()).map(|value| truncate_candidate_preview(value, 220)),
+                "evidence_count": evidence_count,
+                "metrics": metrics,
+                "proposes_canonical": candidate.proposed_content.get("proposed_canonical_payload").is_some(),
+                "proposes_action_descriptor": candidate.proposed_content.get("proposed_action_descriptor_patch").is_some(),
+                "proposes_benchmark_entries": candidate.proposed_content.get("proposed_benchmark_entries").and_then(|value| value.as_array()).map(|items| !items.is_empty()).unwrap_or(false),
+                "proposes_policy": candidate.proposed_content.get("proposed_policy_patch").is_some(),
+                "proposes_capability_graph": candidate.proposed_content.get("proposed_capability_graph_patch").is_some(),
+            })
+        }
         _ => serde_json::Value::Null,
     }
 }

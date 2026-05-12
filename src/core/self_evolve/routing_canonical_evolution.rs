@@ -55,7 +55,7 @@ fn normalize_overlay_label(raw: &str) -> String {
 fn valid_category(raw: &str) -> bool {
     matches!(
         normalize_overlay_label(raw).as_str(),
-        "direct_reply" | "tool_use" | "durable_work" | "managed_app_delivery" | "security_block"
+        "conversational" | "tool_use" | "durable_work" | "managed_app_delivery" | "security_block"
     )
 }
 

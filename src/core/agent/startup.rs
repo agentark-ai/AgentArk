@@ -736,6 +736,12 @@ impl Agent {
             notification_events,
             live_runs: Arc::new(crate::core::LiveRunRegistry::new(Some(storage.clone()))),
             startup_issues: Arc::new(RwLock::new(startup_issues)),
+            capability_snapshot: Arc::new(RwLock::new(None)),
+            capability_snapshot_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            capability_snapshot_generation: Arc::new(AtomicUsize::new(0)),
+            capability_health_snapshot: Arc::new(RwLock::new(None)),
+            capability_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            capability_health_generation: Arc::new(AtomicUsize::new(0)),
             app_registry,
         };
 
@@ -912,6 +918,7 @@ impl Agent {
     }
 
     pub async fn refresh_action_catalog_index(&self, reason: &'static str) {
+        self.invalidate_capability_snapshot(reason).await;
         match self.load_action_catalog_actions().await {
             Ok(actions) => {
                 self.spawn_action_catalog_index_sync(actions, reason);

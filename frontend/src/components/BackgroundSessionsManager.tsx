@@ -26,12 +26,16 @@ import MoreVertIcon from "@mui/icons-material/MoreVert";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import { isBackgroundSessionVisibleInUi } from "../lib/backgroundSessions";
+import {
+  isBackgroundSessionVisibleInUi,
+  isStandaloneBackgroundWorkTask,
+} from "../lib/backgroundSessions";
 import { formatUiDateTime } from "../lib/dateFormat";
 import type {
   BackgroundSessionDetail,
   BackgroundSessionSummary,
   BrowserSessionSummary,
+  Task,
 } from "../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 
@@ -328,13 +332,21 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
 
   const availableTasks = useMemo<SelectableTask[]>(
     () =>
-      pickRecords(tasksQ.data, "tasks").map((item) => ({
-        id: str(item.id),
-        description: str(item.description, "Task"),
-        action: str(item.action, ""),
-        status: str(item.status, ""),
-      })),
-    [tasksQ.data],
+      pickRecords(tasksQ.data, "tasks")
+        .filter((item) => {
+          const id = str(item.id);
+          return (
+            form.task_ids.includes(id) ||
+            isStandaloneBackgroundWorkTask(item as unknown as Task)
+          );
+        })
+        .map((item) => ({
+          id: str(item.id),
+          description: str(item.description, "Task"),
+          action: str(item.action, ""),
+          status: str(item.status, ""),
+        })),
+    [form.task_ids, tasksQ.data],
   );
 
   const availableWatchers = useMemo<SelectableWatcher[]>(

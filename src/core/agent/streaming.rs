@@ -41,6 +41,7 @@ pub enum StreamEvent {
         content: String,
     },
     /// Structured plan for the current execution branch
+    #[allow(dead_code)]
     PlanGenerated {
         plan: crate::core::ExecutionPlan,
     },

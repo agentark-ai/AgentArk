@@ -708,7 +708,7 @@ async fn chat_rejects_oversized_messages() {
 
 #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
-async fn chat_fast_path_stores_secret_without_live_server() {
+async fn chat_quick_path_stores_secret_without_live_server() {
     let (state, config_dir, data_dir) = build_test_state().await;
     let router = Router::new()
         .route("/chat", post(chat))
@@ -756,7 +756,7 @@ async fn chat_fast_path_stores_secret_without_live_server() {
 
 #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
-async fn chat_fast_path_controls_notifications_without_live_server() {
+async fn chat_quick_path_controls_notifications_without_live_server() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
     let router = Router::new()
         .route("/chat", post(chat))
@@ -798,7 +798,7 @@ async fn chat_fast_path_controls_notifications_without_live_server() {
 
 #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
-async fn chat_stream_fast_path_stores_secret_without_live_server() {
+async fn chat_stream_quick_path_stores_secret_without_live_server() {
     let (state, config_dir, data_dir) = build_test_state().await;
     let router = Router::new()
         .route("/chat/stream", post(chat_stream))

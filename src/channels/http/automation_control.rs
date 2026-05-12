@@ -489,8 +489,11 @@ pub(super) fn background_session_watcher_json(
         "status": automation_watcher_status_label(&watcher.status),
         "created_at": watcher.created_at.to_rfc3339(),
         "last_poll_at": watcher.last_poll_at.map(|value| value.to_rfc3339()),
+        "poll_count": watcher.poll_count,
         "notify_channel": watcher.notify_channel.clone(),
         "last_error": watcher.last_error.clone(),
+        "last_poll_outcome": watcher.last_poll_outcome.clone(),
+        "notification_attempts": watcher.notification_attempts.clone(),
         "trigger_result": watcher.trigger_result.clone(),
     })
 }
@@ -3459,7 +3462,13 @@ pub(super) async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) ->
         &now_rfc3339,
     )
     .await;
-    if removed_duplicate_suggestions > 0 {
+    let mut reconciled_suggestion_updates =
+        suggestions::reconcile_open_chat_suggestions_with_durable_work(
+            &agent_snapshot,
+            &mut suggestions,
+        )
+        .await;
+    if removed_duplicate_suggestions > 0 || reconciled_suggestion_updates > 0 {
         save_chat_suggestions(&storage, &suggestions).await;
     }
     let internal_channels = ["arkpulse", "sentinel", "system", "autonomy"];
@@ -3652,6 +3661,11 @@ pub(super) async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) ->
         &now_rfc3339,
     )
     .await;
+    reconciled_suggestion_updates += suggestions::reconcile_open_chat_suggestions_with_durable_work(
+        &agent_snapshot,
+        &mut suggestions,
+    )
+    .await;
     let created_suggestions = new_suggestion_ids
         .iter()
         .filter(|id| {
@@ -3683,6 +3697,7 @@ pub(super) async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) ->
         "status": "completed",
         "examined_chats": examined_chats,
         "created_suggestions": created_suggestions,
+        "reconciled_suggestions": reconciled_suggestion_updates,
         "removed_duplicate_suggestions": removed_duplicate_suggestions,
         "low_signal_skips": low_signal_skips,
         "artifact_skips": artifact_skips,
@@ -3718,8 +3733,8 @@ async fn choose_watch_poll_action_for_suggestion(
         .into_iter()
         .filter(|action| {
             matches!(
-                crate::actions::planner_metadata_for_action(action).role,
-                crate::actions::PlannerActionRole::DataSource
+                crate::actions::action_metadata_for_action(action).role,
+                crate::actions::ActionRole::DataSource
             )
         })
         .collect::<Vec<_>>();

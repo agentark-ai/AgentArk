@@ -1,0 +1,15 @@
+[advisories]
+ignore = [
+    # notify 7 -> notify-types 1.0.1; upstream has not released a non-instant path.
+    "RUSTSEC-2024-0384",
+    # fastembed 5.13.2 -> hf-hub 0.4.3 -> indicatif 0.17.11.
+    "RUSTSEC-2025-0119",
+    # fastembed/tokenizers and image/ravif currently retain paste transitively.
+    "RUSTSEC-2024-0436",
+    # teloxide 0.13 macros path; no compatible upstream replacement in this tree.
+    "RUSTSEC-2024-0370",
+    # teloxide-core 0.10.1 -> reqwest 0.11.27.
+    "RUSTSEC-2025-0134",
+    # scraper/selectors and wasmtime's internal TOML stack retain fxhash transitively.
+    "RUSTSEC-2025-0057",
+]

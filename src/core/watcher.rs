@@ -7,6 +7,8 @@
 //! 4. Self-terminate after trigger or timeout
 //!
 //! Watchers are persisted in the database so they survive container restarts.
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +74,14 @@ pub enum WatchConditionLogic {
     Any,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchConditionEvaluationMode {
+    #[default]
+    CurrentState,
+    Change,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchConditionOperator {
@@ -130,6 +140,8 @@ pub enum WatchConditionMatcher {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WatchCondition {
     pub description: String,
+    #[serde(default)]
+    pub evaluation_mode: WatchConditionEvaluationMode,
     #[serde(flatten)]
     pub matcher: WatchConditionMatcher,
 }
@@ -138,10 +150,15 @@ impl WatchCondition {
     pub fn summary(&self) -> String {
         let description = self.description.trim();
         if !description.is_empty() {
-            return description.to_string();
+            return match self.evaluation_mode {
+                WatchConditionEvaluationMode::CurrentState => description.to_string(),
+                WatchConditionEvaluationMode::Change => {
+                    format!("{} (compare against the previous successful poll)", description)
+                }
+            };
         }
 
-        match &self.matcher {
+        let summary = match &self.matcher {
             WatchConditionMatcher::NotEmpty => {
                 "Trigger when the poll result is not empty".to_string()
             }
@@ -186,6 +203,12 @@ impl WatchCondition {
             ),
             WatchConditionMatcher::Llm => {
                 "Trigger when the model judges the condition satisfied".to_string()
+            }
+        };
+        match self.evaluation_mode {
+            WatchConditionEvaluationMode::CurrentState => summary,
+            WatchConditionEvaluationMode::Change => {
+                format!("{} and differs from the previous successful poll", summary)
             }
         }
     }
@@ -390,6 +413,17 @@ fn watcher_next_wakeup_at(watcher: &Watcher, now: DateTime<Utc>) -> Option<DateT
     Some(poll_due_at.min(timeout_at))
 }
 
+fn watcher_retention_reference_at(watcher: &Watcher) -> DateTime<Utc> {
+    let mut latest = watcher.created_at;
+    if let Some(last_poll_at) = watcher.last_poll_at {
+        latest = latest.max(last_poll_at);
+    }
+    for attempt in &watcher.notification_attempts {
+        latest = latest.max(attempt.attempted_at);
+    }
+    latest
+}
+
 fn strip_automation_meta(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -510,12 +544,6 @@ impl WatcherManager {
             match storage_ref.list_watchers().await {
                 Ok(loaded) => loaded
                     .into_iter()
-                    .filter(|watcher| {
-                        matches!(
-                            watcher.status,
-                            WatcherStatus::Active | WatcherStatus::Paused
-                        )
-                    })
                     .map(|watcher| (watcher.id, watcher))
                     .collect::<HashMap<_, _>>(),
                 Err(e) => {
@@ -545,24 +573,17 @@ impl WatcherManager {
         // Fresh-install-only builds do not persist watcher state to files.
     }
 
-    /// Persist active watchers to the database.
+    /// Persist the in-memory watcher snapshot to the database.
     async fn persist(&self) {
-        let active = {
+        let watchers = {
             let watchers = self.watchers.read().await;
-            watchers
-                .values()
-                .filter(|watcher| {
-                    matches!(
-                        watcher.status,
-                        WatcherStatus::Active | WatcherStatus::Paused
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>()
+            watchers.values().cloned().collect::<Vec<_>>()
         };
         if let Some(storage) = self.storage.as_ref() {
-            if let Err(e) = storage.replace_active_watchers(&active).await {
-                tracing::warn!("Failed to persist watchers to DB: {}", e);
+            for watcher in watchers {
+                if let Err(e) = storage.upsert_watcher(&watcher).await {
+                    tracing::warn!("Failed to persist watcher '{}' to DB: {}", watcher.id, e);
+                }
             }
         }
     }
@@ -577,12 +598,7 @@ impl WatcherManager {
             return;
         };
         match watcher {
-            Some(watcher)
-                if matches!(
-                    watcher.status,
-                    WatcherStatus::Active | WatcherStatus::Paused
-                ) =>
-            {
+            Some(watcher) => {
                 if let Err(error) = storage.upsert_watcher(&watcher).await {
                     tracing::warn!("Failed to persist watcher '{}' to DB: {}", id, error);
                 }
@@ -887,7 +903,7 @@ impl WatcherManager {
         drop(watchers);
         if !expired.is_empty() {
             for watcher in &expired {
-                self.delete_persisted(watcher.id).await;
+                self.persist_one(watcher.id).await;
             }
         }
         expired
@@ -1116,7 +1132,7 @@ impl WatcherManager {
                     (!matches!(
                         watcher.status,
                         WatcherStatus::Active | WatcherStatus::Paused
-                    ) && watcher.created_at <= cutoff)
+                    ) && watcher_retention_reference_at(watcher) <= cutoff)
                         .then_some(*id)
                 })
                 .collect::<Vec<_>>();
@@ -1198,6 +1214,7 @@ mod tests {
             }),
             condition: WatchCondition {
                 description: "Trigger when results contain breaking".to_string(),
+                evaluation_mode: WatchConditionEvaluationMode::CurrentState,
                 matcher: WatchConditionMatcher::TextContains {
                     text: "breaking".to_string(),
                     case_sensitive: false,

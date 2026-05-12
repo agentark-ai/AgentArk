@@ -14,6 +14,8 @@ pub fn delegated_policy_v2_block() -> String {
 pub fn router_policy_v2_block() -> String {
     r#"Router Policy v2:
 - For execution intents, route direct unless explicit parallel decomposition is required.
+- A single user turn can contain multiple independent or dependent outcomes. Preserve the whole requested outcome set instead of collapsing the turn to the first recognizable intent.
+- Use conversation history only to resolve follow-ups, corrections, approvals, references, and dependencies; if the current turn changes or replaces prior intent, route by the current turn.
 - Set should_clarify=true only for ambiguous/underspecified execution requests.
 - When the requested outcome depends on existing state, such as an app, file, task, watcher, background session, integration, channel, account, or prior work item, route to read/inspect/discover the relevant state before choosing a write, create, deploy, notify, or delete action.
 - Do not assume an integration, channel, app, repository, file, or session exists or is connected. If no safe read/inspect path is available and the side effect depends on that state, ask for the missing detail.
@@ -43,6 +45,7 @@ Preferred direct action candidate: {preferred_action}
 Rules:
 - "needs_delegation": true when the work benefits from multiple distinct agents with separable responsibilities.
 - Good delegation cases include complex research, planning, coding, review, validation, or multi-track execution where at least 2 sub-agents have clear tasks.
+- Preserve compound turns. If the user asks for multiple outcomes, reflect that in the reasoning and sub-agent tasks when delegation is needed; otherwise keep direct execution available for the whole outcome set.
 - For executable tasks that map clearly to one direct action or one obvious implementation path, prefer direct execution:
   needs_delegation=false unless there is explicit multi-agent intent or clear parallel decomposition.
 - Set should_clarify=true only when the request is ambiguous or missing critical details.

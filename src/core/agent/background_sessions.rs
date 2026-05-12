@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::*;
 use crate::core::{background_session, task, watcher};
 
@@ -15,12 +17,12 @@ pub(super) fn background_session_policy_for_action(
     let meta = all_actions
         .iter()
         .find(|action| action.name.eq_ignore_ascii_case(action_name.trim()))
-        .map(crate::actions::ActionDef::planner_metadata)
+        .map(crate::actions::ActionDef::action_metadata)
         .unwrap_or_default();
     background_session::BackgroundSessionPolicy {
-        allowed_action_roles: vec![planner_action_role_name(&meta.role).to_string()],
+        allowed_action_roles: vec![action_role_name(&meta.role).to_string()],
         allowed_integration_classes: vec![
-            planner_integration_class_name(&meta.integration_class).to_string(),
+            action_integration_class_name(&meta.integration_class).to_string(),
         ],
     }
     .normalized()
@@ -1336,10 +1338,10 @@ impl Agent {
         let metadata = actions
             .iter()
             .find(|action| action.name.eq_ignore_ascii_case(action_name.trim()))
-            .map(crate::actions::ActionDef::planner_metadata)
+            .map(crate::actions::ActionDef::action_metadata)
             .unwrap_or_default();
-        let role = planner_action_role_name(&metadata.role);
-        let integration_class = planner_integration_class_name(&metadata.integration_class);
+        let role = action_role_name(&metadata.role);
+        let integration_class = action_integration_class_name(&metadata.integration_class);
         if policy.allows(role, integration_class) {
             return Ok(());
         }

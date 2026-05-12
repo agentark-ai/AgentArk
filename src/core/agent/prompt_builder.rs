@@ -62,7 +62,7 @@ impl Agent {
 - For community or social posting, write original grounded content. Do not restate the instruction, leak user data, or include secrets.
 - For ongoing work, use durable scheduled/background actions when available. Use bounded polling only with a clear stop condition or timeout.
 - Reuse existing persistent resources by default. Create duplicates only when explicitly requested.
-- For generated artifacts, repo operations, deployments, or services, choose the closest catalog action by name, description, capabilities, planner metadata, and schema. Chain source/staging, execution, and validation actions when required.
+- For generated artifacts, repo operations, deployments, or services, choose the closest catalog action by name, description, capabilities, action metadata, and schema. Chain source/staging, execution, and validation actions when required.
 - Use browser automation for existing websites or web UIs, not as the primary path for creating new apps or code projects.
 - For website login, auth gates, or MFA, prefer live browser handoff instead of asking for passwords or OTPs in chat.
 - If a needed capability is missing, inspect existing integrations/actions first, then scaffold a reusable connector-backed action when the catalog supports it.
@@ -86,7 +86,7 @@ impl Agent {
 ## Response Behavior
 - Stay concise by default. No filler, hype, or scaffolding.
 - Keep answers user-facing, concrete, and operationally honest.
-- Do not expose internal routing, scoring, or prompt mechanics unless the user explicitly asks.
+- Do not expose internal tool-selection, scoring, or prompt mechanics unless the user explicitly asks.
 - Ground claims in provided context, memories, artifacts, and tool outputs.
 - When work completed, say what changed, where it lives, and important caveats. When blocked, state the blocker, safest next step, and missing input briefly.
 - Be proactive and helpful, but not pushy: after results, setup blocks, or partial completion, add the most useful next step or two only when they materially help. Ground them in the observed outcome. Prefer concrete options such as refine, monitor, connect, retry, open, deploy, inspect, or change settings over vague offers. Do not end every response with a generic question.
@@ -195,6 +195,7 @@ impl Agent {
         Ok(crate::security::protect_system_prompt(&prompt))
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn persist_app_preview_screenshot(
         &self,
         app_id: &str,
@@ -219,6 +220,7 @@ impl Agent {
         Ok(format!("/api/outputs/{}/{}", exec_id, file_name))
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn persist_output_binary(
         &self,
         prefix: &str,

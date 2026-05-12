@@ -260,9 +260,6 @@ pub(super) fn build_request_execution_hints_with_context(
         caller_principal: caller.cloned(),
         execution_surface: surface,
         direct_user_intent,
-        routing: None,
-        routing_trusted: false,
-        force_agent_loop: false,
         secret_offered: None,
         attachments,
         saved_user_facts_context: None,
@@ -350,6 +347,41 @@ pub(super) async fn decide_chat_tool_approval(
     }
 }
 
+async fn handle_direct_chat_approval_submit_text(
+    state: &AppState,
+    message: &str,
+) -> Option<std::result::Result<serde_json::Value, String>> {
+    let (approval_id, decision) = crate::core::parse_direct_chat_approval_submit_text(message)?;
+    let agent = Agent::snapshot(&state.agent).await;
+    let result = match decision {
+        crate::core::DirectChatApprovalSubmitDecision::Approve => agent
+            .approve_direct_chat_any_approval(&approval_id)
+            .await
+            .map(|(approval, response)| {
+                serde_json::json!({
+                    "status": "approved",
+                    "decision": decision.as_str(),
+                    "approval": approval,
+                    "response": response.clone(),
+                    "content": response,
+                })
+            }),
+        crate::core::DirectChatApprovalSubmitDecision::Reject => agent
+            .reject_direct_chat_any_approval(&approval_id)
+            .await
+            .map(|(approval, response)| {
+                serde_json::json!({
+                    "status": "rejected",
+                    "decision": decision.as_str(),
+                    "approval": approval,
+                    "response": response.clone(),
+                    "content": response,
+                })
+            }),
+    };
+    Some(result.map_err(|error| error.to_string()))
+}
+
 pub(super) async fn resolve_chat_request_conversation_id(
     state: &AppState,
     channel: &str,
@@ -418,6 +450,34 @@ pub(super) async fn chat(
         request.message.len(),
         request.conversation_id.as_deref().unwrap_or("-"),
     );
+
+    if let Some(result) = handle_direct_chat_approval_submit_text(&state, &request.message).await {
+        return match result {
+            Ok(payload) => (
+                StatusCode::OK,
+                Json(ChatResponse {
+                    response: payload
+                        .get("response")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Approval decision recorded.")
+                        .to_string(),
+                    proof_id: None,
+                    conversation_id: request.conversation_id.clone(),
+                    conversation_title: None,
+                    run_id: None,
+                    run_status: None,
+                    trace_id: None,
+                    total_tokens: 0,
+                    choices: Vec::new(),
+                    degradation: Vec::new(),
+                    attempted_models: Vec::new(),
+                    user_outcome: None,
+                }),
+            )
+                .into_response(),
+            Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
+        };
+    }
 
     // Internal escape hatch only. The product UX is the secure credential form.
     if let Some((key, value)) = parse_set_secret_command(&request.message) {
@@ -1186,29 +1246,29 @@ fn stream_surface_renderer(name: &str, payload: &serde_json::Value) -> (String, 
         name: name.to_string(),
         ..crate::actions::ActionDef::default()
     };
-    let metadata = crate::actions::planner_metadata_for_action(&action);
+    let metadata = crate::actions::action_metadata_for_action(&action);
     match metadata.integration_class {
-        crate::actions::PlannerIntegrationClass::Code => (
+        crate::actions::ActionIntegrationClass::Code => (
             "agentark.terminal.transcript.v1".to_string(),
             "generic-artifact".to_string(),
         ),
-        crate::actions::PlannerIntegrationClass::Filesystem => (
+        crate::actions::ActionIntegrationClass::Filesystem => (
             "agentark.file.editor.v1".to_string(),
             "generic-artifact".to_string(),
         ),
-        crate::actions::PlannerIntegrationClass::Search => (
+        crate::actions::ActionIntegrationClass::Search => (
             "agentark.search.results.v1".to_string(),
             "generic-artifact".to_string(),
         ),
-        crate::actions::PlannerIntegrationClass::Browser => (
+        crate::actions::ActionIntegrationClass::Browser => (
             "agentark.browser.reader.v1".to_string(),
             "generic-artifact".to_string(),
         ),
-        crate::actions::PlannerIntegrationClass::App => (
+        crate::actions::ActionIntegrationClass::App => (
             "agentark.app.deploy.v1".to_string(),
             "generic-artifact".to_string(),
         ),
-        crate::actions::PlannerIntegrationClass::Media => (
+        crate::actions::ActionIntegrationClass::Media => (
             "agentark.artifact.image.v1".to_string(),
             "generic-artifact".to_string(),
         ),
@@ -1527,20 +1587,36 @@ pub(super) fn normalize_stream_event_for_sse(
             done,
         } => {
             let normalized_phase = phase.trim();
-            let content = content_delta;
+            let phase_visible = {
+                let normalized = normalized_phase.to_ascii_lowercase();
+                normalized.ends_with("_summary") || normalized.contains("summary")
+            };
+            if !phase_visible {
+                return (None, String::new());
+            }
             let stream_key = if normalized_phase.is_empty() {
                 "reasoning:active".to_string()
             } else {
                 format!("reasoning:{}", normalized_phase)
             };
+            let detail = if !content_delta.trim().is_empty() {
+                content_delta.trim().to_string()
+            } else if done {
+                "Reasoning summary completed.".to_string()
+            } else {
+                "Reasoning summary in progress.".to_string()
+            };
+            let content = content_delta.clone();
             (
                 Some((
                     "reasoning_delta",
                     serde_json::json!({
                         "kind": "reasoning_delta",
                         "phase": normalized_phase,
-                        "content": content.clone(),
-                        "content_delta": content,
+                        "title": "Reasoning summary",
+                        "detail": detail,
+                        "content": content,
+                        "content_delta": content_delta,
                         "done": done,
                         "stream_key": stream_key,
                     }),
@@ -2530,7 +2606,7 @@ async fn synthesize_deep_research_report(
 
 Write like a senior research analyst. Use only the supplied evidence brief and its numbered sources. Do not invent facts, citations, dates, statistics, source titles, or URLs. If the evidence is thin, conflicting, or missing for part of the request, say so directly and explain what would need verification.
 
-The report must be rigorous, detailed, and useful: synthesize implications, tradeoffs, uncertainties, counterarguments, and practical options. Adapt headings to the user's underlying research intent instead of mirroring surface wording. Cite material claims with bracketed source numbers such as [1] or [2, 4]. Do not include a Sources section, chart fences, or raw JSON because AgentArk appends the evidence brief separately."#;
+The report must be rigorous, detailed, and useful: synthesize implications, tradeoffs, uncertainties, counterarguments, and practical options. Format it like a clean analyst report: start with a concise executive summary, use numbered or clearly ordered sections, include compact Markdown tables when they improve comparison or planning, and keep paragraphs readable. Adapt headings to the user's underlying research intent instead of mirroring surface wording. Cite material claims with bracketed source numbers such as [1] or [2, 4]. Do not include a Sources section, chart fences, or raw JSON because AgentArk appends the evidence brief separately."#;
 
     let evidence = if evidence_report.chars().count() > 45_000 {
         let trimmed = evidence_report.chars().take(45_000).collect::<String>();
@@ -2542,7 +2618,7 @@ The report must be rigorous, detailed, and useful: synthesize implications, trad
         evidence_report.to_string()
     };
     let user = format!(
-        "Original research request:\n{}\n\nEvidence brief:\n{}\n\nWrite the deep research report now. Include an executive summary, detailed analysis organized around the request's real dimensions, the strongest case for and against the likely conclusion, practical recommendations or options, and evidence gaps/open questions. Keep every substantive claim grounded in the supplied numbered sources.",
+        "Original research request:\n{}\n\nEvidence brief:\n{}\n\nWrite the deep research report now. Include an executive summary, detailed analysis organized around the request's real dimensions, compact tables for comparisons or options when useful, the strongest case for and against the likely conclusion, practical recommendations or options, and evidence gaps/open questions. Keep every substantive claim grounded in the supplied numbered sources.",
         query.trim(),
         evidence.trim()
     );
@@ -5288,6 +5364,40 @@ pub(super) async fn chat_stream(
         request.message.len(),
         request.conversation_id.as_deref().unwrap_or("-"),
     );
+
+    if let Some(result) = handle_direct_chat_approval_submit_text(&state, &request.message).await {
+        let cid = request.conversation_id.clone();
+        let payload = match result {
+            Ok(mut payload) => {
+                if let serde_json::Value::Object(map) = &mut payload {
+                    map.insert("conversation_id".to_string(), serde_json::json!(cid));
+                }
+                payload
+            }
+            Err(error) => serde_json::json!({ "error": error, "conversation_id": cid }),
+        };
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
+        crate::spawn_logged!("src/channels/http.rs:direct_chat_approval_submit", async move {
+            let event_name = if payload.get("error").is_some() {
+                "error"
+            } else {
+                "content"
+            };
+            let _ = tx
+                .send(Ok(Event::default()
+                    .event(event_name)
+                    .data(payload.to_string())))
+                .await;
+            let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
+        });
+
+        return Sse::new(cap_sse_lifetime(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    }
 
     // Internal escape hatch only. The product UX is the secure credential form.
     if let Some((key, value)) = parse_set_secret_command(&request.message) {

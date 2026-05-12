@@ -132,6 +132,7 @@ impl Agent {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn tool_output_requires_sensitive_context_approval(
         &self,
         output: &str,

@@ -749,7 +749,7 @@ fn push_structured_capability_observations(
     raw: &str,
 ) -> bool {
     let capability = normalize_capability_kind(raw);
-    let metadata = action.planner_metadata();
+    let metadata = action.action_metadata();
     let evidence = format!("declared action capability '{}'", raw.trim());
 
     match capability.as_str() {
@@ -869,8 +869,8 @@ fn push_structured_capability_observations(
             );
             if matches!(
                 metadata.role,
-                crate::actions::PlannerActionRole::Delivery
-                    | crate::actions::PlannerActionRole::Mutation
+                crate::actions::ActionRole::Delivery
+                    | crate::actions::ActionRole::Mutation
             ) {
                 push_observation(
                     out,
@@ -924,8 +924,8 @@ fn push_structured_capability_observations(
                 &evidence,
             );
             match metadata.role {
-                crate::actions::PlannerActionRole::DataSource
-                | crate::actions::PlannerActionRole::Inspection => {
+                crate::actions::ActionRole::DataSource
+                | crate::actions::ActionRole::Inspection => {
                     push_observation(
                         out,
                         seen,
@@ -936,7 +936,7 @@ fn push_structured_capability_observations(
                         &evidence,
                     );
                 }
-                crate::actions::PlannerActionRole::Delivery => {
+                crate::actions::ActionRole::Delivery => {
                     push_observation(
                         out,
                         seen,
@@ -956,7 +956,7 @@ fn push_structured_capability_observations(
                         &evidence,
                     );
                 }
-                crate::actions::PlannerActionRole::Mutation => {
+                crate::actions::ActionRole::Mutation => {
                     push_observation(
                         out,
                         seen,
@@ -1007,8 +1007,8 @@ fn push_structured_capability_observations(
             );
             if matches!(
                 metadata.role,
-                crate::actions::PlannerActionRole::Inspection
-                    | crate::actions::PlannerActionRole::DataSource
+                crate::actions::ActionRole::Inspection
+                    | crate::actions::ActionRole::DataSource
             ) {
                 push_observation(
                     out,
@@ -1159,7 +1159,7 @@ fn push_structured_capability_observations(
             true
         }
         "app-hosting" => {
-            if matches!(metadata.role, crate::actions::PlannerActionRole::Inspection) {
+            if matches!(metadata.role, crate::actions::ActionRole::Inspection) {
                 push_observation(out, seen, layer, entity_id, "reads-file", None, &evidence);
             } else {
                 push_observation(out, seen, layer, entity_id, "writes-file", None, &evidence);
@@ -1194,8 +1194,8 @@ fn push_structured_capability_observations(
         | "self-evolve" => {
             if matches!(
                 metadata.role,
-                crate::actions::PlannerActionRole::Inspection
-                    | crate::actions::PlannerActionRole::DataSource
+                crate::actions::ActionRole::Inspection
+                    | crate::actions::ActionRole::DataSource
             ) {
                 push_observation(
                     out,
@@ -1744,7 +1744,7 @@ pub fn evaluate_cross_layer_capabilities(
     report.warnings = report
         .matched_rules
         .iter()
-        .map(|rule| format!("Cross-layer policy rule '{}': {}", rule.id, rule.message))
+        .map(|rule| rule.message.to_string())
         .collect();
     report.blocked = report
         .matched_rules

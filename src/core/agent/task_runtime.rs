@@ -1,21 +1,23 @@
-use super::action_selection::{action_is_read_only, action_is_read_only_knowledge_action};
+#![allow(dead_code)]
+
+use super::action_selection::action_is_read_only;
 use super::*;
 
 fn action_is_scheduler_default_candidate(action: &crate::actions::ActionDef) -> bool {
-    let metadata = action.planner_metadata();
-    let read_only_source = matches!(metadata.side_effect_level, PlannerSideEffectLevel::None)
+    let metadata = action.action_metadata();
+    let read_only_source = matches!(metadata.side_effect_level, ActionSideEffectLevel::None)
         && matches!(
             metadata.role,
-            PlannerActionRole::DataSource
-                | PlannerActionRole::Inspection
-                | PlannerActionRole::Trigger
+            ActionRole::DataSource
+                | ActionRole::Inspection
+                | ActionRole::Trigger
         );
     let internal_notification =
-        matches!(metadata.side_effect_level, PlannerSideEffectLevel::Notify)
-            && matches!(metadata.role, PlannerActionRole::Delivery)
+        matches!(metadata.side_effect_level, ActionSideEffectLevel::Notify)
+            && matches!(metadata.role, ActionRole::Delivery)
             && matches!(
                 metadata.integration_class,
-                PlannerIntegrationClass::Internal
+                ActionIntegrationClass::Internal
             );
     read_only_source || internal_notification
 }
@@ -1782,6 +1784,8 @@ impl Agent {
                         "scheduler",
                         Some(&task.description),
                         Some(&automation_authorization),
+                        None,
+                        None,
                     )
                     .await?;
                 let handled = if let Some(payload) = parse_workflow_missing_inputs_marker(&result) {
@@ -1924,6 +1928,8 @@ impl Agent {
                 "scheduler",
                 Some(&task.description),
                 Some(&automation_authorization),
+                None,
+                None,
             )
             .await?;
         if let Some(payload) = parse_workflow_missing_inputs_marker(&result) {
@@ -3925,13 +3931,24 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         }
     }
 
+    fn normalized_watch_result_for_change_detection(result: &str) -> String {
+        if let Some(payload) = Self::extract_structured_watcher_condition_payload(result) {
+            return serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
+        }
+        automation_primary_result_text(result)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     pub(crate) fn evaluate_watch_condition_without_llm(
         condition: &crate::core::watcher::WatchCondition,
         result: &str,
+        previous_result: Option<&str>,
     ) -> Option<Result<bool, String>> {
         let primary = automation_primary_result_text(result);
         let trimmed = primary.trim();
-        match &condition.matcher {
+        let current_state_match = match &condition.matcher {
             crate::core::watcher::WatchConditionMatcher::NotEmpty => Some(Ok(!trimmed.is_empty()
                 && !trimmed.eq_ignore_ascii_case("no messages found.")
                 && !trimmed.eq_ignore_ascii_case("no results")
@@ -4008,7 +4025,29 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                 }))
             }
             crate::core::watcher::WatchConditionMatcher::Llm => None,
-        }
+        }?;
+
+        Some(current_state_match.and_then(|matched| {
+            if !matched {
+                return Ok(false);
+            }
+            if condition.evaluation_mode
+                != crate::core::watcher::WatchConditionEvaluationMode::Change
+            {
+                return Ok(true);
+            }
+            let Some(previous_result) = previous_result else {
+                return Ok(false);
+            };
+            Ok(Self::normalized_watch_result_for_change_detection(result)
+                != Self::normalized_watch_result_for_change_detection(previous_result))
+        }))
+    }
+
+    fn watch_condition_requires_previous_result(
+        condition: &crate::core::watcher::WatchCondition,
+    ) -> bool {
+        condition.evaluation_mode == crate::core::watcher::WatchConditionEvaluationMode::Change
     }
 
     pub async fn evaluate_watcher_condition(
@@ -4018,7 +4057,13 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         result: &str,
         previous_result: Option<&str>,
     ) -> Result<bool, String> {
-        if let Some(outcome) = Self::evaluate_watch_condition_without_llm(condition, result) {
+        if Self::watch_condition_requires_previous_result(condition) && previous_result.is_none() {
+            return Ok(false);
+        }
+
+        if let Some(outcome) =
+            Self::evaluate_watch_condition_without_llm(condition, result, previous_result)
+        {
             return outcome;
         }
 
@@ -4546,43 +4591,24 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             .as_ref()
             .map(|name| all_actions.iter().any(|a| a.name == *name))
             .unwrap_or(false);
-        let reminder_default = schedule_task_should_default_to_notify_user(
-            &task_desc,
-            explicit_action.as_deref(),
-            scheduled_for,
-            &task_args,
-        );
 
         if explicit_action.is_some() && !explicit_valid {
             return Some(format!(
-                "Scheduled task action `{}` is not available in the enabled action catalog. Use an enabled action or omit `action` so AgentArk can choose a safe default.",
+                "Scheduled task action `{}` is not available in the enabled action catalog. Use an enabled action or omit `action` for an in-app notification reminder.",
                 explicit_action.as_deref().unwrap_or_default()
             ));
         }
 
-        // Runtime must not infer a different action from task text. It can use
-        // an explicit bound action, a safe reminder default, or a deterministic
-        // read-only/internal fallback that validation will still check.
         let mut action_name = if explicit_valid {
             explicit_action.unwrap_or_default()
-        } else if reminder_default
-            && all_actions
-                .iter()
-                .any(|action| action.name == "notify_user")
+        } else if all_actions.iter().any(|action| action.name == "notify_user")
         {
             "notify_user".to_string()
-        } else if let Some(action) = all_actions
-            .iter()
-            .find(|action| action_is_read_only_knowledge_action(action))
-        {
-            action.name.clone()
-        } else if let Some(action) = all_actions
-            .iter()
-            .find(|action| action_is_scheduler_default_candidate(action))
-        {
-            action.name.clone()
         } else {
-            "notify_user".to_string()
+            return Some(
+                "Scheduled task is missing an enabled action and in-app notification delivery is unavailable."
+                    .to_string(),
+            );
         };
         let trigger_kind_hint = if cron_expr.is_some() {
             Some("recurring_schedule")
@@ -5236,15 +5262,20 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             project_id: project_id.map(|value| value.to_string()),
             source: Some("watcher".to_string()),
         };
+        let default_validation = if Self::watch_condition_requires_previous_result(&condition) {
+            AutomationValidation::default()
+        } else {
+            AutomationValidation {
+                mode: AutomationValidationMode::NonEmptyResult,
+                ..AutomationValidation::default()
+            }
+        };
         let policy = automation_policy_from_request_argument(
             arguments,
             AutomationExecutionPolicy {
                 validation: automation_validation_from_request_argument(
                     arguments,
-                    AutomationValidation {
-                        mode: AutomationValidationMode::NonEmptyResult,
-                        ..AutomationValidation::default()
-                    },
+                    default_validation,
                 ),
                 stall_timeout_secs: timeout_secs.min(6 * 60 * 60),
                 ..AutomationExecutionPolicy::default()
@@ -5280,8 +5311,10 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                 poll_action, error
             ));
         }
+        let mut initial_baseline_result: Option<String> = None;
         if poll_action.eq_ignore_ascii_case("code_execute")
             || Self::watch_condition_requires_structured_payload(&condition)
+            || Self::watch_condition_requires_previous_result(&condition)
         {
             let preflight_timeout_secs = policy.stall_timeout_secs.clamp(30, 120);
             let preflight = tokio::time::timeout(
@@ -5317,15 +5350,21 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                 ));
             }
             if let Some(Err(error)) =
-                Self::evaluate_watch_condition_without_llm(&condition, &preflight_output)
+                Self::evaluate_watch_condition_without_llm(&condition, &preflight_output, None)
             {
                 return Some(format!(
                     "Watcher condition is not compatible with the current poller output yet: {}. Repair the poller or the condition contract before creating the watcher.",
                     error
                 ));
             }
+            if Self::watch_condition_requires_previous_result(&condition) {
+                initial_baseline_result = Some(preflight_output.clone());
+            }
         }
 
+        let created_at = chrono::Utc::now();
+        let has_initial_baseline = initial_baseline_result.is_some();
+        let baseline_last_poll_at = has_initial_baseline.then(|| created_at.clone());
         let watcher = super::watcher::Watcher {
             id: uuid::Uuid::new_v4(),
             description: description.clone(),
@@ -5337,15 +5376,16 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             timeout_secs,
             notify_channel: notify_channel.clone(),
             status: super::watcher::WatcherStatus::Active,
-            created_at: chrono::Utc::now(),
-            last_poll_at: None,
-            poll_count: 0,
+            created_at,
+            last_poll_at: baseline_last_poll_at,
+            poll_count: if has_initial_baseline { 1 } else { 0 },
             trigger_result: None,
-            last_result: None,
+            last_result: initial_baseline_result,
             last_error: None,
             consecutive_failures: 0,
             next_poll_not_before: None,
-            last_poll_outcome: None,
+            last_poll_outcome: has_initial_baseline
+                .then_some(super::watcher::WatcherPollOutcome::NoMatch),
             notification_attempts: Vec::new(),
         };
 
@@ -5495,7 +5535,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
              - Cadence: {}\n\
              - Notifications: {}\n\
              - Duration: {}\n\n\
-             You can stop or edit it from Watchers.{}{}{}{}",
+             You can stop or edit it from Background Work.{}{}{}{}",
             render_tool_completion_marker_with_data(
                 "watch",
                 "completed",
@@ -5652,6 +5692,28 @@ mod tests {
         assert_eq!(
             items[1].get("poll_action").and_then(|v| v.as_str()),
             Some("web_search")
+        );
+    }
+
+    #[test]
+    fn watcher_change_mode_requires_baseline_and_detects_difference() {
+        let condition = crate::core::watcher::WatchCondition {
+            description: "Trigger when the observed result changes".to_string(),
+            evaluation_mode: crate::core::watcher::WatchConditionEvaluationMode::Change,
+            matcher: crate::core::watcher::WatchConditionMatcher::NotEmpty,
+        };
+
+        assert_eq!(
+            Agent::evaluate_watch_condition_without_llm(&condition, "alpha", None),
+            Some(Ok(false))
+        );
+        assert_eq!(
+            Agent::evaluate_watch_condition_without_llm(&condition, "alpha", Some("alpha")),
+            Some(Ok(false))
+        );
+        assert_eq!(
+            Agent::evaluate_watch_condition_without_llm(&condition, "beta", Some("alpha")),
+            Some(Ok(true))
         );
     }
 

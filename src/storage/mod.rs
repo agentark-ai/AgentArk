@@ -1852,6 +1852,7 @@ impl Storage {
             .collect())
     }
 
+    #[allow(dead_code)]
     pub async fn nearest_action_catalog_index_entries(
         &self,
         embedding: &PgVector,
@@ -2966,6 +2967,38 @@ impl Storage {
         Ok(runs)
     }
 
+    pub async fn list_automation_runs_since(
+        &self,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::core::automation::AutomationRunRecord>> {
+        let mut query = automation_run::Entity::find()
+            .order_by_desc(automation_run::Column::StartedAt)
+            .limit(limit.max(1) as u64);
+        if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(automation_run::Column::StartedAt.gte(since.to_string()));
+        }
+
+        let mut runs = Vec::new();
+        for row in query.all(&self.db).await? {
+            let payload = decrypt_storage_string(&row.payload);
+            if let Ok(run) =
+                serde_json::from_str::<crate::core::automation::AutomationRunRecord>(&payload)
+            {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
+    }
+
+    pub async fn count_automation_runs(&self, since: Option<&str>) -> Result<u64> {
+        let mut query = automation_run::Entity::find();
+        if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(automation_run::Column::StartedAt.gte(since.to_string()));
+        }
+        Ok(query.count(&self.db).await?)
+    }
+
     pub async fn append_automation_run(
         &self,
         run: &crate::core::automation::AutomationRunRecord,
@@ -3223,82 +3256,6 @@ impl Storage {
         watcher::Entity::delete_by_id(id.to_string())
             .exec(&txn)
             .await?;
-        txn.commit().await?;
-        Ok(())
-    }
-
-    pub async fn replace_active_watchers(
-        &self,
-        watchers: &[crate::core::watcher::Watcher],
-    ) -> Result<()> {
-        let txn = self.db.begin().await?;
-        let existing_ids = watcher::Entity::find()
-            .select_only()
-            .column(watcher::Column::Id)
-            .into_tuple::<String>()
-            .all(&txn)
-            .await?;
-        if watchers.is_empty() {
-            self.cleanup_automation_records_for_ids(&txn, &existing_ids)
-                .await?;
-            watcher::Entity::delete_many().exec(&txn).await?;
-        } else {
-            let active_ids = watchers
-                .iter()
-                .map(|watcher| watcher.id.to_string())
-                .collect::<Vec<_>>();
-            let active_ids_set = active_ids
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-            let removed_ids = existing_ids
-                .into_iter()
-                .filter(|id| !active_ids_set.contains(id))
-                .collect::<Vec<_>>();
-            self.cleanup_automation_records_for_ids(&txn, &removed_ids)
-                .await?;
-            watcher::Entity::delete_many()
-                .filter(watcher::Column::Id.is_not_in(active_ids))
-                .exec(&txn)
-                .await?;
-        }
-        for watcher in watchers {
-            let status = match &watcher.status {
-                crate::core::watcher::WatcherStatus::Active => "active",
-                crate::core::watcher::WatcherStatus::Paused => "paused",
-                crate::core::watcher::WatcherStatus::Triggered => "triggered",
-                crate::core::watcher::WatcherStatus::TimedOut => "timed_out",
-                crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
-                crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
-            };
-            watcher::Entity::insert(watcher::ActiveModel {
-                id: Set(watcher.id.to_string()),
-                status: Set(status.to_string()),
-                created_at: Set(watcher.created_at.to_rfc3339()),
-                updated_at: Set(chrono::Utc::now().to_rfc3339()),
-                payload: Set(serde_json::to_string(watcher)?),
-                lease_owner: Set(None),
-                lease_expires_at: sea_orm::NotSet,
-                lease_version: Set(0),
-                next_retry_at: Set(watcher.next_poll_not_before.map(|value| value.to_rfc3339())),
-                last_run_id: Set(None),
-                consecutive_failures: Set(watcher.consecutive_failures as i32),
-            })
-            .on_conflict(
-                OnConflict::column(watcher::Column::Id)
-                    .update_columns([
-                        watcher::Column::Status,
-                        watcher::Column::UpdatedAt,
-                        watcher::Column::Payload,
-                        watcher::Column::NextRetryAt,
-                        watcher::Column::LastRunId,
-                        watcher::Column::ConsecutiveFailures,
-                    ])
-                    .to_owned(),
-            )
-            .exec(&txn)
-            .await?;
-        }
         txn.commit().await?;
         Ok(())
     }
@@ -9161,6 +9118,38 @@ impl Storage {
             row.payload = decrypt_optional_storage_string(row.payload.clone());
         }
         Ok(rows)
+    }
+
+    /// List recent operational logs across AgentArk modules (newest first).
+    pub async fn list_recent_operational_logs(
+        &self,
+        since: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<operational_log::Model>> {
+        let mut query = operational_log::Entity::find()
+            .order_by_desc(operational_log::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset));
+        if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(operational_log::Column::CreatedAt.gte(since.to_string()));
+        }
+
+        let mut rows = query.all(&self.db).await?;
+        for row in &mut rows {
+            row.outcome = decrypt_storage_string(&row.outcome);
+            row.arguments = decrypt_optional_storage_string(row.arguments.clone());
+            row.payload = decrypt_optional_storage_string(row.payload.clone());
+        }
+        Ok(rows)
+    }
+
+    pub async fn count_operational_logs(&self, since: Option<&str>) -> Result<u64> {
+        let mut query = operational_log::Entity::find();
+        if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(operational_log::Column::CreatedAt.gte(since.to_string()));
+        }
+        Ok(query.count(&self.db).await?)
     }
 
     /// List recent operational logs for a set of trace ids (newest first).

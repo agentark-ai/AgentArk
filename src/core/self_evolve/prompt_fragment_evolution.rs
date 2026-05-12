@@ -165,9 +165,9 @@ pub(crate) async fn evaluate_external_prompt_fragment_candidates(
         let left_eval = evaluate_prompt_fragment_bundle(&left.bundle);
         let right_eval = evaluate_prompt_fragment_bundle(&right.bundle);
         right_eval
-            .score
-            .partial_cmp(&left_eval.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .required_fragments_enabled
+            .cmp(&left_eval.required_fragments_enabled)
+            .then_with(|| right_eval.has_enabled_fragments.cmp(&left_eval.has_enabled_fragments))
             .then_with(|| {
                 left_eval
                     .efficiency
@@ -204,27 +204,20 @@ pub(crate) async fn evaluate_external_prompt_fragment_candidates(
     let promoted = changed
         && best_eval.has_enabled_fragments
         && best_eval.required_fragments_enabled
-        && token_regression_ratio <= MAX_FRAGMENT_TOKEN_REGRESSION_RATIO
-        && best_eval.score + 0.02 >= baseline_eval.score;
+        && token_regression_ratio <= MAX_FRAGMENT_TOKEN_REGRESSION_RATIO;
     let promotion_gate = render_prompt_fragment_promotion_gate(
         promoted,
         changed,
         best_eval.required_fragments_enabled,
         best_eval.has_enabled_fragments,
         token_regression_ratio,
-        baseline_eval.score,
-        best_eval.score,
     );
-    let wins = usize::from(best_eval.score >= baseline_eval.score)
-        + usize::from(
-            best_eval.efficiency.enabled_estimated_tokens
-                <= baseline_eval.efficiency.enabled_estimated_tokens,
-        );
-    let losses = usize::from(best_eval.score < baseline_eval.score)
-        + usize::from(
-            best_eval.efficiency.enabled_estimated_tokens
-                > baseline_eval.efficiency.enabled_estimated_tokens,
-        );
+    let wins = usize::from(best_eval.required_fragments_enabled)
+        + usize::from(best_eval.has_enabled_fragments)
+        + usize::from(token_regression_ratio <= MAX_FRAGMENT_TOKEN_REGRESSION_RATIO);
+    let losses = usize::from(!best_eval.required_fragments_enabled)
+        + usize::from(!best_eval.has_enabled_fragments)
+        + usize::from(token_regression_ratio > MAX_FRAGMENT_TOKEN_REGRESSION_RATIO);
     let notes = build_prompt_fragment_notes(
         &baseline_eval,
         &best_eval,
@@ -371,33 +364,10 @@ fn evaluate_prompt_fragment_bundle(
         .filter(|id| !enabled_ids.contains(**id))
         .map(|id| (*id).to_string())
         .collect::<Vec<_>>();
-    let required_score = if required_prompt_fragment_ids().is_empty() {
-        1.0
-    } else {
-        1.0 - (disabled_required_fragment_ids.len() as f64
-            / required_prompt_fragment_ids().len() as f64)
-    };
-    let surface_count = enabled
-        .iter()
-        .map(|fragment| fragment.surface.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let tag_count = enabled
-        .iter()
-        .flat_map(|fragment| fragment.scope_tags.iter().map(String::as_str))
-        .collect::<BTreeSet<_>>()
-        .len();
-    let coverage_score = ((surface_count + tag_count).min(8) as f64) / 8.0;
-    let integrity_score = if efficiency.enabled_fragments == 0 {
-        0.0
-    } else {
-        1.0
-    };
-    let efficiency_score = 1.0 / (1.0 + (efficiency.enabled_estimated_tokens as f64 / 2_000.0));
-    let score = (0.45 * required_score)
-        + (0.20 * integrity_score)
-        + (0.15 * coverage_score)
-        + (0.20 * efficiency_score);
+    let invariant_checks = 2usize;
+    let passed_invariant_checks =
+        usize::from(disabled_required_fragment_ids.is_empty()) + usize::from(!enabled.is_empty());
+    let score = passed_invariant_checks as f64 / invariant_checks as f64;
 
     PromptFragmentBundleEvaluation {
         score: round4(score),
@@ -519,8 +489,6 @@ fn render_prompt_fragment_promotion_gate(
     required_fragments_enabled: bool,
     has_enabled_fragments: bool,
     token_regression_ratio: f64,
-    baseline_score: f64,
-    candidate_score: f64,
 ) -> String {
     if promoted {
         return "passed structural prompt-fragment canary gate".to_string();
@@ -539,12 +507,6 @@ fn render_prompt_fragment_promotion_gate(
             "enabled prompt-fragment tokens grew by {:.1}% above the {:.1}% limit",
             token_regression_ratio * 100.0,
             MAX_FRAGMENT_TOKEN_REGRESSION_RATIO * 100.0
-        );
-    }
-    if candidate_score + 0.02 < baseline_score {
-        return format!(
-            "structural score {:.4} below baseline {:.4}",
-            candidate_score, baseline_score
         );
     }
     "candidate did not pass prompt-fragment canary gate".to_string()
@@ -657,6 +619,12 @@ pub(crate) fn prompt_fragment_candidate_benchmark_profile() -> serde_json::Value
         "surface": "prompt_fragment_bundle",
         "objective": "Improve selectable agent-loop guidance fragments while preserving required safety and turn-contract invariants.",
         "required_invariants": required_prompt_fragment_ids(),
+        "semantic_contract": {
+            "preserve_multi_outcome_turns": true,
+            "conversation_history_resolves_references_without_overriding_current_turn": true,
+            "memory_capture_remains_deferred_after_chat_persistence": true,
+            "avoid_phrase_specific_or_magic_bonus_routing": true
+        },
         "candidate_shape": {
             "version": "string",
             "updated_at": "optional RFC3339 timestamp",

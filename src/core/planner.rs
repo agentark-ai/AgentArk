@@ -109,8 +109,8 @@ fn action_catalog_for_prompt(
                 serde_json::json!(action.description),
             );
             record.insert(
-                "planner_metadata".to_string(),
-                serde_json::json!(action.planner_metadata()),
+                "action_metadata".to_string(),
+                serde_json::json!(action.action_metadata()),
             );
             if !compact {
                 record.insert(
@@ -579,7 +579,7 @@ Rules:\n\
                     serde_json::json!({
                         "name": action.name,
                         "description": action.description,
-                        "planner_metadata": action.planner_metadata(),
+                        "action_metadata": action.action_metadata(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1060,7 +1060,7 @@ mod tests {
 
         assert!(user.contains("Request grounding:"));
         assert!(user.contains("Available action names:\nresearch, web_search"));
-        assert!(!user.contains("\"planner_metadata\""));
+        assert!(!user.contains("\"action_metadata\""));
         assert!(!user.contains("\"input_schema\""));
         assert!(!user.contains("\"description\""));
     }

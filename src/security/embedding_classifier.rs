@@ -7,8 +7,8 @@ use crate::core::document_search::normalized_embedding_similarity;
 use crate::core::EmbeddingClient;
 
 use super::intent_classifier::{
-    InboundClassificationDecision, InboundMemoryCaptureSignal, InboundRoutingSignal,
-    InboundTurnGoal, IntentVerdict,
+    InboundAdvisorySignal, InboundClassificationDecision, InboundMemoryCaptureSignal,
+    IntentVerdict,
 };
 
 const FAST_BLOCK_MIN_SCORE: f32 = 0.82;
@@ -21,9 +21,10 @@ const FAST_BORDERLINE_BLOCK_SCORE: f32 = 0.55;
 const FAST_MEMORY_CAPTURE_CANDIDATE_MIN_SCORE: f32 = 0.56;
 const FAST_MEMORY_CAPTURE_REJECT_MARGIN: f32 = 0.06;
 const FAST_MEMORY_CAPTURE_REJECT_MIN_SCORE: f32 = 0.74;
-const FAST_ROUTING_MIN_SCORE: f32 = 0.70;
-const FAST_ROUTING_MARGIN: f32 = 0.06;
-const FAST_UNCHECKED_ROUTE_MIN_SCORE: f32 = 0.58;
+const FAST_CONVERSATIONAL_MIN_SCORE: f32 = 0.70;
+const FAST_CONVERSATIONAL_MARGIN: f32 = 0.06;
+const FAST_UNCHECKED_CLASSIFICATION_MIN_SCORE: f32 = 0.58;
+const FAST_CLASSIFIER_CONTEXT_MAX_CHARS: usize = 2400;
 const PRODUCT_IDENTITY_ANSWER_CONCEPT: &str = "product_identity_answer";
 const AGENTARK_CAPABILITIES_ANSWER_CONCEPT: &str = "agentark_capabilities_answer";
 const SCHEDULED_TASK_CONCEPT: &str = "scheduled_task";
@@ -33,7 +34,7 @@ const PERSISTENT_ARTIFACT_CONCEPT: &str = "persistent_artifact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SecurityCategory {
-    DirectReply,
+    Conversational,
     ToolUse,
     DurableWork,
     ManagedAppDelivery,
@@ -127,27 +128,27 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
 
     vec![
         canonical(
-            SecurityCategory::DirectReply,
+            SecurityCategory::Conversational,
             "self_contained_answer",
             "The user wants a current conversational answer, explanation, acknowledgement, clarification, or answer that can be given directly from the conversation context without live tools, external retrieval, durable side effects, saved artifacts, deployments, schedules, integrations, or state inspection.",
         ),
         canonical(
-            SecurityCategory::DirectReply,
+            SecurityCategory::Conversational,
             PRODUCT_IDENTITY_ANSWER_CONCEPT,
             "The user asks for the assistant or running product identity, name, who it is, or what it should call itself, and the answer should come from the trusted product identity already supplied by the system.",
         ),
         canonical(
-            SecurityCategory::DirectReply,
+            SecurityCategory::Conversational,
             AGENTARK_CAPABILITIES_ANSWER_CONCEPT,
             "The user asks what AgentArk can do, how an AgentArk capability works, or where an AgentArk feature is configured; the answer should be grounded in the live AgentArk capability registry with curated manual context only as supplemental explanation, not in the assistant's trusted product identity and not in live logs or external web.",
         ),
         canonical(
-            SecurityCategory::DirectReply,
+            SecurityCategory::Conversational,
             "previous_user_turn_recall",
             "The user asks to recall, quote, restate, identify, or answer from the immediately previous user message or question in the visible conversation history.",
         ),
         canonical(
-            SecurityCategory::DirectReply,
+            SecurityCategory::Conversational,
             "recent_conversation_summary",
             "The user asks for a concise summary, recap, or description of the recent visible conversation history without needing tools or external lookup.",
         ),
@@ -211,7 +212,7 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
 
 fn security_category_from_overlay(raw: &str) -> Option<SecurityCategory> {
     match raw.trim() {
-        "direct_reply" => Some(SecurityCategory::DirectReply),
+        "conversational" => Some(SecurityCategory::Conversational),
         "tool_use" => Some(SecurityCategory::ToolUse),
         "durable_work" => Some(SecurityCategory::DurableWork),
         "managed_app_delivery" => Some(SecurityCategory::ManagedAppDelivery),
@@ -284,152 +285,6 @@ fn category_margin(
     score - competing
 }
 
-fn agentark_capabilities_routing_for_concept(_concept: &str) -> InboundRoutingSignal {
-    InboundRoutingSignal {
-        should_execute: true,
-        tool_use_expected: true,
-        durable_work_expected: false,
-        current_answer_expected: true,
-        semantic_queries: Vec::new(),
-        required_capabilities: vec!["AgentArk capability lookup".to_string()],
-        rationale: Some("high confidence AgentArk capability embedding route".to_string()),
-        agentark_capabilities_expected: true,
-        goals: vec![InboundTurnGoal {
-            id: "g1".to_string(),
-            intent_summary: "Answer from AgentArk capabilities".to_string(),
-            capability_query: "AgentArk capability lookup".to_string(),
-            expected_outcome: "A grounded AgentArk capability answer".to_string(),
-            durability: "none".to_string(),
-            groundings: vec!["agentark_capabilities".to_string()],
-            side_effect: "none".to_string(),
-            dependencies: Vec::new(),
-        }],
-        ..InboundRoutingSignal::default()
-    }
-}
-
-fn durable_routing_shape(concept: &str) -> (&'static str, &'static str, &'static str) {
-    match concept {
-        SCHEDULED_TASK_CONCEPT => (
-            "scheduled_time",
-            "Create or update the requested time-based background task",
-            "Scheduled task is persisted and will run at the requested time or cadence",
-        ),
-        WATCHER_MONITOR_CONCEPT => (
-            "recurring_monitor",
-            "Create or update the requested durable monitor",
-            "Watcher or monitor is persisted with its trigger and reporting route",
-        ),
-        INTEGRATION_SETUP_CONCEPT => (
-            "integration",
-            "Configure the requested durable integration",
-            "Integration setup is completed or the missing authorization step is identified",
-        ),
-        PERSISTENT_ARTIFACT_CONCEPT => (
-            "artifact",
-            "Create or update the requested persistent artifact",
-            "Persistent artifact is saved or updated",
-        ),
-        _ => (
-            "persistent_work",
-            "Complete the requested durable outcome",
-            "Persistent result created, changed, or delivered",
-        ),
-    }
-}
-
-fn routing_for_category(category: SecurityCategory, concept: &str) -> InboundRoutingSignal {
-    match category {
-        SecurityCategory::DirectReply if concept == PRODUCT_IDENTITY_ANSWER_CONCEPT => {
-            InboundRoutingSignal {
-                should_execute: false,
-                tool_use_expected: false,
-                durable_work_expected: false,
-                current_answer_expected: true,
-                semantic_queries: vec!["Answer from trusted product identity".to_string()],
-                rationale: Some("high confidence product-identity embedding route".to_string()),
-                goals: vec![InboundTurnGoal {
-                    id: "g1".to_string(),
-                    intent_summary: "Answer the assistant identity question".to_string(),
-                    capability_query: "trusted product identity context".to_string(),
-                    expected_outcome: "A direct identity answer is returned".to_string(),
-                    durability: "none".to_string(),
-                    groundings: vec!["product_identity".to_string()],
-                    side_effect: "none".to_string(),
-                    dependencies: Vec::new(),
-                }],
-                ..InboundRoutingSignal::default()
-            }
-        }
-        SecurityCategory::DirectReply if concept == AGENTARK_CAPABILITIES_ANSWER_CONCEPT => {
-            agentark_capabilities_routing_for_concept(concept)
-        }
-        SecurityCategory::DirectReply => InboundRoutingSignal {
-            should_execute: false,
-            tool_use_expected: false,
-            durable_work_expected: false,
-            current_answer_expected: true,
-            semantic_queries: vec![concept.to_string()],
-            rationale: Some("high confidence embedding fast path".to_string()),
-            ..InboundRoutingSignal::default()
-        },
-        SecurityCategory::ToolUse => InboundRoutingSignal {
-            should_execute: true,
-            tool_use_expected: true,
-            durable_work_expected: false,
-            current_answer_expected: true,
-            live_state_expected: true,
-            semantic_queries: vec![concept.to_string()],
-            required_capabilities: vec![concept.to_string()],
-            rationale: Some("high confidence embedding fast path".to_string()),
-            goals: vec![InboundTurnGoal {
-                id: "g1".to_string(),
-                intent_summary: "Handle the requested live or tool-mediated outcome".to_string(),
-                capability_query: concept.to_string(),
-                expected_outcome: "Requested outcome completed or answered".to_string(),
-                durability: "none".to_string(),
-                groundings: vec!["local_state".to_string()],
-                side_effect: "none".to_string(),
-                dependencies: Vec::new(),
-            }],
-            ..InboundRoutingSignal::default()
-        },
-        SecurityCategory::DurableWork | SecurityCategory::ManagedAppDelivery => {
-            let (durability, intent_summary, expected_outcome) =
-                if category == SecurityCategory::ManagedAppDelivery {
-                    (
-                        "deployment",
-                        "Complete the requested app delivery outcome",
-                        "Persistent app or browser-usable result is deployed or updated",
-                    )
-                } else {
-                    durable_routing_shape(concept)
-                };
-            InboundRoutingSignal {
-                should_execute: true,
-                tool_use_expected: true,
-                durable_work_expected: true,
-                current_answer_expected: true,
-                semantic_queries: vec![concept.to_string()],
-                required_capabilities: vec![concept.to_string()],
-                rationale: Some("high confidence embedding fast path".to_string()),
-                goals: vec![InboundTurnGoal {
-                    id: "g1".to_string(),
-                    intent_summary: intent_summary.to_string(),
-                    capability_query: concept.to_string(),
-                    expected_outcome: expected_outcome.to_string(),
-                    durability: durability.to_string(),
-                    groundings: Vec::new(),
-                    side_effect: "write".to_string(),
-                    dependencies: Vec::new(),
-                }],
-                ..InboundRoutingSignal::default()
-            }
-        }
-        SecurityCategory::SecurityBlock => InboundRoutingSignal::default(),
-    }
-}
-
 fn block_decision(concept: &str) -> InboundClassificationDecision {
     InboundClassificationDecision {
         verdict: IntentVerdict::Block {
@@ -438,46 +293,45 @@ fn block_decision(concept: &str) -> InboundClassificationDecision {
             severity: 80,
         },
         memory_capture: InboundMemoryCaptureSignal::default(),
-        routing: InboundRoutingSignal::default(),
-        direct_response: None,
+        advisory: InboundAdvisorySignal::default(),
         model_response: None,
     }
 }
 
 fn allow_decision(category: SecurityCategory, concept: &str) -> InboundClassificationDecision {
-    let direct_response = (category == SecurityCategory::DirectReply
-        && concept == PRODUCT_IDENTITY_ANSWER_CONCEPT)
-        .then(|| format!("I'm {}.", crate::branding::PRODUCT_NAME));
+    let _ = (category, concept);
+    // Embedding classifier no longer projects tool intent. Its job is only
+    // to issue a security verdict (Allow / AllowWithUncheckedTag / Block).
+    // The main model sees the full authorized catalog and picks tools.
     InboundClassificationDecision {
         verdict: IntentVerdict::Allow,
         memory_capture: InboundMemoryCaptureSignal::default(),
-        routing: routing_for_category(category, concept),
-        direct_response,
+        advisory: InboundAdvisorySignal::default(),
         model_response: None,
     }
 }
 
-fn unchecked_route_decision(
-    category: SecurityCategory,
-    concept: &str,
-) -> InboundClassificationDecision {
-    InboundClassificationDecision {
-        verdict: IntentVerdict::AllowWithUncheckedTag {
-            reason: "embedding route was execution-shaped but below trusted fast-path threshold"
-                .to_string(),
-            intent_kinds: vec!["ambiguous".to_string()],
-        },
-        memory_capture: InboundMemoryCaptureSignal::default(),
-        routing: routing_for_category(category, concept),
-        direct_response: None,
-        model_response: None,
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
     }
+    out
 }
 
 fn inbound_classifier_embedding_inputs(message: &str, context: &str) -> (String, String) {
     let message = message.trim();
-    let _ = context;
-    (message.to_string(), message.to_string())
+    let context = context.trim();
+    let classification_input = if context.is_empty() {
+        message.to_string()
+    } else {
+        format!(
+            "Current user message:\n{}\n\nRecent semantic context for continuity:\n{}",
+            message,
+            truncate_chars(context, FAST_CLASSIFIER_CONTEXT_MAX_CHARS)
+        )
+    };
+    (classification_input, message.to_string())
 }
 
 fn memory_capture_signal_from_scores(
@@ -514,15 +368,13 @@ fn memory_capture_signal_from_scores(
     }
 }
 
-fn embedding_fast_path_accepts(category: SecurityCategory, score: f32, margin: f32) -> bool {
+fn embedding_security_quick_accepts(category: SecurityCategory, score: f32, margin: f32) -> bool {
     match category {
         SecurityCategory::SecurityBlock => score >= FAST_BLOCK_MIN_SCORE,
-        SecurityCategory::DirectReply => {
-            score >= FAST_ROUTING_MIN_SCORE && margin >= FAST_ROUTING_MARGIN
+        SecurityCategory::Conversational => {
+            score >= FAST_CONVERSATIONAL_MIN_SCORE && margin >= FAST_CONVERSATIONAL_MARGIN
         }
-        SecurityCategory::ToolUse => {
-            score >= FAST_ROUTING_MIN_SCORE && margin >= FAST_ROUTING_MARGIN
-        }
+        SecurityCategory::ToolUse => false,
         SecurityCategory::DurableWork | SecurityCategory::ManagedAppDelivery => false,
     }
 }
@@ -538,14 +390,14 @@ pub async fn classify_inbound_embedding_fast(
         return Ok(None);
     }
     let context = semantic_context.unwrap_or("").trim();
-    let (routing_text_for_embedding, memory_text_for_embedding) =
+    let (classification_text_for_embedding, memory_text_for_embedding) =
         inbound_classifier_embedding_inputs(message, context);
 
     let mut canonicals = default_canonicals();
     canonicals.extend(load_overlay_canonicals(data_dir).await);
     let memory_canonicals = memory_capture_canonicals();
     let mut texts = Vec::with_capacity(canonicals.len() + memory_canonicals.len() + 2);
-    texts.push(routing_text_for_embedding);
+    texts.push(classification_text_for_embedding);
     texts.push(memory_text_for_embedding);
     texts.extend(
         canonicals
@@ -604,14 +456,27 @@ pub async fn classify_inbound_embedding_fast(
     };
     let margin = category_margin(&best, top.category, top.score);
 
-    let accepted = embedding_fast_path_accepts(top.category, top.score, margin);
+    let accepted = embedding_security_quick_accepts(top.category, top.score, margin);
 
-    // When no category passes its trusted threshold, preserve only safe
-    // execution-shaped routing hints. Direct-reply misses fall through to the
-    // model router so chat responses stay model-generated without turning a
-    // low-confidence embedding neighbor into trusted routing.
+    let context_present = !context.is_empty();
+    // Context-bearing turns may depend on earlier objects, sources, or
+    // subjects. Let the structured classifier inspect that context instead of
+    // relying on an embedding-only decision. Security blocks remain eligible
+    // for quick handling.
+    if context_present && !matches!(top.category, SecurityCategory::SecurityBlock) {
+        return Ok(None);
+    }
+
+    // When no category passes its trusted threshold, keep only security
+    // decisions in this layer. Lookup, durable work, and tool selection are
+    // handled by the main model tool loop.
     if !accepted {
-        return Ok(unaccepted_embedding_fallback(top, margin, memory_capture));
+        return Ok(unaccepted_embedding_fallback(
+            top,
+            margin,
+            memory_capture,
+            context_present,
+        ));
     }
 
     let mut decision = if top.category == SecurityCategory::SecurityBlock {
@@ -635,7 +500,11 @@ fn unaccepted_embedding_fallback(
     top: &ScoredCanonical,
     margin: f32,
     memory_capture: InboundMemoryCaptureSignal,
+    context_present: bool,
 ) -> Option<SecurityEmbeddingDecision> {
+    if context_present && !matches!(top.category, SecurityCategory::SecurityBlock) {
+        return None;
+    }
     if top.category == SecurityCategory::SecurityBlock && top.score >= FAST_BORDERLINE_BLOCK_SCORE {
         return Some(SecurityEmbeddingDecision {
             decision: block_decision(&top.concept),
@@ -648,291 +517,21 @@ fn unaccepted_embedding_fallback(
     if matches!(
         top.category,
         SecurityCategory::DurableWork | SecurityCategory::ManagedAppDelivery
-    ) && top.score >= FAST_UNCHECKED_ROUTE_MIN_SCORE
+    ) && top.score >= FAST_UNCHECKED_CLASSIFICATION_MIN_SCORE
     {
-        return Some(SecurityEmbeddingDecision {
-            decision: unchecked_route_decision(top.category, &top.concept),
-            category: top.category,
-            score: top.score,
-            margin,
-            concept: top.concept.to_string(),
-        });
+        return None;
     }
     if matches!(top.category, SecurityCategory::ToolUse)
-        && top.score >= FAST_UNCHECKED_ROUTE_MIN_SCORE
+        && top.score >= FAST_UNCHECKED_CLASSIFICATION_MIN_SCORE
     {
         let _ = memory_capture;
         return None;
     }
-    if top.category == SecurityCategory::DirectReply && top.score >= FAST_UNCHECKED_ROUTE_MIN_SCORE
+    if top.category == SecurityCategory::Conversational
+        && top.score >= FAST_UNCHECKED_CLASSIFICATION_MIN_SCORE
     {
-        return Some(SecurityEmbeddingDecision {
-            decision: unchecked_route_decision(top.category, &top.concept),
-            category: top.category,
-            score: top.score,
-            margin,
-            concept: top.concept.to_string(),
-        });
+        return None;
     }
     let _ = (margin, memory_capture);
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_capture_embedding_input_uses_current_message_without_recent_context() {
-        let (routing_input, memory_input) = inbound_classifier_embedding_inputs(
-            "Stable profile fact.",
-            "{\"recent_messages\":[{\"content\":\"Unrelated old task\"}]}",
-        );
-
-        assert!(routing_input.contains("Stable profile fact."));
-        assert!(!routing_input.contains("Unrelated old task"));
-        assert_eq!(memory_input, "Stable profile fact.");
-        assert!(!memory_input.contains("Unrelated old task"));
-    }
-
-    #[test]
-    fn routing_for_direct_reply_is_current_answer_only() {
-        let routing = routing_for_category(SecurityCategory::DirectReply, "self_contained_answer");
-        assert!(routing.current_answer_expected);
-        assert!(!routing.should_execute);
-        assert!(!routing.tool_use_expected);
-        assert!(!routing.durable_work_expected);
-    }
-
-    #[test]
-    fn routing_for_product_identity_answer_is_not_capability_lookup() {
-        let decision = allow_decision(
-            SecurityCategory::DirectReply,
-            PRODUCT_IDENTITY_ANSWER_CONCEPT,
-        );
-        let expected = format!("I'm {}.", crate::branding::PRODUCT_NAME);
-
-        assert_eq!(decision.direct_response.as_deref(), Some(expected.as_str()));
-        assert!(decision.routing.current_answer_expected);
-        assert!(!decision.routing.should_execute);
-        assert!(!decision.routing.tool_use_expected);
-        assert!(!decision.routing.agentark_capabilities_expected);
-        assert!(!decision.routing.agentark_manual_expected);
-        assert!(decision.routing.is_conversational_only());
-        assert_eq!(
-            decision.routing.goals[0].groundings,
-            vec!["product_identity".to_string()]
-        );
-    }
-
-    #[test]
-    fn routing_for_agentark_capabilities_answer_uses_capability_lookup() {
-        let routing = routing_for_category(
-            SecurityCategory::DirectReply,
-            AGENTARK_CAPABILITIES_ANSWER_CONCEPT,
-        );
-        assert!(routing.current_answer_expected);
-        assert!(routing.should_execute);
-        assert!(routing.tool_use_expected);
-        assert!(!routing.durable_work_expected);
-        assert!(routing.agentark_capabilities_expected);
-        assert!(!routing.agentark_manual_expected);
-        assert!(routing.has_transient_read_only_lookup());
-        assert_eq!(
-            routing.goals[0].groundings,
-            vec!["agentark_capabilities".to_string()]
-        );
-    }
-
-    #[test]
-    fn routing_for_managed_app_delivery_is_deployment() {
-        let routing =
-            routing_for_category(SecurityCategory::ManagedAppDelivery, "managed_app_delivery");
-        assert!(routing.should_execute);
-        assert!(routing.tool_use_expected);
-        assert!(routing.durable_work_expected);
-        assert_eq!(routing.goals[0].durability, "deployment");
-    }
-
-    #[test]
-    fn durable_canonicals_preserve_semantic_delivery_shape() {
-        let scheduled = routing_for_category(SecurityCategory::DurableWork, SCHEDULED_TASK_CONCEPT);
-        assert_eq!(scheduled.goals[0].durability, "scheduled_time");
-        assert_eq!(
-            scheduled.semantic_turn_plan().goals[0].delivery_kind,
-            "scheduled_task"
-        );
-
-        let watcher = routing_for_category(SecurityCategory::DurableWork, WATCHER_MONITOR_CONCEPT);
-        assert_eq!(watcher.goals[0].durability, "recurring_monitor");
-        assert_eq!(
-            watcher.semantic_turn_plan().goals[0].delivery_kind,
-            "watcher_monitor"
-        );
-    }
-
-    #[test]
-    fn durable_shapes_never_use_trusted_embedding_fast_path() {
-        for category in [
-            SecurityCategory::DurableWork,
-            SecurityCategory::ManagedAppDelivery,
-        ] {
-            assert!(!embedding_fast_path_accepts(category, 0.99, 0.99));
-        }
-        assert!(embedding_fast_path_accepts(
-            SecurityCategory::DirectReply,
-            FAST_ROUTING_MIN_SCORE,
-            FAST_ROUTING_MARGIN
-        ));
-        assert!(embedding_fast_path_accepts(
-            SecurityCategory::ToolUse,
-            FAST_ROUTING_MIN_SCORE,
-            FAST_ROUTING_MARGIN
-        ));
-    }
-
-    #[test]
-    fn memory_capture_can_be_true_for_direct_reply_routing() {
-        let signal = memory_capture_signal_from_scores(&[
-            ScoredMemoryCaptureCanonical {
-                should_capture: true,
-                concept: "durable_user_identity_profile",
-                score: 0.82,
-            },
-            ScoredMemoryCaptureCanonical {
-                should_capture: false,
-                concept: "transient_social_or_acknowledgement",
-                score: 0.55,
-            },
-        ]);
-        assert!(signal.should_capture);
-        assert_eq!(
-            signal.reason.as_deref(),
-            Some("durable_user_identity_profile")
-        );
-    }
-
-    #[test]
-    fn memory_capture_rejects_transient_top_score() {
-        let signal = memory_capture_signal_from_scores(&[
-            ScoredMemoryCaptureCanonical {
-                should_capture: true,
-                concept: "artifact_outcome_feedback",
-                score: 0.60,
-            },
-            ScoredMemoryCaptureCanonical {
-                should_capture: false,
-                concept: "transient_social_or_acknowledgement",
-                score: 0.78,
-            },
-        ]);
-        assert!(!signal.should_capture);
-    }
-
-    #[test]
-    fn unaccepted_ambiguous_direct_reply_escalates_to_structured_classifier() {
-        let fallback = unaccepted_embedding_fallback(
-            &ScoredCanonical {
-                category: SecurityCategory::DirectReply,
-                concept: "low_confidence_direct".to_string(),
-                score: 0.40,
-            },
-            0.01,
-            InboundMemoryCaptureSignal {
-                should_capture: true,
-                confidence: Some(0.81),
-                reason: Some("durable_user_identity_profile".to_string()),
-            },
-        );
-
-        assert!(fallback.is_none());
-    }
-
-    #[test]
-    fn unaccepted_direct_reply_routes_without_slow_router_trust_when_moderate() {
-        let fallback = unaccepted_embedding_fallback(
-            &ScoredCanonical {
-                category: SecurityCategory::DirectReply,
-                concept: "moderate_confidence_direct".to_string(),
-                score: 0.71,
-            },
-            0.07,
-            InboundMemoryCaptureSignal {
-                should_capture: true,
-                confidence: Some(0.81),
-                reason: Some("durable_user_identity_profile".to_string()),
-            },
-        )
-        .expect("moderate direct-reply traffic should keep a direct-answer route shape");
-
-        assert_eq!(fallback.category, SecurityCategory::DirectReply);
-        assert!(matches!(
-            fallback.decision.verdict,
-            IntentVerdict::AllowWithUncheckedTag { .. }
-        ));
-        assert!(fallback.decision.routing.current_answer_expected);
-        assert!(!fallback.decision.routing.should_execute);
-    }
-
-    #[test]
-    fn unaccepted_generic_tool_use_defers_to_structured_classifier() {
-        let fallback = unaccepted_embedding_fallback(
-            &ScoredCanonical {
-                category: SecurityCategory::ToolUse,
-                concept: "live_state_or_external_lookup".to_string(),
-                score: FAST_UNCHECKED_ROUTE_MIN_SCORE,
-            },
-            0.0,
-            InboundMemoryCaptureSignal::default(),
-        );
-
-        assert!(fallback.is_none());
-    }
-
-    #[test]
-    fn unaccepted_durable_shape_routes_without_slow_router_trust() {
-        for category in [
-            SecurityCategory::DurableWork,
-            SecurityCategory::ManagedAppDelivery,
-        ] {
-            let fallback = unaccepted_embedding_fallback(
-                &ScoredCanonical {
-                    category,
-                    concept: "durable_or_delivery_neighbor".to_string(),
-                    score: FAST_UNCHECKED_ROUTE_MIN_SCORE,
-                },
-                0.0,
-                InboundMemoryCaptureSignal::default(),
-            )
-            .expect("durable execution-shaped traffic should keep its route shape");
-
-            assert_eq!(fallback.category, category);
-            assert!(matches!(
-                fallback.decision.verdict,
-                IntentVerdict::AllowWithUncheckedTag { .. }
-            ));
-            assert!(fallback.decision.routing.should_execute);
-            assert!(fallback.decision.routing.tool_use_expected);
-            assert!(fallback.decision.routing.durable_work_expected);
-        }
-    }
-
-    #[test]
-    fn unaccepted_borderline_security_block_stays_in_security_layer() {
-        let fallback = unaccepted_embedding_fallback(
-            &ScoredCanonical {
-                category: SecurityCategory::SecurityBlock,
-                concept: "credential_exfiltration".to_string(),
-                score: FAST_BORDERLINE_BLOCK_SCORE,
-            },
-            0.0,
-            InboundMemoryCaptureSignal::default(),
-        )
-        .expect("borderline security risk should be handled by the security layer");
-
-        assert!(matches!(
-            fallback.decision.verdict,
-            IntentVerdict::Block { .. }
-        ));
-    }
 }

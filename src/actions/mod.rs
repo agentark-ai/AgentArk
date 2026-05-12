@@ -22,13 +22,13 @@ pub const ACTION_CATALOG_EMBEDDING_DIM: usize = 384;
 #[allow(unused_imports)]
 pub use gmail::{gmail_reply, gmail_scan};
 #[allow(unused_imports)]
-pub use research::{execute_research, ResearchArgs, ResearchClient, ResearchDepth, ResearchResult};
+pub use research::{ResearchArgs, ResearchClient, ResearchDepth, ResearchResult, execute_research};
 #[allow(unused_imports)]
 pub use search::{SearchBackend, SearchClient, SearchConfig, SearchResponse, SearchResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PlannerActionRole {
+pub enum ActionRole {
     Trigger,
     Delivery,
     DataSource,
@@ -38,9 +38,24 @@ pub enum PlannerActionRole {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionToolRole {
+    DirectOutcome,
+    SupportDocumentation,
+    SupportSchemaInspection,
+    SupportGenericExecutor,
+}
+
+impl ActionToolRole {
+    pub fn is_support(self) -> bool {
+        !matches!(self, Self::DirectOutcome)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PlannerIntegrationClass {
+pub enum ActionIntegrationClass {
     Internal,
     Messaging,
     Workspace,
@@ -58,7 +73,7 @@ pub enum PlannerIntegrationClass {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PlannerCostTier {
+pub enum ActionCostTier {
     Low,
     Medium,
     High,
@@ -66,7 +81,7 @@ pub enum PlannerCostTier {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PlannerSideEffectLevel {
+pub enum ActionSideEffectLevel {
     None,
     Notify,
     Write,
@@ -74,7 +89,7 @@ pub enum PlannerSideEffectLevel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PlannerDeliveryMode {
+pub enum ActionDeliveryMode {
     /// Returns a usable result in the current turn.
     Immediate,
     /// Queues work for later execution.
@@ -85,7 +100,7 @@ pub enum PlannerDeliveryMode {
     Either,
 }
 
-impl Default for PlannerDeliveryMode {
+impl Default for ActionDeliveryMode {
     fn default() -> Self {
         Self::Immediate
     }
@@ -262,6 +277,14 @@ pub enum ActionErrorReason {
     RateLimited,
     Timeout,
     Failed,
+    /// Integration is OAuth-connected but the per-feature bundle (e.g. drive,
+    /// gmail) was not granted by the user. The remediation is to surface the
+    /// grant prompt; the LLM relays this to the user.
+    BundleNotGranted,
+    /// Cross-layer capability policy requires explicit user approval before
+    /// this combination can run (e.g. sensitive read + external send).
+    /// The remediation is an in-chat approval choice; the LLM relays it.
+    ApprovalRequired,
 }
 
 impl ActionErrorReason {
@@ -277,6 +300,8 @@ impl ActionErrorReason {
             Self::RateLimited => "rate_limited",
             Self::Timeout => "timeout",
             Self::Failed => "failed",
+            Self::BundleNotGranted => "bundle_not_granted",
+            Self::ApprovalRequired => "approval_required",
         }
     }
 }
@@ -302,6 +327,8 @@ impl FromStr for ActionErrorReason {
             "rate_limited" => Ok(Self::RateLimited),
             "timeout" => Ok(Self::Timeout),
             "failed" => Ok(Self::Failed),
+            "bundle_not_granted" => Ok(Self::BundleNotGranted),
+            "approval_required" => Ok(Self::ApprovalRequired),
             _ => Err(()),
         }
     }
@@ -364,6 +391,58 @@ impl ActionError {
 
     pub fn into_anyhow(self) -> anyhow::Error {
         anyhow::Error::new(self)
+    }
+
+    /// Build a structured tool-result envelope the LLM can parse without any
+    /// surface-form phrase matching. The shape is purely structural — domain,
+    /// reason, message, and a remediation hint derived from the reason kind.
+    /// The LLM uses semantic understanding to write a user-facing response.
+    pub fn to_envelope(&self, tool_name: &str) -> serde_json::Value {
+        self.to_envelope_with_remediation(tool_name, serde_json::Value::Null)
+    }
+
+    /// Same as `to_envelope` but allows callers (e.g. the executor's approval
+    /// path) to attach a richer `remediation` payload — for example an inline
+    /// `DirectChatApprovalChoice` or a settings_path target.
+    pub fn to_envelope_with_remediation(
+        &self,
+        tool_name: &str,
+        remediation: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "error",
+            "tool": tool_name,
+            "domain": self.domain().as_key(),
+            "reason": self.reason().as_key(),
+            "message": self.message(),
+            "remediation": if remediation.is_null() {
+                default_remediation_for_reason(self.reason())
+            } else {
+                remediation
+            },
+        })
+    }
+}
+
+/// Default remediation hint by reason kind. Purely structural — based on the
+/// canonical reason enum, never on user phrasing. Callers can override via
+/// `to_envelope_with_remediation` when they have richer context (e.g. the
+/// integration_id or the approval_id to retry with).
+fn default_remediation_for_reason(reason: ActionErrorReason) -> serde_json::Value {
+    match reason {
+        ActionErrorReason::NotConnected => serde_json::json!({"type": "reconnect"}),
+        ActionErrorReason::BundleNotGranted => serde_json::json!({"type": "grant_bundle"}),
+        ActionErrorReason::PermissionDenied => serde_json::json!({"type": "grant_permission"}),
+        ActionErrorReason::ApprovalRequired => serde_json::json!({"type": "approve"}),
+        ActionErrorReason::RateLimited | ActionErrorReason::Timeout => {
+            serde_json::json!({"type": "retry"})
+        }
+        ActionErrorReason::MissingInput
+        | ActionErrorReason::InvalidInput
+        | ActionErrorReason::Ambiguous => serde_json::json!({"type": "clarify"}),
+        ActionErrorReason::NotFound
+        | ActionErrorReason::Unavailable
+        | ActionErrorReason::Failed => serde_json::json!({"type": "none"}),
     }
 }
 
@@ -528,46 +607,48 @@ impl ActionAuthorizationDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ActionPlannerMetadata {
-    pub role: PlannerActionRole,
+pub struct ActionMetadata {
+    pub role: ActionRole,
+    pub tool_role: ActionToolRole,
     pub requires_auth: bool,
-    pub integration_class: PlannerIntegrationClass,
-    pub cost: PlannerCostTier,
-    pub side_effect_level: PlannerSideEffectLevel,
+    pub integration_class: ActionIntegrationClass,
+    pub cost: ActionCostTier,
+    pub side_effect_level: ActionSideEffectLevel,
     #[serde(default)]
-    pub delivery_mode: PlannerDeliveryMode,
+    pub delivery_mode: ActionDeliveryMode,
 }
 
-impl Default for ActionPlannerMetadata {
+impl Default for ActionMetadata {
     fn default() -> Self {
         Self {
-            role: PlannerActionRole::Unknown,
+            role: ActionRole::Unknown,
+            tool_role: ActionToolRole::DirectOutcome,
             requires_auth: false,
-            integration_class: PlannerIntegrationClass::Unknown,
-            cost: PlannerCostTier::Medium,
-            side_effect_level: PlannerSideEffectLevel::None,
-            delivery_mode: PlannerDeliveryMode::Immediate,
+            integration_class: ActionIntegrationClass::Unknown,
+            cost: ActionCostTier::Medium,
+            side_effect_level: ActionSideEffectLevel::None,
+            delivery_mode: ActionDeliveryMode::Immediate,
         }
     }
 }
 
 impl ActionDef {
-    pub fn planner_metadata(&self) -> ActionPlannerMetadata {
-        planner_metadata_for_action(self)
+    pub fn action_metadata(&self) -> ActionMetadata {
+        action_metadata_for_action(self)
     }
 }
 
-fn infer_delivery_mode(capabilities: &std::collections::HashSet<String>) -> PlannerDeliveryMode {
+fn infer_delivery_mode(capabilities: &std::collections::HashSet<String>) -> ActionDeliveryMode {
     if capabilities.contains("scheduler") {
-        return PlannerDeliveryMode::Async;
+        return ActionDeliveryMode::Async;
     }
     if capabilities.contains("watcher") {
-        return PlannerDeliveryMode::Conditional;
+        return ActionDeliveryMode::Conditional;
     }
-    PlannerDeliveryMode::Immediate
+    ActionDeliveryMode::Immediate
 }
 
-pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata {
+pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
     let name = action.name.trim().to_ascii_lowercase();
     let capabilities = action
         .capabilities
@@ -575,100 +656,100 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         .map(|value| value.trim().to_ascii_lowercase())
         .collect::<std::collections::HashSet<_>>();
 
-    let mut meta = ActionPlannerMetadata::default();
+    let mut meta = ActionMetadata::default();
     meta.requires_auth = action.authorization.requires_auth;
     meta.delivery_mode = infer_delivery_mode(&capabilities);
 
     match name.as_str() {
         "current_time" => {
-            meta.role = PlannerActionRole::Trigger;
-            meta.integration_class = PlannerIntegrationClass::Internal;
-            meta.cost = PlannerCostTier::Low;
+            meta.role = ActionRole::Trigger;
+            meta.integration_class = ActionIntegrationClass::Internal;
+            meta.cost = ActionCostTier::Low;
             return meta;
         }
         "notify_user" => {
-            meta.role = PlannerActionRole::Delivery;
-            meta.integration_class = PlannerIntegrationClass::Internal;
-            meta.cost = PlannerCostTier::Low;
-            meta.side_effect_level = PlannerSideEffectLevel::Notify;
+            meta.role = ActionRole::Delivery;
+            meta.integration_class = ActionIntegrationClass::Internal;
+            meta.cost = ActionCostTier::Low;
+            meta.side_effect_level = ActionSideEffectLevel::Notify;
             return meta;
         }
         "watch" | "schedule_task" | "delegate" | "watcher_delete" => {
-            meta.role = PlannerActionRole::Orchestration;
-            meta.integration_class = PlannerIntegrationClass::Internal;
-            meta.cost = PlannerCostTier::Low;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.role = ActionRole::Orchestration;
+            meta.integration_class = ActionIntegrationClass::Internal;
+            meta.cost = ActionCostTier::Low;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         "gmail_scan" => {
-            meta.role = PlannerActionRole::DataSource;
+            meta.role = ActionRole::DataSource;
             meta.requires_auth = true;
-            meta.integration_class = PlannerIntegrationClass::Workspace;
+            meta.integration_class = ActionIntegrationClass::Workspace;
             return meta;
         }
         "gmail_reply" => {
-            meta.role = PlannerActionRole::Delivery;
+            meta.role = ActionRole::Delivery;
             meta.requires_auth = true;
-            meta.integration_class = PlannerIntegrationClass::Workspace;
-            meta.side_effect_level = PlannerSideEffectLevel::Notify;
+            meta.integration_class = ActionIntegrationClass::Workspace;
+            meta.side_effect_level = ActionSideEffectLevel::Notify;
             return meta;
         }
         "calendar_today" | "calendar_list" | "calendar_free" => {
-            meta.role = PlannerActionRole::DataSource;
+            meta.role = ActionRole::DataSource;
             meta.requires_auth = true;
-            meta.integration_class = PlannerIntegrationClass::Workspace;
+            meta.integration_class = ActionIntegrationClass::Workspace;
             return meta;
         }
         "calendar_create" => {
-            meta.role = PlannerActionRole::Mutation;
+            meta.role = ActionRole::Mutation;
             meta.requires_auth = true;
-            meta.integration_class = PlannerIntegrationClass::Workspace;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.integration_class = ActionIntegrationClass::Workspace;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         "web_search" | "research" | "page_fetch" => {
-            meta.role = PlannerActionRole::DataSource;
-            meta.integration_class = PlannerIntegrationClass::Search;
+            meta.role = ActionRole::DataSource;
+            meta.integration_class = ActionIntegrationClass::Search;
             meta.cost = if name == "research" {
-                PlannerCostTier::High
+                ActionCostTier::High
             } else {
-                PlannerCostTier::Medium
+                ActionCostTier::Medium
             };
             return meta;
         }
         "browser_auto" => {
-            meta.role = PlannerActionRole::Mutation;
-            meta.integration_class = PlannerIntegrationClass::Browser;
-            meta.cost = PlannerCostTier::High;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.role = ActionRole::Mutation;
+            meta.integration_class = ActionIntegrationClass::Browser;
+            meta.cost = ActionCostTier::High;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         "home_assistant" => {
-            meta.role = PlannerActionRole::DataSource;
+            meta.role = ActionRole::DataSource;
             meta.requires_auth = true;
-            meta.integration_class = PlannerIntegrationClass::Network;
-            meta.cost = PlannerCostTier::Low;
+            meta.integration_class = ActionIntegrationClass::Network;
+            meta.cost = ActionCostTier::Low;
             return meta;
         }
         "home_assistant_call_service" => {
-            meta.role = PlannerActionRole::Mutation;
+            meta.role = ActionRole::Mutation;
             meta.requires_auth = true;
-            meta.integration_class = PlannerIntegrationClass::Network;
-            meta.cost = PlannerCostTier::Medium;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.integration_class = ActionIntegrationClass::Network;
+            meta.cost = ActionCostTier::Medium;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         "capability_resolve" => {
-            meta.role = PlannerActionRole::Inspection;
-            meta.integration_class = PlannerIntegrationClass::Internal;
-            meta.cost = PlannerCostTier::Low;
+            meta.role = ActionRole::Inspection;
+            meta.integration_class = ActionIntegrationClass::Internal;
+            meta.cost = ActionCostTier::Low;
             return meta;
         }
         "capability_acquire" | "manage_actions" => {
-            meta.role = PlannerActionRole::Mutation;
-            meta.integration_class = PlannerIntegrationClass::Internal;
-            meta.cost = PlannerCostTier::Medium;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.role = ActionRole::Mutation;
+            meta.integration_class = ActionIntegrationClass::Internal;
+            meta.cost = ActionCostTier::Medium;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         "file_read"
@@ -678,36 +759,36 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         | "ark_inspect"
         | "postgres_schema_inspect"
         | "postgres_query_readonly" => {
-            meta.role = PlannerActionRole::Inspection;
+            meta.role = ActionRole::Inspection;
             meta.integration_class = if name == "file_read" {
-                PlannerIntegrationClass::Filesystem
+                ActionIntegrationClass::Filesystem
             } else if name == "postgres_schema_inspect" || name == "postgres_query_readonly" {
-                PlannerIntegrationClass::Analytics
+                ActionIntegrationClass::Analytics
             } else {
-                PlannerIntegrationClass::Internal
+                ActionIntegrationClass::Internal
             };
-            meta.cost = PlannerCostTier::Low;
+            meta.cost = ActionCostTier::Low;
             return meta;
         }
         "file_write" => {
-            meta.role = PlannerActionRole::Mutation;
-            meta.integration_class = PlannerIntegrationClass::Filesystem;
-            meta.cost = PlannerCostTier::Low;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.role = ActionRole::Mutation;
+            meta.integration_class = ActionIntegrationClass::Filesystem;
+            meta.cost = ActionCostTier::Low;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         "app_deploy" | "app_restart" | "app_stop" | "app_delete" => {
-            meta.role = PlannerActionRole::Mutation;
-            meta.integration_class = PlannerIntegrationClass::App;
-            meta.cost = PlannerCostTier::Medium;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.role = ActionRole::Mutation;
+            meta.integration_class = ActionIntegrationClass::App;
+            meta.cost = ActionCostTier::Medium;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         "shell" | "code_execute" => {
-            meta.role = PlannerActionRole::Mutation;
-            meta.integration_class = PlannerIntegrationClass::Code;
-            meta.cost = PlannerCostTier::High;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.role = ActionRole::Mutation;
+            meta.integration_class = ActionIntegrationClass::Code;
+            meta.cost = ActionCostTier::High;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
         _ => {}
@@ -717,10 +798,10 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         || capabilities.contains("scheduler")
         || capabilities.contains("orchestration")
     {
-        meta.role = PlannerActionRole::Orchestration;
-        meta.integration_class = PlannerIntegrationClass::Internal;
-        meta.cost = PlannerCostTier::Low;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Orchestration;
+        meta.integration_class = ActionIntegrationClass::Internal;
+        meta.cost = ActionCostTier::Low;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
@@ -735,13 +816,13 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         || capabilities.contains("memory")
         || capabilities.contains("documents")
     {
-        meta.role = PlannerActionRole::Inspection;
+        meta.role = ActionRole::Inspection;
         meta.integration_class = if capabilities.contains("database_readonly") {
-            PlannerIntegrationClass::Analytics
+            ActionIntegrationClass::Analytics
         } else {
-            PlannerIntegrationClass::Internal
+            ActionIntegrationClass::Internal
         };
-        meta.cost = PlannerCostTier::Low;
+        meta.cost = ActionCostTier::Low;
         return meta;
     }
 
@@ -749,43 +830,72 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         || capabilities.contains("integration_builder")
         || capabilities.contains("integration_admin")
     {
-        meta.role = PlannerActionRole::Mutation;
-        meta.integration_class = PlannerIntegrationClass::Internal;
-        meta.cost = PlannerCostTier::Medium;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Mutation;
+        meta.integration_class = ActionIntegrationClass::Internal;
+        meta.cost = ActionCostTier::Medium;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
     if capabilities.contains("notify") {
-        meta.role = PlannerActionRole::Delivery;
-        meta.integration_class = PlannerIntegrationClass::Internal;
-        meta.side_effect_level = PlannerSideEffectLevel::Notify;
+        meta.role = ActionRole::Delivery;
+        meta.integration_class = ActionIntegrationClass::Internal;
+        meta.side_effect_level = ActionSideEffectLevel::Notify;
+        return meta;
+    }
+
+    if capabilities.contains("tool_documentation") || capabilities.contains("schema_inspection") {
+        meta.role = ActionRole::Inspection;
+        meta.tool_role = if capabilities.contains("schema_inspection") {
+            ActionToolRole::SupportSchemaInspection
+        } else {
+            ActionToolRole::SupportDocumentation
+        };
+        meta.integration_class = if capabilities.contains("google_workspace") {
+            ActionIntegrationClass::Workspace
+        } else {
+            ActionIntegrationClass::Internal
+        };
+        meta.cost = ActionCostTier::Low;
+        return meta;
+    }
+
+    if capabilities.contains("generic_tool_executor") {
+        meta.role = ActionRole::Orchestration;
+        meta.tool_role = ActionToolRole::SupportGenericExecutor;
+        meta.integration_class = if capabilities.contains("google_workspace") {
+            ActionIntegrationClass::Workspace
+        } else {
+            ActionIntegrationClass::Internal
+        };
+        meta.cost = ActionCostTier::Medium;
+        meta.requires_auth = action.authorization.requires_auth;
         return meta;
     }
 
     if capabilities.contains("gmail") || capabilities.contains("google_workspace") {
-        meta.role = PlannerActionRole::DataSource;
-        meta.integration_class = PlannerIntegrationClass::Workspace;
+        meta.role = ActionRole::DataSource;
+        meta.integration_class = ActionIntegrationClass::Workspace;
         return meta;
     }
 
     if capabilities.contains("search") || capabilities.contains("research") {
-        meta.role = PlannerActionRole::DataSource;
-        meta.integration_class = PlannerIntegrationClass::Search;
+        meta.role = ActionRole::DataSource;
+        meta.integration_class = ActionIntegrationClass::Search;
         return meta;
     }
 
     if capabilities.contains("custom_api") {
         meta.role = if capabilities.contains("external_write") {
-            PlannerActionRole::Mutation
+            ActionRole::Mutation
         } else {
-            PlannerActionRole::DataSource
+            ActionRole::DataSource
         };
         meta.requires_auth = action.authorization.requires_auth;
-        meta.integration_class = PlannerIntegrationClass::Network;
-        meta.cost = PlannerCostTier::Low;
+        meta.integration_class = ActionIntegrationClass::Network;
+        meta.cost = ActionCostTier::Low;
         if capabilities.contains("external_write") {
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
         }
         return meta;
     }
@@ -795,44 +905,44 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         || capabilities.contains("pdf_generation")
         || capabilities.contains("document_generation")
     {
-        meta.role = PlannerActionRole::DataSource;
-        meta.integration_class = PlannerIntegrationClass::Media;
-        meta.cost = PlannerCostTier::Medium;
+        meta.role = ActionRole::DataSource;
+        meta.integration_class = ActionIntegrationClass::Media;
+        meta.cost = ActionCostTier::Medium;
         if capabilities.contains("pdf_generation") || capabilities.contains("document_generation") {
-            meta.role = PlannerActionRole::Mutation;
-            meta.side_effect_level = PlannerSideEffectLevel::Write;
+            meta.role = ActionRole::Mutation;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
         }
         return meta;
     }
 
     if capabilities.contains("browser") {
-        meta.role = PlannerActionRole::Mutation;
-        meta.integration_class = PlannerIntegrationClass::Browser;
-        meta.cost = PlannerCostTier::High;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Mutation;
+        meta.integration_class = ActionIntegrationClass::Browser;
+        meta.cost = ActionCostTier::High;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
     if capabilities.contains("app_hosting") {
-        meta.role = PlannerActionRole::Mutation;
-        meta.integration_class = PlannerIntegrationClass::App;
-        meta.cost = PlannerCostTier::Medium;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Mutation;
+        meta.integration_class = ActionIntegrationClass::App;
+        meta.cost = ActionCostTier::Medium;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
     if capabilities.contains("file_read") {
-        meta.role = PlannerActionRole::Inspection;
-        meta.integration_class = PlannerIntegrationClass::Filesystem;
-        meta.cost = PlannerCostTier::Low;
+        meta.role = ActionRole::Inspection;
+        meta.integration_class = ActionIntegrationClass::Filesystem;
+        meta.cost = ActionCostTier::Low;
         return meta;
     }
 
     if capabilities.contains("file_write") {
-        meta.role = PlannerActionRole::Mutation;
-        meta.integration_class = PlannerIntegrationClass::Filesystem;
-        meta.cost = PlannerCostTier::Low;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Mutation;
+        meta.integration_class = ActionIntegrationClass::Filesystem;
+        meta.cost = ActionCostTier::Low;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
@@ -840,46 +950,46 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         || capabilities.contains("code_execute")
         || capabilities.contains("local_cli")
     {
-        meta.role = PlannerActionRole::Mutation;
-        meta.integration_class = PlannerIntegrationClass::Code;
-        meta.cost = PlannerCostTier::High;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Mutation;
+        meta.integration_class = ActionIntegrationClass::Code;
+        meta.cost = ActionCostTier::High;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
     if capabilities.contains("ssh") {
-        meta.role = PlannerActionRole::Mutation;
-        meta.integration_class = PlannerIntegrationClass::Network;
-        meta.cost = PlannerCostTier::High;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Mutation;
+        meta.integration_class = ActionIntegrationClass::Network;
+        meta.cost = ActionCostTier::High;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
     if capabilities.contains("local_network_discovery") {
-        meta.role = PlannerActionRole::DataSource;
-        meta.integration_class = PlannerIntegrationClass::Network;
-        meta.cost = PlannerCostTier::Medium;
+        meta.role = ActionRole::DataSource;
+        meta.integration_class = ActionIntegrationClass::Network;
+        meta.cost = ActionCostTier::Medium;
         return meta;
     }
 
     if capabilities.contains("network") {
-        meta.role = PlannerActionRole::DataSource;
-        meta.integration_class = PlannerIntegrationClass::Network;
-        meta.cost = PlannerCostTier::Medium;
+        meta.role = ActionRole::DataSource;
+        meta.integration_class = ActionIntegrationClass::Network;
+        meta.cost = ActionCostTier::Medium;
         return meta;
     }
 
     if capabilities.contains("analytics") {
-        meta.role = PlannerActionRole::DataSource;
-        meta.integration_class = PlannerIntegrationClass::Analytics;
+        meta.role = ActionRole::DataSource;
+        meta.integration_class = ActionIntegrationClass::Analytics;
         return meta;
     }
 
     if capabilities.contains("image_generation") || capabilities.contains("video_generation") {
-        meta.role = PlannerActionRole::Mutation;
-        meta.integration_class = PlannerIntegrationClass::Media;
-        meta.cost = PlannerCostTier::High;
-        meta.side_effect_level = PlannerSideEffectLevel::Write;
+        meta.role = ActionRole::Mutation;
+        meta.integration_class = ActionIntegrationClass::Media;
+        meta.cost = ActionCostTier::High;
+        meta.side_effect_level = ActionSideEffectLevel::Write;
         return meta;
     }
 
@@ -888,16 +998,16 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
 
 #[cfg(test)]
 pub fn action_requires_nontrivial_direct_execution(action: &ActionDef) -> bool {
-    let metadata = planner_metadata_for_action(action);
-    matches!(metadata.role, PlannerActionRole::Orchestration)
+    let metadata = action_metadata_for_action(action);
+    matches!(metadata.role, ActionRole::Orchestration)
         || matches!(
             metadata.integration_class,
-            PlannerIntegrationClass::App
-                | PlannerIntegrationClass::Code
-                | PlannerIntegrationClass::Browser
-                | PlannerIntegrationClass::Network
-                | PlannerIntegrationClass::Commerce
-                | PlannerIntegrationClass::Media
+            ActionIntegrationClass::App
+                | ActionIntegrationClass::Code
+                | ActionIntegrationClass::Browser
+                | ActionIntegrationClass::Network
+                | ActionIntegrationClass::Commerce
+                | ActionIntegrationClass::Media
         )
 }
 
@@ -971,20 +1081,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn planner_metadata_does_not_infer_delivery_from_name_alone() {
+    fn action_metadata_does_not_infer_delivery_from_name_alone() {
         let action = ActionDef {
             name: "telegram_bridge".to_string(),
             description: "Internal helper with no messaging semantics".to_string(),
             ..ActionDef::default()
         };
 
-        let metadata = planner_metadata_for_action(&action);
-        assert_eq!(metadata.role, PlannerActionRole::Unknown);
-        assert_eq!(metadata.integration_class, PlannerIntegrationClass::Unknown);
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::Unknown);
+        assert_eq!(metadata.integration_class, ActionIntegrationClass::Unknown);
     }
 
     #[test]
-    fn planner_metadata_uses_exact_workspace_capability() {
+    fn action_metadata_uses_exact_workspace_capability() {
         let action = ActionDef {
             name: "workspace_reader".to_string(),
             capabilities: vec!["google_workspace".to_string()],
@@ -995,17 +1105,59 @@ mod tests {
             ..ActionDef::default()
         };
 
-        let metadata = planner_metadata_for_action(&action);
-        assert_eq!(metadata.role, PlannerActionRole::DataSource);
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::DataSource);
         assert_eq!(
             metadata.integration_class,
-            PlannerIntegrationClass::Workspace
+            ActionIntegrationClass::Workspace
         );
         assert!(metadata.requires_auth);
     }
 
     #[test]
-    fn planner_metadata_treats_custom_api_actions_as_saved_integrations() {
+    fn support_tool_capabilities_do_not_look_like_direct_workspace_reads() {
+        let docs = ActionDef {
+            name: "workspace_docs".to_string(),
+            capabilities: vec![
+                "google_workspace".to_string(),
+                "tool_documentation".to_string(),
+            ],
+            ..ActionDef::default()
+        };
+        let generic_executor = ActionDef {
+            name: "workspace_cli".to_string(),
+            capabilities: vec![
+                "google_workspace".to_string(),
+                "generic_tool_executor".to_string(),
+            ],
+            ..ActionDef::default()
+        };
+
+        let docs_metadata = action_metadata_for_action(&docs);
+        assert_eq!(docs_metadata.role, ActionRole::Inspection);
+        assert_eq!(
+            docs_metadata.tool_role,
+            ActionToolRole::SupportDocumentation
+        );
+        assert_eq!(
+            docs_metadata.integration_class,
+            ActionIntegrationClass::Workspace
+        );
+
+        let executor_metadata = action_metadata_for_action(&generic_executor);
+        assert_eq!(executor_metadata.role, ActionRole::Orchestration);
+        assert_eq!(
+            executor_metadata.tool_role,
+            ActionToolRole::SupportGenericExecutor
+        );
+        assert_eq!(
+            executor_metadata.integration_class,
+            ActionIntegrationClass::Workspace
+        );
+    }
+
+    #[test]
+    fn action_metadata_treats_custom_api_actions_as_saved_integrations() {
         let action = ActionDef {
             name: "api__project_tool__query".to_string(),
             capabilities: vec![
@@ -1020,10 +1172,10 @@ mod tests {
             ..ActionDef::default()
         };
 
-        let metadata = planner_metadata_for_action(&action);
-        assert_eq!(metadata.role, PlannerActionRole::Mutation);
-        assert_eq!(metadata.integration_class, PlannerIntegrationClass::Network);
-        assert_eq!(metadata.side_effect_level, PlannerSideEffectLevel::Write);
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::Mutation);
+        assert_eq!(metadata.integration_class, ActionIntegrationClass::Network);
+        assert_eq!(metadata.side_effect_level, ActionSideEffectLevel::Write);
         assert!(metadata.requires_auth);
     }
 
@@ -1054,21 +1206,21 @@ mod tests {
         };
 
         assert_eq!(
-            planner_metadata_for_action(&scheduled).delivery_mode,
-            PlannerDeliveryMode::Async
+            action_metadata_for_action(&scheduled).delivery_mode,
+            ActionDeliveryMode::Async
         );
         assert_eq!(
-            planner_metadata_for_action(&watcher).delivery_mode,
-            PlannerDeliveryMode::Conditional
+            action_metadata_for_action(&watcher).delivery_mode,
+            ActionDeliveryMode::Conditional
         );
         assert_eq!(
-            planner_metadata_for_action(&immediate).delivery_mode,
-            PlannerDeliveryMode::Immediate
+            action_metadata_for_action(&immediate).delivery_mode,
+            ActionDeliveryMode::Immediate
         );
     }
 
     #[test]
-    fn pdf_generation_keeps_write_effect_without_filesystem_routing_class() {
+    fn pdf_generation_keeps_write_effect_without_filesystem_action_class() {
         let action = ActionDef {
             name: "pdf_generate".to_string(),
             capabilities: vec![
@@ -1079,10 +1231,10 @@ mod tests {
             ..ActionDef::default()
         };
 
-        let metadata = planner_metadata_for_action(&action);
-        assert_eq!(metadata.role, PlannerActionRole::Mutation);
-        assert_eq!(metadata.integration_class, PlannerIntegrationClass::Media);
-        assert_eq!(metadata.side_effect_level, PlannerSideEffectLevel::Write);
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::Mutation);
+        assert_eq!(metadata.integration_class, ActionIntegrationClass::Media);
+        assert_eq!(metadata.side_effect_level, ActionSideEffectLevel::Write);
     }
 
     #[test]

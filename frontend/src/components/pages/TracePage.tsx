@@ -1004,10 +1004,12 @@ type TracePageProps = {
 
 export default function TracePage({ autoRefresh }: TracePageProps) {
   const [traceSection, setTraceSection] = useState<
-    "history" | "sync" | "exports" | "security"
+    "history" | "agentark" | "sync" | "exports" | "security"
   >("history");
   const [traceRange, setTraceRange] = useState<TraceRange>("7d");
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+  const [selectedOperationalEvent, setSelectedOperationalEvent] =
+    useState<TraceOperationalEvent | null>(null);
   const [selectedSyncRunId, setSelectedSyncRunId] = useState<string | null>(
     null,
   );
@@ -1015,14 +1017,18 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
   const [showTraceConsole, setShowTraceConsole] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Set<number>>(new Set());
   const [historyPage, setHistoryPage] = useState(0);
+  const [activityPage, setActivityPage] = useState(0);
   const historyPageSize = 20;
+  const activityPageSize = 20;
   const syncRunPageSize = 12;
 
   const traceSince = traceRangeSinceISO(traceRange);
   const traceQ = useQuery({
-    queryKey: ["trace-manager", traceRange],
+    queryKey: ["trace-manager", traceRange, activityPage],
     queryFn: () =>
-      api.rawGet(`/trace?limit=200&since=${encodeURIComponent(traceSince)}`),
+      api.rawGet(
+        `/trace?limit=200&since=${encodeURIComponent(traceSince)}&activity_limit=${activityPageSize}&activity_offset=${activityPage * activityPageSize}`,
+      ),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const traceDetailQ = useQuery({
@@ -1060,6 +1066,13 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
     traceData,
     "recent_events",
   ) as TraceOperationalEvent[];
+  const recentEventsTotal = num(traceData.recent_events_total, recentEvents.length);
+  const selectedOperationalEventTime = humanTs(
+    str(selectedOperationalEvent?.created_at, ""),
+  );
+  const selectedOperationalEventDetails = selectedOperationalEvent
+    ? formatTraceData(selectedOperationalEvent.details)
+    : "";
   const selectedTrace = asRecord(traceDetailQ.data);
   const steps = pickRecords(traceDetailQ.data, "steps");
   const historyTotal = num(traceData.history_total, history.length);
@@ -1169,9 +1182,11 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
             className="workspace-page-select"
             size="small"
             value={traceRange}
-            onChange={(event) =>
-              setTraceRange(event.target.value as TraceRange)
-            }
+            onChange={(event) => {
+              setTraceRange(event.target.value as TraceRange);
+              setHistoryPage(0);
+              setActivityPage(0);
+            }}
             sx={{ minWidth: 132, flexShrink: 0 }}
           >
             {TRACE_RANGE_PRESETS.map((preset) => (
@@ -1192,13 +1207,17 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
         >
           <Tabs
             value={traceSection}
-            onChange={(_, value) => setTraceSection(value)}
+            onChange={(_, value) => {
+              setTraceSection(value);
+              if (value !== "agentark") setActivityPage(0);
+            }}
             variant="scrollable"
             allowScrollButtonsMobile
             className="workspace-page-subnav-tabs"
             sx={{ flex: 1 }}
           >
             <Tab value="history" label={`Runs (${historyTotal})`} />
+            <Tab value="agentark" label="Runtime" />
             <Tab value="sync" label={`Sync (${syncRunTotal})`} />
             <Tab value="exports" label={`Exports (${exportLogs.length})`} />
             <Tab value="security" label={`Security (${securityLogs.length})`} />
@@ -1488,6 +1507,179 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
           })()}
         </Box>
       ) : null}
+      {traceSection === "agentark" ? (
+        <Box className="list-shell diagnostics-section-shell trace-section-shell">
+          <Stack spacing={1.25}>
+            <Stack
+              direction="row"
+              spacing={0}
+              useFlexGap
+              className="trace-stats-bar"
+              sx={{ alignItems: "center", flexWrap: "wrap" }}
+            >
+              <Box className="trace-stat-pill">
+                <Typography variant="caption" className="trace-stat-label">
+                  Retention
+                </Typography>
+                <Typography variant="body2" className="trace-stat-value">
+                  14d
+                </Typography>
+              </Box>
+              <Box className="trace-stat-divider" />
+              <Box className="trace-stat-pill">
+                <Typography variant="caption" className="trace-stat-label">
+                  Attention
+                </Typography>
+                <Typography
+                  variant="body2"
+                  className="trace-stat-value trace-stat-value--error"
+                >
+                  {recentEvents.filter((event) => !toBool(event.success)).length}
+                </Typography>
+              </Box>
+              <Box className="trace-stat-divider" />
+              <Box className="trace-stat-pill">
+                <Typography variant="caption" className="trace-stat-label">
+                  Page
+                </Typography>
+                <Typography variant="body2" className="trace-stat-value">
+                  {activityPage + 1}
+                </Typography>
+              </Box>
+              <Box sx={{ flex: 1 }} />
+              <Typography variant="caption" sx={{ color: "text.secondary", pr: 0.5 }}>
+                Latest first
+              </Typography>
+            </Stack>
+
+            {traceQ.error ? (
+              <Alert severity="warning">{errMessage(traceQ.error)}</Alert>
+            ) : recentEvents.length === 0 ? (
+              <Alert severity="info">
+                No runtime activity recorded for this range yet.
+              </Alert>
+            ) : (
+              <>
+                <TableContainer className="table-shell diagnostics-table-shell trace-table-full">
+                  <Table size="small" sx={{ tableLayout: "fixed" }}>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell width="13%">Time</TableCell>
+                        <TableCell width="10%">Source</TableCell>
+                        <TableCell width="14%">Event</TableCell>
+                        <TableCell width="12%">Module</TableCell>
+                        <TableCell width="39%">Outcome</TableCell>
+                        <TableCell width="12%">Duration</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {recentEvents.map((event, idx) => {
+                        const eventId = str(event.id, `agentark-event-${idx}`);
+                        const time = humanTs(str(event.created_at, ""));
+                        const source = formatChannelSource(str(event.source, "Runtime"));
+                        const moduleLabel = formatChannelSource(str(event.channel, "agentark"));
+                        const eventLabel = titleCaseLabel(str(event.event_type, "activity"));
+                        const outcome = str(event.outcome, "Activity recorded");
+                        const toolName = str(event.tool_name, "").trim();
+                        return (
+                          <TableRow
+                            key={eventId}
+                            hover
+                            onClick={() => setSelectedOperationalEvent(event)}
+                            sx={{ cursor: "pointer" }}
+                          >
+                            <TableCell>
+                              <Typography variant="body2" noWrap title={time.tip}>
+                                {time.label}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" noWrap title={source}>
+                                {source}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Stack direction="row" spacing={0.75} useFlexGap sx={{ alignItems: "center" }}>
+                                <Box
+                                  component="span"
+                                  sx={{
+                                    width: 7,
+                                    height: 7,
+                                    borderRadius: "50%",
+                                    flexShrink: 0,
+                                    bgcolor: toBool(event.success)
+                                      ? "var(--ui-rgba-74-210-157-850)"
+                                      : "var(--ui-rgba-255-100-100-850)",
+                                  }}
+                                />
+                                <Typography variant="body2" noWrap title={eventLabel}>
+                                  {eventLabel}
+                                </Typography>
+                              </Stack>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" noWrap title={toolName || moduleLabel}>
+                                {toolName ? titleCaseLabel(toolName) : moduleLabel}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography
+                                variant="body2"
+                                className="diagnostics-cell-clamp diagnostics-cell-clamp--2"
+                                title={outcome}
+                                sx={{ color: toBool(event.success) ? "text.secondary" : "error.main" }}
+                              >
+                                {outcome}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" noWrap>
+                                {event.latency_ms == null ? "-" : formatTraceDuration(event.latency_ms)}
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  useFlexGap
+                  className="trace-table-footer"
+                  sx={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap" }}
+                >
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    Page {activityPage + 1}
+                    {(activityPage + 1) * activityPageSize < recentEventsTotal
+                      ? " | more activity available"
+                      : ""}
+                  </Typography>
+                  <Stack direction="row" spacing={1}>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={activityPage === 0}
+                      onClick={() => setActivityPage((prev) => Math.max(0, prev - 1))}
+                    >
+                      Prev
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={(activityPage + 1) * activityPageSize >= recentEventsTotal}
+                      onClick={() => setActivityPage((prev) => prev + 1)}
+                    >
+                      Next
+                    </Button>
+                  </Stack>
+                </Stack>
+              </>
+            )}
+          </Stack>
+        </Box>
+      ) : null}
       {traceQ.error || traceDetailQ.error ? (
         <Alert severity="error">
           {errMessage(traceQ.error || traceDetailQ.error)}
@@ -1698,6 +1890,161 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
           </Stack>
         </Box>
       ) : null}
+      <Dialog
+        open={selectedOperationalEvent != null}
+        onClose={() => setSelectedOperationalEvent(null)}
+        maxWidth="md"
+        fullWidth
+        slotProps={{
+          paper: {
+            className:
+              "diagnostics-dialog-shell diagnostics-dialog-shell--trace",
+          },
+        }}
+      >
+        <DialogTitle
+          className="diagnostics-dialog-title"
+          sx={{
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+            gap: 2,
+          }}
+        >
+          <Box>
+            <Typography variant="h6">Runtime Event</Typography>
+            <Typography variant="caption" sx={{ color: "text.secondary" }}>
+              <span title={selectedOperationalEventTime.tip}>
+                {selectedOperationalEventTime.label}
+              </span>
+              {selectedOperationalEvent
+                ? ` | ${formatChannelSource(str(selectedOperationalEvent.channel, "agentark"))}`
+                : ""}
+            </Typography>
+          </Box>
+          <IconButton
+            size="small"
+            className="diagnostics-dialog-close"
+            onClick={() => setSelectedOperationalEvent(null)}
+          >
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers className="diagnostics-dialog-content">
+          {!selectedOperationalEvent ? (
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Event details are not available.
+            </Typography>
+          ) : (
+            <Stack spacing={1.5}>
+              <Stack
+                direction="row"
+                spacing={1}
+                useFlexGap
+                className="trace-detail-status-bar"
+                sx={{ alignItems: "center", flexWrap: "wrap" }}
+              >
+                <Chip
+                  size="small"
+                  color={toBool(selectedOperationalEvent.success) ? "success" : "error"}
+                  label={toBool(selectedOperationalEvent.success) ? "allowed" : "attention"}
+                />
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  {titleCaseLabel(str(selectedOperationalEvent.event_type, "activity"))}
+                </Typography>
+                <Typography variant="caption" sx={{ color: "text.secondary", mx: -0.25 }}>
+                  |
+                </Typography>
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  {selectedOperationalEvent.latency_ms == null
+                    ? "-"
+                    : formatTraceDuration(selectedOperationalEvent.latency_ms)}
+                </Typography>
+                <Box sx={{ flex: 1 }} />
+                <Typography variant="caption" className="diagnostics-keyline">
+                  {str(selectedOperationalEvent.id).slice(0, 18)}
+                </Typography>
+              </Stack>
+
+              <Box className="diagnostics-content-card">
+                <Typography variant="caption" className="diagnostics-card-label">
+                  Outcome
+                </Typography>
+                <Typography variant="body2" className="diagnostics-card-copy">
+                  {str(selectedOperationalEvent.outcome, "Activity recorded")}
+                </Typography>
+              </Box>
+
+              <Grid2 container spacing={1}>
+                <Grid2 size={{ xs: 12, sm: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">
+                      Source
+                    </Typography>
+                    <Typography variant="body2">
+                      {formatChannelSource(str(selectedOperationalEvent.source, "Runtime"))}
+                    </Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 12, sm: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">
+                      Module
+                    </Typography>
+                    <Typography variant="body2">
+                      {selectedOperationalEvent.tool_name
+                        ? titleCaseLabel(str(selectedOperationalEvent.tool_name))
+                        : formatChannelSource(str(selectedOperationalEvent.channel, "agentark"))}
+                    </Typography>
+                  </Box>
+                </Grid2>
+                {selectedOperationalEvent.trace_id ? (
+                  <Grid2 size={{ xs: 12 }}>
+                    <Box className="metadata-box diagnostics-stat-card">
+                      <Typography variant="caption" className="diagnostics-stat-label">
+                        Trace
+                      </Typography>
+                      <Typography variant="body2">
+                        {str(selectedOperationalEvent.trace_id)}
+                      </Typography>
+                    </Box>
+                  </Grid2>
+                ) : null}
+              </Grid2>
+
+              {selectedOperationalEventDetails ? (
+                <Box className="diagnostics-content-card">
+                  <Typography variant="caption" className="diagnostics-card-label">
+                    Details
+                  </Typography>
+                  <Typography
+                    component="pre"
+                    variant="body2"
+                    className="diagnostics-card-copy diagnostics-card-copy--scroll"
+                    sx={{ whiteSpace: "pre-wrap", m: 0 }}
+                  >
+                    {selectedOperationalEventDetails}
+                  </Typography>
+                </Box>
+              ) : null}
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions className="diagnostics-dialog-actions">
+          {selectedOperationalEvent?.trace_id ? (
+            <Button
+              onClick={() => {
+                const traceId = str(selectedOperationalEvent.trace_id, "");
+                setSelectedOperationalEvent(null);
+                setSelectedTraceId(traceId);
+              }}
+            >
+              Open Trace
+            </Button>
+          ) : null}
+          <Button onClick={() => setSelectedOperationalEvent(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
       <Dialog
         open={selectedTraceId != null}
         onClose={() => setSelectedTraceId(null)}

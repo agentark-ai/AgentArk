@@ -2038,7 +2038,7 @@ pub(super) async fn stop_whatsapp_bridge(bridge_arc: Arc<RwLock<WhatsAppBridgeSt
     bridge.error = None;
 }
 
-/// List active watchers
+/// List watchers and recent watcher history.
 pub(super) fn watcher_history_error_is_notification_summary_failure(error: Option<&str>) -> bool {
     let Some(error) = error else {
         return false;

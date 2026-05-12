@@ -22,6 +22,11 @@ use super::prompt_fragment_evolution::{
     prompt_fragment_candidate_benchmark_profile, ExternalPromptFragmentCandidate,
     PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH,
 };
+use super::router_learning::{
+    router_learning_benchmark_profile, trace_evidence_from_semantic_steps,
+    validate_router_learning_candidate,
+    RouterLearningCandidatePayload,
+};
 use super::specialist_prompt_evolution::{
     embedded_specialist_prompt_benchmark_profile_json, parse_specialist_prompt_bundle_profile,
     ExternalSpecialistPromptCandidate, SpecialistPromptBundleProfile,
@@ -257,6 +262,8 @@ pub struct GepaImportSummary {
     pub prompt_candidates: usize,
     pub specialist_prompt_candidates: usize,
     pub prompt_fragment_candidates: usize,
+    #[serde(default)]
+    pub router_learning_candidates: usize,
     pub rejected_candidates: Vec<String>,
 }
 
@@ -266,6 +273,7 @@ pub(crate) struct GepaImportedCandidates {
     pub(crate) prompt_candidates: Vec<ExternalPromptCandidate>,
     pub(crate) specialist_prompt_candidates: Vec<ExternalSpecialistPromptCandidate>,
     pub(crate) prompt_fragment_candidates: Vec<ExternalPromptFragmentCandidate>,
+    pub(crate) router_learning_candidates: Vec<RouterLearningCandidatePayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,6 +855,7 @@ pub async fn export_optimization_bundle(
         .into_iter()
         .filter_map(redacted_experience_run)
         .collect::<Vec<_>>();
+    let router_trace_evidence = export_recent_router_trace_evidence(storage, recent_limit).await;
 
     let bundle = serde_json::json!({
         "schema_version": 1,
@@ -862,6 +871,7 @@ pub async fn export_optimization_bundle(
             "prompt_bundle": serde_json::from_str::<Value>(embedded_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
             "specialist_prompt_bundle": serde_json::from_str::<Value>(embedded_specialist_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
             "prompt_fragment_bundle": prompt_fragment_candidate_benchmark_profile(),
+            "router_learning": router_learning_benchmark_profile(),
         },
         "recent_lineage": {
             "prompt_bundle": read_recent_jsonl_values(project_root.join(".agentark/self_evolve/prompt_bundle_lineage.jsonl"), 12).await,
@@ -869,9 +879,10 @@ pub async fn export_optimization_bundle(
             "prompt_fragment_bundle": read_recent_jsonl_values(project_root.join(PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH), 12).await,
         },
         "experience_runs": recent_runs,
+        "router_trace_evidence": router_trace_evidence,
         "candidate_contract": {
             "format": "jsonl",
-            "surfaces": ["prompt_bundle", "specialist_prompt_bundle", "prompt_fragment_bundle"],
+            "surfaces": ["prompt_bundle", "specialist_prompt_bundle", "prompt_fragment_bundle", "router_learning"],
             "required_fields": ["run_id", "surface", "source", "candidate", "objective_scores", "feedback_summary", "trace_refs", "created_at"]
         }
     });
@@ -995,6 +1006,7 @@ pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImpo
     let mut prompt_candidates = Vec::new();
     let mut specialist_prompt_candidates = Vec::new();
     let mut prompt_fragment_candidates = Vec::new();
+    let mut router_learning_candidates = Vec::new();
     let mut rejected_candidates = Vec::new();
 
     for record in records {
@@ -1059,6 +1071,23 @@ pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImpo
                     )),
                 }
             }
+            "router_learning" => {
+                match serde_json::from_value::<RouterLearningCandidatePayload>(
+                    record.candidate.clone(),
+                ) {
+                    Ok(payload) => match validate_router_learning_candidate(&payload) {
+                        Ok(()) => router_learning_candidates.push(payload),
+                        Err(error) => rejected_candidates.push(format!(
+                            "{}:router_learning rejected because candidate failed validation: {}",
+                            record.run_id, error
+                        )),
+                    },
+                    Err(error) => rejected_candidates.push(format!(
+                        "{}:router_learning rejected because candidate JSON was invalid: {}",
+                        record.run_id, error
+                    )),
+                }
+            }
             other => rejected_candidates.push(format!(
                 "{}:{} rejected because surface is not supported",
                 record.run_id, other
@@ -1072,11 +1101,13 @@ pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImpo
             prompt_candidates: prompt_candidates.len(),
             specialist_prompt_candidates: specialist_prompt_candidates.len(),
             prompt_fragment_candidates: prompt_fragment_candidates.len(),
+            router_learning_candidates: router_learning_candidates.len(),
             rejected_candidates,
         },
         prompt_candidates,
         specialist_prompt_candidates,
         prompt_fragment_candidates,
+        router_learning_candidates,
     })
 }
 
@@ -1194,6 +1225,56 @@ fn experience_run_export_safe(run: &crate::storage::entities::experience_run::Mo
             .and_then(|value| value.as_bool())
             .is_some_and(|value| !value);
     !sensitive
+}
+
+async fn export_recent_router_trace_evidence(storage: &Storage, recent_limit: u64) -> Vec<Value> {
+    let rows = storage
+        .list_execution_trace_summaries(None, recent_limit.clamp(1, 120), 0)
+        .await
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|row| {
+            let steps =
+                serde_json::from_str::<Vec<crate::core::ExecutionStep>>(&row.steps_json).ok()?;
+            let evidence = trace_evidence_from_semantic_steps(
+                row.id.clone(),
+                redact_and_truncate(&row.message, MAX_EXPORTED_TEXT_CHARS),
+                &steps,
+            );
+            if evidence.semantic_plan.is_none()
+                && evidence.plan_verification.is_none()
+                && evidence.capability_resolution.is_none()
+                && evidence.result_verification.is_none()
+                && evidence.router_budget.is_none()
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "trace_id": evidence.trace_id,
+                "user_message_preview": evidence.user_message_preview,
+                "semantic_plan": evidence.semantic_plan,
+                "plan_verification": evidence.plan_verification,
+                "capability_resolution": evidence.capability_resolution,
+                "result_verification": evidence.result_verification,
+                "router_budget": evidence.router_budget,
+                "execution_policy": evidence.execution_policy,
+                "capability_snapshot": evidence.capability_snapshot,
+                "selected_tool_names": evidence.selected_tool_names,
+                "native_schema_count": evidence.native_schema_count,
+                "last_prompt_chars": evidence.last_prompt_chars,
+                "direct_response_without_tool": evidence.direct_response_without_tool,
+                "trace_summary": {
+                    "channel": row.channel,
+                    "duration_ms": row.duration_ms,
+                    "step_count": row.step_count,
+                    "total_tokens": row.total_tokens,
+                    "cost_usd": row.cost_usd,
+                    "complexity": row.complexity,
+                    "created_at": row.created_at,
+                }
+            }))
+        })
+        .collect()
 }
 
 fn redact_and_truncate(raw: &str, max_chars: usize) -> String {
