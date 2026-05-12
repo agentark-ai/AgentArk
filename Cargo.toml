@@ -60,7 +60,9 @@ fastembed = "5"
 llama-cpp-2 = { version = "0.1", optional = true }
 
 # WASM sandbox runtime
-wasmtime = "42"
+# 43.0.2 is the first patched release for GHSA-p8xm-42r7-89xg / CVE-2026-44216
+# (table-allocation panic exceeding host address space); 42.x was not backported.
+wasmtime = "43.0.2"
 
 # Docker support
 bollard = { version = "0.20.2", optional = true }
