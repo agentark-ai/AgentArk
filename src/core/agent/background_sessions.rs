@@ -43,11 +43,9 @@ impl Agent {
             url: String::new(),
             related_actions: vec![
                 "schedule_task".to_string(),
-                "watch".to_string(),
-                "background_session_manage".to_string(),
+                "work_manage".to_string(),
                 "notify_user".to_string(),
                 "list_tasks".to_string(),
-                "list_watchers".to_string(),
             ],
             updated_at: session.updated_at.to_rfc3339(),
         }

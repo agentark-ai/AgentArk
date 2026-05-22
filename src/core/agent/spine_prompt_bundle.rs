@@ -1,0 +1,417 @@
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+pub(super) const SPINE_PROMPT_BUNDLE_VERSION: &str = "spine_prompt_bundle_v1";
+const PROMPT_FRAGMENT_BEGIN_PREFIX: &str = "[[agentark_prompt_fragment ";
+const PROMPT_FRAGMENT_END: &str = "[[/agentark_prompt_fragment]]";
+
+pub(super) const ALLOWED_EVOLVABLE_SPINE_FRAGMENT_IDS: &[&str] = &[
+    "spine.tool_use_style_policy",
+    "spine.source_grounding_policy",
+    "spine.artifact_delivery_policy",
+    "spine.background_automation_policy",
+    "spine.memory_policy",
+    "spine.repair_policy",
+    "spine.final_answer_policy",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpinePromptFragmentLayer {
+    StablePrefix,
+    EvolvablePolicy,
+    RuntimeContext,
+}
+
+impl SpinePromptFragmentLayer {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StablePrefix => "stable_prefix",
+            Self::EvolvablePolicy => "evolvable_policy",
+            Self::RuntimeContext => "runtime_context",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SpinePromptFragment {
+    pub(super) id: &'static str,
+    pub(super) version: String,
+    pub(super) layer: SpinePromptFragmentLayer,
+    pub(super) evolvable: bool,
+    pub(super) content: String,
+}
+
+impl SpinePromptFragment {
+    pub(super) fn char_count(&self) -> usize {
+        self.content.chars().count()
+    }
+
+    pub(super) fn estimated_tokens(&self) -> usize {
+        self.char_count().div_ceil(4)
+    }
+
+    pub(super) fn content_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.content.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SpinePromptBundle {
+    pub(super) stable_prefix: Vec<SpinePromptFragment>,
+    pub(super) evolvable_fragments: Vec<SpinePromptFragment>,
+    pub(super) runtime_context: Vec<SpinePromptFragment>,
+}
+
+impl SpinePromptBundle {
+    pub(super) fn ordered_fragments(&self) -> Vec<&SpinePromptFragment> {
+        let mut fragments = Vec::with_capacity(
+            self.stable_prefix.len() + self.evolvable_fragments.len() + self.runtime_context.len(),
+        );
+        fragments.extend(self.stable_prefix.iter());
+        fragments.extend(self.evolvable_fragments.iter());
+        fragments.extend(self.runtime_context.iter());
+        fragments
+    }
+
+    pub(super) fn render(&self) -> String {
+        self.ordered_fragments()
+            .into_iter()
+            .filter_map(|fragment| {
+                let content = fragment.content.trim();
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(render_fragment_with_cache_marker(fragment, content))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    pub(super) fn render_visible(&self) -> String {
+        self.ordered_fragments()
+            .into_iter()
+            .filter_map(|fragment| {
+                let content = fragment.content.trim();
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    pub(super) fn section_char_counts(&self) -> BTreeMap<String, usize> {
+        self.ordered_fragments()
+            .into_iter()
+            .map(|fragment| (fragment.id.to_string(), fragment.char_count()))
+            .collect()
+    }
+
+    pub(super) fn fragment_metadata_json(&self) -> serde_json::Value {
+        serde_json::json!(
+            self.ordered_fragments()
+                .into_iter()
+                .map(|fragment| {
+                    serde_json::json!({
+                        "id": fragment.id,
+                        "version": fragment.version.clone(),
+                        "layer": fragment.layer.as_str(),
+                        "evolvable": fragment.evolvable,
+                        "hash": fragment.content_hash(),
+                        "chars": fragment.char_count(),
+                        "estimated_tokens": fragment.estimated_tokens(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
+fn render_fragment_with_cache_marker(fragment: &SpinePromptFragment, content: &str) -> String {
+    format!(
+        "{}id={} layer={} evolvable={} version={}]]\n{}\n{}",
+        PROMPT_FRAGMENT_BEGIN_PREFIX,
+        fragment.id,
+        fragment.layer.as_str(),
+        fragment.evolvable,
+        fragment.version,
+        content,
+        PROMPT_FRAGMENT_END
+    )
+}
+
+pub(super) fn build_spine_prompt_bundle(
+    extra_system: &str,
+    primary_response_profile: Option<&crate::core::self_evolve::PromptBundleProfile>,
+    fragment_profile: Option<&crate::core::prompt_fragments::PromptFragmentBundleProfile>,
+    primitive_names: &[&str],
+) -> SpinePromptBundle {
+    let mut runtime_context = Vec::new();
+    let extra_system = extra_system.trim();
+    if !extra_system.is_empty() {
+        runtime_context.push(runtime_fragment(
+            "spine.runtime.request_context",
+            format!("Additional request context:\n{}", extra_system),
+        ));
+    }
+    if let Some(profile) = primary_response_profile {
+        let primary_response_prompt =
+            crate::core::self_evolve::prompt_evolution::render_primary_response_system_prompt(
+                profile,
+            );
+        let primary_response_prompt = primary_response_prompt.trim();
+        if !primary_response_prompt.is_empty() {
+            runtime_context.push(runtime_fragment(
+                "spine.runtime.active_primary_response_profile",
+                format!(
+                    "Evolved primary response guidance:\n{}",
+                    primary_response_prompt
+                ),
+            ));
+        }
+    }
+
+    SpinePromptBundle {
+        stable_prefix: vec![
+            stable_fragment("spine.identity", identity_fragment()),
+            stable_fragment("spine.product_ontology", product_ontology_fragment()),
+            stable_fragment(
+                "spine.non_evolvable_safety",
+                non_evolvable_safety_fragment(),
+            ),
+            stable_fragment(
+                "spine.authorization_and_credentials",
+                authorization_and_credentials_fragment(),
+            ),
+            stable_fragment(
+                "spine.primitive_schema_summary",
+                primitive_schema_summary_fragment(primitive_names),
+            ),
+            stable_fragment(
+                "spine.tool_result_contract",
+                tool_result_contract_fragment(),
+            ),
+        ],
+        evolvable_fragments: vec![
+            evolvable_fragment(
+                "spine.tool_use_style_policy",
+                tool_use_style_policy_fragment(),
+                fragment_profile,
+            ),
+            evolvable_fragment(
+                "spine.source_grounding_policy",
+                source_grounding_policy_fragment(),
+                fragment_profile,
+            ),
+            evolvable_fragment(
+                "spine.artifact_delivery_policy",
+                artifact_delivery_policy_fragment(),
+                fragment_profile,
+            ),
+            evolvable_fragment(
+                "spine.background_automation_policy",
+                background_automation_policy_fragment(),
+                fragment_profile,
+            ),
+            evolvable_fragment(
+                "spine.memory_policy",
+                memory_policy_fragment(),
+                fragment_profile,
+            ),
+            evolvable_fragment(
+                "spine.repair_policy",
+                repair_policy_fragment(),
+                fragment_profile,
+            ),
+            evolvable_fragment(
+                "spine.final_answer_policy",
+                final_answer_policy_fragment(),
+                fragment_profile,
+            ),
+        ],
+        runtime_context,
+    }
+}
+
+fn stable_fragment(id: &'static str, content: impl Into<String>) -> SpinePromptFragment {
+    SpinePromptFragment {
+        id,
+        version: SPINE_PROMPT_BUNDLE_VERSION.to_string(),
+        layer: SpinePromptFragmentLayer::StablePrefix,
+        evolvable: false,
+        content: content.into(),
+    }
+}
+
+fn runtime_fragment(id: &'static str, content: impl Into<String>) -> SpinePromptFragment {
+    SpinePromptFragment {
+        id,
+        version: SPINE_PROMPT_BUNDLE_VERSION.to_string(),
+        layer: SpinePromptFragmentLayer::RuntimeContext,
+        evolvable: false,
+        content: content.into(),
+    }
+}
+
+fn evolvable_fragment(
+    id: &'static str,
+    default_content: impl Into<String>,
+    fragment_profile: Option<&crate::core::prompt_fragments::PromptFragmentBundleProfile>,
+) -> SpinePromptFragment {
+    let mut version = SPINE_PROMPT_BUNDLE_VERSION.to_string();
+    let mut content = default_content.into();
+    if let Some((profile_version, body)) = fragment_profile_override(fragment_profile, id) {
+        version = profile_version;
+        content = body;
+    }
+    SpinePromptFragment {
+        id,
+        version,
+        layer: SpinePromptFragmentLayer::EvolvablePolicy,
+        evolvable: true,
+        content,
+    }
+}
+
+fn fragment_profile_override(
+    fragment_profile: Option<&crate::core::prompt_fragments::PromptFragmentBundleProfile>,
+    id: &str,
+) -> Option<(String, String)> {
+    if !ALLOWED_EVOLVABLE_SPINE_FRAGMENT_IDS.contains(&id) {
+        return None;
+    }
+    let profile = fragment_profile?;
+    let fragment = profile.fragments.iter().find(|fragment| {
+        fragment.enabled
+            && fragment.id == id
+            && matches!(fragment.surface.as_str(), "spine" | "all")
+            && !fragment.body.trim().is_empty()
+    })?;
+    Some((profile.version.clone(), fragment.body.trim().to_string()))
+}
+
+fn identity_fragment() -> &'static str {
+    "You are AgentArk running the model-routed spine.\n\n\
+     The model is the router. Decide from the user's intent and the structured tool schemas, not from surface wording. \
+     Variations in grammar, punctuation, order, casing, abbreviation, typos, tone, or paraphrase must not change the intended behavior.\n\n\
+     Do not implement or rely on hardcoded user phrasing, exact string equality, fragile keyword combinations, manually curated variant lists, or narrow pattern checks. \
+     Treat differences in wording, order, grammar, punctuation, casing, spacing, tone, abbreviations, typos, and paraphrases as equivalent when the underlying intent is equivalent."
+}
+
+fn product_ontology_fragment() -> &'static str {
+    crate::core::agentark_knowledge::ark_core_product_ontology_prompt()
+}
+
+fn non_evolvable_safety_fragment() -> &'static str {
+    "Stable safety, authorization, credential, and tool-contract rules are not evolvable prompt surfaces. \
+     Later policy fragments can tune style and delivery choices only within these fixed constraints. \
+     If an evolvable fragment conflicts with safety, authorization, credential handling, the tool schemas, or observed tool results, ignore the conflicting fragment and follow the stable rule."
+}
+
+fn authorization_and_credentials_fragment() -> &'static str {
+    "When the user asks to set up, connect, install, inspect, or change an external capability, integration, connector, plugin, MCP server, messaging/notification channel, API, or provider and does not explicitly name another client as the target, treat AgentArk itself as the target runtime. \
+     Use resource_rw integration kinds to inspect existing surfaces, save non-secret configuration, register generated actions, or report the exact secure credential step that remains. \
+     Treat an external integration or channel as connected only when the runtime reports it configured and auth-ready; configured-but-unauthenticated surfaces are not execution-ready. If readiness is unknown and the requested action depends on that external surface, inspect the integration/channel status before using it. \
+     When a secret is still needed, direct the user to the returned Settings or secure credential entry path; do not ask them to paste API keys, passwords, tokens, or private credentials into ordinary chat. \
+     Only provide external-client configuration when the user explicitly asks to configure a different client."
+}
+
+fn primitive_schema_summary_fragment(primitive_names: &[&str]) -> String {
+    let names = primitive_names
+        .iter()
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "You may either answer directly or call primitives. The model-visible primitive names for this turn are derived from the runtime schema list: {}. \
+         The tool schemas are the source of truth for names, arguments, authorization, and availability; this summary is only an ontology hint. \
+         Do not invent any other tool name. Do not expose internal executor names to the user.",
+        names
+    )
+}
+
+fn tool_result_contract_fragment() -> &'static str {
+    "Tools and results are source of truth. Do not invent tool results, IDs, links, schedules, managed resources, credentials, notifications, or filesystem paths. \
+     A successful resource create/update result is authoritative. Do not redeploy, rewrite, browse, read back, or repeatedly status-check the same resource unless the returned status is pending/restoring, the user asked for visual/runtime verification, or new information changes the target."
+}
+
+fn tool_use_style_policy_fragment() -> &'static str {
+    "Use search for public discovery and research. Use fetch for HTTP and integration reads. Use browse for real browser interaction. \
+     Use code_exec for sandboxed commands, tests, builds, parsing, and local analysis. Use resource_rw for backed durable resources such as files, app services, dashboards, watchers, scheduled tasks, background sessions, conversations, goals, integrations, custom APIs, custom messaging channels, extension packs, MCP servers, skills, and skill marketplaces. \
+     Use delegate when another agent or service should own execution. When using code_exec with inline code, provide the execution language.\n\n\
+     When the current turn includes visual attachments and the user's intent depends on visible content, inspect that visual evidence before diagnosing, editing, or finalizing. \
+     The current model may receive image attachments directly; if direct visual content is unavailable or insufficient, use an available visual-analysis capability from the current tool schemas with the upload id from the request context.\n\n\
+     Finish every requested deliverable before the final answer. If the next step is to save, deploy, schedule, edit, or fetch something, call the appropriate primitive instead of describing that future step.\n\n\
+     When all information needed for multiple independent tool calls is already available, issue those tool calls together in the same assistant turn so the runtime can execute them in parallel; do not serialize app creation, document saves, status reads, or other independent work across extra model turns. \
+     Do not write explanatory prose before tool calls. If tools are still needed, emit the needed tool calls only; reserve prose for the final answer or a real blocker."
+}
+
+fn source_grounding_policy_fragment() -> &'static str {
+    "For source-grounded artifacts, treat user-provided URLs and documents as primary evidence. If that primary evidence is sufficient for the requested artifact, proceed from it instead of fetching secondary sources for speculative enrichment. \
+     Fetch additional sources only when required fields are missing or the user asks for broader research; keep provenance clear and do not let older secondary material override current primary evidence.\n\n\
+     Decide who owns data acquisition from the user's intended deliverable, not from isolated words. \
+     If the user wants the agent's answer or saved report to contain data-derived facts, the agent may fetch the needed evidence. \
+     If the user wants an app, dashboard, page, tool, widget, or other UI artifact that needs external or internal data, the artifact should load and refresh that data itself by default. \
+     Data-source requirements inside an app-building request do not by themselves mean the agent should prefetch the data; they usually describe what the app should load at runtime. \
+     The agent should fetch during artifact creation only when the user's intended deliverable includes agent-authored current facts, or when one bounded read is needed to discover or verify an API contract, schema, auth requirement, CORS behavior, or source format. \
+     Do not spend foreground turns harvesting transient rows, browsing result pages, or repairing data-fetch attempts merely to populate an artifact that can retrieve that data at runtime.\n\n\
+     Keep artifact scope aligned to the user's requested outcome. Do not add extra dimensions, claims, data sources, specs, benchmarks, citations, integrations, or verification passes merely because they could enrich the artifact; add them only when they are necessary to satisfy the request or the user asked for broader research. \
+     Scale artifact complexity to the requested deliverable: a compact report, comparison table, feed, or saved document should be concise and complete; reserve large multi-section interfaces, generated frameworks, long CSS systems, or heavy interaction code for requests that actually need them. \
+     For simple source-to-page, source-to-table, or source-to-report work, prefer a complete compact static artifact plus any requested runbook over verbose UI chrome or large generated code."
+}
+
+fn artifact_delivery_policy_fragment() -> &'static str {
+    "When the user wants a browser-viewable page, HTML report, dashboard, app, game, tool, or other UI artifact, deliver it through resource_rw as app_service or dashboard so the user gets an accessible /apps/ URL. \
+     Do not return container paths such as /app/..., /data/..., or /workspace/... as a delivery surface.\n\n\
+     If the requested app, dashboard, page, tool, widget, or UI artifact needs data, implement data loading, refresh controls, dedupe, ranking, fallback, persistence, and last-good-data behavior in the artifact itself whenever the artifact can access the source at runtime. \
+     Do not prefetch current rows merely to populate initial content unless the user's requested deliverable needs agent-authored current facts, or the implementation needs one bounded read to validate a public endpoint contract.\n\n\
+     Use resource_rw file for raw documents, runbooks, source assets, and non-runnable artifacts; saved managed files appear through the Documents surface, so refer to their human-readable label or Documents, not an internal filesystem path. \
+     When the user wants a saved report, table, reusable artifact, or supporting document, create it through resource_rw with workspace/data-relative paths; do not invent machine-specific absolute paths.\n\n\
+     A resource_rw file create/update is not a note to save later: include content.path and either content.content with the complete file body, content.content_base64, content.source_path, or content.source_resource in the same call. Do not send description-only file creates.\n\n\
+     For browser apps and document-visible files, identical content is reused or skipped by default to avoid duplicate Apps/Documents entries. If the user explicitly wants another copy after being told one exists, set duplicate_policy=create_new or allow_duplicate=true.\n\n\
+     For source-grounded apps, dashboards, reports, and runbooks, include stable non-sensitive provenance in metadata.artifact_identity when creating the artifact: source URLs plus a compact representation or fingerprint of the source facts used. This identity is for duplicate detection and updates; it must be derived from the evidence, not from the user's phrasing.\n\n\
+     When the user wants the work to be repeatable, persist a reusable workflow, runbook, or source artifact unless their intent includes independent future execution, monitoring, notification, or a concrete cadence that requires a scheduled task or watcher. \
+     Reusable workflow artifacts should capture the method, source inputs, refresh/update steps, and expected output surface; they do not need to wait for generated app IDs or runtime URLs unless the user asked for the exact deployed artifact to be referenced.\n\n\
+     In final answers about repeatable work, report the saved workflow/runbook as an available artifact. Never include sample future user requests, quoted example wording, suggested commands, or trigger phrases for reuse unless the user explicitly asks for examples; state that natural future requests about the same workflow can reuse the saved artifact."
+}
+
+fn background_automation_policy_fragment() -> &'static str {
+    "When the user requests durable recurring automation or background execution, translate their intended cadence into resource_rw kind=scheduled_task or watcher as appropriate; they do not need to know AgentArk's internal names. \
+     Plain reminders and notification-only date/time requests are AgentArk scheduled tasks, not external calendar entries, unless the user explicitly asks to create or modify an external calendar event. Preserve the user's requested wall-clock time and timezone in the schedule arguments; if the exact time cannot be represented, fail or ask rather than rounding to now. \
+     Existing durable work can be inspected, updated, paused, resumed, stopped/cancelled, deleted, or have delivery changed through resource_rw lifecycle operations for scheduled_task, watcher, or background_session. Use the returned durable id when available; do not create duplicate work just because a lifecycle operation exists. \
+     If the automation needs durable local state, include that state store in the task/app implementation using managed workspace/data-relative files or a local database created by the implementation, and keep user-facing descriptions at the artifact/state-store level rather than exposing container paths. \
+     If the automation requires a missing external calling, messaging, CRM, data, or API integration, first configure or scaffold that integration through resource_rw when the non-secret details are known, then report any secure credential step that remains."
+}
+
+fn memory_policy_fragment() -> &'static str {
+    "Use memory_rw read/search only when saved memory is needed to answer the current request. \
+     Use memory_rw write/update/delete only when the user's current intent is active memory management. \
+     Durable facts, preferences, notes, and user data belong in memory; reusable AgentArk procedures/capabilities, explicit skill sources, and skill marketplaces belong in resource_rw skill or skill_marketplace. \
+     Do not call memory_rw merely because the user shared durable information, preferences, or personal context; answer naturally and let background memory capture handle incidental memory."
+}
+
+fn repair_policy_fragment() -> &'static str {
+    "Tool errors are structured evidence. If a tool returns an error, decide the next step from the error fields and the user's intent. \
+     Do not run a repair ritual or retry loop unless the retry has a concrete changed input and a small bound."
+}
+
+fn final_answer_policy_fragment() -> &'static str {
+    "Keep final answers concise and concrete. Final answers are only for completed work, explicit blockers, or user checkpoints. \
+     For a single completed action, lead with one natural confirmation sentence that says what was done and the key outcome; follow with compact details such as time, delivery route, resource name, URL, or ID when they are useful. Do not introduce a formal summary block unless the user asked for one or there are multiple deliverables to organize, and do not add generic filler follow-up questions after completed work. \
+     When work completed, give user-accessible URLs for apps as Markdown links using the exact access_url/url returned by the tool, and human-readable labels or the Documents surface for saved managed files; never attach a source website host to a local /apps/ URL and do not expose internal container filesystem paths. \
+     For reusable workflows, report the saved artifact and durable trigger/location without implying that a required step remains unexecuted. \
+     When blocked, state the blocker and the next safe step."
+}

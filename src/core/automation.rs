@@ -104,7 +104,7 @@ impl Default for AutomationExecutionPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 3,
-            stall_timeout_secs: 300,
+            stall_timeout_secs: 0,
             retry_backoff_secs: 60,
             validation: AutomationValidation::default(),
         }
@@ -115,9 +115,12 @@ impl AutomationExecutionPolicy {
     pub fn normalized(&self) -> Self {
         Self {
             max_attempts: self.max_attempts.clamp(1, AUTOMATION_MAX_ATTEMPTS_CAP),
-            stall_timeout_secs: self
-                .stall_timeout_secs
-                .clamp(30, AUTOMATION_MAX_STALL_TIMEOUT_SECS),
+            stall_timeout_secs: if self.stall_timeout_secs == 0 {
+                0
+            } else {
+                self.stall_timeout_secs
+                    .clamp(30, AUTOMATION_MAX_STALL_TIMEOUT_SECS)
+            },
             retry_backoff_secs: self.retry_backoff_secs.clamp(10, 24 * 60 * 60),
             validation: self.validation.normalized(),
         }

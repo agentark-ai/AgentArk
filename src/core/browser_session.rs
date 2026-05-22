@@ -5,16 +5,19 @@
 //! enough durable state to survive restarts.
 #![allow(dead_code)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use crate::integrations::browser::{BrowserIntegration, BrowserSidecarSessionState, PageContent};
+use crate::integrations::browser::{
+    BrowserIntegration, BrowserSessionCreateOptions, BrowserSidecarSessionState, PageContent,
+};
 
 const MAX_ITERATIONS: u32 = 30;
+const CONTENT_SNAPSHOT_ATTEMPTS: usize = 5;
 const MAX_PERSISTED_ACTION_HISTORY: usize = 80;
 const OPERATOR_HANDOFF_TIMEOUT_SECS: u64 = 30 * 60;
 const LIVE_SESSION_IDLE_TIMEOUT_SECS: i64 = 15 * 60;
@@ -35,6 +38,10 @@ pub struct PersistedBrowserSession {
     pub channel: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_detail: Option<String>,
     #[serde(default)]
@@ -65,6 +72,8 @@ pub struct BrowserSession {
     pub sidecar_session_id: String,
     pub channel: String,
     pub conversation_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
     pub task_description: String,
     pub status: SessionStatus,
     pub action_history: Vec<String>,
@@ -159,6 +168,8 @@ impl BrowserSessionNotification {
 pub struct BrowserSessionView {
     pub id: String,
     pub task_description: String,
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
     pub status: String,
     pub question: Option<String>,
     pub summary: Option<String>,
@@ -187,6 +198,12 @@ pub struct StartedBrowserSession {
     pub reused_existing: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BrowserSessionProfileContext {
+    pub profile_id: String,
+    pub profile_name: Option<String>,
+}
+
 impl BrowserSessionManager {
     pub async fn new(storage: Option<crate::storage::Storage>) -> Self {
         let manager = Self {
@@ -210,14 +227,36 @@ impl BrowserSessionManager {
         llm_client: super::llm::LlmClient,
         notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
     ) -> Result<StartedBrowserSession> {
+        self.start_session_with_profile(task, channel, conversation_id, None, llm_client, notify_fn)
+            .await
+    }
+
+    pub async fn start_session_with_profile(
+        &self,
+        task: &str,
+        channel: &str,
+        conversation_id: Option<&str>,
+        profile: Option<BrowserSessionProfileContext>,
+        llm_client: super::llm::LlmClient,
+        notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
+    ) -> Result<StartedBrowserSession> {
         self.cleanup_stale_sessions().await;
         self.prune_unreachable_live_sessions().await;
         let conversation_id = conversation_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let requested_profile_id = profile
+            .as_ref()
+            .map(|profile| profile.profile_id.trim())
+            .filter(|value| !value.is_empty());
         if let Some(existing_session_id) = self
-            .take_reusable_ready_session(conversation_id.as_deref(), task, channel)
+            .take_reusable_ready_session(
+                conversation_id.as_deref(),
+                task,
+                channel,
+                requested_profile_id,
+            )
             .await
         {
             self.spawn_session_loop(existing_session_id.clone(), llm_client, notify_fn);
@@ -227,7 +266,10 @@ impl BrowserSessionManager {
             });
         }
         if let Some(existing_session_id) = self
-            .latest_managed_live_session_for_conversation(conversation_id.as_deref())
+            .latest_managed_live_session_for_conversation(
+                conversation_id.as_deref(),
+                requested_profile_id,
+            )
             .await
         {
             return Ok(StartedBrowserSession {
@@ -240,7 +282,19 @@ impl BrowserSessionManager {
             anyhow::bail!("Maximum 2 concurrent browser sessions");
         }
 
-        let sidecar_id = self.integration.create_session().await?;
+        let create_options = profile
+            .as_ref()
+            .map(|profile| BrowserSessionCreateOptions {
+                profile_id: Some(profile.profile_id.clone()),
+                profile_name: profile.profile_name.clone(),
+            })
+            .unwrap_or_default();
+        let profile_id = profile.as_ref().map(|profile| profile.profile_id.clone());
+        let profile_name = profile.as_ref().and_then(|profile| profile.profile_name.clone());
+        let sidecar_id = self
+            .integration
+            .create_session_with_options(&create_options)
+            .await?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let created_at = now_rfc3339();
 
@@ -251,6 +305,8 @@ impl BrowserSessionManager {
                 sidecar_session_id: sidecar_id.clone(),
                 channel: channel.to_string(),
                 conversation_id,
+                profile_id,
+                profile_name,
                 task_description: task.to_string(),
                 status: SessionStatus::Active,
                 action_history: Vec::new(),
@@ -269,12 +325,23 @@ impl BrowserSessionManager {
     }
 
     pub async fn describe_session(&self, session_id: &str) -> Option<BrowserSessionView> {
-        let (id, sidecar_session_id, task_description, status, created_at, updated_at) =
+        let (
+            id,
+            sidecar_session_id,
+            task_description,
+            profile_id,
+            profile_name,
+            status,
+            created_at,
+            updated_at,
+        ) =
             if let Some(entry) = self.sessions.get(session_id) {
                 (
                     entry.id.clone(),
                     entry.sidecar_session_id.clone(),
                     entry.task_description.clone(),
+                    entry.profile_id.clone(),
+                    entry.profile_name.clone(),
                     entry.status.clone(),
                     entry.created_at.clone(),
                     entry.updated_at.clone(),
@@ -287,6 +354,8 @@ impl BrowserSessionManager {
                     session.id,
                     session.sidecar_session_id,
                     session.task_description,
+                    session.profile_id,
+                    session.profile_name,
                     session.status,
                     session.created_at,
                     session.updated_at,
@@ -325,6 +394,8 @@ impl BrowserSessionManager {
         Some(build_browser_session_view(
             id,
             task_description,
+            profile_id,
+            profile_name,
             status,
             created_at,
             updated_at,
@@ -343,6 +414,8 @@ impl BrowserSessionManager {
                 build_browser_session_view(
                     entry.id.clone(),
                     entry.task_description.clone(),
+                    entry.profile_id.clone(),
+                    entry.profile_name.clone(),
                     entry.status.clone(),
                     entry.created_at.clone(),
                     entry.updated_at.clone(),
@@ -350,6 +423,40 @@ impl BrowserSessionManager {
                 )
             })
             .collect::<Vec<_>>();
+        let seen = sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(storage) = self.storage.as_ref() {
+            match storage.list_browser_sessions().await {
+                Ok(persisted_sessions) => {
+                    for persisted in persisted_sessions {
+                        if seen.contains(&persisted.id) {
+                            continue;
+                        }
+                        let (session, changed) = BrowserSession::restore_from_persisted(persisted);
+                        if changed {
+                            persist_browser_session(
+                                Some(storage),
+                                &PersistedBrowserSession::from_session(&session),
+                            )
+                            .await;
+                        }
+                        sessions.push(build_browser_session_view(
+                            session.id,
+                            session.task_description,
+                            session.profile_id,
+                            session.profile_name,
+                            session.status,
+                            session.created_at,
+                            session.updated_at,
+                            None,
+                        ));
+                    }
+                }
+                Err(error) => tracing::warn!("Failed to list persisted browser sessions: {}", error),
+            }
+        }
         sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         sessions
     }
@@ -394,6 +501,8 @@ impl BrowserSessionManager {
             view_parts = Some((
                 entry.id.clone(),
                 entry.task_description.clone(),
+                entry.profile_id.clone(),
+                entry.profile_name.clone(),
                 entry.status.clone(),
                 entry.created_at.clone(),
                 entry.updated_at.clone(),
@@ -406,11 +515,13 @@ impl BrowserSessionManager {
             persist_browser_session(self.storage.as_ref(), &snapshot).await;
         }
 
-        let (id, task_description, status, created_at, updated_at) =
+        let (id, task_description, profile_id, profile_name, status, created_at, updated_at) =
             view_parts.ok_or_else(|| anyhow!("Browser session not found"))?;
         Ok(build_browser_session_view(
             id,
             task_description,
+            profile_id,
+            profile_name,
             status,
             created_at,
             updated_at,
@@ -453,6 +564,8 @@ impl BrowserSessionManager {
             view_parts = Some((
                 entry.id.clone(),
                 entry.task_description.clone(),
+                entry.profile_id.clone(),
+                entry.profile_name.clone(),
                 entry.status.clone(),
                 entry.created_at.clone(),
                 entry.updated_at.clone(),
@@ -465,11 +578,13 @@ impl BrowserSessionManager {
             persist_browser_session(self.storage.as_ref(), &snapshot).await;
         }
 
-        let (id, task_description, status, created_at, updated_at) =
+        let (id, task_description, profile_id, profile_name, status, created_at, updated_at) =
             view_parts.ok_or_else(|| anyhow!("Browser session not found"))?;
         Ok(build_browser_session_view(
             id,
             task_description,
+            profile_id,
+            profile_name,
             status,
             created_at,
             updated_at,
@@ -522,6 +637,8 @@ impl BrowserSessionManager {
             let parts = (
                 entry.id.clone(),
                 entry.task_description.clone(),
+                entry.profile_id.clone(),
+                entry.profile_name.clone(),
                 entry.status.clone(),
                 entry.created_at.clone(),
                 entry.updated_at.clone(),
@@ -557,10 +674,13 @@ impl BrowserSessionManager {
         }
 
         persist_browser_session(self.storage.as_ref(), &snapshot).await;
-        let (id, task_description, status, created_at, updated_at) = view_parts;
+        let (id, task_description, profile_id, profile_name, status, created_at, updated_at) =
+            view_parts;
         Ok(build_browser_session_view(
             id,
             task_description,
+            profile_id,
+            profile_name,
             status,
             created_at,
             updated_at,
@@ -597,6 +717,8 @@ impl BrowserSessionManager {
                 let view = build_browser_session_view(
                     entry.id.clone(),
                     entry.task_description.clone(),
+                    entry.profile_id.clone(),
+                    entry.profile_name.clone(),
                     entry.status.clone(),
                     entry.created_at.clone(),
                     entry.updated_at.clone(),
@@ -617,6 +739,8 @@ impl BrowserSessionManager {
                     build_browser_session_view(
                         session.id.clone(),
                         session.task_description.clone(),
+                        session.profile_id.clone(),
+                        session.profile_name.clone(),
                         session.status.clone(),
                         session.created_at.clone(),
                         session.updated_at.clone(),
@@ -675,10 +799,7 @@ impl BrowserSessionManager {
         let stale_sessions: Vec<_> = self
             .sessions
             .iter()
-            .filter(|entry| {
-                session_should_be_cleaned_up(&entry.status)
-                    || ready_session_is_expired(entry.value())
-            })
+            .filter(|entry| ready_session_is_expired(entry.value()))
             .map(|entry| (entry.id.clone(), entry.status.kind().to_string()))
             .collect();
 
@@ -750,6 +871,7 @@ impl BrowserSessionManager {
     async fn latest_managed_live_session_for_conversation(
         &self,
         conversation_id: Option<&str>,
+        requested_profile_id: Option<&str>,
     ) -> Option<String> {
         let conversation_id = conversation_id?.trim();
         if conversation_id.is_empty() {
@@ -760,6 +882,10 @@ impl BrowserSessionManager {
             .iter()
             .filter_map(|entry| {
                 (entry.conversation_id.as_deref() == Some(conversation_id)
+                    && browser_session_profile_matches(
+                        entry.profile_id.as_deref(),
+                        requested_profile_id,
+                    )
                     && session_status_has_live_session(&entry.status))
                 .then(|| (entry.id.clone(), entry.updated_at.clone()))
             })
@@ -832,6 +958,7 @@ impl BrowserSessionManager {
         conversation_id: Option<&str>,
         task: &str,
         channel: &str,
+        requested_profile_id: Option<&str>,
     ) -> Option<String> {
         let conversation_id = conversation_id?.trim();
         if conversation_id.is_empty() {
@@ -843,6 +970,10 @@ impl BrowserSessionManager {
             .iter()
             .filter_map(|entry| {
                 (entry.conversation_id.as_deref() == Some(conversation_id)
+                    && browser_session_profile_matches(
+                        entry.profile_id.as_deref(),
+                        requested_profile_id,
+                    )
                     && matches!(entry.status, SessionStatus::Ready { .. }))
                 .then(|| {
                     (
@@ -1080,6 +1211,21 @@ fn session_status_has_live_session(status: &SessionStatus) -> bool {
     )
 }
 
+fn browser_session_profile_matches(
+    session_profile_id: Option<&str>,
+    requested_profile_id: Option<&str>,
+) -> bool {
+    match requested_profile_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(requested) => session_profile_id
+            .map(str::trim)
+            .is_some_and(|profile_id| profile_id == requested),
+        None => true,
+    }
+}
+
 fn session_counts_against_live_limit(status: &SessionStatus) -> bool {
     session_status_has_live_session(status)
 }
@@ -1111,6 +1257,8 @@ fn session_status_is_terminal(status: &SessionStatus) -> bool {
 fn build_browser_session_view(
     id: String,
     task_description: String,
+    profile_id: Option<String>,
+    profile_name: Option<String>,
     status: SessionStatus,
     created_at: String,
     updated_at: String,
@@ -1195,6 +1343,16 @@ fn build_browser_session_view(
     BrowserSessionView {
         id,
         task_description,
+        profile_id: profile_id.or_else(|| {
+            sidecar_state
+                .as_ref()
+                .and_then(|state| state.profile_id.clone())
+        }),
+        profile_name: profile_name.or_else(|| {
+            sidecar_state
+                .as_ref()
+                .and_then(|state| state.profile_name.clone())
+        }),
         status: status_key,
         question,
         summary,
@@ -1301,6 +1459,8 @@ impl PersistedBrowserSession {
             task_description: session.task_description.clone(),
             channel: session.channel.clone(),
             chat_id: session.conversation_id.clone(),
+            profile_id: session.profile_id.clone(),
+            profile_name: session.profile_name.clone(),
             status_detail: session.status.detail(),
             action_history: trimmed_action_history(&session.action_history),
             created_at: session.created_at.clone(),
@@ -1317,6 +1477,8 @@ impl BrowserSession {
             task_description,
             channel,
             chat_id,
+            profile_id,
+            profile_name,
             status_detail,
             action_history,
             created_at,
@@ -1386,6 +1548,8 @@ impl BrowserSession {
                 sidecar_session_id: String::new(),
                 channel,
                 conversation_id: chat_id,
+                profile_id,
+                profile_name,
                 task_description,
                 status,
                 action_history: trimmed_action_history(&action_history),
@@ -1436,6 +1600,27 @@ struct BrowserLoopContext<'a> {
     storage: Option<crate::storage::Storage>,
 }
 
+async fn browser_loop_content_snapshot(
+    ctx: &BrowserLoopContext<'_>,
+) -> Result<PageContent> {
+    let mut last_error = None;
+    for attempt in 0..CONTENT_SNAPSHOT_ATTEMPTS {
+        match ctx.integration.get_content(ctx.sidecar_id).await {
+            Ok(content) => return Ok(content),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < CONTENT_SNAPSHOT_ATTEMPTS {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        250 + (attempt as u64 * 250),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Unable to read browser page snapshot")))
+}
+
 async fn run_browser_loop(session_id: &str, ctx: BrowserLoopContext<'_>) -> Result<String> {
     let browser_system_prompt = format!(
         "You are a browser automation agent. Your task: {}\n\n\
@@ -1468,7 +1653,7 @@ async fn run_browser_loop(session_id: &str, ctx: BrowserLoopContext<'_>) -> Resu
     let mut pending_resume_context: Option<String> = None;
 
     for iteration in 0..MAX_ITERATIONS {
-        let content = ctx.integration.get_content(ctx.sidecar_id).await?;
+        let content = browser_loop_content_snapshot(&ctx).await?;
         let elements_str = content
             .elements
             .iter()
@@ -1491,8 +1676,8 @@ async fn run_browser_loop(session_id: &str, ctx: BrowserLoopContext<'_>) -> Resu
             .collect::<Vec<_>>()
             .join("\n");
 
-        let body_preview = if content.body_text.len() > 2000 {
-            format!("{}...", &content.body_text[..2000])
+        let body_preview = if content.body_text.chars().count() > 2000 {
+            format!("{}...", content.body_text.chars().take(2000).collect::<String>())
         } else {
             content.body_text.clone()
         };
@@ -1755,6 +1940,8 @@ mod tests {
         let waiting = build_browser_session_view(
             "session-1".to_string(),
             "demo".to_string(),
+            None,
+            None,
             SessionStatus::WaitingForOperator {
                 question: "Log in manually".to_string(),
             },
@@ -1769,6 +1956,8 @@ mod tests {
         let claimed = build_browser_session_view(
             "session-1".to_string(),
             "demo".to_string(),
+            None,
+            None,
             SessionStatus::OperatorClaimed {
                 question: "Log in manually".to_string(),
             },
@@ -1783,6 +1972,8 @@ mod tests {
         let ready = build_browser_session_view(
             "session-1".to_string(),
             "demo".to_string(),
+            None,
+            None,
             SessionStatus::Ready {
                 summary: "Browser is ready for follow-up.".to_string(),
             },
@@ -1806,6 +1997,8 @@ mod tests {
             task_description: "demo".to_string(),
             channel: "web".to_string(),
             chat_id: Some("conversation-1".to_string()),
+            profile_id: None,
+            profile_name: None,
             status_detail: Some("Please finish the live login".to_string()),
             action_history: vec!["Step 1: Navigated".to_string()],
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1888,6 +2081,8 @@ mod tests {
             sidecar_session_id: sidecar_session_id.to_string(),
             channel: "web".to_string(),
             conversation_id: conversation_id.map(str::to_string),
+            profile_id: None,
+            profile_name: None,
             task_description: "demo task".to_string(),
             status,
             action_history: Vec::new(),
@@ -1924,7 +2119,7 @@ mod tests {
         );
 
         let session_id = manager
-            .latest_managed_live_session_for_conversation(Some("conversation-1"))
+            .latest_managed_live_session_for_conversation(Some("conversation-1"), None)
             .await
             .expect("expected reusable live browser session");
 

@@ -1,4 +1,4 @@
-//! Security log entity — tracks security events for ArkPulse monitoring
+//! Security log entity — tracks security events for Pulse monitoring
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

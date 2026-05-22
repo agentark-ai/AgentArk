@@ -212,7 +212,7 @@ Rules:\n\
 
     // Internal version labels are structured identifiers, not user-provided
     // free text. Running them through secret redaction can corrupt the labels
-    // and make ArkEvolve telemetry unreadable.
+    // and make Evolve telemetry unreadable.
     fn normalize_optional_version_label(raw: Option<&str>, max_chars: usize) -> Option<String> {
         raw.map(str::trim)
             .filter(|value| !value.is_empty())

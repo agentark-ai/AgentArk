@@ -1,8 +1,8 @@
 //! Core Agent implementation
 use crate::{
     actions::{
-        ActionAuthorizationContext, ActionCallerPrincipal, ActionDef, ActionExecutionSurface,
-        ActionRole, ActionCostTier, ActionIntegrationClass, ActionSideEffectLevel,
+        ActionAuthorizationContext, ActionCallerPrincipal, ActionCostTier, ActionDef,
+        ActionExecutionSurface, ActionIntegrationClass, ActionRole, ActionSideEffectLevel,
     },
     identity::IdentityManager,
     proofs::ProofEngine,
@@ -72,17 +72,12 @@ use super::{
     task_router, watcher,
 };
 
-mod action_selection;
-mod agent_loop;
-mod argument_repair;
 mod automation_helpers;
 mod background_sessions;
-mod capability_health;
 mod chat_approvals;
 mod conversation_context;
-mod context_ledger;
+mod curator;
 mod daily_brief;
-mod failure_repair;
 mod memory;
 mod message_processing;
 mod model_runtime;
@@ -91,25 +86,22 @@ mod operational;
 mod pending_flows;
 mod prompt_builder;
 mod request_context;
-mod resource_locks;
 mod resilience_followups;
-mod routing;
-mod semantic_turn;
 mod skill_import;
+mod spine;
+mod spine_prompt_bundle;
+mod spine_request;
 mod startup;
 mod streaming;
 mod task_runtime;
-mod tool_contracts;
 mod tool_execution;
-mod tool_facts;
 mod tool_responses;
-mod turn_loop;
 mod watcher_followup;
 
 use automation_helpers::*;
 use background_sessions::*;
 pub(crate) use chat_approvals::{
-    parse_direct_chat_approval_submit_text, DirectChatApprovalSubmitDecision,
+    DirectChatApprovalSubmitDecision, parse_direct_chat_approval_submit_text,
 };
 pub use conversation_context::ConversationMessage;
 use memory::*;
@@ -129,25 +121,19 @@ pub(crate) use watcher_followup::{WatcherFollowupPreparation, WatcherFollowupWor
 
 const TOOL_INTEGRATION_ALIASES_KEY: &str = "tool_integration_aliases_v1";
 const HOOKS_STORAGE_KEY: &str = "hooks_v1";
-const CONTEXT_FETCH_LIMIT: u64 = 240;
 const DEFAULT_CHAT_HISTORY_CONTEXT_WINDOW_TOKENS: usize = 32_000;
 const DEFAULT_CHAT_HISTORY_BUDGET_RATIO_PERCENT: usize = 18;
 const MIN_CHAT_HISTORY_TOKEN_BUDGET: usize = 1_024;
 const MAX_CHAT_HISTORY_SUMMARY_TOKENS: usize = 8_000;
-const DEFAULT_CHAT_FIXED_PROMPT_TOKENS: usize = 6_000;
 const DEFAULT_DIRECT_CHAT_FIXED_PROMPT_TOKENS: usize = 2_000;
 const MIN_CHAT_MESSAGE_TOKEN_BUDGET: usize = 128;
 const MAX_CHAT_MESSAGE_TOKEN_BUDGET: usize = 1_200;
-const DEFAULT_CHAT_DIGEST_POINT_TOKENS: usize = 96;
-const CONTEXT_DIGEST_PAGE_SIZE: u64 = 64;
-const CONTEXT_DIGEST_VERSION: u8 = 3;
 const CONVERSATION_RECENT_ARTIFACT_KEY_PREFIX: &str = "conversation_recent_artifact_v1:";
 const CONVERSATION_RECENT_ARTIFACT_LIMIT: usize = 8;
 const BACKGROUND_SESSION_IDLE_CONSOLIDATION_AFTER_MINS: i64 = 10;
 const BACKGROUND_SESSION_CONSOLIDATION_COOLDOWN_MINS: i64 = 30;
 const CONVERSATION_LAST_DEPLOYED_APP_KEY_PREFIX: &str = "conversation_last_deployed_app_v1:";
 pub(crate) const USER_SELECTED_MODEL_SLOT_KEY: &str = "user_selected_model_slot_v1";
-const APP_FOLLOWUP_CONTEXT_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 const AMBIENT_INTENT_KIND: &str = "ambient_intent";
 const AMBIENT_INTENT_REVISIT_SOURCE: &str = "ambient_intent_revisit";
 const AMBIENT_INTENT_REVISIT_LIMIT: u64 = 32;
@@ -299,11 +285,14 @@ fn internal_llm_timeout_ms(env_key: &str, default_ms: u64) -> u64 {
     const MIN_INTERNAL_LLM_TIMEOUT_MS: u64 = 5_000;
     const MAX_INTERNAL_LLM_TIMEOUT_MS: u64 = 300_000;
 
-    std::env::var(env_key)
+    let configured = std::env::var(env_key)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(default_ms.max(60_000))
-        .clamp(MIN_INTERNAL_LLM_TIMEOUT_MS, MAX_INTERNAL_LLM_TIMEOUT_MS)
+        .unwrap_or(default_ms);
+    if configured == 0 {
+        return 0;
+    }
+    configured.clamp(MIN_INTERNAL_LLM_TIMEOUT_MS, MAX_INTERNAL_LLM_TIMEOUT_MS)
 }
 
 fn extract_http_urls(text: &str) -> Vec<String> {
@@ -494,6 +483,20 @@ enum PendingChatCredentialPromptKind {
     RawSecret {
         key: String,
         origin: IntegrationAuthPromptOrigin,
+    },
+    McpServerAuth {
+        server_id: String,
+        server_name: String,
+        auth_type: String,
+        auth_name: Option<String>,
+        settings_path: Option<String>,
+    },
+    CustomApiAuth {
+        api_id: String,
+        api_name: String,
+        auth_mode: String,
+        auth_name: Option<String>,
+        settings_path: Option<String>,
     },
 }
 
@@ -1173,6 +1176,8 @@ pub struct ProcessedMessage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    pub cached_prompt_tokens: i64,
+    pub cache_creation_prompt_tokens: i64,
     pub choices: Vec<ClarificationChoice>,
     pub degradation: Vec<crate::core::DegradationNote>,
     pub attempted_models: Vec<crate::core::ModelAttemptRecord>,
@@ -1514,14 +1519,6 @@ pub struct Agent {
     /// Non-fatal startup degradations that should be surfaced through health/readiness.
     startup_issues: Arc<RwLock<Vec<StartupIssue>>>,
 
-    /// Short-lived immutable capability snapshot used by the semantic router.
-    capability_snapshot: Arc<RwLock<Option<semantic_turn::CapabilitySnapshot>>>,
-    capability_snapshot_refresh: Arc<tokio::sync::Mutex<()>>,
-    capability_snapshot_generation: Arc<AtomicUsize>,
-    capability_health_snapshot: Arc<RwLock<Option<capability_health::CapabilityHealthSnapshot>>>,
-    capability_health_refresh: Arc<tokio::sync::Mutex<()>>,
-    capability_health_generation: Arc<AtomicUsize>,
-
     /// Deployed app registry (static files + dynamic server processes)
     pub app_registry: crate::actions::app::AppRegistry,
 }
@@ -1556,7 +1553,6 @@ impl Default for AutomationIntentAssessment {
 #[derive(Debug, Clone, Copy)]
 enum AutomationSurface {
     Watch,
-    #[allow(dead_code)]
     Schedule,
 }
 
@@ -1579,13 +1575,6 @@ struct AutomationPlanValidationResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SecretOfferedHint {
-    pub kind: String,
-    pub redactions: Vec<String>,
-    pub secure_prompt_pending: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatAttachmentHint {
     pub upload_id: String,
     pub kind: String,
@@ -1599,24 +1588,15 @@ pub struct RequestExecutionHints {
     pub caller_principal: Option<ActionCallerPrincipal>,
     pub execution_surface: ActionExecutionSurface,
     pub direct_user_intent: bool,
-    pub secret_offered: Option<SecretOfferedHint>,
-    pub attachments: Vec<ChatAttachmentHint>,
-    pub saved_user_facts_context: Option<String>,
     pub recorded_user_message_id: Option<String>,
-    /// Per-call structural context describing the ArkOrbit canvas the user
-    /// is on. Includes the active orbit id, widget summary, and the orbit's
-    /// optional `agent_instructions`. Forwarded as augmentation only — never
-    /// a model selection override and never a global system-prompt mutation.
+    pub attachments_present: bool,
+    pub attachments: Vec<ChatAttachmentHint>,
     pub arkorbit_context: Option<serde_json::Value>,
-    /// Per-turn structured launch packet for a user-approved stored
-    /// suggestion. This is typed metadata, not a phrase-matching hint.
-    pub accepted_suggestion_context: Option<serde_json::Value>,
+    pub recent_actionable_artifacts: Vec<serde_json::Value>,
 }
 
 enum InboundSecurityPrecheck {
-    Continue {
-        memory_capture_allowed: bool,
-    },
+    Continue,
     Respond(ProcessedMessage),
 }
 
@@ -1981,6 +1961,9 @@ impl Agent {
             prompt_tokens: usage.prompt_tokens.min(i32::MAX as u64) as i32,
             completion_tokens: usage.completion_tokens.min(i32::MAX as u64) as i32,
             total_tokens: usage.total_tokens.min(i32::MAX as u64) as i32,
+            cached_prompt_tokens: usage.cached_prompt_tokens.min(i32::MAX as u64) as i32,
+            cache_creation_prompt_tokens: usage.cache_creation_prompt_tokens.min(i32::MAX as u64)
+                as i32,
             estimated: usage.estimated,
             cost_usd: usage.cost_usd,
         };

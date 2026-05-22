@@ -897,7 +897,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
       },
       {
         label: "Reflect and learn",
-        detail: showActivityFeed ? "ArkReflect has recent activity to summarize" : "No recent activity yet",
+        detail: showActivityFeed ? "Reflect has recent activity to summarize" : "No recent activity yet",
         state: showActivityFeed ? "ready" : "pending",
       },
     ];
@@ -978,8 +978,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
             </div>
           </div>
 
-          <div className="nw-dashboard-main nw-dashboard-main--mission">
-            <aside className="nw-dashboard-stack nw-dashboard-stack--left" aria-label="Mission objective and plan">
+          <div className="nw-dashboard-main nw-dashboard-main--mission mission-grid">
+            <aside className="nw-dashboard-stack nw-dashboard-stack--left left-stack" aria-label="Mission objective and plan">
               <FocusCard state={focusState} body={activeObjective} />
               <NeuralPanel title="Autonomous Plan" tag={currentTask ? "RUNNING" : "READY"} tagTone={currentTask ? "cyan" : "good"}>
                 <div className="nw-plan-list">
@@ -1005,7 +1005,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
               />
             </aside>
 
-            <div className="nw-dashboard-primary nw-dashboard-primary--mission">
+            <div className="nw-dashboard-primary nw-dashboard-primary--mission center-stack">
               <section className="nw-dashboard-graph-panel nw-dashboard-loop-panel" aria-label="Agent cognition loop">
                 <div className="nw-panel-h nw-dashboard-graph-header">
                   <div>
@@ -1040,54 +1040,62 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
               <RuntimeActivityCard traces={traces} onOpenActivity={() => setActivityOpen(true)} />
             </div>
 
-            <div className="nw-dashboard-stack nw-dashboard-stack--right nw-dashboard-right-grid" aria-label="Mission telemetry">
-              <ReflectionNotesCard
-                briefing={briefingQ.data}
-                traces={traces}
-              />
-              <RecentLearningsCard briefing={briefingQ.data} />
-              <MemoryStateCard
-                memoryCount={serverStatus?.status?.memory_entries ?? 0}
-                health={runtimeHealth}
-              />
-              <ActiveMissionsCard
-                tasks={tasks}
-                sessions={activeBackgroundSessions}
-              />
-              <SafetyGuardrailsCard
-                securityLogs={securityLogs}
-                hasLlmConfigured={hasLlmConfigured}
-              />
-              <RuntimeHealthCard
-                health={runtimeHealth}
-                rttMs={serverStatus?.rtt_ms ?? null}
-              />
-              <ToolActivityCard events={traceEvents} />
-              {activeIntegrations.length > 0 ? (
-                <AutomationPostureCard
-                  automationCounts={automationCounts}
-                  activeIntegrations={activeIntegrations}
-                  onOpenInventory={() => setInventoryOpen(true)}
+            <div className="nw-dashboard-stack nw-dashboard-stack--right right-stack" aria-label="Mission telemetry">
+              <div className="nw-dashboard-right-row nw-dashboard-right-row--signals right-two">
+                <ReflectionNotesCard
+                  briefing={briefingQ.data}
+                  traces={traces}
                 />
-              ) : (
-                <SurfaceSummaryCard automationCounts={automationCounts} />
-              )}
-              <NeedsAttentionCard
-                tasks={tasks}
-                notifications={notifications}
-                securityLogs={securityLogs}
-                settingsLoaded={!settingsQ.isLoading}
-                hasLlmConfigured={hasLlmConfigured}
-                onApprove={(id) => approveMutation.mutate(id)}
-                onReject={(id) => rejectMutation.mutate(id)}
-                onRetry={(id) => retryMutation.mutate(id)}
-                onNavigate={navigateToView}
-                approving={approveMutation.isPending}
-                rejecting={rejectMutation.isPending}
-                retrying={retryMutation.isPending}
-              />
+                <RecentLearningsCard briefing={briefingQ.data} />
+              </div>
+              <div className="nw-dashboard-right-row nw-dashboard-right-row--posture right-three">
+                <MemoryStateCard
+                  memoryCount={serverStatus?.status?.memory_entries ?? 0}
+                  health={runtimeHealth}
+                />
+                <ActiveMissionsCard
+                  tasks={tasks}
+                  sessions={activeBackgroundSessions}
+                />
+                <SafetyGuardrailsCard
+                  securityLogs={securityLogs}
+                  hasLlmConfigured={hasLlmConfigured}
+                />
+              </div>
+              <div className="nw-dashboard-right-row nw-dashboard-right-row--runtime right-two">
+                <RuntimeHealthCard
+                  health={runtimeHealth}
+                  rttMs={serverStatus?.rtt_ms ?? null}
+                />
+                <ToolActivityCard events={traceEvents} />
+              </div>
+              <div className="nw-dashboard-right-row nw-dashboard-right-row--bottom right-two">
+                {activeIntegrations.length > 0 ? (
+                  <AutomationPostureCard
+                    automationCounts={automationCounts}
+                    activeIntegrations={activeIntegrations}
+                    onOpenInventory={() => setInventoryOpen(true)}
+                  />
+                ) : (
+                  <SurfaceSummaryCard automationCounts={automationCounts} />
+                )}
+                <NeedsAttentionCard
+                  tasks={tasks}
+                  notifications={notifications}
+                  securityLogs={securityLogs}
+                  settingsLoaded={!settingsQ.isLoading}
+                  hasLlmConfigured={hasLlmConfigured}
+                  onApprove={(id) => approveMutation.mutate(id)}
+                  onReject={(id) => rejectMutation.mutate(id)}
+                  onRetry={(id) => retryMutation.mutate(id)}
+                  onNavigate={navigateToView}
+                  approving={approveMutation.isPending}
+                  rejecting={rejectMutation.isPending}
+                  retrying={retryMutation.isPending}
+                />
+              </div>
               {showActiveSessionsPanel ? (
-                <Box className="overview-inline-note overview-inline-note--sessions nw-dashboard-sessions">
+                <Box className="overview-inline-note overview-inline-note--sessions nw-dashboard-sessions nw-dashboard-right-row nw-dashboard-right-row--sessions">
                   <Stack spacing={1}>
                     <Stack
                       direction={{ xs: "column", sm: "row" }}

@@ -159,7 +159,7 @@ export function SettingsDataLifecyclePanel({
                         "Retention controls for durable memory, audit history, staged candidates, and memory checks.",
                     })}
                     <Alert severity="info">
-                      ArkMemory is the normal memory surface. These settings
+                      Memory is the normal memory surface. These settings
                       only change how long memory records and evidence are
                       retained.
                     </Alert>

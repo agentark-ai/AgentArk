@@ -2,7 +2,7 @@ use super::config::{ModelCapabilityTier, ModelCostTier};
 use super::llm::{LlmClient, LlmResponse, LlmStreamFailure, LlmStreamFailureKind};
 use crate::actions::ActionDef;
 use crate::core::PromptMemory;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -764,8 +764,8 @@ fn bounded_helper_output_tokens(env_key: &str, default_tokens: u32) -> u32 {
 
 fn supervised_request_output_budget(request_kind: &str) -> Option<u32> {
     match request_kind {
-        "agent_turn_loop_v1" => Some(bounded_helper_output_tokens(
-            "AGENTARK_AGENT_TURN_LOOP_MAX_OUTPUT_TOKENS",
+        "model_routed_spine_v1" => Some(bounded_helper_output_tokens(
+            "AGENTARK_MODEL_ROUTED_SPINE_MAX_OUTPUT_TOKENS",
             2_400,
         )),
         kind if kind.starts_with("user_fact_memory_capture") => Some(bounded_helper_output_tokens(
@@ -1075,7 +1075,7 @@ mod tests {
         let supervisor = ExecutionSupervisor::default();
         assert_eq!(
             supervisor.classify_failure(
-                "supervised_chat_failed(kind=transient_transport, request_kind=agent_turn_loop_v1, model=m): provider stream stalled"
+                "supervised_chat_failed(kind=transient_transport, request_kind=model_routed_spine_v1, model=m): provider stream stalled"
             ),
             FailureKind::TransientTransport
         );

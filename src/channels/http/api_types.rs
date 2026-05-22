@@ -1353,9 +1353,75 @@ pub(super) struct PromptOptimizationReviewEntry {
     pub(super) status: String,
     #[serde(default)]
     pub(super) reviewed_at: Option<String>,
+    #[serde(default)]
+    pub(super) lifecycle: PromptOptimizationLifecycleState,
 }
 
 pub(super) type PromptOptimizationReviewState = BTreeMap<String, PromptOptimizationReviewEntry>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(super) struct PromptOptimizationLifecycleState {
+    #[serde(default)]
+    pub(super) status: String,
+    #[serde(default)]
+    pub(super) reason: Option<String>,
+    #[serde(default)]
+    pub(super) approved_at: Option<String>,
+    #[serde(default)]
+    pub(super) queued_at: Option<String>,
+    #[serde(default)]
+    pub(super) queued_job_id: Option<String>,
+    #[serde(default)]
+    pub(super) queued_job_path: Option<String>,
+    #[serde(default)]
+    pub(super) sample_baseline: usize,
+    #[serde(default)]
+    pub(super) sample_count: usize,
+    #[serde(default)]
+    pub(super) required_samples: usize,
+    #[serde(default)]
+    pub(super) job_status: Option<String>,
+    #[serde(default)]
+    pub(super) live_surface: Option<String>,
+    #[serde(default)]
+    pub(super) rollout_percent: Option<u8>,
+    #[serde(default)]
+    pub(super) baseline_version: Option<String>,
+    #[serde(default)]
+    pub(super) candidate_version: Option<String>,
+    #[serde(default)]
+    pub(super) deployed_at: Option<String>,
+    #[serde(default)]
+    pub(super) rollback_available: bool,
+    #[serde(default)]
+    pub(super) rollback_recommended: bool,
+    #[serde(default)]
+    pub(super) monitoring_samples: usize,
+    #[serde(default)]
+    pub(super) baseline_samples: usize,
+    #[serde(default)]
+    pub(super) candidate_samples: usize,
+    #[serde(default)]
+    pub(super) baseline_success_rate: Option<f64>,
+    #[serde(default)]
+    pub(super) candidate_success_rate: Option<f64>,
+    #[serde(default)]
+    pub(super) baseline_error_rate: Option<f64>,
+    #[serde(default)]
+    pub(super) candidate_error_rate: Option<f64>,
+    #[serde(default)]
+    pub(super) baseline_tool_success_rate: Option<f64>,
+    #[serde(default)]
+    pub(super) candidate_tool_success_rate: Option<f64>,
+    #[serde(default)]
+    pub(super) baseline_p95_latency_ms: Option<i64>,
+    #[serde(default)]
+    pub(super) candidate_p95_latency_ms: Option<i64>,
+    #[serde(default)]
+    pub(super) monitoring_summary: Vec<String>,
+    #[serde(default)]
+    pub(super) monitoring_regressions: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub(super) struct EvolutionChangePreview {
@@ -1377,6 +1443,7 @@ pub(super) struct PromptOptimizationProposal {
     pub(super) review_status: String,
     pub(super) reviewed_at: Option<String>,
     pub(super) reversible: bool,
+    pub(super) lifecycle: PromptOptimizationLifecycleState,
     pub(super) change_preview: EvolutionChangePreview,
 }
 
@@ -1427,4 +1494,5 @@ pub(super) struct EvolutionDevResponse {
 pub(super) struct EvolutionDevActionRequest {
     pub(super) action: String,
     pub(super) candidate_id: Option<String>,
+    pub(super) proposal_id: Option<String>,
 }

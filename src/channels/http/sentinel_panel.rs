@@ -255,9 +255,7 @@ async fn save_daily_review_notice_state(
     state: &SentinelDailyReviewNoticeState,
 ) -> Result<(), anyhow::Error> {
     let raw = serde_json::to_vec(state)?;
-    storage
-        .set(SENTINEL_DAILY_REVIEW_NOTICE_KEY, &raw)
-        .await
+    storage.set(SENTINEL_DAILY_REVIEW_NOTICE_KEY, &raw).await
 }
 
 fn background_learning_label(key: &str) -> String {
@@ -687,23 +685,68 @@ fn json_contains_direct_chat_approval_control(value: &serde_json::Value, depth: 
 }
 
 fn sentinel_observation_is_control_plane_artifact(observation: &SentinelObservation) -> bool {
-    matches!(observation.source_kind.as_str(), "execution_run" | "chat_suggestion")
-        && (json_contains_direct_chat_approval_control(&observation.metadata, 0)
-            || text_contains_direct_chat_approval_submit_text(&observation.title)
-            || text_contains_direct_chat_approval_submit_text(&observation.detail))
+    if observation.kind == "chat_suggestion" || observation.source_kind == "chat_suggestion" {
+        return true;
+    }
+
+    matches!(
+        observation.source_kind.as_str(),
+        "execution_run" | "chat_suggestion"
+    ) && (json_contains_direct_chat_approval_control(&observation.metadata, 0)
+        || text_contains_direct_chat_approval_submit_text(&observation.title)
+        || text_contains_direct_chat_approval_submit_text(&observation.detail))
+}
+
+fn sentinel_proposal_is_chat_continuation_artifact(proposal: &SentinelProposal) -> bool {
+    proposal.proposal_kind == "chat_suggestion_accept"
+        || proposal.source_kind == "chat_suggestion"
+        || proposal.chat_suggestion_id.is_some()
 }
 
 fn sentinel_proposal_is_control_plane_artifact(proposal: &SentinelProposal) -> bool {
-    matches!(proposal.source_kind.as_str(), "execution_run" | "chat_suggestion")
-        && (json_contains_direct_chat_approval_control(&proposal.metadata, 0)
-            || text_contains_direct_chat_approval_submit_text(&proposal.title)
-            || text_contains_direct_chat_approval_submit_text(&proposal.detail)
-            || text_contains_direct_chat_approval_submit_text(&proposal.rationale)
-            || proposal
-                .action
-                .as_ref()
-                .map(|action| json_contains_direct_chat_approval_control(&action.payload, 0))
-                .unwrap_or(false))
+    if sentinel_proposal_is_chat_continuation_artifact(proposal) {
+        return true;
+    }
+
+    matches!(
+        proposal.source_kind.as_str(),
+        "execution_run" | "chat_suggestion"
+    ) && (json_contains_direct_chat_approval_control(&proposal.metadata, 0)
+        || text_contains_direct_chat_approval_submit_text(&proposal.title)
+        || text_contains_direct_chat_approval_submit_text(&proposal.detail)
+        || text_contains_direct_chat_approval_submit_text(&proposal.rationale)
+        || proposal
+            .action
+            .as_ref()
+            .map(|action| json_contains_direct_chat_approval_control(&action.payload, 0))
+            .unwrap_or(false))
+}
+
+fn sentinel_metadata_background_signal(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("background_signal")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn sentinel_observation_is_background_signal(observation: &SentinelObservation) -> bool {
+    if observation.kind == "chat_suggestion" || observation.source_kind == "chat_suggestion" {
+        return false;
+    }
+    if observation.source_kind == "execution_run" {
+        return sentinel_metadata_background_signal(&observation.metadata);
+    }
+    true
+}
+
+fn sentinel_proposal_is_background_signal(proposal: &SentinelProposal) -> bool {
+    if sentinel_proposal_is_chat_continuation_artifact(proposal) {
+        return false;
+    }
+    if proposal.source_kind == "execution_run" {
+        return sentinel_metadata_background_signal(&proposal.metadata);
+    }
+    true
 }
 
 fn prune_observations(
@@ -714,6 +757,7 @@ fn prune_observations(
     let mut retained = observations
         .into_iter()
         .filter(|item| !sentinel_observation_is_control_plane_artifact(item))
+        .filter(sentinel_observation_is_background_signal)
         .filter(|item| {
             parse_optional_utc(Some(&item.updated_at))
                 .map(|updated| updated >= cutoff)
@@ -739,6 +783,7 @@ fn prune_proposals(
     let mut retained = proposals
         .into_iter()
         .filter(|item| !sentinel_proposal_is_control_plane_artifact(item))
+        .filter(sentinel_proposal_is_background_signal)
         .filter(|item| {
             parse_optional_utc(Some(&item.updated_at))
                 .map(|updated| updated >= cutoff)
@@ -770,6 +815,7 @@ fn prune_proposals(
 fn open_proposal_count(proposals: &[SentinelProposal]) -> usize {
     proposals
         .iter()
+        .filter(|proposal| sentinel_proposal_is_background_signal(proposal))
         .filter(|proposal| {
             matches!(
                 proposal.status.as_str(),
@@ -798,7 +844,7 @@ async fn agent_sentinel_daily_review_local_day(
 }
 
 fn sentinel_daily_review_body() -> &'static str {
-    "Daily automation review is ready. Sentinel found reviewable opportunities from recent activity; open Mission Control to approve, dismiss, or refine them."
+    "Sentinel has background signals ready. Open Mission Control to review connected-source events or detached background work."
 }
 
 async fn maybe_send_sentinel_daily_review_notice(
@@ -810,7 +856,6 @@ async fn maybe_send_sentinel_daily_review_notice(
 ) -> bool {
     if open_proposals == 0
         || !settings.sentinel.enabled
-        || !settings.sentinel.infer_new_automations
         || settings.agent_paused
         || settings.autonomy_mode.eq_ignore_ascii_case("off")
         || is_quiet_hours_active(settings)
@@ -831,7 +876,9 @@ async fn maybe_send_sentinel_daily_review_notice(
         return false;
     }
 
-    agent.notify_preferred_channel(sentinel_daily_review_body()).await;
+    agent
+        .notify_preferred_channel(sentinel_daily_review_body())
+        .await;
     true
 }
 
@@ -890,17 +937,11 @@ struct SentinelCandidateBatch {
 }
 
 fn is_current_in_app_observation(observation: &SentinelObservation) -> bool {
-    matches!(
-        observation.source_kind.as_str(),
-        "execution_run" | "chat_suggestion"
-    )
+    observation.source_kind == "execution_run"
 }
 
 fn is_current_in_app_proposal(proposal: &SentinelProposal) -> bool {
-    matches!(
-        proposal.source_kind.as_str(),
-        "execution_run" | "chat_suggestion"
-    ) || proposal.chat_suggestion_id.is_some()
+    proposal.source_kind == "execution_run"
 }
 
 fn reconcile_sentinel_candidates(
@@ -1012,20 +1053,28 @@ struct InAppRunAttention {
     user_actionable: bool,
 }
 
-fn run_conversation_key(run: &crate::core::ExecutionRun) -> Option<String> {
-    run.conversation_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
 fn run_trace_key(run: &crate::core::ExecutionRun) -> Option<String> {
     run.trace_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn execution_run_is_detached_background_signal(run: &crate::core::ExecutionRun) -> bool {
+    let kind = run.kind.trim().to_ascii_lowercase();
+    let channel = run
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    if channel.as_deref() == Some("sentinel") {
+        return true;
+    }
+
+    kind != "chat"
 }
 
 fn run_request_title(run: &crate::core::ExecutionRun, fallback: &str) -> String {
@@ -1129,9 +1178,7 @@ fn run_degradation_summary(run: &crate::core::ExecutionRun) -> Option<String> {
     }
 }
 
-fn clarification_choice_is_direct_chat_approval(
-    choice: &crate::core::ClarificationChoice,
-) -> bool {
+fn clarification_choice_is_direct_chat_approval(choice: &crate::core::ClarificationChoice) -> bool {
     if choice.approval.is_some() {
         return true;
     }
@@ -1150,9 +1197,7 @@ fn clarification_choice_is_direct_chat_approval(
         .unwrap_or(false)
 }
 
-fn clarification_choice_is_sentinel_reviewable(
-    choice: &crate::core::ClarificationChoice,
-) -> bool {
+fn clarification_choice_is_sentinel_reviewable(choice: &crate::core::ClarificationChoice) -> bool {
     !clarification_choice_is_direct_chat_approval(choice)
         && !choice.label.trim().is_empty()
         && !choice.submit_text.trim().is_empty()
@@ -1199,6 +1244,7 @@ fn should_create_in_app_execution_proposal(
     run: &crate::core::ExecutionRun,
     detail: &str,
     choices: &[crate::core::ClarificationChoice],
+    detached_background_signal: bool,
 ) -> bool {
     use crate::core::ExecutionRunStatus;
 
@@ -1210,10 +1256,22 @@ fn should_create_in_app_execution_proposal(
     }
 
     match run.status {
-        ExecutionRunStatus::NeedsInput => choices
-            .iter()
-            .any(clarification_choice_is_sentinel_reviewable),
+        ExecutionRunStatus::NeedsInput => {
+            choices
+                .iter()
+                .any(clarification_choice_is_sentinel_reviewable)
+                || detached_background_signal
+        }
         ExecutionRunStatus::NeedsStrongerModel => true,
+        ExecutionRunStatus::Blocked
+        | ExecutionRunStatus::PlatformFailed
+        | ExecutionRunStatus::Degraded
+        | ExecutionRunStatus::Accepted
+        | ExecutionRunStatus::Routing
+        | ExecutionRunStatus::ModelSelection
+        | ExecutionRunStatus::Planning
+        | ExecutionRunStatus::ToolDispatch
+        | ExecutionRunStatus::Synthesis => detached_background_signal,
         _ => false,
     }
 }
@@ -1223,6 +1281,10 @@ fn in_app_execution_run_is_sentinel_material(
     attention: &InAppRunAttention,
     choices: &[crate::core::ClarificationChoice],
 ) -> bool {
+    let detached_background_signal = execution_run_is_detached_background_signal(run);
+    if !detached_background_signal {
+        return false;
+    }
     let detail = run_attention_detail(run, attention.default_detail);
     if run_is_transient_router_failure(run, &detail) {
         return false;
@@ -1230,7 +1292,7 @@ fn in_app_execution_run_is_sentinel_material(
     if run_is_direct_chat_approval_control_flow(run, choices) {
         return false;
     }
-    should_create_in_app_execution_proposal(run, &detail, choices)
+    should_create_in_app_execution_proposal(run, &detail, choices, detached_background_signal)
 }
 
 fn execution_run_is_stale(
@@ -1258,8 +1320,8 @@ fn in_app_attention_for_run(
         ExecutionRunStatus::NeedsInput => Some(InAppRunAttention {
             title: "Decision needed",
             proposal_title: "Choose how to continue",
-            default_detail: "A recent AgentArk run stopped because it needs more information.",
-            rationale: "This run paused before it could continue, and it is still the latest run in that conversation.",
+            default_detail: "A detached AgentArk run stopped because it needs more information.",
+            rationale: "This background run is not attached to an active chat and needs a deliberate next step.",
             priority: 5,
             confidence: 0.92,
             user_actionable: true,
@@ -1267,8 +1329,8 @@ fn in_app_attention_for_run(
         ExecutionRunStatus::Blocked => Some(InAppRunAttention {
             title: "Request is blocked",
             proposal_title: "Review what blocked the request",
-            default_detail: "A recent AgentArk run could not continue without an external requirement.",
-            rationale: "This run is blocked and is still the latest run in that conversation.",
+            default_detail: "A detached AgentArk run could not continue without an external requirement.",
+            rationale: "This background run is blocked outside an active chat and needs triage.",
             priority: 5,
             confidence: 0.9,
             user_actionable: false,
@@ -1276,8 +1338,8 @@ fn in_app_attention_for_run(
         ExecutionRunStatus::PlatformFailed => Some(InAppRunAttention {
             title: "Request failed",
             proposal_title: "Review the failed request",
-            default_detail: "A recent AgentArk run failed before it could complete.",
-            rationale: "This request failed and is still the latest run in that conversation.",
+            default_detail: "A detached AgentArk run failed before it could complete.",
+            rationale: "This background run failed outside an active chat and needs triage.",
             priority: 5,
             confidence: 0.95,
             user_actionable: false,
@@ -1285,8 +1347,8 @@ fn in_app_attention_for_run(
         ExecutionRunStatus::NeedsStrongerModel => Some(InAppRunAttention {
             title: "Stronger model needed",
             proposal_title: "Review the model escalation",
-            default_detail: "A recent AgentArk run could not complete with the selected model.",
-            rationale: "This request needs a stronger model and is still the latest run in that conversation.",
+            default_detail: "A detached AgentArk run could not complete with the selected model.",
+            rationale: "This background run needs a model decision before it continues.",
             priority: 4,
             confidence: 0.86,
             user_actionable: true,
@@ -1294,8 +1356,8 @@ fn in_app_attention_for_run(
         ExecutionRunStatus::Degraded => Some(InAppRunAttention {
             title: "Completed with caveats",
             proposal_title: "Review the caveat",
-            default_detail: "A recent AgentArk run completed with degraded execution quality.",
-            rationale: "This request completed with caveats and is still the latest run in that conversation.",
+            default_detail: "A detached AgentArk run completed with degraded execution quality.",
+            rationale: "This background run completed with caveats that may need a follow-up.",
             priority: 3,
             confidence: 0.78,
             user_actionable: false,
@@ -1311,8 +1373,8 @@ fn in_app_attention_for_run(
             Some(InAppRunAttention {
                 title: "Request appears stalled",
                 proposal_title: "Check the stalled request",
-                default_detail: "A recent AgentArk run did not reach a terminal state in time.",
-                rationale: "This request is still in progress after its expected window.",
+                default_detail: "A detached AgentArk run did not reach a terminal state in time.",
+                rationale: "This background run is still in progress after its expected window.",
                 priority: 4,
                 confidence: 0.74,
                 user_actionable: false,
@@ -1351,7 +1413,7 @@ fn build_in_app_execution_prompt(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Not available".to_string());
     format!(
-        "A prior AgentArk execution run needs follow-up.\n\
+        "A detached or background AgentArk execution run needs triage.\n\
 Run ID: {}\n\
 Trace ID: {}\n\
 Conversation ID: {}\n\
@@ -1381,6 +1443,7 @@ fn build_in_app_execution_candidates(
     choices: &[crate::core::ClarificationChoice],
 ) -> (SentinelObservation, Option<SentinelProposal>) {
     let detail = run_attention_detail(run, attention.default_detail);
+    let detached_background_signal = execution_run_is_detached_background_signal(run);
     let source_label = run_source_label(run);
     let fingerprint =
         normalize_fingerprint(&["in_app_execution", run.id.as_str(), run.status.as_str()]);
@@ -1406,11 +1469,17 @@ fn build_in_app_execution_candidates(
             "current_stage": run.current_stage,
             "deadline_at": run.deadline_at,
             "user_actionable": attention.user_actionable,
+            "background_signal": detached_background_signal,
         }),
     };
 
-    let proposal = if attention.user_actionable {
-        let should_propose = should_create_in_app_execution_proposal(run, &detail, choices);
+    let proposal = {
+        let should_propose = should_create_in_app_execution_proposal(
+            run,
+            &detail,
+            choices,
+            detached_background_signal,
+        );
         if !should_propose {
             return (observation, None);
         }
@@ -1466,77 +1535,11 @@ fn build_in_app_execution_candidates(
                 "channel": run.channel,
                 "status": run.status.as_str(),
                 "current_stage": run.current_stage,
-                "user_actionable": attention.user_actionable,
+                "user_actionable": true,
+                "background_signal": detached_background_signal,
                 "choices": choices,
             }),
         })
-    } else {
-        None
-    };
-    (observation, proposal)
-}
-
-fn build_chat_suggestion_candidates(
-    suggestion: &super::ChatAutomationSuggestion,
-    now: &str,
-) -> (SentinelObservation, SentinelProposal) {
-    let detail = suggestion.detail.trim().to_string();
-    let fingerprint = normalize_fingerprint(&["chat_suggestion", suggestion.id.as_str()]);
-    let observation = SentinelObservation {
-        id: String::new(),
-        fingerprint: fingerprint.clone(),
-        kind: "chat_suggestion".to_string(),
-        title: suggestion.title.clone(),
-        detail: detail.clone(),
-        source_kind: "chat_suggestion".to_string(),
-        source_id: Some(suggestion.id.clone()),
-        source_label: Some("Chat suggestion".to_string()),
-        confidence: suggestion.confidence,
-        priority: 4,
-        created_at: now.to_string(),
-        updated_at: now.to_string(),
-        metadata: serde_json::json!({
-            "suggestion_id": suggestion.id,
-            "suggestion_kind": suggestion.kind,
-            "conversation_id": suggestion.conversation_id,
-            "conversation_channel": suggestion.conversation_channel,
-            "source_message_id": suggestion.source_message_id,
-        }),
-    };
-    let proposal = SentinelProposal {
-        id: uuid::Uuid::new_v4().to_string(),
-        fingerprint: normalize_fingerprint(&[
-            "proposal",
-            "chat_suggestion",
-            suggestion.id.as_str(),
-        ]),
-        proposal_kind: "chat_suggestion_accept".to_string(),
-        status: "open".to_string(),
-        title: suggestion.title.clone(),
-        detail,
-        rationale: suggestion.rationale.clone(),
-        source_kind: "chat_suggestion".to_string(),
-        source_id: Some(suggestion.id.clone()),
-        source_label: Some("Chat suggestion".to_string()),
-        confidence: suggestion.confidence,
-        priority: 4,
-        created_at: now.to_string(),
-        updated_at: now.to_string(),
-        snoozed_until: None,
-        approved_at: None,
-        dismissed_at: None,
-        trace_id: None,
-        run_status: suggestion.run_status.clone(),
-        last_run_summary: None,
-        action: None,
-        chat_suggestion_id: Some(suggestion.id.clone()),
-        metadata: serde_json::json!({
-            "suggestion_id": suggestion.id,
-            "suggestion_kind": suggestion.kind,
-            "conversation_id": suggestion.conversation_id,
-            "conversation_channel": suggestion.conversation_channel,
-            "source_message_id": suggestion.source_message_id,
-        }),
     };
     (observation, proposal)
 }
@@ -1544,7 +1547,12 @@ fn build_chat_suggestion_candidates(
 fn sentinel_proposal_can_block_duplicate(proposal: &SentinelProposal) -> bool {
     matches!(
         proposal.status.as_str(),
-        "open" | "running" | "queued_for_approval" | "snoozed" | "completed" | "dismissed"
+        "open"
+            | "running"
+            | "queued_for_approval"
+            | "snoozed"
+            | "completed"
+            | "dismissed"
             | "failed"
     )
 }
@@ -1735,7 +1743,7 @@ fn build_sentinel_proposal_dedup_prompt(proposals: &[SentinelProposal]) -> Optio
     }
 
     Some(format!(
-        "You are deduplicating ArkSentinel proposals before they are shown to the user.\n\
+        "You are deduplicating Sentinel proposals before they are shown to the user.\n\
          Cluster proposals only when they represent the same underlying user intent or same useful next action, and resolving one would make the others redundant.\n\
          Judge by intended outcome, target, constraints, schedule, recipient, external system, and required user decision. \
          Wording, order, casing, punctuation, grammar, abbreviations, typos, and source type are irrelevant. \
@@ -1804,13 +1812,10 @@ async fn build_in_app_candidates(
         .list_recent_execution_runs(IN_APP_EXECUTION_SCAN_LIMIT)
         .await
         .unwrap_or_default();
-    let mut seen_conversations = std::collections::HashSet::new();
     let mut attention_runs = Vec::new();
     for run in recent_runs {
-        if let Some(conversation_id) = run_conversation_key(&run) {
-            if !seen_conversations.insert(conversation_id) {
-                continue;
-            }
+        if !execution_run_is_detached_background_signal(&run) {
+            continue;
         }
         let Some(attention) = in_app_attention_for_run(&run, now) else {
             continue;
@@ -1845,20 +1850,6 @@ async fn build_in_app_candidates(
             batch.proposals.push(proposal);
         }
         batch.in_app_events += 1;
-    }
-
-    if settings.sentinel.infer_new_automations {
-        for suggestion in super::load_chat_suggestions(storage)
-            .await
-            .into_iter()
-            .filter(|suggestion| suggestion.status == "open")
-        {
-            let (observation, proposal) = build_chat_suggestion_candidates(&suggestion, &now_text);
-            batch.observations.push(observation);
-            batch.proposals.push(proposal);
-            batch.in_app_events += 1;
-            batch.chat_suggestions += 1;
-        }
     }
 
     batch
@@ -2180,6 +2171,9 @@ async fn try_auto_execute_new_proposals(
         let Some(action) = proposal.action.clone() else {
             continue;
         };
+        if action.action_kind == "chat_prompt" {
+            continue;
+        }
         let risk = score_action_risk(&action.action_kind, &action.payload, &settings.trust_policy);
         let readiness = action.readiness.clone().unwrap_or_else(|| {
             crate::core::readiness::evaluate_recommended_action_readiness(&risk, &readiness_policy)
@@ -2294,47 +2288,6 @@ pub(crate) async fn run_sentinel_scan_tick(
     let mut proposals = load_proposals(&storage).await;
     refresh_snoozed_proposals(&mut proposals, now);
     let mut agent_snapshot: Option<Agent> = None;
-
-    if settings.sentinel.watch_in_app && settings.sentinel.infer_new_automations {
-        let mut chat_suggestions = super::load_chat_suggestions(&storage).await;
-        if agent_snapshot.is_none() {
-            agent_snapshot = Some(Agent::snapshot(&shared).await);
-        }
-        let mut reconciled_suggestion_updates =
-            super::suggestions::reconcile_open_chat_suggestions_with_durable_work(
-                agent_snapshot.as_ref().expect("agent snapshot"),
-                &mut chat_suggestions,
-            )
-            .await;
-        if chat_suggestions
-            .iter()
-            .filter(|suggestion| suggestion.status == "open")
-            .take(2)
-            .count()
-            > 1
-        {
-            if agent_snapshot.is_none() {
-                agent_snapshot = Some(Agent::snapshot(&shared).await);
-            }
-            let removed_duplicates = super::collapse_semantically_equivalent_chat_suggestions(
-                &agent_snapshot.as_ref().expect("agent snapshot").llm,
-                &mut chat_suggestions,
-                &now.to_rfc3339(),
-            )
-            .await;
-            if removed_duplicates > 0 {
-                tracing::info!(
-                    trigger = trigger,
-                    removed_duplicate_suggestions = removed_duplicates,
-                    "Sentinel collapsed semantically duplicate chat suggestions"
-                );
-                reconciled_suggestion_updates += removed_duplicates;
-            }
-        }
-        if reconciled_suggestion_updates > 0 {
-            super::save_chat_suggestions(&storage, &chat_suggestions).await;
-        }
-    }
 
     tracing::info!(trigger = trigger, "Sentinel scan building candidates");
     let candidate_batch = build_candidates(&storage, &integration_ctx, &settings).await;
@@ -2595,16 +2548,6 @@ pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response
         && !settings.agent_paused
         && !settings.autonomy_mode.eq_ignore_ascii_case("off")
     {
-        let mut chat_suggestions = super::load_chat_suggestions(&storage).await;
-        let reconciled_suggestion_updates =
-            super::suggestions::reconcile_open_chat_suggestions_with_durable_work(
-                &agent_snapshot,
-                &mut chat_suggestions,
-            )
-            .await;
-        if reconciled_suggestion_updates > 0 {
-            super::save_chat_suggestions(&storage, &chat_suggestions).await;
-        }
         let in_app_batch = build_in_app_candidates(&storage, &settings, now).await;
         let _ = reconcile_sentinel_candidates(
             &mut observations,
@@ -2654,17 +2597,9 @@ pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response
         important_service_events: feed_items.iter().filter(|item| item.important).count(),
         in_app_events: observations
             .iter()
-            .filter(|item| {
-                matches!(
-                    item.source_kind.as_str(),
-                    "execution_run" | "chat_suggestion"
-                )
-            })
+            .filter(|item| item.source_kind == "execution_run")
             .count(),
-        chat_suggestions: observations
-            .iter()
-            .filter(|item| item.kind == "chat_suggestion")
-            .count(),
+        chat_suggestions: 0,
         recent_runs,
         auto_mode_enabled: settings.autonomy_mode.eq_ignore_ascii_case("auto"),
     };
@@ -2714,6 +2649,20 @@ pub(super) async fn approve_sentinel_proposal(
             .into_response();
     };
 
+    if sentinel_proposal_is_chat_continuation_artifact(&proposals[index]) {
+        proposals.remove(index);
+        save_proposals(&storage, &proposals).await;
+        return (
+            StatusCode::GONE,
+            Json(ErrorResponse {
+                error:
+                    "This item was an old chat continuation and is no longer surfaced by Sentinel."
+                        .to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     if !matches!(
         proposals[index].status.as_str(),
         "open" | "snoozed" | "failed"
@@ -2733,27 +2682,7 @@ pub(super) async fn approve_sentinel_proposal(
     let proposal = proposals[index].clone();
     save_proposals(&storage, &proposals).await;
 
-    let result = if proposal.proposal_kind == "chat_suggestion_accept" {
-        if let Some(suggestion_id) = proposal.chat_suggestion_id.clone() {
-            super::accept_chat_suggestion(&state, &suggestion_id)
-                .await
-                .map(|payload| {
-                    let trace_id = payload
-                        .get("trace_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
-                    let summary = payload
-                        .get("run")
-                        .and_then(|value| value.get("summary"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("Launched suggestion execution.")
-                        .to_string();
-                    (summary, trace_id, "running".to_string())
-                })
-        } else {
-            Err("Proposal is missing the chat suggestion id".to_string())
-        }
-    } else {
+    let result = {
         let agent = Agent::snapshot(&state.agent).await;
         let mut settings = super::load_autonomy_settings_from_storage(&storage).await;
         let outcome = execute_action_proposal(&agent, &mut settings, &proposal).await;
@@ -2767,8 +2696,6 @@ pub(super) async fn approve_sentinel_proposal(
             Ok((summary, trace_id, run_status)) => {
                 current.status = if run_status == "queued_for_approval" {
                     "queued_for_approval".to_string()
-                } else if proposal.proposal_kind == "chat_suggestion_accept" {
-                    "running".to_string()
                 } else {
                     "completed".to_string()
                 };
@@ -2934,6 +2861,140 @@ mod tests {
             chat_suggestion_id: None,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    fn execution_run(
+        id: &str,
+        kind: &str,
+        channel: Option<&str>,
+        conversation_id: Option<&str>,
+        status: crate::core::ExecutionRunStatus,
+    ) -> crate::core::ExecutionRun {
+        crate::core::ExecutionRun {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            request_id: Some(id.to_string()),
+            status: status.clone(),
+            current_stage: status.as_str().to_string(),
+            lease_owner: None,
+            lease_expires_at: None,
+            attempt: 0,
+            deadline_at: None,
+            cancellation_requested: false,
+            degradation: Vec::new(),
+            last_error: Some("failed".to_string()),
+            result_summary: None,
+            trace_id: Some(format!("trace-{id}")),
+            conversation_id: conversation_id.map(ToString::to_string),
+            channel: channel.map(ToString::to_string),
+            request_message: Some("background work".to_string()),
+            attempted_models: Vec::new(),
+            created_at: "2026-05-11T00:00:00Z".to_string(),
+            updated_at: "2026-05-11T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn prune_removes_chat_continuation_artifacts_from_sentinel() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-11T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut continuation = proposal("chat-suggestion", "open", 4, 0.9);
+        continuation.proposal_kind = "chat_suggestion_accept".to_string();
+        continuation.source_kind = "chat_suggestion".to_string();
+        continuation.chat_suggestion_id = Some("suggestion-1".to_string());
+
+        let retained = prune_proposals(vec![continuation], now);
+
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn prune_removes_chat_owned_execution_proposals_without_background_signal() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-11T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut chat_owned = proposal("chat-owned", "open", 4, 0.9);
+        chat_owned.source_kind = "execution_run".to_string();
+        chat_owned.metadata = serde_json::json!({
+            "conversation_id": "conversation-1",
+            "channel": "web",
+            "status": "needs_input"
+        });
+        let mut background = proposal("background", "open", 4, 0.9);
+        background.source_kind = "execution_run".to_string();
+        background.metadata = serde_json::json!({
+            "background_signal": true,
+            "channel": "sentinel",
+            "status": "platform_failed"
+        });
+
+        let retained = prune_proposals(vec![chat_owned, background], now);
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, "background");
+    }
+
+    #[test]
+    fn chat_owned_execution_runs_are_not_sentinel_background_signals() {
+        let chat_run = execution_run(
+            "chat-run",
+            "chat",
+            Some("web"),
+            Some("conversation-1"),
+            crate::core::ExecutionRunStatus::PlatformFailed,
+        );
+        let sentinel_owned_run = execution_run(
+            "sentinel-run",
+            "chat",
+            Some("sentinel"),
+            None,
+            crate::core::ExecutionRunStatus::PlatformFailed,
+        );
+        let background_run = execution_run(
+            "background-run",
+            "automation",
+            Some("scheduler"),
+            Some("origin-conversation"),
+            crate::core::ExecutionRunStatus::PlatformFailed,
+        );
+
+        assert!(!execution_run_is_detached_background_signal(&chat_run));
+        assert!(execution_run_is_detached_background_signal(
+            &sentinel_owned_run
+        ));
+        assert!(execution_run_is_detached_background_signal(&background_run));
+    }
+
+    #[test]
+    fn background_failures_can_create_sentinel_proposals_without_chat_continuations() {
+        let chat_run = execution_run(
+            "chat-run",
+            "chat",
+            Some("web"),
+            Some("conversation-1"),
+            crate::core::ExecutionRunStatus::PlatformFailed,
+        );
+        let background_run = execution_run(
+            "background-run",
+            "automation",
+            Some("scheduler"),
+            None,
+            crate::core::ExecutionRunStatus::PlatformFailed,
+        );
+
+        assert!(!should_create_in_app_execution_proposal(
+            &chat_run,
+            "failed",
+            &[],
+            execution_run_is_detached_background_signal(&chat_run),
+        ));
+        assert!(should_create_in_app_execution_proposal(
+            &background_run,
+            "failed",
+            &[],
+            execution_run_is_detached_background_signal(&background_run),
+        ));
     }
 
     #[test]

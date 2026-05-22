@@ -50,8 +50,8 @@ import {
   setUiTimeZoneOverride,
 } from "../../lib/dateFormat";
 import type {
-  ArkPulseRemediationSpec,
-  ArkPulseRunFixRequest,
+  PulseRemediationSpec,
+  PulseRunFixRequest,
 } from "../../types";
 import {
   asRecord,
@@ -275,7 +275,7 @@ type RestartNoticeState = {
   etaLabel: string;
 };
 
-type ArkPulseInlineResult = {
+type PulseInlineResult = {
   severity: "success" | "error";
   message: string;
   output: string;
@@ -359,7 +359,7 @@ export default function SettingsPage({
     useState<JsonRecord | null>(null);
   const [activePulseFixId, setActivePulseFixId] = useState<string | null>(null);
   const [pulseFixResultsById, setPulseFixResultsById] = useState<
-    Record<string, ArkPulseInlineResult>
+    Record<string, PulseInlineResult>
   >({});
   const [pulsePollState, setPulsePollState] = useState<{
     baselineEventId: string;
@@ -388,8 +388,8 @@ export default function SettingsPage({
   const securityTabActive = tab === 4;
   const advancedTabActive = tab === 5;
   const observabilityTabActive = tab === 6;
-  const standaloneArkPulse = standaloneSurface === "arkpulse";
-  const pulseTabActive = standaloneArkPulse || tab === 9;
+  const standalonePulse = standaloneSurface === "arkpulse";
+  const pulseTabActive = standalonePulse || tab === 9;
   const updatesTabActive = tab === 25;
   const setupTabActive = tab === 0;
   const channelsTabActive = tab === 20;
@@ -400,7 +400,7 @@ export default function SettingsPage({
   const changeSettingsTab = (nextTabRaw: number) => {
     const nextTab = normalizeSettingsTab(nextTabRaw);
     preloadSettingsTab(nextTab);
-    if (!standaloneArkPulse) {
+    if (!standalonePulse) {
       prefetchSettingsTabData(queryClient, nextTab);
     }
     setTab((current) => (current === nextTab ? current : nextTab));
@@ -413,10 +413,10 @@ export default function SettingsPage({
 
   useEffect(() => {
     preloadSettingsTab(tab);
-    if (!standaloneArkPulse) {
+    if (!standalonePulse) {
       prefetchSettingsTabData(queryClient, tab);
     }
-  }, [queryClient, standaloneArkPulse, tab]);
+  }, [queryClient, standalonePulse, tab]);
 
   useEffect(() => {
     const refreshDeveloperMode = () => {
@@ -2808,7 +2808,7 @@ export default function SettingsPage({
     stableModelSlots.length > 0 &&
     (modelsQ.isFetching || !!modelsRefreshIssue);
   const activeSettingsDataRefreshing =
-    !standaloneArkPulse &&
+    !standalonePulse &&
     !settingsQ.isLoading &&
     !(needsMediaSettings && mediaQ.isLoading && mediaQ.data == null) &&
     !(needsModelSettings && modelsQ.isLoading && modelSlots.length === 0) &&
@@ -3095,7 +3095,7 @@ export default function SettingsPage({
         severity: "warning" as const,
         title: `${selectedPulseFindings.length} ${issueLabel} need attention.`,
         detail:
-          "Run only verified ArkPulse actions; findings without a runnable remediation are manual follow-up.",
+          "Run only verified Pulse actions; findings without a runnable remediation are manual follow-up.",
       };
     }
     return {
@@ -3206,10 +3206,10 @@ export default function SettingsPage({
   const latestPulseScore = num(latestPulseDetails.doctor_score, -1);
   const latestPulseStatus = str(latestPulseEvent.status, "").toLowerCase();
   const latestPulseHeadline = pulseRunning
-    ? "ArkPulse is currently running."
+    ? "Pulse is currently running."
     : pulseEvents.length === 0
       ? pulseHistoryUnavailable
-        ? "Earlier ArkPulse history is unavailable."
+        ? "Earlier Pulse history is unavailable."
         : "No health checks yet."
       : latestPulseFindingsCount > 0
         ? `${latestPulseFindingsCount} issue${latestPulseFindingsCount === 1 ? "" : "s"} need attention.`
@@ -3221,7 +3221,7 @@ export default function SettingsPage({
     : pulseEvents.length === 0
       ? pulseHistoryUnavailable
         ? pulseHistoryUnavailableReason ||
-          "A previous ArkPulse payload exists, but this runtime could not decrypt it. New runs will appear normally."
+          "A previous Pulse payload exists, but this runtime could not decrypt it. New runs will appear normally."
         : "Click Run now to generate your first diagnostics report."
       : latestPulseFindingsCount > 0
         ? "Open the latest report and start with Fix #1."
@@ -3664,13 +3664,13 @@ export default function SettingsPage({
   const runPulseFixMutation = useMutation({
     mutationFn: async (payload: {
       fixCommand: string;
-      remediation?: ArkPulseRemediationSpec | null;
+      remediation?: PulseRemediationSpec | null;
       issueTitle: string;
       target: string;
       eventTimestamp?: string;
       findingIndex?: number;
     }) => {
-      const body: ArkPulseRunFixRequest = {
+      const body: PulseRunFixRequest = {
         issue_title: payload.issueTitle,
         target: payload.target,
         event_timestamp: payload.eventTimestamp || undefined,
@@ -3691,7 +3691,7 @@ export default function SettingsPage({
         const errorText =
           str(out.error, "").trim() ||
           str(out.message, "").trim() ||
-          "ArkPulse fix failed.";
+          "Pulse fix failed.";
         throw new Error(errorText);
       }
       return out;
@@ -3704,7 +3704,7 @@ export default function SettingsPage({
       } else if (message) {
         setSuccess(message);
       } else {
-        setSuccess("ArkPulse fix completed.");
+        setSuccess("Pulse fix completed.");
       }
       setSelectedPulseEvent(null);
       await queryClient.invalidateQueries({ queryKey: ["arkpulse-log"] });
@@ -4001,7 +4001,7 @@ export default function SettingsPage({
     }
     await updateSettingsEvolution(
       { readiness_policy: readinessPolicy },
-      "ArkEvolve readiness thresholds saved.",
+      "Evolve readiness thresholds saved.",
     );
   }
 
@@ -4030,8 +4030,8 @@ export default function SettingsPage({
         infer_new_automations: false,
       },
       settingsAutonomyPaused
-        ? "ArkSentinel turned off. Its signal switches will stay off after autonomy resumes until you turn them back on."
-        : "ArkSentinel turned off. Its signal switches are off until you turn them back on.",
+        ? "Sentinel turned off. Its signal switches will stay off after autonomy resumes until you turn them back on."
+        : "Sentinel turned off. Its signal switches are off until you turn them back on.",
     );
     if (changed) {
       setSentinelDisableDialogOpen(false);
@@ -4041,7 +4041,7 @@ export default function SettingsPage({
   async function submitSentinelInAppDisableDialog() {
     const changed = await updateSettingsSentinel(
       { watch_in_app: false },
-      "ArkSentinel will ignore in-app AgentArk activity until you turn it back on.",
+      "Sentinel will ignore in-app AgentArk activity until you turn it back on.",
     );
     if (changed) {
       setSentinelInAppDisableDialogOpen(false);
@@ -4162,7 +4162,7 @@ export default function SettingsPage({
   const arkPulseHeader = (
     <WorkspacePageHeader
       eyebrow="Ark Core"
-      title="ArkPulse"
+      title="Pulse"
       description="Setup health, integration checks, runtime drift, and repair actions."
       actions={
         <Button
@@ -4180,7 +4180,7 @@ export default function SettingsPage({
   );
   const arkPulsePageContent = (
     <Stack spacing={2}>
-      {standaloneArkPulse ? arkPulseHeader : null}
+      {standalonePulse ? arkPulseHeader : null}
       <Grid2
         container
         spacing={2}
@@ -4232,14 +4232,14 @@ export default function SettingsPage({
                   }}
                 >
                   {pulseHistoryUnavailable
-                    ? "Stored ArkPulse history could not be loaded in this runtime."
-                    : "No ArkPulse events yet."}
+                    ? "Stored Pulse history could not be loaded in this runtime."
+                    : "No Pulse events yet."}
                 </Typography>
                 {renderSettingsInlineCard({
-                  eyebrow: "ArkPulse",
+                  eyebrow: "Pulse",
                   title: "How this helps",
                   description:
-                    "ArkPulse runs a health check for setup, integrations, safety, and runtime drift.",
+                    "Pulse runs a health check for setup, integrations, safety, and runtime drift.",
                   tone: "info",
                   children: (
                     <Stack spacing={0.6}>
@@ -4258,7 +4258,7 @@ export default function SettingsPage({
                           color: "text.secondary",
                         }}
                       >
-                        Example: if notifications stop arriving, ArkPulse can
+                        Example: if notifications stop arriving, Pulse can
                         point you to the broken setup step.
                       </Typography>
                       <Typography
@@ -4396,9 +4396,9 @@ export default function SettingsPage({
       const out = asRecord(await triggerPulseMutation.mutateAsync());
       const status = str(out.status, "").toLowerCase();
       if (status === "running") {
-        setSuccess(str(out.message, "ArkPulse is already running."));
+        setSuccess(str(out.message, "Pulse is already running."));
       } else {
-        setSuccess(str(out.message, "ArkPulse check started."));
+        setSuccess(str(out.message, "Pulse check started."));
       }
     } catch (e) {
       setPulsePollState(null);
@@ -4880,7 +4880,7 @@ export default function SettingsPage({
 
   return (
     <Stack spacing={2}>
-      {standaloneArkPulse ? (
+      {standalonePulse ? (
         <WorkspacePageShell spacing={1.5}>
           {success ? <Alert severity="success">{success}</Alert> : null}
           {error ? <Alert severity="error">{error}</Alert> : null}
@@ -5377,7 +5377,7 @@ export default function SettingsPage({
                       ),
                     })}
                     {renderSettingsInlineCard({
-                      eyebrow: "ArkReflect",
+                      eyebrow: "Reflect",
                       title: "Daily digest",
                       description:
                         "Send one end-of-day reflection to the same notification channel, only when AgentArk found meaningful activity.",
@@ -5985,14 +5985,14 @@ export default function SettingsPage({
                             }}
                           >
                             {pulseHistoryUnavailable
-                              ? "Stored ArkPulse history could not be loaded in this runtime."
-                              : "No ArkPulse events yet."}
+                              ? "Stored Pulse history could not be loaded in this runtime."
+                              : "No Pulse events yet."}
                           </Typography>
                           {renderSettingsInlineCard({
-                            eyebrow: "ArkPulse",
+                            eyebrow: "Pulse",
                             title: "How this helps",
                             description:
-                              "ArkPulse runs a health check for setup, integrations, safety, and runtime drift.",
+                              "Pulse runs a health check for setup, integrations, safety, and runtime drift.",
                             tone: "info",
                             children: (
                               <Stack spacing={0.6}>
@@ -6012,7 +6012,7 @@ export default function SettingsPage({
                                   }}
                                 >
                                   Example: if notifications stop arriving,
-                                  ArkPulse can point you to the broken setup
+                                  Pulse can point you to the broken setup
                                   step.
                                 </Typography>
                                 <Typography
@@ -6114,7 +6114,7 @@ export default function SettingsPage({
           >
             <Box>
               <Typography variant="h6" sx={{ fontWeight: 650 }}>
-                ArkPulse Run
+                Pulse Run
               </Typography>
               <Typography
                 variant="body2"
@@ -6555,9 +6555,9 @@ export default function SettingsPage({
                                         message:
                                           str(
                                             result.message,
-                                            "ArkPulse diagnostic completed.",
+                                            "Pulse diagnostic completed.",
                                           ).trim() ||
-                                          "ArkPulse diagnostic completed.",
+                                          "Pulse diagnostic completed.",
                                         output: str(result.output, "").trim(),
                                         timestamp: new Date().toISOString(),
                                       },
@@ -6634,7 +6634,7 @@ export default function SettingsPage({
                 variant="body2"
                 sx={{ color: "var(--ui-rgba-188-198-212-720)" }}
               >
-                This shows exactly what ArkPulse scanned, how long each phase
+                This shows exactly what Pulse scanned, how long each phase
                 took, and what happened with notifications. Sections stay
                 collapsed until you open them.
               </Typography>
@@ -7334,7 +7334,7 @@ export default function SettingsPage({
               paused.
             </Typography>
             <Typography variant="body2">
-              2. Watchers, external polling triggers, and ArkPulse health checks
+              2. Watchers, external polling triggers, and Pulse health checks
               stop running.
             </Typography>
             <Typography variant="body2">
@@ -7424,14 +7424,14 @@ export default function SettingsPage({
         maxWidth="sm"
         fullWidth
       >
-        <DialogTitle>Turn off ArkSentinel?</DialogTitle>
+        <DialogTitle>Turn off Sentinel?</DialogTitle>
         <DialogContent>
           <Stack spacing={1.2} sx={{ mt: 0.5 }}>
             <Alert severity="warning">
-              This stops ArkSentinel follow-up scanning in the background.
+              This stops Sentinel follow-up scanning in the background.
             </Alert>
             <Typography variant="body2" sx={{ color: "text.secondary" }}>
-              While ArkSentinel is off:
+              While Sentinel is off:
             </Typography>
             <Typography variant="body2">
               1. New follow-up suggestions from in-app and connected-app activity
@@ -7441,7 +7441,7 @@ export default function SettingsPage({
               2. Routine-detection proposals stop appearing.
             </Typography>
             <Typography variant="body2" sx={{ color: "text.secondary" }}>
-              3. Existing preferences stay saved, but ArkSentinel stays off until
+              3. Existing preferences stay saved, but Sentinel stays off until
               you turn it back on.
             </Typography>
           </Stack>
@@ -7461,7 +7461,7 @@ export default function SettingsPage({
           >
             {settingsSentinelMutation.isPending
               ? "Turning off..."
-              : "Turn off ArkSentinel"}
+              : "Turn off Sentinel"}
           </Button>
         </DialogActions>
       </Dialog>
@@ -7475,7 +7475,7 @@ export default function SettingsPage({
         <DialogContent>
           <Stack spacing={1.2} sx={{ mt: 0.5 }}>
             <Alert severity="warning">
-              ArkSentinel will stop surfacing follow-ups from in-app chat and
+              Sentinel will stop surfacing follow-ups from in-app chat and
               execution runs.
             </Alert>
             <Typography variant="body2" sx={{ color: "text.secondary" }}>

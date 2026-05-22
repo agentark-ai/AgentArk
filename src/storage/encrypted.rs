@@ -5,8 +5,8 @@
 //! are encrypted with AES-256-GCM before storage and decrypted on retrieval.
 //! Non-content fields (timestamps, IDs, metadata) remain in plaintext for querying.
 
-use super::entities::{approval_log, execution_trace, message};
 use super::Storage;
+use super::entities::{approval_log, execution_trace, message};
 use crate::crypto::KeyManager;
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -92,6 +92,23 @@ impl EncryptedStorage {
             if let Ok(decrypted) = key_manager.decrypt_string(&fact.fact) {
                 fact.fact = decrypted;
             }
+            let value = super::learned_fact_value_from_content(fact.key.as_deref(), &fact.fact);
+            if let Some(raw_key) = fact.key.clone() {
+                let allow_value_suffix_repair = fact.memory_category
+                    == crate::core::memory_schema::MEMORY_CATEGORY_PROFILE_FACT;
+                if let Some((key, repaired_value)) =
+                    crate::core::memory_schema::repair_memory_slot_key_and_value(
+                        &raw_key,
+                        &value,
+                        allow_value_suffix_repair,
+                    )
+                {
+                    fact.key = Some(key);
+                    fact.value = repaired_value.unwrap_or(value);
+                    continue;
+                }
+            }
+            fact.value = value;
         }
         facts
     }
@@ -259,8 +276,10 @@ impl EncryptedStorage {
 mod tests {
     use super::*;
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn reencrypt_all_sensitive_data_updates_rows_and_live_key() {
         let _temp_dir = tempfile::tempdir().unwrap();

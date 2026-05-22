@@ -1,6 +1,6 @@
 use super::*;
-use anyhow::{anyhow, Context, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
@@ -326,11 +326,7 @@ fn sanitize_header_name(value: Option<&str>) -> Option<String> {
             let valid = candidate
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-');
-            if valid {
-                Some(candidate)
-            } else {
-                None
-            }
+            if valid { Some(candidate) } else { None }
         })
 }
 
@@ -1025,11 +1021,7 @@ fn source_status_message(source: &WebhookSource, outcome: &str) -> String {
 }
 
 fn queued_notification_level(event: &NormalizedWebhookEvent) -> &'static str {
-    if event.is_failure {
-        "warning"
-    } else {
-        "info"
-    }
+    if event.is_failure { "warning" } else { "info" }
 }
 
 fn webhook_queue_notification_body(
@@ -2078,8 +2070,8 @@ pub(super) async fn test_webhook_source(
 mod tests {
     use super::*;
     use crate::core::Agent;
-    use axum::body::{to_bytes, Body};
-    use axum::http::{header, Request};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
     use axum::routing::{get, post};
     use tower::ServiceExt;
 
@@ -2155,8 +2147,10 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn webhook_source_secret_is_stored_encrypted_but_not_returned() {
         let (state, config_dir, data_dir) = build_test_state().await;
@@ -2221,8 +2215,10 @@ mod tests {
         assert!(!list_body.to_string().contains("super-secret-token"));
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn webhook_source_rejects_unknown_completion_channel() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2249,10 +2245,11 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = json_response(response).await;
-        assert!(body
-            .get("error")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| value.contains("not currently available")));
+        assert!(
+            body.get("error")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.contains("not currently available"))
+        );
     }
 
     #[test]
@@ -2279,17 +2276,21 @@ mod tests {
         let error = validate_public_webhook_auth_mode(WebhookAuthMode::None, true)
             .expect_err("public no-auth webhooks should be rejected");
 
-        assert!(error
-            .to_string()
-            .contains("Public webhook sources require a secret"));
+        assert!(
+            error
+                .to_string()
+                .contains("Public webhook sources require a secret")
+        );
         validate_public_webhook_auth_mode(WebhookAuthMode::HeaderToken, true)
             .expect("authenticated public webhooks are allowed");
         validate_public_webhook_auth_mode(WebhookAuthMode::None, false)
             .expect("local-only no-auth webhooks are allowed");
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn inbound_webhook_queues_autonomous_task() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2400,8 +2401,10 @@ mod tests {
         );
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn failures_only_source_ignores_success_events() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2460,8 +2463,10 @@ mod tests {
         assert!(tasks.all().is_empty());
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn duplicate_delivery_is_ignored() {
         let (state, _config_dir, _data_dir) = build_test_state().await;

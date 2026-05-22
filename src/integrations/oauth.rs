@@ -11,7 +11,7 @@
 //! accidentally expose tokens.
 
 use crate::crypto::KeyManager;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;

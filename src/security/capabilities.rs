@@ -835,7 +835,16 @@ fn push_structured_capability_observations(
             );
             true
         }
-        "platform-observability" | "session-history" => {
+        "platform-observability"
+        | "app-registry"
+        | "app-inventory"
+        | "personal-activity"
+        | "activity-insights"
+        | "conversation-history"
+        | "session-history"
+        | "model-runtime"
+        | "model-status"
+        | "provider-status" => {
             push_observation(
                 out,
                 seen,
@@ -869,8 +878,7 @@ fn push_structured_capability_observations(
             );
             if matches!(
                 metadata.role,
-                crate::actions::ActionRole::Delivery
-                    | crate::actions::ActionRole::Mutation
+                crate::actions::ActionRole::Delivery | crate::actions::ActionRole::Mutation
             ) {
                 push_observation(
                     out,
@@ -924,8 +932,7 @@ fn push_structured_capability_observations(
                 &evidence,
             );
             match metadata.role {
-                crate::actions::ActionRole::DataSource
-                | crate::actions::ActionRole::Inspection => {
+                crate::actions::ActionRole::DataSource | crate::actions::ActionRole::Inspection => {
                     push_observation(
                         out,
                         seen,
@@ -1007,8 +1014,7 @@ fn push_structured_capability_observations(
             );
             if matches!(
                 metadata.role,
-                crate::actions::ActionRole::Inspection
-                    | crate::actions::ActionRole::DataSource
+                crate::actions::ActionRole::Inspection | crate::actions::ActionRole::DataSource
             ) {
                 push_observation(
                     out,
@@ -1194,8 +1200,7 @@ fn push_structured_capability_observations(
         | "self-evolve" => {
             if matches!(
                 metadata.role,
-                crate::actions::ActionRole::Inspection
-                    | crate::actions::ActionRole::DataSource
+                crate::actions::ActionRole::Inspection | crate::actions::ActionRole::DataSource
             ) {
                 push_observation(
                     out,
@@ -1796,10 +1801,12 @@ mod tests {
         );
 
         assert!(report.blocked);
-        assert!(report
-            .matched_rules
-            .iter()
-            .any(|rule| rule.id == "block-shell-file-network"));
+        assert!(
+            report
+                .matched_rules
+                .iter()
+                .any(|rule| rule.id == "block-shell-file-network")
+        );
     }
 
     #[test]
@@ -1823,10 +1830,12 @@ mod tests {
         let report = evaluate_cross_layer_capabilities(observations)
             .expect("cross-layer report should be produced");
         assert!(report.blocked);
-        assert!(report
-            .matched_rules
-            .iter()
-            .any(|rule| rule.id == "block-shell-file-network"));
+        assert!(
+            report
+                .matched_rules
+                .iter()
+                .any(|rule| rule.id == "block-shell-file-network")
+        );
     }
 
     #[test]
@@ -1878,12 +1887,12 @@ mod tests {
             decision.effect,
             CapabilityCorrelationEffect::RequireApproval
         ));
-        assert!(decision
-            .report
-            .as_ref()
-            .is_some_and(|report| report.matched_rules.iter().any(|rule| {
-                rule.id == "approve-sensitive-source-to-external-send"
-            })));
+        assert!(decision.report.as_ref().is_some_and(|report| {
+            report
+                .matched_rules
+                .iter()
+                .any(|rule| rule.id == "approve-sensitive-source-to-external-send")
+        }));
     }
 
     #[test]
@@ -1939,11 +1948,15 @@ mod tests {
             "agentark_capabilities",
             "agentark_manual",
             "analytics",
+            "app_inventory",
+            "app_registry",
             "app_hosting",
+            "activity_insights",
             "capability_inventory",
             "clipboard_read",
             "clipboard_write",
             "code_execute",
+            "conversation_history",
             "database_readonly",
             "delegate",
             "document_generation",
@@ -1964,12 +1977,16 @@ mod tests {
             "local_network",
             "local_network_discovery",
             "memory",
+            "model_runtime",
+            "model_status",
             "multi_agent",
             "network",
             "notify",
             "orchestration",
             "pdf_generation",
             "platform_observability",
+            "personal_activity",
+            "provider_status",
             "scheduler",
             "search",
             "self_evolve",

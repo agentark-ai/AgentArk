@@ -1,6 +1,6 @@
 //! MCP client for connecting to external servers (HTTP or stdio)
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;

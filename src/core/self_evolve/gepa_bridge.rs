@@ -1,8 +1,8 @@
-//! File-based DSPy/GEPA bridge for offline ArkEvolve seeding.
+//! File-based DSPy/GEPA bridge for offline Evolve seeding.
 //!
 //! This module deliberately keeps GEPA out of the production Rust runtime. It
 //! exports redacted evidence, imports typed candidates, and leaves evaluation,
-//! canarying, and promotion to the existing ArkEvolve engines.
+//! canarying, and promotion to the existing Evolve engines.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,27 +15,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::storage::Storage;
 
 use super::prompt_evolution::{
-    embedded_prompt_benchmark_profile_json, parse_prompt_bundle_profile, ExternalPromptCandidate,
-    PromptBundleProfile, PROMPT_BUNDLE_PROFILE_KEY,
+    ExternalPromptCandidate, PROMPT_BUNDLE_PROFILE_KEY, PromptBundleProfile,
+    embedded_prompt_benchmark_profile_json, parse_prompt_bundle_profile,
 };
 use super::prompt_fragment_evolution::{
-    prompt_fragment_candidate_benchmark_profile, ExternalPromptFragmentCandidate,
-    PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH,
+    ExternalPromptFragmentCandidate, PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH,
+    prompt_fragment_candidate_benchmark_profile,
 };
 use super::router_learning::{
-    router_learning_benchmark_profile, trace_evidence_from_semantic_steps,
-    validate_router_learning_candidate,
-    RouterLearningCandidatePayload,
+    RouterLearningCandidatePayload, router_learning_benchmark_profile,
+    trace_evidence_from_semantic_steps, validate_router_learning_candidate,
 };
 use super::specialist_prompt_evolution::{
-    embedded_specialist_prompt_benchmark_profile_json, parse_specialist_prompt_bundle_profile,
-    ExternalSpecialistPromptCandidate, SpecialistPromptBundleProfile,
-    SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
+    ExternalSpecialistPromptCandidate, SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
+    SpecialistPromptBundleProfile, embedded_specialist_prompt_benchmark_profile_json,
+    parse_specialist_prompt_bundle_profile,
 };
 use crate::core::prompt_fragments::{
+    PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY, PromptFragmentBundleProfile,
     default_prompt_fragment_bundle, parse_prompt_fragment_bundle_profile,
-    sanitize_prompt_fragment_bundle, PromptFragmentBundleProfile,
-    PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
+    sanitize_prompt_fragment_bundle,
 };
 
 const GEPA_ROOT_REL: &str = ".agentark/self_evolve/gepa";
@@ -174,6 +173,8 @@ pub struct PendingGepaJob {
     pub job_id: String,
     pub kind: GepaJobKind,
     pub request: String,
+    #[serde(default)]
+    pub metadata: Value,
     #[serde(default)]
     pub run_id: Option<String>,
     #[serde(default)]
@@ -339,11 +340,7 @@ pub fn gepa_venv_python(project_root: &Path) -> PathBuf {
 
 fn bundled_gepa_python() -> Option<PathBuf> {
     let path = PathBuf::from("/opt/agentark-gepa/bin/python");
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.exists() { Some(path) } else { None }
 }
 
 pub async fn load_gepa_optimizer_config(storage: &Storage) -> GepaOptimizerConfig {
@@ -1684,7 +1681,7 @@ fn default_gepa_max_attempts() -> u32 {
 }
 
 fn default_apply_promotion() -> bool {
-    false
+    true
 }
 
 fn default_canary_rollout_percent() -> u8 {
@@ -1741,11 +1738,7 @@ trait IfEmpty {
 
 impl IfEmpty for str {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
-        if self.is_empty() {
-            fallback
-        } else {
-            self
-        }
+        if self.is_empty() { fallback } else { self }
     }
 }
 
@@ -1782,9 +1775,9 @@ mod tests {
     }
 
     #[test]
-    fn gepa_promotion_settings_default_requires_manual_acceptance() {
+    fn gepa_promotion_settings_default_allows_gate_to_decide() {
         let settings = GepaPromotionSettings::default();
-        assert!(!settings.apply_promotion);
+        assert!(settings.apply_promotion);
     }
 
     #[test]

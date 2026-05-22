@@ -563,7 +563,7 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
     if (!traceKind.startsWith("self_evolve.")) return;
 
     const status = str(step.type, str(step.step_type, "info")).trim() || "info";
-    const title = str(step.title, "ArkEvolve").trim();
+    const title = str(step.title, "Evolve").trim();
     const detail = str(step.detail, "").trim();
     const chips: string[] = [];
     const evidence: string[] = [];
@@ -574,7 +574,6 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
       const request = str(data.request, "").trim();
       chips.push(`Mode ${mode}`);
       if (toBool(data.apply_promotion)) chips.push("Promotion enabled");
-      if (toBool(data.allow_code_writes)) chips.push("Code writes allowed");
       const canaryRollout = num(data.canary_rollout_percent, -1);
       if (canaryRollout > 0) chips.push(`Canary ${canaryRollout}%`);
       rationale = request;
@@ -809,26 +808,6 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
       const successGain = num(replay.success_gain, Number.NaN);
       if (Number.isFinite(successGain))
         evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
-    } else if (traceKind === "self_evolve.code.blocked") {
-      chips.push("Code evolution");
-      chips.push("Blocked");
-      rationale = str(data.request, "").trim();
-    } else if (traceKind === "self_evolve.code.result") {
-      const filesChanged = stringList(data.files_changed);
-      const securityWarnings = stringList(data.security_warnings);
-      const iterations = num(data.iterations_used, 0);
-      chips.push(
-        `${filesChanged.length} file${filesChanged.length === 1 ? "" : "s"}`,
-      );
-      chips.push(`${iterations} iteration${iterations === 1 ? "" : "s"}`);
-      if (toBool(data.push_recommended)) chips.push("Push suggested");
-      rationale = str(data.diff_summary, "").trim();
-      if (filesChanged.length)
-        evidence.push(`Files changed: ${filesChanged.join(", ")}`);
-      if (securityWarnings.length)
-        evidence.push(`Security warnings: ${securityWarnings.join(" | ")}`);
-      const error = str(data.error, "").trim();
-      if (error) evidence.push(`Error: ${error}`);
     } else if (
       traceKind === "self_evolve.manual_action.result" ||
       traceKind === "self_evolve.manual_action.request"
@@ -1082,7 +1061,7 @@ export function buildEvolutionEvidenceCards(
 
       let detail = `Captured ${runCount} related run${runCount === 1 ? "" : "s"} for comparison.`;
       let rationale =
-        "ArkEvolve is still collecting enough examples to decide whether a product change is warranted.";
+        "Evolve is still collecting enough examples to decide whether a product change is warranted.";
 
       if (isPreferencePattern) {
         detail = `Captured an explicit user correction that should steer similar requests from the start.`;
@@ -1099,14 +1078,14 @@ export function buildEvolutionEvidenceCards(
       } else if (completedCount > 0 && failedCount > 0) {
         detail = `Observed ${runCount} related runs with mixed outcomes. The latest path completed, but earlier attempts show the routing still needs refinement.`;
         rationale =
-          "ArkEvolve can use the failures to narrow when the alternate path should be avoided.";
+          "Evolve can use the failures to narrow when the alternate path should be avoided.";
       } else if (failedCount > 0) {
         detail = `Observed ${runCount} failed run${runCount === 1 ? "" : "s"}${dominantBlocker ? `, mostly blocked by ${dominantBlocker}` : ""}.`;
         rationale =
           "This is evidence for a guardrail or tighter trigger before retrying the same path.";
       } else if (completedCount === 1) {
         detail =
-          "Observed one completed run. ArkEvolve usually waits for repetition before treating it as a stable lesson.";
+          "Observed one completed run. Evolve usually waits for repetition before treating it as a stable lesson.";
         rationale =
           "A single success is useful context, but not enough to claim that behavior improved.";
       }
@@ -1415,7 +1394,7 @@ export function EvolutionReviewEvidenceStrip({
                   <Typography
                     key={`${section.label}-${idx}`}
                     variant="caption"
-                    sx={{ color: "#d8edff", display: "block" }}
+                    sx={{ color: "#fff8ed", display: "block" }}
                   >
                     - {line}
                   </Typography>
@@ -1720,7 +1699,7 @@ export function learningCandidateReviewEvidence(
     proposed: cleanEvidenceLines([str(row.preview, ""), str(row.title, "")]),
     impact: cleanEvidenceLines([
       `Confidence ${confidence}.`,
-      "ArkEvolve will measure impact after approval if this change goes live.",
+      "Evolve will measure impact after approval if this change goes live.",
     ]),
   };
 }

@@ -99,6 +99,9 @@ impl Agent {
             style_desc = style_desc,
         );
 
+        prompt.push_str("\n\n");
+        prompt.push_str(crate::core::agentark_knowledge::ark_core_product_ontology_prompt());
+
         prompt.push('\n');
         prompt.push_str(&crate::docs::agent_toc::render_agent_doc_toc());
         prompt.push('\n');

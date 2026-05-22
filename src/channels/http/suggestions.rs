@@ -203,7 +203,10 @@ fn artifact_prompt_payload(artifact: &DurableSuggestionArtifact) -> serde_json::
     })
 }
 
-fn artifact_as_outcome(artifact: &DurableSuggestionArtifact, primary: bool) -> ChatSuggestionOutcome {
+fn artifact_as_outcome(
+    artifact: &DurableSuggestionArtifact,
+    primary: bool,
+) -> ChatSuggestionOutcome {
     ChatSuggestionOutcome {
         kind: artifact.kind.clone(),
         id: artifact.id.clone(),
@@ -212,7 +215,10 @@ fn artifact_as_outcome(artifact: &DurableSuggestionArtifact, primary: bool) -> C
         status: Some(artifact.status.clone()),
         url: artifact.url.clone(),
         view: artifact.view.clone(),
-        created_at: artifact.created_at.clone().or_else(|| artifact.updated_at.clone()),
+        created_at: artifact
+            .created_at
+            .clone()
+            .or_else(|| artifact.updated_at.clone()),
         primary,
     }
 }
@@ -248,7 +254,9 @@ fn suggestion_resolution_signature(
         suggestion.source_snippet.as_str(),
     ] {
         hasher.update([0]);
-        hasher.update(compact_resolution_text(value, CHAT_SUGGESTION_RESOLUTION_MAX_TEXT_CHARS).as_bytes());
+        hasher.update(
+            compact_resolution_text(value, CHAT_SUGGESTION_RESOLUTION_MAX_TEXT_CHARS).as_bytes(),
+        );
     }
     for row in rows {
         hasher.update([0]);
@@ -323,7 +331,10 @@ fn artifact_scope_matches_suggestion(
     artifact: &DurableSuggestionArtifact,
     suggestion: &ChatAutomationSuggestion,
 ) -> bool {
-    if artifact.source_suggestion_ids.contains(suggestion.id.trim()) {
+    if artifact
+        .source_suggestion_ids
+        .contains(suggestion.id.trim())
+    {
         return true;
     }
     let suggestion_conversation = suggestion.conversation_id.trim();
@@ -377,7 +388,8 @@ async fn load_recent_conversation_artifacts(
     let Some(raw) = storage.get(&key).await.ok().flatten() else {
         return Vec::new();
     };
-    let value = serde_json::from_slice::<serde_json::Value>(&raw).unwrap_or(serde_json::Value::Null);
+    let value =
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap_or(serde_json::Value::Null);
     let items = match value {
         serde_json::Value::Array(items) => items,
         object @ serde_json::Value::Object(_) => vec![object],
@@ -428,7 +440,11 @@ async fn load_durable_suggestion_artifacts(
             serde_json::from_str::<serde_json::Value>(&task.arguments).unwrap_or_default();
         let origin = crate::core::automation::origin_from_arguments(&arguments);
         let mut source_suggestion_ids = HashSet::new();
-        collect_matching_suggestion_ids(&arguments, open_suggestion_ids, &mut source_suggestion_ids);
+        collect_matching_suggestion_ids(
+            &arguments,
+            open_suggestion_ids,
+            &mut source_suggestion_ids,
+        );
         artifacts.push(DurableSuggestionArtifact {
             key: format!("task:{}", task.id),
             kind: "task".to_string(),
@@ -757,7 +773,11 @@ pub(super) async fn reconcile_open_chat_suggestions_with_durable_work(
 
         let direct_matches = artifacts
             .iter()
-            .filter(|artifact| artifact.source_suggestion_ids.contains(suggestion.id.trim()))
+            .filter(|artifact| {
+                artifact
+                    .source_suggestion_ids
+                    .contains(suggestion.id.trim())
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !direct_matches.is_empty() {
@@ -781,11 +801,7 @@ pub(super) async fn reconcile_open_chat_suggestions_with_durable_work(
             semantically_resolved_artifacts(&agent.llm, suggestion, &artifacts).await
         {
             mark_suggestion_resolved_by_artifacts(
-                suggestion,
-                &selected,
-                &summary,
-                &signature,
-                &now_text,
+                suggestion, &selected, &summary, &signature, &now_text,
             );
             resolved += 1;
             changed += 1;

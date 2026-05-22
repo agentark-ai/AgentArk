@@ -91,7 +91,6 @@ export default function DocumentsPage({
         ref={fileInputRef}
         type="file"
         hidden
-        accept=".txt,.md,.markdown,.json,.csv,.tsv,.xml,.html,.htm,.yaml,.yml,.log,.ini,.toml,.sql,.js,.ts,.tsx,.jsx,.py,.rs,.go,.java,.c,.cpp,.h,.hpp,.sh,.bat,.ps1,.pdf,.docx,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         onChange={handleFileSelected}
       />
       <WorkspacePageHeader
@@ -135,7 +134,8 @@ export default function DocumentsPage({
                   color: "text.secondary",
                 }}
               >
-                Supports PDF, DOCX, TXT, MD, JSON, CSV and code/text files.
+                Supports text, PDF/DOCX extraction, images, archives, and other files.
+                Non-text files are saved with searchable metadata.
               </Typography>
               {selectedFile ? (
                 <Alert severity="info" sx={{ py: 0.5 }}>

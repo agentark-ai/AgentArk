@@ -24,7 +24,14 @@ pub(super) async fn list_tasks(
         .get("offset")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0usize);
-    let tasks = state.tasks.read().await;
+    let agent = state.agent.read().await;
+    if let Err(error) = agent.repair_settings_authorized_approval_tasks().await {
+        tracing::warn!(
+            error = %error,
+            "Failed to repair settings-authorized approval tasks before listing tasks"
+        );
+    }
+    let tasks = agent.tasks.read().await;
     let all = tasks.all();
     let total = all.len();
     let sort = params
@@ -491,6 +498,7 @@ pub(super) fn background_session_watcher_json(
         "last_poll_at": watcher.last_poll_at.map(|value| value.to_rfc3339()),
         "poll_count": watcher.poll_count,
         "notify_channel": watcher.notify_channel.clone(),
+        "repeat_on_match": watcher.repeat_on_match,
         "last_error": watcher.last_error.clone(),
         "last_poll_outcome": watcher.last_poll_outcome.clone(),
         "notification_attempts": watcher.notification_attempts.clone(),
@@ -2269,7 +2277,7 @@ pub(super) async fn create_task(
     State(state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Response {
-    use crate::core::{status_for_task_approval, Task, TaskApproval};
+    use crate::core::{Task, TaskApproval, status_for_task_approval};
 
     // Convert and validate cron expression if provided
     // Standard 5-field cron is converted to 6-field (with seconds) for Rust cron crate
@@ -2535,13 +2543,21 @@ pub(super) async fn approve_task(
         .await
     {
         Ok(Some(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Task not found or is not awaiting approval".to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(None) => {
+            let _ = agent
+                .storage
+                .resolve_approval_request(&id, "stale", "api")
+                .await;
+            (
+                StatusCode::GONE,
+                Json(serde_json::json!({
+                    "code": "approval_stale",
+                    "error": "This approval is no longer attached to an awaiting task.",
+                    "status": "stale"
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -2580,13 +2596,21 @@ pub(super) async fn reject_task(
         .unwrap_or("Task was rejected and will not be executed.");
     match agent.reject_task_request(uuid, "api", comment).await {
         Ok(Some(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Task not found or is not awaiting approval".to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(None) => {
+            let _ = agent
+                .storage
+                .resolve_approval_request(&id, "stale", "api")
+                .await;
+            (
+                StatusCode::GONE,
+                Json(serde_json::json!({
+                    "code": "approval_stale",
+                    "error": "This approval is no longer attached to an awaiting task.",
+                    "status": "stale"
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -2951,8 +2975,9 @@ pub(super) async fn resume_chat_task_stream(
             recorded_user_message_id: None,
             deep_research: resume_request.deep_research,
             plan_confirmation_mode: None,
-            arkorbit_context: None,
+            attachments_present: false,
             attachments: Vec::new(),
+            arkorbit_context: None,
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             accepted_suggestion: None,
             task_mode: ChatStreamTaskMode::Existing(Box::new(StreamedChatTask {
@@ -3661,11 +3686,12 @@ pub(super) async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) ->
         &now_rfc3339,
     )
     .await;
-    reconciled_suggestion_updates += suggestions::reconcile_open_chat_suggestions_with_durable_work(
-        &agent_snapshot,
-        &mut suggestions,
-    )
-    .await;
+    reconciled_suggestion_updates +=
+        suggestions::reconcile_open_chat_suggestions_with_durable_work(
+            &agent_snapshot,
+            &mut suggestions,
+        )
+        .await;
     let created_suggestions = new_suggestion_ids
         .iter()
         .filter(|id| {
@@ -4380,7 +4406,9 @@ pub(super) async fn run_recommended_action(
         }));
     }
 
-    if trust.requires_approval {
+    if crate::core::task_requires_explicit_approval(&TaskApproval::RequireApproval)
+        && trust.requires_approval
+    {
         let mut approval_task = Task::new(
             format!("Approval required: {}", action.title),
             "autonomy_action".to_string(),

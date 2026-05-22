@@ -2,7 +2,7 @@ use super::*;
 
 static ARKPULSE_CLEANUP_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ARKPULSE_CLEANUP_JOBS: once_cell::sync::Lazy<
-    RwLock<HashMap<String, ArkPulseCleanupJobSnapshot>>,
+    RwLock<HashMap<String, PulseCleanupJobSnapshot>>,
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 const ARKPULSE_CLEANUP_IDLE_APP_HOURS: i64 = 24;
 const ARKPULSE_CLEANUP_JOB_HISTORY_LIMIT: usize = 20;
@@ -24,7 +24,7 @@ pub(super) struct RunArkPulseFixRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct ArkPulseCleanupPreviewRequest {
+pub(super) struct PulseCleanupPreviewRequest {
     #[serde(default)]
     _refresh: bool,
 }
@@ -42,7 +42,7 @@ pub(super) struct RunArkPulseCleanupRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct ArkPulseCleanupJobSnapshot {
+pub(super) struct PulseCleanupJobSnapshot {
     job_id: String,
     status: String,
     queued_at: String,
@@ -63,7 +63,7 @@ pub(super) struct ArkPulseCleanupJobSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum ArkPulseFixPlan {
+pub(super) enum PulseFixPlan {
     TunnelStartVerify,
     TunnelRestartVerify,
     AppRestart(String),
@@ -79,29 +79,29 @@ pub(super) enum ArkPulseFixPlan {
 pub(super) fn arkpulse_fix_plan_from_remediation(
     remediation: &crate::sentinel::DoctorRemediationSpec,
     _allow_shell_command: bool,
-) -> Option<ArkPulseFixPlan> {
+) -> Option<PulseFixPlan> {
     match remediation {
         crate::sentinel::DoctorRemediationSpec::TunnelStartVerify => {
-            Some(ArkPulseFixPlan::TunnelStartVerify)
+            Some(PulseFixPlan::TunnelStartVerify)
         }
         crate::sentinel::DoctorRemediationSpec::TunnelRestartVerify => {
-            Some(ArkPulseFixPlan::TunnelRestartVerify)
+            Some(PulseFixPlan::TunnelRestartVerify)
         }
         crate::sentinel::DoctorRemediationSpec::AppRestart { app_id } => {
             if is_valid_app_id(app_id) {
-                Some(ArkPulseFixPlan::AppRestart(app_id.clone()))
+                Some(PulseFixPlan::AppRestart(app_id.clone()))
             } else {
                 None
             }
         }
         crate::sentinel::DoctorRemediationSpec::ReadonlyInvestigation { topic } => {
-            Some(ArkPulseFixPlan::ReadonlyInvestigation {
+            Some(PulseFixPlan::ReadonlyInvestigation {
                 topic: topic.clone(),
             })
         }
         crate::sentinel::DoctorRemediationSpec::ManagedAppOperation { app_id, operation } => {
             if is_valid_app_id(app_id) {
-                Some(ArkPulseFixPlan::ManagedAppOperation {
+                Some(PulseFixPlan::ManagedAppOperation {
                     app_id: app_id.clone(),
                     operation: operation.clone(),
                 })
@@ -194,7 +194,7 @@ async fn collect_arkpulse_cleanup_candidates_for_state(
     .await
 }
 
-async fn cleanup_active_job_snapshot() -> Option<ArkPulseCleanupJobSnapshot> {
+async fn cleanup_active_job_snapshot() -> Option<PulseCleanupJobSnapshot> {
     let jobs = ARKPULSE_CLEANUP_JOBS.read().await;
     jobs.values()
         .filter(|job| job.status == "queued" || job.status == "running")
@@ -202,7 +202,7 @@ async fn cleanup_active_job_snapshot() -> Option<ArkPulseCleanupJobSnapshot> {
         .cloned()
 }
 
-async fn upsert_cleanup_job(snapshot: ArkPulseCleanupJobSnapshot) {
+async fn upsert_cleanup_job(snapshot: PulseCleanupJobSnapshot) {
     let mut jobs = ARKPULSE_CLEANUP_JOBS.write().await;
     jobs.insert(snapshot.job_id.clone(), snapshot);
     if jobs.len() > ARKPULSE_CLEANUP_JOB_HISTORY_LIMIT {
@@ -220,7 +220,7 @@ async fn upsert_cleanup_job(snapshot: ArkPulseCleanupJobSnapshot) {
     }
 }
 
-async fn get_cleanup_job_snapshot(job_id: &str) -> Option<ArkPulseCleanupJobSnapshot> {
+async fn get_cleanup_job_snapshot(job_id: &str) -> Option<PulseCleanupJobSnapshot> {
     ARKPULSE_CLEANUP_JOBS.read().await.get(job_id).cloned()
 }
 
@@ -317,7 +317,7 @@ pub(super) fn apply_arkpulse_sanitized_env(command: &mut tokio::process::Command
     }
 }
 
-type ArkPulseFixHttpResult = (StatusCode, serde_json::Value);
+type PulseFixHttpResult = (StatusCode, serde_json::Value);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HealSkipReason {
@@ -342,7 +342,7 @@ pub(super) struct DeletedAppCleanupSummary {
 pub(super) fn arkpulse_error_result(
     status: StatusCode,
     error: impl Into<String>,
-) -> ArkPulseFixHttpResult {
+) -> PulseFixHttpResult {
     let error = error.into();
     (
         status,
@@ -359,7 +359,7 @@ pub(super) async fn resolve_arkpulse_app_dir(
 ) -> Result<PathBuf, String> {
     let trimmed = raw_app_dir.trim();
     if trimmed.is_empty() {
-        return Err("App directory is required for ArkPulse shell operations".to_string());
+        return Err("App directory is required for Pulse shell operations".to_string());
     }
     let requested = tokio::fs::canonicalize(PathBuf::from(trimmed))
         .await
@@ -372,7 +372,7 @@ pub(super) async fn resolve_arkpulse_app_dir(
         .await
         .map_err(|e| format!("Managed apps root is not accessible: {}", e))?;
     if !requested.starts_with(&apps_root) {
-        return Err("ArkPulse fixes may only run inside the managed apps directory".to_string());
+        return Err("Pulse fixes may only run inside the managed apps directory".to_string());
     }
     Ok(requested)
 }
@@ -383,7 +383,7 @@ pub(super) async fn resolve_arkpulse_app_dir_by_id(
 ) -> Result<PathBuf, String> {
     let trimmed = app_id.trim();
     if !is_valid_app_id(trimmed) {
-        return Err("App id is required for ArkPulse app remediation".to_string());
+        return Err("App id is required for Pulse app remediation".to_string());
     }
     let registry_dir = state.app_registry.get_dir(trimmed).await;
     let fallback_dir = {
@@ -435,7 +435,7 @@ pub(super) async fn run_arkpulse_managed_app_operation_fix(
     state: &AppState,
     app_id: &str,
     operation: &crate::sentinel::DoctorManagedAppOperation,
-) -> ArkPulseFixHttpResult {
+) -> PulseFixHttpResult {
     let app_dir = match resolve_arkpulse_app_dir_by_id(state, app_id).await {
         Ok(path) => path,
         Err(error) => return arkpulse_error_result(StatusCode::BAD_REQUEST, error),
@@ -510,7 +510,7 @@ pub(super) async fn cleanup_deleted_app_references(
             Ok(count) => count,
             Err(error) => {
                 tracing::warn!(
-                    "Failed to prune ArkPulse history while cleaning '{}': {}",
+                    "Failed to prune Pulse history while cleaning '{}': {}",
                     app_id,
                     error
                 );
@@ -524,7 +524,7 @@ pub(super) async fn cleanup_deleted_app_references(
         Ok(count) => count,
         Err(error) => {
             tracing::warn!(
-                "Failed to prune ArkReflect rows while cleaning '{}': {}",
+                "Failed to prune Reflect rows while cleaning '{}': {}",
                 app_id,
                 error
             );
@@ -618,7 +618,7 @@ pub(super) fn spawn_arkpulse_app_restart_fix(
             Err(_) => arkpulse_error_result(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!(
-                    "App restart for {} timed out. ArkPulse aborted the remediation to keep the control plane responsive.",
+                    "App restart for {} timed out. Pulse aborted the remediation to keep the control plane responsive.",
                     app_id
                 ),
             ),
@@ -626,8 +626,8 @@ pub(super) fn spawn_arkpulse_app_restart_fix(
         let status = result.0;
         let body = result.1;
         let latency_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
-        let plan = ArkPulseFixPlan::AppRestart(app_id.clone());
-        let audit = ArkPulseFixAuditDetails {
+        let plan = PulseFixPlan::AppRestart(app_id.clone());
+        let audit = PulseFixAuditDetails {
             plan: &plan,
             issue_title: &issue_title,
             target: &target,
@@ -642,7 +642,7 @@ pub(super) fn spawn_arkpulse_app_restart_fix(
 pub(super) async fn run_arkpulse_app_restart_fix(
     state: &AppState,
     app_id: &str,
-) -> ArkPulseFixHttpResult {
+) -> PulseFixHttpResult {
     let response = restart_app(State(state.clone()), Path(app_id.to_string())).await;
     let status = response.status();
     let body = response.into_body();
@@ -703,7 +703,7 @@ pub(super) async fn run_arkpulse_app_restart_fix(
 pub(super) async fn run_arkpulse_readonly_investigation_fix(
     state: &AppState,
     topic: &crate::sentinel::DoctorReadonlyInvestigationTopic,
-) -> ArkPulseFixHttpResult {
+) -> PulseFixHttpResult {
     match topic {
         crate::sentinel::DoctorReadonlyInvestigationTopic::MemoryCaptureHealth => {
             let (storage, config) = {
@@ -855,7 +855,7 @@ pub(super) async fn run_arkpulse_readonly_investigation_fix(
                     "status": "ok",
                     "mode": "readonly_investigation",
                     "topic": "memory_capture_health",
-                    "message": "ArkPulse diagnostic completed.",
+                    "message": "Pulse diagnostic completed.",
                     "output": output_lines.join("\n"),
                     "details": {
                         "failed_count": failed_count,
@@ -870,18 +870,18 @@ pub(super) async fn run_arkpulse_readonly_investigation_fix(
     }
 }
 
-pub(super) fn arkpulse_fix_plan_label(plan: &ArkPulseFixPlan) -> &'static str {
+pub(super) fn arkpulse_fix_plan_label(plan: &PulseFixPlan) -> &'static str {
     match plan {
-        ArkPulseFixPlan::TunnelStartVerify => "tunnel_start_verify",
-        ArkPulseFixPlan::TunnelRestartVerify => "tunnel_restart_verify",
-        ArkPulseFixPlan::AppRestart(_) => "app_restart",
-        ArkPulseFixPlan::ManagedAppOperation { .. } => "managed_app_operation",
-        ArkPulseFixPlan::ReadonlyInvestigation { .. } => "readonly_investigation",
+        PulseFixPlan::TunnelStartVerify => "tunnel_start_verify",
+        PulseFixPlan::TunnelRestartVerify => "tunnel_restart_verify",
+        PulseFixPlan::AppRestart(_) => "app_restart",
+        PulseFixPlan::ManagedAppOperation { .. } => "managed_app_operation",
+        PulseFixPlan::ReadonlyInvestigation { .. } => "readonly_investigation",
     }
 }
 
-pub(super) struct ArkPulseFixAuditDetails<'a> {
-    plan: &'a ArkPulseFixPlan,
+pub(super) struct PulseFixAuditDetails<'a> {
+    plan: &'a PulseFixPlan,
     issue_title: &'a str,
     target: &'a str,
     fix_summary: &'a str,
@@ -891,7 +891,7 @@ pub(super) struct ArkPulseFixAuditDetails<'a> {
 
 pub(super) async fn persist_arkpulse_fix_audit(
     state: &AppState,
-    audit: &ArkPulseFixAuditDetails<'_>,
+    audit: &PulseFixAuditDetails<'_>,
     latency_ms: i64,
     status: StatusCode,
     body: &serde_json::Value,
@@ -928,9 +928,9 @@ pub(super) async fn persist_arkpulse_fix_audit(
         event_type: "arkpulse_fix".to_string(),
         success,
         outcome: if success {
-            format!("ArkPulse fix completed ({mode})")
+            format!("Pulse fix completed ({mode})")
         } else {
-            format!("ArkPulse fix failed ({mode})")
+            format!("Pulse fix failed ({mode})")
         },
         tool_name: Some(mode.to_string()),
         latency_ms: Some(latency_ms),
@@ -942,19 +942,19 @@ pub(super) async fn persist_arkpulse_fix_audit(
         model_slot: None,
     };
     if let Err(error) = storage.insert_operational_log(&log).await {
-        tracing::warn!("Failed to persist ArkPulse fix audit log: {}", error);
+        tracing::warn!("Failed to persist Pulse fix audit log: {}", error);
     }
 }
 
-pub(super) struct ArkPulseFixResponseContext<'a> {
-    audit: ArkPulseFixAuditDetails<'a>,
+pub(super) struct PulseFixResponseContext<'a> {
+    audit: PulseFixAuditDetails<'a>,
     started_at: std::time::Instant,
 }
 
 pub(super) async fn respond_arkpulse_fix(
     state: &AppState,
-    context: ArkPulseFixResponseContext<'_>,
-    result: ArkPulseFixHttpResult,
+    context: PulseFixResponseContext<'_>,
+    result: PulseFixHttpResult,
 ) -> Response {
     let (status, body) = result;
     let latency_ms = context
@@ -968,7 +968,7 @@ pub(super) async fn respond_arkpulse_fix(
 
 pub(super) async fn arkpulse_cleanup_preview(
     State(state): State<AppState>,
-    Json(_request): Json<ArkPulseCleanupPreviewRequest>,
+    Json(_request): Json<PulseCleanupPreviewRequest>,
 ) -> Response {
     let state_for_worker = state.clone();
     let worker = tokio::spawn(async move {
@@ -995,7 +995,7 @@ pub(super) async fn arkpulse_cleanup_preview(
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
                     "status": "running",
-                    "message": "Cleanup preview is still running on the ArkPulse worker. Try again shortly."
+                    "message": "Cleanup preview is still running on the Pulse worker. Try again shortly."
                 })),
             )
                 .into_response();
@@ -1048,7 +1048,7 @@ pub(super) async fn run_arkpulse_cleanup(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "confirm_archive must be true before ArkPulse archives managed artifacts"
+                "error": "confirm_archive must be true before Pulse archives managed artifacts"
             })),
         )
             .into_response();
@@ -1061,7 +1061,7 @@ pub(super) async fn run_arkpulse_cleanup(
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "status": "running",
-                "message": "An ArkPulse cleanup worker is already running.",
+                "message": "An Pulse cleanup worker is already running.",
                 "active_job": cleanup_active_job_snapshot().await,
             })),
         )
@@ -1076,7 +1076,7 @@ pub(super) async fn run_arkpulse_cleanup(
         .collect::<Vec<_>>();
     let job_id = uuid::Uuid::new_v4().to_string();
     let queued_at = chrono::Utc::now().to_rfc3339();
-    let snapshot = ArkPulseCleanupJobSnapshot {
+    let snapshot = PulseCleanupJobSnapshot {
         job_id: job_id.clone(),
         status: "queued".to_string(),
         queued_at,
@@ -1114,7 +1114,7 @@ pub(super) async fn run_arkpulse_cleanup(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
             "status": "accepted",
-            "message": "ArkPulse cleanup is running on its background worker.",
+            "message": "Pulse cleanup is running on its background worker.",
             "job_id": job_id,
         })),
     )
@@ -1123,7 +1123,7 @@ pub(super) async fn run_arkpulse_cleanup(
 
 async fn execute_arkpulse_cleanup_job(
     state: AppState,
-    mut snapshot: ArkPulseCleanupJobSnapshot,
+    mut snapshot: PulseCleanupJobSnapshot,
     candidate_ids: Vec<String>,
     event_timestamp: Option<String>,
     finding_index: Option<usize>,
@@ -1272,7 +1272,7 @@ async fn stop_app_runtime_for_artifact_cleanup(
     Ok(())
 }
 
-/// Execute a supported ArkPulse remediation directly (without going through Chat).
+/// Execute a supported Pulse remediation directly (without going through Chat).
 pub(super) async fn run_arkpulse_fix(
     State(state): State<AppState>,
     Json(request): Json<RunArkPulseFixRequest>,
@@ -1296,7 +1296,7 @@ pub(super) async fn run_arkpulse_fix(
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "structured remediation or ArkPulse finding context is required".to_string(),
+                error: "structured remediation or Pulse finding context is required".to_string(),
             }),
         )
             .into_response();
@@ -1340,7 +1340,7 @@ pub(super) async fn run_arkpulse_fix(
             return (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "ArkPulse event not found".to_string(),
+                    error: "Pulse event not found".to_string(),
                 }),
             )
                 .into_response();
@@ -1349,7 +1349,7 @@ pub(super) async fn run_arkpulse_fix(
             return (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "ArkPulse finding index is out of range".to_string(),
+                    error: "Pulse finding index is out of range".to_string(),
                 }),
             )
                 .into_response();
@@ -1358,7 +1358,7 @@ pub(super) async fn run_arkpulse_fix(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "This ArkPulse finding is advisory-only and must be fixed manually"
+                    error: "This Pulse finding is advisory-only and must be fixed manually"
                         .to_string(),
                 }),
             )
@@ -1381,18 +1381,17 @@ pub(super) async fn run_arkpulse_fix(
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "This finding has no executable ArkPulse auto-fix.".to_string(),
+                error: "This finding has no executable Pulse auto-fix.".to_string(),
             }),
         )
             .into_response();
     };
 
-    if matches!(plan, ArkPulseFixPlan::ManagedAppOperation { .. }) && !request_has_event_context {
+    if matches!(plan, PulseFixPlan::ManagedAppOperation { .. }) && !request_has_event_context {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "Managed app ArkPulse fixes must come from a stored ArkPulse finding."
-                    .to_string(),
+                error: "Managed app Pulse fixes must come from a stored Pulse finding.".to_string(),
             }),
         )
             .into_response();
@@ -1403,13 +1402,13 @@ pub(super) async fn run_arkpulse_fix(
     let fix_summary =
         describe_arkpulse_remediation(effective_remediation.as_ref(), &effective_fix_command);
     tracing::info!(
-        "ArkPulse fix requested: issue='{}' target='{}' command='{}'",
+        "Pulse fix requested: issue='{}' target='{}' command='{}'",
         issue_title,
         target,
         truncate_for_response(&fix_summary, 220)
     );
 
-    let audit = ArkPulseFixAuditDetails {
+    let audit = PulseFixAuditDetails {
         plan: &plan,
         issue_title: &issue_title,
         target: &target,
@@ -1418,7 +1417,7 @@ pub(super) async fn run_arkpulse_fix(
         finding_index: selected_finding_index,
     };
 
-    if let ArkPulseFixPlan::AppRestart(app_id) = &plan {
+    if let PulseFixPlan::AppRestart(app_id) = &plan {
         match assess_auto_heal_viability(&state, app_id).await {
             HealViability::Recoverable => {
                 spawn_arkpulse_app_restart_fix(
@@ -1436,7 +1435,7 @@ pub(super) async fn run_arkpulse_fix(
                         "status": "accepted",
                         "mode": "app_restart",
                         "app_id": app_id,
-                        "message": "Queued app restart. ArkPulse will apply it in the background while the control plane stays responsive."
+                        "message": "Queued app restart. Pulse will apply it in the background while the control plane stays responsive."
                     })),
                 )
                     .into_response();
@@ -1455,7 +1454,7 @@ pub(super) async fn run_arkpulse_fix(
                 );
                 return respond_arkpulse_fix(
                     &state,
-                    ArkPulseFixResponseContext { audit, started_at },
+                    PulseFixResponseContext { audit, started_at },
                     result,
                 )
                 .await;
@@ -1479,7 +1478,7 @@ pub(super) async fn run_arkpulse_fix(
                 );
                 return respond_arkpulse_fix(
                     &state,
-                    ArkPulseFixResponseContext { audit, started_at },
+                    PulseFixResponseContext { audit, started_at },
                     result,
                 )
                 .await;
@@ -1497,7 +1496,7 @@ pub(super) async fn run_arkpulse_fix(
                 );
                 return respond_arkpulse_fix(
                     &state,
-                    ArkPulseFixResponseContext { audit, started_at },
+                    PulseFixResponseContext { audit, started_at },
                     result,
                 )
                 .await;
@@ -1507,7 +1506,7 @@ pub(super) async fn run_arkpulse_fix(
 
     let execution = async {
         match &plan {
-            ArkPulseFixPlan::TunnelStartVerify => {
+            PulseFixPlan::TunnelStartVerify => {
                 let tunnel_arc = state.tunnel.clone();
                 if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
                     arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error)
@@ -1543,7 +1542,7 @@ pub(super) async fn run_arkpulse_fix(
                     )
                 }
             }
-            ArkPulseFixPlan::TunnelRestartVerify => {
+            PulseFixPlan::TunnelRestartVerify => {
                 tunnel::stop_tunnel_internal(&state).await;
                 let tunnel_arc = state.tunnel.clone();
                 if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
@@ -1580,11 +1579,11 @@ pub(super) async fn run_arkpulse_fix(
                     )
                 }
             }
-            ArkPulseFixPlan::AppRestart(_) => unreachable!("app_restart handled above"),
-            ArkPulseFixPlan::ManagedAppOperation { app_id, operation } => {
+            PulseFixPlan::AppRestart(_) => unreachable!("app_restart handled above"),
+            PulseFixPlan::ManagedAppOperation { app_id, operation } => {
                 run_arkpulse_managed_app_operation_fix(&state, app_id, operation).await
             }
-            ArkPulseFixPlan::ReadonlyInvestigation { topic } => {
+            PulseFixPlan::ReadonlyInvestigation { topic } => {
                 run_arkpulse_readonly_investigation_fix(&state, topic).await
             }
         }
@@ -1594,7 +1593,7 @@ pub(super) async fn run_arkpulse_fix(
         Err(_) => arkpulse_error_result(
             StatusCode::GATEWAY_TIMEOUT,
             format!(
-                "ArkPulse {} timed out. The control plane aborted the remediation to stay responsive.",
+                "Pulse {} timed out. The control plane aborted the remediation to stay responsive.",
                 arkpulse_fix_plan_label(&plan)
             ),
         ),
@@ -1602,13 +1601,13 @@ pub(super) async fn run_arkpulse_fix(
 
     respond_arkpulse_fix(
         &state,
-        ArkPulseFixResponseContext { audit, started_at },
+        PulseFixResponseContext { audit, started_at },
         result,
     )
     .await
 }
 
-/// Return the ArkPulse event log (last 100 events)
+/// Return the Pulse event log (last 100 events)
 pub(super) async fn get_pulse_log(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -1649,7 +1648,7 @@ pub(super) async fn get_pulse_log(
         "running": crate::sentinel::is_pulse_running(),
         "history_unavailable": total == 0 && has_persisted_payload,
         "history_unavailable_reason": if total == 0 && has_persisted_payload {
-            Some("A persisted ArkPulse history payload exists but could not be read. New runs will appear normally.")
+            Some("A persisted Pulse history payload exists but could not be read. New runs will appear normally.")
         } else {
             None::<&str>
         }
@@ -1669,17 +1668,17 @@ pub(super) async fn trigger_arkpulse_after_app_change(state: &AppState, reason: 
     }
     let agent = state.agent.clone();
     crate::spawn_logged!("src/channels/http.rs:13513", async move {
-        tracing::info!("ArkPulse auto-triggered after {}", reason);
+        tracing::info!("Pulse auto-triggered after {}", reason);
         crate::sentinel::run_pulse(&agent).await;
     });
 }
 
-/// Trigger an ArkPulse check immediately
+/// Trigger an Pulse check immediately
 pub(super) async fn trigger_pulse(State(state): State<AppState>) -> Json<serde_json::Value> {
     if crate::sentinel::is_pulse_running() {
         return Json(serde_json::json!({
             "status": "running",
-            "message": "ArkPulse is already running"
+            "message": "Pulse is already running"
         }));
     }
     {
@@ -1688,7 +1687,7 @@ pub(super) async fn trigger_pulse(State(state): State<AppState>) -> Json<serde_j
         if autonomy_background_disabled(&autonomy) {
             return Json(serde_json::json!({
                 "status": "paused",
-                "message": "Autonomy is disabled. Re-enable autonomy to run ArkPulse."
+                "message": "Autonomy is disabled. Re-enable autonomy to run Pulse."
             }));
         }
     }
@@ -1696,5 +1695,5 @@ pub(super) async fn trigger_pulse(State(state): State<AppState>) -> Json<serde_j
     crate::spawn_logged!("src/channels/http.rs:13538", async move {
         crate::sentinel::run_pulse(&agent).await;
     });
-    Json(serde_json::json!({ "status": "triggered", "message": "ArkPulse check started" }))
+    Json(serde_json::json!({ "status": "triggered", "message": "Pulse check started" }))
 }

@@ -24,12 +24,17 @@ import {
   TableHead,
   TableRow,
   TextField,
+  Tooltip,
   Typography
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
+import EditRoundedIcon from "@mui/icons-material/EditRounded";
+import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
+import VpnKeyRoundedIcon from "@mui/icons-material/VpnKeyRounded";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
@@ -54,28 +59,8 @@ const OAUTH_SIGNAL_CHANNEL = "agentark-oauth";
 const OAUTH_PENDING_TIMEOUT_MS = 2 * 60 * 1000;
 const OAUTH_COMPLETION_REFRESH_DELAYS_MS = [0, 500, 1500, 3500, 7000];
 
-const CHANNEL_ICON_COLORS: Record<string, string> = {
-  email: "#14B8A6",
-  telegram: "#26A5E4",
-  whatsapp: "#25D366",
-  slack: "#4A154B",
-  discord: "#5865F2",
-  matrix: "#0DBD8B",
-  teams: "#6264A7",
-  google_chat: "#34A853",
-  signal: "#3A76F0",
-  imessage: "#147EFB",
-  line: "#06C755",
-  wechat: "#07C160",
-  qq: "#12B7F5",
-  "web search": "#69e2ff",
-  google_workspace: "#4285F4",
-  github: "#f0f0f0",
-  jira: "#0052CC",
-  sentry: "#362D59",
-  notion: "#ffffff",
-  linear: "#5E6AD2",
-};
+const CHANNEL_ICON_FALLBACK_BG = "#78f2b0";
+const CHANNEL_ICON_FALLBACK_TEXT = "var(--ui-rgba-0-0-0-850)";
 
 // Channel & integration SVG icon imports
 import iconTelegram from "../assets/icons/telegram.svg";
@@ -150,7 +135,7 @@ export function ChannelIcon({ name, size = 20 }: { name: string; size?: number }
       />
     );
   }
-  const color = CHANNEL_ICON_COLORS[key] || "var(--ui-rgba-180-200-225-600)";
+  const color = CHANNEL_ICON_FALLBACK_BG;
   const letter = name.charAt(0).toUpperCase();
   return (
     <Box
@@ -166,7 +151,7 @@ export function ChannelIcon({ name, size = 20 }: { name: string; size?: number }
         flexShrink: 0,
         fontSize: size * 0.55,
         fontWeight: 800,
-        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "var(--ui-rgba-0-0-0-850)" : "#fff",
+        color: CHANNEL_ICON_FALLBACK_TEXT,
         lineHeight: 1,
       }}
     >
@@ -175,9 +160,8 @@ export function ChannelIcon({ name, size = 20 }: { name: string; size?: number }
   );
 }
 
-function ConnectorIcon({ id, name, size = 22 }: { id: string; name: string; size?: number }) {
-  const key = id.toLowerCase();
-  const color = CHANNEL_ICON_COLORS[key] || "var(--ui-rgba-108-156-212-300)";
+function ConnectorIcon({ name, size = 22 }: { id: string; name: string; size?: number }) {
+  const color = CHANNEL_ICON_FALLBACK_BG;
   const letter = name.charAt(0).toUpperCase();
   return (
     <Box
@@ -193,7 +177,7 @@ function ConnectorIcon({ id, name, size = 22 }: { id: string; name: string; size
         flexShrink: 0,
         fontSize: size * 0.5,
         fontWeight: 800,
-        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "var(--ui-rgba-0-0-0-850)" : "#fff",
+        color: CHANNEL_ICON_FALLBACK_TEXT,
         lineHeight: 1,
       }}
     >
@@ -893,6 +877,7 @@ export function IntegrationsPanel({
   const [mcpHasStoredAuth, setMcpHasStoredAuth] = useState(false);
   const [mcpError, setMcpError] = useState<string | null>(null);
   const [mcpNotice, setMcpNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const [locallyDeletedMcpIds, setLocallyDeletedMcpIds] = useState<Set<string>>(() => new Set());
   const [sshNotice, setSshNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [sshKeyDialogOpen, setSshKeyDialogOpen] = useState(false);
   const [sshConnDialogOpen, setSshConnDialogOpen] = useState(false);
@@ -1710,6 +1695,21 @@ export function IntegrationsPanel({
       : "Not configured"
   );
   const mcpServers = showMcp ? asRecords(asRecord(mcpQ.data).servers) : [];
+  useEffect(() => {
+    if (locallyDeletedMcpIds.size === 0) return;
+    const listedIds = new Set(mcpServers.map((server) => str(server.id, "")).filter(Boolean));
+    setLocallyDeletedMcpIds((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of prev) {
+        if (!listedIds.has(id)) {
+          next.delete(id);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [locallyDeletedMcpIds.size, mcpServers]);
   const sorted = useMemo(
     () =>
       [...integrations].sort((a, b) => {
@@ -1866,8 +1866,11 @@ export function IntegrationsPanel({
     boxShadow: "none"
   } as const;
   const mcpSorted = useMemo(
-    () => [...mcpServers].sort((a, b) => str(a.name, "").localeCompare(str(b.name, ""))),
-    [mcpServers]
+    () =>
+      mcpServers
+        .filter((server) => !locallyDeletedMcpIds.has(str(server.id, "")))
+        .sort((a, b) => str(a.name, "").localeCompare(str(b.name, ""))),
+    [locallyDeletedMcpIds, mcpServers]
   );
   const sshKeyNames = asStringList(asRecord(sshKeysQ.data).keys).sort((a, b) => a.localeCompare(b));
   const sshConnectionsText = str(asRecord(sshConnectionsQ.data).connections, "");
@@ -3257,16 +3260,6 @@ export function IntegrationsPanel({
         };
       }
 
-      // Warn if auth type set but no credentials provided (for new servers)
-      if (!mcpEditingId && mcpForm.auth_type !== "none") {
-          const hasCredential = mcpForm.auth_type === "basic"
-              ? (mcpForm.auth_username.trim() || mcpForm.auth_password.trim())
-              : mcpForm.auth_token.trim();
-          if (!hasCredential) {
-              throw new Error(`Auth type "${mcpForm.auth_type}" selected but no credentials provided. Add credentials or set auth to "none".`);
-          }
-      }
-
       if (mcpEditingId) {
         await api.rawPut(`/mcp/servers/${encodeURIComponent(mcpEditingId)}`, payload);
       } else {
@@ -3274,6 +3267,15 @@ export function IntegrationsPanel({
       }
     },
     onSuccess: async () => {
+      const savedId = mcpEditingId || mcpForm.id.trim();
+      if (savedId) {
+        setLocallyDeletedMcpIds((prev) => {
+          if (!prev.has(savedId)) return prev;
+          const next = new Set(prev);
+          next.delete(savedId);
+          return next;
+        });
+      }
       setMcpNotice({ kind: "success", text: mcpEditingId ? "MCP server updated." : "MCP server created." });
       closeMcpDialog();
       await syncAfterMcpMutation();
@@ -3285,7 +3287,12 @@ export function IntegrationsPanel({
 
   const deleteMcpMutation = useMutation({
     mutationFn: (id: string) => api.rawDelete(`/mcp/servers/${encodeURIComponent(id)}`),
-    onSuccess: async () => {
+    onSuccess: async (_data, id) => {
+      setLocallyDeletedMcpIds((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
       setMcpNotice({ kind: "success", text: "MCP server deleted." });
       await syncAfterMcpMutation();
     },
@@ -3508,7 +3515,7 @@ export function IntegrationsPanel({
     } catch (err) {
       if (authWindow && !authWindow.closed) {
         authWindow.document.write(
-          `<!doctype html><title>Sign-in failed</title><body style="font-family:system-ui;background:#0b1320;color:#dce7f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;"><div style="max-width:420px;background:#102236;border:1px solid var(--ui-rgba-112-153-201-180);border-radius:16px;padding:20px;"><h2 style="margin:0 0 12px;font-size:18px;">Sign-in could not start</h2><p style="margin:0;color:#a9bdd6;line-height:1.5;">${String(asErrorMessage(err))
+          `<!doctype html><title>Sign-in failed</title><body style="font-family:system-ui;background:#0b1320;color:#dce7f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;"><div style="max-width:420px;background:#102236;border:1px solid var(--ui-rgba-112-153-201-180);border-radius:16px;padding:20px;"><h2 style="margin:0 0 12px;font-size:18px;">Sign-in could not start</h2><p style="margin:0;color:#d8d0c4;line-height:1.5;">${String(asErrorMessage(err))
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
             .replace(/>/g, "&gt;")}</p></div></body>`
@@ -3727,7 +3734,7 @@ export function IntegrationsPanel({
             <Typography variant="caption" sx={{
               color: "text.secondary"
             }}>
-              Configure delivery transports and review live channel health. If something looks off, run ArkPulse for diagnostics.
+              Configure delivery transports and review live channel health. If something looks off, run Pulse for diagnostics.
             </Typography>
           ) : mode === "connectors" ? (
             <Typography variant="caption" sx={{
@@ -3741,10 +3748,10 @@ export function IntegrationsPanel({
                 variant="body2"
                 sx={{
                   fontWeight: 700,
-                  color: "#69e2ff"
+                  color: "#78f2b0"
                 }}
               >
-                Finish channel onboarding here. If you need a health check later, run ArkPulse.
+                Finish channel onboarding here. If you need a health check later, run Pulse.
               </Typography>
               <Typography variant="caption" sx={{
                 color: "text.secondary"
@@ -3758,7 +3765,7 @@ export function IntegrationsPanel({
                 variant="body2"
                 sx={{
                   fontWeight: 700,
-                  color: "#69e2ff"
+                  color: "#78f2b0"
                 }}
               >
                 Built-in integrations and custom integrations are managed separately here.
@@ -4719,7 +4726,7 @@ export function IntegrationsPanel({
               <Typography variant="caption" sx={{
                 color: "text.secondary"
               }}>
-                Onboard Slack, Discord, Matrix, and Teams here. If something looks off later, run ArkPulse for diagnostics.
+                Onboard Slack, Discord, Matrix, and Teams here. If something looks off later, run Pulse for diagnostics.
               </Typography>
             </Box>
             {channelsQ.error ? (
@@ -5112,77 +5119,163 @@ export function IntegrationsPanel({
             No MCP servers configured.
           </Typography>
         ) : (
-          <Grid2 container spacing={1.5} sx={{ mt: 0.5 }}>
+          <Grid2 container spacing={1} sx={{ mt: 1 }}>
             {mcpSorted.map((server) => {
               const id = str(server.id, "");
               const warnings = asStringList(server.warnings);
               const lastError = str(server.last_error, "");
               const tools = asRecords(server.tools);
               const resources = asRecords(server.resources);
+              const auth = asRecord(server.auth);
+              const authType = str(auth.auth_type, "none");
+              const hasAuth = toBool(auth.has_auth);
+              const needsAuth = authType !== "none" && !hasAuth;
+              const hasError = Boolean(lastError);
+              const statusLabel = hasError
+                ? "Error"
+                : toBool(server.enabled)
+                  ? "Enabled"
+                  : "Disabled";
+              const statusColor = hasError
+                ? "error"
+                : toBool(server.enabled)
+                  ? "success"
+                  : "default";
               return (
-                <Grid2 key={id || str(server.name, Math.random().toString())} size={{ xs: 12, md: 6 }}>
-                  <Box className="list-shell" sx={{ minHeight: 0 }}>
-                    <Stack spacing={1}>
+                <Grid2 key={id || str(server.name, Math.random().toString())} size={{ xs: 12, sm: 6, xl: 4 }}>
+                  <Box
+                    sx={{
+                      height: "100%",
+                      p: 1,
+                      borderRadius: "8px",
+                      border: "1px solid",
+                      borderColor: hasError
+                        ? "rgba(248, 113, 113, 0.36)"
+                        : needsAuth
+                          ? "rgba(245, 158, 11, 0.35)"
+                          : "divider",
+                      background: hasError
+                        ? "rgba(127, 29, 29, 0.08)"
+                        : needsAuth
+                          ? "rgba(120, 53, 15, 0.08)"
+                          : "rgba(255,255,255,0.018)",
+                      transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                      "&:hover": {
+                        borderColor: hasError
+                          ? "rgba(248, 113, 113, 0.55)"
+                          : needsAuth
+                            ? "rgba(245, 158, 11, 0.55)"
+                            : "rgba(120, 242, 176, 0.32)",
+                        boxShadow: "0 2px 12px var(--ui-rgba-0-0-0-200)"
+                      }
+                    }}
+                  >
+                    <Stack spacing={0.75} sx={{ height: "100%" }}>
                       <Stack
                         direction="row"
+                        spacing={1}
                         sx={{
                           alignItems: "center",
                           justifyContent: "space-between"
                         }}>
-                        <Typography variant="subtitle1" sx={{
-                          fontWeight: 700
-                        }}>
-                          {str(server.name, "(unnamed)")}
-                        </Typography>
-                        <Stack direction="row" spacing={0.5}>
-                          <Chip
-                            size="small"
-                            label={toBool(server.enabled) ? "enabled" : "disabled"}
-                            color={toBool(server.enabled) ? "success" : "default"}
-                          />
-                          <Chip
-                            size="small"
-                            label={toBool(server.resources_enabled) ? "resources on" : "resources off"}
-                            color={toBool(server.resources_enabled) ? "warning" : "default"}
-                          />
-                        </Stack>
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography variant="subtitle2" noWrap sx={{ fontWeight: 750 }}>
+                            {str(server.name, "(unnamed)")}
+                          </Typography>
+                        </Box>
+                        <Chip
+                          size="small"
+                          label={statusLabel}
+                          color={statusColor}
+                          variant={hasError ? "filled" : "outlined"}
+                          sx={{ height: 20, fontSize: "0.65rem", fontWeight: 700 }}
+                        />
                       </Stack>
-                      <Typography variant="body2" sx={{
-                        color: "text.secondary"
-                      }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          lineHeight: 1.35,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 1,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden"
+                        }}
+                      >
                         {str(server.description, "No description")}
                       </Typography>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        {transportSummary(server)}
-                      </Typography>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        Auth: {authSummary(server)} | Tools: {str(server.tool_count, "0")} | Resources: {str(server.resource_count, "0")}
-                      </Typography>
-                      {lastError ? <Alert severity="error">{lastError}</Alert> : null}
+                      <Stack spacing={0.15}>
+                        <Typography variant="caption" sx={{ color: "text.secondary", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {transportSummary(server)}
+                        </Typography>
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                          Auth: {authSummary(server)} | Tools: {str(server.tool_count, "0")} | Resources: {str(server.resource_count, "0")}
+                        </Typography>
+                      </Stack>
+                      <Stack direction="row" useFlexGap sx={{ flexWrap: "wrap", gap: 0.5 }}>
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          label={toBool(server.resources_enabled) ? "resources on" : "resources off"}
+                          color={toBool(server.resources_enabled) ? "warning" : "default"}
+                          sx={{ height: 20, fontSize: "0.65rem" }}
+                        />
+                        {authType !== "none" ? (
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            label={hasAuth ? "auth configured" : "auth needed"}
+                            color={needsAuth ? "warning" : "default"}
+                            sx={{ height: 20, fontSize: "0.65rem" }}
+                          />
+                        ) : null}
+                      </Stack>
+                      {lastError ? (
+                        <Alert
+                          severity="error"
+                          sx={{
+                            py: 0.25,
+                            px: 0.75,
+                            fontSize: "0.74rem",
+                            "& .MuiAlert-icon": { py: 0.2 },
+                            "& .MuiAlert-message": {
+                              py: 0.2,
+                              display: "-webkit-box",
+                              WebkitLineClamp: 2,
+                              WebkitBoxOrient: "vertical",
+                              overflow: "hidden"
+                            }
+                          }}
+                        >
+                          {lastError}
+                        </Alert>
+                      ) : null}
                       {warnings.length > 0 ? (
-                        <Alert severity="warning">{warnings.slice(0, 2).join(" ")}</Alert>
+                        <Alert
+                          severity="warning"
+                          sx={{
+                            py: 0.25,
+                            px: 0.75,
+                            fontSize: "0.74rem",
+                            "& .MuiAlert-icon": { py: 0.2 },
+                            "& .MuiAlert-message": {
+                              py: 0.2,
+                              display: "-webkit-box",
+                              WebkitLineClamp: 2,
+                              WebkitBoxOrient: "vertical",
+                              overflow: "hidden"
+                            }
+                          }}
+                        >
+                          {warnings.slice(0, 2).join(" ")}
+                        </Alert>
                       ) : null}
                       {tools.length > 0 ? (
-                        <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
-                          <Typography variant="caption" sx={{ fontWeight: 700 }}>Reviewed tools</Typography>
-                          <Stack spacing={0.75} sx={{ mt: 0.75 }}>
-                            {tools.slice(0, 4).map((tool) => (
-                              <Box key={str(tool.name)} sx={{ minWidth: 0 }}>
-                                <Typography variant="caption" sx={{ fontWeight: 650 }}>{str(tool.name)}</Typography>
-                                <Typography variant="caption" sx={{ color: "text.secondary", display: "block", overflowWrap: "anywhere" }}>
-                                  {str(tool.description, "No description")}
-                                </Typography>
-                                <Typography component="pre" variant="caption" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", m: 0, color: "text.secondary" }}>
-                                  {JSON.stringify(tool.input_schema ?? {}, null, 2).slice(0, 700)}
-                                </Typography>
-                              </Box>
-                            ))}
-                          </Stack>
-                        </Box>
+                        <Stack direction="row" useFlexGap sx={{ flexWrap: "wrap", gap: 0.5 }}>
+                          {tools.slice(0, 4).map((tool) => (
+                            <Chip key={str(tool.name)} size="small" variant="outlined" label={str(tool.name, "tool")} />
+                          ))}
+                        </Stack>
                       ) : null}
                       {resources.length > 0 ? (
                         <Stack direction="row" useFlexGap sx={{ flexWrap: "wrap", gap: 0.5 }}>
@@ -5191,34 +5284,64 @@ export function IntegrationsPanel({
                           ))}
                         </Stack>
                       ) : null}
-                      <Stack direction="row" sx={{
-                        justifyContent: "flex-end"
-                      }}>
-                        <CardActionsMenu
-                          ariaLabel={`${str(server.name, "MCP server")} options`}
-                          actions={[
-                            {
-                              label: "Edit",
-                              onClick: () => openEditMcp(server)
-                            },
-                            {
-                              label: "Refresh",
-                              disabled: refreshMcpMutation.isPending || !id,
-                              onClick: () => refreshMcpMutation.mutate(id)
-                            },
-                            {
-                              label: "Delete",
-                              tone: "error",
-                              divider: true,
-                              disabled: deleteMcpMutation.isPending || !id,
-                              onClick: () => {
-                                if (!id) return;
-                                if (!window.confirm(`Delete MCP server '${str(server.name, id)}'?`)) return;
-                                deleteMcpMutation.mutate(id);
-                              }
-                            }
-                          ]}
-                        />
+                      <Stack
+                        direction="row"
+                        useFlexGap
+                        sx={{
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                          gap: 0.5,
+                          pt: 0.25
+                        }}
+                      >
+                        {authType !== "none" ? (
+                          <Button
+                            size="small"
+                            variant={needsAuth ? "contained" : "outlined"}
+                            startIcon={<VpnKeyRoundedIcon fontSize="small" />}
+                            sx={{ minHeight: 28, px: 1, fontSize: "0.72rem" }}
+                            onClick={() => openEditMcp(server)}
+                          >
+                            {needsAuth ? "Credentials" : "Auth"}
+                          </Button>
+                        ) : null}
+                        <Stack direction="row" spacing={0.5}>
+                          <Tooltip title="Edit MCP server">
+                            <span>
+                              <IconButton size="small" onClick={() => openEditMcp(server)}>
+                                <EditRoundedIcon fontSize="small" />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                          <Tooltip title="Refresh tools and resources">
+                            <span>
+                              <IconButton
+                                size="small"
+                                disabled={refreshMcpMutation.isPending || !id}
+                                onClick={() => refreshMcpMutation.mutate(id)}
+                              >
+                                <RefreshRoundedIcon fontSize="small" />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                          <Tooltip title="Delete MCP server">
+                            <span>
+                              <IconButton
+                                size="small"
+                                color="error"
+                                disabled={deleteMcpMutation.isPending || !id}
+                                onClick={() => {
+                                  if (!id) return;
+                                  if (!window.confirm(`Delete MCP server '${str(server.name, id)}'?`)) return;
+                                  deleteMcpMutation.mutate(id);
+                                }}
+                              >
+                                <DeleteRoundedIcon fontSize="small" />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        </Stack>
                       </Stack>
                     </Stack>
                   </Box>
@@ -7020,7 +7143,7 @@ export function IntegrationsPanel({
                         <Typography variant="caption" sx={{
                           color: "text.secondary"
                         }}>
-                          Defaults to ArkPulse cadence: every 30 minutes. Use a shorter interval only when this integration needs closer polling.
+                          Defaults to Pulse cadence: every 30 minutes. Use a shorter interval only when this integration needs closer polling.
                         </Typography>
                       </Box>
                       <Chip
@@ -7435,6 +7558,11 @@ export function IntegrationsPanel({
             {mcpHasStoredAuth ? (
               <Alert severity="info">
                 Stored credentials exist for this server. Leave secret fields blank to keep them, or enable clear auth.
+              </Alert>
+            ) : null}
+            {mcpForm.auth_type !== "none" && !mcpHasStoredAuth ? (
+              <Alert severity="info">
+                You can save the server without entering credentials. Add them here or use the secure credential form in chat; secret fields are stored encrypted.
               </Alert>
             ) : null}
             {!mcpEditingId ? (

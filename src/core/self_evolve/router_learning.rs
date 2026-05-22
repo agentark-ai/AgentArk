@@ -1,4 +1,4 @@
-//! Router-layer learning contracts for ArkEvolve.
+//! Router-layer learning contracts for Evolve.
 //!
 //! This module intentionally models router learning as data-level candidates.
 //! Runtime router code changes remain outside automatic promotion.
@@ -162,12 +162,17 @@ pub fn validate_router_learning_candidate(
     if payload.evidence.is_empty() {
         return Err("router learning candidate requires replayable trace evidence".to_string());
     }
-    if payload
-        .evidence
-        .iter()
-        .any(|evidence| evidence.failed_layer.as_deref().unwrap_or_default().trim().is_empty())
-    {
-        return Err("each router learning evidence item must identify the failed layer".to_string());
+    if payload.evidence.iter().any(|evidence| {
+        evidence
+            .failed_layer
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    }) {
+        return Err(
+            "each router learning evidence item must identify the failed layer".to_string(),
+        );
     }
     if payload.evidence.iter().any(|evidence| {
         evidence
@@ -306,8 +311,9 @@ pub fn trace_evidence_from_semantic_steps(
             evidence.native_schema_count = data
                 .get("native_schema_count")
                 .and_then(|value| value.as_u64());
-            evidence.last_prompt_chars =
-                data.get("last_prompt_chars").and_then(|value| value.as_u64());
+            evidence.last_prompt_chars = data
+                .get("last_prompt_chars")
+                .and_then(|value| value.as_u64());
             evidence.router_budget = Some(data);
             continue;
         }
@@ -483,7 +489,9 @@ fn looks_like_plan_verification(data: &serde_json::Value) -> bool {
 fn looks_like_capability_resolution(data: &serde_json::Value) -> bool {
     data.as_array().is_some_and(|steps| {
         steps.iter().any(|step| {
-            step.get("goal_id").and_then(|value| value.as_str()).is_some()
+            step.get("goal_id")
+                .and_then(|value| value.as_str())
+                .is_some()
                 && (step.get("action_name").is_some()
                     || step
                         .get("respond_without_tool")

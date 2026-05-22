@@ -41,6 +41,13 @@ pub enum LlmProvider {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct LlmImageAttachment {
+    pub mime_type: String,
+    pub data_base64: String,
+    pub label: Option<String>,
+}
+
 impl std::fmt::Debug for LlmProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -699,7 +706,10 @@ fn queue_stream_event(token_tx: &Sender<StreamEvent>, event: StreamEvent) {
 
 fn reasoning_phase_is_user_visible(phase: &str) -> bool {
     let normalized = phase.trim().to_ascii_lowercase();
-    normalized.ends_with("_summary") || normalized.contains("summary")
+    matches!(
+        normalized.as_str(),
+        "model" | "model_summary" | "reasoning" | "reasoning_summary"
+    )
 }
 
 fn queue_reasoning_delta(token_tx: &Sender<StreamEvent>, phase: &str, content_delta: String) {
@@ -1148,9 +1158,10 @@ fn build_openai_responses_request(
     prompt_cache_key: Option<String>,
     prompt_cache_retention: Option<String>,
 ) -> serde_json::Value {
+    let prompt_cache = prompt_cache_plan(system_prompt);
     let mut request = serde_json::json!({
         "model": model,
-        "instructions": system_prompt,
+        "instructions": prompt_cache.visible_prompt,
         "stream": stream,
         "store": false,
     });
@@ -1242,6 +1253,113 @@ fn openai_cached_prompt_tokens_from_usage_value(usage: &serde_json::Value) -> u6
         .and_then(|details| details.get("cached_tokens"))
         .and_then(|value| value.as_u64())
         .unwrap_or(0)
+}
+
+const PROMPT_CACHE_FRAGMENT_BEGIN_PREFIX: &str = "[[agentark_prompt_fragment ";
+const PROMPT_CACHE_FRAGMENT_END: &str = "[[/agentark_prompt_fragment]]";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptCacheBlock {
+    text: String,
+    cacheable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptCachePlan {
+    visible_prompt: String,
+    cache_key_material: String,
+    blocks: Vec<PromptCacheBlock>,
+}
+
+fn push_prompt_cache_block(blocks: &mut Vec<PromptCacheBlock>, text: String, cacheable: bool) {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = blocks.last_mut() {
+        if last.cacheable == cacheable {
+            if !last.text.is_empty() {
+                last.text.push_str("\n\n");
+            }
+            last.text.push_str(&text);
+            return;
+        }
+    }
+    blocks.push(PromptCacheBlock { text, cacheable });
+}
+
+fn prompt_fragment_marker_cacheable(line: &str) -> Option<bool> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(PROMPT_CACHE_FRAGMENT_BEGIN_PREFIX) || !trimmed.ends_with("]]") {
+        return None;
+    }
+    Some(trimmed.contains(" layer=stable_prefix "))
+}
+
+fn prompt_cache_plan(system_prompt: &str) -> PromptCachePlan {
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    let mut in_fragment = false;
+    let mut current_cacheable = false;
+    let mut saw_fragment_markers = false;
+
+    for line in system_prompt.lines() {
+        if let Some(cacheable) = prompt_fragment_marker_cacheable(line) {
+            push_prompt_cache_block(&mut blocks, std::mem::take(&mut current), current_cacheable);
+            in_fragment = true;
+            current_cacheable = cacheable;
+            saw_fragment_markers = true;
+            continue;
+        }
+        if line.trim() == PROMPT_CACHE_FRAGMENT_END {
+            push_prompt_cache_block(&mut blocks, std::mem::take(&mut current), current_cacheable);
+            in_fragment = false;
+            current_cacheable = false;
+            continue;
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+    push_prompt_cache_block(
+        &mut blocks,
+        std::mem::take(&mut current),
+        saw_fragment_markers && in_fragment && current_cacheable,
+    );
+
+    if !saw_fragment_markers {
+        let visible_prompt = system_prompt.trim().to_string();
+        return PromptCachePlan {
+            visible_prompt: visible_prompt.clone(),
+            cache_key_material: visible_prompt.clone(),
+            blocks: vec![PromptCacheBlock {
+                text: visible_prompt,
+                cacheable: true,
+            }],
+        };
+    }
+
+    let visible_prompt = blocks
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let cache_key_material = blocks
+        .iter()
+        .filter(|block| block.cacheable)
+        .map(|block| block.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    PromptCachePlan {
+        visible_prompt: visible_prompt.clone(),
+        cache_key_material: if cache_key_material.trim().is_empty() {
+            visible_prompt
+        } else {
+            cache_key_material
+        },
+        blocks,
+    }
 }
 
 fn parse_json_f64(value: &serde_json::Value) -> Option<f64> {
@@ -1344,10 +1462,11 @@ fn openai_prompt_cache_key(
     system_prompt: &str,
     actions: &[crate::actions::ActionDef],
 ) -> String {
+    let prompt_cache = prompt_cache_plan(system_prompt);
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"agentark-llm-cache-v1");
     hasher.update(scope.as_bytes());
-    hasher.update(system_prompt.as_bytes());
+    hasher.update(prompt_cache.cache_key_material.as_bytes());
     let mut sorted_actions = actions.iter().collect::<Vec<_>>();
     sorted_actions.sort_by(|left, right| left.name.cmp(&right.name));
     for action in sorted_actions {
@@ -1365,11 +1484,15 @@ fn openai_prompt_cache_key(
 }
 
 fn prompt_cache_uses_openai_explicit_key(capability: PromptCacheCapability) -> bool {
-    matches!(capability, PromptCacheCapability::OpenAiExplicitKey)
+    matches!(
+        capability,
+        PromptCacheCapability::OpenAiExplicitKey
+            | PromptCacheCapability::OpenRouterProviderSpecific
+    )
 }
 
 fn openai_prompt_cache_retention(capability: PromptCacheCapability) -> Option<String> {
-    if !prompt_cache_uses_openai_explicit_key(capability) {
+    if !matches!(capability, PromptCacheCapability::OpenAiExplicitKey) {
         return None;
     }
     let configured = std::env::var("AGENTARK_OPENAI_PROMPT_CACHE_RETENTION")
@@ -1417,14 +1540,26 @@ fn openrouter_message_content_with_cache_control(
     text: String,
     capability: PromptCacheCapability,
 ) -> serde_json::Value {
+    let prompt_cache = prompt_cache_plan(&text);
     if let Some(cache_control) = openrouter_prompt_cache_control(capability) {
-        serde_json::json!([{
-            "type": "text",
-            "text": text,
-            "cache_control": cache_control,
-        }])
+        serde_json::Value::Array(
+            prompt_cache
+                .blocks
+                .into_iter()
+                .map(|block| {
+                    let mut value = serde_json::json!({
+                        "type": "text",
+                        "text": block.text,
+                    });
+                    if block.cacheable {
+                        value["cache_control"] = cache_control.clone();
+                    }
+                    value
+                })
+                .collect(),
+        )
     } else {
-        serde_json::Value::String(text)
+        serde_json::Value::String(prompt_cache.visible_prompt)
     }
 }
 
@@ -2017,15 +2152,17 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmTokenUsage, ModelRequestMode, ToolCall, append_runtime_temporal_context,
+        LlmImageAttachment, LlmTokenUsage, ModelRequestMode, ToolCall,
+        anthropic_user_content_value, append_runtime_temporal_context,
         attach_runtime_identity_contract, attach_runtime_temporal_context,
         emit_partial_draft_file_previews, extract_openai_reasoning_delta,
         extract_partial_draft_files, generated_output_chars_for_usage,
         json_contains_tool_call_indicators, merge_usage_field, normalize_openai_tool_schema,
         openai_prompt_cache_key, openai_prompt_cache_key_for_config, openai_prompt_cache_retention,
-        openai_stream_data_has_terminal_finish_reason, parse_openai_responses_payload,
-        parse_partial_tool_arguments, prompt_cache_uses_openai_explicit_key,
-        should_request_openai_stream_usage, total_tokens_or_sum, usage_with_generated_output_floor,
+        openai_stream_data_has_terminal_finish_reason, openai_user_content_value,
+        parse_openai_responses_payload, parse_partial_tool_arguments, prompt_cache_plan,
+        prompt_cache_uses_openai_explicit_key, should_request_openai_stream_usage,
+        total_tokens_or_sum, usage_with_generated_output_floor,
     };
     use crate::core::StreamEvent;
     use crate::core::llm_provider::{
@@ -2133,6 +2270,55 @@ mod tests {
         assert!(prompt.contains("Runtime Identity Contract"));
         assert!(prompt.contains("direct-response fields"));
         assert!(prompt.contains(crate::branding::PRODUCT_NAME));
+    }
+
+    #[test]
+    fn openai_user_content_includes_native_image_blocks_when_attachments_exist() {
+        let content = openai_user_content_value(
+            "what is wrong here?",
+            &[LlmImageAttachment {
+                mime_type: "image/png".to_string(),
+                data_base64: "aW1hZ2U=".to_string(),
+                label: Some("image.png".to_string()),
+            }],
+        );
+
+        let blocks = content
+            .as_array()
+            .expect("image attachments should use OpenAI multimodal blocks");
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("what is wrong here?")
+        );
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(
+            blocks[1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn anthropic_user_content_includes_native_image_blocks_when_attachments_exist() {
+        let content = anthropic_user_content_value(
+            "read this screenshot",
+            &[LlmImageAttachment {
+                mime_type: "image/jpeg".to_string(),
+                data_base64: "anBlZw==".to_string(),
+                label: None,
+            }],
+        );
+
+        let blocks = content
+            .as_array()
+            .expect("image attachments should use Anthropic multimodal blocks");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[1]["source"]["data"], "anBlZw==");
     }
 
     #[test]
@@ -2435,10 +2621,40 @@ mod tests {
         assert!(prompt_cache_uses_openai_explicit_key(
             direct.prompt_cache_capability
         ));
+        assert!(prompt_cache_uses_openai_explicit_key(
+            routed.prompt_cache_capability
+        ));
         assert!(openai_prompt_cache_key_for_config(&direct, "chat", "sys", &[]).is_some());
         assert!(openai_prompt_cache_retention(direct.prompt_cache_capability).is_some());
-        assert!(openai_prompt_cache_key_for_config(&routed, "chat", "sys", &[]).is_none());
+        assert!(openai_prompt_cache_key_for_config(&routed, "chat", "sys", &[]).is_some());
         assert!(openai_prompt_cache_retention(routed.prompt_cache_capability).is_none());
+    }
+
+    #[test]
+    fn prompt_cache_key_uses_stable_spine_fragments_not_runtime_context() {
+        let left = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v1]]\nStable spine rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nMemory A.\n[[/agentark_prompt_fragment]]";
+        let right = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v1]]\nStable spine rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nMemory B.\n[[/agentark_prompt_fragment]]";
+        let changed_stable = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v2]]\nChanged stable spine rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nMemory A.\n[[/agentark_prompt_fragment]]";
+
+        assert_eq!(
+            openai_prompt_cache_key("chat", left, &[]),
+            openai_prompt_cache_key("chat", right, &[])
+        );
+        assert_ne!(
+            openai_prompt_cache_key("chat", left, &[]),
+            openai_prompt_cache_key("chat", changed_stable, &[])
+        );
+        let plan = prompt_cache_plan(left);
+        assert!(!plan.visible_prompt.contains("agentark_prompt_fragment"));
+        assert_eq!(plan.blocks.len(), 2);
+        assert!(plan.blocks[0].cacheable);
+        assert!(!plan.blocks[1].cacheable);
+    }
+
+    #[test]
+    fn default_llm_total_timeouts_are_enabled() {
+        assert!(super::DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS > 0);
+        assert!(super::DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS > 0);
     }
 
     #[test]
@@ -2723,6 +2939,7 @@ struct OpenAiChatParams<'a> {
     system_prompt: &'a str,
     user_message: &'a str,
     history: &'a [crate::core::agent::ConversationMessage],
+    image_attachments: &'a [LlmImageAttachment],
     actions: &'a [crate::actions::ActionDef],
     max_output_tokens: Option<u32>,
 }
@@ -2735,6 +2952,7 @@ struct OpenAiStreamParams<'a> {
     system_prompt: &'a str,
     user_message: &'a str,
     history: &'a [crate::core::agent::ConversationMessage],
+    image_attachments: &'a [LlmImageAttachment],
     actions: &'a [crate::actions::ActionDef],
     token_tx: Sender<StreamEvent>,
 }
@@ -2745,8 +2963,75 @@ struct AnthropicStreamParams<'a> {
     system_prompt: &'a str,
     user_message: &'a str,
     history: &'a [crate::core::agent::ConversationMessage],
+    image_attachments: &'a [LlmImageAttachment],
     actions: &'a [crate::actions::ActionDef],
     token_tx: Sender<StreamEvent>,
+}
+
+fn openai_user_content_value(
+    user_message: &str,
+    image_attachments: &[LlmImageAttachment],
+) -> serde_json::Value {
+    if image_attachments.is_empty() {
+        return serde_json::Value::String(user_message.to_string());
+    }
+
+    let mut blocks = vec![serde_json::json!({
+        "type": "text",
+        "text": multimodal_user_text(user_message, image_attachments),
+    })];
+    for image in image_attachments {
+        blocks.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.mime_type, image.data_base64),
+            },
+        }));
+    }
+    serde_json::Value::Array(blocks)
+}
+
+fn anthropic_user_content_value(
+    user_message: &str,
+    image_attachments: &[LlmImageAttachment],
+) -> serde_json::Value {
+    if image_attachments.is_empty() {
+        return serde_json::Value::String(user_message.to_string());
+    }
+
+    let mut blocks = vec![serde_json::json!({
+        "type": "text",
+        "text": multimodal_user_text(user_message, image_attachments),
+    })];
+    for image in image_attachments {
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.mime_type,
+                "data": image.data_base64,
+            },
+        }));
+    }
+    serde_json::Value::Array(blocks)
+}
+
+fn multimodal_user_text(user_message: &str, image_attachments: &[LlmImageAttachment]) -> String {
+    let labels = image_attachments
+        .iter()
+        .filter_map(|image| image.label.as_deref())
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        user_message.to_string()
+    } else {
+        format!(
+            "{}\n\nAttached image labels: {}",
+            user_message,
+            labels.join(", ")
+        )
+    }
 }
 
 /// Last-resort text extraction from any JSON structure.
@@ -2863,10 +3148,10 @@ fn is_retryable_error(err: &anyhow::Error) -> bool {
 const RETRY_DELAYS_MS: [u64; 3] = [500, 1500, 3000];
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_HTTP_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_LLM_REQUIRED_TOOL_START_TIMEOUT_SECS: u64 = 90;
 
 fn llm_http_timeout_secs() -> u64 {
@@ -2877,12 +3162,33 @@ fn llm_http_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_LLM_HTTP_TIMEOUT_SECS)
 }
 
-fn llm_non_stream_total_timeout_secs() -> u64 {
+fn optional_timeout_secs_from_env(
+    env_key: &str,
+    default_secs: u64,
+    min_secs: u64,
+    max_secs: u64,
+) -> Option<u64> {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| {
+            if secs == 0 {
+                0
+            } else {
+                secs.clamp(min_secs, max_secs)
+            }
+        })
+        .or(Some(default_secs))
+        .filter(|secs| *secs > 0)
+}
+
+fn llm_non_stream_total_timeout_secs() -> Option<u64> {
     std::env::var("AGENTARK_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .filter(|secs| *secs >= 30 && *secs <= 600)
-        .unwrap_or(DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS)
+        .map(|secs| if secs == 0 { 0 } else { secs.clamp(30, 600) })
+        .or(Some(DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS))
+        .filter(|secs| *secs > 0)
 }
 
 fn llm_stream_first_token_timeout_secs() -> u64 {
@@ -2901,12 +3207,13 @@ fn llm_stream_inter_chunk_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS)
 }
 
-fn llm_stream_total_timeout_secs() -> u64 {
-    std::env::var("AGENTARK_LLM_STREAM_TOTAL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|secs| *secs >= 30 && *secs <= 1800)
-        .unwrap_or(DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS)
+fn llm_stream_total_timeout_secs() -> Option<u64> {
+    optional_timeout_secs_from_env(
+        "AGENTARK_LLM_STREAM_TOTAL_TIMEOUT_SECS",
+        DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS,
+        30,
+        1800,
+    )
 }
 
 fn llm_required_tool_start_timeout_secs() -> u64 {
@@ -3018,6 +3325,7 @@ impl LlmClient {
             actions,
             &crate::security::ModelPrivacyConfig::default(),
             false,
+            &[],
             None,
         )
         .await
@@ -3077,6 +3385,7 @@ impl LlmClient {
             &[],
             &crate::security::ModelPrivacyConfig::default(),
             false,
+            &[],
             Some(max_output_tokens),
         )
         .await
@@ -3121,6 +3430,7 @@ impl LlmClient {
             actions,
             policy,
             allow_sensitive_context,
+            &[],
             max_output_tokens,
         )
         .await
@@ -3165,6 +3475,32 @@ impl LlmClient {
             actions,
             policy,
             allow_sensitive_context,
+            &[],
+            None,
+        )
+        .await
+    }
+
+    pub async fn chat_with_history_for_helper_with_images(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::core::PromptMemory],
+        actions: &[crate::actions::ActionDef],
+        image_attachments: &[LlmImageAttachment],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_for_helper_limited(
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            policy,
+            allow_sensitive_context,
+            image_attachments,
             None,
         )
         .await
@@ -3179,6 +3515,7 @@ impl LlmClient {
         actions: &[crate::actions::ActionDef],
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
+        image_attachments: &[LlmImageAttachment],
         max_output_tokens: Option<u32>,
     ) -> Result<LlmResponse> {
         self.chat_with_history_in_mode(
@@ -3190,6 +3527,7 @@ impl LlmClient {
             actions,
             policy,
             allow_sensitive_context,
+            image_attachments,
             max_output_tokens,
         )
         .await
@@ -3205,6 +3543,7 @@ impl LlmClient {
         actions: &[crate::actions::ActionDef],
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
+        image_attachments: &[LlmImageAttachment],
         max_output_tokens: Option<u32>,
     ) -> Result<LlmResponse> {
         let (system_prompt, user_message, sanitized_history) = sanitize_model_request_bundle(
@@ -3225,7 +3564,7 @@ impl LlmClient {
             LlmProvider::Ollama { model, .. } => ("ollama", model.as_str()),
         };
 
-        let prompt_chars = system_prompt.len()
+        let prompt_chars = prompt_cache_plan(&system_prompt).visible_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
         tracing::info!(
@@ -3240,63 +3579,67 @@ impl LlmClient {
         let mode_label = model_request_mode_label(mode);
         let timeout_secs = llm_non_stream_total_timeout_secs();
         let start = std::time::Instant::now();
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            async {
-                match &self.provider {
-                    LlmProvider::Anthropic { api_key, model } => {
-                        self.chat_anthropic_with_history(
-                            api_key,
-                            model,
-                            &system_prompt,
-                            &user_message,
-                            &history,
-                            actions,
-                            max_output_tokens,
-                        )
-                        .await
-                    }
-                    LlmProvider::OpenAI {
+        let request_call = async {
+            match &self.provider {
+                LlmProvider::Anthropic { api_key, model } => {
+                    self.chat_anthropic_with_history(
                         api_key,
                         model,
-                        base_url,
-                    } => {
-                        self.chat_openai_with_history(OpenAiChatParams {
-                            api_key,
-                            model,
-                            base_url: base_url.as_deref(),
-                            system_prompt: &system_prompt,
-                            user_message: &user_message,
-                            history: &history,
-                            actions,
-                            max_output_tokens,
-                        })
-                        .await
-                    }
-                    LlmProvider::Ollama { base_url, model } => {
-                        self.chat_ollama_with_history(
-                            base_url,
-                            model,
-                            &system_prompt,
-                            &user_message,
-                            &history,
-                            max_output_tokens,
-                        )
-                        .await
-                    }
+                        &system_prompt,
+                        &user_message,
+                        &history,
+                        image_attachments,
+                        actions,
+                        max_output_tokens,
+                    )
+                    .await
                 }
-            },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!(
-                "LLM non-streaming request timed out after {}s (provider={}, model={}, mode={})",
-                timeout_secs,
-                provider_name,
-                model_name,
-                mode_label
-            )),
+                LlmProvider::OpenAI {
+                    api_key,
+                    model,
+                    base_url,
+                } => {
+                    self.chat_openai_with_history(OpenAiChatParams {
+                        api_key,
+                        model,
+                        base_url: base_url.as_deref(),
+                        system_prompt: &system_prompt,
+                        user_message: &user_message,
+                        history: &history,
+                        image_attachments,
+                        actions,
+                        max_output_tokens,
+                    })
+                    .await
+                }
+                LlmProvider::Ollama { base_url, model } => {
+                    self.chat_ollama_with_history(
+                        base_url,
+                        model,
+                        &system_prompt,
+                        &user_message,
+                        &history,
+                        max_output_tokens,
+                    )
+                    .await
+                }
+            }
+        };
+        let result = if let Some(timeout_secs) = timeout_secs {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), request_call)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!(
+                    "LLM non-streaming request timed out after {}s (provider={}, model={}, mode={})",
+                    timeout_secs,
+                    provider_name,
+                    model_name,
+                    mode_label
+                )),
+            }
+        } else {
+            request_call.await
         };
 
         let elapsed = start.elapsed();
@@ -3343,6 +3686,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[crate::core::agent::ConversationMessage],
+        image_attachments: &[LlmImageAttachment],
         actions: &[crate::actions::ActionDef],
         max_output_tokens: Option<u32>,
     ) -> Result<LlmResponse> {
@@ -3371,7 +3715,7 @@ impl LlmClient {
         #[derive(Serialize)]
         struct AnthropicMessage {
             role: String,
-            content: String,
+            content: serde_json::Value,
         }
 
         #[derive(Serialize)]
@@ -3453,24 +3797,29 @@ impl LlmClient {
             .filter(|m| !(m.role == "user" && m.content == user_message))
             .map(|m| AnthropicMessage {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: serde_json::Value::String(m.content.clone()),
             })
             .collect();
 
         // Add the current user message
         messages.push(AnthropicMessage {
             role: "user".to_string(),
-            content: user_message.to_string(),
+            content: anthropic_user_content_value(user_message, image_attachments),
         });
 
+        let prompt_cache = prompt_cache_plan(system_prompt);
         let request = AnthropicRequest {
             model: model.to_string(),
             max_tokens: max_output_tokens,
-            system: vec![AnthropicTextBlock {
-                block_type: "text",
-                text: system_prompt.to_string(),
-                cache_control: Some(anthropic_cache_control()),
-            }],
+            system: prompt_cache
+                .blocks
+                .into_iter()
+                .map(|block| AnthropicTextBlock {
+                    block_type: "text",
+                    text: block.text,
+                    cache_control: block.cacheable.then(anthropic_cache_control),
+                })
+                .collect(),
             messages,
             tools,
             tool_choice: forced_native_tool_name(actions).map(|name| AnthropicToolChoice {
@@ -3533,7 +3882,7 @@ impl LlmClient {
             }
         }
 
-        let prompt_chars = system_prompt.len()
+        let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
         let completion_chars = generated_output_chars_for_usage(&content, &tool_calls);
@@ -3602,6 +3951,7 @@ impl LlmClient {
         let system_prompt = params.system_prompt;
         let user_message = params.user_message;
         let history = params.history;
+        let image_attachments = params.image_attachments;
         let actions = params.actions;
         let max_output_tokens = params.max_output_tokens;
 
@@ -3769,7 +4119,7 @@ impl LlmClient {
         // Add current user message
         messages.push(OpenAIMessage {
             role: "user".to_string(),
-            content: serde_json::Value::String(user_message.to_string()),
+            content: openai_user_content_value(user_message, image_attachments),
         });
 
         let endpoint = format!("{}/chat/completions", request_config.base_url);
@@ -4000,7 +4350,7 @@ impl LlmClient {
                             preview
                         ));
                     }
-                    let prompt_chars = system_prompt.len()
+                    let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
                         + user_message.len()
                         + history.iter().map(|m| m.content.len()).sum::<usize>();
                     return Ok(LlmResponse {
@@ -4037,7 +4387,7 @@ impl LlmClient {
                             text.len(),
                             e,
                         );
-                        let prompt_chars = system_prompt.len()
+                        let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
                             + user_message.len()
                             + history.iter().map(|m| m.content.len()).sum::<usize>();
                         let completion_chars = text.len();
@@ -4107,7 +4457,7 @@ impl LlmClient {
                 }
             }
 
-            let prompt_chars = system_prompt.len()
+            let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
                 + user_message.len()
                 + history.iter().map(|m| m.content.len()).sum::<usize>();
 
@@ -4197,6 +4547,34 @@ impl LlmClient {
             token_tx,
             policy,
             allow_sensitive_context,
+            &[],
+        )
+        .await
+    }
+
+    pub async fn chat_with_history_stream_for_helper_with_images(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::core::PromptMemory],
+        actions: &[crate::actions::ActionDef],
+        token_tx: Sender<StreamEvent>,
+        image_attachments: &[LlmImageAttachment],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_stream_in_mode(
+            ModelRequestMode::Helper,
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            token_tx,
+            policy,
+            allow_sensitive_context,
+            image_attachments,
         )
         .await
     }
@@ -4222,6 +4600,7 @@ impl LlmClient {
             token_tx,
             policy,
             allow_sensitive_context,
+            &[],
         )
         .await
     }
@@ -4237,6 +4616,7 @@ impl LlmClient {
         token_tx: Sender<StreamEvent>,
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
+        image_attachments: &[LlmImageAttachment],
     ) -> Result<LlmResponse> {
         let (system_prompt, user_message, sanitized_history) = sanitize_model_request_bundle(
             mode,
@@ -4259,6 +4639,7 @@ impl LlmClient {
                     system_prompt: &system_prompt,
                     user_message: &user_message,
                     history: &history,
+                    image_attachments,
                     actions,
                     token_tx,
                 })
@@ -4277,6 +4658,7 @@ impl LlmClient {
                     system_prompt: &system_prompt,
                     user_message: &user_message,
                     history: &history,
+                    image_attachments,
                     actions,
                     token_tx,
                 })
@@ -4361,9 +4743,10 @@ impl LlmClient {
         }
 
         // Build messages with system prompt first
+        let prompt_cache = prompt_cache_plan(system_prompt);
         let mut messages = vec![OllamaMessage {
             role: "system".to_string(),
-            content: system_prompt.to_string(),
+            content: prompt_cache.visible_prompt,
         }];
 
         // Add conversation history
@@ -4408,7 +4791,7 @@ impl LlmClient {
         let response: OllamaResponse = read_response_json_limited(response, "Ollama API").await?;
 
         let content = response.message.content;
-        let prompt_chars = system_prompt.len()
+        let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
         let usage = Some(usage_or_estimated_with_output_floor(
@@ -4475,9 +4858,10 @@ impl LlmClient {
         }
 
         // Build messages with system prompt first
+        let prompt_cache = prompt_cache_plan(system_prompt);
         let mut messages = vec![OllamaMessage {
             role: "system".to_string(),
-            content: system_prompt.to_string(),
+            content: prompt_cache.visible_prompt,
         }];
 
         // Add conversation history
@@ -4589,7 +4973,7 @@ impl LlmClient {
             "LLM stream done"
         );
 
-        let prompt_chars = system_prompt.len()
+        let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
         let usage = Some(usage_or_estimated_with_output_floor(
@@ -4646,7 +5030,7 @@ impl LlmClient {
             ),
             openai_prompt_cache_retention(request_config.prompt_cache_capability),
         );
-        let prompt_chars = system_prompt.len()
+        let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
             + user_message.len()
             + history
                 .iter()
@@ -4656,8 +5040,10 @@ impl LlmClient {
         let mut forced_oauth_refresh = false;
         let stream_total_timeout_label = if matches!(mode, ModelRequestMode::AppDelivery) {
             "none".to_string()
+        } else if let Some(timeout_secs) = llm_stream_total_timeout_secs() {
+            format!("{}s", timeout_secs)
         } else {
-            format!("{}s", llm_stream_total_timeout_secs())
+            "none".to_string()
         };
         tracing::debug!(
             target: "agentark.turn_timing",
@@ -4759,8 +5145,11 @@ impl LlmClient {
         let mut first_token = true;
         let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
         let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
-        let total_timeout_secs =
-            (!matches!(mode, ModelRequestMode::AppDelivery)).then(llm_stream_total_timeout_secs);
+        let total_timeout_secs = if matches!(mode, ModelRequestMode::AppDelivery) {
+            None
+        } else {
+            llm_stream_total_timeout_secs()
+        };
 
         let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb_done_clone = heartbeat_done.clone();
@@ -4904,6 +5293,7 @@ impl LlmClient {
         let system_prompt = params.system_prompt;
         let user_message = params.user_message;
         let history = params.history;
+        let image_attachments = params.image_attachments;
         let actions = params.actions;
         let token_tx = params.token_tx;
 
@@ -5096,7 +5486,7 @@ impl LlmClient {
         // Add current user message
         messages.push(OpenAIMessage {
             role: "user".to_string(),
-            content: serde_json::Value::String(user_message.to_string()),
+            content: openai_user_content_value(user_message, image_attachments),
         });
 
         let url = request_config.base_url.clone();
@@ -5151,8 +5541,10 @@ impl LlmClient {
         let send_start = std::time::Instant::now();
         let stream_total_timeout_label = if matches!(params.mode, ModelRequestMode::AppDelivery) {
             "none".to_string()
+        } else if let Some(timeout_secs) = llm_stream_total_timeout_secs() {
+            format!("{}s", timeout_secs)
         } else {
-            format!("{}s", llm_stream_total_timeout_secs())
+            "none".to_string()
         };
         tracing::debug!(
             target: "agentark.turn_timing",
@@ -5330,8 +5722,11 @@ impl LlmClient {
         };
         let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
         let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
-        let total_timeout_secs = (!matches!(params.mode, ModelRequestMode::AppDelivery))
-            .then(llm_stream_total_timeout_secs);
+        let total_timeout_secs = if matches!(params.mode, ModelRequestMode::AppDelivery) {
+            None
+        } else {
+            llm_stream_total_timeout_secs()
+        };
         let required_tool_name = if request.tools.len() == 1 && effective_tool_choice.is_some() {
             request
                 .tools
@@ -5867,7 +6262,7 @@ impl LlmClient {
         tool_calls.sort_by_key(|(idx, _)| *idx);
         let tool_calls: Vec<ToolCall> = tool_calls.into_iter().map(|(_, tc)| tc).collect();
 
-        let prompt_chars = system_prompt.len()
+        let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
         let completion_chars = generated_output_chars_for_usage(&content, &tool_calls);
@@ -5896,6 +6291,7 @@ impl LlmClient {
         let system_prompt = params.system_prompt;
         let user_message = params.user_message;
         let history = params.history;
+        let image_attachments = params.image_attachments;
         let actions = params.actions;
         let token_tx = params.token_tx;
 
@@ -5927,7 +6323,7 @@ impl LlmClient {
         #[derive(Serialize)]
         struct AnthropicMessage {
             role: String,
-            content: String,
+            content: serde_json::Value,
         }
 
         #[derive(Serialize)]
@@ -6063,24 +6459,29 @@ impl LlmClient {
             .filter(|m| !(m.role == "user" && m.content == user_message))
             .map(|m| AnthropicMessage {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: serde_json::Value::String(m.content.clone()),
             })
             .collect();
 
         // Add the current user message
         messages.push(AnthropicMessage {
             role: "user".to_string(),
-            content: user_message.to_string(),
+            content: anthropic_user_content_value(user_message, image_attachments),
         });
 
+        let prompt_cache = prompt_cache_plan(system_prompt);
         let request = AnthropicRequest {
             model: model.to_string(),
             max_tokens: None,
-            system: vec![AnthropicTextBlock {
-                block_type: "text",
-                text: system_prompt.to_string(),
-                cache_control: Some(anthropic_cache_control()),
-            }],
+            system: prompt_cache
+                .blocks
+                .into_iter()
+                .map(|block| AnthropicTextBlock {
+                    block_type: "text",
+                    text: block.text,
+                    cache_control: block.cacheable.then(anthropic_cache_control),
+                })
+                .collect(),
             messages,
             tools,
             tool_choice: forced_native_tool_name(actions).map(|name| AnthropicToolChoice {
@@ -6424,7 +6825,7 @@ impl LlmClient {
             })
             .collect();
 
-        let prompt_chars = system_prompt.len()
+        let prompt_chars = prompt_cache_plan(system_prompt).visible_prompt.len()
             + user_message.len()
             + history.iter().map(|m| m.content.len()).sum::<usize>();
         let completion_chars = generated_output_chars_for_usage(&content, &tool_calls);

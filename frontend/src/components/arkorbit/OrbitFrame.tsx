@@ -1131,11 +1131,8 @@ export function OrbitFrame({
       if (shouldReloadForPath(path)) reload();
     };
     source.addEventListener("file_changed", handleFileChanged as EventListener);
-    source.onerror = () => {
-      onRuntimeNotice?.("Orbit file event stream disconnected.");
-    };
     return () => source.close();
-  }, [orbitId, onRuntimeNotice, reload]);
+  }, [orbitId, reload]);
 
   const widgetLayouts = useMemo(
     () =>

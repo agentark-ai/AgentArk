@@ -6,7 +6,7 @@
 //!
 //! API reference: https://developers.facebook.com/docs/whatsapp/cloud-api
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -914,8 +914,7 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     };
 
     let Some(phone_number) = configured_notification_recipient(config) else {
-        let message =
-            "WhatsApp proactive delivery is fail-closed until exactly one allowed number is configured.";
+        let message = "WhatsApp proactive delivery is fail-closed until exactly one allowed number is configured.";
         tracing::warn!("WhatsApp send_message: {}", message);
         return Err(anyhow!(message));
     };
@@ -1994,7 +1993,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::outbound_split::{split_outbound_message, SplitProfile};
+    use crate::channels::outbound_split::{SplitProfile, split_outbound_message};
 
     #[test]
     fn test_split_message_short() {
@@ -2178,8 +2177,10 @@ mod tests {
         assert!(state.recent.len() <= MAX_RECENT_MESSAGE_IDS);
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn record_message_id_is_idempotent_for_retries() {
         let _dir = tempfile::tempdir().unwrap();
@@ -2188,11 +2189,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!record_whatsapp_message_id(&storage, "wamid.1")
-            .await
-            .unwrap());
-        assert!(record_whatsapp_message_id(&storage, "wamid.1")
-            .await
-            .unwrap());
+        assert!(
+            !record_whatsapp_message_id(&storage, "wamid.1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            record_whatsapp_message_id(&storage, "wamid.1")
+                .await
+                .unwrap()
+        );
     }
 }

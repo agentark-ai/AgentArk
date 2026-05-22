@@ -47,12 +47,6 @@ pub enum ActionToolRole {
     SupportGenericExecutor,
 }
 
-impl ActionToolRole {
-    pub fn is_support(self) -> bool {
-        !matches!(self, Self::DirectOutcome)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionIntegrationClass {
@@ -104,6 +98,14 @@ impl Default for ActionDeliveryMode {
     fn default() -> Self {
         Self::Immediate
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionOrchestrationKind {
+    #[default]
+    None,
+    MultiAgent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -466,10 +468,12 @@ pub fn action_error_domain_for_action_name(action_name: &str) -> ActionErrorDoma
     let name = action_name.trim().to_ascii_lowercase();
     match name.as_str() {
         "notify_user" => ActionErrorDomain::Channel,
-        "schedule_task" => ActionErrorDomain::Scheduler,
+        "schedule_task" | "work_manage" => ActionErrorDomain::Scheduler,
         "watch" => ActionErrorDomain::Watcher,
         "web_search" | "research" | "page_fetch" => ActionErrorDomain::Search,
-        "app_deploy" | "app_restart" | "app_stop" | "app_delete" => ActionErrorDomain::App,
+        "service_manage" | "app_deploy" | "app_restart" | "app_stop" | "app_delete" => {
+            ActionErrorDomain::App
+        }
         "gmail_scan"
         | "gmail_reply"
         | "calendar_today"
@@ -477,6 +481,7 @@ pub fn action_error_domain_for_action_name(action_name: &str) -> ActionErrorDoma
         | "calendar_create"
         | "calendar_free"
         | "connector_request"
+        | "http_request"
         | "extension_pack_connect"
         | "extension_pack_invoke" => ActionErrorDomain::Integration,
         _ => ActionErrorDomain::Action,
@@ -616,6 +621,8 @@ pub struct ActionMetadata {
     pub side_effect_level: ActionSideEffectLevel,
     #[serde(default)]
     pub delivery_mode: ActionDeliveryMode,
+    #[serde(default)]
+    pub orchestration_kind: ActionOrchestrationKind,
 }
 
 impl Default for ActionMetadata {
@@ -628,6 +635,7 @@ impl Default for ActionMetadata {
             cost: ActionCostTier::Medium,
             side_effect_level: ActionSideEffectLevel::None,
             delivery_mode: ActionDeliveryMode::Immediate,
+            orchestration_kind: ActionOrchestrationKind::None,
         }
     }
 }
@@ -674,11 +682,14 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
             meta.side_effect_level = ActionSideEffectLevel::Notify;
             return meta;
         }
-        "watch" | "schedule_task" | "delegate" | "watcher_delete" => {
+        "work_manage" | "watch" | "schedule_task" | "delegate" | "watcher_delete" => {
             meta.role = ActionRole::Orchestration;
             meta.integration_class = ActionIntegrationClass::Internal;
             meta.cost = ActionCostTier::Low;
             meta.side_effect_level = ActionSideEffectLevel::Write;
+            if name == "delegate" {
+                meta.orchestration_kind = ActionOrchestrationKind::MultiAgent;
+            }
             return meta;
         }
         "gmail_scan" => {
@@ -717,6 +728,12 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
             };
             return meta;
         }
+        "http_get" => {
+            meta.role = ActionRole::DataSource;
+            meta.integration_class = ActionIntegrationClass::Network;
+            meta.cost = ActionCostTier::Low;
+            return meta;
+        }
         "browser_auto" => {
             meta.role = ActionRole::Mutation;
             meta.integration_class = ActionIntegrationClass::Browser;
@@ -752,6 +769,13 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
             meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
+        "http_request" => {
+            meta.role = ActionRole::Mutation;
+            meta.integration_class = ActionIntegrationClass::Network;
+            meta.cost = ActionCostTier::Medium;
+            meta.side_effect_level = ActionSideEffectLevel::Write;
+            return meta;
+        }
         "file_read"
         | "list_tasks"
         | "list_watchers"
@@ -777,7 +801,7 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
             meta.side_effect_level = ActionSideEffectLevel::Write;
             return meta;
         }
-        "app_deploy" | "app_restart" | "app_stop" | "app_delete" => {
+        "service_manage" | "app_deploy" | "app_restart" | "app_stop" | "app_delete" => {
             meta.role = ActionRole::Mutation;
             meta.integration_class = ActionIntegrationClass::App;
             meta.cost = ActionCostTier::Medium;
@@ -802,6 +826,31 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
         meta.integration_class = ActionIntegrationClass::Internal;
         meta.cost = ActionCostTier::Low;
         meta.side_effect_level = ActionSideEffectLevel::Write;
+        return meta;
+    }
+
+    if capabilities.contains("extension_pack_lifecycle") {
+        meta.role = if capabilities.contains("integration_inventory") {
+            ActionRole::Inspection
+        } else {
+            ActionRole::Mutation
+        };
+        meta.tool_role = ActionToolRole::SupportGenericExecutor;
+        meta.integration_class = ActionIntegrationClass::Internal;
+        meta.cost = ActionCostTier::Medium;
+        if capabilities.contains("integration_admin")
+            || capabilities.contains("integration_runtime_lifecycle")
+        {
+            meta.side_effect_level = ActionSideEffectLevel::Write;
+        }
+        return meta;
+    }
+
+    if capabilities.contains("agentark_capabilities") || capabilities.contains("agentark_manual") {
+        meta.role = ActionRole::Inspection;
+        meta.tool_role = ActionToolRole::SupportDocumentation;
+        meta.integration_class = ActionIntegrationClass::Internal;
+        meta.cost = ActionCostTier::Low;
         return meta;
     }
 
@@ -1157,6 +1206,41 @@ mod tests {
     }
 
     #[test]
+    fn action_metadata_treats_agentark_capability_lookup_as_support_docs() {
+        let action = ActionDef {
+            name: "agentark_capability_lookup".to_string(),
+            capabilities: vec![
+                "agentark_capabilities".to_string(),
+                "agentark_manual".to_string(),
+                "capability_inventory".to_string(),
+            ],
+            ..ActionDef::default()
+        };
+
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::Inspection);
+        assert_eq!(metadata.tool_role, ActionToolRole::SupportDocumentation);
+        assert_eq!(metadata.integration_class, ActionIntegrationClass::Internal);
+    }
+
+    #[test]
+    fn action_metadata_treats_extension_pack_lifecycle_as_support_executor() {
+        let action = ActionDef {
+            name: "extension_pack_connect".to_string(),
+            capabilities: vec![
+                "integration_admin".to_string(),
+                "extension_pack_lifecycle".to_string(),
+            ],
+            ..ActionDef::default()
+        };
+
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::Mutation);
+        assert_eq!(metadata.tool_role, ActionToolRole::SupportGenericExecutor);
+        assert_eq!(metadata.side_effect_level, ActionSideEffectLevel::Write);
+    }
+
+    #[test]
     fn action_metadata_treats_custom_api_actions_as_saved_integrations() {
         let action = ActionDef {
             name: "api__project_tool__query".to_string(),
@@ -1180,6 +1264,44 @@ mod tests {
     }
 
     #[test]
+    fn action_metadata_treats_http_request_as_direct_external_write() {
+        let action = ActionDef {
+            name: "http_request".to_string(),
+            capabilities: vec![
+                "network".to_string(),
+                "raw_http".to_string(),
+                "external_write".to_string(),
+            ],
+            ..ActionDef::default()
+        };
+
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::Mutation);
+        assert_eq!(metadata.integration_class, ActionIntegrationClass::Network);
+        assert_eq!(metadata.side_effect_level, ActionSideEffectLevel::Write);
+        assert_eq!(metadata.tool_role, ActionToolRole::DirectOutcome);
+    }
+
+    #[test]
+    fn action_metadata_treats_http_get_as_direct_external_read() {
+        let action = ActionDef {
+            name: "http_get".to_string(),
+            capabilities: vec![
+                "network".to_string(),
+                "url_fetch".to_string(),
+                "external_read".to_string(),
+            ],
+            ..ActionDef::default()
+        };
+
+        let metadata = action_metadata_for_action(&action);
+        assert_eq!(metadata.role, ActionRole::DataSource);
+        assert_eq!(metadata.integration_class, ActionIntegrationClass::Network);
+        assert_eq!(metadata.side_effect_level, ActionSideEffectLevel::None);
+        assert_eq!(metadata.tool_role, ActionToolRole::DirectOutcome);
+    }
+
+    #[test]
     fn orchestration_actions_require_nontrivial_direct_execution() {
         let action = ActionDef {
             name: "watch".to_string(),
@@ -1188,6 +1310,23 @@ mod tests {
         };
 
         assert!(action_requires_nontrivial_direct_execution(&action));
+    }
+
+    #[test]
+    fn delegate_declares_typed_multi_agent_orchestration_kind() {
+        let action = ActionDef {
+            name: "delegate".to_string(),
+            capabilities: Vec::new(),
+            ..ActionDef::default()
+        };
+
+        let metadata = action_metadata_for_action(&action);
+
+        assert_eq!(metadata.role, ActionRole::Orchestration);
+        assert_eq!(
+            metadata.orchestration_kind,
+            ActionOrchestrationKind::MultiAgent
+        );
     }
 
     #[test]

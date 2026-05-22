@@ -357,6 +357,11 @@ impl Agent {
         let _ = self.storage.delete(&key).await;
     }
 
+    pub async fn dismiss_chat_credential_prompt(&self, conversation_id: &str) {
+        self.clear_pending_chat_credential_prompt(conversation_id)
+            .await;
+    }
+
     pub(super) async fn load_pending_chat_credential_prompt(
         &self,
         conversation_id: &str,
@@ -469,6 +474,70 @@ impl Agent {
                     tool_name: tool_name.map(|value| value.to_string()),
                     trace_id: trace_id.map(|value| value.to_string()),
                 },
+            },
+        )
+        .await;
+    }
+
+    pub async fn remember_mcp_server_auth_chat_prompt(
+        &self,
+        conversation_id: &str,
+        server_id: &str,
+        server_name: &str,
+        auth_type: &str,
+        auth_name: Option<&str>,
+        settings_path: Option<&str>,
+    ) {
+        let server_id = server_id.trim();
+        if conversation_id.trim().is_empty() || server_id.is_empty() {
+            return;
+        }
+        self.remember_pending_chat_credential_prompt(
+            conversation_id,
+            PendingChatCredentialPromptKind::McpServerAuth {
+                server_id: server_id.to_string(),
+                server_name: server_name.trim().to_string(),
+                auth_type: auth_type.trim().to_ascii_lowercase(),
+                auth_name: auth_name
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                settings_path: settings_path
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            },
+        )
+        .await;
+    }
+
+    pub async fn remember_custom_api_auth_chat_prompt(
+        &self,
+        conversation_id: &str,
+        api_id: &str,
+        api_name: &str,
+        auth_mode: &str,
+        auth_name: Option<&str>,
+        settings_path: Option<&str>,
+    ) {
+        let api_id = api_id.trim();
+        if conversation_id.trim().is_empty() || api_id.is_empty() {
+            return;
+        }
+        self.remember_pending_chat_credential_prompt(
+            conversation_id,
+            PendingChatCredentialPromptKind::CustomApiAuth {
+                api_id: api_id.to_string(),
+                api_name: api_name.trim().to_string(),
+                auth_mode: auth_mode.trim().to_ascii_lowercase(),
+                auth_name: auth_name
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                settings_path: settings_path
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
             },
         )
         .await;
@@ -620,6 +689,270 @@ impl Agent {
             response.push_str(&followup);
         }
         Ok(response)
+    }
+
+    pub(super) async fn submit_pending_mcp_server_auth_credentials(
+        &self,
+        conversation_id: &str,
+        server_id: String,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> Result<String> {
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &self.config_dir,
+            Some(&self.data_dir),
+        )?;
+        let config = manager.load()?;
+        let server = config
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("MCP server `{}` was not found.", server_id))?;
+        let Some(auth) = server.auth.as_ref() else {
+            anyhow::bail!("MCP server `{}` does not require stored auth.", server.name);
+        };
+
+        let mut secret = manager
+            .load_secrets()?
+            .mcp_auth
+            .get(&server.id)
+            .cloned()
+            .unwrap_or_default();
+        match auth {
+            crate::core::config::McpAuthConfig::Bearer { .. }
+            | crate::core::config::McpAuthConfig::Header { .. }
+            | crate::core::config::McpAuthConfig::Query { .. } => {
+                let token = values
+                    .get("token")
+                    .or_else(|| values.get("value"))
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Token is required."))?;
+                secret.token = Some(token.to_string());
+            }
+            crate::core::config::McpAuthConfig::Basic => {
+                let username = values
+                    .get("username")
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Username is required."))?;
+                let password = values
+                    .get("password")
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Password is required."))?;
+                secret.username = Some(username.to_string());
+                secret.password = Some(password.to_string());
+            }
+        }
+
+        manager.update_secrets(|secrets| {
+            secrets.mcp_auth.insert(server.id.clone(), secret);
+            Ok(())
+        })?;
+        self.clear_pending_chat_credential_prompt(conversation_id)
+            .await;
+
+        let refresh = self
+            .runtime
+            .execute_action_with_context(
+                "mcp_server_manage",
+                &serde_json::json!({
+                    "operation": "refresh",
+                    "id": server.id,
+                }),
+                &crate::actions::ActionAuthorizationContext {
+                    principal: Some(crate::actions::ActionCallerPrincipal::local_admin(
+                        "secure_credential_prompt",
+                    )),
+                    surface: crate::actions::ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                    current_turn_is_explicit_approval: false,
+                    agent_name: None,
+                    agent_access_scope: None,
+                    capability_context_id: Some(format!("mcp_credential_save:{}", server_id)),
+                },
+            )
+            .await;
+
+        let mut response = format!(
+            "Saved credentials for {} securely. The value was not sent to the assistant.",
+            server.name
+        );
+        match refresh {
+            Ok(output) => {
+                if output.contains("\"status\": \"refresh_requested\"")
+                    || output.contains("\"status\":\"refresh_requested\"")
+                {
+                    response.push_str(" MCP sync was refreshed.");
+                }
+            }
+            Err(error) => {
+                response.push_str(&format!(
+                    " MCP sync will retry from Settings; immediate refresh failed: {}",
+                    error
+                ));
+            }
+        }
+        Ok(response)
+    }
+
+    async fn mcp_server_auth_prompt_is_satisfied(&self, server_id: &str) -> bool {
+        let Ok(manager) = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &self.config_dir,
+            Some(&self.data_dir),
+        ) else {
+            return false;
+        };
+        let Ok(config) = manager.load() else {
+            return false;
+        };
+        let Some(server) = config
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+        else {
+            return true;
+        };
+        if let Some(profile_id) = server.auth_profile_id.as_deref() {
+            return crate::core::auth_profiles::AuthProfileControlPlane::get(
+                &self.storage,
+                profile_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|profile| profile.ready);
+        }
+        let Some(auth) = server.auth.as_ref() else {
+            return true;
+        };
+        let Ok(secrets) = manager.load_secrets() else {
+            return false;
+        };
+        let Some(secret) = secrets.mcp_auth.get(server_id) else {
+            return false;
+        };
+        match auth {
+            crate::core::config::McpAuthConfig::Bearer { .. }
+            | crate::core::config::McpAuthConfig::Header { .. }
+            | crate::core::config::McpAuthConfig::Query { .. } => secret
+                .token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            crate::core::config::McpAuthConfig::Basic => {
+                secret
+                    .username
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    && secret
+                        .password
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+            }
+        }
+    }
+
+    pub(super) async fn submit_pending_custom_api_auth_credentials(
+        &self,
+        conversation_id: &str,
+        api_id: String,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> Result<String> {
+        let views =
+            crate::custom_apis::list_custom_apis(&self.storage, &self.config_dir, &self.data_dir)
+                .await?;
+        let view = views
+            .into_iter()
+            .find(|view| view.config.id == api_id)
+            .ok_or_else(|| anyhow::anyhow!("Custom API `{}` was not found.", api_id))?;
+        let api_id = view.config.id.clone();
+        let api_name = view.config.name.clone();
+        let auth_mode = view.config.auth_mode;
+        let secret = values
+            .get("secret")
+            .or_else(|| values.get("token"))
+            .or_else(|| values.get("password"))
+            .or_else(|| values.get("value"))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Credential value is required."))?;
+        let username = values
+            .get("username")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &self.config_dir,
+            Some(&self.data_dir),
+        )?;
+        manager.set_custom_secret(
+            &crate::custom_apis::custom_api_secret_key(&api_id),
+            Some(secret.to_string()),
+        )?;
+
+        if matches!(auth_mode, crate::custom_apis::CustomApiAuthMode::Basic) {
+            let username = username
+                .or(view.config.auth_username.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("Username is required for basic auth."))?;
+            let request = crate::custom_apis::CustomApiUpsertRequest {
+                id: Some(api_id.clone()),
+                name: view.config.name.clone(),
+                description: Some(view.config.description.clone()),
+                base_url: view.config.base_url.clone(),
+                enabled: Some(view.config.enabled),
+                auth_mode: Some(auth_mode),
+                auth_profile_id: view.config.auth_profile_id.clone(),
+                auth_header: view.config.auth_header.clone(),
+                auth_name: view.config.auth_name.clone(),
+                auth_username: Some(username.to_string()),
+                secret: None,
+                clear_secret: None,
+                allow_missing_secret: Some(true),
+                operations: view
+                    .config
+                    .operations
+                    .into_iter()
+                    .map(|operation| operation.draft)
+                    .collect(),
+            };
+            crate::custom_apis::upsert_custom_api(
+                &self.storage,
+                &self.config_dir,
+                &self.data_dir,
+                &self.runtime,
+                request,
+                Some(&api_id),
+            )
+            .await?;
+        }
+
+        self.clear_pending_chat_credential_prompt(conversation_id)
+            .await;
+        let mut response = format!(
+            "Saved credentials for {} securely. The value was not sent to the assistant.",
+            api_name
+        );
+        if let Some(followup) = self.on_secret_saved_followup(conversation_id).await {
+            response.push_str("\n\n");
+            response.push_str(&followup);
+        }
+        Ok(response)
+    }
+
+    async fn custom_api_auth_prompt_is_satisfied(&self, api_id: &str) -> bool {
+        crate::custom_apis::list_custom_apis(&self.storage, &self.config_dir, &self.data_dir)
+            .await
+            .ok()
+            .and_then(|views| views.into_iter().find(|view| view.config.id == api_id))
+            .is_none_or(|view| {
+                matches!(
+                    view.config.auth_mode,
+                    crate::custom_apis::CustomApiAuthMode::None
+                ) || view.secret_configured
+            })
     }
 
     /// Hydrate a [`ChatCredentialPrompt`] view from a manifest by
@@ -935,6 +1268,160 @@ impl Agent {
                         }
                         let manifest = crate::core::integration_auth::raw_key_manifest(&key);
                         return Some(Self::chat_credential_prompt_from_manifest(&manifest));
+                    }
+                    PendingChatCredentialPromptKind::McpServerAuth {
+                        server_id,
+                        server_name,
+                        auth_type,
+                        auth_name,
+                        settings_path,
+                    } => {
+                        if self.mcp_server_auth_prompt_is_satisfied(&server_id).await {
+                            self.clear_pending_chat_credential_prompt(conversation_id)
+                                .await;
+                            return None;
+                        }
+                        let fields = match auth_type.as_str() {
+                            "basic" => vec![
+                                ChatCredentialPromptField {
+                                    key: "username".to_string(),
+                                    label: "Username".to_string(),
+                                    required: true,
+                                    input_type: Some("text".to_string()),
+                                    placeholder: None,
+                                    help: None,
+                                    options: None,
+                                },
+                                ChatCredentialPromptField {
+                                    key: "password".to_string(),
+                                    label: "Password".to_string(),
+                                    required: true,
+                                    input_type: Some("password".to_string()),
+                                    placeholder: None,
+                                    help: None,
+                                    options: None,
+                                },
+                            ],
+                            "header" | "query" => vec![ChatCredentialPromptField {
+                                key: "token".to_string(),
+                                label: auth_name
+                                    .as_deref()
+                                    .map(Self::chat_credential_field_label)
+                                    .unwrap_or_else(|| "Credential value".to_string()),
+                                required: true,
+                                input_type: Some("password".to_string()),
+                                placeholder: None,
+                                help: None,
+                                options: None,
+                            }],
+                            _ => vec![ChatCredentialPromptField {
+                                key: "token".to_string(),
+                                label: "Bearer token".to_string(),
+                                required: true,
+                                input_type: Some("password".to_string()),
+                                placeholder: None,
+                                help: None,
+                                options: None,
+                            }],
+                        };
+                        return self
+                            .build_chat_credential_prompt(
+                                format!("Connect {}", server_name),
+                                format!(
+                                    "AgentArk configured {}. Save the required MCP credential here; it is stored encrypted and never sent through normal chat.",
+                                    server_name
+                                ),
+                                fields,
+                                "mcp_server_auth",
+                            )
+                            .map(|mut prompt| {
+                                prompt.settings_path = settings_path;
+                                prompt.mode_kind = Some("mcp_server_auth".to_string());
+                                prompt
+                            });
+                    }
+                    PendingChatCredentialPromptKind::CustomApiAuth {
+                        api_id,
+                        api_name,
+                        auth_mode,
+                        auth_name,
+                        settings_path,
+                    } => {
+                        if self.custom_api_auth_prompt_is_satisfied(&api_id).await {
+                            self.clear_pending_chat_credential_prompt(conversation_id)
+                                .await;
+                            return None;
+                        }
+                        let fields = match auth_mode.as_str() {
+                            "basic" => vec![
+                                ChatCredentialPromptField {
+                                    key: "username".to_string(),
+                                    label: "Username".to_string(),
+                                    required: true,
+                                    input_type: Some("text".to_string()),
+                                    placeholder: None,
+                                    help: None,
+                                    options: None,
+                                },
+                                ChatCredentialPromptField {
+                                    key: "password".to_string(),
+                                    label: "Password".to_string(),
+                                    required: true,
+                                    input_type: Some("password".to_string()),
+                                    placeholder: None,
+                                    help: None,
+                                    options: None,
+                                },
+                            ],
+                            "api_key_header" | "api_key_query" => vec![ChatCredentialPromptField {
+                                key: "secret".to_string(),
+                                label: auth_name
+                                    .as_deref()
+                                    .map(Self::chat_credential_field_label)
+                                    .unwrap_or_else(|| "API key".to_string()),
+                                required: true,
+                                input_type: Some("password".to_string()),
+                                placeholder: None,
+                                help: None,
+                                options: None,
+                            }],
+                            "oauth2" => vec![ChatCredentialPromptField {
+                                key: "secret".to_string(),
+                                label: "OAuth access token".to_string(),
+                                required: true,
+                                input_type: Some("password".to_string()),
+                                placeholder: None,
+                                help: Some(
+                                    "Use a secure auth profile instead when a browser OAuth flow is required."
+                                        .to_string(),
+                                ),
+                                options: None,
+                            }],
+                            _ => vec![ChatCredentialPromptField {
+                                key: "secret".to_string(),
+                                label: "Bearer token".to_string(),
+                                required: true,
+                                input_type: Some("password".to_string()),
+                                placeholder: None,
+                                help: None,
+                                options: None,
+                            }],
+                        };
+                        return self
+                            .build_chat_credential_prompt(
+                                format!("Connect {}", api_name),
+                                format!(
+                                    "AgentArk configured {}. Save the required API credential here; it is stored encrypted and never sent through normal chat.",
+                                    api_name
+                                ),
+                                fields,
+                                "custom_api_auth",
+                            )
+                            .map(|mut prompt| {
+                                prompt.settings_path = settings_path;
+                                prompt.mode_kind = Some("custom_api_auth".to_string());
+                                prompt
+                            });
                     }
                 }
             }
@@ -1327,6 +1814,24 @@ impl Agent {
                         PendingChatCredentialPromptKind::RawSecret { key, .. } => {
                             return self
                                 .submit_pending_raw_secret_credentials(cid, key.clone(), &cleaned)
+                                .await;
+                        }
+                        PendingChatCredentialPromptKind::McpServerAuth { server_id, .. } => {
+                            return self
+                                .submit_pending_mcp_server_auth_credentials(
+                                    cid,
+                                    server_id.clone(),
+                                    &cleaned,
+                                )
+                                .await;
+                        }
+                        PendingChatCredentialPromptKind::CustomApiAuth { api_id, .. } => {
+                            return self
+                                .submit_pending_custom_api_auth_credentials(
+                                    cid,
+                                    api_id.clone(),
+                                    &cleaned,
+                                )
                                 .await;
                         }
                     }

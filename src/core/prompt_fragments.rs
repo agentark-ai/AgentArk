@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY: &str = "prompt_fragment_bundle_profile_v1";
 pub const PROMPT_FRAGMENT_BUNDLE_PROFILE_CANARY_KEY: &str =
@@ -178,8 +178,8 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
                 true,
                 940,
                 r#"- Treat every user turn as a possible set of independent or dependent outcomes, not as a single intent by default.
-- Preserve all outcomes the current turn asks for: direct answers, workspace changes, app delivery, durable watchers, scheduled reminders, integration work, browser actions, and local inspections can coexist in one turn.
-- Use recent conversation, memories, active artifacts, background sessions, watchers, and pending actions only to resolve references, continuations, corrections, approvals, and dependencies. If the current turn changes topic or reverses earlier intent, follow the current turn.
+- Preserve all outcomes the current turn asks for: direct answers, workspace changes, managed services, scheduled or conditional background work, reminders, integration work, browser actions, and local inspections can coexist in one turn.
+- Use recent conversation, memories, active artifacts, managed services, scheduled/background work, and pending actions only to resolve references, continuations, corrections, approvals, and dependencies. If the current turn changes topic or reverses earlier intent, follow the current turn.
 - Build the smallest implicit goal graph needed: run independent reads or mutations together when safe, sequence dependent work only when one result is needed by the next, and ask a concise clarification only for the missing detail that blocks a specific outcome.
 - Multiple tool calls are allowed when the user asks for multiple outcomes. Do not drop a requested outcome just because another tool call already succeeded."#,
             ),
@@ -199,15 +199,15 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
                 &["app_hosting", "integration_app", "app_delivery"],
                 false,
                 900,
-                r#"- For generated app, site, dashboard, or browser tool delivery, writing files is staging; the goal completes only when the authorized app-hosting path returns a runnable app result or asks for missing required inputs.
+                r#"- For generated app, site, dashboard, local service, or browser tool delivery, writing files is staging; the goal completes only when the authorized managed-service path returns a runnable result or asks for missing required inputs.
 - Build the smallest working app that satisfies the user-visible requirements. Prefer a compact MVP over a broad product scaffold: keep file count low, avoid generated boilerplate, and do not add routes, auth, databases, service layers, package manifests, tests, or admin surfaces unless the request semantically requires them.
 - Make the app visually polished and pleasant to use within that lean scope: strong layout, responsive behavior, good typography, clear controls, useful empty/loading/error states, and domain-appropriate styling. Do not expand polished UI into unrelated SaaS features.
 - Prefer a standalone static/browser bundle when the requested workflow can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Emit complete static files without package manifests, servers, or lifecycle commands in that case.
 - Use a dynamic backend/runtime only for server-only needs: secret credentials, authenticated server-side API access, durable jobs that must continue with no browser open, durable server-side state/databases, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs that the browser/app proxy cannot safely call.
-- If the file-stream protocol is active, emit complete app files as `<file path="relative/path.ext">...</file>` blocks and let AgentArk synthesize the app-hosting action. Do not emit app_deploy JSON, agent_tool_calls JSON, markdown fences around file blocks, or native tool calls in that response.
+- If the file-stream protocol is active, emit complete service files as `<file path="relative/path.ext">...</file>` blocks and let AgentArk synthesize the service-management action. Do not emit lifecycle JSON, agent_tool_calls JSON, markdown fences around file blocks, or native tool calls in that response.
 - When updating a recent deployed app, preserve the active app identity, original requirements, current deployed files, and working behavior unless the user asks to replace or recreate it. Apply the requested add/remove/change directly and keep unrelated app scope unchanged.
 - Deploy locally by default. Content visibility or audience requirements inside the app are not the same as external network exposure.
-- After deployed app edits, restart or validate through the available app actions before claiming completion when those actions are in scope.
+- After managed-service edits, restart or validate through the available service action before claiming completion when that action is in scope.
 - After deployment, nudge the user to the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls."#,
             ),
             fragment(
@@ -227,7 +227,8 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
                 ],
                 false,
                 850,
-                r#"- For AgentArk-owned runtime state, pages, deployed apps, ArkPulse, Sentinel, Evolution, Trace, operator health, analytics, recent work, or reflective activity insight, inspect local evidence before answering.
+                r#"- For AgentArk-owned runtime state, pages, deployed apps, Pulse, Sentinel, Evolve, Trace, operator health, analytics, recent work, or reflective activity insight, inspect local evidence before answering.
+- Reflective activity insight includes questions whose answer depends on the user's recent behavior, conversations, work patterns, attention, avoidance, recurring themes, or inferred mindset; use AgentArk local activity plus Reflect/Sentinel-style signals when they are available.
 - For current model/provider selection, configured model slots, access/readiness, failover, or provider health, use read-only runtime inspection and disclose only non-secret status.
 - Prefer the structured Ark inspection/API-discovery path when available. Use database schema/read-only queries only after a suitable API surface is unavailable or insufficient.
 - Answer with calibrated uncertainty from observed evidence rather than generic assumptions."#,
@@ -265,7 +266,7 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
                 780,
                 r#"- For evidence gathering, call the minimum needed data-source or inspection action, then answer from the observed result.
 - If the intended result is an in-chat report, synthesis, or analysis, use prose and tables for exact values. Include fenced `agentark-chart` JSON only when a chart materially clarifies quantitative comparisons, trends, distributions, proportions, uncertainty, evidence coverage, or grouped breakdowns.
-- Use app delivery only when the requested final object is a managed browser-runnable, reusable, hosted, or previewable experience."#,
+- Use managed service delivery only when the requested final object is a browser-runnable, reusable, hosted, or previewable experience."#,
             ),
             fragment(
                 "fragment.automation.durable_work",
@@ -279,8 +280,8 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
                 ],
                 false,
                 820,
-                r#"- For scheduled tasks, watchers, reminders, background sessions, and conditional monitoring, preserve each distinct target, condition, cadence, timeout, and delivery route.
-- A cadence belongs to the object it modifies: app/dashboard/tool refresh belongs inside the generated artifact, while AgentArk-owned later execution, independent monitoring, and outside-UI notification belong to schedule/watch actions.
+                r#"- For scheduled tasks, reminders, recurring jobs, and conditional monitoring, preserve each distinct target, condition, cadence, timeout, and delivery route.
+- A cadence belongs to the object it modifies: service/dashboard/tool refresh belongs inside the generated artifact, while AgentArk-owned later execution, independent monitoring, and outside-UI notification belong to scheduled work.
 - Create or update the durable object before optional reads unless a required argument cannot be inferred without a read."#,
             ),
             fragment(
@@ -559,14 +560,14 @@ mod tests {
     #[test]
     fn action_tags_are_derived_from_internal_metadata() {
         let action = crate::actions::ActionDef {
-            name: "app_deploy".to_string(),
-            capabilities: vec!["app_hosting".to_string()],
+            name: "service_manage".to_string(),
+            capabilities: vec!["app_hosting".to_string(), "service_management".to_string()],
             ..Default::default()
         };
         let mut tags = BTreeSet::new();
         add_action_prompt_tags(&mut tags, &action);
 
-        assert!(tags.contains("action_app_deploy"));
+        assert!(tags.contains("action_service_manage"));
         assert!(tags.contains("app_hosting"));
         assert!(tags.contains("integration_app"));
     }
@@ -582,8 +583,10 @@ mod tests {
 
         assert!(fragment.body.contains("standalone static/browser bundle"));
         assert!(fragment.body.contains("Use a dynamic backend/runtime only"));
-        assert!(fragment
-            .body
-            .contains("durable jobs that must continue with no browser open"));
+        assert!(
+            fragment
+                .body
+                .contains("durable jobs that must continue with no browser open")
+        );
     }
 }

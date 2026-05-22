@@ -5,6 +5,7 @@ import {
   Button,
   ButtonBase,
   Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -22,8 +23,19 @@ import {
   formatUiDateTimeMeta,
   formatUiRelativeDateTimeMeta,
 } from "../../lib/dateFormat";
-import { isStandaloneBackgroundWorkTask } from "../../lib/backgroundSessions";
-import type { BackgroundSessionSummary, Task } from "../../types";
+import {
+  isBackgroundSessionVisibleInUi,
+  isStandaloneBackgroundWorkTask,
+} from "../../lib/backgroundSessions";
+import { BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED } from "../../lib/featureFlags";
+import type {
+  BackgroundSessionDetail,
+  BackgroundSessionLinkedTask,
+  BackgroundSessionLinkedWatcher,
+  BackgroundSessionRun,
+  BackgroundSessionSummary,
+  Task,
+} from "../../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
   type JsonRecord,
@@ -251,9 +263,81 @@ function watcherMetaLine(watcher: JsonRecord): string {
     : "never";
   const lastStatus = watcherLatestStatusLine(watcher);
   const notification = watcherNotificationLine(watcher);
-  return `${str(watcher.poll_action, "poller")} - every ${interval} - last poll ${lastPoll} - last status ${lastStatus} - notify ${notificationChannelLabel(
+  const mode = toBool(watcher.repeat_on_match) ? "repeats on match" : "stops after match";
+  return `${str(watcher.poll_action, "poller")} - every ${interval} - ${mode} - last poll ${lastPoll} - last status ${lastStatus} - notify ${notificationChannelLabel(
     watcher.notify_channel,
   )}${notification ? ` - ${notification}` : ""}`;
+}
+
+function compactWatcherMetaLine(watcher: JsonRecord): string {
+  const interval = formatDurationFromSeconds(num(watcher.interval_secs, 0));
+  const lastPoll = str(watcher.last_poll_at, "").trim()
+    ? formatTimestampForHumans(str(watcher.last_poll_at, "")).label
+    : "not run";
+  const mode = toBool(watcher.repeat_on_match) ? "repeats" : "stops";
+  return `${str(watcher.poll_action, "poller")} - ${interval} - ${mode} - last ${lastPoll}`;
+}
+
+function watcherActionLabel(watcher: unknown): string {
+  const action = str(asRecord(watcher).poll_action, "").trim();
+  return action ? statusLabel(action) : "Poller";
+}
+
+function watcherCadencePill(watcher: unknown): string {
+  const seconds = num(asRecord(watcher).interval_secs, -1);
+  if (seconds <= 0) return "";
+  return `Every ${formatDurationFromSeconds(seconds)}`;
+}
+
+function watcherModePill(watcher: unknown): string {
+  return toBool(asRecord(watcher).repeat_on_match) ? "Repeats" : "One-shot";
+}
+
+function watcherPollPill(watcher: unknown): string {
+  const lastPoll = str(asRecord(watcher).last_poll_at, "").trim();
+  return lastPoll ? `Poll ${humanTs(lastPoll).label}` : "No poll yet";
+}
+
+function watcherAlertPill(watcher: unknown): string {
+  const lastTrigger = watcherLastTriggerLine(watcher);
+  return lastTrigger ? `Alert ${lastTrigger}` : "";
+}
+
+function sameContent(left: string, right: string): boolean {
+  const normalize = (value: string) => value.trim().replace(/\s+/g, " ").toLowerCase();
+  const a = normalize(left);
+  const b = normalize(right);
+  return Boolean(a && b && (a === b || a.includes(b) || b.includes(a)));
+}
+
+function meaningfulSessionSummary(session: BackgroundSessionSummary): string {
+  const title = session.title || "";
+  const candidates = [
+    session.live_summary || "",
+    session.summary || "",
+    session.objective || "",
+    session.current_focus || "",
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return (
+    candidates.find((value) => !sameContent(value, title)) ||
+    candidates[0] ||
+    "Background work"
+  );
+}
+
+function sessionLinkedWorkLabel(
+  session: BackgroundSessionSummary,
+  children: { tasks: Task[]; watchers: JsonRecord[] },
+): string {
+  const watcherCount = children.watchers.length || session.counts?.watchers_total || 0;
+  const taskCount = children.tasks.length || session.counts?.tasks_total || 0;
+  const parts = [];
+  if (watcherCount) parts.push(`${watcherCount} monitor${watcherCount === 1 ? "" : "s"}`);
+  if (taskCount) parts.push(`${taskCount} task${taskCount === 1 ? "" : "s"}`);
+  if (!parts.length) parts.push("No linked work");
+  return parts.join(" - ");
 }
 
 function watcherLatestStatusLine(watcher: JsonRecord): string {
@@ -267,8 +351,7 @@ function watcherLatestStatusLine(watcher: JsonRecord): string {
 }
 
 function watcherNotificationLine(watcher: JsonRecord): string {
-  const attempts = pickRecords(watcher.notification_attempts);
-  const latest = attempts[attempts.length - 1];
+  const latest = latestWatcherNotification(watcher);
   if (!latest) return "";
   const channel = notificationChannelLabel(latest.channel);
   const status = toBool(latest.success) ? "sent" : "failed";
@@ -276,6 +359,28 @@ function watcherNotificationLine(watcher: JsonRecord): string {
     ? formatTimestampForHumans(str(latest.attempted_at, "")).label
     : "unknown time";
   return `${channel} ${status} ${when}`;
+}
+
+function latestWatcherNotification(watcher: unknown): JsonRecord | null {
+  const attempts = pickRecords(asRecord(watcher).notification_attempts);
+  return attempts[attempts.length - 1] || null;
+}
+
+function watcherLastTriggerLine(watcher: unknown): string {
+  const latest = latestWatcherNotification(watcher);
+  const deliveredAt = str(latest?.attempted_at, "").trim();
+  if (deliveredAt) return formatTimestampForHumans(deliveredAt).label;
+  const record = asRecord(watcher);
+  if (str(record.last_poll_outcome, "").toLowerCase() === "matched") {
+    const lastPoll = str(record.last_poll_at, "").trim();
+    if (lastPoll) return formatTimestampForHumans(lastPoll).label;
+  }
+  return "";
+}
+
+function watcherLastMessage(watcher: unknown): string {
+  const latest = latestWatcherNotification(watcher);
+  return str(latest?.message, "").trim() || str(latest?.error, "").trim();
 }
 
 function payloadText(raw: unknown): string {
@@ -351,6 +456,60 @@ function RowOpsMenu({
   );
 }
 
+function MetaPill({
+  label,
+  title,
+  tone = "default",
+}: {
+  label: string;
+  title?: string;
+  tone?: "default" | "success" | "info" | "warning";
+}) {
+  const toneStyles = {
+    default: {
+      color: "text.secondary",
+      borderColor: "var(--surface-border)",
+      background: "var(--ui-rgba-255-255-255-020)",
+    },
+    success: {
+      color: "var(--ui-rgba-167-243-208-950)",
+      borderColor: "var(--ui-rgba-74-210-157-250)",
+      background: "var(--ui-rgba-74-210-157-080)",
+    },
+    info: {
+      color: "var(--ui-rgba-165-225-255-950)",
+      borderColor: "var(--ui-rgba-57-208-255-220)",
+      background: "var(--ui-rgba-57-208-255-065)",
+    },
+    warning: {
+      color: "var(--ui-rgba-255-218-170-950)",
+      borderColor: "var(--ui-rgba-255-191-130-220)",
+      background: "var(--ui-rgba-255-191-130-070)",
+    },
+  }[tone];
+  return (
+    <Box
+      component="span"
+      title={title || label}
+      sx={{
+        display: "inline-flex",
+        alignItems: "center",
+        minHeight: 22,
+        maxWidth: "100%",
+        px: 0.75,
+        borderRadius: "999px",
+        border: "1px solid",
+        fontSize: "0.72rem",
+        lineHeight: 1.35,
+        whiteSpace: "nowrap",
+        ...toneStyles,
+      }}
+    >
+      {label}
+    </Box>
+  );
+}
+
 function BackgroundWorkChildRow({
   badge,
   title,
@@ -370,40 +529,58 @@ function BackgroundWorkChildRow({
     <Stack
       direction="row"
       spacing={1}
-      sx={{ alignItems: "center", minWidth: 0, width: "100%" }}
+      sx={{ alignItems: "flex-start", minWidth: 0, width: "100%" }}
     >
-      <Chip size="small" variant="outlined" label={badge} sx={{ flexShrink: 0 }} />
-      <Typography
-        variant="body2"
-        noWrap
-        sx={{ fontWeight: 600, minWidth: 0, flex: 1 }}
-        title={title}
-      >
-        {title}
-      </Typography>
-      <Chip
-        size="small"
-        color={rowStatusColor}
-        variant="outlined"
-        label={status}
-        sx={{ flexShrink: 0 }}
+      <Box
+        sx={{
+          width: 6,
+          height: 6,
+          mt: 0.75,
+          borderRadius: "50%",
+          flexShrink: 0,
+          background: dotColor(status),
+        }}
       />
-      <Typography
-        variant="caption"
-        noWrap
-        sx={{ color: "text.secondary", minWidth: 0, flex: 1 }}
-        title={meta}
-      >
-        {meta}
-      </Typography>
+      <Stack spacing={0.35} sx={{ minWidth: 0, flex: 1 }}>
+        <Stack
+          direction="row"
+          spacing={0.6}
+          sx={{ alignItems: "center", minWidth: 0 }}
+        >
+          <Typography
+            variant="body2"
+            noWrap
+            sx={{ fontWeight: 700, minWidth: 0, flex: 1 }}
+            title={title}
+          >
+            {title}
+          </Typography>
+          <Chip size="small" variant="outlined" label={badge} sx={{ height: 22 }} />
+          <Chip
+            size="small"
+            color={rowStatusColor}
+            variant="outlined"
+            label={status}
+            sx={{ height: 22 }}
+          />
+        </Stack>
+        <Typography
+          variant="caption"
+          noWrap
+          sx={{ color: "text.secondary", minWidth: 0 }}
+          title={meta}
+        >
+          {meta}
+        </Typography>
+      </Stack>
     </Stack>
   );
   const sx = {
     width: "100%",
     textAlign: "left",
     justifyContent: "flex-start",
-    px: 1,
-    py: 0.75,
+    px: 1.1,
+    py: 0.9,
     border: "1px solid var(--surface-border)",
     borderRadius: 1,
     background: "var(--ui-rgba-255-255-255-020)",
@@ -422,6 +599,40 @@ function BackgroundWorkChildRow({
   );
 }
 
+function runMetaLine(run: BackgroundSessionRun): string {
+  const parts = [
+    run.action || run.kind || "run",
+    `attempt ${run.attempt || 1}`,
+    run.started_at ? `started ${humanTs(run.started_at).label}` : "",
+    run.completed_at ? `completed ${humanTs(run.completed_at).label}` : "",
+    typeof run.duration_ms === "number" ? `${Math.max(1, Math.round(run.duration_ms / 1000))}s` : "",
+  ].filter(Boolean);
+  return parts.join(" - ");
+}
+
+function linkedWatcherMetaLine(watcher: BackgroundSessionLinkedWatcher): string {
+  const lastTrigger = watcherLastTriggerLine(watcher);
+  const parts = [
+    watcher.poll_action || "poller",
+    `polls ${watcher.poll_count || 0}`,
+    watcher.last_poll_at ? `last poll ${humanTs(watcher.last_poll_at).label}` : "last poll not run",
+    lastTrigger ? `last alert ${lastTrigger}` : "",
+    watcher.last_poll_outcome ? `outcome ${statusLabel(watcher.last_poll_outcome)}` : "",
+    `notify ${notificationChannelLabel(watcher.notify_channel)}`,
+  ].filter(Boolean);
+  return parts.join(" - ");
+}
+
+function linkedTaskMetaLine(task: BackgroundSessionLinkedTask): string {
+  const parts = [
+    task.action || "task",
+    task.scheduled_for ? `scheduled ${humanTs(task.scheduled_for).label}` : "",
+    task.cron ? `cron ${task.cron}` : "",
+    `created ${humanTs(task.created_at).label}`,
+  ].filter(Boolean);
+  return parts.join(" - ");
+}
+
 type WatchersPageProps = {
   autoRefresh: boolean;
 };
@@ -430,18 +641,7 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [selectedWatcherId, setSelectedWatcherId] = useState<string | null>(null);
-  const [expandedSessionIds, setExpandedSessionIds] = useState<Set<string>>(
-    () => new Set(),
-  );
-
-  const toggleSession = (sessionId: string) => {
-    setExpandedSessionIds((previous) => {
-      const next = new Set(previous);
-      if (next.has(sessionId)) next.delete(sessionId);
-      else next.add(sessionId);
-      return next;
-    });
-  };
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
 
   const invalidateBackgroundWork = async () => {
     await Promise.all([
@@ -470,6 +670,12 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
     queryFn: api.getBackgroundSessions,
     refetchInterval: autoRefresh ? REFRESH_MS : false,
     staleTime: 10_000,
+  });
+  const sessionDetailQ = useQuery<BackgroundSessionDetail>({
+    queryKey: ["background-session-detail", selectedSessionId],
+    queryFn: () => api.getBackgroundSession(selectedSessionId || ""),
+    enabled: Boolean(selectedSessionId),
+    refetchInterval: autoRefresh && selectedSessionId ? REFRESH_MS : false,
   });
   const channelsQ = useQuery({
     queryKey: ["available-messaging-channels"],
@@ -536,7 +742,7 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
   const watchers = useMemo(() => pickRecords(watchersQ.data, "watchers"), [watchersQ.data]);
   const tasks = useMemo(() => tasksQ.data || [], [tasksQ.data]);
   const sessions = useMemo(
-    () => sessionsQ.data?.sessions || [],
+    () => (sessionsQ.data?.sessions || []).filter((session) => isBackgroundSessionVisibleInUi(session)),
     [sessionsQ.data],
   );
 
@@ -680,6 +886,21 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
       watchers.find((watcher) => str(watcher.id, "") === selectedWatcherId) ?? null,
     [selectedWatcherId, watchers],
   );
+  const selectedSession =
+    sessionDetailQ.data?.session ||
+    sessions.find((session) => session.id === selectedSessionId) ||
+    null;
+  const selectedSessionDetail = sessionDetailQ.data || null;
+  const latestSessionRun = selectedSessionDetail?.recent_runs?.[0] || null;
+  const selectedWatcherLatestNotification = selectedWatcher
+    ? latestWatcherNotification(selectedWatcher)
+    : null;
+  const selectedWatcherLastMessage = selectedWatcher
+    ? watcherLastMessage(selectedWatcher)
+    : "";
+  const selectedWatcherLastTrigger = selectedWatcher
+    ? watcherLastTriggerLine(selectedWatcher)
+    : "";
 
   const workBadgeCounts = useMemo(() => {
     let monitors = orphanWatchers.length;
@@ -721,12 +942,14 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
       },
     ];
     if (!isHistoryOnly && isActive) {
+      actions.push({
+        label: "Run now",
+        disabled: watcherMutation.isPending,
+        onClick: () => watcherMutation.mutate({ kind: "run", id }),
+      });
+    }
+    if (BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED && !isHistoryOnly && isActive) {
       actions.push(
-        {
-          label: "Run now",
-          disabled: watcherMutation.isPending,
-          onClick: () => watcherMutation.mutate({ kind: "run", id }),
-        },
         {
           label: "Pause",
           disabled: watcherMutation.isPending,
@@ -734,14 +957,18 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
         },
       );
     }
-    if (!isHistoryOnly && isPaused) {
+    if (BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED && !isHistoryOnly && isPaused) {
       actions.push({
         label: "Resume",
         disabled: watcherMutation.isPending,
         onClick: () => watcherMutation.mutate({ kind: "resume", id }),
       });
     }
-    if (!isHistoryOnly && (isActive || isPaused)) {
+    if (
+      BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED &&
+      !isHistoryOnly &&
+      (isActive || isPaused)
+    ) {
       actions.push({
         label: "Stop",
         tone: "warning",
@@ -771,20 +998,20 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
       status.includes("awaitingapproval") ||
       status.includes("awaiting_approval");
     const actions: RowMenuAction[] = [];
-    if (!isTerminal && isPaused) {
+    if (BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED && !isTerminal && isPaused) {
       actions.push({
         label: "Resume",
         disabled: taskMutation.isPending,
         onClick: () => taskMutation.mutate({ kind: "resume", id: task.id }),
       });
-    } else if (!isTerminal && canPause) {
+    } else if (BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED && !isTerminal && canPause) {
       actions.push({
         label: "Pause",
         disabled: taskMutation.isPending,
         onClick: () => taskMutation.mutate({ kind: "pause", id: task.id }),
       });
     }
-    if (!isTerminal) {
+    if (BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED && !isTerminal) {
       actions.push({
         label: "Stop",
         tone: "warning",
@@ -816,7 +1043,7 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
         sessionDeliveryMutation.mutate({ id: session.id, channel: channel.id }),
     }));
     const actions: RowMenuAction[] = [];
-    if (!isTerminal) {
+    if (BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED && !isTerminal) {
       actions.push(
         {
           label: isPaused ? "Resume" : "Pause",
@@ -865,7 +1092,6 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
       children.watchers.length +
       children.missingTaskIds.length +
       children.missingWatcherIds.length;
-    const expanded = expandedSessionIds.has(session.id);
     const watcherNotificationChannels = Array.from(
       new Set(
         children.watchers
@@ -876,133 +1102,132 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
     const notificationLabel = watcherNotificationChannels.length
       ? watcherNotificationChannels.join(", ")
       : notificationChannelLabel(session.preferred_delivery_channel || "preferred");
+    const summary = meaningfulSessionSummary(session);
+    const lastActivity = formatTimestampForHumans(
+      session.last_activity_at || session.updated_at,
+    );
+    const primaryWatcher = children.watchers[0] || null;
+    const detailPills = [
+      sessionLinkedWorkLabel(session, children),
+      primaryWatcher ? watcherActionLabel(primaryWatcher) : badge,
+      primaryWatcher ? watcherCadencePill(primaryWatcher) : "",
+      primaryWatcher ? watcherModePill(primaryWatcher) : "",
+      primaryWatcher ? watcherPollPill(primaryWatcher) : "",
+      primaryWatcher ? watcherAlertPill(primaryWatcher) : "",
+      `Notify ${notificationLabel}`,
+      `Activity ${lastActivity.label}`,
+    ].filter(Boolean);
     return (
       <Box
         key={session.id}
-        sx={{ py: 1.15, borderBottom: "1px solid", borderColor: "divider" }}
+        sx={{
+          display: "flex",
+          alignItems: "stretch",
+          gap: 1,
+          borderBottom: "1px solid",
+          borderColor: "divider",
+          "&:last-of-type": { borderBottom: 0 },
+        }}
       >
-        <Stack direction="row" spacing={1} sx={{ alignItems: "flex-start" }}>
-          <Box
-            sx={{
-              width: 7,
-              height: 7,
-              borderRadius: "50%",
-              flexShrink: 0,
-              mt: 0.85,
-              background: dotColor(session.status),
-            }}
-          />
-          <Box sx={{ minWidth: 0, flex: 1 }}>
-            <Stack
-              direction="row"
-              spacing={0.75}
-              onClick={() => toggleSession(session.id)}
+        <ButtonBase
+          onClick={() => {
+            setError(null);
+            setSelectedSessionId(session.id);
+          }}
+          sx={{
+            flex: 1,
+            minWidth: 0,
+            textAlign: "left",
+            justifyContent: "flex-start",
+            py: 1.05,
+            px: 1,
+            borderRadius: 1,
+            transition: "background 0.15s ease",
+            "&:hover": { background: "var(--ui-rgba-57-208-255-040)" },
+            "&:focus-visible": {
+              outline: "2px solid var(--ui-rgba-57-208-255-500)",
+              outlineOffset: 1,
+            },
+          }}
+        >
+          <Stack direction="row" spacing={1} sx={{ alignItems: "center", minWidth: 0, width: "100%" }}>
+            <Box
               sx={{
-                alignItems: "center",
-                minWidth: 0,
-                flexWrap: "wrap",
-                cursor: "pointer",
-                borderRadius: 1,
-                px: 0.5,
-                py: 0.35,
-                mx: -0.5,
-                "&:hover": { background: "var(--ui-rgba-57-208-255-040)" },
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                flexShrink: 0,
+                background: dotColor(session.status),
               }}
-            >
-              <Typography
-                variant="body2"
-                noWrap
-                sx={{ fontWeight: 700, minWidth: 160, flex: 1 }}
-                title={session.title}
+            />
+            <Stack spacing={0.55} sx={{ minWidth: 0, flex: 1 }}>
+              <Stack
+                direction="row"
+                spacing={0.6}
+                sx={{ alignItems: "center", minWidth: 0 }}
               >
-                {session.title}
-              </Typography>
-              <Chip size="small" variant="outlined" label={badge} />
-              <Chip
-                size="small"
-                color={statusColor(session.status)}
-                variant="outlined"
-                label={statusLabel(session.status)}
-              />
-              <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                {formatTimestampForHumans(session.last_activity_at || session.updated_at).label}
-              </Typography>
-            </Stack>
-            <Typography
-              variant="caption"
-              sx={{ color: "text.secondary", display: "block", mt: 0.25 }}
-              title={session.live_summary || session.objective}
-            >
-              {session.live_summary || session.objective}
-            </Typography>
-            <Typography
-              variant="caption"
-              sx={{ color: "text.secondary", display: "block", mt: 0.2 }}
-            >
-              {`${children.watchers.length} monitor${children.watchers.length === 1 ? "" : "s"} - ${children.tasks.length} task${children.tasks.length === 1 ? "" : "s"} - notifications ${notificationLabel}`}
-            </Typography>
-            {expanded ? (
-              <Stack spacing={0.65} sx={{ mt: 0.75 }}>
-                {children.watchers.map((watcher) => (
-                  <BackgroundWorkChildRow
-                    key={`watcher-${str(watcher.id)}`}
-                    badge="Monitor"
-                    title={str(watcher.description, "Monitor")}
-                    status={statusLabel(watcher.status)}
-                    rowStatusColor={statusColor(watcher.status)}
-                    meta={watcherMetaLine(watcher)}
-                    onClick={() => setSelectedWatcherId(str(watcher.id, ""))}
-                  />
-                ))}
-                {children.tasks.map((task) => (
-                  <BackgroundWorkChildRow
-                    key={`task-${task.id}`}
-                    badge={workBadgeForTask(task)}
-                    title={task.description || "Task"}
-                    status={taskStatusLabel(task)}
-                    rowStatusColor={taskStatusColor(task)}
-                    meta={taskMetaLine(task)}
-                  />
-                ))}
-                {children.missingWatcherIds.map((id) => (
-                  <BackgroundWorkChildRow
-                    key={`missing-watcher-${id}`}
-                    badge="Monitor"
-                    title={`Missing monitor ${id.slice(0, 8)}`}
-                    status="Missing"
-                    rowStatusColor="warning"
-                    meta="No live or historical monitor record is available for this linked id"
-                  />
-                ))}
-                {children.missingTaskIds.map((id) => (
-                  <BackgroundWorkChildRow
-                    key={`missing-task-${id}`}
-                    badge="Follow-up"
-                    title={`Missing task ${id.slice(0, 8)}`}
-                    status="Missing"
-                    rowStatusColor="warning"
-                    meta="Linked record was not found in the task list"
-                  />
-                ))}
-                {!childCount ? (
-                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                    No linked task or monitor records are currently attached.
-                  </Typography>
-                ) : null}
+                <Typography
+                  variant="body2"
+                  noWrap
+                  sx={{ fontWeight: 700, minWidth: 0, flex: 1 }}
+                  title={session.title}
+                >
+                  {session.title}
+                </Typography>
+                <Chip size="small" variant="outlined" label={badge} sx={{ height: 22, flexShrink: 0 }} />
+                <Chip
+                  size="small"
+                  color={statusColor(session.status)}
+                  variant="outlined"
+                  label={statusLabel(session.status)}
+                  sx={{ height: 22, flexShrink: 0 }}
+                />
               </Stack>
-            ) : childCount ? (
               <Typography
-                variant="caption"
-                sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+                  variant="caption"
+                noWrap
+                  title={summary}
+                sx={{
+                  color: "text.secondary",
+                  minWidth: 0,
+                  maxWidth: "min(980px, 100%)",
+                }}
               >
-                Click row to show {childCount} linked item{childCount === 1 ? "" : "s"}.
+                  {summary}
               </Typography>
-            ) : null}
-          </Box>
-          <Box sx={{ flexShrink: 0 }}>
-            <RowOpsMenu actions={sessionActions(session)} ariaLabel="Background work actions" />
-          </Box>
-        </Stack>
+              <Box
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 0.6,
+                  flexWrap: "wrap",
+                  minWidth: 0,
+                }}
+              >
+                {detailPills.map((pill, index) => (
+                  <MetaPill
+                    key={`${session.id}-pill-${index}-${pill}`}
+                    label={pill}
+                    title={pill.startsWith("Activity") ? lastActivity.tooltip : pill}
+                    tone={
+                      index === 0
+                        ? "info"
+                        : pill.startsWith("Alert")
+                          ? "success"
+                          : pill.startsWith("No poll")
+                            ? "warning"
+                            : "default"
+                    }
+                  />
+                ))}
+                {childCount ? <MetaPill label="Details" /> : null}
+              </Box>
+            </Stack>
+          </Stack>
+        </ButtonBase>
+        <Box sx={{ flexShrink: 0, display: "flex", alignItems: "center", py: 0.7, pr: 0.25 }}>
+          <RowOpsMenu actions={sessionActions(session)} ariaLabel="Background work actions" />
+        </Box>
       </Box>
     );
   };
@@ -1115,6 +1340,320 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
       )}
 
       <Dialog
+        open={selectedSessionId != null}
+        onClose={() => setSelectedSessionId(null)}
+        maxWidth="md"
+        fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              borderRadius: "8px",
+              border: "1px solid var(--surface-border)",
+              background: "var(--surface-bg-elevated)",
+              boxShadow: "0 28px 96px var(--ui-rgba-0-0-0-500)",
+              maxHeight: "86vh",
+            },
+          },
+        }}
+      >
+        <DialogTitle
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 1,
+            borderBottom: "1px solid",
+            borderColor: "divider",
+            pb: 1.2,
+          }}
+        >
+          <Typography
+            variant="h6"
+            noWrap
+            sx={{ fontWeight: 700, flex: 1, minWidth: 0 }}
+            title={selectedSession?.title || "Background work"}
+          >
+            {selectedSession?.title || "Background work"}
+          </Typography>
+          {selectedSession ? (
+            <Chip
+              size="small"
+              label={statusLabel(selectedSession.status)}
+              color={statusColor(selectedSession.status)}
+            />
+          ) : null}
+        </DialogTitle>
+        <DialogContent dividers>
+          {!selectedSessionId || sessionDetailQ.isLoading ? (
+            <Box sx={{ py: 5, textAlign: "center" }}>
+              <CircularProgress size={28} />
+            </Box>
+          ) : sessionDetailQ.error || !selectedSession ? (
+            <Alert severity="error">{errMessage(sessionDetailQ.error)}</Alert>
+          ) : (
+            <Stack spacing={1.25}>
+              <Stack
+                direction="row"
+                spacing={0.75}
+                useFlexGap
+                sx={{ flexWrap: "wrap", alignItems: "center" }}
+              >
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={`${selectedSession.counts.watchers_total} monitors`}
+                />
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={`${selectedSession.counts.tasks_total} tasks`}
+                />
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={`notify ${notificationChannelLabel(selectedSession.preferred_delivery_channel)}`}
+                />
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  Updated {humanTs(selectedSession.updated_at).label}
+                </Typography>
+              </Stack>
+
+              <Box className="micro-surface-list-item">
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  Summary
+                </Typography>
+                <Typography variant="body2" sx={{ mt: 0.35, lineHeight: 1.45 }}>
+                  {meaningfulSessionSummary(selectedSession)}
+                </Typography>
+              </Box>
+
+              <Box className="micro-surface-list-item">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{ justifyContent: "space-between", alignItems: "center" }}
+                >
+                  <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                    Last run
+                  </Typography>
+                  {latestSessionRun ? (
+                    <Chip
+                      size="small"
+                      label={statusLabel(latestSessionRun.status)}
+                      color={statusColor(latestSessionRun.status)}
+                    />
+                  ) : null}
+                </Stack>
+                {latestSessionRun ? (
+                  <Stack spacing={0.35} sx={{ mt: 0.75 }}>
+                    <Typography
+                      variant="body2"
+                      sx={{ fontWeight: 600 }}
+                      noWrap
+                      title={latestSessionRun.title}
+                    >
+                      {latestSessionRun.title}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      {runMetaLine(latestSessionRun)}
+                    </Typography>
+                    {latestSessionRun.summary ? (
+                      <Typography variant="body2" sx={{ lineHeight: 1.45 }}>
+                        {latestSessionRun.summary}
+                      </Typography>
+                    ) : null}
+                    {latestSessionRun.output_preview ? (
+                      <Typography
+                        component="pre"
+                        variant="body2"
+                        sx={{
+                          mt: 0.35,
+                          mb: 0,
+                          p: 1,
+                          maxHeight: 150,
+                          overflow: "auto",
+                          whiteSpace: "pre-wrap",
+                          overflowWrap: "anywhere",
+                          fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                          fontSize: "0.75rem",
+                          background: "var(--ui-rgba-0-0-0-300)",
+                          borderRadius: 1,
+                        }}
+                      >
+                        {latestSessionRun.output_preview}
+                      </Typography>
+                    ) : null}
+                    {latestSessionRun.error ? (
+                      <Alert severity="error" variant="outlined" sx={{ py: 0.5 }}>
+                        {latestSessionRun.error}
+                      </Alert>
+                    ) : null}
+                  </Stack>
+                ) : (
+                  <Typography variant="body2" sx={{ mt: 0.65, color: "text.secondary" }}>
+                    No run has been recorded for this session yet.
+                  </Typography>
+                )}
+              </Box>
+
+              <Box className="micro-surface-list-item">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{ justifyContent: "space-between", alignItems: "center", mb: 0.75 }}
+                >
+                  <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                    Monitors
+                  </Typography>
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={selectedSessionDetail?.linked_watchers.length || 0}
+                  />
+                </Stack>
+                {selectedSessionDetail?.linked_watchers.length ? (
+                  <Stack spacing={0.65}>
+                    {selectedSessionDetail.linked_watchers.map((watcher) => {
+                      const latestNotify = latestWatcherNotification(watcher);
+                      const lastMessage = watcherLastMessage(watcher);
+                      const notifyWhen = str(latestNotify?.attempted_at, "").trim();
+                      return (
+                        <ButtonBase
+                          key={watcher.id}
+                          onClick={() => {
+                            setSelectedSessionId(null);
+                            setSelectedWatcherId(watcher.id);
+                          }}
+                          sx={{
+                            display: "block",
+                            width: "100%",
+                            textAlign: "left",
+                            borderRadius: 1,
+                            p: 0.75,
+                            background: "var(--ui-rgba-255-255-255-020)",
+                            "&:hover": { background: "var(--ui-rgba-57-208-255-040)" },
+                          }}
+                        >
+                          <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", minWidth: 0 }}>
+                            <Typography
+                              variant="body2"
+                              noWrap
+                              sx={{ fontWeight: 600, minWidth: 0, flex: 1 }}
+                              title={watcher.description}
+                            >
+                              {watcher.description}
+                            </Typography>
+                            <Chip size="small" label={statusLabel(watcher.status)} color={statusColor(watcher.status)} />
+                          </Stack>
+                          <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+                            {linkedWatcherMetaLine(watcher)}
+                          </Typography>
+                          {latestNotify ? (
+                            <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.3 }}>
+                              Last Telegram message {toBool(latestNotify.success) ? "sent" : "failed"}
+                              {notifyWhen ? ` ${humanTs(notifyWhen).label}` : ""}
+                            </Typography>
+                          ) : null}
+                          {lastMessage ? (
+                            <Typography
+                              component="pre"
+                              variant="body2"
+                              sx={{
+                                mt: 0.5,
+                                mb: 0,
+                                p: 0.75,
+                                maxHeight: 150,
+                                overflow: "auto",
+                                whiteSpace: "pre-wrap",
+                                overflowWrap: "anywhere",
+                                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                                fontSize: "0.74rem",
+                                background: "var(--ui-rgba-0-0-0-300)",
+                                borderRadius: 1,
+                              }}
+                            >
+                              {lastMessage}
+                            </Typography>
+                          ) : null}
+                          {watcher.last_error ? (
+                            <Typography variant="caption" sx={{ color: "error.main", display: "block" }}>
+                              {watcher.last_error}
+                            </Typography>
+                          ) : null}
+                        </ButtonBase>
+                      );
+                    })}
+                  </Stack>
+                ) : (
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    No linked monitors.
+                  </Typography>
+                )}
+              </Box>
+
+              <Box className="micro-surface-list-item">
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{ justifyContent: "space-between", alignItems: "center", mb: 0.75 }}
+                >
+                  <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                    Tasks
+                  </Typography>
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={selectedSessionDetail?.linked_tasks.length || 0}
+                  />
+                </Stack>
+                {selectedSessionDetail?.linked_tasks.length ? (
+                  <Stack spacing={0.65}>
+                    {selectedSessionDetail.linked_tasks.map((task) => (
+                      <Box
+                        key={task.id}
+                        sx={{
+                          borderRadius: 1,
+                          p: 0.75,
+                          background: "var(--ui-rgba-255-255-255-020)",
+                        }}
+                      >
+                        <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", minWidth: 0 }}>
+                          <Typography
+                            variant="body2"
+                            noWrap
+                            sx={{ fontWeight: 600, minWidth: 0, flex: 1 }}
+                            title={task.description}
+                          >
+                            {task.description}
+                          </Typography>
+                          <Chip size="small" label={statusLabel(task.status)} color={statusColor(task.status)} />
+                        </Stack>
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                          {linkedTaskMetaLine(task)}
+                        </Typography>
+                      </Box>
+                    ))}
+                  </Stack>
+                ) : (
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    No linked tasks.
+                  </Typography>
+                )}
+              </Box>
+
+              {selectedSession.last_error ? (
+                <Alert severity="error" variant="outlined">
+                  {selectedSession.last_error}
+                </Alert>
+              ) : null}
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSelectedSessionId(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
         open={selectedWatcher != null}
         onClose={() => setSelectedWatcherId(null)}
         maxWidth="md"
@@ -1182,13 +1721,37 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
                   label: "Notify",
                   value: notificationChannelLabel(selectedWatcher?.notify_channel),
                 },
+                {
+                  label: "Mode",
+                  value: toBool(selectedWatcher?.repeat_on_match)
+                    ? "Repeats on match"
+                    : "Stops after match",
+                },
                 { label: "Polls", value: String(num(selectedWatcher?.poll_count, 0)) },
                 { label: "Last status", value: watcherLatestStatusLine(selectedWatcher || {}) },
+                ...(selectedWatcherLastTrigger
+                  ? [
+                      {
+                        label: "Last trigger",
+                        value: selectedWatcherLastTrigger,
+                      },
+                    ]
+                  : []),
                 ...(watcherNotificationLine(selectedWatcher || {})
                   ? [
                       {
                         label: "Latest notify",
                         value: watcherNotificationLine(selectedWatcher || {}),
+                      },
+                    ]
+                  : []),
+                ...(selectedWatcherLatestNotification
+                  ? [
+                      {
+                        label: "Delivery",
+                        value: toBool(selectedWatcherLatestNotification.success)
+                          ? "Sent"
+                          : "Failed",
                       },
                     ]
                   : []),
@@ -1242,6 +1805,33 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
                 </Typography>
                 <Typography variant="body2" sx={{ mt: 0.25, lineHeight: 1.5 }}>
                   {str(selectedWatcher?.on_trigger, "-")}
+                </Typography>
+              </Box>
+            ) : null}
+
+            {selectedWatcherLastMessage ? (
+              <Box>
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  Last delivered message
+                </Typography>
+                <Typography
+                  component="pre"
+                  variant="body2"
+                  sx={{
+                    mt: 0.5,
+                    mb: 0,
+                    p: 1,
+                    maxHeight: 240,
+                    overflow: "auto",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                    fontSize: "0.75rem",
+                    background: "var(--ui-rgba-0-0-0-300)",
+                    borderRadius: 1,
+                  }}
+                >
+                  {selectedWatcherLastMessage}
                 </Typography>
               </Box>
             ) : null}

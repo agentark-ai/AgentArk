@@ -26,11 +26,14 @@ const MIN_HISTORY_TOKEN_BUDGET: usize = 1_024;
 const MAX_HISTORY_SUMMARY_TOKENS: usize = 8_000;
 const HISTORY_POINT_MAX_TOKENS: usize = 96;
 const READ_ROUND_LIMIT: usize = 3;
+const OPERATION_RETRY_LIMIT: usize = 2;
 const MAX_READ_BYTES: usize = 32 * 1024;
+const MAX_OPERATION_DIAGNOSTIC_CHARS: usize = 1_200;
 const MAX_FILE_TREE_ENTRIES: usize = 80;
 const MAX_WORKSPACE_ORBIT_SNAPSHOTS: usize = 16;
 const MAX_WIDGET_SUMMARIES_PER_ORBIT: usize = 12;
 const MAX_SAVED_MODULES_PER_ORBIT: usize = 16;
+const EXISTING_MODULE_WRITE_REJECTION_HINT: &str = "Existing widget modules must be updated with read-first exact edit operations, not full-file writes.";
 const ORBIT_OPERATIONS_ACTION: &str = "arkorbit_apply_operations";
 const ORBIT_SCOPE_CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 320;
 const ORBIT_SCOPE_CLASSIFIER_TIMEOUT_SECS: u64 = 20;
@@ -581,7 +584,7 @@ mod orbit_agent_extra_tests {
             .iter()
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(operations, vec!["read", "write", "edit", "create_widget"]);
+        assert_eq!(operations, vec!["read", "write", "edit"]);
     }
 
     #[test]
@@ -595,7 +598,16 @@ mod orbit_agent_extra_tests {
             .iter()
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(operations, vec!["write", "edit", "create_widget"]);
+        assert_eq!(operations, vec!["write", "edit"]);
+    }
+
+    #[test]
+    fn canvas_action_schema_does_not_advertise_legacy_widget_creation() {
+        let action = orbit_operations_action(OrbitChatSurfaceKind::Canvas, true, true);
+        let rendered = serde_json::to_string(&action.input_schema).expect("schema json");
+
+        assert!(!rendered.contains("create_widget"));
+        assert!(!rendered.contains("\"widget\""));
     }
 
     #[test]
@@ -609,7 +621,37 @@ mod orbit_agent_extra_tests {
             .iter()
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(operations, vec!["edit", "create_widget"]);
+        assert_eq!(operations, vec!["edit"]);
+    }
+
+    #[test]
+    fn module_read_context_disables_full_file_writes() {
+        let reads = vec![(
+            OrbitReadRequest {
+                orbit_id: "orbit".to_string(),
+                path: "mod/workout/index.js".to_string(),
+                note: None,
+            },
+            "export function render() {}".to_string(),
+        )];
+
+        assert!(!allow_full_writes_after_read_context(&reads, false));
+        assert!(!allow_full_writes_after_read_context(&reads, true));
+    }
+
+    #[test]
+    fn data_read_context_keeps_full_file_writes_available() {
+        let reads = vec![(
+            OrbitReadRequest {
+                orbit_id: "orbit".to_string(),
+                path: "data/workout.json".to_string(),
+                note: None,
+            },
+            "{}".to_string(),
+        )];
+
+        assert!(allow_full_writes_after_read_context(&reads, false));
+        assert!(!allow_full_writes_after_read_context(&reads, true));
     }
 
     #[test]
@@ -703,7 +745,7 @@ mod orbit_agent_extra_tests {
     }
 
     #[test]
-    fn parses_declarative_widget_operation_without_file_path() {
+    fn rejects_create_widget_operations() {
         let parsed = parse_orbit_tool_arguments(&serde_json::json!({
             "operations": [{
                 "operation": "create_widget",
@@ -718,11 +760,9 @@ mod orbit_agent_extra_tests {
         }))
         .expect("structured arguments");
         assert_eq!(parsed.operations.len(), 1);
-        assert_eq!(
-            normalize_orbit_operation_kind(&parsed.operations[0]).expect("kind"),
-            OrbitStructuredOperationKind::CreateWidget
-        );
-        assert!(parsed.operations[0].path.is_empty());
+        let err = normalize_orbit_operation_kind(&parsed.operations[0]).unwrap_err();
+
+        assert!(err.to_string().contains("Unknown ArkOrbit operation"));
     }
 
     #[test]
@@ -752,48 +792,56 @@ mod orbit_agent_extra_tests {
 
     #[test]
     fn declarative_app_shell_rejects_title_only_widgets() {
-        let err = normalize_declarative_widget_entry(&serde_json::json!({
-            "title": "Status",
-            "spec": {
-                "title": "Status"
-            }
-        }))
+        let err = validate_widget_registry_content(
+            "data/widgets.json",
+            r#"[{"title":"Status","module":"app-shell","spec":{"title":"Status"}}]"#,
+        )
         .unwrap_err();
 
         assert!(err.to_string().contains("app-specific content"));
     }
 
     #[test]
-    fn declarative_app_shell_accepts_generic_dashboard_content() {
-        let entry = normalize_declarative_widget_entry(&serde_json::json!({
-            "title": "Operations",
-            "spec": {
-                "title": "Operations",
-                "summary": "Live operational overview for the selected workspace.",
-                "metrics": [
-                    { "label": "Open", "value": 8 },
-                    { "label": "Blocked", "value": 1 }
-                ],
-                "sections": [
-                    {
-                        "label": "Queue",
-                        "rows": [
-                            { "label": "Build", "value": "running" },
-                            { "label": "Review", "value": "ready" }
-                        ]
-                    }
-                ],
-                "actions": [
-                    { "label": "Refresh", "trigger": "refresh" }
-                ]
-            }
-        }))
-        .expect("generic dashboard spec should be useful enough for app-shell");
+    fn declarative_app_shell_rejects_embedded_html_documents() {
+        let err = validate_widget_registry_content(
+            "data/widgets.json",
+            r#"[{"title":"Daily Workout","module":"app-shell","spec":{"title":"Daily Workout","content":"<!DOCTYPE html><html><head><style>body{color:red}</style></head><body><script>init()</script></body></html>"}}]"#,
+        )
+        .unwrap_err();
 
-        assert_eq!(
-            entry.get("module").and_then(|value| value.as_str()),
-            Some("app-shell")
-        );
+        assert!(err.to_string().contains("cannot contain full HTML"));
+    }
+
+    #[test]
+    fn declarative_app_shell_accepts_generic_dashboard_content() {
+        validate_widget_registry_content(
+            "data/widgets.json",
+            r#"[{
+                "title": "Operations",
+                "module": "app-shell",
+                "spec": {
+                    "title": "Operations",
+                    "summary": "Live operational overview for the selected workspace.",
+                    "metrics": [
+                        { "label": "Open", "value": 8 },
+                        { "label": "Blocked", "value": 1 }
+                    ],
+                    "sections": [
+                        {
+                            "label": "Queue",
+                            "rows": [
+                                { "label": "Build", "value": "running" },
+                                { "label": "Review", "value": "ready" }
+                            ]
+                        }
+                    ],
+                    "actions": [
+                        { "label": "Refresh", "trigger": "refresh" }
+                    ]
+                }
+            }]"#,
+        )
+        .expect("generic dashboard spec should be useful enough for app-shell");
     }
 
     #[test]
@@ -805,6 +853,75 @@ mod orbit_agent_extra_tests {
 
         assert!(rendered.contains("Widget module must export render"));
         assert!(rendered.len() < 700);
+    }
+
+    #[test]
+    fn operation_retry_prompt_corrects_rejected_operations_by_behavior() {
+        let prompt = render_operation_retry_system_prompt(OrbitChatSurfaceKind::Canvas, false);
+
+        assert!(prompt.contains("rejected before it changed canvas files"));
+        assert!(prompt.contains("custom browser JavaScript widget module"));
+        assert!(prompt.contains("complete file contents"));
+        assert!(!prompt.contains("create_widget"));
+    }
+
+    #[test]
+    fn operation_retry_message_carries_structured_diagnostic() {
+        let rendered = render_operation_retry_message(
+            "Build an app surface",
+            "app-shell spec was insufficient",
+            &[],
+            false,
+        );
+
+        assert!(rendered.contains("Original user request"));
+        assert!(rendered.contains("Build an app surface"));
+        assert!(rendered.contains("Previous Orbit operation diagnostic"));
+        assert!(rendered.contains("app-shell spec was insufficient"));
+    }
+
+    #[test]
+    fn user_visible_operation_failure_sanitizes_diagnostics() {
+        let rendered = user_visible_orbit_operation_failure("bad\noperation");
+
+        assert!(rendered.contains("bad operation"));
+        assert!(!rendered.contains('\n'));
+    }
+
+    #[test]
+    fn runtime_repair_payload_message_is_suppressed() {
+        assert!(user_visible_payload_message("Fixed the widget.", false).is_some());
+        assert!(user_visible_payload_message("Fixed the widget.", true).is_none());
+    }
+
+    #[test]
+    fn code_like_payload_message_is_suppressed() {
+        assert!(
+            user_visible_payload_message("```js\nexport function render(el) {}\n```", false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn code_like_model_content_without_operations_retries_instead_of_emitting() {
+        let diagnostic = model_content_without_operations_diagnostic(
+            "export function render(el) { el.textContent = 'x'; }",
+            true,
+        )
+        .expect("diagnostic");
+
+        assert!(diagnostic.contains("instead of a concrete edit operation"));
+    }
+
+    #[test]
+    fn concise_plain_model_content_without_operations_can_be_visible() {
+        assert!(
+            model_content_without_operations_diagnostic(
+                "I could not identify the broken widget from the provided context.",
+                true
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -847,8 +964,14 @@ mod orbit_agent_extra_tests {
             widgets[0].get("module").and_then(|value| value.as_str()),
             Some("animated-sales-dashboard")
         );
-        assert_eq!(widgets[0].get("left").and_then(|value| value.as_i64()), Some(44));
-        assert_eq!(widgets[0].get("top").and_then(|value| value.as_i64()), Some(88));
+        assert_eq!(
+            widgets[0].get("left").and_then(|value| value.as_i64()),
+            Some(44)
+        );
+        assert_eq!(
+            widgets[0].get("top").and_then(|value| value.as_i64()),
+            Some(88)
+        );
     }
 
     #[test]
@@ -896,8 +1019,6 @@ struct OrbitToolOperation {
     find: Option<String>,
     #[serde(default)]
     replace: Option<String>,
-    #[serde(default)]
-    widget: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -905,6 +1026,20 @@ struct OrbitReadRequest {
     orbit_id: String,
     path: String,
     note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OrbitOperationFailure {
+    diagnostic: String,
+}
+
+#[derive(Debug)]
+struct OrbitSingleStreamOutcome {
+    visible: String,
+    reads: Vec<OrbitReadRequest>,
+    writes: usize,
+    usage: OrbitChatUsage,
+    operation_failure: Option<OrbitOperationFailure>,
 }
 
 pub async fn stream_orbit_chat_turn(
@@ -1044,8 +1179,15 @@ async fn continue_orbit_chat_turn(
     let mut terminal_error = false;
     let runtime_repair_mode = initial_user_context.contains(RUNTIME_REPAIR_MODE_MARKER);
 
-    for round in 0..=READ_ROUND_LIMIT {
-        if round == 0 {
+    let mut read_round = 0usize;
+    let mut operation_retry_count = 0usize;
+    let mut operation_feedback: Option<String> = None;
+    loop {
+        if read_round > READ_ROUND_LIMIT {
+            reached_read_limit_with_pending_reads = true;
+            break;
+        }
+        if read_round == 0 && operation_feedback.is_none() {
             emit_status(
                 event_tx,
                 assistant_draft,
@@ -1053,24 +1195,36 @@ async fn continue_orbit_chat_turn(
             )
             .await?;
         }
-        let system_prompt = if round == 0 {
+        let correction_feedback = operation_feedback.take();
+        let system_prompt = if correction_feedback.is_some() {
+            render_operation_retry_system_prompt(surface_kind, runtime_repair_mode)
+        } else if read_round == 0 {
             initial_system_prompt.clone()
         } else {
             render_post_read_system_prompt(surface_kind, runtime_repair_mode)
         };
-        let current_user = if round == 0 {
+        let current_user = if let Some(feedback) = correction_feedback.as_deref() {
+            render_operation_retry_message(
+                user_message,
+                feedback,
+                &read_context,
+                runtime_repair_mode,
+            )
+        } else if read_round == 0 {
             initial_user_context.clone()
         } else {
             render_read_resume_message(user_message, &read_context, runtime_repair_mode)
         };
         let empty_history: &[ConversationMessage] = &[];
-        let turn_history = if round == 0 {
+        let turn_history = if read_round == 0 && correction_feedback.is_none() {
             history.as_slice()
         } else {
             empty_history
         };
         let persist_prefix = assistant_visible.clone();
-        let (visible, reads, writes, turn_usage) = run_single_stream(
+        let allow_write_operations =
+            allow_full_writes_after_read_context(&read_context, runtime_repair_mode);
+        let outcome = run_single_stream(
             service,
             llm,
             orbit_id,
@@ -1081,24 +1235,46 @@ async fn continue_orbit_chat_turn(
             assistant_draft,
             &persist_prefix,
             true,
-            true,
+            allow_write_operations,
             surface_kind,
             runtime_repair_mode,
         )
         .await?;
-        usage.merge(turn_usage);
-        total_writes = total_writes.saturating_add(writes);
-        assistant_visible.push_str(&visible);
-        if reads.is_empty() {
+        usage.merge(outcome.usage);
+        total_writes = total_writes.saturating_add(outcome.writes);
+        assistant_visible.push_str(&outcome.visible);
+        if let Some(failure) = outcome.operation_failure {
+            if outcome.writes == 0
+                && outcome.reads.is_empty()
+                && operation_retry_count < OPERATION_RETRY_LIMIT
+                && surface_kind.allows_file_operations()
+            {
+                operation_retry_count = operation_retry_count.saturating_add(1);
+                operation_feedback = Some(failure.diagnostic.clone());
+                emit_status(
+                    event_tx,
+                    assistant_draft,
+                    "Regenerating a valid Orbit canvas operation...".to_string(),
+                )
+                .await?;
+                continue;
+            }
+            terminal_error = true;
+            let message = user_visible_orbit_operation_failure(&failure.diagnostic);
+            append_visible_line(&mut assistant_visible, &message);
+            let _ = event_tx.send(OrbitAgentEvent::Error(message)).await;
             break;
         }
-        let satisfied_reads = satisfy_reads(service, orbit_id, &reads, event_tx)?;
+        if outcome.reads.is_empty() {
+            break;
+        }
+        let satisfied_reads = satisfy_reads(service, orbit_id, &outcome.reads, event_tx)?;
         let added_reads = merge_read_context(&mut read_context, satisfied_reads);
-        if round == READ_ROUND_LIMIT {
+        if read_round == READ_ROUND_LIMIT {
             reached_read_limit_with_pending_reads = true;
             break;
         }
-        if added_reads == 0 && writes == 0 {
+        if added_reads == 0 && outcome.writes == 0 {
             reached_read_limit_with_pending_reads = true;
             break;
         }
@@ -1109,9 +1285,10 @@ async fn continue_orbit_chat_turn(
         });
         history.push(ConversationMessage {
             role: "assistant".to_string(),
-            content: visible,
+            content: outcome.visible,
             _timestamp: chrono::Utc::now(),
         });
+        read_round = read_round.saturating_add(1);
     }
 
     if surface_kind.allows_file_operations()
@@ -1128,7 +1305,7 @@ async fn continue_orbit_chat_turn(
         let current_user =
             render_no_more_reads_message(user_message, &read_context, runtime_repair_mode);
         let persist_prefix = assistant_visible.clone();
-        let (visible, _reads, writes, turn_usage) = run_single_stream(
+        let outcome = run_single_stream(
             service,
             llm,
             orbit_id,
@@ -1144,10 +1321,16 @@ async fn continue_orbit_chat_turn(
             runtime_repair_mode,
         )
         .await?;
-        usage.merge(turn_usage);
-        total_writes = total_writes.saturating_add(writes);
-        assistant_visible.push_str(&visible);
-        if writes > 0 {
+        usage.merge(outcome.usage);
+        total_writes = total_writes.saturating_add(outcome.writes);
+        assistant_visible.push_str(&outcome.visible);
+        if let Some(failure) = outcome.operation_failure {
+            terminal_error = true;
+            let message = user_visible_orbit_operation_failure(&failure.diagnostic);
+            append_visible_line(&mut assistant_visible, &message);
+            let _ = event_tx.send(OrbitAgentEvent::Error(message)).await;
+        }
+        if outcome.writes > 0 {
             reached_read_limit_with_pending_reads = false;
         }
     }
@@ -1185,7 +1368,7 @@ async fn continue_orbit_chat_turn(
     if assistant_visible.trim().is_empty() && !read_context.is_empty() {
         let system_prompt = render_read_answer_system_prompt();
         let answer_user = render_read_answer_message(user_message, &read_context);
-        let (visible, _reads, _writes, turn_usage) = run_single_stream(
+        let outcome = run_single_stream(
             service,
             llm,
             orbit_id,
@@ -1201,15 +1384,15 @@ async fn continue_orbit_chat_turn(
             false,
         )
         .await?;
-        usage.merge(turn_usage);
-        assistant_visible.push_str(&visible);
+        usage.merge(outcome.usage);
+        assistant_visible.push_str(&outcome.visible);
     }
 
     if assistant_visible.trim().is_empty() {
         let system_prompt = render_orbit_system_prompt(surface_kind);
         let repair_user =
             render_empty_turn_repair_message(user_message, &read_context, surface_kind);
-        let (visible, _reads, _writes, turn_usage) = run_single_stream(
+        let outcome = run_single_stream(
             service,
             llm,
             orbit_id,
@@ -1225,8 +1408,14 @@ async fn continue_orbit_chat_turn(
             runtime_repair_mode,
         )
         .await?;
-        usage.merge(turn_usage);
-        assistant_visible.push_str(&visible);
+        usage.merge(outcome.usage);
+        assistant_visible.push_str(&outcome.visible);
+        if let Some(failure) = outcome.operation_failure {
+            terminal_error = true;
+            let message = user_visible_orbit_operation_failure(&failure.diagnostic);
+            append_visible_line(&mut assistant_visible, &message);
+            let _ = event_tx.send(OrbitAgentEvent::Error(message)).await;
+        }
     }
 
     if assistant_visible.trim().is_empty() {
@@ -1293,7 +1482,7 @@ async fn run_single_stream(
     allow_read_operations: bool,
     surface_kind: OrbitChatSurfaceKind,
     runtime_repair_mode: bool,
-) -> Result<(String, Vec<OrbitReadRequest>, usize, OrbitChatUsage)> {
+) -> Result<OrbitSingleStreamOutcome> {
     let (token_tx, mut token_rx) = mpsc::channel::<StreamEvent>(128);
     let llm = llm.clone();
     let system_prompt = system_prompt.to_string();
@@ -1435,6 +1624,23 @@ async fn run_single_stream(
             collect_orbit_operation_payloads(&response.tool_calls, &model_content);
         if operation_payloads.is_empty() {
             if !model_content.trim().is_empty() {
+                if let Some(diagnostic) =
+                    model_content_without_operations_diagnostic(&model_content, runtime_repair_mode)
+                {
+                    emit_status(
+                        event_tx,
+                        assistant_draft,
+                        "Orbit needs a structured canvas operation; regenerating.".to_string(),
+                    )
+                    .await?;
+                    return Ok(OrbitSingleStreamOutcome {
+                        visible: assistant_visible,
+                        reads,
+                        writes,
+                        usage,
+                        operation_failure: Some(OrbitOperationFailure { diagnostic }),
+                    });
+                }
                 emit_visible_text(
                     event_tx,
                     assistant_draft,
@@ -1461,8 +1667,24 @@ async fn run_single_stream(
             )
             .await
             {
+                let diagnostic = orbit_operation_retry_diagnostic(&error);
+                if writes == 0 && reads.is_empty() {
+                    emit_status(
+                        event_tx,
+                        assistant_draft,
+                        "Orbit rejected the generated operation; preparing a corrected update."
+                            .to_string(),
+                    )
+                    .await?;
+                    return Ok(OrbitSingleStreamOutcome {
+                        visible: assistant_visible,
+                        reads,
+                        writes,
+                        usage,
+                        operation_failure: Some(OrbitOperationFailure { diagnostic }),
+                    });
+                }
                 let message = user_visible_orbit_operation_error(&error);
-                reads.clear();
                 append_visible_line(&mut assistant_visible, &message);
                 assistant_draft.persist_content(&combine_visible_content(
                     persist_prefix,
@@ -1481,7 +1703,13 @@ async fn run_single_stream(
         )
         .await?;
     }
-    Ok((assistant_visible, reads, writes, usage))
+    Ok(OrbitSingleStreamOutcome {
+        visible: assistant_visible,
+        reads,
+        writes,
+        usage,
+        operation_failure: None,
+    })
 }
 
 async fn emit_progress_status_if_changed(
@@ -1595,6 +1823,132 @@ fn user_visible_orbit_operation_error(error: &anyhow::Error) -> String {
     }
 }
 
+fn orbit_operation_retry_diagnostic(error: &anyhow::Error) -> String {
+    let diagnostic = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .filter(|message| !message.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(": ");
+    let diagnostic = if diagnostic.trim().is_empty() {
+        "The requested Orbit operation was rejected before it changed canvas files.".to_string()
+    } else {
+        diagnostic
+    };
+    truncate_chars(&diagnostic, MAX_OPERATION_DIAGNOSTIC_CHARS)
+}
+
+fn user_visible_orbit_operation_failure(diagnostic: &str) -> String {
+    let safe_detail = diagnostic
+        .trim()
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .chars()
+        .take(260)
+        .collect::<String>();
+    if !safe_detail.is_empty() && !safe_detail.contains('{') && !safe_detail.contains('}') {
+        format!(
+            "I couldn't complete the Orbit file operation: {}",
+            safe_detail
+        )
+    } else {
+        "I couldn't complete the Orbit file operation because the canvas operation failed internally. No further canvas changes were applied.".to_string()
+    }
+}
+
+fn allow_full_writes_after_read_context(
+    reads: &[(OrbitReadRequest, String)],
+    runtime_repair_mode: bool,
+) -> bool {
+    !runtime_repair_mode
+        && !reads
+            .iter()
+            .any(|(request, _)| is_widget_module_index_path(&request.path))
+}
+
+fn is_widget_module_index_path(path: &str) -> bool {
+    let normalized = path.trim().replace('\\', "/");
+    normalized
+        .strip_prefix("mod/")
+        .and_then(|rest| rest.strip_suffix("/index.js"))
+        .is_some_and(|module| !module.trim().is_empty() && !module.contains('/'))
+}
+
+fn reject_existing_module_write_if_needed(
+    service: &ArkOrbitService,
+    orbit_id: &str,
+    path: &str,
+) -> Result<()> {
+    if !is_widget_module_index_path(path) {
+        return Ok(());
+    }
+    if service.read_orbit_file_text(orbit_id, path).is_ok() {
+        return Err(anyhow!(
+            "{} Read the current file and use an edit operation with the smallest exact find/replace snippet for {}.",
+            EXISTING_MODULE_WRITE_REJECTION_HINT,
+            path
+        ));
+    }
+    Ok(())
+}
+
+fn user_visible_payload_message(message: &str, runtime_repair_mode: bool) -> Option<String> {
+    if runtime_repair_mode {
+        return None;
+    }
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 420 || message_looks_like_code(trimmed) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn message_looks_like_code(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "```",
+        "export function",
+        "function render",
+        "const ",
+        "let ",
+        "<!doctype",
+        "<html",
+        "<script",
+        "<style",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn model_content_without_operations_diagnostic(
+    model_content: &str,
+    runtime_repair_mode: bool,
+) -> Option<String> {
+    let trimmed = model_content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if message_looks_like_code(trimmed) {
+        return Some(if runtime_repair_mode {
+            "Runtime repair returned app/widget code as chat text instead of a concrete edit operation."
+                .to_string()
+        } else {
+            "The model returned app/widget code as chat text instead of a structured Orbit file operation."
+                .to_string()
+        });
+    }
+    if trimmed.chars().count() > 1_500 {
+        return Some(if runtime_repair_mode {
+            "Runtime repair returned an oversized chat response instead of a concrete edit operation."
+                .to_string()
+        } else {
+            "The model returned an oversized chat response instead of a structured Orbit file operation."
+                .to_string()
+        });
+    }
+    None
+}
+
 async fn emit_visible_text(
     event_tx: &mpsc::Sender<OrbitAgentEvent>,
     assistant_draft: &mut AssistantMessageDraft,
@@ -1644,7 +1998,7 @@ async fn apply_orbit_operation_payloads(
         for operation in args.operations {
             let path = operation.path.trim().to_string();
             let operation_kind = normalize_orbit_operation_kind(&operation)?;
-            if path.is_empty() && operation_kind != OrbitStructuredOperationKind::CreateWidget {
+            if path.is_empty() {
                 return Err(anyhow!("ArkOrbit operation is missing a path"));
             }
             if operation_kind == OrbitStructuredOperationKind::Write && runtime_repair_mode {
@@ -1660,51 +2014,6 @@ async fn apply_orbit_operation_payloads(
             )
             .await?;
             match operation_kind {
-                OrbitStructuredOperationKind::CreateWidget => {
-                    if !surface_kind.allows_file_operations() || target_orbit_id != orbit_id {
-                        return Err(anyhow!(
-                            "This Orbit surface can inspect files, but widget creation must target the selected created canvas."
-                        ));
-                    }
-                    let Some(widget) = operation.widget.as_ref() else {
-                        return Err(anyhow!(
-                            "ArkOrbit create_widget operation requires a widget object"
-                        ));
-                    };
-                    emit_status(
-                        event_tx,
-                        assistant_draft,
-                        "Creating a framework-rendered widget...".to_string(),
-                    )
-                    .await?;
-                    let entry = normalize_declarative_widget_entry(widget)?;
-                    let (bytes, file_operation) =
-                        upsert_widget_registry_entry(service, &target_orbit_id, entry)?;
-                    emit_status(
-                        event_tx,
-                        assistant_draft,
-                        format!("Writing data/widgets.json ({}).", format_byte_count(bytes)),
-                    )
-                    .await?;
-                    concrete_operations = concrete_operations.saturating_add(1);
-                    let line = format_file_update_line(file_operation, "data/widgets.json");
-                    append_visible_line(assistant_visible, &line);
-                    assistant_draft.persist_content(&combine_visible_content(
-                        persist_prefix,
-                        assistant_visible,
-                    ))?;
-                    *writes += 1;
-                    let _ = event_tx
-                        .send(OrbitAgentEvent::FileWritten {
-                            path: "data/widgets.json".to_string(),
-                            operation: file_operation,
-                            bytes,
-                        })
-                        .await;
-                    let _ = event_tx
-                        .send(OrbitAgentEvent::Token(format!("{}\n", line)))
-                        .await;
-                }
                 OrbitStructuredOperationKind::Read => {
                     if !allow_read_operations {
                         return Err(anyhow!(
@@ -1752,6 +2061,8 @@ async fn apply_orbit_operation_payloads(
                         continue;
                     };
                     validate_writable_orbit_path(&path)?;
+                    validate_widget_registry_content(&path, &content)?;
+                    reject_existing_module_write_if_needed(service, &target_orbit_id, &path)?;
                     emit_status(
                         event_tx,
                         assistant_draft,
@@ -1832,12 +2143,13 @@ async fn apply_orbit_operation_payloads(
                         reads.push(OrbitReadRequest {
                             orbit_id: target_orbit_id.clone(),
                             path: path.clone(),
-                            note: Some("The previous edit target was not found in this file. Use the current content below and either produce a smaller exact edit or replace the complete file.".to_string()),
+                            note: Some("The previous edit target was not found in this file. Use the current content below and produce a smaller exact edit.".to_string()),
                         });
                         concrete_operations = concrete_operations.saturating_add(1);
                         let _ = event_tx.send(OrbitAgentEvent::ReadRequested { path }).await;
                         continue;
                     };
+                    validate_widget_registry_content(&path, &updated)?;
                     let bytes = updated.len();
                     emit_status(
                         event_tx,
@@ -1869,13 +2181,15 @@ async fn apply_orbit_operation_payloads(
             }
         }
         if *writes > writes_before_payload {
-            if let Some(message) = payload_message.as_deref() {
+            if let Some(message) = payload_message
+                .and_then(|message| user_visible_payload_message(&message, runtime_repair_mode))
+            {
                 emit_visible_text(
                     event_tx,
                     assistant_draft,
                     persist_prefix,
                     assistant_visible,
-                    message,
+                    &message,
                 )
                 .await?;
                 if !assistant_visible.ends_with('\n') {
@@ -1904,7 +2218,6 @@ enum OrbitStructuredOperationKind {
     Read,
     Write,
     Edit,
-    CreateWidget,
 }
 
 async fn resolve_operation_target_orbit(
@@ -1955,17 +2268,16 @@ fn orbit_operations_action(
             operations.push("write");
         }
         operations.push("edit");
-        operations.push("create_widget");
         serde_json::json!(operations)
     };
     let description = if read_only {
         "Read selected ArkOrbit files for the workspace overview. Use the current inventory to choose relevant canvas files by orbit_id and path. This action cannot write, edit, create, delete, or move widgets."
     } else if allow_read_operations && allow_write_operations {
-        "Apply structured ArkOrbit canvas operations. Prefer create_widget for simple app/dashboard/card widgets so the framework renders the app from a small declarative spec; use write/edit only when custom JavaScript is required."
+        "Apply structured ArkOrbit canvas operations. For compact app/widget creation, prefer a small data/widgets.json app-shell registry spec with views, sections, checklist items, metrics, and actions. Write custom JavaScript only when the requested behavior cannot fit the declarative shell. Existing widget modules must be updated with read-first edit operations."
     } else if allow_write_operations {
-        "Apply the final structured ArkOrbit canvas update from already inspected files. Reads are disabled for this pass; use write, edit, or create_widget, or answer that the change is blocked."
+        "Apply the final structured ArkOrbit canvas update from already inspected files. Reads are disabled for this pass; use write or edit, or answer that the change is blocked."
     } else {
-        "Apply a surgical ArkOrbit runtime repair from already inspected files. Reads and full-file writes are disabled for this pass; use edit or create_widget, or answer that the change is blocked."
+        "Apply a surgical ArkOrbit runtime repair from already inspected files. Reads and full-file writes are disabled for this pass; use edit, or answer that the change is blocked."
     };
     ActionDef {
         name: ORBIT_OPERATIONS_ACTION.to_string(),
@@ -1990,11 +2302,11 @@ fn orbit_operations_action(
                                 "description": if read_only {
                                     "read requests an existing orbit file for a follow-up turn."
                                 } else if allow_read_operations {
-                                    "read requests an existing file for a follow-up turn; create_widget adds or updates a framework-rendered declarative widget; write persists complete content; edit replaces the first exact find snippet."
+                                    "read requests an existing file for a follow-up turn; write persists complete content for new files or compact registry specs; edit replaces the first exact find snippet. Existing widget modules reject full writes."
                                 } else if allow_write_operations {
-                                    "create_widget adds or updates a framework-rendered declarative widget; write persists complete content; edit replaces the first exact find snippet. File reads are disabled in this pass."
+                                    "write persists complete content for new files or compact registry specs; edit replaces the first exact find snippet. File reads are disabled in this pass."
                                 } else {
-                                    "create_widget updates a declarative registry entry; edit replaces the first exact find snippet. File reads and full-file writes are disabled in this pass."
+                                    "edit replaces the first exact find snippet. File reads and full-file writes are disabled in this pass."
                                 }
                             },
                             "orbit_id": {
@@ -2016,10 +2328,6 @@ fn orbit_operations_action(
                             "replace": {
                                 "type": "string",
                                 "description": "Replacement snippet for edit operations. Use an empty string to delete the find snippet."
-                            },
-                            "widget": {
-                                "type": "object",
-                                "description": "Required for create_widget. Declarative app/widget registry entry. Omit module to use the framework app-shell renderer. Put app-specific content, public data bindings, sections, metrics, source, and visual choices under widget.spec."
                             }
                         },
                         "required": ["operation"],
@@ -2044,13 +2352,6 @@ fn orbit_operations_action(
                                     "required": ["operation"]
                                 },
                                 "then": { "required": ["path", "find"] }
-                            },
-                            {
-                                "if": {
-                                    "properties": { "operation": { "const": "create_widget" } },
-                                    "required": ["operation"]
-                                },
-                                "then": { "required": ["widget"] }
                             }
                         ]
                     }
@@ -2217,10 +2518,8 @@ fn normalize_orbit_operation_kind(
         "read" => Ok(OrbitStructuredOperationKind::Read),
         "write" | "create" | "replace" => Ok(OrbitStructuredOperationKind::Write),
         "edit" | "patch" | "update" => Ok(OrbitStructuredOperationKind::Edit),
-        "create_widget" => Ok(OrbitStructuredOperationKind::CreateWidget),
         "" if operation.content.is_some() => Ok(OrbitStructuredOperationKind::Write),
         "" if operation.find.is_some() => Ok(OrbitStructuredOperationKind::Edit),
-        "" if operation.widget.is_some() => Ok(OrbitStructuredOperationKind::CreateWidget),
         _ => Err(anyhow!(
             "Unknown ArkOrbit operation '{}'",
             operation.operation
@@ -2340,7 +2639,7 @@ fn render_read_resume_message(
         .unwrap_or_else(|_| "{\"files\":[]}".to_string());
     let continuation = if runtime_repair_mode {
         format!(
-            "The requested orbit file contents are available below as JSON. Continue the same runtime repair using all provided files. If these files are enough, call {action} with the concrete edit or create_widget operation now. Request another read only when a different unread file is essential. Do not claim the canvas is fixed unless the same response includes a concrete edit or create_widget operation. If the repair is blocked, answer directly with the specific reason.",
+            "The requested orbit file contents are available below as JSON. Continue the same runtime repair using all provided files. If these files are enough, call {action} with the concrete edit operation now. Request another read only when a different unread file is essential. Do not claim the canvas is fixed unless the same response includes a concrete edit operation. If the repair is blocked, answer directly with the specific reason.",
             action = ORBIT_OPERATIONS_ACTION
         )
     } else {
@@ -2361,7 +2660,7 @@ fn render_post_read_system_prompt(
 ) -> String {
     if runtime_repair_mode && surface_kind.allows_file_operations() {
         return format!(
-            "You are continuing an ArkOrbit runtime repair after file reads. Use the provided file contents and original request. Fix all listed runtime notices in one pass where possible. Prefer the smallest exact edit operations; use create_widget only for declarative registry updates. Request another read only when an unread file is essential. Do not claim the canvas is fixed unless the same response includes a concrete edit or create_widget operation. If no concrete change can be made from the inspected files, answer with the blocking reason. Do not call {action} with an empty operations array.",
+            "You are continuing an ArkOrbit runtime repair after file reads. Use the provided file contents and original request. Fix all listed runtime notices in one pass where possible. Prefer the smallest exact edit operations. Request another read only when an unread file is essential. Do not claim the canvas is fixed unless the same response includes a concrete edit operation. If no concrete change can be made from the inspected files, answer with the blocking reason. Do not call {action} with an empty operations array.",
             action = ORBIT_OPERATIONS_ACTION
         );
     }
@@ -2376,15 +2675,53 @@ fn render_post_read_system_prompt(
     )
 }
 
+fn render_operation_retry_system_prompt(
+    surface_kind: OrbitChatSurfaceKind,
+    runtime_repair_mode: bool,
+) -> String {
+    let operation_guidance = if runtime_repair_mode {
+        "Use a surgical edit when that is sufficient for the requested repair."
+    } else if surface_kind.allows_file_operations() {
+        "Apply a corrected concrete Orbit canvas operation. For app/widget creation, write a custom browser JavaScript widget module with a named render export and complete file contents."
+    } else {
+        "The selected surface is read-only; request only targeted file reads from the supplied inventory."
+    };
+    format!(
+        "You are correcting an ArkOrbit operation that was rejected before it changed canvas files. Treat the diagnostic as execution feedback, not as user-facing content. Do not repeat the rejected operation shape. {}\nIf a canvas change is still needed, call {} with a concrete operation. If the operation cannot be corrected from the available context, answer with the specific blocker.",
+        operation_guidance, ORBIT_OPERATIONS_ACTION
+    )
+}
+
+fn render_operation_retry_message(
+    user_message: &str,
+    diagnostic: &str,
+    reads: &[(OrbitReadRequest, String)],
+    runtime_repair_mode: bool,
+) -> String {
+    let mut message = format!(
+        "Original user request:\n{}\n\nPrevious Orbit operation diagnostic:\n{}\n\nCorrect the operation now. Do not mention the diagnostic to the user unless it remains a blocker.",
+        user_message,
+        truncate_chars(diagnostic, MAX_OPERATION_DIAGNOSTIC_CHARS)
+    );
+    if runtime_repair_mode {
+        message.push_str("\nRuntime repair mode is active; produce a concrete repair operation or state the blocker.");
+    }
+    if !reads.is_empty() {
+        message.push_str("\n\nAlready-read orbit file contents:\n");
+        message.push_str(&render_read_context_json(reads));
+    }
+    message
+}
+
 fn render_no_more_reads_system_prompt(runtime_repair_mode: bool) -> String {
     if runtime_repair_mode {
         return format!(
-            "You are completing an ArkOrbit runtime repair. No more file reads are available in this turn. Use only the already inspected file contents. Produce the concrete edit or create_widget operation that fixes the issue, or answer with the specific blocking reason. Do not claim the canvas is fixed unless the same response calls {action} with an edit or create_widget operation. Do not call {action} with read, write, or an empty operations array.",
+            "You are completing an ArkOrbit runtime repair. No more file reads are available in this turn. Use only the already inspected file contents. Produce the concrete edit operation that fixes the issue, or answer with the specific blocking reason. Do not claim the canvas is fixed unless the same response calls {action} with an edit operation. Do not call {action} with read, write, or an empty operations array.",
             action = ORBIT_OPERATIONS_ACTION
         );
     }
     format!(
-        "You are completing an ArkOrbit canvas turn. No more file reads are available in this turn. Use only the already inspected file contents. If a canvas change is needed, call {action} with write, edit, or create_widget. If the change is blocked, answer with the specific reason. Do not call {action} with read or with an empty operations array.",
+        "You are completing an ArkOrbit canvas turn. No more file reads are available in this turn. Use only the already inspected file contents. If a canvas change is needed, call {action} with write or edit. If the change is blocked, answer with the specific reason. Do not call {action} with read or with an empty operations array.",
         action = ORBIT_OPERATIONS_ACTION
     )
 }
@@ -2456,84 +2793,69 @@ fn render_read_context_json(reads: &[(OrbitReadRequest, String)]) -> String {
         .unwrap_or_else(|_| "{\"files\":[]}".to_string())
 }
 
-fn normalize_declarative_widget_entry(
-    raw: &serde_json::Value,
-) -> Result<serde_json::Map<String, serde_json::Value>> {
-    let Some(object) = raw.as_object() else {
-        return Err(anyhow!(
-            "ArkOrbit create_widget widget must be a JSON object"
-        ));
+fn validate_widget_registry_content(path: &str, content: &str) -> Result<()> {
+    if path.trim().replace('\\', "/") != "data/widgets.json" {
+        return Ok(());
+    }
+    let value: serde_json::Value = serde_json::from_str(content)
+        .map_err(|error| anyhow!("data/widgets.json must contain valid JSON: {}", error))?;
+    validate_widget_registry_value(&value)
+}
+
+fn validate_widget_registry_value(value: &serde_json::Value) -> Result<()> {
+    let widgets = widget_registry_entries_slice(value)?;
+    for widget in widgets {
+        validate_widget_registry_entry(widget)?;
+    }
+    Ok(())
+}
+
+fn widget_registry_entries_slice(value: &serde_json::Value) -> Result<&[serde_json::Value]> {
+    if let Some(items) = value.as_array() {
+        return Ok(items.as_slice());
+    }
+    if let Some(object) = value.as_object() {
+        return object
+            .get("widgets")
+            .map(|widgets| {
+                widgets
+                    .as_array()
+                    .map(|items| items.as_slice())
+                    .ok_or_else(|| {
+                        anyhow!("data/widgets.json object field 'widgets' must be an array")
+                    })
+            })
+            .unwrap_or_else(|| Ok(&[]));
+    }
+    Err(anyhow!(
+        "data/widgets.json must be a widget array or an object with a widgets array"
+    ))
+}
+
+fn validate_widget_registry_entry(widget: &serde_json::Value) -> Result<()> {
+    let Some(object) = widget.as_object() else {
+        return Err(anyhow!("data/widgets.json widget entries must be objects"));
     };
-    let title = object
-        .get("title")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(120).collect::<String>());
-    let id = object
-        .get("id")
-        .and_then(|value| value.as_str())
-        .and_then(normalize_widget_registry_key)
-        .or_else(|| title.as_deref().and_then(normalize_widget_registry_key))
-        .unwrap_or_else(|| {
-            format!(
-                "widget-{}",
-                Uuid::new_v4().simple().to_string()[..8].to_string()
-            )
-        });
-    let module = object
+    if object
         .get("module")
         .and_then(|value| value.as_str())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("app-shell");
-    if !valid_widget_module_name(module) {
-        return Err(anyhow!(
-            "ArkOrbit create_widget module must be one safe module segment"
-        ));
+        == Some("app-shell")
+    {
+        let spec = object
+            .get("spec")
+            .ok_or_else(|| anyhow!("ArkOrbit app-shell widgets need a spec object"))?;
+        validate_declarative_app_shell_spec(spec)?;
     }
-
-    let mut entry = serde_json::Map::new();
-    entry.insert("id".to_string(), serde_json::Value::String(id));
-    entry.insert(
-        "module".to_string(),
-        serde_json::Value::String(module.to_string()),
-    );
-    if let Some(title) = title {
-        entry.insert("title".to_string(), serde_json::Value::String(title));
-    }
-    for field in ["left", "top", "width", "height"] {
-        if let Some(number) = object.get(field).and_then(|value| value.as_f64()) {
-            if number.is_finite() {
-                entry.insert(field.to_string(), serde_json::json!(number));
-            }
-        }
-    }
-
-    let spec = object
-        .get("spec")
-        .filter(|value| value.is_object())
-        .cloned()
-        .unwrap_or_else(|| {
-            let mut spec = serde_json::Map::new();
-            for (key, value) in object {
-                if !is_registry_structural_widget_key(key) {
-                    spec.insert(key.clone(), value.clone());
-                }
-            }
-            serde_json::Value::Object(spec)
-        });
-    if serde_json::to_vec(&spec)?.len() > 64 * 1024 {
-        return Err(anyhow!("ArkOrbit create_widget spec is too large"));
-    }
-    if module == "app-shell" {
-        validate_declarative_app_shell_spec(&spec)?;
-    }
-    entry.insert("spec".to_string(), spec);
-    Ok(entry)
+    Ok(())
 }
 
 fn validate_declarative_app_shell_spec(spec: &serde_json::Value) -> Result<()> {
+    if declarative_app_shell_spec_has_embedded_document(spec, 0) {
+        return Err(anyhow!(
+            "ArkOrbit app-shell widgets cannot contain full HTML documents, script blocks, or style blocks. Write a custom browser JavaScript module under mod/<name>/index.js instead."
+        ));
+    }
     let score = declarative_app_shell_spec_score(None, spec, true, 0);
     if score >= 80 {
         return Ok(());
@@ -2541,6 +2863,36 @@ fn validate_declarative_app_shell_spec(spec: &serde_json::Value) -> Result<()> {
     Err(anyhow!(
         "ArkOrbit app-shell widgets need app-specific content: metrics, sections, rows, actions, public data bindings, or concrete body content. Use custom JavaScript instead when the request needs behavior the declarative shell cannot express."
     ))
+}
+
+fn declarative_app_shell_spec_has_embedded_document(
+    value: &serde_json::Value,
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        serde_json::Value::String(raw) => string_contains_embedded_html_document(raw),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| declarative_app_shell_spec_has_embedded_document(item, depth + 1)),
+        serde_json::Value::Object(object) => object
+            .values()
+            .any(|child| declarative_app_shell_spec_has_embedded_document(child, depth + 1)),
+        _ => false,
+    }
+}
+
+fn string_contains_embedded_html_document(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    ["<!doctype", "<html", "<head", "<body", "<script", "<style"]
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 fn declarative_app_shell_spec_score(
@@ -2612,103 +2964,6 @@ fn is_body_content_key(key: &str) -> bool {
         key,
         "content" | "body" | "description" | "summary" | "subtitle"
     )
-}
-
-fn normalize_widget_registry_key(raw: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in raw.trim().chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if matches!(ch, '-' | '_' | ' ' | '\t' | '\n' | '\r') && !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-        if out.len() >= 64 {
-            break;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    (!out.is_empty()).then_some(out)
-}
-
-fn valid_widget_module_name(value: &str) -> bool {
-    let trimmed = value.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= 80
-        && !trimmed.contains('/')
-        && trimmed
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-fn is_registry_structural_widget_key(key: &str) -> bool {
-    matches!(
-        key,
-        "id" | "module" | "title" | "left" | "top" | "width" | "height"
-    )
-}
-
-fn upsert_widget_registry_entry(
-    service: &ArkOrbitService,
-    orbit_id: &str,
-    entry: serde_json::Map<String, serde_json::Value>,
-) -> Result<(usize, OrbitFileOperation)> {
-    let (mut root, mut widgets) = service
-        .read_orbit_file_text(orbit_id, "data/widgets.json")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .map(|value| {
-            if let Some(list) = value.as_array() {
-                (None, list.clone())
-            } else if let Some(object) = value.as_object() {
-                let widgets = object
-                    .get("widgets")
-                    .and_then(|widgets| widgets.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                (Some(object.clone()), widgets)
-            } else {
-                (None, Vec::new())
-            }
-        })
-        .unwrap_or((None, Vec::new()));
-
-    let entry_value = serde_json::Value::Object(entry);
-    let replaced = widgets
-        .iter_mut()
-        .find(|widget| widget_registry_entries_match(widget, &entry_value))
-        .map(|widget| {
-            let mut next = entry_value.clone();
-            preserve_widget_layout(widget, &mut next);
-            *widget = next;
-        })
-        .is_some();
-    if !replaced {
-        widgets.push(entry_value);
-    }
-    let removed_duplicates = collapse_duplicate_widget_registry_entries(&mut widgets);
-
-    let next_value = if let Some(root) = root.as_mut() {
-        root.insert("widgets".to_string(), serde_json::Value::Array(widgets));
-        serde_json::Value::Object(root.clone())
-    } else {
-        serde_json::Value::Array(widgets)
-    };
-    let next = serde_json::to_string_pretty(&next_value)?;
-    let bytes = next.len();
-    service.write_orbit_file(orbit_id, "data/widgets.json", &next)?;
-    Ok((
-        bytes,
-        if replaced || removed_duplicates > 0 {
-            OrbitFileOperation::Edited
-        } else {
-            OrbitFileOperation::Wrote
-        },
-    ))
 }
 
 fn widget_registry_entries_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
@@ -2821,9 +3076,9 @@ fn preserve_widget_layout(existing: &serde_json::Value, replacement: &mut serde_
         if replacement_object.contains_key(field) {
             continue;
         }
-        if let Some(value) = existing_object.get(field).and_then(|value| value.as_f64()) {
-            if value.is_finite() {
-                replacement_object.insert(field.to_string(), serde_json::json!(value));
+        if let Some(value) = existing_object.get(field) {
+            if value.as_f64().is_some_and(|number| number.is_finite()) {
+                replacement_object.insert(field.to_string(), value.clone());
             }
         }
     }
@@ -2949,7 +3204,7 @@ fn title_from_module(module: &str) -> String {
 }
 
 fn compact_l0_catalog() -> &'static str {
-    "Widget modules are browser JavaScript under mod/<name>/index.js and export render(el, ctx = {}). Built-in helpers include app-shell for generic declarative mini-apps, markdown, iframe-html, chart, table, todo, and public fetch helpers ctx.fetchText/ctx.fetchJson/ctx.fetchPublic for unauthenticated HTTPS data. Never embed secrets. Prefer create_widget with app-shell for simple app/dashboard/card widgets; use custom JavaScript only when the requested behavior cannot be represented as a declarative spec."
+    "Widget modules are browser JavaScript under mod/<name>/index.js and export render(el, ctx = {}). Built-in helpers include markdown, iframe-html, chart, table, todo, and app-shell. app-shell renders compact data/widgets.json specs with title, summary/content, metrics, sections, rows/items, views/tabs, checklist items, refresh actions, and public fetch bindings. Prefer app-shell registry specs for ordinary apps, dashboards, trackers, plans, and checklists; write custom JavaScript only for behavior the shell cannot represent. Public HTTPS data helpers are ctx.fetchText/ctx.fetchJson/ctx.fetchPublic. Never embed secrets."
 }
 
 fn render_orbit_file_tree(files: &[OrbitFileEntry]) -> String {
@@ -3278,13 +3533,10 @@ fn render_orbit_system_prompt(surface_kind: OrbitChatSurfaceKind) -> String {
         format!(
             "File operation protocol:\n\
 - Use the structured {action} tool for every selected-canvas file read, write, or edit.\n\
-- If native tool calling is unavailable, return JSON only with an agent_tool_calls array that calls {action}; for simple widgets, use operation create_widget with a widget object containing title and spec.\n\
-- For an existing widget/file, use a read operation first if the exact current contents are needed, then use an edit operation with the smallest exact find/replace snippet.\n\
-- For a simple new app, dashboard, card, tracker, or public-data widget, prefer a create_widget operation with a small declarative widget.spec. The framework renders app-shell; fill only app-specific title, summary/content, metrics, sections, rows/items, actions, public fetch URL, bindings, and visual accent.\n\
-- Use create_widget only when the spec is enough to produce a useful first screen. Include meaningful app-specific metrics, section rows, controls/actions, source/fetch bindings, or concrete content. Do not create an empty titled shell or placeholder-only card.\n\
-- If the requested app needs interaction, custom layout, parsing, simulation, or rendering that app-shell cannot express, write a custom browser JavaScript widget module with a named render export instead of forcing it into create_widget.\n\
-- Use write/edit for custom JavaScript only when the requested behavior cannot be expressed by create_widget.\n\
-- For a new custom-code widget, use a write operation with complete file contents.\n\
+- If native tool calling is unavailable, return JSON only with an agent_tool_calls array that calls {action}.\n\
+- For app/widget creation that can be represented with title, summary, metrics, sections, rows/items, views/tabs, checklist items, and simple actions, write a compact data/widgets.json entry using module app-shell and a spec object. Do not generate custom JavaScript for those cases.\n\
+- For app/widget creation that needs custom rendering, parsing, simulation, canvas drawing, or behavior beyond app-shell, write a browser JavaScript module with complete contents under mod/<name>/index.js.\n\
+- For an existing widget module, use a read operation first, then an edit operation with the smallest exact find/replace snippet. Full write operations to an existing module are rejected.\n\
 - Do not emit XML-style file commands such as <file>, <edit>, or <read>; prose is not a file operation protocol.",
             action = ORBIT_OPERATIONS_ACTION
         )
@@ -3324,15 +3576,15 @@ Available L0 widgets and runtime notes:\n{}\n\n\
 Canvas behavior:\n\
 - index.html is a stable canvas host. Do not rewrite it for ordinary widget requests.\n\
 - If the current Orbit context includes an accent color, use it as the primary canvas/widget accent unless the user asks for a different visual direction.\n\
-- For simple app/dashboard/card widgets, use create_widget first so the framework can render app-shell from widget.spec without model-authored JavaScript.\n\
-- Do not use create_widget as a shortcut for a low-quality card. The generated artifact must look and behave like the requested app, with the important information visible immediately and no empty divider sections.\n\
-- For a new custom-code widget, write one small JavaScript module at mod/<short-widget-id>/index.js.\n\
-- The module must export render(el, ctx = {{}}). The host automatically registers, mounts, reloads, and makes it draggable.\n\
-- Every write operation must include the complete JavaScript file content in the content field. Never call a write operation with only a path.\n\
+- For a new app/widget, prefer a compact data/widgets.json app-shell entry when the requested UI can be represented with views/tabs, metrics, sections, checklist items, rows, and actions.\n\
+- Write a custom JavaScript module at mod/<short-widget-id>/index.js only when the requested UI needs behavior that app-shell cannot represent.\n\
+- The generated artifact must look and behave like the requested app, with the important information visible immediately and no empty divider sections.\n\
+- Custom JavaScript modules must export render(el, ctx = {{}}). The host automatically registers, mounts, reloads, and makes them draggable.\n\
+- Every write operation must include the complete target file content in the content field. Never call a write operation with only a path.\n\
 - Visible widgets come from data/widgets.json. Modules that exist on disk but are absent from that registry are saved code, not visible canvas widgets.\n\
 - For canvas inspection, inspect the visible registry first and read only modules or data files that are registered or otherwise necessary for the user's actual request.\n\
 - Widget left/top/width/height values in data/widgets.json are user layout state. Preserve them for existing widgets unless the user asks to move, resize, rearrange, or replace the whole canvas.\n\
-- For an edit to an existing widget, first read the target file if needed, then replace only the smallest exact snippet that satisfies the request.\n\
+- For an edit to an existing widget module, first read the target file if needed, then replace only the smallest exact snippet that satisfies the request. Never rewrite the whole existing module.\n\
 - To delete or remove a visible widget from the canvas, update data/widgets.json so the final visible registry no longer includes that widget. Do not invent a separate file-delete operation.\n\
 - When the user's intent is to replace the whole canvas state, treat the current widget registry as disposable: write the desired final widget registry and the needed modules directly, and do not read existing files unless the final result depends on their current contents.\n\
 - When the user wants a previously available widget brought back into the canvas, first check whether its module still exists. If it exists, read or edit data/widgets.json and add a registry entry for that module. If it was deleted, recreate the module from the user's request and conversation context.\n\
@@ -3353,7 +3605,7 @@ Execution rules:\n\
 - Treat \"live\" as live for the user's requested timeframe. For example, \"live corona dashboard for March 2020\" means data from March 2020, not today's data.\n\
 - For current, recent, latest, pricing, market, news, or other time-sensitive data, label the widget with the resolved timeframe. Do not invent an older snapshot date when the user did not ask for one.\n\
 - Do not claim data is live unless the widget actually fetches a live public source at runtime. If live data is not available, label values as approximate/example data for the resolved timeframe and tell the user what source should be checked.\n\
-- For widget creation, prefer create_widget. Emit JavaScript at mod/<short-widget-id>/index.js only when custom behavior is needed, unless the user explicitly asks for assets or data.\n\
+- For widget creation, use app-shell registry specs unless custom JavaScript is required by the behavior.\n\
 - Do not say a file was created, updated, edited, written, or placed unless you call the matching structured operation in the same response.\n\
 - After file operations, summarize briefly in plain prose for a human, including what changed and which files were touched.",
         surface_rules,
@@ -3859,7 +4111,6 @@ mod tests {
             content: Some("export function render() {}".to_string()),
             find: None,
             replace: None,
-            widget: None,
         };
         assert_eq!(
             normalize_orbit_operation_kind(&operation).expect("kind"),

@@ -1,4 +1,4 @@
 pub mod protocol;
 pub mod server;
 
-pub use server::{run_service, ExecutorServiceConfig};
+pub use server::{ExecutorServiceConfig, run_service};

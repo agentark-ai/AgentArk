@@ -281,7 +281,9 @@ pub(super) async fn handle_autonomy_quick_command(
                 &settings.trust_policy,
             );
 
-            if trust.requires_approval || require_approval {
+            if crate::core::task_requires_explicit_approval(&TaskApproval::RequireApproval)
+                && (trust.requires_approval || require_approval)
+            {
                 let mut approval_task = Task::new(
                     format!("Delegation approval: {}", task),
                     "delegate".to_string(),
@@ -323,18 +325,16 @@ pub(super) async fn handle_autonomy_quick_command(
             let active_specialist_prompt_bundle = agent
                 .active_specialist_prompt_bundle_for_message(&task)
                 .await;
-            let mut decision = agent
-                .route_query(&task, &actions, &active_prompt_bundle)
-                .await;
-            decision.needs_delegation = true;
-            if decision.sub_agents.len() < 2 {
-                decision.sub_agents = agent.forced_swarm_specs(&task, &actions);
-            }
-            decision.confidence = decision.confidence.max(0.96);
-            decision.reasoning = format!(
-                "{} | Explicit /delegate command forced multi-agent execution.",
-                decision.reasoning
-            );
+            let decision = crate::core::task_router::RoutingDecision {
+                needs_delegation: true,
+                complexity: crate::core::QueryComplexity::Complex,
+                sub_agents: agent.forced_swarm_specs(&task, &actions),
+                reasoning: "Delegation was explicitly requested by the control command."
+                    .to_string(),
+                confidence: 0.96,
+                should_clarify: false,
+                clarification_question: None,
+            };
             let system_prompt = match agent
                 .build_system_prompt(&[], Some(&active_prompt_bundle))
                 .await

@@ -84,6 +84,20 @@ pub(super) fn build_swarm_agent_from_delegation(
 
 pub(super) fn is_system_swarm_agent(agent: &crate::storage::entities::swarm_agent::Model) -> bool {
     agent.id.starts_with("default-")
+        || agent.id.contains("::")
+        || agent.id.contains(":agent:")
+        || agent.id.contains(":plan-step:")
+}
+
+fn swarm_delegation_run_id(row: &crate::storage::entities::swarm_delegation::Model) -> String {
+    row.parent_task_id
+        .clone()
+        .or_else(|| {
+            row.id
+                .split_once("::")
+                .map(|(run_id, _)| run_id.to_string())
+        })
+        .unwrap_or_else(|| row.id.clone())
 }
 
 pub(super) fn summarize_swarm_run_status(
@@ -210,7 +224,7 @@ pub(super) async fn swarm_status(State(state): State<AppState>) -> Response {
     > = std::collections::HashMap::new();
     if let Ok(rows) = agent.storage.get_active_swarm_delegations(250).await {
         for row in rows {
-            let run_id = row.parent_task_id.clone().unwrap_or_else(|| row.id.clone());
+            let run_id = swarm_delegation_run_id(&row);
             persisted_grouped.entry(run_id).or_default().push(row);
         }
     }
@@ -311,6 +325,7 @@ pub(super) async fn swarm_list_agents(State(state): State<AppState>) -> Response
                 .unwrap_or_default();
             let agent_infos: Vec<serde_json::Value> = agents
                 .iter()
+                .filter(|a| !(a.enabled == 0 && is_system_swarm_agent(a)))
                 .map(|a| {
                     let agent_type = crate::core::swarm::persistence::parse_agent_type(
                         &a.agent_type,
@@ -807,6 +822,7 @@ pub(super) async fn swarm_agent_builder_options(State(state): State<AppState>) -
             }
         }
     };
+    #[cfg(feature = "ssh")]
     let ssh_connections = match crate::actions::ssh::list_connections(&agent.config_dir) {
         Ok(items) => items,
         Err(error) => {
@@ -819,6 +835,8 @@ pub(super) async fn swarm_agent_builder_options(State(state): State<AppState>) -
                 .into_response();
         }
     };
+    #[cfg(not(feature = "ssh"))]
+    let ssh_connections: Vec<serde_json::Value> = Vec::new();
     let custom_apis = match crate::custom_apis::list_custom_apis(
         &agent.storage,
         &agent.config_dir,
@@ -1586,6 +1604,7 @@ pub(super) async fn swarm_get_config(State(state): State<AppState>) -> Response 
             "enabled": true,
             "max_specialists": config.max_specialists,
             "default_timeout_secs": config.default_timeout_secs,
+            "timeout_policy": "wait_until_completion",
         })),
     )
         .into_response()
@@ -1627,8 +1646,9 @@ pub(super) async fn swarm_update_config(
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok",
-            "message": "Swarm config updated. Restart to apply changes.",
+            "message": "Swarm config updated. Delegated agents wait until completion.",
             "enabled": true,
+            "timeout_policy": "wait_until_completion",
         })),
     )
         .into_response()
@@ -1723,7 +1743,7 @@ pub(super) async fn swarm_list_delegations(
                 Vec<crate::storage::entities::swarm_delegation::Model>,
             > = std::collections::HashMap::new();
             for row in delegations {
-                let run_id = row.parent_task_id.clone().unwrap_or_else(|| row.id.clone());
+                let run_id = swarm_delegation_run_id(&row);
                 grouped.entry(run_id).or_default().push(row);
             }
             let mut runs = agent.swarm_activity.recent_runs(limit).await;

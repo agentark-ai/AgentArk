@@ -46,6 +46,140 @@ pub fn normalize_memory_category(
     }
 }
 
+pub fn normalize_memory_slot_key(raw: &str, max_len: usize) -> Option<String> {
+    let key = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if key.is_empty() || key.len() > max_len {
+        return None;
+    }
+    Some(key)
+}
+
+fn normalize_memory_keyish_text(raw: &str) -> Option<String> {
+    let key = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if key.is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
+fn memory_text_tokens_for_key_repair(raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut normalized = String::new();
+    let mut original = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            original.push(ch);
+        } else if !normalized.is_empty() {
+            out.push((normalized.clone(), original.clone()));
+            normalized.clear();
+            original.clear();
+        }
+    }
+    if !normalized.is_empty() {
+        out.push((normalized, original));
+    }
+    out
+}
+
+fn memory_value_suffix_from_key_suffix(raw_value: &str, key_suffix: &[&str]) -> Option<String> {
+    if key_suffix.is_empty() {
+        return None;
+    }
+    let value_tokens = memory_text_tokens_for_key_repair(raw_value);
+    if value_tokens.len() < key_suffix.len() {
+        return None;
+    }
+    let value_suffix = &value_tokens[value_tokens.len() - key_suffix.len()..];
+    if value_suffix
+        .iter()
+        .zip(key_suffix.iter())
+        .all(|((normalized, _), key_segment)| normalized == *key_segment)
+    {
+        let repaired = value_suffix
+            .iter()
+            .map(|(_, original)| original.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let value = repaired
+            .trim()
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
+            .to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub fn repair_memory_slot_key_and_value(
+    raw_key: &str,
+    raw_value: &str,
+    allow_value_suffix_repair: bool,
+) -> Option<(String, Option<String>)> {
+    let key = normalize_memory_slot_key(raw_key, 80)?;
+    let value_key = normalize_memory_keyish_text(raw_value)?;
+    if key == value_key {
+        return None;
+    }
+
+    if !allow_value_suffix_repair {
+        return Some((key, None));
+    }
+
+    let key_segments = key
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let value_segments = value_key
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if key_segments.len() <= 1 || value_segments.is_empty() {
+        return Some((key, None));
+    }
+
+    let max_suffix_len = key_segments.len().min(value_segments.len() + 1) - 1;
+    for suffix_len in (1..=max_suffix_len).rev() {
+        let key_suffix = &key_segments[key_segments.len() - suffix_len..];
+        let value_suffix = &value_segments[value_segments.len() - suffix_len..];
+        if key_suffix == value_suffix {
+            let repaired = key_segments[..key_segments.len() - suffix_len].join("_");
+            let repaired_key = normalize_memory_slot_key(&repaired, 80)?;
+            let repaired_value = memory_value_suffix_from_key_suffix(raw_value, key_suffix);
+            return Some((repaired_key, repaired_value));
+        }
+    }
+
+    Some((key, None))
+}
+
 pub fn memory_category_from_metadata(
     metadata: &Value,
     semantic_kind: Option<&str>,

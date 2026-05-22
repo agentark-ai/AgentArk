@@ -49,43 +49,43 @@ const tooltipFor = (key: NeuralNodeKey, p: Props): TooltipData => {
     case 'memories':
     case 'arkmemory':
       return {
-        title: 'ArkMemory',
+        title: 'Memory',
         value: p.memoryCount === 1 ? '1 entry' : `${p.memoryCount} entries`,
         detail: 'Persistent learnings the agent recalls across sessions and conversations.',
         tone: 'green',
-        meta: 'Open ArkMemory',
+        meta: 'Open Memory',
       };
     case 'arksentinel':
       return {
-        title: 'ArkSentinel',
+        title: 'Sentinel',
         value: p.taskCount === 0 ? 'Queue clear' : 'Review queue active',
         detail: 'Decision inbox for approvals, observations, and background learning items that need operator attention.',
         tone: p.taskCount === 0 ? 'green' : 'cyan',
-        meta: 'Open ArkSentinel',
+        meta: 'Open Sentinel',
       };
     case 'arkevolve':
       return {
-        title: 'ArkEvolve',
+        title: 'Evolve',
         value: p.surfaceCount === 0 ? 'Watching' : `${p.surfaceCount} surfaces`,
         detail: 'Improvement lifecycle for learning, review-only suggestions, live tests, stable changes, and rollback.',
         tone: 'green',
-        meta: 'Open ArkEvolve',
+        meta: 'Open Evolve',
       };
     case 'arkreflect':
       return {
-        title: 'ArkReflect',
+        title: 'Reflect',
         value: 'Recap layer',
         detail: 'Retrospective view over time windows, work patterns, source coverage, and background activity.',
         tone: 'cyan',
-        meta: 'Open ArkReflect',
+        meta: 'Open Reflect',
       };
     case 'arkpulse':
       return {
-        title: 'ArkPulse',
+        title: 'Pulse',
         value: p.serverError ? 'Needs attention' : p.rttMs != null ? `${Math.round(p.rttMs)}ms pulse` : 'Ready',
         detail: 'Operational health, runtime diagnostics, findings, remediation guidance, and safe fix execution.',
         tone: p.serverError ? 'crit' : 'green',
-        meta: 'Open ArkPulse',
+        meta: 'Open Pulse',
       };
     case 'skills':
       return {
@@ -176,7 +176,7 @@ const tooltipFor = (key: NeuralNodeKey, p: Props): TooltipData => {
       };
     case 'core':
       return {
-        title: 'ArkCore',
+        title: 'Ark Core',
         value: p.serverError
           ? 'Offline'
           : p.rttMs != null
@@ -323,7 +323,7 @@ const nodeStrokeColor = (tone: Tone): string => {
     case 'crit':
       return 'rgba(255,155,155,0.95)';
     default:
-      return 'rgba(124,231,255,0.88)';
+      return 'rgba(120,242,176,0.88)';
   }
 };
 
@@ -336,7 +336,7 @@ const labelFill = (tone: Tone): string => {
     case 'crit':
       return '#ffc8c8';
     default:
-      return '#d8f5ff';
+      return '#dff7e7';
   }
 };
 
@@ -470,8 +470,8 @@ export function NeuralWebGraph(props: Props) {
         <defs>
           <radialGradient id="grad-core" cx="50%" cy="50%" r="50%">
             <stop offset="0%" stopColor="#ffffff" stopOpacity="0.95" />
-            <stop offset="35%" stopColor="#7ce7ff" stopOpacity="0.82" />
-            <stop offset="100%" stopColor="#7ce7ff" stopOpacity="0" />
+            <stop offset="35%" stopColor="#78f2b0" stopOpacity="0.82" />
+            <stop offset="100%" stopColor="#78f2b0" stopOpacity="0" />
           </radialGradient>
           <radialGradient id="grad-core-crit" cx="50%" cy="50%" r="50%">
             <stop offset="0%" stopColor="#ffe5e5" stopOpacity="0.95" />
@@ -479,9 +479,9 @@ export function NeuralWebGraph(props: Props) {
             <stop offset="100%" stopColor="#ff6b6b" stopOpacity="0" />
           </radialGradient>
           <radialGradient id="grad-node" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#e0f8ff" stopOpacity="0.95" />
-            <stop offset="60%" stopColor="#7ce7ff" stopOpacity="0.54" />
-            <stop offset="100%" stopColor="#7ce7ff" stopOpacity="0" />
+            <stop offset="0%" stopColor="#e7fff0" stopOpacity="0.95" />
+            <stop offset="60%" stopColor="#78f2b0" stopOpacity="0.54" />
+            <stop offset="100%" stopColor="#78f2b0" stopOpacity="0" />
           </radialGradient>
           <radialGradient id="grad-amber" cx="50%" cy="50%" r="50%">
             <stop offset="0%" stopColor="#fff1d6" stopOpacity="0.95" />
@@ -489,9 +489,9 @@ export function NeuralWebGraph(props: Props) {
             <stop offset="100%" stopColor="#f2c478" stopOpacity="0" />
           </radialGradient>
           <radialGradient id="grad-cyan" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#daf6ff" stopOpacity="0.95" />
-            <stop offset="60%" stopColor="#78dcf2" stopOpacity="0.55" />
-            <stop offset="100%" stopColor="#78dcf2" stopOpacity="0" />
+            <stop offset="0%" stopColor="#e7fff0" stopOpacity="0.95" />
+            <stop offset="60%" stopColor="#78f2b0" stopOpacity="0.55" />
+            <stop offset="100%" stopColor="#78f2b0" stopOpacity="0" />
           </radialGradient>
           <radialGradient id="grad-crit" cx="50%" cy="50%" r="50%">
             <stop offset="0%" stopColor="#ffe5e5" stopOpacity="0.95" />
@@ -499,14 +499,14 @@ export function NeuralWebGraph(props: Props) {
             <stop offset="100%" stopColor="#ff6b6b" stopOpacity="0" />
           </radialGradient>
           <linearGradient id="edge-grad" x1="0%" y1="0%" x2="100%" y2="0%">
-            <stop offset="0%" stopColor="#7ce7ff" stopOpacity="0" />
-            <stop offset="50%" stopColor="#7ce7ff" stopOpacity="0.82" />
-            <stop offset="100%" stopColor="#7ce7ff" stopOpacity="0" />
+            <stop offset="0%" stopColor="#78f2b0" stopOpacity="0" />
+            <stop offset="50%" stopColor="#78f2b0" stopOpacity="0.82" />
+            <stop offset="100%" stopColor="#78f2b0" stopOpacity="0" />
           </linearGradient>
           <linearGradient id="edge-grad-cyan" x1="0%" y1="0%" x2="100%" y2="0%">
-            <stop offset="0%" stopColor="#78dcf2" stopOpacity="0" />
-            <stop offset="50%" stopColor="#78dcf2" stopOpacity="0.85" />
-            <stop offset="100%" stopColor="#78dcf2" stopOpacity="0" />
+            <stop offset="0%" stopColor="#78f2b0" stopOpacity="0" />
+            <stop offset="50%" stopColor="#78f2b0" stopOpacity="0.85" />
+            <stop offset="100%" stopColor="#78f2b0" stopOpacity="0" />
           </linearGradient>
           <linearGradient id="edge-grad-amber" x1="0%" y1="0%" x2="100%" y2="0%">
             <stop offset="0%" stopColor="#f2c478" stopOpacity="0" />
@@ -540,7 +540,7 @@ export function NeuralWebGraph(props: Props) {
             rx={ring.rx}
             ry={ring.ry}
             fill="none"
-            stroke={coreTone === 'crit' ? 'rgba(255,107,107,.08)' : 'rgba(124,231,255,.065)'}
+            stroke={coreTone === 'crit' ? 'rgba(255,107,107,.08)' : 'rgba(120,242,176,.065)'}
             strokeWidth={1}
             strokeDasharray="2 6"
           />
@@ -556,7 +556,7 @@ export function NeuralWebGraph(props: Props) {
               key={`cross-${i}`}
               d={`M ${p1.x.toFixed(2)} ${p1.y.toFixed(2)} A ${OUTER_RX} ${OUTER_RY} 0 0 1 ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`}
               fill="none"
-              stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.24)' : 'rgba(124,231,255,0.18)'}
+              stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.24)' : 'rgba(120,242,176,0.18)'}
               strokeWidth={1}
               strokeDasharray="3 5"
             />
@@ -587,7 +587,7 @@ export function NeuralWebGraph(props: Props) {
               className="nw-edge-slow"
               d={`M ${CX} ${CY} L ${pos.x.toFixed(2)} ${pos.y.toFixed(2)}`}
               fill="none"
-              stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.50)' : 'rgba(124,231,255,0.44)'}
+              stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.50)' : 'rgba(120,242,176,0.44)'}
               strokeOpacity={0.4}
               strokeWidth={1}
             />
@@ -713,7 +713,7 @@ export function NeuralWebGraph(props: Props) {
           className="nw-node-hover"
           role="button"
           tabIndex={0}
-          aria-label="ArkCore — show details"
+          aria-label="Ark Core — show details"
           aria-expanded={hovered === 'core'}
           data-nw-nav="core"
           onMouseEnter={handleEnter('core')}
@@ -739,7 +739,7 @@ export function NeuralWebGraph(props: Props) {
             cx={CX}
             cy={CY}
             r={18}
-            fill={coreTone === 'crit' ? '#ffb9b9' : '#e0f8ff'}
+            fill={coreTone === 'crit' ? '#ffb9b9' : '#e7fff0'}
             opacity={0.95}
           />
           <circle
@@ -748,7 +748,7 @@ export function NeuralWebGraph(props: Props) {
             cy={CY}
             r={60}
             fill="none"
-            stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.72)' : 'rgba(124,231,255,0.68)'}
+            stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.72)' : 'rgba(120,242,176,0.68)'}
             strokeWidth={1}
           />
           <circle
@@ -757,27 +757,27 @@ export function NeuralWebGraph(props: Props) {
             cy={CY}
             r={88}
             fill="none"
-            stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.48)' : 'rgba(124,231,255,0.42)'}
+            stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.48)' : 'rgba(120,242,176,0.42)'}
             strokeWidth={1}
           />
           <path
             d={hexPath(CX, CY, 28)}
             fill="none"
-            stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.92)' : 'rgba(124,231,255,0.88)'}
+            stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.92)' : 'rgba(120,242,176,0.88)'}
             strokeWidth={1.2}
           />
           {/* Crosshair ticks */}
-          <line x1={CX - 110} y1={CY} x2={CX - 100} y2={CY} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(124,231,255,0.55)'} strokeWidth={1} />
-          <line x1={CX + 100} y1={CY} x2={CX + 110} y2={CY} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(124,231,255,0.55)'} strokeWidth={1} />
-          <line x1={CX} y1={CY - 110} x2={CX} y2={CY - 100} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(124,231,255,0.55)'} strokeWidth={1} />
-          <line x1={CX} y1={CY + 100} x2={CX} y2={CY + 110} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(124,231,255,0.55)'} strokeWidth={1} />
+          <line x1={CX - 110} y1={CY} x2={CX - 100} y2={CY} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(120,242,176,0.55)'} strokeWidth={1} />
+          <line x1={CX + 100} y1={CY} x2={CX + 110} y2={CY} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(120,242,176,0.55)'} strokeWidth={1} />
+          <line x1={CX} y1={CY - 110} x2={CX} y2={CY - 100} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(120,242,176,0.55)'} strokeWidth={1} />
+          <line x1={CX} y1={CY + 100} x2={CX} y2={CY + 110} stroke={coreTone === 'crit' ? 'rgba(255,107,107,0.58)' : 'rgba(120,242,176,0.55)'} strokeWidth={1} />
           <text
             x={CX}
             y={CY + 4}
             textAnchor="middle"
             fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
             fontSize={13}
-            fill={coreTone === 'crit' ? '#ffc8c8' : 'var(--nw-green, #7ce7ff)'}
+            fill={coreTone === 'crit' ? '#ffc8c8' : 'var(--nw-green, #78f2b0)'}
             letterSpacing={2}
           >
             ARKCORE
@@ -788,7 +788,7 @@ export function NeuralWebGraph(props: Props) {
             textAnchor="middle"
             fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
             fontSize={10}
-            fill={coreTone === 'crit' ? '#ffc8c8' : '#d8f5ff'}
+            fill={coreTone === 'crit' ? '#ffc8c8' : '#dff7e7'}
             letterSpacing={1.2}
           >
             {coreLine2}

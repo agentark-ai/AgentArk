@@ -29,6 +29,7 @@ type ReflectHeroProps = {
   showDetails: boolean;
   onToggleDetails: () => void;
   onLaunchPrompt?: (prompt: string, source: string) => void;
+  onShowNextSteps?: () => void;
 };
 
 const FAMILY_ICON: Record<SourceFamily, React.ElementType> = {
@@ -43,12 +44,12 @@ const FAMILY_ICON: Record<SourceFamily, React.ElementType> = {
 // Per-family tint — kept low-saturation against the dark surfaces so the
 // hero's single green accent (the headline number) stays dominant.
 const FAMILY_ACCENT: Record<SourceFamily, string> = {
-  conversations: "rgba(57, 208, 255, 0.78)",
+  conversations: "rgba(120, 242, 176, 0.78)",
   memory: "rgba(139, 214, 165, 0.78)",
   apps: "rgba(255, 190, 99, 0.78)",
   background: "rgba(213, 145, 255, 0.78)",
-  system: "rgba(124, 231, 255, 0.78)",
-  mixed: "rgba(213, 228, 255, 0.62)",
+  system: "rgba(230, 214, 192, 0.78)",
+  mixed: "rgba(216, 173, 120, 0.68)",
 };
 
 export default function ReflectHero({
@@ -57,6 +58,7 @@ export default function ReflectHero({
   showDetails,
   onToggleDetails,
   onLaunchPrompt,
+  onShowNextSteps,
 }: ReflectHeroProps) {
   const story = useMemo(() => {
     if (!input) return null;
@@ -102,6 +104,7 @@ export default function ReflectHero({
           showDetails={showDetails}
           onToggleDetails={onToggleDetails}
           onLaunchPrompt={onLaunchPrompt}
+          onShowNextSteps={onShowNextSteps}
         />
       )}
     </Card>
@@ -202,7 +205,7 @@ function HeroEmpty({ sentence }: { sentence: HeroSentence | null }) {
           color: "var(--text-secondary)",
         }}
       >
-        ArkReflect
+        Reflect
       </Typography>
       <Typography
         variant="h3"
@@ -225,7 +228,7 @@ function HeroEmpty({ sentence }: { sentence: HeroSentence | null }) {
         }}
       >
         {sentence?.detail ??
-          "ArkReflect will pull together what happened across your chats, memory, apps, and background work once there's something meaningful to show."}
+          "Reflect will pull together what happened across your chats, memory, apps, and background work once there's something meaningful to show."}
       </Typography>
     </Stack>
   );
@@ -239,6 +242,7 @@ type HeroBodyProps = {
   showDetails: boolean;
   onToggleDetails: () => void;
   onLaunchPrompt?: (prompt: string, source: string) => void;
+  onShowNextSteps?: () => void;
 };
 
 function HeroBody({
@@ -249,6 +253,7 @@ function HeroBody({
   showDetails,
   onToggleDetails,
   onLaunchPrompt,
+  onShowNextSteps,
 }: HeroBodyProps) {
   return (
     <Stack spacing={{ xs: 2.4, md: 3 }}>
@@ -295,6 +300,12 @@ function HeroBody({
         <HeadlineNumberDisplay headline={headline} />
       </Stack>
 
+      <OpportunityCard
+        next={next}
+        onLaunchPrompt={onLaunchPrompt}
+        onShowNextSteps={onShowNextSteps}
+      />
+
       {moments.length > 0 ? (
         <Box
           sx={{
@@ -312,10 +323,6 @@ function HeroBody({
             <MomentCard key={moment.id} moment={moment} />
           ))}
         </Box>
-      ) : null}
-
-      {next ? (
-        <NextStepCard next={next} onLaunchPrompt={onLaunchPrompt} />
       ) : null}
 
       <Stack direction="row" sx={{ justifyContent: "flex-end" }}>
@@ -459,25 +466,26 @@ function MomentCard({ moment }: { moment: Moment }) {
   );
 }
 
-function NextStepCard({
+function OpportunityCard({
   next,
   onLaunchPrompt,
+  onShowNextSteps,
 }: {
-  next: NonNullable<NextStep>;
+  next: NextStep;
   onLaunchPrompt?: (prompt: string, source: string) => void;
+  onShowNextSteps?: () => void;
 }) {
-  // Single suggestion card with one CTA. Placed below the moments so the
-  // user has skimmed the "what happened" answer before being asked to
-  // act. The CTA reuses the AgentArk green via the success colour so
-  // it's visually linked to the headline number.
+  // Opportunity is the primary novice surface. It branches only on whether
+  // the backend produced a structured follow-up, never on user wording.
+  const hasPrompt = Boolean(next?.prompt?.trim());
   return (
     <Box
       sx={{
-        p: { xs: 1.6, md: 2 },
+        p: { xs: 1.8, md: 2.2 },
         borderRadius: 1.5,
         border: "1px solid rgba(120, 242, 176, 0.22)",
         background:
-          "linear-gradient(180deg, rgba(120, 242, 176, 0.06), rgba(120, 242, 176, 0.02))",
+          "linear-gradient(135deg, rgba(120, 242, 176, 0.09), rgba(120, 242, 176, 0.035) 48%, rgba(255,255,255,0.018))",
       }}
     >
       <Stack
@@ -495,17 +503,17 @@ function NextStepCard({
               color: "#78f2b0",
             }}
           >
-            Suggested next step
+            Next best action
           </Typography>
           <Typography
             sx={{
-              fontSize: "1rem",
-              fontWeight: 600,
+              fontSize: { xs: "1.04rem", md: "1.14rem" },
+              fontWeight: 650,
               color: "var(--text-primary)",
               lineHeight: 1.32,
             }}
           >
-            {next.title}
+            {next ? next.title : "No next steps ready for this range"}
           </Typography>
           <Typography
             sx={{
@@ -514,23 +522,44 @@ function NextStepCard({
               color: "var(--text-secondary)",
             }}
           >
-            {next.reason}
+            {next
+              ? next.reason
+              : "Reflect has not found a clear opportunity to act on yet. You can still inspect the recap details, sources, and topics."}
           </Typography>
         </Stack>
-        <Button
-          variant="contained"
-          color="success"
-          startIcon={<PlayArrowRoundedIcon />}
-          onClick={() => onLaunchPrompt?.(next.prompt, "arkreflect_hero_next_step")}
-          disabled={!onLaunchPrompt}
-          sx={{
-            minHeight: 40,
-            alignSelf: { xs: "stretch", md: "center" },
-            whiteSpace: "nowrap",
-          }}
+        <Stack
+          direction={{ xs: "column", sm: "row", md: "column" }}
+          spacing={0.8}
+          sx={{ alignSelf: { xs: "stretch", md: "center" } }}
         >
-          Try this in Chat
-        </Button>
+          {next ? (
+            <Button
+              variant="contained"
+              color="success"
+              startIcon={<PlayArrowRoundedIcon />}
+              onClick={() => onLaunchPrompt?.(next.prompt, "arkreflect_hero_next_step")}
+              disabled={!onLaunchPrompt || !hasPrompt}
+              sx={{
+                minHeight: 40,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Open in Chat
+            </Button>
+          ) : null}
+          <Button
+            variant={next ? "outlined" : "contained"}
+            color={next ? "inherit" : "success"}
+            onClick={onShowNextSteps}
+            disabled={!onShowNextSteps}
+            sx={{
+              minHeight: 40,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {next ? "View all opportunities" : "View details"}
+          </Button>
+        </Stack>
       </Stack>
     </Box>
   );

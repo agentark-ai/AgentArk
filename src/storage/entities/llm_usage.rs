@@ -15,6 +15,8 @@ pub struct Model {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
     pub total_tokens: i32,
+    pub cached_prompt_tokens: i32,
+    pub cache_creation_prompt_tokens: i32,
     pub estimated: bool,
     pub cost_usd: Option<f64>,
 }

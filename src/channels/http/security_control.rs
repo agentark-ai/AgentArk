@@ -7,14 +7,14 @@
 //! existing `approval_log` entry.
 
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{error_response, spawn_security_log, AppState};
+use super::{AppState, error_response, spawn_security_log};
 use crate::core::config::{AbuseTrackerConfig, SecurityConfig};
 use crate::security::tool_args_guard::ToolArgsGuardConfig;
 

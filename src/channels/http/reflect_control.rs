@@ -1,15 +1,15 @@
-//! ArkReflect retrospective API.
+//! Reflect retrospective API.
 
 use super::sentinel_panel;
 use super::*;
 
 use crate::core::arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitChatTranscriptSummary};
 use crate::core::{EmbeddingClient, LlmClient, TaskStatus};
+use crate::storage::Storage;
 use crate::storage::entities::{
     arkpulse_event, conversation, experience_item, experience_run, llm_usage, message,
     procedural_pattern, semantic_work_unit, task,
 };
-use crate::storage::Storage;
 use chrono::{TimeZone, Timelike};
 use sea_orm::entity::prelude::PgVector;
 use sha2::{Digest, Sha256};
@@ -66,8 +66,11 @@ const REFLECT_MAX_SUGGESTED_FOLLOWUPS: usize = 5;
 const REFLECT_SUGGESTION_EXPERIENCE_RUN_LIMIT: u64 = 160;
 const REFLECT_SUGGESTION_TEXT_CHARS: usize = 220;
 const REFLECT_FOLLOWUP_SEARCH_CACHE_KEY: &str = "arkreflect_followup_search_cache_v1";
+const REFLECT_FOLLOWUP_PLAN_CACHE_KEY: &str = "arkreflect_followup_plan_cache_v1";
+const REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_KEY: &str = "arkreflect_followup_cache_write_lease_v1";
 const REFLECT_FOLLOWUP_SEARCH_LEASE_KEY: &str = "arkreflect_followup_search_lease_v1";
 const REFLECT_FOLLOWUP_SUMMARY_LEASE_KEY: &str = "arkreflect_followup_summary_lease_v1";
+const REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_TTL_SECS: i64 = 60;
 const REFLECT_FOLLOWUP_SEARCH_LEASE_TTL_SECS: i64 = 480;
 const REFLECT_FOLLOWUP_SUMMARY_LEASE_TTL_SECS: i64 = 480;
 const REFLECT_FOLLOWUP_SEARCH_TIMEOUT: Duration = Duration::from_secs(75);
@@ -76,6 +79,7 @@ const REFLECT_FOLLOWUP_SEARCH_DUE_AFTER_SECS: i64 = 24 * 60 * 60;
 const REFLECT_FOLLOWUP_SEARCH_RESULTS_PER_TOPIC: usize = 3;
 const REFLECT_FOLLOWUP_BACKGROUND_SEARCH_LIMIT: usize = 3;
 const REFLECT_FOLLOWUP_PLAN_LIMIT: usize = 8;
+const REFLECT_FOLLOWUP_PLAN_RETENTION_DAYS: i64 = 120;
 const REFLECT_FOLLOWUP_PLAN_TIMEOUT: Duration = Duration::from_secs(45);
 const REFLECT_FOLLOWUP_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
 const REFLECT_FOLLOWUP_SUMMARY_MAX_CHARS: usize = 1_000;
@@ -83,6 +87,8 @@ const REFLECT_SEMANTIC_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(5);
 const REFLECT_SEMANTIC_FRESHNESS_MIN_SIMILARITY: f32 = 0.28;
 const REFLECT_SEMANTIC_FRESHNESS_MIN_MARGIN: f32 = 0.04;
 const REFLECT_FEEDBACK_SEMANTIC_MAX_DISTANCE: f32 = 0.18;
+const REFLECT_FOLLOWUP_TEXT_DUPLICATE_THRESHOLD: f64 = 0.56;
+const REFLECT_REFRESH_DUPLICATE_SUPPRESS_SECS: i64 = 15 * 60;
 const REFLECT_PUBLIC_DEVELOPMENT_CONCEPT_TEXT: &str = "A reflected topic about public events, external entities, products, places, services, regulations, markets, research, releases, or other outside-world information whose useful answer depends on current source evidence.";
 const REFLECT_PRIVATE_WORK_CONCEPT_TEXT: &str = "A reflected local or personal topic about private profile facts, identity, location, preferences, saved memories, internal notes, app UI, code edits, workflow state, system maintenance, or other user-specific context that should continue without public source research.";
 
@@ -316,7 +322,7 @@ impl ReflectDailyDigestStatus {
             cluster_count: 0,
             source_counts: ReflectSourceCounts::default(),
             summary: None,
-            detail: "Daily ArkReflect digest delivery is off.".to_string(),
+            detail: "Daily Reflect digest delivery is off.".to_string(),
             last_checked_at: None,
             last_sent_at: None,
             last_skipped_at: None,
@@ -444,6 +450,28 @@ struct ReflectFollowupSearchEntry {
     summary_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ReflectFollowupPlanCache {
+    updated_at: Option<String>,
+    #[serde(default)]
+    entries: BTreeMap<String, ReflectFollowupPlanEntry>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ReflectFollowupPlanEntry {
+    id: String,
+    #[serde(default)]
+    useful: bool,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    search_query: String,
+    #[serde(default)]
+    rationale: String,
+    #[serde(default)]
+    planned_at: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ReflectFollowupSearchResult {
     title: String,
@@ -464,6 +492,17 @@ struct ReflectExternalPursuitPlan {
     search_query: String,
     #[serde(default)]
     rationale: String,
+}
+
+struct ReflectDueFollowupWork {
+    searches: Vec<(String, String)>,
+    summaries: Vec<String>,
+}
+
+impl ReflectDueFollowupWork {
+    fn has_work(&self) -> bool {
+        !self.searches.is_empty() || !self.summaries.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -577,6 +616,37 @@ async fn update_refresh_status(
     let mut status = refresh_status_store().write().await;
     update(&mut status);
     status.clone()
+}
+
+fn reflect_refresh_status_matches_request(
+    status: &ReflectRefreshStatus,
+    request: &ReflectRefreshRequest,
+) -> bool {
+    let from = request.from.to_rfc3339();
+    let to = request.to.to_rfc3339();
+    status.period.as_deref() == Some(request.period.as_str())
+        && status.from.as_deref() == Some(from.as_str())
+        && status.to.as_deref() == Some(to.as_str())
+}
+
+fn reflect_refresh_recently_completed_for_request(
+    status: &ReflectRefreshStatus,
+    request: &ReflectRefreshRequest,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if status.running
+        || status.status != "completed"
+        || !reflect_refresh_status_matches_request(status, request)
+    {
+        return false;
+    }
+    status
+        .completed_at
+        .as_deref()
+        .and_then(parse_time)
+        .is_some_and(|completed_at| {
+            (now - completed_at).num_seconds() < REFLECT_REFRESH_DUPLICATE_SUPPRESS_SECS
+        })
 }
 
 fn parse_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -718,8 +788,8 @@ fn source_label(source_kind: &str, channel: &str) -> String {
         "goal" => "Goals".to_string(),
         "watcher" => "Watchers".to_string(),
         "sentinel" => "Sentinel".to_string(),
-        "arkpulse" => "ArkPulse".to_string(),
-        "arkevolve" => "ArkEvolve".to_string(),
+        "arkpulse" => "Pulse".to_string(),
+        "arkevolve" => "Evolve".to_string(),
         "llm_usage" => "Usage".to_string(),
         _ if !channel.trim().is_empty() => channel.trim().to_string(),
         _ => "Work".to_string(),
@@ -1318,6 +1388,7 @@ fn reflect_latest_suggestion(
     );
     let has_fresh_cache = !reflect_followup_search_is_due(cache, &source_id, now);
     let cache_entry = reflect_search_cache_entry(cache, &source_id);
+    let needs_planning = cache_entry.is_none();
     let search_results = cache_entry
         .map(|entry| entry.results.clone())
         .unwrap_or_default();
@@ -1338,6 +1409,10 @@ fn reflect_latest_suggestion(
     });
     let (latest_summary, latest_summary_generated_at, latest_summary_error) =
         reflect_followup_latest_summary_fields(cache_entry);
+    let planned_search_query = cache_entry
+        .map(|entry| entry.query.trim().to_string())
+        .filter(|query| !query.is_empty())
+        .unwrap_or_else(|| topic_preview.clone());
     let title = if topic_preview.is_empty() {
         "Open research thread - what changed?".to_string()
     } else {
@@ -1373,9 +1448,40 @@ fn reflect_latest_suggestion(
             run.conversation_id.as_deref(),
         ),
         feedback_vector: None,
-        search_query: Some(topic_preview),
-        search_planning_context: None,
-        search_requires_planning: false,
+        search_query: Some(planned_search_query),
+        search_planning_context: needs_planning.then(|| {
+            let mut parts = Vec::new();
+            let request =
+                reflect_external_text(run.request_text.as_deref().unwrap_or_default(), 360);
+            let outcome =
+                reflect_external_text(run.outcome_summary.as_deref().unwrap_or_default(), 360);
+            let failure =
+                reflect_external_text(run.failure_reason.as_deref().unwrap_or_default(), 260);
+            if !topic_preview.trim().is_empty() {
+                parts.push(format!(
+                    "reflected_topic: {}",
+                    reflect_external_text(&topic_preview, 220)
+                ));
+            }
+            if !request.trim().is_empty() {
+                parts.push(format!("source_request: {}", request));
+            }
+            if !outcome.trim().is_empty() {
+                parts.push(format!("prior_outcome: {}", outcome));
+            }
+            if !failure.trim().is_empty() {
+                parts.push(format!("prior_failure: {}", failure));
+            }
+            if let Some(task_type) = run
+                .task_type
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(format!("task_type: {}", task_type.trim()));
+            }
+            truncate_chars(&parts.join("\n"), 1200)
+        }),
+        search_requires_planning: needs_planning,
     }
 }
 
@@ -1494,7 +1600,7 @@ fn reflect_cluster_external_planning_context(cluster: &ReflectClusterResponse) -
             ("summary", unit.summary.as_str()),
             ("preview", unit.content_preview.as_str()),
         ] {
-            let fragment = reflect_sentence_fragment(value, 260);
+            let fragment = reflect_external_text(value, 260);
             if fragment.is_empty() || !seen.insert(format!("{}:{}", label, fragment)) {
                 continue;
             }
@@ -1578,7 +1684,7 @@ fn reflect_semantic_cluster_latest_suggestion(
     let detail = if cache_entry.is_some() {
         reflect_followup_latest_detail(cache, &source_id)
     } else {
-        "ArkReflect inferred that this reflected topic may benefit from current external sources. A source check will run when AgentArk is idle.".to_string()
+        "Reflect inferred that this reflected topic may benefit from current external sources. A source check will run when AgentArk is idle.".to_string()
     };
     let conversation_id = unit
         .metadata
@@ -1623,7 +1729,7 @@ fn reflect_semantic_cluster_latest_suggestion(
             .map(|embedding| embedding.as_slice().to_vec()),
         search_query: Some(planned_search_query),
         search_planning_context: Some(planning_context),
-        search_requires_planning: true,
+        search_requires_planning: cache_entry.is_none(),
     })
 }
 
@@ -1674,7 +1780,7 @@ fn reflect_planned_cluster_latest_suggestion(
     let detail = if cache_entry.is_some() {
         reflect_followup_latest_detail(cache, &source_id)
     } else {
-        "ArkReflect found a user-facing reflected topic that may need current public evidence. AgentArk will only keep it if the planner finds a useful source-backed pursuit.".to_string()
+        "Reflect found a user-facing reflected topic that may need current public evidence. AgentArk will only keep it if the planner finds a useful source-backed pursuit.".to_string()
     };
     let conversation_id = unit
         .metadata
@@ -1717,8 +1823,138 @@ fn reflect_planned_cluster_latest_suggestion(
             .map(|embedding| embedding.as_slice().to_vec()),
         search_query: Some(planned_search_query),
         search_planning_context: Some(planning_context),
-        search_requires_planning: true,
+        search_requires_planning: cache_entry.is_none(),
     })
+}
+
+fn reflect_followup_display_family(kind: &str) -> &'static str {
+    match kind {
+        "latest_developments" => "next_step",
+        "recovery_advice" => "review_thread",
+        _ => "other",
+    }
+}
+
+fn reflect_followup_intent_text(candidate: &ReflectSuggestedFollowup) -> String {
+    let mut values = vec![candidate.title.as_str()];
+    if let Some(search_query) = candidate.search_query.as_deref() {
+        values.push(search_query);
+    }
+    if candidate.kind == "recovery_advice" || candidate.title.trim().is_empty() {
+        values.push(candidate.detail.as_str());
+    }
+    values
+        .into_iter()
+        .filter_map(|value| {
+            let fragment = reflect_sentence_fragment(value, 260);
+            (!fragment.trim().is_empty()).then_some(fragment)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn reflect_followup_token_is_generic(token: &str) -> bool {
+    matches!(
+        token,
+        "about"
+            | "after"
+            | "again"
+            | "against"
+            | "and"
+            | "are"
+            | "can"
+            | "current"
+            | "for"
+            | "from"
+            | "help"
+            | "into"
+            | "new"
+            | "next"
+            | "now"
+            | "old"
+            | "out"
+            | "prior"
+            | "review"
+            | "same"
+            | "set"
+            | "step"
+            | "that"
+            | "the"
+            | "this"
+            | "thread"
+            | "use"
+            | "with"
+    )
+}
+
+fn reflect_followup_meaning_tokens(value: &str) -> HashSet<String> {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|token| token.chars().count() >= 3 && !reflect_followup_token_is_generic(token))
+        .map(str::to_string)
+        .collect()
+}
+
+fn reflect_followup_text_similarity(left: &str, right: &str) -> f64 {
+    let left_tokens = reflect_followup_meaning_tokens(left);
+    let right_tokens = reflect_followup_meaning_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+    let overlap = left_tokens.intersection(&right_tokens).count() as f64;
+    let union = left_tokens.union(&right_tokens).count() as f64;
+    let smaller = left_tokens.len().min(right_tokens.len()) as f64;
+    let jaccard = if union > 0.0 { overlap / union } else { 0.0 };
+    let containment = if smaller > 0.0 {
+        overlap / smaller
+    } else {
+        0.0
+    };
+    jaccard.max(containment)
+}
+
+fn reflect_followup_vectors_duplicate(
+    left: &ReflectSuggestedFollowup,
+    right: &ReflectSuggestedFollowup,
+) -> bool {
+    let (Some(left_vector), Some(right_vector)) = (
+        left.feedback_vector.as_deref(),
+        right.feedback_vector.as_deref(),
+    ) else {
+        return false;
+    };
+    !left_vector.is_empty()
+        && left_vector.len() == right_vector.len()
+        && cosine_distance(left_vector, right_vector) <= REFLECT_FEEDBACK_SEMANTIC_MAX_DISTANCE
+}
+
+fn reflect_followups_are_duplicates(
+    left: &ReflectSuggestedFollowup,
+    right: &ReflectSuggestedFollowup,
+) -> bool {
+    if reflect_followup_display_family(&left.kind) != reflect_followup_display_family(&right.kind) {
+        return false;
+    }
+    if !left.id.trim().is_empty() && left.id == right.id {
+        return true;
+    }
+    if left.source_unit_id.is_some()
+        && right.source_unit_id.is_some()
+        && left.source_unit_id == right.source_unit_id
+    {
+        return true;
+    }
+    if reflect_followup_vectors_duplicate(left, right) {
+        return true;
+    }
+    let left_text = reflect_followup_intent_text(left);
+    let right_text = reflect_followup_intent_text(right);
+    reflect_followup_text_similarity(&left_text, &right_text)
+        >= REFLECT_FOLLOWUP_TEXT_DUPLICATE_THRESHOLD
 }
 
 fn select_top_reflect_followups(
@@ -1738,6 +1974,12 @@ fn select_top_reflect_followups(
             break;
         }
         if selected_ids.contains(&candidate.id) {
+            continue;
+        }
+        if selected
+            .iter()
+            .any(|existing| reflect_followups_are_duplicates(existing, candidate))
+        {
             continue;
         }
         if kind_counts.get(&candidate.kind).copied().unwrap_or(0) >= 4 {
@@ -1766,6 +2008,253 @@ async fn save_reflect_followup_search_cache(storage: &Storage, cache: &ReflectFo
             tracing::debug!(target: "arkreflect", error = %error, "failed to save followup search cache");
         }
     }
+}
+
+async fn load_reflect_followup_plan_cache(storage: &Storage) -> ReflectFollowupPlanCache {
+    storage
+        .get(REFLECT_FOLLOWUP_PLAN_CACHE_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<ReflectFollowupPlanCache>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+async fn save_reflect_followup_plan_cache(storage: &Storage, cache: &ReflectFollowupPlanCache) {
+    if let Ok(bytes) = serde_json::to_vec(cache) {
+        if let Err(error) = storage.set(REFLECT_FOLLOWUP_PLAN_CACHE_KEY, &bytes).await {
+            tracing::debug!(target: "arkreflect", error = %error, "failed to save followup plan cache");
+        }
+    }
+}
+
+fn reflect_plan_cache_entry_from_plan(
+    plan: &ReflectExternalPursuitPlan,
+    planned_at: &str,
+) -> Option<ReflectFollowupPlanEntry> {
+    let id = plan.id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    if !plan.useful {
+        return Some(ReflectFollowupPlanEntry {
+            id: truncate_chars(id, 140),
+            useful: false,
+            title: String::new(),
+            search_query: String::new(),
+            rationale: reflect_external_text(&plan.rationale, 220),
+            planned_at: planned_at.to_string(),
+        });
+    }
+
+    let title = reflect_external_text(&plan.title, 120);
+    let search_query = plan.search_query.trim();
+    if title.is_empty()
+        || search_query.is_empty()
+        || !reflect_external_search_query_is_safe(search_query)
+    {
+        return None;
+    }
+
+    Some(ReflectFollowupPlanEntry {
+        id: truncate_chars(id, 140),
+        useful: true,
+        title,
+        search_query: search_query.to_string(),
+        rationale: reflect_external_text(&plan.rationale, 220),
+        planned_at: planned_at.to_string(),
+    })
+}
+
+fn reflect_plan_from_cache_entry(entry: &ReflectFollowupPlanEntry) -> ReflectExternalPursuitPlan {
+    ReflectExternalPursuitPlan {
+        id: entry.id.clone(),
+        useful: entry.useful,
+        title: entry.title.clone(),
+        search_query: entry.search_query.clone(),
+        rationale: entry.rationale.clone(),
+    }
+}
+
+fn prune_reflect_followup_plan_cache(
+    cache: &mut ReflectFollowupPlanCache,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    cache.entries.retain(|_, entry| {
+        if entry.id.trim().is_empty() {
+            return false;
+        }
+        parse_time(&entry.planned_at).is_none_or(|planned_at| {
+            (now - planned_at).num_days() <= REFLECT_FOLLOWUP_PLAN_RETENTION_DAYS
+        })
+    });
+}
+
+fn update_reflect_followup_plan_cache(
+    cache: &mut ReflectFollowupPlanCache,
+    plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let planned_at = now.to_rfc3339();
+    let mut changed = false;
+    for plan in plans.values() {
+        let Some(entry) = reflect_plan_cache_entry_from_plan(plan, &planned_at) else {
+            continue;
+        };
+        let changed_entry = cache.entries.get(&entry.id).is_none_or(|existing| {
+            existing.useful != entry.useful
+                || existing.title != entry.title
+                || existing.search_query != entry.search_query
+                || existing.rationale != entry.rationale
+        });
+        if changed_entry {
+            changed = true;
+        }
+        cache.entries.insert(entry.id.clone(), entry);
+    }
+    let before = cache.entries.len();
+    prune_reflect_followup_plan_cache(cache, now);
+    if cache.entries.len() != before {
+        changed = true;
+    }
+    if changed {
+        cache.updated_at = Some(planned_at);
+    }
+    changed
+}
+
+async fn update_reflect_followup_search_cache<R, F>(storage: &Storage, update: F) -> Option<R>
+where
+    F: FnOnce(&mut ReflectFollowupSearchCache) -> R + Send,
+    R: Send,
+{
+    let lease_owner = format!(
+        "arkreflect-followup-cache:{}:{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let lease_guard = match tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.acquire_kv_lease_guard(
+            REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_KEY,
+            &lease_owner,
+            REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_TTL_SECS,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(guard))) => guard,
+        Ok(Ok(None)) => {
+            tracing::debug!(target: "arkreflect", "followup cache write lease is held elsewhere");
+            return None;
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(target: "arkreflect", error = %error, "failed to acquire followup cache write lease");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(target: "arkreflect", "followup cache write lease timed out");
+            return None;
+        }
+    };
+    let mut cache = load_reflect_followup_search_cache(storage).await;
+    let result = update(&mut cache);
+    cache.updated_at = Some(chrono::Utc::now().to_rfc3339());
+    prune_reflect_followup_search_cache(&mut cache);
+    save_reflect_followup_search_cache(storage, &cache).await;
+    if let Err(error) = storage
+        .release_kv_lease_guard(REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_KEY, &lease_guard)
+        .await
+    {
+        tracing::debug!(target: "arkreflect", error = %error, "failed to release followup cache write lease");
+    }
+    Some(result)
+}
+
+fn reflect_sensitive_key_fragment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "client_secret",
+        "password",
+        "passwd",
+        "private_key",
+        "refresh_token",
+        "access_token",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn reflect_token_looks_sensitive(value: &str) -> bool {
+    let trimmed = value.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '@');
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('@') && trimmed.contains('.') {
+        return true;
+    }
+    if reflect_sensitive_key_fragment(trimmed) {
+        return true;
+    }
+    let alnum_count = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .count();
+    let has_alpha = trimmed.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = trimmed.chars().any(|ch| ch.is_ascii_digit());
+    alnum_count >= 40 && has_alpha && has_digit
+}
+
+fn reflect_line_looks_sensitive(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    reflect_sensitive_key_fragment(&lower)
+        && (lower.contains(':') || lower.contains('=') || lower.contains(" is "))
+}
+
+fn reflect_external_text(value: &str, max_chars: usize) -> String {
+    let mut parts = Vec::new();
+    for line in value.lines().take(8) {
+        if reflect_line_looks_sensitive(line) {
+            parts.push("[redacted-sensitive-context]".to_string());
+            continue;
+        }
+        let redacted = line
+            .split_whitespace()
+            .map(|token| {
+                if reflect_token_looks_sensitive(token) {
+                    "[redacted]".to_string()
+                } else {
+                    token.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !redacted.trim().is_empty() {
+            parts.push(redacted);
+        }
+    }
+    truncate_chars(&parts.join("\n"), max_chars)
+}
+
+fn reflect_external_search_query_is_safe(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.chars().count() < 3 || trimmed.chars().count() > 240 {
+        return false;
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r'))
+    {
+        return false;
+    }
+    !reflect_line_looks_sensitive(trimmed)
+        && !trimmed
+            .split_whitespace()
+            .any(reflect_token_looks_sensitive)
 }
 
 fn extract_reflect_json_value(text: &str) -> Option<serde_json::Value> {
@@ -1842,9 +2331,9 @@ async fn plan_reflect_external_pursuits(
                 .unwrap_or(&candidate.title);
             serde_json::json!({
                 "id": candidate.id,
-                "reflected_topic": truncate_chars(reflected_topic, 900),
+                "reflected_topic": reflect_external_text(reflected_topic, 900),
                 "source_label": candidate.source_label,
-                "detail": truncate_chars(&candidate.detail, 260),
+                "detail": reflect_external_text(&candidate.detail, 260),
             })
         })
         .collect::<Vec<_>>();
@@ -1853,7 +2342,7 @@ async fn plan_reflect_external_pursuits(
     }
     let system_prompt = reflect_opportunity_classifier_system_prompt();
     let user_message = format!(
-        "Classify these reflected topics as human opportunities before any source enrichment runs:\n{}\n\nFor each useful opportunity, include the public-source query that should be used later to enrich the UI. Do not require search results to exist at this stage.\n\nReturn JSON in this exact shape: {{\"plans\":[{{\"id\":\"same id\",\"useful\":true|false,\"title\":\"short human-facing title when useful\",\"search_query\":\"public web search query for later enrichment when useful\",\"rationale\":\"brief reason\"}}]}}",
+        "Classify these reflected topics as human next steps before any source enrichment runs:\n{}\n\nFor each useful next step, include the public-source query that should be used later to enrich the UI. Do not require search results to exist at this stage.\n\nReturn JSON in this exact shape: {{\"plans\":[{{\"id\":\"same id\",\"useful\":true|false,\"title\":\"short human-facing title when useful\",\"search_query\":\"public web search query for later enrichment when useful\",\"rationale\":\"brief reason\"}}]}}",
         serde_json::to_string_pretty(&planning_items).unwrap_or_else(|_| "[]".to_string())
     );
     match tokio::time::timeout(
@@ -1875,12 +2364,26 @@ async fn plan_reflect_external_pursuits(
 }
 
 fn reflect_opportunity_classifier_system_prompt() -> &'static str {
-    "You classify whether ArkReflect reflected topics are human opportunities. Classification happens before search, so do not require source results to already exist. Work from the underlying human intent and likely usefulness, not exact words, topic labels, or keyword matches. A topic is useful when public evidence would materially help the user pursue, compare, decide, prepare, defer intelligently, monitor, or understand a constructive next step. The useful horizon may be immediate, later, exploratory, or recurring; judge whether external evidence improves the human pursuit, not whether the wording resembles an example. Treat private or personal context only as intent context, not as a fact to verify: do not validate private memories, profile facts, names, relationships, emotions, or assertions against the web. If the useful next step can be grounded in public sources without exposing unrelated private details, emit a concise human-facing title and public search query for later enrichment. Preserve the user's real requested deliverable, named entity, domain, constraints, and evaluation criteria when present. If the reflected activity implies currentness matters, target the freshest reliable evidence needed for the user's real decision rather than generic news. For complex analytical topics, target the evidence needed to answer the real decision rather than generic news. For potentially sensitive personal topics, avoid diagnosis and avoid turning private claims into public queries; target broadly useful, reputable, practical public resources. Remove unrelated private facts, names, raw memory keys, and credentials from the query. Do not surface routine background/system state unless it clearly contains a user-facing decision or repair path. If public evidence would not materially improve the user's next step, mark it not useful. Return only JSON."
+    "You classify whether Reflect reflected topics are useful human next steps. Classification happens before search, so do not require source results to already exist. Work from underlying user intent and semantic meaning, not exact words, topic labels, keyword matches, templates, or anticipated phrasing. Differences in wording, order, grammar, punctuation, casing, spacing, tone, abbreviations, typos, and paraphrasing must not change the decision when the intent is the same. A useful item is an x+1, x+2, or x+z pursuit: public evidence would materially help the user compare, decide, prepare, monitor, book, plan, study, understand what changed, estimate cost/timing, or defer intelligently. Do not merely tell the user to continue the old thread. Use the old reflected context as the seed, then create the next researched item that would add new evidence or a concrete decision path. The useful horizon may be immediate, near-term, later, exploratory, or recurring. Reflected memories and ambient interests are eligible only when they imply a real future decision or public-source check; private facts alone are context, not facts to validate. Treat private or personal context only as intent context: do not validate private memories, profile facts, names, relationships, emotions, or assertions against the web. If the useful next step can be grounded in public sources without exposing unrelated private details, emit a concise human-facing title and a public search query for later enrichment. Preserve the user's real deliverable, named entity, domain, constraints, location or timing constraints when relevant, and evaluation criteria when present. If currentness matters, target the freshest reliable evidence needed for the decision rather than generic news. For analytical topics, target the evidence needed to answer the real decision rather than broad background. For potentially sensitive personal topics, avoid diagnosis and avoid turning private claims into public queries; target reputable practical public resources if useful. Remove unrelated private facts, raw memory keys, credentials, and unnecessary personal identifiers from the query. Do not surface routine background/system state unless it clearly contains a user-facing decision or repair path. If public evidence would not materially improve the user's next step, mark it not useful. Return only JSON."
+}
+
+fn reflect_external_plan_for_candidate(
+    candidate: &ReflectSuggestedFollowup,
+    plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
+    plan_cache: &ReflectFollowupPlanCache,
+) -> Option<ReflectExternalPursuitPlan> {
+    plans.get(&candidate.id).cloned().or_else(|| {
+        plan_cache
+            .entries
+            .get(&candidate.id)
+            .map(reflect_plan_from_cache_entry)
+    })
 }
 
 fn apply_reflect_external_pursuit_plans(
     candidates: Vec<ReflectSuggestedFollowup>,
     plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
+    plan_cache: &ReflectFollowupPlanCache,
 ) -> Vec<ReflectSuggestedFollowup> {
     candidates
         .into_iter()
@@ -1888,9 +2391,17 @@ fn apply_reflect_external_pursuit_plans(
             if !candidate.search_requires_planning {
                 return Some(candidate);
             }
-            let plan = plans.get(&candidate.id)?;
+            let plan = reflect_external_plan_for_candidate(&candidate, plans, plan_cache)?;
             if !plan.useful || plan.search_query.trim().is_empty() || plan.title.trim().is_empty()
             {
+                return None;
+            }
+            if !reflect_external_search_query_is_safe(&plan.search_query) {
+                tracing::debug!(
+                    target: "arkreflect",
+                    source_id = %candidate.id,
+                    "dropping planned next step with unsafe external search query"
+                );
                 return None;
             }
             let query_changed = candidate
@@ -1898,16 +2409,16 @@ fn apply_reflect_external_pursuit_plans(
                 .as_deref()
                 .map(|query| query.trim() != plan.search_query.trim())
                 .unwrap_or(true);
-            candidate.title = plan.title.clone();
-            candidate.search_query = Some(plan.search_query.clone());
+            candidate.title = reflect_external_text(&plan.title, 120);
+            candidate.search_query = Some(plan.search_query.trim().to_string());
             candidate.prompt = format!(
                 "Use current source evidence to summarize this useful next step: {}",
-                plan.title
+                candidate.title
             );
             candidate.detail = if plan.rationale.trim().is_empty() {
-                "ArkReflect classified this reflected topic as a human opportunity. Source enrichment is queued.".to_string()
+                "Reflect classified this reflected topic as a useful next step. Source enrichment is queued.".to_string()
             } else {
-                plan.rationale.clone()
+                reflect_external_text(&plan.rationale, 220)
             };
             if query_changed {
                 candidate.status = "queued".to_string();
@@ -1929,9 +2440,11 @@ async fn build_suggested_followups(
     clusters: &[ReflectClusterResponse],
     embedder: Option<&EmbeddingClient>,
     llm: Option<&LlmClient>,
+    persist_feedback_vectors: bool,
 ) -> Vec<ReflectSuggestedFollowup> {
     let now = chrono::Utc::now();
     let cache = load_reflect_followup_search_cache(storage).await;
+    let mut plan_cache = load_reflect_followup_plan_cache(storage).await;
     let mut feedback_store = load_reflect_followup_feedback(storage).await;
     let mut candidates = Vec::new();
     let runs = tokio::time::timeout(
@@ -1993,8 +2506,16 @@ async fn build_suggested_followups(
         }
     }
     let plans = plan_reflect_external_pursuits(llm, &candidates).await;
-    candidates = apply_reflect_external_pursuit_plans(candidates, &plans);
-    if reflect_register_followup_feedback_vectors(&mut feedback_store, &candidates) {
+    if !plans.is_empty()
+        && update_reflect_followup_plan_cache(&mut plan_cache, &plans, now)
+        && persist_feedback_vectors
+    {
+        save_reflect_followup_plan_cache(storage, &plan_cache).await;
+    }
+    candidates = apply_reflect_external_pursuit_plans(candidates, &plans, &plan_cache);
+    if persist_feedback_vectors
+        && reflect_register_followup_feedback_vectors(&mut feedback_store, &candidates)
+    {
         feedback_store.updated_at = Some(now.to_rfc3339());
         save_reflect_followup_feedback(storage, &feedback_store).await;
     }
@@ -2063,6 +2584,7 @@ fn due_latest_followup_searches(
                 .map(|entry| entry.query.trim() == query)
                 .unwrap_or(false);
             if query.is_empty()
+                || !reflect_external_search_query_is_safe(query)
                 || (cached_query_matches
                     && !reflect_followup_search_is_due(cache, &suggestion.id, now))
             {
@@ -2115,6 +2637,34 @@ fn prune_reflect_followup_search_cache(cache: &mut ReflectFollowupSearchCache) {
     cache.entries.retain(|key, _| keep.contains(key));
 }
 
+fn reflect_cache_insert_search_entry(
+    cache: &mut ReflectFollowupSearchCache,
+    source_id: String,
+    entry: ReflectFollowupSearchEntry,
+) {
+    cache.entries.insert(source_id, entry);
+}
+
+fn reflect_cache_apply_summary_if_current(
+    cache: &mut ReflectFollowupSearchCache,
+    source_id: &str,
+    checked_at: &str,
+    summary: Option<String>,
+    summary_error: Option<String>,
+    generated_at: String,
+) -> bool {
+    let Some(current) = cache.entries.get_mut(source_id) else {
+        return false;
+    };
+    if current.checked_at != checked_at || !reflect_followup_summary_is_due(current) {
+        return false;
+    }
+    current.summary = summary;
+    current.summary_generated_at = current.summary.as_ref().map(|_| generated_at);
+    current.summary_error = summary_error;
+    true
+}
+
 async fn generate_reflect_followup_latest_summary(
     llm: &LlmClient,
     query: &str,
@@ -2142,9 +2692,9 @@ async fn generate_reflect_followup_latest_summary(
         "checked_at": checked_at,
         "sources": source_context,
     });
-    let system_prompt = "You synthesize ArkReflect current-source checks for a personal AI Agent OS. The reflected topic can be any subject inferred from the user's reflected activity and state. Use only the provided topic and source snippets. Do not invent facts, dates, causes, entities, attributes, constraints, or outcomes. Anchor the answer to the actual requested deliverable and constraints in the reflected topic. If the sources are adjacent but do not cover required pieces such as segment data, consensus estimates, assumptions, comparisons, or lead/lag evidence, say what is supported and what still needs better sourcing. If the sources do not establish a useful insight, say that plainly. Write a concise user-facing source-backed insight in 2-4 bullets or one short paragraph. Avoid tables, citations markup, and generic advice.";
+    let system_prompt = "You synthesize Reflect current-source checks for a personal AI Agent OS. The reflected topic can be any subject inferred from the user's reflected activity and state. Use only the provided topic and source snippets. Do not invent facts, dates, causes, entities, attributes, constraints, or outcomes. Anchor the answer to the actual requested deliverable and constraints in the reflected topic. If the sources are adjacent but do not cover required pieces such as segment data, consensus estimates, assumptions, comparisons, or lead/lag evidence, say what is supported and what still needs better sourcing. If the sources do not establish a useful insight, say that plainly. Write a concise user-facing source-backed insight in 2-4 bullets or one short paragraph. Avoid tables, citations markup, and generic advice.";
     let user_message = format!(
-        "Structured ArkReflect current-source check:\n{}\n\nWrite the source-backed insight. Make it actionable only to the extent supported by the source evidence.",
+        "Structured Reflect current-source check:\n{}\n\nWrite the source-backed insight. Make it actionable only to the extent supported by the source evidence.",
         serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string())
     );
     match tokio::time::timeout(
@@ -2192,7 +2742,6 @@ async fn run_reflect_followup_search_job(
     let search_config = crate::runtime::build_search_config(&config_dir, Some(&storage)).await;
     let mut completed = 0usize;
     for (source_id, query) in searches {
-        let mut cache = load_reflect_followup_search_cache(&storage).await;
         let args = crate::actions::search::SearchArgs {
             query: query.clone(),
             num_results: REFLECT_FOLLOWUP_SEARCH_RESULTS_PER_TOPIC,
@@ -2236,11 +2785,15 @@ async fn run_reflect_followup_search_job(
                     summary_error: None,
                 },
             };
-        cache.updated_at = Some(chrono::Utc::now().to_rfc3339());
-        cache.entries.insert(source_id, entry);
-        prune_reflect_followup_search_cache(&mut cache);
-        save_reflect_followup_search_cache(&storage, &cache).await;
-        completed += 1;
+        if update_reflect_followup_search_cache(&storage, move |cache| {
+            reflect_cache_insert_search_entry(cache, source_id, entry);
+            true
+        })
+        .await
+        .unwrap_or(false)
+        {
+            completed += 1;
+        }
     }
     Ok(completed)
 }
@@ -2269,19 +2822,20 @@ async fn run_reflect_followup_summary_job(
             &entry.results,
         )
         .await;
-        let mut cache = load_reflect_followup_search_cache(&storage).await;
-        if let Some(current) = cache.entries.get_mut(&source_id) {
-            if current.checked_at == entry.checked_at && reflect_followup_summary_is_due(current) {
-                current.summary = summary;
-                current.summary_generated_at = current
-                    .summary
-                    .as_ref()
-                    .map(|_| chrono::Utc::now().to_rfc3339());
-                current.summary_error = summary_error;
-                cache.updated_at = Some(chrono::Utc::now().to_rfc3339());
-                save_reflect_followup_search_cache(&storage, &cache).await;
-                completed += 1;
-            }
+        if update_reflect_followup_search_cache(&storage, move |cache| {
+            reflect_cache_apply_summary_if_current(
+                cache,
+                &source_id,
+                &entry.checked_at,
+                summary,
+                summary_error,
+                chrono::Utc::now().to_rfc3339(),
+            )
+        })
+        .await
+        .unwrap_or(false)
+        {
+            completed += 1;
         }
     }
     Ok(completed)
@@ -2477,6 +3031,17 @@ async fn spawn_reflect_followup_search_worker(
     true
 }
 
+fn reflect_due_followup_work(
+    suggestions: &[ReflectSuggestedFollowup],
+    cache: &ReflectFollowupSearchCache,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ReflectDueFollowupWork {
+    ReflectDueFollowupWork {
+        searches: due_latest_followup_searches(suggestions, cache, now),
+        summaries: due_latest_followup_summaries(suggestions, cache),
+    }
+}
+
 async fn maybe_spawn_reflect_followup_search(
     state: AppState,
     suggestions: Vec<ReflectSuggestedFollowup>,
@@ -2491,40 +3056,73 @@ async fn maybe_spawn_reflect_followup_search(
     {
         return false;
     }
-    crate::spawn_logged!(
-        "src/channels/http/reflect_control.rs:followup_coordinator",
-        async move {
-            let _guard = ReflectFollowupCoordinatorInFlightGuard;
-            if !reflect_server_is_idle(&state).await {
-                return;
-            }
-            let (storage, config_dir, llm) = {
-                let agent = state.agent.read().await;
-                (
-                    agent.storage.clone(),
-                    agent.config_dir.clone(),
-                    agent.llm.clone(),
-                )
-            };
-            let cache = load_reflect_followup_search_cache(&storage).await;
-            let searches = due_latest_followup_searches(&suggestions, &cache, chrono::Utc::now());
-            let summaries = due_latest_followup_summaries(&suggestions, &cache);
-            if searches.is_empty() && summaries.is_empty() {
-                return;
-            }
-            let _ = spawn_reflect_followup_summary_worker(
-                storage.clone(),
-                llm.clone(),
-                summaries,
-                trigger,
-            )
+    let _guard = ReflectFollowupCoordinatorInFlightGuard;
+    if !reflect_server_is_idle(&state).await {
+        return false;
+    }
+    let (storage, config_dir, llm) = {
+        let agent = state.agent.read().await;
+        (
+            agent.storage.clone(),
+            agent.config_dir.clone(),
+            agent.llm.clone(),
+        )
+    };
+    let cache = load_reflect_followup_search_cache(&storage).await;
+    let due_work = reflect_due_followup_work(&suggestions, &cache, chrono::Utc::now());
+    if !due_work.has_work() {
+        return false;
+    }
+    let summary_spawned = spawn_reflect_followup_summary_worker(
+        storage.clone(),
+        llm.clone(),
+        due_work.summaries,
+        trigger,
+    )
+    .await;
+    let search_spawned =
+        spawn_reflect_followup_search_worker(storage, config_dir, llm, due_work.searches, trigger)
             .await;
-            let _ =
-                spawn_reflect_followup_search_worker(storage, config_dir, llm, searches, trigger)
-                    .await;
-        }
-    );
-    true
+    summary_spawned || search_spawned
+}
+
+async fn maybe_spawn_reflect_followup_search_for_range(
+    state: AppState,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+    trigger: &'static str,
+) -> bool {
+    if !reflect_server_is_idle(&state).await {
+        return false;
+    }
+    let (storage, embedding_client, llm) = {
+        let agent = state.agent.read().await;
+        (
+            agent.storage.clone(),
+            agent.embedding_client.clone(),
+            agent.llm.clone(),
+        )
+    };
+    let from_s = from.to_rfc3339();
+    let to_s = to.to_rfc3339();
+    let units = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_semantic_work_units_between(&from_s, &to_s, REFLECT_MAX_UNITS),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .unwrap_or_default();
+    let (clusters, _, _) = build_clusters_bounded(units).await;
+    let suggestions = build_suggested_followups(
+        &storage,
+        &clusters,
+        embedding_client.as_deref(),
+        Some(&llm),
+        true,
+    )
+    .await;
+    maybe_spawn_reflect_followup_search(state, suggestions, trigger).await
 }
 
 async fn maybe_spawn_reflect_followup_search_from_recent_activity(
@@ -2542,8 +3140,26 @@ async fn maybe_spawn_reflect_followup_search_from_recent_activity(
             agent.llm.clone(),
         )
     };
-    let suggestions =
-        build_suggested_followups(&storage, &[], embedding_client.as_deref(), Some(&llm)).await;
+    let now = chrono::Utc::now();
+    let from_s = (now - chrono::Duration::days(REFLECT_IDLE_LOOKBACK_DAYS)).to_rfc3339();
+    let to_s = now.to_rfc3339();
+    let units = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_semantic_work_units_between(&from_s, &to_s, REFLECT_MAX_UNITS),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .unwrap_or_default();
+    let (clusters, _, _) = build_clusters_bounded(units).await;
+    let suggestions = build_suggested_followups(
+        &storage,
+        &clusters,
+        embedding_client.as_deref(),
+        Some(&llm),
+        true,
+    )
+    .await;
     maybe_spawn_reflect_followup_search(state, suggestions, trigger).await
 }
 
@@ -3067,7 +3683,8 @@ fn watcher_candidate(
             "watcher_id": watcher.id.to_string(),
             "status": status,
             "poll_action": watcher.poll_action,
-            "poll_count": watcher.poll_count
+            "poll_count": watcher.poll_count,
+            "repeat_on_match": watcher.repeat_on_match
         }),
         inherited_embedding: None,
     })
@@ -3233,7 +3850,7 @@ fn arkpulse_candidate(event: arkpulse_event::Model) -> ReflectCandidateUnit {
     let summary = first_non_empty([event.summary.as_str(), event.message.as_str()]);
     let embedding_text = truncate_chars(
         &format!(
-            "ArkPulse status: {}\nMessage: {}\nSummary: {}\nFlags: {}\nDetails: {}",
+            "Pulse status: {}\nMessage: {}\nSummary: {}\nFlags: {}\nDetails: {}",
             event.status, event.message, event.summary, event.flags_json, event.details_json
         ),
         REFLECT_EMBED_TEXT_CHARS,
@@ -3329,7 +3946,7 @@ fn lineage_candidate(
         raw.as_str(),
     ]);
     let embedding_text = truncate_chars(
-        &format!("ArkEvolve lineage kind: {}\nEntry: {}", kind, raw),
+        &format!("Evolve lineage kind: {}\nEntry: {}", kind, raw),
         REFLECT_EMBED_TEXT_CHARS,
     );
     Some(ReflectCandidateUnit {
@@ -4199,7 +4816,7 @@ fn build_clusters(
                 mode: "activity".to_string(),
                 embedded_units: embedded_count,
                 total_units: units.len(),
-                detail: "ArkReflect is showing cached activity while background semantic grouping catches up.".to_string(),
+                detail: "Reflect is showing cached activity while background semantic grouping catches up.".to_string(),
             },
         );
     }
@@ -4635,8 +5252,7 @@ async fn spawn_reflect_refresh(
             accepted: false,
             running: false,
             status: "deferred_busy".to_string(),
-            detail: "ArkReflect refresh was deferred because foreground work is active."
-                .to_string(),
+            detail: "Reflect refresh was deferred because foreground work is active.".to_string(),
             refresh_status,
         };
     }
@@ -4645,6 +5261,20 @@ async fn spawn_reflect_refresh(
         let agent = state.agent.read().await;
         agent.storage.clone()
     };
+
+    let now = chrono::Utc::now();
+    let current_status = current_refresh_status().await;
+    if reflect_refresh_recently_completed_for_request(&current_status, &request, now) {
+        return ReflectRefreshStartResponse {
+            accepted: false,
+            running: false,
+            status: "already_current".to_string(),
+            detail:
+                "Reflect already refreshed this range recently; it will run again after new activity or the cache becomes stale."
+                    .to_string(),
+            refresh_status: current_status,
+        };
+    }
 
     if REFLECT_REFRESH_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -4655,10 +5285,7 @@ async fn spawn_reflect_refresh(
             if status.status != "running" {
                 status.status = "already_running".to_string();
             }
-            status.trigger = status
-                .trigger
-                .clone()
-                .or_else(|| Some(trigger.to_string()));
+            status.trigger = status.trigger.clone().or_else(|| Some(trigger.to_string()));
             status.period = status
                 .period
                 .clone()
@@ -4667,10 +5294,7 @@ async fn spawn_reflect_refresh(
                 .from
                 .clone()
                 .or_else(|| Some(request.from.to_rfc3339()));
-            status.to = status
-                .to
-                .clone()
-                .or_else(|| Some(request.to.to_rfc3339()));
+            status.to = status.to.clone().or_else(|| Some(request.to.to_rfc3339()));
             status.requested_at = status
                 .requested_at
                 .clone()
@@ -4681,7 +5305,7 @@ async fn spawn_reflect_refresh(
             accepted: false,
             running: true,
             status: "already_running".to_string(),
-            detail: "An ArkReflect refresh is already running.".to_string(),
+            detail: "An Reflect refresh is already running.".to_string(),
             refresh_status,
         };
     }
@@ -4715,7 +5339,7 @@ async fn spawn_reflect_refresh(
                 accepted: false,
                 running: true,
                 status: "already_running".to_string(),
-                detail: "An ArkReflect refresh is already running in another worker.".to_string(),
+                detail: "An Reflect refresh is already running in another worker.".to_string(),
                 refresh_status,
             };
         }
@@ -4737,7 +5361,7 @@ async fn spawn_reflect_refresh(
                 accepted: false,
                 running: false,
                 status: "lease_failed".to_string(),
-                detail: "ArkReflect could not acquire its background refresh lease.".to_string(),
+                detail: "Reflect could not acquire its background refresh lease.".to_string(),
                 refresh_status,
             };
         }
@@ -4758,8 +5382,7 @@ async fn spawn_reflect_refresh(
                 accepted: false,
                 running: false,
                 status: "lease_timed_out".to_string(),
-                detail: "ArkReflect timed out before it could acquire its refresh lease."
-                    .to_string(),
+                detail: "Reflect timed out before it could acquire its refresh lease.".to_string(),
                 refresh_status,
             };
         }
@@ -4783,13 +5406,13 @@ async fn spawn_reflect_refresh(
     .await;
 
     crate::spawn_logged!("src/channels/http/reflect_control.rs:refresh", async move {
-        let _guard = ReflectInFlightGuard;
+        let guard = ReflectInFlightGuard;
         let result = tokio::time::timeout(
             REFLECT_REFRESH_TIMEOUT,
-            run_reflect_refresh_job(state, request.clone()),
+            run_reflect_refresh_job(state.clone(), request.clone()),
         )
         .await;
-        match result {
+        let completed = match result {
             Ok(Ok(counts)) => {
                 update_refresh_status(|status| {
                     status.running = false;
@@ -4799,6 +5422,7 @@ async fn spawn_reflect_refresh(
                     status.last_source_counts = counts;
                 })
                 .await;
+                true
             }
             Ok(Err(error)) => {
                 update_refresh_status(|status| {
@@ -4808,6 +5432,7 @@ async fn spawn_reflect_refresh(
                     status.last_error = Some(error);
                 })
                 .await;
+                false
             }
             Err(_) => {
                 update_refresh_status(|status| {
@@ -4820,13 +5445,24 @@ async fn spawn_reflect_refresh(
                     ));
                 })
                 .await;
+                false
             }
-        }
+        };
         if let Err(error) = lease_storage
             .release_kv_lease_guard(REFLECT_REFRESH_LEASE_KEY, &lease_guard)
             .await
         {
             tracing::warn!(target: "arkreflect", error = %error, "failed to release refresh lease");
+        }
+        drop(guard);
+        if completed {
+            let _ = maybe_spawn_reflect_followup_search_for_range(
+                state.clone(),
+                request.from.clone(),
+                request.to.clone(),
+                trigger,
+            )
+            .await;
         }
     });
 
@@ -4834,7 +5470,7 @@ async fn spawn_reflect_refresh(
         accepted: true,
         running: true,
         status: "queued".to_string(),
-        detail: "ArkReflect refresh started in the background.".to_string(),
+        detail: "Reflect refresh started in the background.".to_string(),
         refresh_status,
     }
 }
@@ -4949,8 +5585,7 @@ async fn load_daily_digest_status(
         cluster_count: 0,
         source_counts: ReflectSourceCounts::default(),
         summary: None,
-        detail: "Waiting for the next quiet window to prepare today's ArkReflect digest."
-            .to_string(),
+        detail: "Waiting for the next quiet window to prepare today's Reflect digest.".to_string(),
         last_checked_at: None,
         last_sent_at: None,
         last_skipped_at: None,
@@ -5010,8 +5645,8 @@ fn reflect_digest_source_lines(counts: &ReflectSourceCounts) -> Vec<String> {
         ("goals", counts.goals),
         ("watchers", counts.watchers),
         ("Sentinel", counts.sentinel),
-        ("ArkPulse", counts.arkpulse),
-        ("ArkEvolve", counts.arkevolve),
+        ("Pulse", counts.arkpulse),
+        ("Evolve", counts.arkevolve),
         ("usage", counts.usage),
     ]
     .into_iter()
@@ -5035,7 +5670,7 @@ fn fallback_daily_digest_summary(
         .collect::<Vec<_>>();
     if focus.is_empty() {
         lines.push(format!(
-            "ArkReflect found meaningful activity on {}.",
+            "Reflect found meaningful activity on {}.",
             date_key
         ));
     } else {
@@ -5115,9 +5750,9 @@ async fn generate_daily_digest_summary(
         "clusters": cluster_context,
         "examples": example_context,
     });
-    let system_prompt = "You write ArkReflect daily digests for a personal AI Agent OS. Use only the structured facts provided. Do not invent work, outcomes, sources, dates, costs, or failures. Write for a novice user in plain language. Keep it concise: 3-5 bullets, no heading, no empty-day language, no generic encouragement.";
+    let system_prompt = "You write Reflect daily digests for a personal AI Agent OS. Use only the structured facts provided. Do not invent work, outcomes, sources, dates, costs, or failures. Write for a novice user in plain language. Keep it concise: 3-5 bullets, no heading, no empty-day language, no generic encouragement.";
     let user_message = format!(
-        "Structured ArkReflect daily context:\n{}\n\nWrite the user-readable digest.",
+        "Structured Reflect daily context:\n{}\n\nWrite the user-readable digest.",
         serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string())
     );
     let llm = {
@@ -5233,7 +5868,7 @@ async fn maybe_prepare_daily_digest(state: AppState) {
             cluster_count: 0,
             source_counts: source_counts_from_units(&units),
             summary: None,
-            detail: "Preparing the daily ArkReflect recap in the background.".to_string(),
+            detail: "Preparing the daily Reflect recap in the background.".to_string(),
             last_checked_at: Some(now.to_rfc3339()),
             last_sent_at: previous.last_sent_at,
             last_skipped_at: previous.last_skipped_at,
@@ -5261,9 +5896,8 @@ async fn maybe_prepare_daily_digest(state: AppState) {
             cluster_count: clusters.len(),
             source_counts: counts,
             summary: None,
-            detail:
-                "No meaningful ArkReflect activity was found for this day, so no digest was sent."
-                    .to_string(),
+            detail: "No meaningful Reflect activity was found for this day, so no digest was sent."
+                .to_string(),
             last_checked_at: Some(now.to_rfc3339()),
             last_sent_at: previous.last_sent_at,
             last_skipped_at: Some(now.to_rfc3339()),
@@ -5282,12 +5916,7 @@ async fn maybe_prepare_daily_digest(state: AppState) {
     let (in_app, push_attempts) = {
         let agent = state.agent.read().await;
         let in_app = agent
-            .emit_notification_with_status(
-                "ArkReflect Daily Digest",
-                &summary,
-                "info",
-                "arkreflect",
-            )
+            .emit_notification_with_status("Reflect Daily Digest", &summary, "info", "arkreflect")
             .await;
         let push_attempts = agent.notify_preferred_channel_reported(&summary).await;
         (in_app, push_attempts)
@@ -5316,9 +5945,9 @@ async fn maybe_prepare_daily_digest(state: AppState) {
         source_counts: counts,
         summary: Some(summary),
         detail: if sent_ok {
-            "Daily ArkReflect digest was prepared and delivered.".to_string()
+            "Daily Reflect digest was prepared and delivered.".to_string()
         } else {
-            "Daily ArkReflect digest was prepared, but delivery failed.".to_string()
+            "Daily Reflect digest was prepared, but delivery failed.".to_string()
         },
         last_checked_at: Some(now.to_rfc3339()),
         last_sent_at: if sent_ok {
@@ -5447,7 +6076,8 @@ pub(super) async fn ark_reflect_endpoint(
     {
         tracing::debug!(target: "arkreflect", "related history enrichment timed out");
     }
-    let suggested_followups = build_suggested_followups(&storage, &clusters, None, None).await;
+    let suggested_followups =
+        build_suggested_followups(&storage, &clusters, None, None, false).await;
     (
         StatusCode::OK,
         Json(ReflectResponse {
@@ -5480,6 +6110,8 @@ pub(super) async fn ark_reflect_refresh_endpoint(
     let result = spawn_reflect_refresh(state, request, "manual", false).await;
     let status = if result.accepted || result.running {
         StatusCode::ACCEPTED
+    } else if result.status == "already_current" {
+        StatusCode::OK
     } else {
         StatusCode::CONFLICT
     };
@@ -5669,10 +6301,12 @@ mod tests {
             task_type: task_type.map(str::to_string),
             request_text: Some("Compare current public updates for a topic.".to_string()),
             tool_sequence_digest: None,
-            tool_sequence_json: serde_json::json!(tool_names
-                .iter()
-                .map(|name| serde_json::json!({ "tool_name": name }))
-                .collect::<Vec<_>>()),
+            tool_sequence_json: serde_json::json!(
+                tool_names
+                    .iter()
+                    .map(|name| serde_json::json!({ "tool_name": name }))
+                    .collect::<Vec<_>>()
+            ),
             strategy_version: None,
             policy_version: None,
             prompt_version: None,
@@ -5722,9 +6356,11 @@ mod tests {
             followup("l2", "latest_developments", 96.0),
         ]);
         assert_eq!(selected.len(), REFLECT_MAX_SUGGESTED_FOLLOWUPS);
-        assert!(selected
-            .iter()
-            .any(|item| item.kind == "latest_developments"));
+        assert!(
+            selected
+                .iter()
+                .any(|item| item.kind == "latest_developments")
+        );
         assert!(
             selected
                 .iter()
@@ -5732,6 +6368,51 @@ mod tests {
                 .count()
                 <= 4
         );
+    }
+
+    #[test]
+    fn latest_research_followup_requires_semantic_planning_before_first_search() {
+        let run = experience_run_with_tools(Some("research"), &["web_search"]);
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .unwrap();
+
+        let suggestion =
+            reflect_latest_suggestion(&run, &ReflectFollowupSearchCache::default(), now);
+
+        assert_eq!(suggestion.kind, "latest_developments");
+        assert_eq!(suggestion.status, "queued");
+        assert!(suggestion.search_requires_planning);
+        assert!(suggestion.search_planning_context.is_some());
+        assert!(suggestion.search_results.is_empty());
+    }
+
+    #[test]
+    fn selected_followups_collapse_near_duplicate_recovery_threads() {
+        let mut first = followup("thread-a", "recovery_advice", 90.0);
+        first.title = "Set up the MCP server for AgentArk".to_string();
+        first.detail =
+            "Review the earlier integration request and decide the next step.".to_string();
+        first.prompt =
+            "Review this reflected thread and help decide the next concrete step.".to_string();
+
+        let mut second = followup("thread-b", "recovery_advice", 88.0);
+        second.title = "Configure AgentArk MCP integration".to_string();
+        second.detail = "Continue the prior setup request for the same MCP server.".to_string();
+        second.prompt =
+            "Review this reflected thread and help decide the next concrete step.".to_string();
+
+        let mut distinct = followup("thread-c", "recovery_advice", 86.0);
+        distinct.title = "Compare deployment options for a dashboard".to_string();
+        distinct.detail = "A separate reflected workstream deserves review.".to_string();
+
+        let selected = select_top_reflect_followups(vec![first, second, distinct]);
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|item| item.id == "thread-a"));
+        assert!(selected.iter().any(|item| item.id == "thread-c"));
+        assert!(!selected.iter().any(|item| item.id == "thread-b"));
     }
 
     #[test]
@@ -5768,7 +6449,7 @@ mod tests {
                 results: vec![ReflectFollowupSearchResult {
                     title: "Fresh public update".to_string(),
                     url: "https://example.com/update".to_string(),
-                    snippet: "A source-backed result appears in ArkReflect.".to_string(),
+                    snippet: "A source-backed result appears in Reflect.".to_string(),
                     source: "Example".to_string(),
                     published_date: Some("2026-05-06".to_string()),
                 }],
@@ -5811,6 +6492,60 @@ mod tests {
         assert_eq!(suggestion.kind, "latest_developments");
         assert_eq!(suggestion.status, "queued");
         assert!(suggestion.search_query.is_some());
+        assert!(suggestion.search_requires_planning);
+    }
+
+    #[test]
+    fn semantic_freshness_followup_uses_cached_source_check_without_replanning() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .unwrap();
+        let context = freshness_context();
+        let cluster = freshness_cluster("fresh", "Cross-border news tracking", &[0.99, 0.01, 0.0]);
+        let score = reflect_semantic_freshness_score(
+            cluster.centroid_embedding.as_ref().unwrap(),
+            &context,
+        )
+        .unwrap();
+        let topic = reflect_cluster_latest_topic(&cluster);
+        let source_id = format!(
+            "latest:semantic:{}",
+            stable_hash(&format!("{}:{}", cluster.representative_unit_id, topic))
+                .chars()
+                .take(24)
+                .collect::<String>()
+        );
+        let mut cache = ReflectFollowupSearchCache::default();
+        cache.entries.insert(
+            source_id.clone(),
+            ReflectFollowupSearchEntry {
+                source_id,
+                query: "current cross-border news tracking sources".to_string(),
+                checked_at: "2026-05-06T11:30:00Z".to_string(),
+                backend: Some("test".to_string()),
+                results: vec![ReflectFollowupSearchResult {
+                    title: "Fresh public update".to_string(),
+                    url: "https://example.com/update".to_string(),
+                    snippet: "A source-backed result appears in Reflect.".to_string(),
+                    source: "Example".to_string(),
+                    published_date: Some("2026-05-06".to_string()),
+                }],
+                error: None,
+                summary: None,
+                summary_generated_at: None,
+                summary_error: None,
+            },
+        );
+
+        let suggestion =
+            reflect_semantic_cluster_latest_suggestion(&cluster, &cache, now, score).unwrap();
+        assert!(!suggestion.search_requires_planning);
+        assert_eq!(
+            suggestion.search_query.as_deref(),
+            Some("current cross-border news tracking sources")
+        );
+        assert_eq!(suggestion.search_results.len(), 1);
     }
 
     #[test]
@@ -5827,13 +6562,15 @@ mod tests {
         )
         .unwrap();
         assert!(!reflect_semantic_freshness_is_actionable(score));
-        assert!(reflect_semantic_cluster_latest_suggestion(
-            &cluster,
-            &ReflectFollowupSearchCache::default(),
-            now,
-            score,
-        )
-        .is_none());
+        assert!(
+            reflect_semantic_cluster_latest_suggestion(
+                &cluster,
+                &ReflectFollowupSearchCache::default(),
+                now,
+                score,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -5863,6 +6600,58 @@ mod tests {
     }
 
     #[test]
+    fn planned_latest_followup_uses_cached_source_check_without_replanning() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .unwrap();
+        let user_cluster = freshness_cluster(
+            "research",
+            "Research an external market update",
+            &[0.7, 0.2, 0.1],
+        );
+        let topic = reflect_cluster_latest_topic(&user_cluster);
+        let source_id = format!(
+            "latest:planned:{}",
+            stable_hash(&format!("{}:{}", user_cluster.id, topic))
+                .chars()
+                .take(24)
+                .collect::<String>()
+        );
+        let mut cache = ReflectFollowupSearchCache::default();
+        cache.entries.insert(
+            source_id.clone(),
+            ReflectFollowupSearchEntry {
+                source_id,
+                query: "external market update current sources".to_string(),
+                checked_at: "2026-05-06T11:30:00Z".to_string(),
+                backend: Some("test".to_string()),
+                results: vec![ReflectFollowupSearchResult {
+                    title: "Market source".to_string(),
+                    url: "https://example.com/market".to_string(),
+                    snippet: "A current source is cached for this reflected topic.".to_string(),
+                    source: "Example".to_string(),
+                    published_date: Some("2026-05-06".to_string()),
+                }],
+                error: None,
+                summary: Some("Cached source-backed insight.".to_string()),
+                summary_generated_at: Some("2026-05-06T11:40:00Z".to_string()),
+                summary_error: None,
+            },
+        );
+
+        let suggestion =
+            reflect_planned_cluster_latest_suggestion(&user_cluster, &cache, now).unwrap();
+        assert!(!suggestion.search_requires_planning);
+        assert_eq!(
+            suggestion.search_query.as_deref(),
+            Some("external market update current sources")
+        );
+        assert_eq!(suggestion.search_results.len(), 1);
+        assert!(suggestion.latest_summary.is_some());
+    }
+
+    #[test]
     fn external_pursuit_planning_drops_unuseful_memory_candidates() {
         let mut candidate = followup("memory-topic", "latest_developments", 80.0);
         candidate.search_requires_planning = true;
@@ -5879,8 +6668,51 @@ mod tests {
             },
         );
 
-        let planned = apply_reflect_external_pursuit_plans(vec![candidate], &plans);
+        let planned = apply_reflect_external_pursuit_plans(
+            vec![candidate],
+            &plans,
+            &ReflectFollowupPlanCache::default(),
+        );
         assert!(planned.is_empty());
+    }
+
+    #[test]
+    fn external_pursuit_planning_reuses_cached_useful_plan_without_llm() {
+        let mut candidate = followup("cloud-pricing-topic", "latest_developments", 80.0);
+        candidate.title = "GMI Cloud GPU Pricing Comparison".to_string();
+        candidate.detail = "Compare options before using cloud GPU providers.".to_string();
+        candidate.search_query = Some("GMI Cloud GPU Pricing Comparison".to_string());
+        candidate.search_requires_planning = true;
+
+        let mut cache = ReflectFollowupPlanCache::default();
+        cache.entries.insert(
+            candidate.id.clone(),
+            ReflectFollowupPlanEntry {
+                id: candidate.id.clone(),
+                useful: true,
+                title: "Compare current GPU cloud pricing options".to_string(),
+                search_query: "GMI Cloud GPU pricing comparison alternatives 2026".to_string(),
+                rationale:
+                    "Current provider pricing and alternatives can change and help the user decide."
+                        .to_string(),
+                planned_at: "2026-05-21T00:00:00Z".to_string(),
+            },
+        );
+
+        let planned =
+            apply_reflect_external_pursuit_plans(vec![candidate], &BTreeMap::new(), &cache);
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].kind, "latest_developments");
+        assert_eq!(
+            planned[0].title,
+            "Compare current GPU cloud pricing options"
+        );
+        assert_eq!(
+            planned[0].search_query.as_deref(),
+            Some("GMI Cloud GPU pricing comparison alternatives 2026")
+        );
+        assert_eq!(planned[0].status, "queued");
     }
 
     #[test]
@@ -5901,7 +6733,11 @@ mod tests {
             },
         );
 
-        let planned = apply_reflect_external_pursuit_plans(vec![candidate], &plans);
+        let planned = apply_reflect_external_pursuit_plans(
+            vec![candidate],
+            &plans,
+            &ReflectFollowupPlanCache::default(),
+        );
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].title, "Places worth exploring nearby");
         assert_eq!(
@@ -5909,5 +6745,120 @@ mod tests {
             Some("places of interest near a Kolkata neighborhood")
         );
         assert!(planned[0].rank_score > 80.0);
+    }
+
+    #[test]
+    fn external_pursuit_planning_drops_sensitive_search_queries() {
+        let mut candidate = followup("sensitive-topic", "latest_developments", 80.0);
+        candidate.search_requires_planning = true;
+        candidate.search_query = Some("private token context".to_string());
+        let mut plans = BTreeMap::new();
+        plans.insert(
+            candidate.id.clone(),
+            ReflectExternalPursuitPlan {
+                id: candidate.id.clone(),
+                useful: true,
+                title: "Unsafe query should not survive".to_string(),
+                search_query: "access_token sk_test_1234567890123456789012345678901234567890"
+                    .to_string(),
+                rationale: "The query contains credential-shaped material.".to_string(),
+            },
+        );
+
+        let planned = apply_reflect_external_pursuit_plans(
+            vec![candidate],
+            &plans,
+            &ReflectFollowupPlanCache::default(),
+        );
+        assert!(planned.is_empty());
+    }
+
+    #[test]
+    fn due_followup_work_ignores_unsafe_queries() {
+        let mut unsafe_candidate = followup("unsafe", "latest_developments", 90.0);
+        unsafe_candidate.search_query =
+            Some("refresh_token abc1234567890123456789012345678901234567890".to_string());
+
+        let mut safe_candidate = followup("safe", "latest_developments", 89.0);
+        safe_candidate.search_query = Some("current public exam counselling dates".to_string());
+
+        let work = reflect_due_followup_work(
+            &[unsafe_candidate, safe_candidate],
+            &ReflectFollowupSearchCache::default(),
+            chrono::Utc
+                .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+                .single()
+                .unwrap(),
+        );
+
+        assert_eq!(work.searches.len(), 1);
+        assert_eq!(work.searches[0].0, "safe");
+    }
+
+    #[test]
+    fn cache_summary_update_preserves_newer_search_entry() {
+        let mut cache = ReflectFollowupSearchCache::default();
+        cache.entries.insert(
+            "topic".to_string(),
+            ReflectFollowupSearchEntry {
+                source_id: "topic".to_string(),
+                query: "new query".to_string(),
+                checked_at: "2026-05-06T12:00:00Z".to_string(),
+                backend: Some("test".to_string()),
+                results: vec![ReflectFollowupSearchResult {
+                    title: "New result".to_string(),
+                    url: "https://example.com/new".to_string(),
+                    snippet: "Newer source result.".to_string(),
+                    source: "Example".to_string(),
+                    published_date: None,
+                }],
+                error: None,
+                summary: None,
+                summary_generated_at: None,
+                summary_error: None,
+            },
+        );
+
+        let applied = reflect_cache_apply_summary_if_current(
+            &mut cache,
+            "topic",
+            "2026-05-06T11:00:00Z",
+            Some("Old summary".to_string()),
+            None,
+            "2026-05-06T12:05:00Z".to_string(),
+        );
+
+        assert!(!applied);
+        let current = cache.entries.get("topic").unwrap();
+        assert_eq!(current.checked_at, "2026-05-06T12:00:00Z");
+        assert!(current.summary.is_none());
+    }
+
+    #[test]
+    fn refresh_recent_completion_suppresses_same_range_only_temporarily() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .unwrap();
+        let request = ReflectRefreshRequest {
+            period: ReflectPeriod::Weekly,
+            from: now - chrono::Duration::days(7),
+            to: now,
+        };
+        let mut status = ReflectRefreshStatus::default();
+        status.status = "completed".to_string();
+        status.period = Some(request.period.as_str().to_string());
+        status.from = Some(request.from.to_rfc3339());
+        status.to = Some(request.to.to_rfc3339());
+        status.completed_at = Some((now - chrono::Duration::minutes(3)).to_rfc3339());
+
+        assert!(reflect_refresh_recently_completed_for_request(
+            &status, &request, now
+        ));
+
+        status.completed_at = Some((now - chrono::Duration::minutes(20)).to_rfc3339());
+        assert!(!reflect_refresh_recently_completed_for_request(
+            &status, &request, now
+        ));
     }
 }

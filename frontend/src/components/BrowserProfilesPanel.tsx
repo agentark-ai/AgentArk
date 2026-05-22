@@ -1,3 +1,4 @@
+import ChatBubbleOutlineRoundedIcon from "@mui/icons-material/ChatBubbleOutlineRounded";
 import LoginRoundedIcon from "@mui/icons-material/LoginRounded";
 import PhonelinkRoundedIcon from "@mui/icons-material/PhonelinkRounded";
 import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
@@ -8,6 +9,10 @@ import {
   CardContent,
   Chip,
   Divider,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   MenuItem,
   Stack,
   TextField,
@@ -22,6 +27,8 @@ export type BrowserSessionSummary = {
   status: "active" | "waiting" | "completed" | "failed" | string;
   title?: string;
   url?: string;
+  profile_id?: string | null;
+  profile_name?: string | null;
   updated_at?: string;
 };
 
@@ -46,6 +53,7 @@ export type BrowserProfilesPanelProps = {
   onLaunchProfile?: (profileId: string) => void | Promise<void>;
   onStopProfile?: (profileId: string) => void | Promise<void>;
   onOpenManualLogin?: (profileId: string) => void | Promise<void>;
+  onUseProfileInChat?: (profile: BrowserProfile) => void | Promise<void>;
   onCreateProfile?: (payload: { name: string; browser: string; managed: boolean }) => void | Promise<void>;
   onSetDefaultProfile?: (profileId: string) => void | Promise<void>;
   className?: string;
@@ -82,6 +90,7 @@ export function BrowserProfilesPanel({
   onLaunchProfile,
   onStopProfile,
   onOpenManualLogin,
+  onUseProfileInChat,
   onCreateProfile,
   onSetDefaultProfile,
   className
@@ -90,6 +99,7 @@ export function BrowserProfilesPanel({
   const [draftName, setDraftName] = useState("");
   const [draftBrowser, setDraftBrowser] = useState("chrome");
   const [draftManaged, setDraftManaged] = useState(true);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
 
   const stats = useMemo(() => {
     const running = profiles.filter((profile) => String(profile.status).toLowerCase() === "running").length;
@@ -98,25 +108,60 @@ export function BrowserProfilesPanel({
     return { running, locked, managed };
   }, [profiles]);
 
+  const resetDraft = () => {
+    setDraftName("");
+    setDraftBrowser("chrome");
+    setDraftManaged(true);
+  };
+
+  const submitProfile = () => {
+    const name = draftName.trim();
+    if (!name || !onCreateProfile) return;
+    void Promise.resolve(
+      onCreateProfile({ name, browser: draftBrowser, managed: draftManaged }),
+    );
+    resetDraft();
+    setCreateDialogOpen(false);
+  };
+
   return (
     <Box className={className}>
       <Stack spacing={1.25}>
-        <Box>
-          <Typography variant="overline" className="workspace-shell-kicker">
-            Browser
-          </Typography>
-          <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
-            Managed browser profiles and handoff state
-          </Typography>
-          <Typography
-            variant="body2"
-            sx={{
-              color: "text.secondary",
-              maxWidth: 840
-            }}>
-            Use this shell to surface named browser profiles, active sessions, and manual-login workflows.
-          </Typography>
-        </Box>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={1}
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: "flex-start", sm: "center" }
+          }}
+        >
+          <Box>
+            <Typography variant="overline" className="workspace-shell-kicker">
+              Browser
+            </Typography>
+            <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: 0 }}>
+              Saved browser logins and handoff state
+            </Typography>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "text.secondary",
+                maxWidth: 840
+              }}>
+              Save separate browser identities for accounts, customer sites, and login-required automation.
+            </Typography>
+          </Box>
+          {onCreateProfile ? (
+            <Button
+              variant="contained"
+              size="small"
+              startIcon={<LoginRoundedIcon fontSize="small" />}
+              onClick={() => setCreateDialogOpen(true)}
+            >
+              Add login profile
+            </Button>
+          ) : null}
+        </Stack>
 
         <Grid2 container spacing={1.25}>
           <Grid2 size={{ xs: 12, sm: 4 }}>
@@ -180,7 +225,7 @@ export function BrowserProfilesPanel({
                     <Typography variant="body2" sx={{
                       color: "text.secondary"
                     }}>
-                      Managed
+                      Reusable
                     </Typography>
                     <Typography variant="h5" sx={{ fontWeight: 700 }}>
                       {stats.managed}
@@ -207,28 +252,38 @@ export function BrowserProfilesPanel({
                     }}>
                     <Box>
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
-                        Profile inventory
+                        Saved browser identities
                       </Typography>
                       <Typography variant="body2" sx={{
                         color: "text.secondary"
                       }}>
-                        Managed and manual profiles in one list.
+                        Reusable login context for browser tasks that need cookies, sessions, or manual handoff.
                       </Typography>
                     </Box>
-                    <Chip size="small" variant="outlined" label={`${profiles.length} profiles`} />
+                    <Chip size="small" variant="outlined" label={`${profiles.length} identities`} />
                   </Stack>
                   <Divider />
 
                   {profiles.length === 0 ? (
                     <Box sx={{ py: 4 }}>
                       <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
-                        No browser profiles yet
+                        No saved browser logins yet
                       </Typography>
                       <Typography variant="body2" sx={{
                         color: "text.secondary"
                       }}>
-                        Create a profile to isolate logins, cookies, and manual-login handoffs.
+                        Add one when a site or account needs its own cookies, login state, or manual 2FA handoff.
                       </Typography>
+                      {onCreateProfile ? (
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          sx={{ mt: 1.25 }}
+                          onClick={() => setCreateDialogOpen(true)}
+                        >
+                          Add login profile
+                        </Button>
+                      ) : null}
                     </Box>
                   ) : (
                     <Stack spacing={0.85}>
@@ -275,7 +330,7 @@ export function BrowserProfilesPanel({
                               <Typography variant="body2" sx={{
                                 color: "text.secondary"
                               }}>
-                                {profile.detail || "No profile detail supplied yet."}
+                                {profile.detail || "No login context notes yet."}
                               </Typography>
                             </Stack>
                           </Box>
@@ -295,12 +350,12 @@ export function BrowserProfilesPanel({
                   <Stack spacing={1.2}>
                     <Box>
                       <Typography variant="h6" sx={{ fontWeight: 650 }}>
-                        Profile details
+                        Login profile details
                       </Typography>
                       <Typography variant="body2" sx={{
                         color: "text.secondary"
                       }}>
-                        Launch, stop, or hand off manual login for the selected profile.
+                        Use this saved identity from Chat when a browser task needs cookies, login, CAPTCHA, or 2FA.
                       </Typography>
                     </Box>
 
@@ -309,7 +364,7 @@ export function BrowserProfilesPanel({
                     }}>
                       <Chip size="small" variant="outlined" label={selected.browser} />
                       <Chip size="small" color={statusTone(selected.status)} label={statusLabel(selected.status)} />
-                      {selected.managed ? <Chip size="small" variant="outlined" label="Managed" /> : null}
+                      {selected.managed ? <Chip size="small" variant="outlined" label="Reusable login" /> : null}
                     </Stack>
 
                     <Typography variant="body2" sx={{
@@ -323,80 +378,77 @@ export function BrowserProfilesPanel({
                       Active sessions: {selected.session_count || 0}
                     </Typography>
 
-                    <Stack direction="row" spacing={0.75} useFlexGap sx={{
-                      flexWrap: "wrap"
-                    }}>
-                      <Button variant="contained" size="small" onClick={() => onLaunchProfile?.(selected.id)}>
-                        Launch
-                      </Button>
-                      <Button variant="outlined" size="small" onClick={() => onStopProfile?.(selected.id)}>
-                        Stop
-                      </Button>
-                      <Button variant="text" size="small" onClick={() => onOpenManualLogin?.(selected.id)}>
-                        Manual login
-                      </Button>
-                    </Stack>
+                    <Box
+                      sx={{
+                        border: "1px solid",
+                        borderColor: "divider",
+                        borderRadius: 1,
+                        p: 1,
+                        bgcolor: "var(--ui-rgba-47-212-255-045)",
+                      }}
+                    >
+                      <Stack spacing={0.85}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                          Next step
+                        </Typography>
+                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                          Start from Chat, describe the site and job, and AgentArk can reuse this saved login profile or pause for a handoff when the site asks for you.
+                        </Typography>
+                        {onUseProfileInChat ? (
+                          <Box>
+                            <Button
+                              variant="contained"
+                              size="small"
+                              startIcon={<ChatBubbleOutlineRoundedIcon fontSize="small" />}
+                              onClick={() => onUseProfileInChat(selected)}
+                            >
+                              Start browser task
+                            </Button>
+                          </Box>
+                        ) : null}
+                      </Stack>
+                    </Box>
 
-                    <Button variant="outlined" size="small" onClick={() => onSetDefaultProfile?.(selected.id)}>
-                      Set as default
-                    </Button>
+                    {onLaunchProfile || onStopProfile || onOpenManualLogin ? (
+                      <Stack direction="row" spacing={0.75} useFlexGap sx={{
+                        flexWrap: "wrap"
+                      }}>
+                        {onLaunchProfile ? (
+                          <Button variant="contained" size="small" onClick={() => onLaunchProfile(selected.id)}>
+                            Launch
+                          </Button>
+                        ) : null}
+                        {onStopProfile ? (
+                          <Button variant="outlined" size="small" onClick={() => onStopProfile(selected.id)}>
+                            Stop
+                          </Button>
+                        ) : null}
+                        {onOpenManualLogin ? (
+                          <Button variant="text" size="small" onClick={() => onOpenManualLogin(selected.id)}>
+                            Open login handoff
+                          </Button>
+                        ) : null}
+                      </Stack>
+                    ) : null}
+
+                    {onSetDefaultProfile ? (
+                      <Button variant="outlined" size="small" onClick={() => onSetDefaultProfile(selected.id)}>
+                        Use by default
+                      </Button>
+                    ) : null}
                   </Stack>
                 ) : (
                   <Box sx={{ py: 4 }}>
                     <Typography variant="subtitle1" sx={{ fontWeight: 650, mb: 0.5 }}>
-                      No profile selected
+                      No login profile selected
                     </Typography>
                     <Typography variant="body2" sx={{
                       color: "text.secondary"
                     }}>
-                      Select a browser profile to manage launch and login flow.
+                      Select a saved login profile to manage launch and handoff flow.
                     </Typography>
                   </Box>
                 )}
-              </CardContent>
-            </Card>
-
-            <Card className="workspace-side-card" sx={{ mt: 1.25 }}>
-              <CardContent sx={{ p: 1.5 }}>
-                <Stack spacing={1.1}>
-                  <Typography variant="h6" sx={{ fontWeight: 650 }}>
-                    Create profile
-                  </Typography>
-                  <TextField label="Profile name" size="small" value={draftName} onChange={(event) => setDraftName(event.target.value)} />
-                  <TextField
-                    select
-                    label="Browser"
-                    size="small"
-                    value={draftBrowser}
-                    onChange={(event) => setDraftBrowser(event.target.value)}
-                  >
-                    <MenuItem value="chrome">Chrome</MenuItem>
-                    <MenuItem value="chromium">Chromium</MenuItem>
-                    <MenuItem value="firefox">Firefox</MenuItem>
-                    <MenuItem value="edge">Edge</MenuItem>
-                  </TextField>
-                  <TextField
-                    select
-                    label="Managed"
-                    size="small"
-                    value={draftManaged ? "yes" : "no"}
-                    onChange={(event) => setDraftManaged(event.target.value === "yes")}
-                  >
-                    <MenuItem value="yes">Yes</MenuItem>
-                    <MenuItem value="no">No</MenuItem>
-                  </TextField>
-                  <Button
-                    variant="contained"
-                    onClick={() => {
-                      const name = draftName.trim();
-                      if (!name) return;
-                      onCreateProfile?.({ name, browser: draftBrowser, managed: draftManaged });
-                      setDraftName("");
-                    }}
-                  >
-                    Create profile
-                  </Button>
-                </Stack>
               </CardContent>
             </Card>
 
@@ -423,7 +475,9 @@ export function BrowserProfilesPanel({
                             <Typography variant="caption" sx={{
                               color: "text.secondary"
                             }}>
-                              {session.status} {session.url ? `| ${session.url}` : ""}
+                              {session.status}
+                              {session.profile_name ? ` | ${session.profile_name}` : ""}
+                              {session.url ? ` | ${session.url}` : ""}
                             </Typography>
                           </Stack>
                         </Box>
@@ -436,6 +490,76 @@ export function BrowserProfilesPanel({
           </Grid2>
         </Grid2>
       </Stack>
+      <Dialog
+        open={createDialogOpen}
+        onClose={() => {
+          setCreateDialogOpen(false);
+          resetDraft();
+        }}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle>Add login profile</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.2} sx={{ pt: 0.25 }}>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Use a login profile to keep cookies, saved sessions, and browser state separate for repeat browser tasks.
+            </Typography>
+            <TextField
+              autoFocus
+              label="Profile name"
+              placeholder="Work Gmail, Client Shopify, Research sandbox"
+              helperText="Name the account, site, or purpose this browser identity is for."
+              size="small"
+              value={draftName}
+              onChange={(event) => setDraftName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") submitProfile();
+              }}
+            />
+            <TextField
+              select
+              label="Browser"
+              size="small"
+              value={draftBrowser}
+              onChange={(event) => setDraftBrowser(event.target.value)}
+            >
+              <MenuItem value="chrome">Chrome</MenuItem>
+              <MenuItem value="chromium">Chromium</MenuItem>
+              <MenuItem value="firefox">Firefox</MenuItem>
+              <MenuItem value="edge">Edge</MenuItem>
+            </TextField>
+            <TextField
+              select
+              label="Keep session managed"
+              helperText="Managed login profiles are saved for future agent runs; unmanaged sessions are for throwaway browser work."
+              size="small"
+              value={draftManaged ? "yes" : "no"}
+              onChange={(event) => setDraftManaged(event.target.value === "yes")}
+            >
+              <MenuItem value="yes">Yes</MenuItem>
+              <MenuItem value="no">No</MenuItem>
+            </TextField>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setCreateDialogOpen(false);
+              resetDraft();
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            disabled={!draftName.trim() || !onCreateProfile}
+            onClick={submitProfile}
+          >
+            Add login profile
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }

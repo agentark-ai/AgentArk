@@ -6,7 +6,9 @@ const DEFERRED_CHAT_PERSISTENCE_ATTEMPTS: usize = 3;
 const DEFERRED_CHAT_PERSISTENCE_ATTEMPT_TIMEOUT_SECS: u64 = 45;
 const DEFERRED_CHAT_PERSISTENCE_WARN_PENDING: usize = 64;
 const TURN_TIMING_SLOW_STAGE_WARN_MS: u64 = 1_000;
-const TURN_TIMING_INBOUND_CLASSIFIER_WARN_MS: u64 = 15_000;
+const DEFAULT_INBOUND_EMBEDDING_FASTPATH_GRACE_MS: u64 = 900;
+const EXPERIENCE_RUN_REQUEST_TEXT_CHARS: usize = 4_000;
+const EXPERIENCE_RUN_OUTCOME_SUMMARY_CHARS: usize = 2_000;
 
 static DEFERRED_CHAT_PERSISTENCE_SEMAPHORE: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
     once_cell::sync::Lazy::new(|| {
@@ -21,16 +23,54 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn inbound_llm_classifier_enabled() -> bool {
-    std::env::var("AGENTARK_INBOUND_LLM_CLASSIFIER")
+fn inbound_embedding_fastpath_grace_ms() -> u64 {
+    std::env::var("AGENTARK_INBOUND_EMBEDDING_FASTPATH_GRACE_MS")
         .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INBOUND_EMBEDDING_FASTPATH_GRACE_MS)
+        .clamp(100, 5_000)
+}
+
+fn emit_inbound_precheck_progress(
+    stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    stage: &str,
+    content: impl Into<String>,
+    data: serde_json::Value,
+) {
+    let Some(tx) = stream_tx else {
+        return;
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("inbound_precheck".to_string()),
+    );
+    payload.insert(
+        "stage".to_string(),
+        serde_json::Value::String(stage.to_string()),
+    );
+    payload.insert(
+        "status".to_string(),
+        serde_json::Value::String("progress".to_string()),
+    );
+    if !data.is_null() {
+        if let Some(object) = data.as_object() {
+            for (key, value) in object {
+                if !payload.contains_key(key) {
+                    payload.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        payload.insert("details".to_string(), data);
+    }
+    queue_stream_event(
+        tx,
+        StreamEvent::ToolProgress {
+            name: "inbound_precheck".to_string(),
+            content: content.into(),
+            payload: Some(serde_json::Value::Object(payload)),
+        },
+    );
 }
 
 fn log_turn_timing_stage(
@@ -86,103 +126,6 @@ fn log_turn_timing_instant(
     );
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct MemoryBackstopState {
-    has_attachments: bool,
-    has_secret_offered: bool,
-    has_pending_actions: bool,
-    has_pending_credential_prompt: bool,
-    user_message_already_recorded: bool,
-    skip_inbound_security_precheck: bool,
-    supported_surface: bool,
-}
-
-fn attachment_hint_is_visual(attachment: &ChatAttachmentHint) -> bool {
-    let kind = attachment.kind.trim().to_ascii_lowercase();
-    let content_type = attachment
-        .content_type
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    kind.contains("visual") || kind.contains("image") || content_type.starts_with("image/")
-}
-
-fn truncate_for_attachment_memory_source(value: &str, max_chars: usize) -> String {
-    let mut truncated = value.chars().take(max_chars).collect::<String>();
-    if value.chars().count() > max_chars {
-        truncated.push_str("...");
-    }
-    truncated
-}
-
-fn visual_attachment_memory_capture_source(
-    message: &str,
-    response: &str,
-    request_hints: &RequestExecutionHints,
-    semantic_memory_capture_requested: bool,
-) -> Option<String> {
-    if !request_hints
-        .attachments
-        .iter()
-        .any(attachment_hint_is_visual)
-    {
-        return None;
-    }
-    let message = message.trim();
-    if !semantic_memory_capture_requested && !message.is_empty() {
-        return None;
-    }
-    let response = response.trim();
-    if response.is_empty() {
-        return None;
-    }
-
-    let visual_analysis = truncate_for_attachment_memory_source(response, 1_100);
-    if message.is_empty() {
-        return Some(format!(
-            "Memory extraction input for a visual-only user turn. Analyze only durable user preferences or reusable workflow constraints that are supported by the visual analysis below. Do not store that the user sent an attachment or omitted text. Do not store one-off image contents, identities, sensitive traits, credentials, or guesses.\n\nVisual analysis:\n{}",
-            visual_analysis
-        ));
-    }
-
-    let user_message = truncate_for_attachment_memory_source(message, 700);
-    Some(format!(
-        "Memory extraction input for a user turn with visual evidence and a semantic memory-capture signal. Use the user message to decide what durable memory, preference, reusable constraint, or long-lived user data was intended. Use the visual analysis only as supporting evidence. Do not store one-off image contents, task-specific object details, identities, sensitive traits, credentials, or guesses.\n\nUser message:\n{}\n\nVisual analysis:\n{}",
-        user_message, visual_analysis
-    ))
-}
-
-fn visual_attachment_analysis_text_from_turn_records(
-    records: &[AgentTurnRecord],
-) -> Option<String> {
-    records.iter().find_map(|record| {
-        if record.action_name.as_deref() != Some("vision_ocr")
-            || record.outcome != AgentTurnOutcomeKind::Succeeded
-        {
-            return None;
-        }
-        let output = record.tool_output.as_ref()?;
-        for pointer in ["/text", "/data/text", "/result/text"] {
-            if let Some(text) = output
-                .pointer(pointer)
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                return Some(text.to_string());
-            }
-        }
-        output.as_str().map(str::trim).and_then(|value| {
-            if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            }
-        })
-    })
-}
-
 fn redact_chat_message_for_storage(secret_scrubbed_message: &str) -> String {
     let mut redactor = crate::security::pii::PiiRedactor::new();
     redactor.redact_emails = false;
@@ -191,12 +134,8 @@ fn redact_chat_message_for_storage(secret_scrubbed_message: &str) -> String {
     redactor.redact(secret_scrubbed_message)
 }
 
-fn has_contact_info_for_memory_capture(secret_scrubbed_message: &str) -> bool {
-    let mut redactor = crate::security::pii::PiiRedactor::new();
-    redactor.redact_ssn = false;
-    redactor.redact_credit_cards = false;
-    redactor.redact_ips = false;
-    redactor.redact(secret_scrubbed_message) != secret_scrubbed_message
+fn normalize_request_project_id(project_id: Option<&str>) -> Option<&str> {
+    project_id.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,52 +157,19 @@ fn parse_conversation_control_command(message: &str) -> Option<ConversationContr
     }
 }
 
-fn runtime_state_allows_semantic_user_memory_capture(state: MemoryBackstopState) -> bool {
-    state.supported_surface
-        && !state.has_attachments
-        && !state.has_secret_offered
-        && !state.has_pending_actions
-        && !state.has_pending_credential_prompt
-        && (!state.user_message_already_recorded || !state.skip_inbound_security_precheck)
-        && !state.skip_inbound_security_precheck
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn agent_turn_record_has_action_surface(record: &AgentTurnRecord) -> bool {
-    let action_name = record
-        .action_name
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    let side_effect = record
-        .side_effect
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty() && value != "none");
-    action_name || side_effect || record.resolved_object_ref.is_some()
-}
-
-fn agent_loop_completed_without_actions(processed: &ProcessedMessage) -> bool {
-    !processed
-        .turn_records
-        .iter()
-        .any(agent_turn_record_has_action_surface)
-        && processed.choices.is_empty()
-        && processed.degradation.is_empty()
-        && processed
-            .run_status
-            .as_deref()
-            .map(|status| matches!(status.trim(), "completed" | "completed_degraded"))
-            .unwrap_or(false)
-}
-
-fn should_enqueue_agent_loop_semantic_memory_backstop(
-    message: &str,
-    state: MemoryBackstopState,
-    processed: &ProcessedMessage,
-) -> bool {
-    let _ = message;
-    runtime_state_allows_semantic_user_memory_capture(state)
-        && agent_loop_completed_without_actions(processed)
+    #[test]
+    fn request_project_id_is_trimmed_not_dropped() {
+        assert_eq!(
+            normalize_request_project_id(Some(" project-1 ")),
+            Some("project-1")
+        );
+        assert_eq!(normalize_request_project_id(Some("   ")), None);
+        assert_eq!(normalize_request_project_id(None), None);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -284,6 +190,7 @@ enum DeferredExchangePersistenceKind {
 struct DeferredExchangePersistence {
     kind: DeferredExchangePersistenceKind,
     trace_snapshot: ExecutionTrace,
+    execution_run_id: Option<String>,
     message: String,
     response: String,
     run_status: String,
@@ -321,6 +228,192 @@ fn operational_success_for_run_status(status: &str) -> bool {
     )
 }
 
+fn experience_run_success_state(outcome: &crate::core::UserFacingOutcome) -> &'static str {
+    match outcome.status {
+        crate::core::UserFacingOutcomeStatus::Complete
+        | crate::core::UserFacingOutcomeStatus::Degraded => "provisional",
+        crate::core::UserFacingOutcomeStatus::NeedsClarification
+        | crate::core::UserFacingOutcomeStatus::NeedsPermission
+        | crate::core::UserFacingOutcomeStatus::NeedsIntegration
+        | crate::core::UserFacingOutcomeStatus::NeedsCredentials
+        | crate::core::UserFacingOutcomeStatus::NeedsStrongerModel
+        | crate::core::UserFacingOutcomeStatus::ServiceUnavailable => "failed",
+    }
+}
+
+fn experience_run_failure_reason(
+    run_status: &str,
+    outcome: &crate::core::UserFacingOutcome,
+) -> Option<String> {
+    if experience_run_success_state(outcome) != "failed" {
+        return None;
+    }
+    outcome
+        .reason_code
+        .as_ref()
+        .map(|reason| reason.trim())
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| safe_truncate(reason, 240))
+        .or_else(|| {
+            outcome
+                .degradation
+                .first()
+                .map(|note| safe_truncate(&note.summary, 240))
+        })
+        .or_else(|| Some(safe_truncate(run_status, 120)))
+}
+
+fn experience_tool_history_from_trace(trace: &ExecutionTrace) -> Vec<serde_json::Value> {
+    let mut history = Vec::new();
+    for step in &trace.steps {
+        let Some(data) = step.data.as_deref() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let Some(entries) = value
+            .get("tool_history_json")
+            .or_else(|| value.get("tool_history"))
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        history.extend(entries.iter().cloned());
+    }
+    history
+}
+
+fn experience_tool_names(tool_history: &[serde_json::Value]) -> Vec<String> {
+    tool_history
+        .iter()
+        .filter_map(|entry| entry.get("tool").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn experience_tool_batch_events(tool_history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    tool_history
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("status")
+                .and_then(|value| value.as_str())
+                .is_some_and(|status| status == "tool_batch")
+        })
+        .filter_map(|entry| entry.get("batch").cloned())
+        .collect()
+}
+
+fn experience_tool_entry_status(entry: &serde_json::Value) -> &'static str {
+    let Some(result) = entry.get("result") else {
+        return "unknown";
+    };
+    if super::tool_responses::structured_tool_value_reports_degenerate_output(result) {
+        return "degenerate";
+    }
+    match super::tool_responses::structured_tool_value_outcome(result).map(|report| report.state) {
+        Some(super::tool_responses::StructuredToolOutcomeState::Success) => "success",
+        Some(super::tool_responses::StructuredToolOutcomeState::NeedsInput) => "needs_input",
+        Some(super::tool_responses::StructuredToolOutcomeState::Failure) => "failed",
+        None => "unknown",
+    }
+}
+
+fn experience_tool_sequence_json(tool_history: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::Value::Array(
+        tool_history
+            .iter()
+            .filter_map(|entry| {
+                let name = entry
+                    .get("tool")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())?;
+                Some(serde_json::json!({
+                    "name": name,
+                    "status": experience_tool_entry_status(entry),
+                    "started_at": serde_json::Value::Null,
+                    "completed_at": serde_json::Value::Null,
+                }))
+            })
+            .collect(),
+    )
+}
+
+fn experience_tool_sequence_digest(tool_names: &[String]) -> Option<String> {
+    if tool_names.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(tool_names.join("|").as_bytes());
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn experience_intent_key(plan: Option<&ExecutionPlan>, tool_names: &[String]) -> String {
+    let mut keys = plan
+        .map(|plan| {
+            plan.steps
+                .iter()
+                .filter_map(|step| {
+                    step.action
+                        .as_deref()
+                        .or(step.tool_hint.as_deref())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if keys.is_empty() {
+        keys = tool_names.to_vec();
+    }
+    if keys.is_empty() {
+        "chat".to_string()
+    } else {
+        keys.dedup();
+        safe_truncate(&keys.join("+"), 240)
+    }
+}
+
+fn experience_repair_decisions(tool_history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    tool_history
+        .iter()
+        .filter_map(|entry| {
+            let action = entry.get("action")?;
+            let reason = entry.get("reason")?;
+            Some(serde_json::json!({
+                "action": action,
+                "reason": reason,
+                "alternative_action": entry.get("alternative_action").cloned().unwrap_or(serde_json::Value::Null),
+                "run_status": entry.get("run_status").cloned().unwrap_or(serde_json::Value::Null),
+            }))
+        })
+        .collect()
+}
+
+fn experience_run_scope(project_id: Option<&str>, conversation_id: Option<&str>) -> String {
+    if conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return "conversation".to_string();
+    }
+    if project_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "project".to_string()
+    } else {
+        "global".to_string()
+    }
+}
+
 impl TurnPipelineUsageSnapshot {
     fn delta_since(self, previous: Self) -> Self {
         Self {
@@ -330,64 +423,6 @@ impl TurnPipelineUsageSnapshot {
             cost_usd: (self.cost_usd - previous.cost_usd).max(0.0),
         }
     }
-}
-
-fn memory_capture_source_with_completed_work_context(
-    message: &str,
-    _response: &str,
-    records: &[AgentTurnRecord],
-    turn_plan: Option<&ExecutionPlan>,
-) -> Option<String> {
-    let completed_work = records
-        .iter()
-        .filter(|record| record.outcome == AgentTurnOutcomeKind::Succeeded)
-        .filter(|record| {
-            record
-                .side_effect
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty() && value != "none")
-                || record.resolved_object_ref.is_some()
-        })
-        .map(|record| {
-            serde_json::json!({
-                "goal_id": &record.goal_id,
-                "action": record.action_name.as_ref(),
-                "side_effect": record.side_effect.as_ref(),
-                "object_ref": record.resolved_object_ref.as_ref(),
-            })
-        })
-        .collect::<Vec<_>>();
-    if completed_work.is_empty() {
-        return None;
-    }
-
-    let plan_summary = turn_plan.map(|plan| {
-        serde_json::json!({
-            "summary": &plan.summary,
-            "steps": plan.steps.iter().map(|step| {
-                serde_json::json!({
-                    "title": &step.title,
-                    "description": &step.description,
-                    "action": step.action.as_ref(),
-                    "status": step.status.as_ref(),
-                })
-            }).collect::<Vec<_>>(),
-        })
-    });
-
-    Some(format!(
-        "Memory extraction input for a turn that also created or updated durable work objects.\n\
-         The completed-work context below is provenance only, not memory source text. It already owns task-specific schedules, watcher conditions, notification routes, targets, execution state, setup status, authentication state, and follow-up instructions. Do not store those object-specific details as ArkMemory. Only extract durable user facts, stable preferences, reusable constraints, or cross-context workflow rules that the source user message itself states.\n\n\
-         Source user message:\n{}\n\n\
-         Completed work context, not memory source:\n{}\n\n\
-         Turn plan context, not memory source:\n{}",
-        safe_truncate(message, 1800),
-        serde_json::to_string_pretty(&completed_work).unwrap_or_default(),
-        plan_summary
-            .and_then(|value| serde_json::to_string_pretty(&value).ok())
-            .unwrap_or_else(|| "null".to_string())
-    ))
 }
 
 impl Agent {
@@ -520,6 +555,27 @@ impl Agent {
             project_id,
             request_hints,
             false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    pub async fn process_message_prerecorded_with_meta_and_hints(
+        &self,
+        message: &str,
+        channel: &str,
+        conversation_id: Option<&str>,
+        project_id: Option<&str>,
+        request_hints: RequestExecutionHints,
+    ) -> Result<ProcessedMessage> {
+        self.process_turn_request(
+            message,
+            channel,
+            conversation_id,
+            project_id,
+            request_hints,
+            true,
             false,
             None,
         )
@@ -667,14 +723,14 @@ impl Agent {
         message: &str,
         channel: &str,
         conversation_id: Option<&str>,
-        _project_id: Option<&str>,
+        project_id: Option<&str>,
         mut request_hints: RequestExecutionHints,
         user_message_already_recorded: bool,
         skip_inbound_security_precheck: bool,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<ProcessedMessage> {
         let process_started = std::time::Instant::now();
-        let project_id: Option<&str> = None;
+        let project_id = normalize_request_project_id(project_id);
         let _active_request = self.track_active_message_request();
         *self.last_activity.write().await = Some(chrono::Utc::now());
 
@@ -687,8 +743,6 @@ impl Agent {
             );
         }
         let message_storage = redact_chat_message_for_storage(&secret_redaction.text);
-        let contact_info_memory_candidate =
-            !secret_redaction.had_secret() && has_contact_info_for_memory_capture(&message_storage);
         let early_safe_message = message_storage.clone();
         if !matches!(channel, "http" | "web") {
             if let (Some(request_conversation_id), Some(command)) = (
@@ -735,6 +789,8 @@ impl Agent {
                     input_tokens: 0,
                     output_tokens: 0,
                     total_tokens: 0,
+                    cached_prompt_tokens: 0,
+                    cache_creation_prompt_tokens: 0,
                     choices: Vec::new(),
                     degradation: Vec::new(),
                     attempted_models: Vec::new(),
@@ -772,24 +828,48 @@ impl Agent {
             true,
             TURN_TIMING_SLOW_STAGE_WARN_MS,
         );
+        emit_inbound_precheck_progress(
+            stream_tx.as_ref(),
+            "request_context",
+            "Preparing request context...",
+            serde_json::json!({
+                "conversation_id": conversation_key,
+                "skip_inbound_security_precheck": skip_inbound_security_precheck,
+            }),
+        );
 
-        let mut memory_capture_allowed = false;
         let turn_started_at = chrono::Utc::now();
         let usage_before_turn = self.turn_pipeline_usage_snapshot().await;
-        let stage_started = std::time::Instant::now();
-        let saved_user_facts_context = self
-            .build_saved_user_facts_context(project_id, Some(&conversation_key), &message_storage)
-            .await;
-        log_turn_timing_instant(
-            &turn_timing_id,
-            &conversation_key,
-            channel,
-            "preload_saved_user_facts_context",
-            stage_started,
-            true,
-            TURN_TIMING_SLOW_STAGE_WARN_MS,
-        );
         if !skip_inbound_security_precheck {
+            if self
+                .pending_chat_credential_prompt(&conversation_key)
+                .await
+                .is_some()
+            {
+                let safe_reply = "A secure credential form is open for this chat. I can't accept credential values through normal chat. Use the secure form shown in the conversation or the integration's Settings page.";
+                let processed = self
+                    .persist_immediate_exchange(
+                        &message_storage,
+                        safe_reply,
+                        ImmediateExchangeContext {
+                            channel,
+                            conversation_key: &conversation_key,
+                            is_new_conversation,
+                            project_id,
+                            model_used: "secure_credential_prompt_guard",
+                            user_message_already_recorded,
+                            recorded_user_message_id: request_hints
+                                .recorded_user_message_id
+                                .clone(),
+                            memory_capture_allowed: false,
+                            memory_capture_source: None,
+                            user_message_for_link_capture: Some(message_storage.as_str()),
+                        },
+                    )
+                    .await?;
+                return Ok(processed);
+            }
+
             if secret_redaction.had_secret() {
                 if let Some(processed) = self
                     .respond_if_abuse_tracker_suppressed(
@@ -850,64 +930,17 @@ impl Agent {
                     is_new_conversation,
                     project_id,
                     user_message_already_recorded,
-                    saved_user_facts_context.as_deref(),
                     &turn_timing_id,
                     stream_tx.as_ref(),
                 )
                 .await?
             {
                 InboundSecurityPrecheck::Respond(processed) => return Ok(processed),
-                InboundSecurityPrecheck::Continue {
-                    memory_capture_allowed: should_capture,
-                } => {
-                    memory_capture_allowed = should_capture;
-                }
+                InboundSecurityPrecheck::Continue => {}
             }
         }
 
-        if secret_redaction.had_secret() {
-            memory_capture_allowed = false;
-            let pending_chat_credential_prompt =
-                self.pending_chat_credential_prompt(&conversation_key).await;
-            let secure_prompt_pending = pending_chat_credential_prompt.is_some();
-            let kind = match secret_redaction
-                .primary_kind()
-                .unwrap_or(crate::security::SecretInputType::ApiKeyOrToken)
-            {
-                crate::security::SecretInputType::PrivateKeyMaterial => "private_key_material",
-                crate::security::SecretInputType::ApiKeyOrToken => "api_key_or_token",
-                crate::security::SecretInputType::PaymentCredential => "payment_credential",
-            };
-            request_hints.secret_offered = Some(SecretOfferedHint {
-                kind: kind.to_string(),
-                redactions: secret_redaction.redactions.clone(),
-                secure_prompt_pending,
-            });
-        }
-        if contact_info_memory_candidate {
-            memory_capture_allowed = true;
-        }
-
-        let memory_backstop_state = MemoryBackstopState {
-            has_attachments: !request_hints.attachments.is_empty(),
-            has_secret_offered: request_hints.secret_offered.is_some(),
-            has_pending_actions: false,
-            has_pending_credential_prompt: false,
-            user_message_already_recorded,
-            skip_inbound_security_precheck,
-            supported_surface: matches!(
-                request_hints.execution_surface,
-                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
-            ),
-        };
-        let raw_memory_capture_source = if memory_capture_allowed && !secret_redaction.had_secret()
-        {
-            Some(message_storage.as_str())
-        } else {
-            None
-        };
-
-        if is_new_conversation && !conversation_key.is_empty() {
+        if is_new_conversation && !user_message_already_recorded && !conversation_key.is_empty() {
             self.ensure_conversation_row_for_turn(
                 &conversation_key,
                 channel,
@@ -918,8 +951,15 @@ impl Agent {
             .await?;
         }
 
+        if request_hints.recent_actionable_artifacts.is_empty() && !is_new_conversation {
+            request_hints.recent_actionable_artifacts = Self::conversation_artifacts_for_prompt(
+                &self.load_recent_artifact_contexts(&conversation_key).await,
+                INBOUND_CLASSIFIER_RECENT_ARTIFACTS,
+            );
+        }
+
         match self
-            .run_agent_turn_loop_for_chat(
+            .run_model_routed_spine_for_chat(
                 channel,
                 message_storage.as_str(),
                 Some(&conversation_key),
@@ -934,44 +974,6 @@ impl Agent {
                     .turn_pipeline_usage_snapshot()
                     .await
                     .delta_since(usage_before_turn);
-                let visual_attachment_analysis_source =
-                    visual_attachment_analysis_text_from_turn_records(&processed.turn_records);
-                let visual_memory_response = visual_attachment_analysis_source
-                    .as_deref()
-                    .unwrap_or(&processed.response);
-                let visual_attachment_memory_source = visual_attachment_memory_capture_source(
-                    message_storage.as_str(),
-                    visual_memory_response,
-                    &request_hints,
-                    memory_capture_allowed,
-                );
-                let durable_work_memory_source = memory_capture_source_with_completed_work_context(
-                    message_storage.as_str(),
-                    &processed.response,
-                    &processed.turn_records,
-                    processed.turn_plan.as_ref(),
-                );
-                let run_allows_memory_capture = processed
-                    .run_status
-                    .as_deref()
-                    .map(|status| matches!(status, "completed" | "completed_degraded"))
-                    .unwrap_or(true);
-                let semantic_memory_backstop_source =
-                    should_enqueue_agent_loop_semantic_memory_backstop(
-                        message_storage.as_str(),
-                        memory_backstop_state,
-                        &processed,
-                    )
-                    .then_some(message_storage.as_str());
-                let memory_capture_source = if run_allows_memory_capture {
-                    visual_attachment_memory_source
-                        .as_deref()
-                        .or(durable_work_memory_source.as_deref())
-                        .or(raw_memory_capture_source)
-                        .or(semantic_memory_backstop_source)
-                } else {
-                    None
-                };
                 self.persist_turn_pipeline_exchange(
                     message_storage.as_str(),
                     &processed.response,
@@ -980,14 +982,11 @@ impl Agent {
                         conversation_key: &conversation_key,
                         is_new_conversation,
                         project_id,
-                        model_used: "agent_turn_loop",
+                        model_used: "model_routed_spine",
                         user_message_already_recorded,
                         recorded_user_message_id: request_hints.recorded_user_message_id.clone(),
-                        memory_capture_allowed: run_allows_memory_capture
-                            && (memory_capture_allowed
-                                || visual_attachment_memory_source.is_some()
-                                || semantic_memory_backstop_source.is_some()),
-                        memory_capture_source,
+                        memory_capture_allowed: true,
+                        memory_capture_source: None,
                         user_message_for_link_capture: Some(message_storage.as_str()),
                     },
                     processed.run_status.as_deref().unwrap_or("completed"),
@@ -1004,9 +1003,13 @@ impl Agent {
                 if error.to_string() == "Conversation not found" {
                     return Err(error);
                 }
-                tracing::warn!("Agent turn loop failed on channel '{}': {}", channel, error);
+                tracing::warn!(
+                    "Model-routed spine failed on channel '{}': {}",
+                    channel,
+                    error
+                );
                 let response = format!(
-                    "The agent turn loop hit a framework-level failure before execution could complete, so I did not run any action. Please retry after checking the server logs. Error: {}",
+                    "The model-routed spine hit a framework-level failure before execution could complete, so I did not run any action. Please retry after checking the server logs. Error: {}",
                     error
                 );
                 let usage_delta = self
@@ -1021,10 +1024,10 @@ impl Agent {
                         conversation_key: &conversation_key,
                         is_new_conversation,
                         project_id,
-                        model_used: "agent_turn_loop_failed",
+                        model_used: "model_routed_spine_failed",
                         user_message_already_recorded,
                         recorded_user_message_id: request_hints.recorded_user_message_id.clone(),
-                        memory_capture_allowed: false,
+                        memory_capture_allowed: true,
                         memory_capture_source: None,
                         user_message_for_link_capture: Some(message_storage.as_str()),
                     },
@@ -1106,6 +1109,188 @@ impl Agent {
         if update_last_trace {
             *self.last_trace.write().await = trace_snapshot;
         }
+    }
+
+    async fn load_tool_strategy_profile_by_key(
+        &self,
+        key: &str,
+    ) -> Option<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile> {
+        let raw = self.storage.get(key).await.ok().flatten()?;
+        serde_json::from_slice::<crate::core::self_evolve::strategy_runtime::ToolStrategyProfile>(
+            &raw,
+        )
+        .ok()
+    }
+
+    async fn active_tool_strategy_version_for_message(&self, message: &str) -> Option<String> {
+        let mut selected = self
+            .load_tool_strategy_profile_by_key(
+                crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
+            )
+            .await
+            .unwrap_or_default();
+        let canary_state_raw = self
+            .storage
+            .get(crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY)
+            .await
+            .ok()
+            .flatten();
+        if let Some(raw) = canary_state_raw {
+            if let Ok(state) = serde_json::from_slice::<
+                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+            >(&raw)
+            {
+                if state.enabled
+                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
+                        &Self::prompt_seed_for_message(message),
+                        state.rollout_percent,
+                    )
+                {
+                    if let Some(canary) = self
+                        .load_tool_strategy_profile_by_key(
+                            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_CANARY_KEY,
+                        )
+                        .await
+                    {
+                        selected = canary;
+                    }
+                }
+            }
+        }
+        let version = selected.version.trim();
+        if version.is_empty() {
+            None
+        } else {
+            Some(safe_truncate(version, 128))
+        }
+    }
+
+    async fn persist_experience_run_for_exchange(
+        &self,
+        job: &DeferredExchangePersistence,
+        policy_version: &str,
+    ) -> Result<()> {
+        let trace_id = job.trace_snapshot.id.trim().to_string();
+        let run_id = if trace_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            trace_id.clone()
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let tool_history = experience_tool_history_from_trace(&job.trace_snapshot);
+        let tool_names = experience_tool_names(&tool_history);
+        let prompt_bundle = self.active_prompt_bundle_for_message(&job.message).await;
+        let prompt_version = crate::core::self_evolve::prompt_evolution::compose_prompt_version(
+            &prompt_bundle.version,
+        );
+        let execution_run_id = match job
+            .execution_run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(id) => match self.storage.load_execution_run(id).await {
+                Ok(Some(_)) => Some(id.to_string()),
+                Ok(None) => {
+                    tracing::debug!(
+                        trace_id = %trace_id,
+                        execution_run_id = %id,
+                        "Dropping stale execution_run_id while persisting experience_run"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        trace_id = %trace_id,
+                        execution_run_id = %id,
+                        error = %error,
+                        "Could not verify execution_run_id while persisting experience_run"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let strategy_version = self
+            .active_tool_strategy_version_for_message(&job.message)
+            .await;
+        let success_state = experience_run_success_state(&job.user_outcome);
+        let repair_decisions = experience_repair_decisions(&tool_history);
+        let tool_batches = experience_tool_batch_events(&tool_history);
+        let tool_batch_count = tool_batches.len();
+        let reports_degenerate = tool_history.iter().any(|entry| {
+            entry
+                .get("result")
+                .is_some_and(super::tool_responses::structured_tool_value_reports_degenerate_output)
+        });
+        let metadata = serde_json::json!({
+            "run_status": job.run_status.as_str(),
+            "flow_kind": match job.kind {
+                DeferredExchangePersistenceKind::TurnPipeline => "turn_pipeline",
+                DeferredExchangePersistenceKind::Immediate => "immediate",
+            },
+            "degenerate": reports_degenerate,
+            "tool_call_count": tool_names.len(),
+            "tool_batch_count": tool_batch_count,
+            "tool_batches": tool_batches,
+            "retries": tool_names.len().saturating_sub(tool_names.iter().collect::<HashSet<_>>().len()),
+            "repair_decisions": repair_decisions,
+            "trace_complexity": job.trace_snapshot.complexity.as_deref(),
+            "user_outcome_status": &job.user_outcome.status,
+            "learning_signal": {
+                "procedure_eligible": !tool_names.is_empty(),
+                "negative_eligible": success_state == "failed",
+            },
+        });
+        let run = crate::storage::entities::experience_run::Model {
+            id: run_id,
+            execution_run_id,
+            trace_id: if trace_id.is_empty() {
+                None
+            } else {
+                Some(trace_id.clone())
+            },
+            conversation_id: if job.conversation_key.trim().is_empty() {
+                None
+            } else {
+                Some(job.conversation_key.clone())
+            },
+            project_id: job.project_id.clone(),
+            channel: job.channel.clone(),
+            scope: experience_run_scope(job.project_id.as_deref(), Some(&job.conversation_key)),
+            intent_key: experience_intent_key(job.trace_snapshot.plan.as_ref(), &tool_names),
+            task_type: Some("chat".to_string()),
+            request_text: Some(safe_truncate(
+                &crate::security::redact_secret_input(&job.message).text,
+                EXPERIENCE_RUN_REQUEST_TEXT_CHARS,
+            )),
+            tool_sequence_digest: experience_tool_sequence_digest(&tool_names),
+            tool_sequence_json: experience_tool_sequence_json(&tool_history),
+            strategy_version,
+            policy_version: Some(policy_version.to_string()),
+            prompt_version: Some(prompt_version),
+            model_slot: Some(job.model_used.clone()),
+            success_state: success_state.to_string(),
+            correction_state: "none".to_string(),
+            outcome_summary: Some(safe_truncate(
+                &crate::security::redact_secret_input(&job.response).text,
+                EXPERIENCE_RUN_OUTCOME_SUMMARY_CHARS,
+            )),
+            failure_reason: experience_run_failure_reason(&job.run_status, &job.user_outcome),
+            metadata,
+            consolidated: false,
+            accepted_at: None,
+            corrected_at: None,
+            heuristic_reflected: false,
+            heuristic_reflection_status: None,
+            heuristic_reflection_attempted_at: None,
+            heuristic_reflection_completed_at: None,
+            heuristic_lesson_id: None,
+            heuristic_reflection_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.storage.upsert_experience_run(&run).await
     }
 
     fn spawn_deferred_exchange_persistence(&self, job: DeferredExchangePersistence) {
@@ -1192,8 +1377,19 @@ impl Agent {
             DeferredExchangePersistenceKind::Immediate => "immediate",
         };
         let policy_version = self
-            .active_routing_policy_version_for_message(&job.message)
-            .await;
+            .active_tool_strategy_version_for_message(&job.message)
+            .await
+            .unwrap_or_else(|| "model_routed_spine_v1".to_string());
+        if let Err(error) = self
+            .persist_experience_run_for_exchange(&job, &policy_version)
+            .await
+        {
+            tracing::warn!(
+                trace_id,
+                "Failed to persist experience_run evidence for completed turn: {}",
+                error
+            );
+        }
         let duration_ms = trace_duration_ms(&job.trace_snapshot).unwrap_or(0);
         let started_payload = serde_json::json!({
             "flow_kind": flow_kind,
@@ -1251,7 +1447,7 @@ impl Agent {
                 "choices": job.choices,
             });
             self.log_operational_event(operational::OperationalEvent {
-                event_type: "action_selection",
+                event_type: "spine_user_input",
                 channel: &job.channel,
                 success: true,
                 outcome: "needs_input",
@@ -1271,7 +1467,7 @@ impl Agent {
         }
 
         if !job.conversation_key.is_empty() {
-            if job.is_new_conversation {
+            if job.is_new_conversation && !job.user_message_already_recorded {
                 self.ensure_conversation_row_for_turn(
                     &job.conversation_key,
                     &job.channel,
@@ -1288,6 +1484,9 @@ impl Agent {
                     conversation_id: job.conversation_key.clone(),
                     role: "user".to_string(),
                     content: job.message.clone(),
+                    tool_calls_json: None,
+                    tool_call_id: None,
+                    provider_message_json: None,
                     timestamp: job.user_timestamp.clone(),
                     model_used: None,
                     trace_id: Some(trace_id.clone()),
@@ -1302,6 +1501,9 @@ impl Agent {
                 conversation_id: job.conversation_key.clone(),
                 role: "assistant".to_string(),
                 content: job.response.clone(),
+                tool_calls_json: None,
+                tool_call_id: None,
+                provider_message_json: None,
                 timestamp: job.assistant_timestamp.clone(),
                 model_used: Some(job.model_used.clone()),
                 trace_id: Some(trace_id.clone()),
@@ -1387,9 +1589,9 @@ impl Agent {
             );
         }
         let safe_response = filtered_response.text;
-        let flow_label = "Agent turn loop";
-        let complexity = "agent_turn_loop";
-        let first_content_source = "agent_turn_loop_first_content";
+        let flow_label = "Model-routed spine";
+        let complexity = "model_routed_spine";
+        let first_content_source = "model_routed_spine_first_content";
         let mut steps = Vec::with_capacity(trace_steps.len() + 3);
         steps.push(ExecutionStep {
             icon: "[turn]".to_string(),
@@ -1509,6 +1711,7 @@ impl Agent {
         self.spawn_deferred_exchange_persistence(DeferredExchangePersistence {
             kind: DeferredExchangePersistenceKind::TurnPipeline,
             trace_snapshot,
+            execution_run_id: Some(run_id.clone()),
             message: message.to_string(),
             response: safe_response.clone(),
             run_status: final_run_status.clone(),
@@ -1543,6 +1746,8 @@ impl Agent {
             input_tokens: usage_delta.input_tokens,
             output_tokens: usage_delta.output_tokens,
             total_tokens: usage_delta.total_tokens,
+            cached_prompt_tokens: 0,
+            cache_creation_prompt_tokens: 0,
             choices,
             degradation: Vec::new(),
             attempted_models: Vec::new(),
@@ -1762,33 +1967,6 @@ impl Agent {
     /// available) rather than from any phrase. Returns `None` when the
     /// channel does not correspond to a known structural surface, so the
     /// general inbound prompt is unchanged for ordinary chat traffic.
-    pub(super) async fn build_inbound_surface_context(
-        &self,
-        channel: &str,
-    ) -> Option<serde_json::Value> {
-        if channel != "arkorbit" {
-            return None;
-        }
-        let user_id = self.identity.did().to_string();
-        let orbit_count = self
-            .arkorbit
-            .list_orbits(&user_id)
-            .await
-            .map(|orbits| orbits.len())
-            .unwrap_or(0);
-        Some(serde_json::json!({
-            "surface": "arkorbit_canvas",
-            "orbit_count": orbit_count,
-            "scope_policy": "an orbit must be explicitly selected or created before durable orbit file authoring",
-            "orbit_file_namespace": ["index.html", "orbit.json", "mod/", "data/", "assets/"],
-            "security_model": "Orbit browser code runs in a sandboxed iframe. Do not place credentials or session material in orbit files; authenticated retrieval must happen through authorized server-side tools before writing safe display data.",
-            "available_capability_clusters": [
-                "arkorbit_file_authoring",
-            ],
-            "description": "User is on a per-user orbit canvas where the agent can create durable HTML, JavaScript, CSS, data, and asset files rendered in a sandboxed iframe."
-        }))
-    }
-
     pub(super) async fn run_inbound_security_precheck(
         &self,
         classification_message: &str,
@@ -1798,11 +1976,19 @@ impl Agent {
         is_new_conversation: bool,
         project_id: Option<&str>,
         user_message_already_recorded: bool,
-        saved_user_facts_context: Option<&str>,
         turn_timing_id: &str,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<InboundSecurityPrecheck> {
         let inbound_total_started = std::time::Instant::now();
+        emit_inbound_precheck_progress(
+            stream_tx,
+            "start",
+            "Checking request safety and routing signals...",
+            serde_json::json!({
+                "channel": channel,
+                "conversation_id": conversation_key,
+            }),
+        );
         // Abuse-tracker short-circuit: if this source is currently in
         // pending-approval or paused status from prior guard trips, decline
         // before any early command path can mutate state.
@@ -1934,15 +2120,27 @@ impl Agent {
         });
         if let Some(embedder) = self.embedding_client.as_deref() {
             let stage_started = std::time::Instant::now();
-            match crate::security::embedding_classifier::classify_inbound_embedding_fast(
-                embedder,
-                &normalized_for_guard,
-                embedding_context.as_deref(),
-                Some(self.data_dir.as_path()),
+            let grace_ms = inbound_embedding_fastpath_grace_ms();
+            emit_inbound_precheck_progress(
+                stream_tx,
+                "embedding_fastpath",
+                "Checking fast semantic guard...",
+                serde_json::json!({
+                    "grace_ms": grace_ms,
+                }),
+            );
+            let embedding_decision = tokio::time::timeout(
+                std::time::Duration::from_millis(grace_ms),
+                crate::security::embedding_classifier::classify_inbound_embedding_fast(
+                    embedder,
+                    &normalized_for_guard,
+                    embedding_context.as_deref(),
+                    Some(self.data_dir.as_path()),
+                ),
             )
-            .await
-            {
-                Ok(Some(fast)) => {
+            .await;
+            match embedding_decision {
+                Ok(Ok(Some(fast))) => {
                     log_turn_timing_instant(
                         turn_timing_id,
                         conversation_key,
@@ -1966,6 +2164,15 @@ impl Agent {
                             rule_id,
                             severity,
                         } => {
+                            emit_inbound_precheck_progress(
+                                stream_tx,
+                                "complete",
+                                "Request was handled by the fast guard.",
+                                serde_json::json!({
+                                    "verdict": "block",
+                                    "source": "embedding_fastpath",
+                                }),
+                            );
                             log_turn_timing_instant(
                                 turn_timing_id,
                                 conversation_key,
@@ -2041,8 +2248,15 @@ impl Agent {
                             return Ok(InboundSecurityPrecheck::Respond(processed));
                         }
                         crate::security::intent_classifier::IntentVerdict::Allow => {
-                            let memory_capture_allowed =
-                                fast.decision.memory_capture.should_capture;
+                            emit_inbound_precheck_progress(
+                                stream_tx,
+                                "complete",
+                                "Fast semantic guard passed.",
+                                serde_json::json!({
+                                    "verdict": "allow",
+                                    "source": "embedding_fastpath",
+                                }),
+                            );
                             log_turn_timing_instant(
                                 turn_timing_id,
                                 conversation_key,
@@ -2052,13 +2266,20 @@ impl Agent {
                                 true,
                                 TURN_TIMING_SLOW_STAGE_WARN_MS,
                             );
-                            return Ok(InboundSecurityPrecheck::Continue {
-                                memory_capture_allowed,
-                            });
+                            return Ok(InboundSecurityPrecheck::Continue);
                         }
                         crate::security::intent_classifier::IntentVerdict::AllowWithUncheckedTag {
                             ..
                         } => {
+                            emit_inbound_precheck_progress(
+                                stream_tx,
+                                "complete",
+                                "Fast semantic guard passed with limited context.",
+                                serde_json::json!({
+                                    "verdict": "allow_unchecked",
+                                    "source": "embedding_fastpath",
+                                }),
+                            );
                             log_turn_timing_instant(
                                 turn_timing_id,
                                 conversation_key,
@@ -2068,16 +2289,14 @@ impl Agent {
                                 true,
                                 TURN_TIMING_SLOW_STAGE_WARN_MS,
                             );
-                            return Ok(InboundSecurityPrecheck::Continue {
-                                memory_capture_allowed: false,
-                            });
+                            return Ok(InboundSecurityPrecheck::Continue);
                         }
                         crate::security::intent_classifier::IntentVerdict::ClassifierUnavailable {
                             ..
                         } => {}
                     }
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     log_turn_timing_instant(
                         turn_timing_id,
                         conversation_key,
@@ -2088,7 +2307,7 @@ impl Agent {
                         TURN_TIMING_SLOW_STAGE_WARN_MS,
                     );
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     log_turn_timing_instant(
                         turn_timing_id,
                         conversation_key,
@@ -2101,332 +2320,67 @@ impl Agent {
                     tracing::warn!(
                         target: "security.inbound",
                         error = %error,
-                        "inbound embedding classifier unavailable; falling back to LLM classifier"
+                        "inbound embedding classifier unavailable; continuing to spine without model pre-classification"
+                    );
+                }
+                Err(_) => {
+                    log_turn_timing_instant(
+                        turn_timing_id,
+                        conversation_key,
+                        channel,
+                        "inbound_embedding_classifier_deferred",
+                        stage_started,
+                        true,
+                        TURN_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    let embedder_clone = (*embedder).clone();
+                    let normalized_for_warmup = normalized_for_guard.clone();
+                    let embedding_context_for_warmup = embedding_context.clone();
+                    let data_dir_for_warmup = self.data_dir.clone();
+                    crate::spawn_logged!(
+                        "src/core/agent/message_processing.rs:inbound_embedding_warmup",
+                        async move {
+                            let _ =
+                                crate::security::embedding_classifier::classify_inbound_embedding_fast(
+                                    &embedder_clone,
+                                    &normalized_for_warmup,
+                                    embedding_context_for_warmup.as_deref(),
+                                    Some(data_dir_for_warmup.as_path()),
+                                )
+                                .await;
+                        }
+                    );
+                    emit_inbound_precheck_progress(
+                        stream_tx,
+                        "embedding_fastpath",
+                        "Fast guard is still warming; continuing with the main model.",
+                        serde_json::json!({
+                            "embedding_fastpath_deferred": true,
+                            "grace_ms": grace_ms,
+                        }),
                     );
                 }
             }
         }
-        if !inbound_llm_classifier_enabled() {
-            tracing::debug!(
-                target: "security.inbound",
-                channel = %channel,
-                "inbound LLM classifier disabled; security precheck completed without model advisory"
-            );
-            log_turn_timing_instant(
-                turn_timing_id,
-                conversation_key,
-                channel,
-                "inbound_precheck_total",
-                inbound_total_started,
-                true,
-                TURN_TIMING_SLOW_STAGE_WARN_MS,
-            );
-            return Ok(InboundSecurityPrecheck::Continue {
-                memory_capture_allowed: false,
-            });
-        }
-        let stage_started = std::time::Instant::now();
-        let pending_actions_for_guard = self.pending_conversation_actions(conversation_key).await;
+        emit_inbound_precheck_progress(
+            stream_tx,
+            "complete",
+            "Request guard complete.",
+            serde_json::json!({
+                "verdict": "continue",
+                "source": "embedding_fastpath",
+            }),
+        );
         log_turn_timing_instant(
             turn_timing_id,
             conversation_key,
             channel,
-            "inbound_pending_actions_lookup",
-            stage_started,
+            "inbound_precheck_total",
+            inbound_total_started,
             true,
             TURN_TIMING_SLOW_STAGE_WARN_MS,
         );
-        let stage_started = std::time::Instant::now();
-        let trusted_prior_assistant_message = if pending_actions_for_guard.is_empty() {
-            None
-        } else {
-            self.recent_trusted_assistant_message_for_inbound_guard(
-                conversation_key,
-                stored_user_message,
-            )
-            .await
-        };
-        log_turn_timing_instant(
-            turn_timing_id,
-            conversation_key,
-            channel,
-            "inbound_trusted_prior_assistant_lookup",
-            stage_started,
-            true,
-            TURN_TIMING_SLOW_STAGE_WARN_MS,
-        );
-        let inbound_policy = crate::security::intent_classifier::default_policy();
-        let mut inbound_candidates = self.llm_candidates_for_role(&ModelRole::Fast);
-        if inbound_candidates.is_empty() {
-            inbound_candidates.push(self.primary_llm_candidate());
-        }
-        let stage_started = std::time::Instant::now();
-        let mut inbound_candidates = self
-            .reorder_candidates_with_failover(inbound_candidates, Some(conversation_key))
-            .await;
-        log_turn_timing_instant(
-            turn_timing_id,
-            conversation_key,
-            channel,
-            "inbound_candidate_reorder",
-            stage_started,
-            true,
-            TURN_TIMING_SLOW_STAGE_WARN_MS,
-        );
-        if inbound_candidates.is_empty() {
-            inbound_candidates.push(self.primary_llm_candidate());
-        }
-        // Per-call structural surface context. The chat handler routes the
-        // ArkOrbit OrbitChat panel through `channel == "arkorbit"`. When we
-        // see that channel we hand the classifier a structured JSON
-        // describing the surface and orbit file-authoring capability. The
-        // classifier reasons from that context, never from a phrase or
-        // keyword list.
-        let stage_started = std::time::Instant::now();
-        let surface_context = self.build_inbound_surface_context(channel).await;
-        log_turn_timing_instant(
-            turn_timing_id,
-            conversation_key,
-            channel,
-            "inbound_surface_context_build",
-            stage_started,
-            true,
-            TURN_TIMING_SLOW_STAGE_WARN_MS,
-        );
-        let mut inbound_decision = None;
-        for candidate in inbound_candidates.iter().take(2) {
-            let candidate_started = std::time::Instant::now();
-            tracing::debug!(
-                target: "agentark.turn_timing",
-                turn_timing_id = %turn_timing_id,
-                conversation_id = %conversation_key,
-                channel = %channel,
-                stage = "inbound_llm_classifier_candidate_start",
-                slot_id = %candidate.slot_id,
-                slot_label = %candidate.slot_label,
-                model = %candidate.client.model_name(),
-                "turn timing candidate start"
-            );
-            let decision = crate::security::intent_classifier::classify_inbound_with_metadata(
-                &candidate.client,
-                &inbound_policy,
-                &normalized_for_guard,
-                recent_messages_context_value.as_ref(),
-                trusted_prior_assistant_message.as_deref(),
-                saved_user_facts_context,
-                surface_context.as_ref(),
-                recent_artifacts_context.as_ref(),
-                stream_tx,
-            )
-            .await;
-            let candidate_duration_ms = elapsed_ms(candidate_started);
-            tracing::debug!(
-                target: "agentark.turn_timing",
-                turn_timing_id = %turn_timing_id,
-                conversation_id = %conversation_key,
-                channel = %channel,
-                stage = "inbound_llm_classifier_candidate",
-                slot_id = %candidate.slot_id,
-                slot_label = %candidate.slot_label,
-                model = %candidate.client.model_name(),
-                duration_ms = candidate_duration_ms,
-                verdict = ?decision.verdict,
-                advisory_signal_count = decision
-                    .advisory
-                    .semantic_queries
-                    .len()
-                    .saturating_add(decision.advisory.required_capabilities.len()),
-                "turn timing candidate"
-            );
-            if candidate_duration_ms >= TURN_TIMING_INBOUND_CLASSIFIER_WARN_MS {
-                tracing::debug!(
-                    target: "agentark.turn_timing",
-                    turn_timing_id = %turn_timing_id,
-                    conversation_id = %conversation_key,
-                    channel = %channel,
-                    stage = "inbound_llm_classifier_candidate",
-                    slot_id = %candidate.slot_id,
-                    slot_label = %candidate.slot_label,
-                    model = %candidate.client.model_name(),
-                    duration_ms = candidate_duration_ms,
-                    warn_after_ms = TURN_TIMING_INBOUND_CLASSIFIER_WARN_MS,
-                    "slow inbound classifier candidate"
-                );
-            }
-            if let Some(model_response) = decision.model_response.as_ref() {
-                self.record_llm_usage(channel, "inbound_intent_classifier", model_response)
-                    .await;
-            }
-            if matches!(
-                decision.verdict,
-                crate::security::intent_classifier::IntentVerdict::ClassifierUnavailable { .. }
-            ) {
-                tracing::warn!(
-                    target: "security.inbound",
-                    slot_id = %candidate.slot_id,
-                    slot_label = %candidate.slot_label,
-                    "inbound intent classifier candidate returned no usable security decision"
-                );
-                inbound_decision = Some(decision);
-                continue;
-            }
-            inbound_decision = Some(decision);
-            break;
-        }
-        let inbound_decision = inbound_decision.unwrap_or_else(|| {
-            crate::security::intent_classifier::InboundClassificationDecision {
-                verdict: crate::security::intent_classifier::IntentVerdict::ClassifierUnavailable {
-                    reason: "no inbound classifier model candidates available".to_string(),
-                },
-                memory_capture: Default::default(),
-                advisory: Default::default(),
-                model_response: None,
-            }
-        });
-        let memory_capture_allowed = inbound_decision.memory_capture.should_capture;
-
-        match &inbound_decision.verdict {
-            crate::security::intent_classifier::IntentVerdict::Block {
-                message: safe_reply,
-                rule_id,
-                severity,
-            } => {
-                self.security_events.record_injection_attempt();
-                tracing::warn!(
-                    target: "security.inbound",
-                    rule_id = %rule_id,
-                    severity = severity,
-                    channel = %channel,
-                    "inbound intent classifier blocked message"
-                );
-                let source_label = inbound_security_source_label(channel);
-                let alert_msg = format!(
-                    "Security guard blocked a message from {} (rule {}).",
-                    &source_label, rule_id
-                );
-                tracing::info!(
-                    target: "security.inbound",
-                    channel = %channel,
-                    rule_id = %rule_id,
-                    alert = %alert_msg,
-                    "inbound guard block kept in security logs without user notification"
-                );
-                match abuse_tracker.record_trip(&abuse_source).await {
-                    Ok(outcome) if outcome.newly_pending => {
-                        let escalation = format!(
-                            "Security escalation: {} reached {} guard trips in the configured window. Operator approval required to resume.",
-                            &source_label, outcome.trip_count_in_window
-                        );
-                        self.emit_notification(
-                            "Security approval required",
-                            &escalation,
-                            "error",
-                            "security",
-                        )
-                        .await;
-                        self.notify_preferred_channel(&escalation).await;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "security.abuse",
-                            channel = %channel,
-                            error = %error,
-                            "abuse_tracker.record_trip failed; block applied but escalation state not updated"
-                        );
-                    }
-                }
-                let processed = self
-                    .persist_immediate_exchange(
-                        stored_user_message,
-                        safe_reply,
-                        ImmediateExchangeContext {
-                            channel,
-                            conversation_key,
-                            is_new_conversation,
-                            project_id,
-                            model_used: "security_guard",
-                            user_message_already_recorded,
-                            recorded_user_message_id: None,
-                            memory_capture_allowed: false,
-                            memory_capture_source: None,
-                            user_message_for_link_capture: Some(stored_user_message),
-                        },
-                    )
-                    .await?;
-                log_turn_timing_instant(
-                    turn_timing_id,
-                    conversation_key,
-                    channel,
-                    "inbound_precheck_total",
-                    inbound_total_started,
-                    true,
-                    TURN_TIMING_SLOW_STAGE_WARN_MS,
-                );
-                Ok(InboundSecurityPrecheck::Respond(processed))
-            }
-            crate::security::intent_classifier::IntentVerdict::AllowWithUncheckedTag {
-                reason,
-                intent_kinds,
-            } => {
-                tracing::warn!(
-                    target: "security.inbound",
-                    reason = %reason,
-                    channel = %channel,
-                    "inbound intent classifier degraded; message passed with unchecked tag"
-                );
-                let _ = (reason, intent_kinds);
-                log_turn_timing_instant(
-                    turn_timing_id,
-                    conversation_key,
-                    channel,
-                    "inbound_precheck_total",
-                    inbound_total_started,
-                    true,
-                    TURN_TIMING_SLOW_STAGE_WARN_MS,
-                );
-                Ok(InboundSecurityPrecheck::Continue {
-                    memory_capture_allowed: false,
-                })
-            }
-            crate::security::intent_classifier::IntentVerdict::ClassifierUnavailable { reason } => {
-                tracing::warn!(
-                    target: "security.inbound",
-                    reason = %reason,
-                    channel = %channel,
-                    "inbound intent classifier unavailable; continuing without classifier advisory"
-                );
-                log_turn_timing_instant(
-                    turn_timing_id,
-                    conversation_key,
-                    channel,
-                    "inbound_precheck_total",
-                    inbound_total_started,
-                    true,
-                    TURN_TIMING_SLOW_STAGE_WARN_MS,
-                );
-                Ok(InboundSecurityPrecheck::Continue {
-                    // A timed-out classifier should not fan out into the
-                    // memory extractor for every operational request. The
-                    // model tool loop still handles the user-visible turn.
-                    memory_capture_allowed: false,
-                })
-            }
-            crate::security::intent_classifier::IntentVerdict::Allow => {
-                log_turn_timing_instant(
-                    turn_timing_id,
-                    conversation_key,
-                    channel,
-                    "inbound_precheck_total",
-                    inbound_total_started,
-                    true,
-                    TURN_TIMING_SLOW_STAGE_WARN_MS,
-                );
-                Ok(InboundSecurityPrecheck::Continue {
-                    memory_capture_allowed,
-                })
-            }
-        }
+        Ok(InboundSecurityPrecheck::Continue)
     }
 
     pub(super) async fn persist_immediate_exchange(
@@ -2548,6 +2502,7 @@ impl Agent {
         self.spawn_deferred_exchange_persistence(DeferredExchangePersistence {
             kind: DeferredExchangePersistenceKind::Immediate,
             trace_snapshot,
+            execution_run_id: None,
             message: message.to_string(),
             response: safe_response.clone(),
             run_status: run_status.as_str().to_string(),
@@ -2582,6 +2537,8 @@ impl Agent {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            cached_prompt_tokens: 0,
+            cache_creation_prompt_tokens: 0,
             choices: Vec::new(),
             degradation: Vec::new(),
             attempted_models: Vec::new(),

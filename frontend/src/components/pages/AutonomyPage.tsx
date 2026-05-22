@@ -420,7 +420,7 @@ export default function AutonomyPage({
         : `Mode: ${modeIndicator} | Waiting on you: ${awaitingApprovals} approval${awaitingApprovals === 1 ? "" : "s"}, ${missingInputs} required input${missingInputs === 1 ? "" : "s"}`;
   const modePlainHint =
     autonomyMode === "off"
-      ? "Autonomy is paused. ArkSentinel, ArkPulse, background learning, and chat suggestion scans are paused until you turn it back on. Scheduled reminders still fire."
+      ? "Autonomy is paused. Sentinel, Pulse, background learning, and chat suggestion scans are paused until you turn it back on. Scheduled reminders still fire."
       : autonomyMode === "assist"
         ? "Agent prepares work and asks before sensitive actions."
         : "Agent runs allowed work automatically and only asks when required.";
@@ -2821,7 +2821,7 @@ export default function AutonomyPage({
                           color: "text.secondary",
                         }}
                       >
-                        Configure ArkEvolve switches in Settings &gt; Advanced.
+                        Configure Evolve switches in Settings &gt; Advanced.
                       </Typography>
                     </Stack>
                   )}

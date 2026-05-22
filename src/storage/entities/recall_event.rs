@@ -1,4 +1,4 @@
-//! Durable ArkMemory ledger event.
+//! Durable Memory ledger event.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

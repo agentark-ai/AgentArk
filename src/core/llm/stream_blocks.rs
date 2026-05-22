@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub(crate) struct StreamBlockParser {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ParsedStreamBlocks {
     pub files: BTreeMap<String, String>,
     pub file_patches: Vec<ParsedStreamPatch>,
@@ -65,20 +67,13 @@ pub(crate) struct ParsedStreamBlocks {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ParsedStreamPatch {
     pub path: String,
     pub patch: String,
 }
 
-impl ParsedStreamBlocks {
-    pub(crate) fn has_operations(&self) -> bool {
-        !self.files.is_empty()
-            || !self.file_patches.is_empty()
-            || !self.delete_paths.is_empty()
-            || self.delete_orphans
-    }
-}
-
+#[cfg(test)]
 pub(crate) fn parse_stream_blocks_from_text(text: &str) -> ParsedStreamBlocks {
     let mut parser = StreamBlockParser::new();
     let mut events = parser.feed(text);

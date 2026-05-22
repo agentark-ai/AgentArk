@@ -4,9 +4,9 @@ use super::*;
 
 use crate::core::arkorbit::store::orbit_file_is_user_artifact_path;
 use crate::core::arkorbit::{
-    content_type_for_name, stream_orbit_chat_turn, OrbitAgentEvent, OrbitChatUsage, OrbitUpdate,
+    OrbitAgentEvent, OrbitChatUsage, OrbitUpdate, content_type_for_name, stream_orbit_chat_turn,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -1000,8 +1000,7 @@ pub(super) async fn orbit_events_endpoint(
     };
     drop(service);
 
-    let (notify_tx, mut notify_rx) =
-        tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(64);
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(64);
     let mut watcher = match notify::recommended_watcher(move |event| {
         let _ = notify_tx.blocking_send(event);
     }) {
@@ -1014,12 +1013,13 @@ pub(super) async fn orbit_events_endpoint(
         return internal_error(err);
     }
 
-    let (tx, srx) =
-        tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(32);
-    crate::spawn_logged!(
-        "src/channels/http/arkorbit_control.rs:orbit_events",
-        async move {
-            let _watcher = watcher;
+    let stream = futures::stream::unfold(
+        (watcher, notify_rx, orbit_dir, VecDeque::<Event>::new()),
+        |(watcher, mut notify_rx, orbit_dir, mut pending)| async move {
+            if let Some(event) = pending.pop_front() {
+                return Some((Ok(event), (watcher, notify_rx, orbit_dir, pending)));
+            }
+
             while let Some(event) = notify_rx.recv().await {
                 let Ok(event) = event else {
                     continue;
@@ -1042,24 +1042,21 @@ pub(super) async fn orbit_events_endpoint(
                     let Ok(data) = serde_json::to_string(&payload) else {
                         continue;
                     };
-                    if tx
-                        .send(Ok(Event::default().event("file_changed").data(data)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                    pending.push_back(Event::default().event("file_changed").data(data));
+                }
+                if let Some(event) = pending.pop_front() {
+                    return Some((Ok(event), (watcher, notify_rx, orbit_dir, pending)));
                 }
             }
-        }
+
+            None
+        },
     );
 
     set_event_stream_headers(
-        Sse::new(cap_sse_lifetime(
-            tokio_stream::wrappers::ReceiverStream::new(srx),
-        ))
-        .keep_alive(KeepAlive::default())
-        .into_response(),
+        Sse::new(cap_sse_lifetime(stream))
+            .keep_alive(KeepAlive::default())
+            .into_response(),
     )
 }
 

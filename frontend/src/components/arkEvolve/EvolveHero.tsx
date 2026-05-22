@@ -97,7 +97,7 @@ function buildMoments(props: EvolveHeroProps): Moment[] {
           ? "A suggestion is waiting for you"
           : `${props.needsApprovalCount} suggestions are waiting`,
       sentence:
-        "Nothing has actually changed yet. Decide whether ArkEvolve should try them out.",
+        "Nothing has actually changed yet. Decide whether Evolve should try them out.",
       cta: props.onOpenReviewQueue
         ? {
             label: "Open review",
@@ -111,13 +111,13 @@ function buildMoments(props: EvolveHeroProps): Moment[] {
     moments.push({
       id: "live",
       icon: ScienceRoundedIcon,
-      accent: "rgba(124, 231, 255, 0.9)",
+      accent: "rgba(120, 242, 176, 0.9)",
       title:
         props.activeTests === 1
           ? "One live test is running"
           : `${props.activeTests} live tests are running`,
       sentence:
-        "ArkEvolve is trying small changes on a slice of traffic. You can view, stop, or make them stable.",
+        "Evolve is trying small changes on a slice of traffic. You can view, stop, or make them stable.",
       cta: props.onOpenLiveTests
         ? { label: "View tests", onClick: props.onOpenLiveTests }
         : undefined,
@@ -268,19 +268,6 @@ function HeroBody({ title, detail, headline, moments, showDetails, onToggleDetai
         </Box>
       ) : null}
 
-      <Stack direction="row" sx={{ justifyContent: "flex-end" }}>
-        <Button
-          variant="text"
-          onClick={onToggleDetails}
-          endIcon={showDetails ? <ExpandLessRoundedIcon /> : <ExpandMoreRoundedIcon />}
-          sx={{
-            color: "var(--text-secondary)",
-            "&:hover": { color: "var(--text-primary)" },
-          }}
-        >
-          {showDetails ? "Hide details" : "Show details"}
-        </Button>
-      </Stack>
     </Stack>
   );
 }
@@ -297,14 +284,14 @@ function HeadlineDisplay({ headline }: { headline: Headline }) {
         "0 0 24px rgba(255, 190, 99, 0.32), 0 0 60px rgba(255, 190, 99, 0.10)",
     },
     live: {
-      color: "#7ce7ff",
-      glow:
-        "0 0 24px rgba(124, 231, 255, 0.28), 0 0 60px rgba(124, 231, 255, 0.08)",
-    },
-    steady: {
       color: "#78f2b0",
       glow:
-        "0 0 24px rgba(120, 242, 176, 0.24), 0 0 60px rgba(120, 242, 176, 0.08)",
+        "0 0 24px rgba(120, 242, 176, 0.28), 0 0 60px rgba(120, 242, 176, 0.08)",
+    },
+    steady: {
+      color: "#c8d8c9",
+      glow:
+        "0 0 24px rgba(200, 216, 201, 0.18), 0 0 60px rgba(200, 216, 201, 0.06)",
     },
     paused: {
       color: "var(--text-secondary)",

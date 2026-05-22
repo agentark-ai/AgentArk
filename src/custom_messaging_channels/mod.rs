@@ -1,12 +1,12 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::Mutex;
 
 use crate::channels::messaging_dispatch::{
-    dispatch_pack_channel_with_overlay, extract_secret_references, rewrite_send_spec_secret_refs,
-    DispatchInputs,
+    DispatchInputs, dispatch_pack_channel_with_overlay, extract_secret_references,
+    rewrite_send_spec_secret_refs,
 };
 use crate::core::config::SecureConfigManager;
 use crate::core::integration_auth::{

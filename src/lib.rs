@@ -89,7 +89,7 @@ struct Args {
     #[arg(long)]
     chat: bool,
 
-    /// Run one ArkPulse health check and print the latest snapshot
+    /// Run one Pulse health check and print the latest snapshot
     #[arg(long)]
     pulse: bool,
 
@@ -295,12 +295,11 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         caller_principal: Some(actions::ActionCallerPrincipal::local_admin("cli")),
         execution_surface: actions::ActionExecutionSurface::Chat,
         direct_user_intent: true,
-        secret_offered: None,
-        attachments: Vec::new(),
-        saved_user_facts_context: None,
         recorded_user_message_id: None,
+        attachments_present: false,
+        attachments: Vec::new(),
         arkorbit_context: None,
-        accepted_suggestion_context: None,
+        recent_actionable_artifacts: Vec::new(),
     }
 }
 
@@ -1096,7 +1095,7 @@ fn print_cli_pulse_event(event: &crate::sentinel::PulseEvent) {
     let details = &event.details;
     let status = event.status.trim().to_ascii_lowercase();
     let status_color = pulse_status_color(&status);
-    print_unix_cli_banner_with_color("ArkPulse", Some(status_color));
+    print_unix_cli_banner_with_color("Pulse", Some(status_color));
     println!();
     println!(
         "\x1b[36mStatus:\x1b[0m {}{}\x1b[0m",
@@ -1183,7 +1182,7 @@ fn print_cli_pulse_event(event: &crate::sentinel::PulseEvent) {
 }
 
 async fn run_cli_pulse(agent: core::Agent) -> Result<()> {
-    println!("Running ArkPulse health check...");
+    println!("Running Pulse health check...");
     println!();
 
     let agent = std::sync::Arc::new(tokio::sync::RwLock::new(agent));
@@ -1197,7 +1196,7 @@ async fn run_cli_pulse(agent: core::Agent) -> Result<()> {
     if let Some(event) = latest {
         print_cli_pulse_event(&event);
     } else {
-        println!("\x1b[3;90mNo ArkPulse snapshot is available yet.\x1b[0m");
+        println!("\x1b[3;90mNo Pulse snapshot is available yet.\x1b[0m");
     }
 
     Ok(())
@@ -1749,7 +1748,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
         })
     };
 
-    // Start ArkSentinel - unified background engine (scheduler, watchers, experience learning, ArkPulse)
+    // Start Sentinel - unified background engine (scheduler, watchers, experience learning, Pulse)
     let sentinel_handles = sentinel::start(
         agent.clone(),
         sentinel::SentinelConfig::default(),
@@ -1813,14 +1812,14 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
+        CLI_SETTINGS_URL, CLI_SETUP_COMMAND, CLI_SETUP_PROMPT, CliChatReadiness,
         cli_chat_readiness, cli_chat_request_hints, render_cli_chat_onboarding_message,
-        should_launch_cli_setup, CliChatReadiness, CLI_SETTINGS_URL, CLI_SETUP_COMMAND,
-        CLI_SETUP_PROMPT,
+        should_launch_cli_setup,
     };
+    use crate::core::LlmProvider;
     use crate::core::config::{
         AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
     };
-    use crate::core::LlmProvider;
 
     #[test]
     fn cli_chat_readiness_treats_default_config_as_unconfigured() {

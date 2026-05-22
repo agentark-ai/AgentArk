@@ -1,4 +1,4 @@
-//! Developmental readiness scoring for ArkEvolve and autonomous action gates.
+//! Developmental readiness scoring for Evolve and autonomous action gates.
 //!
 //! The scorer only uses structured evidence: replay-gate metrics, pattern
 //! counters, candidate confidence, and trust envelopes. It deliberately avoids
@@ -6,10 +6,10 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::core::autonomy::RiskEnvelope;
-use crate::storage::{learning_candidate, procedural_pattern, readiness_evaluation, Storage};
+use crate::storage::{Storage, learning_candidate, procedural_pattern, readiness_evaluation};
 
 pub const READINESS_POLICY_SETTINGS_KEY: &str = "readiness_policy_settings_v1";
 pub const READINESS_POLICY_VERSION: &str = "readiness-policy-v1";
@@ -164,7 +164,7 @@ fn summarize(stage: &str, reasons: &[String], blockers: &[String]) -> String {
     } else if let Some(reason) = reasons.first() {
         reason.clone()
     } else {
-        "ArkEvolve is still collecting evidence.".to_string()
+        "Evolve is still collecting evidence.".to_string()
     }
 }
 
@@ -433,7 +433,7 @@ pub fn evaluate_recommended_action_readiness(
         ));
     }
     blockers.push(
-        "Auto-run needs repeated successful history from ArkEvolve, not only a low risk score."
+        "Auto-run needs repeated successful history from Evolve, not only a low risk score."
             .to_string(),
     );
 

@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use crate::core::llm::LlmClient;
 
 use super::promotion_gate::{
-    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
-    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
+    PromotionGateCheck, PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
+    promotion_gate_report, render_legacy_promotion_gate,
 };
 
 pub const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
@@ -56,17 +56,6 @@ pub fn routing_complexity_policy_from_slice(raw: &[u8]) -> Result<RoutingComplex
     apply_override(&mut policy, &value);
     sanitize_policy(&mut policy);
     Ok(policy)
-}
-
-pub fn classify_message_complexity(
-    policy: &RoutingComplexityPolicy,
-    message: &str,
-) -> crate::core::agent::QueryComplexity {
-    match classify_complexity(policy, message) {
-        ComplexityLabel::Simple => crate::core::agent::QueryComplexity::Simple,
-        ComplexityLabel::Medium => crate::core::agent::QueryComplexity::Medium,
-        ComplexityLabel::Complex => crate::core::agent::QueryComplexity::Complex,
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -68,7 +68,7 @@ export function MetricBarCard({
       {
         pct: tailPct,
         value: tailValue,
-        color: "#6c8fae",
+        color: "#c8d8c9",
         label: `Other (${tail.length} more)`,
         displayValue:
           tail.length > 4
@@ -145,7 +145,7 @@ export function MetricBarCard({
                           variant="caption"
                           sx={{
                             display: "block",
-                            color: "#d8edff",
+                            color: "#fff8ed",
                             fontWeight: 600,
                           }}
                         >
@@ -155,7 +155,7 @@ export function MetricBarCard({
                           variant="caption"
                           sx={{
                             display: "block",
-                            color: "#a9c4df",
+                            color: "#d8d0c4",
                           }}
                         >
                           {seg.displayValue} · {seg.pct.toFixed(1)}%

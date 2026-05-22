@@ -1,5 +1,5 @@
 use crate::actions::ActionDef;
-use crate::docs::agentark_manual::{render_agentark_manual_doc, AGENTARK_MANUAL_DOCS};
+use crate::docs::agentark_manual::{AGENTARK_MANUAL_DOCS, render_agentark_manual_doc};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -9,6 +9,18 @@ pub const DOCUMENT_ID_PREFIX: &str = "agentark_knowledge:";
 pub const DOCUMENT_CONTENT_TYPE: &str = "application/x-agentark-knowledge";
 pub const INTERNAL_DOCUMENT_CONTENT_TYPE_PREFIX: &str = "application/x-agentark-";
 const AGENTARK_KNOWLEDGE_CHUNK_MAX_CHARS: usize = 1_400;
+
+pub fn ark_core_product_ontology_prompt() -> &'static str {
+    "Ark Core product ontology.\n\n\
+     Ark Core is the AgentArk navigation group for the five core operating surfaces. These are product concepts, not generic nouns, when the user's surrounding intent is about AgentArk, this runtime, its UI, its health, its memory, its learning, its supervision, or its recent work.\n\n\
+     Ark Core product glossary:\n\
+     - Pulse | Operational health, runtime diagnostics, findings, security posture, storage and integration checks, remediation guidance, and safe fix execution.\n\
+     - Sentinel | Supervision, follow-ups, routines, observations, approvals, policy enforcement, background proposals, and background learning status.\n\
+     - Evolve | Learning lifecycle for prompts, routing, policies, specialist behavior, tests, canaries, impact, review, promotion, and rollback.\n\
+     - Memory | Durable facts, preferences, user data, reusable knowledge, provenance, review, retention, and rollback.\n\
+     - Reflect | Retrospectives for days, weeks, or months, including work clusters, source coverage, activity rhythm, narrative recap, and background-agent activity.\n\n\
+     If a user asks what one of these surfaces does, answer directly from this ontology and add the most useful next step in the UI. If the user is clearly asking about a non-AgentArk meaning, follow that surrounding context instead. Do not ask for generic clarification merely because a product surface name is also an ordinary word."
+}
 
 pub fn is_agentark_knowledge_document_id(value: &str) -> bool {
     value.trim().starts_with(DOCUMENT_ID_PREFIX)
@@ -292,7 +304,11 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
             "/library",
             "Reusable surfaces grouping Skills, Documents, and Apps.",
         ),
-        ("Skills", "/skills", "Reusable skills and imports."),
+        (
+            "Skills",
+            "/skills",
+            "Reusable skills, imports, tests, enable/disable state, security review, and marketplaces.",
+        ),
         (
             "Apps",
             "/apps",
@@ -314,22 +330,22 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
             "Durable queue, schedules, and approvals.",
         ),
         (
-            "ArkSentinel",
+            "Sentinel",
             "/sentinel",
             "Decision inbox for proposals, observations, approvals, and Background learning status.",
         ),
         (
-            "ArkEvolve",
+            "Evolve",
             "/evolution",
             "Learning status, review-only suggestions, live tests, stable changes, and rollback.",
         ),
         (
-            "ArkMemory",
+            "Memory",
             "/arkmemory",
             "Stored facts, preferences, user data, knowledge, provenance, review, and rollback.",
         ),
         (
-            "ArkReflect",
+            "Reflect",
             "/arkreflect",
             "Day, week, and month recaps with local work patterns and follow-ups.",
         ),
@@ -338,7 +354,11 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
             "/watchers",
             "Background poll-until-condition monitors.",
         ),
-        ("ArkPulse", "/arkpulse", "Operational health, findings, and fix guidance."),
+        (
+            "Pulse",
+            "/arkpulse",
+            "Operational health, findings, and fix guidance.",
+        ),
         ("Trace", "/trace", "Execution history and tool telemetry."),
         (
             "Documents",
@@ -390,7 +410,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
                 "Settings > Integrations > Plugins",
             ],
         ),
-        ("Knowledge", &["ArkMemory"]),
+        ("Knowledge", &["Memory"]),
         (
             "Admin",
             &["Settings > Data Lifecycle", "Settings > Observability"],
@@ -461,7 +481,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
 - Use the request-scoped runtime access summary and AgentArk capability registry as the live source of truth for what this instance can do right now.\n\
 - Use integration inventory for connected channels and connectors.\n\
 - Use MCP Servers and Plugins settings when the user asks about external capability extensions.\n\
-- Use Tasks, Watchers, Goals, Apps, Trace, Analytics, and ArkPulse to inspect durable work and operational state.\n\
+- Use Tasks, Watchers, Goals, Apps, Trace, Analytics, and Pulse to inspect durable work and operational state.\n\
 - Use Security and approval-related surfaces to understand what still needs approval.\n\
 - If exact host RAM or orchestrator memory ceilings matter, verify from the live deployment/runtime layer rather than guessing from static docs.",
     );
@@ -497,15 +517,17 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
     });
 
     let library_content = "Library and knowledge-related surfaces in the current UI.\n\n\
+- Library > Skills | Reusable AgentArk procedures/capabilities, SKILL.md imports, tests, enable/disable state, security review, and marketplaces.\n\
 - Library > Documents | Uploaded files and indexed document context.\n\
-- ArkMemory | Structured memory, source attribution, review, rollback, and reusable knowledge-base items.\n\
-- ArkMemory > Current Memory > Facts | Learned facts and operating constraints captured by the memory system.\n\
-- ArkMemory > Current Memory > Preferences | Durable user preferences and rules.\n\
-- ArkMemory > Current Memory > User Data | Notes, links, and captured user data.\n\
-- ArkMemory > Current Memory > Knowledge | Reusable knowledge-base items, including AgentArk manual/capability entries after sync.\n\n\
+- Memory | Structured memory, source attribution, review, rollback, and reusable knowledge-base items.\n\
+- Memory > Current Memory > Facts | Learned facts and operating constraints captured by the memory system.\n\
+- Memory > Current Memory > Preferences | Durable user preferences and rules.\n\
+- Memory > Current Memory > User Data | Notes, links, and captured user data.\n\
+- Memory > Current Memory > Knowledge | Reusable knowledge-base items, including AgentArk manual/capability entries after sync.\n\n\
 Semantic routing guidance.\n\n\
 - Choose by meaning, not by product-name usage or keyword matching.\n\
-- ArkMemory owns persistent personal/work knowledge: durable facts, preferences, user data, source attribution, and reusable knowledge-base items.\n\
+- Skills owns reusable procedures/capabilities and skill marketplaces; explicit \"save as skill\" requests should land here only when the requested item is a workflow or capability, not a durable fact.\n\
+- Memory owns persistent personal/work knowledge: durable facts, preferences, user data, source attribution, and reusable knowledge-base items.\n\
 - Library > Documents owns file-centric retrieval: uploaded files, indexed documents, document search, and document-grounded answers.";
     items.push(SeedKnowledgeItem {
         title: "Library, documents, and memory surfaces".to_string(),
@@ -537,18 +559,18 @@ Semantic routing guidance.\n\n\
         ),
     });
 
-    let evolution_content = "ArkEvolve and self-learning surfaces in the current UI.\n\n\
-- ArkEvolve | Main self-learning page with Overview, Results, Live tests, Review queue, and developer controls.\n\
-- ArkSentinel > Background learning | Live status for heuristic reflection, experience consolidation, pattern induction, and candidate generation.\n\
+    let evolution_content = "Evolve and self-learning surfaces in the current UI.\n\n\
+- Evolve | Main self-learning page with Overview, Results, Live tests, Review queue, and developer controls.\n\
+- Sentinel > Background learning | Live status for heuristic reflection, experience consolidation, pattern induction, and candidate generation.\n\
 - Learned Heuristics | Short transferable lessons distilled from completed runs.\n\
-- ArkEvolve > Overview | Current state, whether behavior changed, next step, and rollback availability.\n\
-- ArkEvolve > Results | Measured impact from prompt, classifier, specialist, and routing changes.\n\
-- ArkEvolve > Live tests | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
-- ArkEvolve > Review queue | Draft workflow, strategy, and memory candidates waiting for review.\n\
-- Settings > Advanced > ArkSentinel | Keep ArkSentinel available, choose whether it watches AgentArk activity or connected apps, and control routine detection.\n\
-- Settings > Advanced > ArkEvolve | ArkEvolve self-evolve master switch for background learning and canary experiments.\n\
+- Evolve > Overview | Current state, whether behavior changed, next step, and rollback availability.\n\
+- Evolve > Results | Measured impact from prompt, classifier, specialist, and routing changes.\n\
+- Evolve > Live tests | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
+- Evolve > Review queue | Draft workflow, strategy, and memory candidates waiting for review.\n\
+- Settings > Advanced > Sentinel | Keep Sentinel available, choose whether it watches AgentArk activity or connected apps, and control routine detection.\n\
+- Settings > Advanced > Evolve | Evolve self-evolve master switch for background learning and canary experiments.\n\
 - Settings > Advanced > App Deploy Defaults | Default app access guard for new app deploy and public-link flows.\n\
-- ArkEvolve > Controls | Developer-mode canary actions and manual testing controls.\n\
+- Evolve > Controls | Developer-mode canary actions and manual testing controls.\n\
 - Learned Memory | Durable facts, rules, lessons, and memory extracted from runs.\n\
 - Learned Procedures | Repeated successful workflows distilled into procedures.\n\
 - Recent Experience Runs | Recent evidence feeding the learning system.\n\
@@ -556,12 +578,12 @@ Semantic routing guidance.\n\n\
 - Canary History and Strategy Metrics | Diagnostics for policy rollout and promotion decisions.\n\n\
 Semantic routing guidance.\n\n\
 - Choose by meaning, not by product-name usage or keyword matching.\n\
-- ArkEvolve owns the improvement lifecycle: learning state, experiments, canary or live tests, stable behavior changes, deployment uncertainty, rollback state, and self-evolve controls.\n\
-- ArkSentinel owns operator decision state: approvals, rejected or snoozed suggestions, background observations, and items waiting for user attention.\n\
-- ArkPulse owns operational health: diagnostics, findings, runtime state, remediation guidance, and safe fix execution.\n\
-- ArkReflect owns retrospective understanding: time-window recaps, work patterns, source coverage, activity rhythm, and background-agent activity summaries.";
+- Evolve owns the improvement lifecycle: learning state, experiments, canary or live tests, stable behavior changes, deployment uncertainty, rollback state, and self-evolve controls.\n\
+- Sentinel owns operator decision state: approvals, rejected or snoozed suggestions, background observations, and items waiting for user attention.\n\
+- Pulse owns operational health: diagnostics, findings, runtime state, remediation guidance, and safe fix execution.\n\
+- Reflect owns retrospective understanding: time-window recaps, work patterns, source coverage, activity rhythm, and background-agent activity summaries.";
     items.push(SeedKnowledgeItem {
-        title: "ArkEvolve and self-learning surfaces".to_string(),
+        title: "Evolve and self-learning surfaces".to_string(),
         content: evolution_content.to_string(),
         source: RUNTIME_SOURCE,
         url: Some(crate::branding::help_uri("help/runtime/evolution")),
@@ -701,32 +723,50 @@ mod tests {
         ]);
         assert!(items.iter().any(|item| item.source == CURATED_SOURCE));
         assert!(items.iter().any(|item| item.source == RUNTIME_SOURCE));
-        assert!(items
-            .iter()
-            .any(|item| item.title.contains("Main navigation")));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Models and provider setup"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Embeddings and retrieval"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Input needed and unattended runs"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Environment, deployment, and investigation"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Chat shortcuts and safe actions"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Custom integrations and extension packs"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "MCP servers, plugins, webhooks, and custom APIs"));
-        assert!(items
-            .iter()
-            .any(|item| item.title == "Runtime environment and investigation"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title.contains("Main navigation"))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Models and provider setup")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Embeddings and retrieval")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Input needed and unattended runs")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Environment, deployment, and investigation")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Chat shortcuts and safe actions")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Custom integrations and extension packs")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "MCP servers, plugins, webhooks, and custom APIs")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Runtime environment and investigation")
+        );
     }
 }

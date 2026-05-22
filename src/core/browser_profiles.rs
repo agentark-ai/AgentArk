@@ -3,13 +3,15 @@
 //! This module keeps profile state in the existing encrypted KV store so we can
 //! add browser profile management without introducing schema churn.
 
-use anyhow::{bail, Context, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::storage::Storage;
 
 const BROWSER_PROFILES_KEY: &str = "browser:profiles:v1";
 const MAX_RECENT_SESSIONS: usize = 20;
+const PROFILE_RESOLVE_MIN_SCORE: f64 = 0.34;
+const PROFILE_RESOLVE_AMBIGUITY_MARGIN: f64 = 0.08;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +126,27 @@ pub struct BrowserProfileListResponse {
     pub profiles: Vec<BrowserProfileRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserProfileResolveCandidate {
+    pub profile: BrowserProfileRecord,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BrowserProfileResolveOutcome {
+    Resolved {
+        profile: BrowserProfileRecord,
+        candidates: Vec<BrowserProfileResolveCandidate>,
+    },
+    Ambiguous {
+        candidates: Vec<BrowserProfileResolveCandidate>,
+    },
+    NotFound {
+        candidates: Vec<BrowserProfileResolveCandidate>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BrowserProfileUpsert {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +252,137 @@ fn sanitize_tags(tags: Vec<String>) -> Vec<String> {
     result.sort();
     result.dedup();
     result
+}
+
+fn profile_match_normalized(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| ch.to_lowercase())
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn profile_match_tokens(value: &str) -> Vec<String> {
+    let mut tokens = profile_match_normalized(value)
+        .split_whitespace()
+        .map(str::to_string)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn profile_match_ngrams(value: &str) -> std::collections::BTreeSet<String> {
+    let compact = profile_match_normalized(value).replace(' ', "");
+    let chars = compact.chars().collect::<Vec<_>>();
+    let mut out = std::collections::BTreeSet::new();
+    if chars.is_empty() {
+        return out;
+    }
+    if chars.len() <= 3 {
+        out.insert(compact);
+        return out;
+    }
+    for window in chars.windows(3) {
+        out.insert(window.iter().collect::<String>());
+    }
+    out
+}
+
+fn profile_match_dice(left: &str, right: &str) -> f64 {
+    let left = profile_match_ngrams(left);
+    let right = profile_match_ngrams(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let overlap = left.intersection(&right).count() as f64;
+    (2.0 * overlap) / (left.len() as f64 + right.len() as f64)
+}
+
+fn profile_match_token_score(query_tokens: &[String], field_tokens: &[String]) -> f64 {
+    if query_tokens.is_empty() || field_tokens.is_empty() {
+        return 0.0;
+    }
+    let query = query_tokens
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let field = field_tokens
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let overlap = query.intersection(&field).count() as f64;
+    let coverage = overlap / query.len() as f64;
+    let precision = overlap / field.len() as f64;
+    (coverage * 0.72) + (precision * 0.28)
+}
+
+fn profile_metadata_match_text(metadata: &Option<serde_json::Value>) -> String {
+    let Some(metadata) = metadata else {
+        return String::new();
+    };
+    match metadata {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .filter_map(|(key, value)| {
+                if key.to_ascii_lowercase().contains("secret") {
+                    return None;
+                }
+                match value {
+                    serde_json::Value::String(text) => Some(format!("{key} {text}")),
+                    serde_json::Value::Bool(flag) => Some(format!("{key} {flag}")),
+                    serde_json::Value::Number(number) => Some(format!("{key} {number}")),
+                    _ => Some(key.clone()),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+fn profile_resolve_score(query: &str, profile: &BrowserProfileRecord) -> f64 {
+    let query_norm = profile_match_normalized(query);
+    if query_norm.is_empty() {
+        return 0.0;
+    }
+    let query_tokens = profile_match_tokens(query);
+    let id_norm = profile_match_normalized(&profile.id);
+    let name_norm = profile_match_normalized(&profile.name);
+    let target_kind = format!("{:?}", profile.target_kind);
+    let fields = [
+        profile.name.clone(),
+        profile.description.clone().unwrap_or_default(),
+        profile.tags.join(" "),
+        profile.target_endpoint.clone().unwrap_or_default(),
+        profile.target_profile_path.clone().unwrap_or_default(),
+        profile.target_workspace.clone().unwrap_or_default(),
+        target_kind,
+        profile_metadata_match_text(&profile.metadata),
+    ];
+    let combined = fields.join(" ");
+    let combined_norm = profile_match_normalized(&combined);
+    let field_tokens = profile_match_tokens(&combined);
+
+    let mut score = profile_match_token_score(&query_tokens, &field_tokens);
+    score = score.max(profile_match_dice(&query_norm, &combined_norm) * 0.82);
+
+    if !id_norm.is_empty() && id_norm == query_norm {
+        score = score.max(1.0);
+    }
+    if !name_norm.is_empty() {
+        if name_norm == query_norm {
+            score = score.max(0.98);
+        } else if query_norm.contains(&name_norm) || name_norm.contains(&query_norm) {
+            score = score.max(0.86);
+        } else {
+            score = score.max(profile_match_dice(&query_norm, &name_norm) * 0.94);
+        }
+    }
+
+    score.clamp(0.0, 1.0)
 }
 
 fn normalize_profile(mut profile: BrowserProfileRecord) -> BrowserProfileRecord {
@@ -437,6 +591,54 @@ impl BrowserProfileControlPlane {
         Ok(BrowserProfileListResponse {
             summary: build_summary(&profiles),
             profiles,
+        })
+    }
+
+    pub async fn resolve(
+        storage: &Storage,
+        selector: &str,
+    ) -> Result<BrowserProfileResolveOutcome> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Ok(BrowserProfileResolveOutcome::NotFound {
+                candidates: Vec::new(),
+            });
+        }
+
+        let mut candidates = load_profiles(storage)
+            .await?
+            .into_iter()
+            .filter(|profile| profile.enabled)
+            .map(|profile| BrowserProfileResolveCandidate {
+                score: profile_resolve_score(selector, &profile),
+                profile,
+            })
+            .filter(|candidate| candidate.score > 0.0)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.profile.name.cmp(&right.profile.name))
+        });
+        candidates.truncate(5);
+
+        let Some(best) = candidates.first().cloned() else {
+            return Ok(BrowserProfileResolveOutcome::NotFound { candidates });
+        };
+        if best.score < PROFILE_RESOLVE_MIN_SCORE {
+            return Ok(BrowserProfileResolveOutcome::NotFound { candidates });
+        }
+        if candidates
+            .get(1)
+            .is_some_and(|next| best.score - next.score <= PROFILE_RESOLVE_AMBIGUITY_MARGIN)
+        {
+            return Ok(BrowserProfileResolveOutcome::Ambiguous { candidates });
+        }
+        Ok(BrowserProfileResolveOutcome::Resolved {
+            profile: best.profile.clone(),
+            candidates,
         })
     }
 

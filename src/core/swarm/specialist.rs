@@ -1,12 +1,12 @@
 //! Lightweight specialist agent
 
-use super::agent_trait::*;
 use super::AgentAccessScope;
+use super::agent_trait::*;
 use crate::actions::ActionDef;
+use crate::core::PromptMemory;
 use crate::core::llm::{LlmClient, LlmProvider};
 use crate::core::orchestra::SubAgentType;
 use crate::core::prompt_policy::delegated_policy_v2_block;
-use crate::core::PromptMemory;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -89,6 +89,7 @@ impl SpecialistAgent {
             &[],
             &self.available_actions,
             system_prompt_override,
+            None,
         )
         .await
     }
@@ -102,6 +103,7 @@ impl SpecialistAgent {
         memories: &[PromptMemory],
         available_actions: &[ActionDef],
         system_prompt_override: Option<String>,
+        timeout_ms: Option<u64>,
     ) -> Result<String> {
         let system_prompt = format!(
             "{}\n\nYou are part of an agent swarm. Your name is '{}'. \
@@ -130,7 +132,7 @@ impl SpecialistAgent {
             task,
             memories,
             available_actions,
-            Some(60_000),
+            timeout_ms.filter(|value| *value > 0),
         )
         .await?;
 

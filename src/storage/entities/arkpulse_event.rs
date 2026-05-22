@@ -1,4 +1,4 @@
-//! ArkPulse event history stored as individual rows instead of a single KV blob.
+//! Pulse event history stored as individual rows instead of a single KV blob.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

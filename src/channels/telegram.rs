@@ -1,5 +1,5 @@
 //! Telegram bot channel
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ParseMode};
@@ -767,8 +767,7 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     };
 
     let Some(chat_id) = configured_notification_chat_id(config) else {
-        let message =
-            "Telegram proactive delivery is fail-closed until exactly one allowed user ID is configured.";
+        let message = "Telegram proactive delivery is fail-closed until exactly one allowed user ID is configured.";
         tracing::warn!("Telegram send_message: {}", message);
         return Err(anyhow!(message));
     };
@@ -1209,9 +1208,15 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                     crate::core::LlmProvider::Anthropic { model, .. } => model.clone(),
                     crate::core::LlmProvider::OpenAI { model, .. } => model.clone(),
                 };
-                format!("Current model: {}\n\nUsage: /model <model_name>\n\nNote: Changing models requires restart", current)
+                format!(
+                    "Current model: {}\n\nUsage: /model <model_name>\n\nNote: Changing models requires restart",
+                    current
+                )
             } else {
-                format!("Model change to '{}' noted.\n\nTo apply, please update via web UI settings and restart.", args)
+                format!(
+                    "Model change to '{}' noted.\n\nTo apply, please update via web UI settings and restart.",
+                    args
+                )
             }
         }
 

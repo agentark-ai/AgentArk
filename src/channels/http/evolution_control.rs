@@ -346,11 +346,7 @@ pub(super) async fn load_learning_queue_cap(storage: &crate::storage::Storage) -
 }
 
 pub(super) fn bool_setting_bytes(enabled: bool) -> &'static [u8] {
-    if enabled {
-        b"true"
-    } else {
-        b"false"
-    }
+    if enabled { b"true" } else { b"false" }
 }
 
 pub(super) async fn store_bool_setting(
@@ -411,7 +407,9 @@ pub(super) fn build_learning_candidate_summary(
         .proposed_content
         .get("name")
         .and_then(|value| value.as_str())
-        .map(crate::core::self_evolve::skill_evolution::canonicalize_skill_name);
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let strategy_version = candidate
         .proposed_content
         .get("version")
@@ -436,18 +434,6 @@ pub(super) fn build_learning_candidate_summary(
                     .join(" | ")
             })
             .filter(|value| !value.is_empty()),
-        "skill_patch" => candidate
-            .proposed_content
-            .get("diff_summary")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .or_else(|| {
-                candidate
-                    .proposed_content
-                    .get("after_content")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.lines().take(4).collect::<Vec<_>>().join(" "))
-            }),
         crate::core::self_evolve::ROUTING_CANONICAL_CANDIDATE_TYPE => candidate
             .proposed_content
             .get("add")
@@ -499,7 +485,9 @@ pub(super) fn build_learning_candidate_summary(
         .proposed_content
         .get("skill_name")
         .and_then(|value| value.as_str())
-        .map(crate::core::self_evolve::skill_evolution::canonicalize_skill_name);
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let skill_action = candidate
         .proposed_content
         .get("action")
@@ -514,7 +502,7 @@ pub(super) fn build_learning_candidate_summary(
     serde_json::json!({
         "id": candidate.id,
         "candidate_type": candidate.candidate_type,
-        "subject_key": crate::core::self_evolve::skill_evolution::canonicalize_skill_name(&candidate.subject_key),
+        "subject_key": candidate.subject_key.trim(),
         "title": candidate.title,
         "summary": candidate.summary,
         "pattern_id": candidate.pattern_id,
@@ -707,244 +695,6 @@ pub(super) fn build_learning_candidate_content_preview(
         }
         _ => serde_json::Value::Null,
     }
-}
-
-pub(super) fn skill_patch_string(
-    candidate: &crate::storage::learning_candidate::Model,
-    key: &str,
-) -> Option<String> {
-    candidate
-        .proposed_content
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-}
-
-pub(super) fn compact_skill_metrics(metrics: &SkillMetricsSnapshot) -> String {
-    format!(
-        "{} matched, success {:.1}%, failure {:.1}%, tool errors {:.1}%",
-        metrics.matched_runs,
-        metrics.success_rate * 100.0,
-        metrics.failure_rate * 100.0,
-        metrics.tool_error_rate * 100.0
-    )
-}
-
-pub(super) fn build_skill_candidate_evidence_markdown(
-    candidate: &crate::storage::learning_candidate::Model,
-) -> String {
-    let action =
-        skill_patch_string(candidate, "action").unwrap_or_else(|| "improve_skill".to_string());
-    let skill_name = skill_patch_string(candidate, "skill_name")
-        .unwrap_or_else(|| candidate.subject_key.clone());
-    let diff_summary = skill_patch_string(candidate, "diff_summary").unwrap_or_else(|| {
-        "Reviewable skill change generated from local session evidence.".to_string()
-    });
-    let baseline = candidate
-        .proposed_content
-        .get("impact_baseline")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<SkillMetricsSnapshot>(value).ok())
-        .unwrap_or_default();
-    let evidence = candidate
-        .proposed_content
-        .get("evidence")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let evidence_refs = candidate
-        .evidence_refs
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "none recorded".to_string());
-    let history_versions_read = candidate
-        .proposed_content
-        .get("history_versions_read")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let selected_only_failures = evidence
-        .get("selected_only_failures")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let executed_failures = evidence
-        .get("executed_failures")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let recent_failure_reasons = evidence
-        .get("recent_failure_reasons")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "none recorded".to_string());
-    let recent_tool_errors = evidence
-        .get("recent_tool_errors")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "none recorded".to_string());
-    format!(
-        concat!(
-            "# Skill evolution evidence\n\n",
-            "## Decision summary\n",
-            "- action: {action}\n",
-            "- target skill: {skill_name}\n",
-            "- why change is needed now: {diff_summary}\n\n",
-            "## Session evidence\n",
-            "- candidate id: {candidate_id}\n",
-            "- evidence refs: {evidence_refs}\n",
-            "- confidence: {confidence:.0}%\n",
-            "- baseline window: {baseline_summary}\n",
-            "- selected-only failures: {selected_only_failures}\n",
-            "- executed failures: {executed_failures}\n",
-            "- repeated failure notes: {recent_failure_reasons}\n",
-            "- repeated tool errors: {recent_tool_errors}\n\n",
-            "## Historical comparison\n",
-            "- history entries read before applying: {history_versions_read}\n",
-            "- previous skill content was snapshotted before this edit.\n\n",
-            "## Edit plan\n",
-            "- preserve the existing skill body except for the targeted diff proposed in this candidate.\n",
-            "- write a versioned history snapshot before changing the live skill.\n\n",
-            "## Open questions\n",
-            "- monitor the first few post-approval runs before marking this skill as improved.\n"
-        ),
-        action = action,
-        skill_name = skill_name,
-        diff_summary = diff_summary,
-        candidate_id = candidate.id,
-        evidence_refs = evidence_refs,
-        confidence = candidate.confidence * 100.0,
-        baseline_summary = compact_skill_metrics(&baseline),
-        selected_only_failures = selected_only_failures,
-        executed_failures = executed_failures,
-        recent_failure_reasons = recent_failure_reasons,
-        recent_tool_errors = recent_tool_errors,
-        history_versions_read = history_versions_read,
-    )
-}
-
-pub(super) fn build_skill_evolution_entry(
-    candidate: &crate::storage::learning_candidate::Model,
-    recent_runs: &[crate::storage::entities::experience_run::Model],
-    replay_gate: Option<&crate::core::self_evolve::replay_gate::CandidateReplayGateResult>,
-    readiness: Option<&crate::core::DevelopmentalReadiness>,
-) -> Option<serde_json::Value> {
-    if candidate.candidate_type != "skill_patch" {
-        return None;
-    }
-    let skill_name = skill_patch_string(candidate, "skill_name")
-        .unwrap_or_else(|| candidate.subject_key.clone());
-    let action =
-        skill_patch_string(candidate, "action").unwrap_or_else(|| "improve_skill".to_string());
-    let target_source =
-        skill_patch_string(candidate, "target_source").unwrap_or_else(|| "custom".to_string());
-    let before_content = skill_patch_string(candidate, "before_content").unwrap_or_default();
-    let after_content = skill_patch_string(candidate, "after_content")
-        .or_else(|| skill_patch_string(candidate, "content"))
-        .unwrap_or_default();
-    let diff_summary = skill_patch_string(candidate, "diff_summary").unwrap_or_default();
-    let diff_preview = candidate
-        .proposed_content
-        .get("diff_preview")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let evidence = candidate
-        .proposed_content
-        .get("evidence")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let baseline = candidate
-        .proposed_content
-        .get("impact_baseline")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<SkillMetricsSnapshot>(value).ok())
-        .unwrap_or_default();
-    let stored_status =
-        skill_patch_string(candidate, "impact_status").unwrap_or_else(|| "pending".to_string());
-    let (observed, assessment, impact_status) = if candidate.approval_status == "approved" {
-        if let Some(reviewed_at) = candidate.reviewed_at.as_deref() {
-            let observed = skill_evolution::compute_skill_metrics(
-                recent_runs,
-                &skill_name,
-                Some(reviewed_at),
-                SkillWindowDirection::Observed,
-                8,
-                64,
-            );
-            let assessment = skill_evolution::assess_skill_impact(&baseline, &observed);
-            let status = assessment.status.clone();
-            (observed, assessment, status)
-        } else {
-            let assessment = SkillImpactAssessment {
-                status: "pending".to_string(),
-                summary: vec!["Approved, but waiting for the first post-approval runs.".to_string()],
-                ..SkillImpactAssessment::default()
-            };
-            (
-                SkillMetricsSnapshot::default(),
-                assessment,
-                "pending".to_string(),
-            )
-        }
-    } else {
-        let assessment = SkillImpactAssessment {
-            status: stored_status.clone(),
-            summary: vec!["Waiting for review before impact tracking starts.".to_string()],
-            ..SkillImpactAssessment::default()
-        };
-        (SkillMetricsSnapshot::default(), assessment, stored_status)
-    };
-    Some(serde_json::json!({
-        "id": candidate.id,
-        "candidate_type": candidate.candidate_type,
-        "approval_status": candidate.approval_status,
-        "title": candidate.title,
-        "summary": candidate.summary,
-        "skill_name": skill_name,
-        "action": action,
-        "target_source": target_source,
-        "diff_summary": diff_summary,
-        "diff_preview": diff_preview,
-        "before_content": before_content,
-        "after_content": after_content,
-        "evidence": evidence,
-        "impact_baseline": baseline,
-        "impact_observed": observed,
-        "impact_assessment": assessment,
-        "impact_status": impact_status,
-        "impact_delta": {
-            "success_gain": assessment.success_gain,
-            "failure_reduction": assessment.failure_reduction,
-            "tool_error_reduction": assessment.tool_error_reduction,
-        },
-        "confidence": candidate.confidence,
-        "approved_ref": candidate.approved_ref,
-        "review_notes": candidate.review_notes,
-        "reviewed_at": candidate.reviewed_at,
-        "replay_gate": replay_gate,
-        "readiness": readiness,
-        "created_at": candidate.created_at,
-        "updated_at": candidate.updated_at,
-    }))
 }
 
 pub(super) fn build_experience_item_summary(
@@ -1612,18 +1362,320 @@ pub(super) async fn update_prompt_optimization_review_state(
     }
 
     let mut state = load_prompt_optimization_review_state(storage).await;
-    state.insert(
-        proposal_id.to_string(),
-        PromptOptimizationReviewEntry {
-            status: status.to_string(),
-            reviewed_at: Some(chrono::Utc::now().to_rfc3339()),
-        },
-    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut entry = state.remove(proposal_id).unwrap_or_default();
+    entry.status = status.to_string();
+    entry.reviewed_at = Some(now.clone());
+    if status == "rejected" {
+        entry.lifecycle.status = "dismissed".to_string();
+        entry.lifecycle.reason = Some("Rejected by user.".to_string());
+        entry.lifecycle.rollback_available = false;
+    }
+    state.insert(proposal_id.to_string(), entry);
     let bytes = serde_json::to_vec(&state)?;
     storage
         .set(PROMPT_OPTIMIZATION_REVIEW_STATE_KEY, &bytes)
         .await?;
     Ok(())
+}
+
+async fn current_prompt_telemetry_sample_count(storage: &crate::storage::Storage) -> usize {
+    let runs = storage
+        .list_recent_experience_runs_any_scope(EVOLUTION_DEV_DEFAULT_LIMIT)
+        .await
+        .unwrap_or_default();
+    let traces = storage
+        .list_execution_trace_summaries(None, EVOLUTION_DEV_DEFAULT_LIMIT, 0)
+        .await
+        .unwrap_or_default();
+    aggregate_prompt_telemetry_summary_with_traces(&runs, &traces).sample_count
+}
+
+async fn update_prompt_optimization_lifecycle(
+    storage: &crate::storage::Storage,
+    proposal_id: &str,
+    status: &str,
+    reason: Option<String>,
+    update: impl FnOnce(&mut PromptOptimizationLifecycleState),
+) -> Result<()> {
+    let proposal_id = proposal_id.trim();
+    if proposal_id.is_empty() {
+        return Ok(());
+    }
+    let mut state = load_prompt_optimization_review_state(storage).await;
+    let mut entry = state.remove(proposal_id).unwrap_or_default();
+    entry.status = status.to_string();
+    entry.reviewed_at = Some(chrono::Utc::now().to_rfc3339());
+    if entry.lifecycle.required_samples == 0 {
+        entry.lifecycle.required_samples = GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS;
+    }
+    entry.lifecycle.status = status.to_string();
+    entry.lifecycle.reason = reason;
+    update(&mut entry.lifecycle);
+    state.insert(proposal_id.to_string(), entry);
+    storage
+        .set(
+            PROMPT_OPTIMIZATION_REVIEW_STATE_KEY,
+            &serde_json::to_vec(&state)?,
+        )
+        .await?;
+    Ok(())
+}
+
+fn gepa_job_proposal_id(item: &serde_json::Value) -> Option<&str> {
+    let job = item.get("job")?;
+    job.get("metadata")
+        .and_then(|metadata| metadata.get("proposal_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn gepa_queue_item_for_proposal<'a>(
+    gepa_queue: &'a serde_json::Value,
+    proposal_id: &str,
+) -> Option<(&'static str, &'a serde_json::Value)> {
+    for status in ["running", "pending", "completed", "failed"] {
+        let Some(items) = gepa_queue.get(status).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        if let Some(item) = items
+            .iter()
+            .find(|item| gepa_job_proposal_id(item) == Some(proposal_id))
+        {
+            return Some((status, item));
+        }
+    }
+    None
+}
+
+fn prompt_metric_for_version<'a>(
+    prompt_metrics: &'a [PromptEvolutionMetric],
+    version: Option<&str>,
+) -> Option<&'a PromptEvolutionMetric> {
+    let version = version.map(str::trim).filter(|value| !value.is_empty())?;
+    prompt_metrics
+        .iter()
+        .find(|metric| metric.version.trim() == version)
+}
+
+fn update_prompt_lifecycle_monitoring(
+    lifecycle: &mut PromptOptimizationLifecycleState,
+    prompt_metrics: &[PromptEvolutionMetric],
+    rollback_available: bool,
+) {
+    let baseline = prompt_metric_for_version(prompt_metrics, lifecycle.baseline_version.as_deref());
+    let candidate =
+        prompt_metric_for_version(prompt_metrics, lifecycle.candidate_version.as_deref());
+
+    lifecycle.rollback_recommended = false;
+    lifecycle.monitoring_summary.clear();
+    lifecycle.monitoring_regressions.clear();
+    lifecycle.baseline_samples = baseline.map(|metric| metric.samples).unwrap_or_default();
+    lifecycle.candidate_samples = candidate.map(|metric| metric.samples).unwrap_or_default();
+    lifecycle.monitoring_samples = lifecycle.candidate_samples;
+    lifecycle.baseline_success_rate = baseline.map(|metric| metric.success_rate);
+    lifecycle.candidate_success_rate = candidate.map(|metric| metric.success_rate);
+    lifecycle.baseline_error_rate = baseline.map(|metric| metric.error_rate);
+    lifecycle.candidate_error_rate = candidate.map(|metric| metric.error_rate);
+    lifecycle.baseline_tool_success_rate = baseline.map(|metric| metric.tool_success_rate);
+    lifecycle.candidate_tool_success_rate = candidate.map(|metric| metric.tool_success_rate);
+    lifecycle.baseline_p95_latency_ms = baseline.and_then(|metric| metric.p95_latency_ms);
+    lifecycle.candidate_p95_latency_ms = candidate.and_then(|metric| metric.p95_latency_ms);
+
+    let Some(base) = baseline else {
+        lifecycle
+            .monitoring_summary
+            .push("Waiting for baseline comparison metrics.".to_string());
+        return;
+    };
+    let Some(cand) = candidate else {
+        lifecycle
+            .monitoring_summary
+            .push("Waiting for candidate monitoring metrics.".to_string());
+        return;
+    };
+
+    let success_delta = cand.success_rate - base.success_rate;
+    if success_delta >= 0.0 {
+        lifecycle.monitoring_summary.push(format!(
+            "Experience success is up {:.1} points versus the previous baseline.",
+            success_delta * 100.0
+        ));
+    } else {
+        lifecycle.monitoring_regressions.push(format!(
+            "Experience success is down {:.1} points versus the previous baseline.",
+            success_delta.abs() * 100.0
+        ));
+    }
+
+    let error_delta = cand.error_rate - base.error_rate;
+    if error_delta <= 0.0 {
+        lifecycle.monitoring_summary.push(format!(
+            "Resolved-run errors are down {:.1} points.",
+            error_delta.abs() * 100.0
+        ));
+    } else {
+        lifecycle.monitoring_regressions.push(format!(
+            "Resolved-run errors are up {:.1} points.",
+            error_delta * 100.0
+        ));
+    }
+
+    let tool_success_delta = cand.tool_success_rate - base.tool_success_rate;
+    if tool_success_delta >= 0.0 {
+        lifecycle.monitoring_summary.push(format!(
+            "Tool success is up {:.1} points.",
+            tool_success_delta * 100.0
+        ));
+    } else {
+        lifecycle.monitoring_regressions.push(format!(
+            "Tool success is down {:.1} points.",
+            tool_success_delta.abs() * 100.0
+        ));
+    }
+
+    let latency_regressed = match (base.p95_latency_ms, cand.p95_latency_ms) {
+        (Some(base_ms), Some(cand_ms)) if cand_ms > base_ms => {
+            let delta_ms = cand_ms - base_ms;
+            lifecycle
+                .monitoring_regressions
+                .push(format!("p95 latency regressed by {} ms.", delta_ms));
+            base_ms > 0 && cand_ms as f64 > base_ms as f64 * 1.15 && delta_ms >= 1_000
+        }
+        (Some(base_ms), Some(cand_ms)) if cand_ms <= base_ms => {
+            lifecycle
+                .monitoring_summary
+                .push(format!("p95 latency improved by {} ms.", base_ms - cand_ms));
+            false
+        }
+        _ => false,
+    };
+
+    let enough_samples = cand.samples >= lifecycle.required_samples.max(10);
+    let quality_regressed =
+        success_delta <= -0.02 || error_delta >= 0.02 || tool_success_delta <= -0.03;
+    lifecycle.rollback_recommended =
+        rollback_available && enough_samples && (quality_regressed || latency_regressed);
+}
+
+fn build_prompt_optimization_lifecycle(
+    proposal_id: &str,
+    review_entry: Option<&PromptOptimizationReviewEntry>,
+    summary: &PromptTelemetrySummary,
+    prompt_metrics: &[PromptEvolutionMetric],
+    gepa_queue: &serde_json::Value,
+    prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    prompt_rollback_available: bool,
+) -> PromptOptimizationLifecycleState {
+    let review_status = review_entry
+        .map(|entry| entry.status.trim())
+        .filter(|status| !status.is_empty())
+        .unwrap_or("open");
+    let mut lifecycle = review_entry
+        .map(|entry| entry.lifecycle.clone())
+        .unwrap_or_default();
+    if lifecycle.required_samples == 0 {
+        lifecycle.required_samples = GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS;
+    }
+    lifecycle.sample_count = summary
+        .sample_count
+        .saturating_sub(lifecycle.sample_baseline);
+
+    if review_status == "rejected" {
+        lifecycle.status = "dismissed".to_string();
+        lifecycle.rollback_available = false;
+        return lifecycle;
+    }
+    if review_status != "approved" {
+        lifecycle.status = "suggested".to_string();
+        lifecycle.rollback_available = false;
+        return lifecycle;
+    }
+
+    if lifecycle.status.trim().is_empty() || lifecycle.status == "approved" {
+        lifecycle.status = "approved_waiting_for_more_examples".to_string();
+    }
+    if lifecycle.status == "deployed" || lifecycle.status == "rollback_suggested" {
+        lifecycle.rollback_available = prompt_rollback_available;
+        update_prompt_lifecycle_monitoring(
+            &mut lifecycle,
+            prompt_metrics,
+            prompt_rollback_available,
+        );
+        if lifecycle.rollback_recommended {
+            lifecycle.status = "rollback_suggested".to_string();
+            lifecycle.reason = lifecycle
+                .monitoring_regressions
+                .first()
+                .cloned()
+                .map(|reason| format!("{} Rollback is available.", reason));
+        } else {
+            lifecycle.status = "deployed".to_string();
+            lifecycle.reason = lifecycle.reason.or_else(|| {
+                Some("Monitoring deployed behavior; no rollback signal yet.".to_string())
+            });
+        }
+        return lifecycle;
+    }
+    if lifecycle.status == "rolled_back" {
+        lifecycle.rollback_available = false;
+        return lifecycle;
+    }
+
+    if let Some((queue_status, item)) = gepa_queue_item_for_proposal(gepa_queue, proposal_id) {
+        let job = item.get("job").unwrap_or(item);
+        lifecycle.job_status = Some(queue_status.to_string());
+        lifecycle.queued_job_id = job
+            .get("job_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| lifecycle.queued_job_id.clone());
+        lifecycle.queued_at = job
+            .get("created_at")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| lifecycle.queued_at.clone());
+        lifecycle.reason = job
+            .get("last_error")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| lifecycle.reason.clone());
+        lifecycle.status = match queue_status {
+            "running" => "running_background_test".to_string(),
+            "pending" => "queued_for_background_test".to_string(),
+            "failed" => "blocked".to_string(),
+            "completed" => "background_test_completed".to_string(),
+            other => other.to_string(),
+        };
+    }
+
+    if let Some(canary) = prompt_canary_state.filter(|state| state.enabled) {
+        let has_matching_completed_job = gepa_queue_item_for_proposal(gepa_queue, proposal_id)
+            .is_some_and(|(status, _)| {
+                status == "completed" || status == "running" || status == "pending"
+            });
+        if has_matching_completed_job {
+            lifecycle.status = "testing".to_string();
+            lifecycle.live_surface = Some("prompt".to_string());
+            lifecycle.rollout_percent = Some(canary.rollout_percent);
+            lifecycle.baseline_version = Some(canary.baseline_version.clone());
+            lifecycle.candidate_version = Some(canary.candidate_version.clone());
+            lifecycle.required_samples = canary.min_samples_per_version;
+            lifecycle.rollback_available = false;
+            update_prompt_lifecycle_monitoring(&mut lifecycle, prompt_metrics, false);
+            if lifecycle.rollback_recommended || !lifecycle.monitoring_regressions.is_empty() {
+                lifecycle.status = "test_regression".to_string();
+                lifecycle.reason = lifecycle
+                    .monitoring_regressions
+                    .first()
+                    .cloned()
+                    .map(|reason| format!("{} Stopping this test is recommended.", reason));
+            }
+        }
+    }
+
+    lifecycle
 }
 
 pub(super) async fn load_prompt_canary_safety_events(
@@ -1951,9 +2003,14 @@ pub(super) async fn disable_prompt_canary_from_safety_event(
 
 pub(super) fn build_prompt_optimization_proposal(
     review_state: &PromptOptimizationReviewState,
+    summary: &PromptTelemetrySummary,
+    prompt_metrics: &[PromptEvolutionMetric],
+    gepa_queue: &serde_json::Value,
+    prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    prompt_rollback_available: bool,
     id: &str,
     title: &str,
-    summary: &str,
+    proposal_summary: &str,
     evidence: Vec<String>,
     expected_benefit: Vec<String>,
     caveats: Vec<String>,
@@ -1968,11 +2025,20 @@ pub(super) fn build_prompt_optimization_proposal(
         .unwrap_or("open")
         .to_string();
     let reviewed_at = review_entry.and_then(|entry| entry.reviewed_at.clone());
+    let lifecycle = build_prompt_optimization_lifecycle(
+        id,
+        review_entry,
+        summary,
+        prompt_metrics,
+        gepa_queue,
+        prompt_canary_state,
+        prompt_rollback_available,
+    );
 
     PromptOptimizationProposal {
         id: id.to_string(),
         title: title.to_string(),
-        summary: summary.to_string(),
+        summary: proposal_summary.to_string(),
         evidence,
         expected_benefit,
         caveats,
@@ -1981,13 +2047,18 @@ pub(super) fn build_prompt_optimization_proposal(
         review_status,
         reviewed_at,
         reversible: true,
+        lifecycle,
         change_preview,
     }
 }
 
 pub(super) fn build_prompt_optimization_opportunities(
     summary: &PromptTelemetrySummary,
+    prompt_metrics: &[PromptEvolutionMetric],
     review_state: &PromptOptimizationReviewState,
+    gepa_queue: &serde_json::Value,
+    prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    prompt_rollback_available: bool,
 ) -> Vec<PromptOptimizationProposal> {
     if summary.sample_count < 6 {
         return Vec::new();
@@ -2016,6 +2087,11 @@ pub(super) fn build_prompt_optimization_opportunities(
         }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
+            summary,
+            prompt_metrics,
+            gepa_queue,
+            prompt_canary_state,
+            prompt_rollback_available,
             "prompt-opt-runtime-summary-compact",
             "Shorten setup instructions on simple chats",
             "Your agent reads a block of setup instructions every turn. On simple chats it doesn't really need them. Skipping it there makes those replies faster and cheaper.",
@@ -2080,6 +2156,11 @@ pub(super) fn build_prompt_optimization_opportunities(
         }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
+            summary,
+            prompt_metrics,
+            gepa_queue,
+            prompt_canary_state,
+            prompt_rollback_available,
             "prompt-opt-action-catalog-compact",
             "Simplify tool descriptions on tool-heavy chats",
             "Your agent sees a long technical description of every tool it can use. When many tools are available, that adds up. A shorter version speeds things up without removing any tools.",
@@ -2143,6 +2224,11 @@ pub(super) fn build_prompt_optimization_opportunities(
         }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
+            summary,
+            prompt_metrics,
+            gepa_queue,
+            prompt_canary_state,
+            prompt_rollback_available,
             "prompt-opt-deployed-app-scope",
             "Only mention your deployed apps when the chat is about apps",
             "Your agent gets a list of your deployed apps on every turn, even when the chat has nothing to do with apps. Sharing that list only on app-related chats makes other replies faster.",
@@ -2200,6 +2286,11 @@ pub(super) fn build_prompt_optimization_opportunities(
         }
         proposals.push(build_prompt_optimization_proposal(
             review_state,
+            summary,
+            prompt_metrics,
+            gepa_queue,
+            prompt_canary_state,
+            prompt_rollback_available,
             "prompt-opt-document-context-guard",
             "Trim long document quotes when the chat drifts off-topic",
             "When you share documents, your agent pastes big excerpts into every reply — even when the chat drifts to other topics. Trimming them on non-document turns speeds things up without affecting document-focused work.",
@@ -3392,6 +3483,7 @@ pub(super) async fn build_evolution_dev_response(
     }
     let learning_candidates = learning_candidate_rows
         .iter()
+        .filter(|candidate| candidate.candidate_type != "skill_patch")
         .map(|candidate| {
             build_learning_candidate_summary(
                 candidate,
@@ -3400,17 +3492,7 @@ pub(super) async fn build_evolution_dev_response(
             )
         })
         .collect::<Vec<_>>();
-    let skill_evolutions = learning_candidate_rows
-        .iter()
-        .filter_map(|candidate| {
-            build_skill_evolution_entry(
-                candidate,
-                &recent_experience_run_rows,
-                learning_candidate_replay_gates.get(&candidate.id),
-                learning_candidate_readiness.get(&candidate.id),
-            )
-        })
-        .collect::<Vec<_>>();
+    let skill_evolutions = Vec::<serde_json::Value>::new();
     let learning_item_rows = storage
         .list_active_experience_items_any_scope(
             &["constraint", "personal_fact", "lesson", "procedure"],
@@ -3463,19 +3545,42 @@ pub(super) async fn build_evolution_dev_response(
         &recent_experience_run_rows,
         &recent_trace_rows,
     );
-    let prompt_optimization_review_state = load_prompt_optimization_review_state(storage).await;
-    let prompt_canary_safety_events = load_prompt_canary_safety_events(storage).await;
-    let prompt_optimization_opportunities = build_prompt_optimization_opportunities(
-        &prompt_telemetry_summary,
-        &prompt_optimization_review_state,
-    );
     let prompt_metrics = aggregate_prompt_metrics(
         &recent_experience_run_rows,
         &prompt_tool_logs,
         &prompt_routing_logs,
         &prompt_llm_logs,
     );
+    let prompt_optimization_review_state = load_prompt_optimization_review_state(storage).await;
+    let prompt_canary_safety_events = load_prompt_canary_safety_events(storage).await;
     let prompt_canary_state = load_prompt_evolution_canary_state(storage).await;
+    let prompt_rollback_available = storage
+        .get(crate::core::self_evolve::PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let gepa_queue_for_lifecycle =
+        match crate::core::self_evolve::gepa_bridge::queue_status_snapshot(
+            &resolve_project_root(),
+            25,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({
+                "status": "unavailable",
+                "error": error.to_string(),
+            }),
+        };
+    let prompt_optimization_opportunities = build_prompt_optimization_opportunities(
+        &prompt_telemetry_summary,
+        &prompt_metrics,
+        &prompt_optimization_review_state,
+        &gepa_queue_for_lifecycle,
+        prompt_canary_state.as_ref(),
+        prompt_rollback_available,
+    );
     let prompt_insights = build_prompt_insights(&prompt_metrics, prompt_canary_state.as_ref());
     let specialist_prompt_canary_state = load_canary_state_by_key(
         storage,
@@ -4320,6 +4425,27 @@ async fn save_gepa_auto_skip(
     }
 }
 
+fn classify_gepa_auto_readiness_blocker(
+    readiness: &crate::core::self_evolve::gepa_bridge::GepaReadiness,
+) -> Option<&'static str> {
+    if !readiness.enabled {
+        return Some("gepa_disabled");
+    }
+    if !readiness.budget.allowed {
+        return Some("budget_paused");
+    }
+    if !readiness.python_ready || (!readiness.dspy_ready && !readiness.auto_setup) {
+        return Some("runtime_not_ready");
+    }
+    if !readiness.model_ready || !readiness.provider_key_ready {
+        return Some("model_not_ready");
+    }
+    if !readiness.ready {
+        return Some("model_or_runtime_not_ready");
+    }
+    None
+}
+
 async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
     let agent = {
         let agent = state.agent.read().await;
@@ -4353,24 +4479,8 @@ async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
         &agent.primary_model_id,
     )
     .await;
-    if !readiness.enabled {
-        save_gepa_auto_skip(&storage, auto_state, now, "gepa_disabled", 0, None).await;
-        return Ok(());
-    }
-    if !readiness.ready {
-        save_gepa_auto_skip(
-            &storage,
-            auto_state,
-            now,
-            "model_or_runtime_not_ready",
-            0,
-            None,
-        )
-        .await;
-        return Ok(());
-    }
-    if !readiness.budget.allowed {
-        save_gepa_auto_skip(&storage, auto_state, now, "budget_paused", 0, None).await;
+    if let Some(reason) = classify_gepa_auto_readiness_blocker(&readiness) {
+        save_gepa_auto_skip(&storage, auto_state, now, reason, 0, None).await;
         return Ok(());
     }
 
@@ -4439,7 +4549,7 @@ async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
 
     let pending_path = agent
         .queue_gepa_seed_run(
-            "Generate safer prompt candidates from recent private ArkEvolve evidence.",
+            "Generate safer prompt candidates from recent private Evolve evidence.",
             GEPA_AUTO_QUIET_WINDOW_SECS,
         )
         .await?;
@@ -4514,9 +4624,7 @@ async fn run_guided_routing_optimization(
         .unwrap_or(true)
         && crate::core::learning::load_learning_enabled(storage).await;
     if !enabled {
-        return Err(
-            "ArkEvolve is off. Turn on Self-evolve before running optimization.".to_string(),
-        );
+        return Err("Evolve is off. Turn on Self-evolve before running optimization.".to_string());
     }
 
     let llm = {
@@ -4710,7 +4818,7 @@ pub(super) async fn run_evolution_dev_action(
                 name: "self_evolve".to_string(),
                 arguments: serde_json::json!({
                     "mode": "gepa_run",
-                    "request": "Use recent ArkEvolve evidence to generate GEPA prompt candidates.",
+                    "request": "Use recent Evolve evidence to generate GEPA prompt candidates.",
                     "gepa_quiet_window_seconds": 60,
                     "apply_promotion": false,
                     "import_after_run": true,
@@ -4754,8 +4862,8 @@ pub(super) async fn run_evolution_dev_action(
                     .get("stderr_tail")
                     .and_then(|value| value.as_str())
                     .map(|error| format!("GEPA run failed: {}", error))
-                    .unwrap_or_else(|| "GEPA run failed; check ArkEvolve status.".to_string()),
-                _ => "GEPA run finished; check ArkEvolve status for details.".to_string(),
+                    .unwrap_or_else(|| "GEPA run failed; check Evolve status.".to_string()),
+                _ => "GEPA run finished; check Evolve status for details.".to_string(),
             }
         }
         "run_guided_optimization" => {
@@ -5337,72 +5445,15 @@ pub(super) async fn run_evolution_dev_action(
                     name.to_string()
                 }
                 "skill_patch" => {
-                    let action = skill_patch_string(&candidate, "action")
-                        .ok_or_else(|| anyhow::anyhow!("skill patch candidate missing action"));
-                    let skill_name = skill_patch_string(&candidate, "skill_name")
-                        .ok_or_else(|| anyhow::anyhow!("skill patch candidate missing skill_name"));
-                    let content = skill_patch_string(&candidate, "after_content")
-                        .or_else(|| skill_patch_string(&candidate, "content"))
-                        .ok_or_else(|| anyhow::anyhow!("skill patch candidate missing content"));
-                    let (action, skill_name, content) = match (action, skill_name, content) {
-                        (Ok(action), Ok(skill_name), Ok(content)) => (action, skill_name, content),
-                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(ErrorResponse {
-                                    error: error.to_string(),
-                                }),
-                            )
-                                .into_response();
-                        }
-                    };
-                    let evidence_markdown = build_skill_candidate_evidence_markdown(&candidate);
-                    let agent = state.agent.read().await;
-                    let semantic_review =
-                        crate::security::skill_review::review_skill_import_with_configured_model(
-                            &agent.llm,
-                            &agent.config_dir,
-                            "learning-candidate://skill-patch",
-                            &skill_name,
-                            &content,
-                        )
-                        .await;
-                    if semantic_review.policy.blocked {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: "Skill patch candidate was blocked by semantic skill security policy."
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error:
+                                "Evolve learning does not create or modify skills. Use the Skills page for manual skill design or import."
                                     .to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                    let result = match agent
-                        .runtime
-                        .apply_semantically_reviewed_skill_evolution_candidate(
-                            &action,
-                            &skill_name,
-                            &content,
-                            &evidence_markdown,
-                            &semantic_review,
-                        )
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(error) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(ErrorResponse {
-                                    error: format!(
-                                        "Failed to apply skill evolution candidate: {}",
-                                        error
-                                    ),
-                                }),
-                            )
-                                .into_response();
-                        }
-                    };
-                    result.approved_ref
+                        }),
+                    )
+                        .into_response();
                 }
                 "strategy" => {
                     if let Err(error) = parse_tool_strategy_candidate_profile(&candidate) {
@@ -5901,8 +5952,133 @@ pub(super) async fn run_evolution_dev_action(
                 )
                     .into_response();
             };
-            if let Err(error) =
-                update_prompt_optimization_review_state(&storage, proposal_id, "approved").await
+            let sample_baseline = current_prompt_telemetry_sample_count(&storage).await;
+            let project_root = resolve_project_root();
+            let gepa_queue = match crate::core::self_evolve::gepa_bridge::queue_status_snapshot(
+                &project_root,
+                50,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(_) => serde_json::Value::Null,
+            };
+            let existing_job = gepa_queue_item_for_proposal(&gepa_queue, proposal_id);
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut message = format!(
+                "Recorded approval for prompt optimization proposal '{}'.",
+                proposal_id
+            );
+            let lifecycle_status: String;
+            let lifecycle_reason: Option<String>;
+            let mut queued_job_path: Option<String> = None;
+            let mut queued_job_id: Option<String> = None;
+            let mut queued_at: Option<String> = None;
+
+            if let Some((job_status, item)) = existing_job {
+                let job = item.get("job").unwrap_or(item);
+                lifecycle_status = match job_status {
+                    "running" => "running_background_test".to_string(),
+                    "pending" => "queued_for_background_test".to_string(),
+                    "completed" => "background_test_completed".to_string(),
+                    "failed" => "blocked".to_string(),
+                    other => other.to_string(),
+                };
+                lifecycle_reason = Some(format!(
+                    "A background optimization job for this proposal is already {}.",
+                    job_status
+                ));
+                queued_job_id = job
+                    .get("job_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                queued_at = job
+                    .get("created_at")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                message.push_str(" Existing background work is already attached to this row.");
+            } else {
+                let readiness = crate::core::self_evolve::gepa_bridge::check_gepa_readiness(
+                    &storage,
+                    &project_root,
+                    &agent_config,
+                    &primary_model_id,
+                )
+                .await;
+                if let Some(blocker) = classify_gepa_auto_readiness_blocker(&readiness) {
+                    lifecycle_status = "blocked".to_string();
+                    lifecycle_reason = Some(format!(
+                        "Background optimization cannot start yet: {}.",
+                        blocker
+                    ));
+                    message.push_str(
+                        " Background optimization is blocked until Evolve readiness is fixed.",
+                    );
+                } else {
+                    let agent = {
+                        let agent = state.agent.read().await;
+                        agent.clone()
+                    };
+                    let request = format!(
+                        "Approved Evolve prompt optimization proposal '{}'. Generate reversible prompt/profile candidates for this approved optimization, keep safety and task success ahead of latency or token savings, and if a candidate passes evaluation import it as a limited canary rather than a stable deployment.",
+                        proposal_id
+                    );
+                    match agent
+                        .queue_gepa_prompt_optimization_run(
+                            proposal_id,
+                            &request,
+                            GEPA_AUTO_QUIET_WINDOW_SECS,
+                        )
+                        .await
+                    {
+                        Ok(path) => {
+                            lifecycle_status = "queued_for_background_test".to_string();
+                            lifecycle_reason = Some(
+                                "Background optimization queued and will run when AgentArk is idle."
+                                    .to_string(),
+                            );
+                            queued_job_path = Some(path);
+                            queued_at = Some(now.clone());
+                            message.push_str(
+                                " Background optimization is queued and attached to this row.",
+                            );
+                        }
+                        Err(error) => {
+                            lifecycle_status = "blocked".to_string();
+                            lifecycle_reason = Some(format!(
+                                "Failed to queue background optimization: {}.",
+                                error
+                            ));
+                            message.push_str(" Background optimization could not be queued.");
+                        }
+                    }
+                }
+            }
+
+            if let Err(error) = update_prompt_optimization_lifecycle(
+                &storage,
+                proposal_id,
+                "approved",
+                lifecycle_reason,
+                |lifecycle| {
+                    lifecycle.status = lifecycle_status;
+                    lifecycle.approved_at = lifecycle.approved_at.clone().or(Some(now.clone()));
+                    lifecycle.queued_at = queued_at.or_else(|| lifecycle.queued_at.clone());
+                    lifecycle.queued_job_id =
+                        queued_job_id.or_else(|| lifecycle.queued_job_id.clone());
+                    lifecycle.queued_job_path =
+                        queued_job_path.or_else(|| lifecycle.queued_job_path.clone());
+                    lifecycle.sample_baseline = if lifecycle.sample_baseline == 0 {
+                        sample_baseline
+                    } else {
+                        lifecycle.sample_baseline
+                    };
+                    lifecycle.sample_count = 0;
+                    lifecycle.required_samples = GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS;
+                    lifecycle.rollback_available = false;
+                },
+            )
+            .await
             {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -5912,10 +6088,7 @@ pub(super) async fn run_evolution_dev_action(
                 )
                     .into_response();
             }
-            format!(
-                "Recorded approval for prompt optimization proposal '{}'. No runtime prompt behavior changed.",
-                proposal_id
-            )
+            message
         }
         "reject_prompt_optimization_proposal" => {
             let Some(proposal_id) = request
@@ -5967,7 +6140,35 @@ pub(super) async fn run_evolution_dev_action(
                     .into_response();
             };
             match disable_prompt_canary_for_surface(&storage, surface).await {
-                Ok(message) => message,
+                Ok(message) => {
+                    if let Some(proposal_id) = request
+                        .proposal_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        if let Err(error) = update_prompt_optimization_lifecycle(
+                            &storage,
+                            proposal_id,
+                            "approved",
+                            Some("Live test stopped by user.".to_string()),
+                            |lifecycle| {
+                                lifecycle.status = "test_stopped".to_string();
+                                lifecycle.live_surface = Some(surface.to_string());
+                                lifecycle.rollback_available = false;
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                proposal_id = %proposal_id,
+                                error = %error,
+                                "Failed to update prompt optimization lifecycle after stopping canary"
+                            );
+                        }
+                    }
+                    message
+                }
                 Err(error) => {
                     return (
                         StatusCode::BAD_REQUEST,
@@ -5996,8 +6197,55 @@ pub(super) async fn run_evolution_dev_action(
                 )
                     .into_response();
             };
+            let canary_before_promotion = match prompt_runtime_surface(surface) {
+                Ok(runtime_surface) => {
+                    load_prompt_canary_state_for_surface(&storage, &runtime_surface)
+                        .await
+                        .ok()
+                }
+                Err(_) => None,
+            };
             match promote_prompt_canary_to_baseline(&storage, surface).await {
-                Ok(message) => message,
+                Ok(message) => {
+                    if let Some(proposal_id) = request
+                        .proposal_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        if let Err(error) = update_prompt_optimization_lifecycle(
+                            &storage,
+                            proposal_id,
+                            "approved",
+                            Some("Accepted as stable by user; monitoring continues with rollback available.".to_string()),
+                            |lifecycle| {
+                                lifecycle.status = "deployed".to_string();
+                                lifecycle.deployed_at = Some(now.clone());
+                                lifecycle.live_surface = Some(surface.to_string());
+                                if let Some(canary) = canary_before_promotion.as_ref() {
+                                    lifecycle.baseline_version =
+                                        Some(canary.baseline_version.clone());
+                                    lifecycle.candidate_version =
+                                        Some(canary.candidate_version.clone());
+                                    lifecycle.required_samples = canary.min_samples_per_version;
+                                    lifecycle.rollout_percent = Some(100);
+                                }
+                                lifecycle.rollback_available = true;
+                                lifecycle.rollback_recommended = false;
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                proposal_id = %proposal_id,
+                                error = %error,
+                                "Failed to update prompt optimization lifecycle after stable promotion"
+                            );
+                        }
+                    }
+                    message
+                }
                 Err(error) => {
                     return (
                         StatusCode::BAD_REQUEST,
@@ -6027,7 +6275,40 @@ pub(super) async fn run_evolution_dev_action(
                     .into_response();
             };
             match rollback_prompt_baseline_for_surface(&storage, surface).await {
-                Ok(message) => message,
+                Ok(message) => {
+                    if let Some(proposal_id) = request
+                        .proposal_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        if let Err(error) = update_prompt_optimization_lifecycle(
+                            &storage,
+                            proposal_id,
+                            "approved",
+                            Some("Rolled back by user; treat this optimization as harmful unless new evidence proves otherwise.".to_string()),
+                            |lifecycle| {
+                                lifecycle.status = "rolled_back".to_string();
+                                lifecycle.live_surface = Some(surface.to_string());
+                                lifecycle.rollback_available = false;
+                                lifecycle.rollback_recommended = false;
+                                lifecycle.monitoring_regressions.push(
+                                    "User rollback recorded this candidate as a bad outcome."
+                                        .to_string(),
+                                );
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                proposal_id = %proposal_id,
+                                error = %error,
+                                "Failed to update prompt optimization lifecycle after rollback"
+                            );
+                        }
+                    }
+                    message
+                }
                 Err(error) => {
                     return (
                         StatusCode::BAD_REQUEST,
@@ -6157,4 +6438,71 @@ pub(super) async fn run_evolution_dev_action(
         "dev": dev
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_gepa_status() -> crate::core::self_evolve::gepa_bridge::GepaReadiness {
+        crate::core::self_evolve::gepa_bridge::GepaReadiness {
+            ready: true,
+            enabled: true,
+            python_ready: true,
+            dspy_ready: true,
+            model_ready: true,
+            provider_key_ready: true,
+            venv_path: ".venv".to_string(),
+            python_path: "python".to_string(),
+            model: Some("test-model".to_string()),
+            model_slot: Some("primary".to_string()),
+            provider: Some("test-provider".to_string()),
+            auto_setup: true,
+            budget: crate::core::self_evolve::gepa_bridge::GepaBudgetStatus {
+                daily_budget_usd: 1.0,
+                per_run_budget_usd: 0.5,
+                max_runs_per_day: 1,
+                used_today_usd: 0.0,
+                runs_today: 0,
+                remaining_today_usd: 1.0,
+                allowed: true,
+                reason: None,
+            },
+            issues: Vec::new(),
+            bundled: true,
+        }
+    }
+
+    #[test]
+    fn gepa_auto_readiness_blocker_prefers_budget_over_generic_not_ready() {
+        let mut readiness = ready_gepa_status();
+        readiness.ready = false;
+        readiness.budget.allowed = false;
+        readiness.budget.reason = Some("GEPA daily run limit has been reached.".to_string());
+
+        assert_eq!(
+            classify_gepa_auto_readiness_blocker(&readiness),
+            Some("budget_paused")
+        );
+    }
+
+    #[test]
+    fn gepa_auto_readiness_blocker_distinguishes_model_and_runtime_gates() {
+        let mut model_blocked = ready_gepa_status();
+        model_blocked.ready = false;
+        model_blocked.provider_key_ready = false;
+
+        let mut runtime_blocked = ready_gepa_status();
+        runtime_blocked.ready = false;
+        runtime_blocked.python_ready = false;
+
+        assert_eq!(
+            classify_gepa_auto_readiness_blocker(&model_blocked),
+            Some("model_not_ready")
+        );
+        assert_eq!(
+            classify_gepa_auto_readiness_blocker(&runtime_blocked),
+            Some("runtime_not_ready")
+        );
+    }
 }

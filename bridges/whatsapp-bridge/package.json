@@ -16,6 +16,6 @@
     "file-type": "^21.3.2",
     "music-metadata": "^11.12.2",
     "path-to-regexp": "^0.1.13",
-    "protobufjs": "^7.5.5"
+    "protobufjs": "^7.5.8"
   }
 }

@@ -198,6 +198,8 @@ pub(super) async fn list_facts(
                 items.push(serde_json::json!({
                     "id": f.id,
                     "fact": f.fact,
+                    "key": f.key,
+                    "value": f.value,
                     "confidence": f.confidence,
                     "memory_kind": f.memory_kind.clone(),
                     "memory_category": f.memory_category.clone(),
@@ -271,7 +273,7 @@ pub(super) async fn delete_memory_fact(
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "item is not a deletable ArkMemory learned memory".to_string(),
+                error: "item is not a deletable Memory learned memory".to_string(),
             }),
         )
             .into_response();
@@ -287,6 +289,210 @@ pub(super) async fn delete_memory_fact(
                 "deleted": deleted,
                 "id": memory_id,
             })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn memory_fact_key_for_value_edit(item: &crate::storage::experience_item::Model) -> Option<String> {
+    item.metadata
+        .get("key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            item.content
+                .split_once(':')
+                .map(|(key, _)| key.trim())
+                .filter(|key| !key.is_empty() && !key.chars().any(char::is_whitespace))
+                .map(str::to_string)
+        })
+}
+
+fn memory_fact_content_from_value_edit(
+    item: &crate::storage::experience_item::Model,
+    value: &str,
+) -> String {
+    let (key, _) = memory_fact_repaired_key_value(item);
+    match key {
+        Some(key) => format!("{key}: {}", value.trim()),
+        None => value.trim().to_string(),
+    }
+}
+
+fn memory_fact_value_from_content(key: Option<&str>, content: &str) -> String {
+    let trimmed = content.trim();
+    if let Some(key) = key.map(str::trim).filter(|value| !value.is_empty()) {
+        let prefix = format!("{key}:");
+        if let Some(value) = trimmed.strip_prefix(&prefix) {
+            return value.trim().to_string();
+        }
+        return trimmed.to_string();
+    }
+    if let Some((candidate_key, value)) = trimmed.split_once(':') {
+        let candidate_key = candidate_key.trim();
+        if !candidate_key.is_empty() && !candidate_key.chars().any(char::is_whitespace) {
+            return value.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn memory_fact_repair_allows_value_suffix(item: &crate::storage::experience_item::Model) -> bool {
+    let memory_kind = item
+        .metadata
+        .get("memory_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    crate::core::memory_schema::memory_category_from_metadata(&item.metadata, memory_kind)
+        == crate::core::memory_schema::MEMORY_CATEGORY_PROFILE_FACT
+}
+
+fn memory_fact_repaired_key_value(
+    item: &crate::storage::experience_item::Model,
+) -> (Option<String>, String) {
+    let key = memory_fact_key_for_value_edit(item);
+    let value = memory_fact_value_from_content(key.as_deref(), &item.content);
+    match key {
+        Some(raw_key) => {
+            match crate::core::memory_schema::repair_memory_slot_key_and_value(
+                &raw_key,
+                &value,
+                memory_fact_repair_allows_value_suffix(item),
+            ) {
+                Some((key, repaired_value)) => (Some(key), repaired_value.unwrap_or(value)),
+                None => (Some(raw_key), value),
+            }
+        }
+        None => (None, value),
+    }
+}
+
+fn memory_fact_response_payload(
+    item: &crate::storage::experience_item::Model,
+) -> serde_json::Value {
+    let memory_kind = item
+        .metadata
+        .get("memory_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (key, value) = memory_fact_repaired_key_value(item);
+    serde_json::json!({
+        "id": item.id,
+        "fact": item.content,
+        "key": key,
+        "value": value,
+        "confidence": item.confidence,
+        "memory_kind": memory_kind,
+        "memory_category": crate::core::memory_schema::memory_category_from_metadata(
+            &item.metadata,
+            memory_kind,
+        ),
+        "topics": crate::core::memory_schema::normalize_memory_topics(
+            item.metadata.get("topics"),
+            8,
+        ),
+        "scope": item.scope,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    })
+}
+
+pub(super) async fn update_memory_fact_value(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateMemoryFactValueRequest>,
+) -> Response {
+    let memory_id = id.trim();
+    if memory_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "memory id is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let edited_value = request
+        .value
+        .or(request.content)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(edited_value) = edited_value else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "memory value is required".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let project_id: Option<&str> = None;
+    let agent = state.agent.read().await;
+    let item = match agent.storage.get_experience_item(memory_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "memory not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if item.status != "active"
+        || !arkmemory_item_is_memory(&item)
+        || !arkmemory_item_visible_for_project(&item, project_id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "item is not an editable Memory learned memory".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let next_content = memory_fact_content_from_value_edit(&item, &edited_value);
+    match agent
+        .storage
+        .update_experience_item_content(memory_id, &next_content)
+        .await
+    {
+        Ok(Some(updated)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "id": memory_id,
+                "memory": memory_fact_response_payload(&updated),
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "memory not found".to_string(),
+            }),
         )
             .into_response(),
         Err(error) => (
@@ -370,6 +576,101 @@ fn memory_operation_evidence_source_refs(
 #[cfg(test)]
 mod memory_control_tests {
     use super::*;
+
+    fn memory_fact_test_item(
+        content: &str,
+        metadata: serde_json::Value,
+    ) -> crate::storage::experience_item::Model {
+        let now = "2026-05-22T00:00:00Z".to_string();
+        crate::storage::experience_item::Model {
+            id: "memory-1".to_string(),
+            kind: "personal_fact".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            title: "Learned user memory".to_string(),
+            content: content.to_string(),
+            normalized_key: "user_memory::user_first_name::permanent".to_string(),
+            confidence: 0.95,
+            support_count: 1,
+            contradiction_count: 0,
+            status: "active".to_string(),
+            metadata,
+            last_supported_at: Some(now.clone()),
+            last_contradicted_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn memory_fact_payload_exposes_structured_key_and_plain_value() {
+        let item = memory_fact_test_item(
+            "user_first_name: Alex",
+            serde_json::json!({
+                "key": "user_first_name",
+                "memory_kind": "identity",
+                "memory_category": "profile_fact",
+                "topics": ["identity"],
+            }),
+        );
+
+        let payload = memory_fact_response_payload(&item);
+
+        assert_eq!(
+            payload.get("fact").and_then(|value| value.as_str()),
+            Some("user_first_name: Alex")
+        );
+        assert_eq!(
+            payload.get("key").and_then(|value| value.as_str()),
+            Some("user_first_name")
+        );
+        assert_eq!(
+            payload.get("value").and_then(|value| value.as_str()),
+            Some("Alex")
+        );
+        assert_eq!(
+            memory_fact_content_from_value_edit(&item, "Alexandra"),
+            "user_first_name: Alexandra"
+        );
+    }
+
+    #[test]
+    fn memory_fact_payload_repairs_existing_key_that_contains_value() {
+        let item = memory_fact_test_item(
+            "user_name_alex: The user's name is Alex.",
+            serde_json::json!({
+                "key": "user_name_alex",
+                "memory_kind": "identity",
+                "memory_category": "profile_fact",
+                "topics": ["identity"],
+            }),
+        );
+
+        let payload = memory_fact_response_payload(&item);
+
+        assert_eq!(
+            payload.get("key").and_then(|value| value.as_str()),
+            Some("user_name")
+        );
+        assert_eq!(
+            payload.get("value").and_then(|value| value.as_str()),
+            Some("Alex")
+        );
+        assert_eq!(
+            memory_fact_content_from_value_edit(&item, "Alexandra"),
+            "user_name: Alexandra"
+        );
+    }
+
+    #[test]
+    fn memory_fact_value_does_not_strip_unrelated_prefix_when_key_is_known() {
+        assert_eq!(
+            memory_fact_value_from_content(Some("user_first_name"), "display_name: Alex"),
+            "display_name: Alex"
+        );
+    }
 
     #[test]
     fn fact_source_refs_parse_legacy_and_structured_sources() {
@@ -554,6 +855,14 @@ async fn memory_fact_evidence_sources(
     sources.sort();
     sources.dedup();
     sources
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct UpdateMemoryFactValueRequest {
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -936,7 +1245,7 @@ pub(super) async fn delete_knowledge_item(
     }
 }
 
-// ==================== ArkMemory Endpoints ====================
+// ==================== Memory Endpoints ====================
 
 pub(super) const ARKMEMORY_MEMORY_CANDIDATE_TYPES: &[&str] = &[
     "memory_deprecate",
@@ -963,12 +1272,12 @@ const ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS: u64 = 8;
 const ARKMEMORY_LEARNED_REVIEW_MAX_OUTPUT_TOKENS: u32 = 360;
 
 #[derive(Debug, Deserialize)]
-pub(super) struct ArkMemoryHealthReviewRequest {
+pub(super) struct MemoryHealthReviewRequest {
     outcome: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct ArkMemoryCaptureReviewPattern {
+struct MemoryCaptureReviewPattern {
     similar_review_count: usize,
     expected_sensitive_skip_count: usize,
     false_positive_safe_memory_count: usize,
@@ -976,7 +1285,7 @@ struct ArkMemoryCaptureReviewPattern {
 }
 
 #[derive(Clone, Debug)]
-struct ArkMemoryCaptureReviewContext {
+struct MemoryCaptureReviewContext {
     source_semantic_text: String,
     source_redactions: Vec<String>,
     status: String,
@@ -986,16 +1295,16 @@ struct ArkMemoryCaptureReviewContext {
 }
 
 #[derive(Clone, Debug)]
-struct ArkMemoryLearnedReviewExample {
+struct MemoryLearnedReviewExample {
     event_id: String,
     outcome: &'static str,
     reviewed_at: Option<String>,
     failure_key: String,
-    context: ArkMemoryCaptureReviewContext,
+    context: MemoryCaptureReviewContext,
 }
 
 #[derive(Clone, Debug)]
-struct ArkMemoryLearnedReviewDecision {
+struct MemoryLearnedReviewDecision {
     apply: bool,
     outcome: Option<String>,
     confidence: f64,
@@ -1094,10 +1403,10 @@ fn arkmemory_known_capture_review_outcome(raw: &str) -> Option<&'static str> {
 fn arkmemory_capture_review_context_from_source_text(
     event: &crate::storage::memory_capture_event::Model,
     source_text: &str,
-) -> ArkMemoryCaptureReviewContext {
+) -> MemoryCaptureReviewContext {
     let redacted = crate::security::redact_secret_input(source_text);
     let (last_error_code, _) = arkmemory_capture_event_error_summary(event);
-    ArkMemoryCaptureReviewContext {
+    MemoryCaptureReviewContext {
         source_semantic_text: arkmemory_truncate_chars(&redacted.text, 700),
         source_redactions: redacted.redactions,
         status: event.status.trim().to_string(),
@@ -1109,7 +1418,7 @@ fn arkmemory_capture_review_context_from_source_text(
 
 fn arkmemory_capture_review_context_from_metadata(
     event: &crate::storage::memory_capture_event::Model,
-) -> Option<ArkMemoryCaptureReviewContext> {
+) -> Option<MemoryCaptureReviewContext> {
     let review_context = event
         .attempt_metadata
         .get("user_review")
@@ -1133,7 +1442,7 @@ fn arkmemory_capture_review_context_from_metadata(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Some(ArkMemoryCaptureReviewContext {
+    Some(MemoryCaptureReviewContext {
         source_semantic_text,
         source_redactions,
         status: review_context
@@ -1166,7 +1475,7 @@ fn arkmemory_capture_review_context_from_metadata(
 async fn arkmemory_capture_review_context(
     storage: &crate::storage::Storage,
     event: &crate::storage::memory_capture_event::Model,
-) -> Option<ArkMemoryCaptureReviewContext> {
+) -> Option<MemoryCaptureReviewContext> {
     if let Some(context) = arkmemory_capture_review_context_from_metadata(event) {
         return Some(context);
     }
@@ -1194,7 +1503,7 @@ async fn arkmemory_capture_review_context(
 }
 
 fn arkmemory_capture_review_context_json(
-    context: &ArkMemoryCaptureReviewContext,
+    context: &MemoryCaptureReviewContext,
 ) -> serde_json::Value {
     serde_json::json!({
         "source_semantic_text": context.source_semantic_text.clone(),
@@ -1206,9 +1515,7 @@ fn arkmemory_capture_review_context_json(
     })
 }
 
-fn arkmemory_capture_review_context_embedding_text(
-    context: &ArkMemoryCaptureReviewContext,
-) -> String {
+fn arkmemory_capture_review_context_embedding_text(context: &MemoryCaptureReviewContext) -> String {
     format!(
         "source: {}\nredactions: {}\nstatus: {}\ncapture_kind: {}\nchannel: {}\nerror: {}",
         context.source_semantic_text,
@@ -1233,9 +1540,9 @@ fn arkmemory_extract_json_object(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
 }
 
-fn arkmemory_parse_learned_review_decision(text: &str) -> Option<ArkMemoryLearnedReviewDecision> {
+fn arkmemory_parse_learned_review_decision(text: &str) -> Option<MemoryLearnedReviewDecision> {
     let json = arkmemory_extract_json_object(text)?;
-    Some(ArkMemoryLearnedReviewDecision {
+    Some(MemoryLearnedReviewDecision {
         apply: json
             .get("apply")
             .and_then(|value| value.as_bool())
@@ -1521,8 +1828,8 @@ fn arkmemory_reviewed_capture_failure_signature_key(
 
 fn arkmemory_capture_review_pattern_summary(
     reviewed_events: &[crate::storage::memory_capture_event::Model],
-) -> std::collections::HashMap<String, ArkMemoryCaptureReviewPattern> {
-    let mut patterns = std::collections::HashMap::<String, ArkMemoryCaptureReviewPattern>::new();
+) -> std::collections::HashMap<String, MemoryCaptureReviewPattern> {
+    let mut patterns = std::collections::HashMap::<String, MemoryCaptureReviewPattern>::new();
     for event in reviewed_events {
         let Some(key) = arkmemory_reviewed_capture_failure_signature_key(event) else {
             continue;
@@ -1545,7 +1852,7 @@ fn arkmemory_capture_review_pattern_summary(
 }
 
 fn arkmemory_capture_review_pattern_payload(
-    pattern: Option<&ArkMemoryCaptureReviewPattern>,
+    pattern: Option<&MemoryCaptureReviewPattern>,
 ) -> serde_json::Value {
     let Some(pattern) = pattern else {
         return serde_json::Value::Null;
@@ -1673,7 +1980,7 @@ fn arkmemory_memory_operation_source_context(
 
 fn arkmemory_capture_event_finding(
     event: crate::storage::memory_capture_event::Model,
-    review_pattern: Option<&ArkMemoryCaptureReviewPattern>,
+    review_pattern: Option<&MemoryCaptureReviewPattern>,
     source_context: serde_json::Value,
 ) -> serde_json::Value {
     let capture_event_id = event.id.clone();
@@ -1760,11 +2067,11 @@ fn arkmemory_capture_event_learned_review_finding(
         });
     let detail = match confidence {
         Some(value) => format!(
-            "ArkMemory auto-applied learned review feedback with {:.0}% confidence. You can confirm or correct this outcome.",
+            "Memory auto-applied learned review feedback with {:.0}% confidence. You can confirm or correct this outcome.",
             (value * 100.0).clamp(0.0, 100.0)
         ),
         None => {
-            "ArkMemory auto-applied learned review feedback. You can confirm or correct this outcome."
+            "Memory auto-applied learned review feedback. You can confirm or correct this outcome."
                 .to_string()
         }
     };
@@ -1823,14 +2130,14 @@ pub(super) fn arkmemory_item_visible_for_project(
 }
 
 #[derive(Default)]
-pub(super) struct ArkMemoryEventContext {
+pub(super) struct MemoryEventContext {
     scope: Option<String>,
     project_id: Option<String>,
     conversation_id: Option<String>,
     source_ref: Option<String>,
 }
 
-impl ArkMemoryEventContext {
+impl MemoryEventContext {
     fn from_memory(item: &crate::storage::experience_item::Model) -> Self {
         Self {
             scope: Some(item.scope.clone()),
@@ -1897,13 +2204,13 @@ pub(super) async fn arkmemory_visible_open_memory_candidates(
                     &candidate.id,
                     "applying",
                     "draft",
-                    Some("Reset stale ArkMemory apply claim."),
+                    Some("Reset stale Memory apply claim."),
                     None,
                 )
                 .await?;
             if reset {
                 candidate.approval_status = "draft".to_string();
-                candidate.review_notes = Some("Reset stale ArkMemory apply claim.".to_string());
+                candidate.review_notes = Some("Reset stale Memory apply claim.".to_string());
                 candidate.updated_at = chrono::Utc::now().to_rfc3339();
                 visible.push(candidate);
             }
@@ -1937,13 +2244,13 @@ pub(super) async fn arkmemory_latest_open_candidate_for_subject(
                     &row.id,
                     "applying",
                     "draft",
-                    Some("Reset stale ArkMemory apply claim."),
+                    Some("Reset stale Memory apply claim."),
                     None,
                 )
                 .await?;
             if reset {
                 row.approval_status = "draft".to_string();
-                row.review_notes = Some("Reset stale ArkMemory apply claim.".to_string());
+                row.review_notes = Some("Reset stale Memory apply claim.".to_string());
                 row.updated_at = chrono::Utc::now().to_rfc3339();
                 open.push(row);
             }
@@ -2088,7 +2395,7 @@ fn arkmemory_capture_event_has_learned_review(
 
 fn arkmemory_learned_review_example_compatible(
     event: &crate::storage::memory_capture_event::Model,
-    example: &ArkMemoryLearnedReviewExample,
+    example: &MemoryLearnedReviewExample,
 ) -> bool {
     example.context.status == event.status.trim()
         && example.context.capture_kind == event.capture_kind.trim()
@@ -2096,7 +2403,7 @@ fn arkmemory_learned_review_example_compatible(
 
 async fn arkmemory_learned_review_examples(
     storage: &crate::storage::Storage,
-) -> Result<Vec<ArkMemoryLearnedReviewExample>> {
+) -> Result<Vec<MemoryLearnedReviewExample>> {
     let reviewed_events = storage
         .list_memory_capture_events_by_statuses_all_scopes(
             ARKMEMORY_REVIEWED_CAPTURE_STATUSES,
@@ -2114,7 +2421,7 @@ async fn arkmemory_learned_review_examples(
         let Some(context) = arkmemory_capture_review_context(storage, &event).await else {
             continue;
         };
-        examples.push(ArkMemoryLearnedReviewExample {
+        examples.push(MemoryLearnedReviewExample {
             event_id: event.id.clone(),
             outcome,
             reviewed_at: event
@@ -2132,9 +2439,9 @@ async fn arkmemory_learned_review_examples(
 
 async fn arkmemory_rank_learned_review_examples(
     embedder: Option<&crate::core::embeddings::EmbeddingClient>,
-    current: &ArkMemoryCaptureReviewContext,
-    examples: &[ArkMemoryLearnedReviewExample],
-) -> Vec<ArkMemoryLearnedReviewExample> {
+    current: &MemoryCaptureReviewContext,
+    examples: &[MemoryLearnedReviewExample],
+) -> Vec<MemoryLearnedReviewExample> {
     if examples.is_empty() {
         return Vec::new();
     }
@@ -2183,18 +2490,18 @@ async fn arkmemory_rank_learned_review_examples(
             }
             Ok(Ok(_)) => {
                 tracing::debug!(
-                    "ArkMemory learned review embedding ranker returned unexpected vector count"
+                    "Memory learned review embedding ranker returned unexpected vector count"
                 );
             }
             Ok(Err(error)) => {
                 tracing::debug!(
-                    "ArkMemory learned review embedding ranker unavailable: {}",
+                    "Memory learned review embedding ranker unavailable: {}",
                     error
                 );
             }
             Err(_) => {
                 tracing::debug!(
-                    "ArkMemory learned review embedding ranker timed out after {}s",
+                    "Memory learned review embedding ranker timed out after {}s",
                     ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS
                 );
             }
@@ -2209,8 +2516,8 @@ async fn arkmemory_rank_learned_review_examples(
 
 fn arkmemory_learned_review_prompt(
     current: &crate::storage::memory_capture_event::Model,
-    current_context: &ArkMemoryCaptureReviewContext,
-    examples: &[ArkMemoryLearnedReviewExample],
+    current_context: &MemoryCaptureReviewContext,
+    examples: &[MemoryLearnedReviewExample],
 ) -> String {
     let examples_payload = examples
         .iter()
@@ -2224,7 +2531,7 @@ fn arkmemory_learned_review_prompt(
         })
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&serde_json::json!({
-        "task": "Decide whether prior human ArkMemory health-review feedback should apply to the current capture finding.",
+        "task": "Decide whether prior human Memory health-review feedback should apply to the current capture finding.",
         "decision_rules": [
             "Compare semantic meaning, intent, subject, polarity, and source context after secret redaction.",
             "Do not rely on exact wording, punctuation, casing, spacing, token text, or one shared word.",
@@ -2256,10 +2563,10 @@ fn arkmemory_learned_review_prompt(
 async fn arkmemory_judge_learned_review(
     llm: &crate::core::LlmClient,
     current: &crate::storage::memory_capture_event::Model,
-    current_context: &ArkMemoryCaptureReviewContext,
-    examples: &[ArkMemoryLearnedReviewExample],
-) -> Option<ArkMemoryLearnedReviewDecision> {
-    let system = "You are a strict semantic reviewer for ArkMemory health feedback. \
+    current_context: &MemoryCaptureReviewContext,
+    examples: &[MemoryLearnedReviewExample],
+) -> Option<MemoryLearnedReviewDecision> {
+    let system = "You are a strict semantic reviewer for Memory health feedback. \
         You apply previous human review outcomes only when the current case has the same meaning and review intent. \
         Return only the required JSON object.";
     let user = arkmemory_learned_review_prompt(current, current_context, examples);
@@ -2271,12 +2578,12 @@ async fn arkmemory_judge_learned_review(
     {
         Ok(Ok(response)) => arkmemory_parse_learned_review_decision(&response.content),
         Ok(Err(error)) => {
-            tracing::debug!("ArkMemory learned reviewer model call failed: {}", error);
+            tracing::debug!("Memory learned reviewer model call failed: {}", error);
             None
         }
         Err(_) => {
             tracing::debug!(
-                "ArkMemory learned reviewer timed out after {}s",
+                "Memory learned reviewer timed out after {}s",
                 ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS
             );
             None
@@ -2285,8 +2592,8 @@ async fn arkmemory_judge_learned_review(
 }
 
 fn arkmemory_learned_review_can_apply(
-    decision: &ArkMemoryLearnedReviewDecision,
-    examples: &[ArkMemoryLearnedReviewExample],
+    decision: &MemoryLearnedReviewDecision,
+    examples: &[MemoryLearnedReviewExample],
 ) -> bool {
     if !decision.apply || decision.confidence < ARKMEMORY_LEARNED_REVIEW_MIN_CONFIDENCE {
         return false;
@@ -2616,7 +2923,7 @@ pub(super) async fn arkmemory_build_health_findings(
                 "detail": operation
                     .review_notes
                     .clone()
-                    .unwrap_or_else(|| "This staged memory operation still needs ArkMemory review.".to_string()),
+                    .unwrap_or_else(|| "This staged memory operation still needs Memory review.".to_string()),
                 "source_context": source_context,
                 "operation": {
                     "id": operation_id,
@@ -2666,7 +2973,7 @@ pub(super) fn arkmemory_event_model_with_id(
     related_memory_id: Option<String>,
     summary: impl Into<String>,
     metadata: serde_json::Value,
-    context: ArkMemoryEventContext,
+    context: MemoryEventContext,
 ) -> crate::storage::recall_event::Model {
     let now = chrono::Utc::now().to_rfc3339();
     crate::storage::recall_event::Model {
@@ -2699,7 +3006,7 @@ pub(super) fn arkmemory_event_model(
     related_memory_id: Option<String>,
     summary: impl Into<String>,
     metadata: serde_json::Value,
-    context: ArkMemoryEventContext,
+    context: MemoryEventContext,
 ) -> crate::storage::recall_event::Model {
     arkmemory_event_model_with_id(
         uuid::Uuid::new_v4().to_string(),
@@ -2719,7 +3026,7 @@ pub(super) async fn arkmemory_record_event(
     related_memory_id: Option<String>,
     summary: impl Into<String>,
     metadata: serde_json::Value,
-    context: ArkMemoryEventContext,
+    context: MemoryEventContext,
 ) -> Result<()> {
     let event = arkmemory_event_model(
         event_type,
@@ -2740,7 +3047,7 @@ pub(super) async fn arkmemory_record_event_once(
     related_memory_id: Option<String>,
     summary: impl Into<String>,
     metadata: serde_json::Value,
-    context: ArkMemoryEventContext,
+    context: MemoryEventContext,
 ) -> Result<()> {
     let event = arkmemory_event_model_with_id(
         event_id,
@@ -2790,7 +3097,7 @@ pub(super) async fn arkmemory_apply_memory_candidate(
             candidate_id,
             "draft",
             "applying",
-            Some("Applying from ArkMemory."),
+            Some("Applying from Memory."),
             None,
         )
         .await?;
@@ -2805,7 +3112,7 @@ pub(super) async fn arkmemory_apply_memory_candidate(
                     candidate_id,
                     "applying",
                     "approved",
-                    Some("Approved from ArkMemory."),
+                    Some("Approved from Memory."),
                     Some(&approved_ref),
                 )
                 .await?;
@@ -2868,7 +3175,7 @@ pub(super) async fn arkmemory_apply_claimed_memory_candidate(
                     "operation_id": operation_id,
                     "operation_type": candidate.candidate_type.clone(),
                 }),
-                ArkMemoryEventContext::from_candidate(candidate),
+                MemoryEventContext::from_candidate(candidate),
             )
             .await?;
             approved_ref
@@ -2905,7 +3212,7 @@ pub(super) async fn arkmemory_apply_claimed_memory_candidate(
                 None,
                 format!("Approved memory deprecation for {}", item_id),
                 serde_json::json!({ "candidate_id": candidate.id.clone(), "next_status": next_status }),
-                ArkMemoryEventContext::from_memory(&item),
+                MemoryEventContext::from_memory(&item),
             )
             .await?;
             item_id.to_string()
@@ -2965,7 +3272,7 @@ pub(super) async fn arkmemory_apply_claimed_memory_candidate(
                 Some(source_item_id.to_string()),
                 format!("Approved memory merge into {}", target_item_id),
                 serde_json::json!({ "candidate_id": candidate.id.clone() }),
-                ArkMemoryEventContext::from_memory(&target_item),
+                MemoryEventContext::from_memory(&target_item),
             )
             .await?;
             target_item_id.to_string()
@@ -3107,7 +3414,7 @@ pub(super) async fn arkmemory_queue(
                         Ok(gate) => Some(gate),
                         Err(error) => {
                             tracing::warn!(
-                                "Failed to evaluate ArkMemory replay gate for candidate '{}': {}",
+                                "Failed to evaluate Memory replay gate for candidate '{}': {}",
                                 item.id,
                                 error
                             );
@@ -3185,7 +3492,7 @@ pub(super) async fn arkmemory_reject_queue_item(
                 &id,
                 "draft",
                 "rejected",
-                Some("Rejected from ArkMemory."),
+                Some("Rejected from Memory."),
                 None,
             )
             .await?;
@@ -3202,7 +3509,7 @@ pub(super) async fn arkmemory_reject_queue_item(
             if let Some(mut operation) = storage.get_memory_operation(operation_id).await? {
                 operation.status = "rejected".to_string();
                 operation.reviewed_at = Some(chrono::Utc::now().to_rfc3339());
-                operation.review_notes = Some("Rejected from ArkMemory.".to_string());
+                operation.review_notes = Some("Rejected from Memory.".to_string());
                 operation.updated_at = chrono::Utc::now().to_rfc3339();
                 storage.upsert_memory_operation(&operation).await?;
             }
@@ -3214,7 +3521,7 @@ pub(super) async fn arkmemory_reject_queue_item(
             None,
             format!("Rejected memory queue item {}", id),
             serde_json::json!({ "candidate_id": id }),
-            ArkMemoryEventContext::from_candidate(&candidate),
+            MemoryEventContext::from_candidate(&candidate),
         )
         .await?;
         Ok::<(), anyhow::Error>(())
@@ -3250,6 +3557,42 @@ pub(super) async fn arkmemory_ledger(
         .await
     {
         Ok(events) => {
+            let mut event_payloads = Vec::with_capacity(events.len());
+            for event in events {
+                let mut payload = serde_json::to_value(&event).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "id": event.id,
+                        "event_type": event.event_type,
+                        "created_at": event.created_at,
+                    })
+                });
+                if let Some(memory_id) = event
+                    .memory_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    let current_memory = agent
+                        .storage
+                        .get_experience_item(memory_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert(
+                            "memory_current_exists".to_string(),
+                            serde_json::Value::Bool(current_memory.is_some()),
+                        );
+                        if let Some(current_memory) = current_memory {
+                            object.insert(
+                                "memory_current_status".to_string(),
+                                serde_json::Value::String(current_memory.status),
+                            );
+                        }
+                    }
+                }
+                event_payloads.push(payload);
+            }
             let total = agent
                 .storage
                 .count_recall_events(project_id)
@@ -3258,7 +3601,7 @@ pub(super) async fn arkmemory_ledger(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "events": events,
+                    "events": event_payloads,
                     "total": total,
                     "limit": limit,
                     "offset": offset,
@@ -3307,7 +3650,7 @@ pub(super) async fn arkmemory_rollback_ledger_event(
             event.related_memory_id.clone(),
             format!("Rolled back memory ledger event {}", id),
             serde_json::json!({ "rolled_back_event_id": id.clone() }),
-            ArkMemoryEventContext::from_memory(&previous),
+            MemoryEventContext::from_memory(&previous),
         );
         let marked = storage
             .rollback_recall_event_with_memory_snapshot(&id, &previous, &rollback_event)
@@ -3361,7 +3704,7 @@ pub(super) async fn arkmemory_apply_health(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-    payload: Option<Json<ArkMemoryHealthReviewRequest>>,
+    payload: Option<Json<MemoryHealthReviewRequest>>,
 ) -> Response {
     let project_id = arkmemory_project_param(&params);
     let agent = state.agent.read().await;
@@ -3410,12 +3753,12 @@ pub(super) async fn arkmemory_apply_health(
             } else if operation.project_id.is_some() {
                 anyhow::bail!("Memory operation is outside the active memory scope.");
             }
-            operation_context = Some(ArkMemoryEventContext::from_operation(&operation));
+            operation_context = Some(MemoryEventContext::from_operation(&operation));
             let previous_status = operation.status.trim().to_string();
             let now = chrono::Utc::now().to_rfc3339();
             operation.status = "reviewed_ignored".to_string();
             operation.reviewed_at = Some(now.clone());
-            operation.review_notes = Some("Dismissed from ArkMemory health.".to_string());
+            operation.review_notes = Some("Dismissed from Memory health.".to_string());
             operation.updated_at = now.clone();
             agent.storage.upsert_memory_operation(&operation).await?;
 
@@ -3428,7 +3771,7 @@ pub(super) async fn arkmemory_apply_health(
                         &candidate_id,
                         status,
                         "rejected",
-                        Some("Dismissed from ArkMemory health."),
+                        Some("Dismissed from Memory health."),
                         None,
                     )
                     .await?;
@@ -3459,14 +3802,14 @@ pub(super) async fn arkmemory_apply_health(
                     {
                         anyhow::bail!("Memory health finding is outside the active memory scope.");
                     }
-                    ArkMemoryEventContext::from_memory(&item)
+                    MemoryEventContext::from_memory(&item)
                 }
-                None => ArkMemoryEventContext::default(),
+                None => MemoryEventContext::default(),
             }
         } else if let Some(context) = operation_context {
             context
         } else {
-            ArkMemoryEventContext::default()
+            MemoryEventContext::default()
         };
         let capture_resolution = if let Some(capture_event_id) = capture_event_id.as_deref() {
             let mut event = agent
@@ -3763,9 +4106,9 @@ pub(super) async fn arkmemory_run_tests(
             None,
             format!("Refreshed {} memory checks", generated),
             serde_json::json!({ "generated_or_refreshed": generated }),
-            ArkMemoryEventContext {
+            MemoryEventContext {
                 project_id: None,
-                ..ArkMemoryEventContext::default()
+                ..MemoryEventContext::default()
             },
         )
         .await?;
@@ -3847,11 +4190,11 @@ pub(super) async fn arkmemory_apply_cleanup(
         "cleanup_review_acknowledged",
         None,
         None,
-        "Acknowledged ArkMemory cleanup review",
+        "Acknowledged Memory cleanup review",
         serde_json::json!({ "cleanup": "retention_managed" }),
-        ArkMemoryEventContext {
+        MemoryEventContext {
             project_id: None,
-            ..ArkMemoryEventContext::default()
+            ..MemoryEventContext::default()
         },
     )
     .await;

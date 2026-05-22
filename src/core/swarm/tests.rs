@@ -275,7 +275,7 @@ mod swarm_tests {
     fn test_config_default() {
         let c = SwarmConfig::default();
         assert_eq!(c.max_specialists, 5);
-        assert_eq!(c.default_timeout_secs, 60);
+        assert_eq!(c.default_timeout_secs, 0);
         assert!(c.specialists.is_empty());
     }
 
@@ -470,7 +470,7 @@ mod swarm_tests {
     async fn test_manager_init_with_specialists() {
         let config = SwarmConfig {
             max_specialists: 5,
-            default_timeout_secs: 60,
+            default_timeout_secs: 0,
             specialists: vec![make_spec_config("Auto", SubAgentType::Researcher)],
         };
         let m = SwarmManager::new(config).await.unwrap();
@@ -483,7 +483,7 @@ mod swarm_tests {
         disabled.enabled = false;
         let config = SwarmConfig {
             max_specialists: 5,
-            default_timeout_secs: 60,
+            default_timeout_secs: 0,
             specialists: vec![
                 make_spec_config("Enabled", SubAgentType::Researcher),
                 disabled,

@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 use crate::actions::{ActionDef, ActionSource};
@@ -357,6 +357,7 @@ pub async fn upsert_custom_api(
             .as_deref()
             .map(|value| value.trim().is_empty())
             .unwrap_or(true)
+        && !allow_missing_secret
     {
         anyhow::bail!("Basic auth requires a username.");
     }
@@ -523,10 +524,7 @@ pub async fn test_custom_api(
         .await;
     let (ok, detail) = match execution {
         Ok(_) => (true, probe.success_detail()),
-        Err(error) => (
-            false,
-            user_facing_custom_api_test_error(&error.to_string()),
-        ),
+        Err(error) => (false, user_facing_custom_api_test_error(&error.to_string())),
     };
 
     configs[index].last_tested_at = Some(tested_at);
@@ -574,11 +572,7 @@ async fn register_config(runtime: &ActionRuntime, config: &CustomApiConfig) -> R
         };
         let mut description = format!(
             "Use saved custom API integration '{}' for operation '{}' ({} {} on {}). Auth is injected from Settings > Integrations; do not use raw connector_request for this API when this action matches.",
-            config.name,
-            operation_label,
-            method,
-            operation.draft.path,
-            config.base_url
+            config.name, operation_label, method, operation.draft.path, config.base_url
         );
         let detail = operation.draft.description.trim();
         if !detail.is_empty() {
@@ -1259,25 +1253,22 @@ fn clean_optional_string(value: Option<&str>) -> Option<String> {
 }
 
 fn find_testable_operation(config: &CustomApiConfig) -> Option<&CustomApiOperation> {
-    config
-        .operations
-        .iter()
-        .find(|operation| {
-            operation.draft.enabled
-                && operation.draft.read_only
-                && !operation.draft.body_required
-                && operation.draft.parameters.iter().all(|parameter| {
-                    if !parameter.required {
-                        return true;
+    config.operations.iter().find(|operation| {
+        operation.draft.enabled
+            && operation.draft.read_only
+            && !operation.draft.body_required
+            && operation.draft.parameters.iter().all(|parameter| {
+                if !parameter.required {
+                    return true;
+                }
+                match parameter.location {
+                    CustomApiParameterLocation::Query => {
+                        operation.draft.default_query.contains_key(&parameter.name)
                     }
-                    match parameter.location {
-                        CustomApiParameterLocation::Query => {
-                            operation.draft.default_query.contains_key(&parameter.name)
-                        }
-                        _ => false,
-                    }
-                })
-        })
+                    _ => false,
+                }
+            })
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1413,11 +1404,9 @@ pub fn custom_api_operation_supports_graphql_body(
     let path_has_graphql_segment = path
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .any(|segment| segment.eq_ignore_ascii_case("graphql"));
-    let content_type_declares_graphql =
-        default_headers.iter().any(|(key, value)| {
-            key.eq_ignore_ascii_case("content-type")
-                && value.to_ascii_lowercase().contains("graphql")
-        });
+    let content_type_declares_graphql = default_headers.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().contains("graphql")
+    });
     path_has_graphql_segment || content_type_declares_graphql
 }
 
@@ -1660,7 +1649,8 @@ mod tests {
                       }
                     }
                   }
-                }"#.to_string(),
+                }"#
+                .to_string(),
             ),
             curl_text: None,
         })
@@ -1768,8 +1758,10 @@ mod tests {
         })));
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn failed_custom_api_test_persists_failure_state() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1833,16 +1825,19 @@ mod tests {
             .find(|item| item.config.id == "ops")
             .expect("saved API present");
         assert_eq!(api.config.last_test_outcome.as_deref(), Some("failure"));
-        assert!(api
-            .config
-            .last_test_message
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(
+            api.config
+                .last_test_message
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        );
         assert!(api.config.last_tested_at.is_some());
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn delete_custom_api_removes_owned_config_secret_actions_and_runtime_records() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1917,18 +1912,24 @@ mod tests {
             .await
             .expect("custom API deleted");
 
-        assert!(list_custom_apis(&storage, dir.path(), dir.path())
-            .await
-            .expect("list custom APIs")
-            .is_empty());
-        assert!(manager
-            .get_custom_secret(&custom_api_secret_key("ops"))
-            .expect("read deleted custom API secret")
-            .is_none());
-        assert!(manager
-            .get_custom_secret(&action_env_key)
-            .expect("read deleted action env mapping")
-            .is_none());
+        assert!(
+            list_custom_apis(&storage, dir.path(), dir.path())
+                .await
+                .expect("list custom APIs")
+                .is_empty()
+        );
+        assert!(
+            manager
+                .get_custom_secret(&custom_api_secret_key("ops"))
+                .expect("read deleted custom API secret")
+                .is_none()
+        );
+        assert!(
+            manager
+                .get_custom_secret(&action_env_key)
+                .expect("read deleted action env mapping")
+                .is_none()
+        );
         assert!(runtime.action_definition(&action_name).await.is_none());
         assert!(runtime.get_action_review(&action_name).await.is_none());
     }

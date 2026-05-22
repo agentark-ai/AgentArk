@@ -42,6 +42,7 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ArrowDropDownRoundedIcon from "@mui/icons-material/ArrowDropDownRounded";
 import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import AttachFileRoundedIcon from "@mui/icons-material/AttachFileRounded";
+import TravelExploreRoundedIcon from "@mui/icons-material/TravelExploreRounded";
 import AutorenewRoundedIcon from "@mui/icons-material/AutorenewRounded";
 import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
@@ -52,6 +53,8 @@ import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import OpenInFullRoundedIcon from "@mui/icons-material/OpenInFullRounded";
+import ArticleRoundedIcon from "@mui/icons-material/ArticleRounded";
+import PictureAsPdfRoundedIcon from "@mui/icons-material/PictureAsPdfRounded";
 import RadioButtonUncheckedRoundedIcon from "@mui/icons-material/RadioButtonUncheckedRounded";
 import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
 import StarRoundedIcon from "@mui/icons-material/StarRounded";
@@ -81,6 +84,8 @@ import {
   type MouseEvent,
   type ReactNode,
 } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api, apiUrl } from "../../api/client";
 import AgentLogo from "../../assets/logo.svg";
 import { MetricBarCard } from "../analytics/MetricBarCard";
@@ -123,9 +128,13 @@ import {
   taskKind,
   taskKindLabel,
 } from "../../lib/backgroundSessions";
+import {
+  TASK_CANCEL_CONTROLS_ENABLED,
+  TASK_RETRY_CONTROLS_ENABLED,
+} from "../../lib/featureFlags";
 import type {
-  ArkPulseRemediationSpec,
-  ArkPulseRunFixRequest,
+  PulseRemediationSpec,
+  PulseRunFixRequest,
   BackgroundSessionSummary,
   SkillImportResponse,
   Task,
@@ -135,6 +144,7 @@ import type {
 import { ComputerPane } from "../chat";
 import type { SurfaceDescriptor } from "../chat/types";
 import { surfaceFromValue } from "../chat/surface";
+import { readablePayloadFromValue } from "../chat/readablePayload";
 import {
   InlineAgentArkChart,
   isAgentArkChartFence,
@@ -155,6 +165,10 @@ const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434";
 const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const SHOW_EXPERIMENTAL_AUTONOMY_TOOLS = false;
 const CHAT_LAST_CONVERSATION_STORAGE_KEY = "agentark.chat.lastConversationId";
+const CHAT_DRAFT_MODE_STORAGE_KEY = "agentark.chat.draftMode";
+const CHAT_COMPOSER_PREFILL_STORAGE_KEY = "agentark.chat.composerPrefill";
+const CHAT_COMPOSER_PREFILL_EVENT = "agentark.chat.composer-prefill";
+const ARKREFLECT_COMPOSER_PREFILL_STORAGE_KEY = "arkreflect.composerPrefill";
 const CHAT_PENDING_RUN_STORAGE_KEY = "agentark.chat.pendingRun";
 const CHAT_BACKGROUND_RUN_STORAGE_KEY = "agentark.chat.backgroundRun";
 const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
@@ -186,7 +200,6 @@ const CHAT_WORKSPACE_UI_MAX_FILE_CHARS = 80_000;
 const CHAT_WORKSPACE_UI_MAX_TOTAL_CHARS = 480_000;
 const CHAT_STREAMING_STEP_FLUSH_MS = 180;
 const CHAT_REASONING_PREVIEW_FLUSH_MS = 180;
-const CHAT_REASONING_PREVIEW_MAX_CHARS = 12_000;
 const CHAT_PENDING_RUN_SNAPSHOT_FLUSH_MS = 1200;
 const CHAT_WORKSPACE_SNAPSHOT_FLUSH_MS = 300;
 const CHAT_TRACE_STATE_CACHE_MAX = 8;
@@ -246,6 +259,30 @@ function writeChatRouteConversationId(conversationId: string | null): void {
   const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   if (nextUrl !== currentUrl) {
     window.history.replaceState(null, "", nextUrl);
+  }
+}
+
+function readChatDraftMode(): boolean {
+  if (typeof window === "undefined" || readChatRouteConversationId()) {
+    return false;
+  }
+  try {
+    return window.sessionStorage.getItem(CHAT_DRAFT_MODE_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeChatDraftMode(active: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (active) {
+      window.sessionStorage.setItem(CHAT_DRAFT_MODE_STORAGE_KEY, "1");
+    } else {
+      window.sessionStorage.removeItem(CHAT_DRAFT_MODE_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage failures.
   }
 }
 
@@ -527,8 +564,14 @@ type ChatRunMetrics = {
   inputTokens?: number | null;
   outputTokens?: number | null;
   totalTokens?: number | null;
+  cachedPromptTokens?: number | null;
+  cacheCreationPromptTokens?: number | null;
   durationMs?: number | null;
   timeToFirstTokenMs?: number | null;
+};
+type ChatRunMetricItem = {
+  label: string;
+  value: string;
 };
 type PasswordDialogMode = "set" | "change" | "remove";
 type RowMenuAction = {
@@ -1663,10 +1706,48 @@ function shouldKeepPlanInApprovalState(
   return activityStepsHaveExecutionPlanContext(trimmedSteps);
 }
 
+function executionPlanFromStructuredValue(
+  value: unknown,
+): ExecutionPlanState | null {
+  const direct = normalizeExecutionPlanState(value);
+  if (direct) return direct;
+
+  const record = asRecord(value);
+  const preview = asRecord(record._plan_preview);
+  return (
+    normalizeExecutionPlanState(record.plan) ||
+    normalizeExecutionPlanState(record.current_plan) ||
+    normalizeExecutionPlanState(record.original_plan) ||
+    normalizeExecutionPlanState(preview.current_plan) ||
+    normalizeExecutionPlanState(preview.original_plan) ||
+    null
+  );
+}
+
+function executionPlanFromMaybeJsonValue(
+  value: unknown,
+): ExecutionPlanState | null {
+  const structured = executionPlanFromStructuredValue(value);
+  if (structured) return structured;
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    return executionPlanFromStructuredValue(JSON.parse(value));
+  } catch {
+    return null;
+  }
+}
+
 function extractExecutionPlanFromTraceSteps(
   steps: JsonRecord[],
 ): ExecutionPlanState | null {
   for (const step of [...steps].reverse()) {
+    const structuredPlan =
+      executionPlanFromStructuredValue(step.plan) ||
+      executionPlanFromStructuredValue(step.plan_preview) ||
+      executionPlanFromStructuredValue(step._plan_preview) ||
+      executionPlanFromMaybeJsonValue(step.data);
+    if (structuredPlan) return structuredPlan;
+
     const title =
       typeof step.title === "string" ? step.title.trim().toLowerCase() : "";
     const stepType =
@@ -1720,8 +1801,18 @@ function extractPlanConfirmationSourceFromSteps(steps: JsonRecord[]): string {
     const stepType = str(step.step_type, str(step.type, ""))
       .trim()
       .toLowerCase();
-    if (stepType !== "plan_ready_for_confirmation") continue;
-    const source = str(step.source, "").trim();
+    if (
+      stepType !== "plan_ready_for_confirmation" &&
+      stepType !== "plan_generated" &&
+      stepType !== "plan_revised"
+    )
+      continue;
+    const data = asRecord(step.data);
+    const preview = asRecord(data._plan_preview);
+    const source = str(
+      step.source,
+      str(data.source, str(preview.source, "")),
+    ).trim();
     if (source) return planConfirmationSourceValue(source);
   }
   return "";
@@ -2057,6 +2148,84 @@ function streamPayloadConversationId(payload: unknown, fallback = ""): string {
       ),
     ),
   ).trim();
+}
+
+function streamPayloadRunId(payload: unknown, fallback = ""): string {
+  const obj = asRecord(payload);
+  const nested = asRecord(obj.payload);
+  return str(
+    obj.run_id,
+    str(obj.runId, str(nested.run_id, str(nested.runId, fallback))),
+  ).trim();
+}
+
+function streamPayloadContent(payload: unknown): string {
+  const obj = asRecord(payload);
+  const nested = asRecord(obj.payload);
+  return stripAgentInternalReasoningLeaks(
+    str(obj.content, str(nested.content, "")),
+  ).trim();
+}
+
+function extractLatestRunAssistantContentPayload(
+  latestRunPayload: unknown,
+  fallbackConversationId = "",
+  expectedRunId = "",
+): JsonRecord | null {
+  const root = asRecord(latestRunPayload);
+  const run = asRecord(root.run);
+  const runId = str(run.id, expectedRunId).trim();
+  const conversationId = str(
+    run.conversation_id,
+    str(run.conversationId, fallbackConversationId),
+  ).trim();
+  const requiredRunId = expectedRunId.trim();
+  const events = asRecords(root.events);
+
+  for (let idx = events.length - 1; idx >= 0; idx -= 1) {
+    const event = events[idx];
+    const kind = str(
+      event.kind,
+      str(event.event, str(event.event_name, str(event.type, ""))),
+    )
+      .trim()
+      .toLowerCase();
+    if (kind !== "content") continue;
+    const payload = asRecord(event.payload);
+    const content = streamPayloadContent(payload);
+    if (!content) continue;
+    const eventRunId = streamPayloadRunId(
+      payload,
+      str(event.run_id, str(event.runId, runId)),
+    );
+    if (requiredRunId && eventRunId && eventRunId !== requiredRunId) continue;
+    const eventConversationId = streamPayloadConversationId(
+      payload,
+      conversationId || fallbackConversationId,
+    );
+    return {
+      ...payload,
+      content,
+      conversation_id: eventConversationId || conversationId || fallbackConversationId,
+      run_id: eventRunId || runId || requiredRunId,
+    };
+  }
+
+  const directContent = streamPayloadContent(root);
+  if (!directContent) return null;
+  const directRunId = streamPayloadRunId(root, runId);
+  if (requiredRunId && directRunId && directRunId !== requiredRunId) {
+    return null;
+  }
+  return {
+    ...root,
+    content: directContent,
+    conversation_id:
+      streamPayloadConversationId(root, conversationId || fallbackConversationId) ||
+      conversationId ||
+      fallbackConversationId,
+    run_id: directRunId || runId || requiredRunId,
+  };
 }
 
 function streamPayloadRunStatus(payload: unknown): string {
@@ -2830,6 +2999,13 @@ type ChatTranscriptActionDetail = {
   card: ActivityTimelineCard;
 };
 
+type ChatTranscriptCommandAudit = {
+  commandLabel: string;
+  command: string;
+  outputLabel: string;
+  output: string;
+};
+
 type ChatTranscriptItem =
   | {
       kind: "prose";
@@ -2855,6 +3031,240 @@ type ChatTranscriptItem =
       details: ChatTranscriptActionDetail[];
     };
 
+function isTranscriptOmittedPlaceholder(value: string): boolean {
+  return /^\[omitted\s+[\d,]+\s+chars?(?:\s*\/\s*[\d,]+\s+lines?)?\]$/i.test(
+    value.trim(),
+  );
+}
+
+function normalizeTranscriptContractKey(value: string): string {
+  return (value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function truncateTranscriptAuditBlock(value: string, maxChars = 2400): string {
+  const trimmed = value.trim();
+  if (!trimmed || isTranscriptOmittedPlaceholder(trimmed)) return "";
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function firstTranscriptString(records: JsonRecord[], keys: string[]): string {
+  const normalizedKeys = keys.map((key) => key.toLowerCase());
+  for (const record of records) {
+    for (const [key, value] of Object.entries(record)) {
+      if (!normalizedKeys.includes(key.toLowerCase())) continue;
+      if (typeof value === "string" && value.trim()) {
+        const trimmed = value.trim();
+        if (isTranscriptOmittedPlaceholder(trimmed)) continue;
+        return trimmed;
+      }
+      if (typeof value === "number" || typeof value === "boolean") return String(value);
+      if (value && typeof value === "object") {
+        const serialized = compactUnknown(value, 1600);
+        if (serialized && !isTranscriptOmittedPlaceholder(serialized)) return serialized;
+      }
+    }
+  }
+  return "";
+}
+
+function isInternalChatTranscriptStep(step: JsonRecord): boolean {
+  const data = activityDataRecord(step.data);
+  const keys = [
+    activityStepType(step),
+    str(step.kind, ""),
+    str(data.kind, ""),
+    str(step.name, ""),
+    str(data.name, ""),
+    str(step.tool_name, ""),
+    str(data.tool_name, ""),
+    str(step.title, ""),
+    str(data.title, ""),
+    str(step.label, ""),
+    str(data.label, ""),
+  ].map(normalizeTranscriptContractKey);
+  return keys.includes("inbound_precheck");
+}
+
+function transcriptCardStep(card: ActivityTimelineCard): JsonRecord {
+  const parsed = tryParseActivityJson(card.traceJson || "");
+  return asRecord(parsed);
+}
+
+function transcriptCardPayloadRecords(card: ActivityTimelineCard): JsonRecord[] {
+  const step = transcriptCardStep(card);
+  const data = activityDataRecord(step.data);
+  const nestedPayload = asRecord(data.payload);
+  const nestedResult = asRecord(data.result);
+  return [data, nestedPayload, nestedResult, step].filter(
+    (record) => Object.keys(record).length > 0,
+  );
+}
+
+function transcriptCardArtifacts(card: ActivityTimelineCard): JsonRecord[] {
+  return asRecords(transcriptCardStep(card).artifacts);
+}
+
+function transcriptArtifactBody(artifact: JsonRecord): string {
+  const raw = artifact.data;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return isTranscriptOmittedPlaceholder(trimmed) ? "" : trimmed;
+  }
+  if (raw == null) return "";
+  const compacted = compactUnknown(raw, 3200);
+  return isTranscriptOmittedPlaceholder(compacted) ? "" : compacted;
+}
+
+function transcriptArtifactMatches(
+  artifact: JsonRecord,
+  candidates: string[],
+): boolean {
+  const normalizedCandidates = candidates.map((candidate) =>
+    candidate.trim().toLowerCase(),
+  );
+  const haystack = [
+    str(artifact.id, ""),
+    str(artifact.kind, ""),
+    str(artifact.label, ""),
+    str(artifact.title, ""),
+  ]
+    .join(" ")
+    .replace(/[_-]+/g, " ")
+    .toLowerCase();
+  return normalizedCandidates.some((candidate) => {
+    const normalized = candidate.replace(/[_-]+/g, " ");
+    return haystack === normalized || haystack.includes(normalized);
+  });
+}
+
+function transcriptArtifactBodies(
+  artifacts: JsonRecord[],
+  candidates: string[],
+): Array<{ label: string; body: string }> {
+  return artifacts
+    .filter((artifact) => transcriptArtifactMatches(artifact, candidates))
+    .map((artifact) => ({
+      label:
+        str(artifact.label, str(artifact.title, str(artifact.kind, "Artifact"))).trim() ||
+        "Artifact",
+      body: transcriptArtifactBody(artifact),
+    }))
+    .filter((entry) => Boolean(entry.body));
+}
+
+function transcriptToolNameFromCard(card: ActivityTimelineCard): string {
+  const explicit = firstTranscriptString(transcriptCardPayloadRecords(card), [
+    "tool_name",
+    "name",
+    "action",
+    "action_kind",
+  ]);
+  if (explicit) return explicit.toLowerCase();
+  const title = (card.rawTitle || card.label || "").trim();
+  const match = title.match(/^(?:tool result|tool event):\s*(.+)$/i);
+  return normalizeTranscriptContractKey(match?.[1] || "");
+}
+
+function transcriptCommandAuditFromCard(card: ActivityTimelineCard): ChatTranscriptCommandAudit | null {
+  const records = transcriptCardPayloadRecords(card);
+  const artifacts = transcriptCardArtifacts(card);
+  const toolName = transcriptToolNameFromCard(card);
+  const stepType = (card.stepType || "").trim().toLowerCase();
+  const argumentArtifacts = transcriptArtifactBodies(artifacts, [
+    "tool_arguments",
+    "arguments",
+    "input",
+  ]);
+  const argumentRecords = argumentArtifacts
+    .map((entry) => asRecord(tryParseActivityJson(entry.body)))
+    .filter((record) => Object.keys(record).length > 0);
+  const command =
+    firstTranscriptString([...records, ...argumentRecords], [
+      "command",
+      "cmd",
+      "shell_command",
+      "code",
+      "script",
+      "input",
+      "arguments",
+      "args",
+      "query",
+      "path",
+      "file",
+      "source_path",
+      "source_dir",
+      "url",
+      "app_url",
+      "app_id",
+    ]) ||
+    argumentArtifacts[0]?.body ||
+    "";
+
+  const stdout = firstTranscriptString(records, ["stdout"]);
+  const stderr = firstTranscriptString(records, ["stderr"]);
+  const streamOutputParts = [
+    stdout ? `stdout:\n${stdout}` : "",
+    stderr ? `stderr:\n${stderr}` : "",
+  ].filter(Boolean);
+  const artifactOutputParts =
+    stepType === "tool_start"
+      ? []
+      : transcriptArtifactBodies(artifacts, [
+          "tool_output",
+          "output",
+          "tool_error",
+          "error",
+        ]).map((entry) => `${entry.label}:\n${entry.body}`);
+  const explicitOutput =
+    streamOutputParts.join("\n\n") ||
+    artifactOutputParts.join("\n\n") ||
+    (stepType === "tool_start"
+      ? ""
+      : firstTranscriptString(records, [
+          "output",
+          "output_preview",
+          "result_preview",
+          "content",
+          "result",
+          "response",
+          "summary",
+          "message",
+          "error",
+          "error_text",
+        ]));
+  const output =
+    explicitOutput ||
+    (stepType === "tool_result" ? card.rawDetailFull || card.detailFull || "" : "");
+
+  const commandLabel =
+    toolName === "file_read" || toolName === "source_read"
+      ? "Path"
+      : toolName.startsWith("browser")
+        ? "Browser action"
+        : toolName === "app_deploy"
+          ? "Deploy input"
+          : toolName === "code_execute"
+            ? "Code"
+            : "Command";
+  const outputLabel =
+    card.kind === "Issue" || card.tone === "tone-error" ? "Error output" : "Output";
+
+  const cleanedCommand = truncateTranscriptAuditBlock(command, 1600);
+  const cleanedOutput = truncateTranscriptAuditBlock(output, 3200);
+  if (!cleanedCommand && !cleanedOutput) return null;
+  return {
+    commandLabel,
+    command: cleanedCommand,
+    outputLabel,
+    output: cleanedOutput,
+  };
+}
+
 const ACTIVITY_PAYLOAD_PREVIEW_PRIORITY = [
   "kind",
   "status",
@@ -2873,9 +3283,13 @@ const ACTIVITY_PAYLOAD_PREVIEW_PRIORITY = [
 
 const ACTIVITY_PAYLOAD_INTERNAL_KEYS = new Set([
   "__streamKey",
+  "__omitted_keys",
+  "agent_id",
+  "chat_visible",
   "conversation_id",
   "conversationId",
   "cid",
+  "delegation_id",
   "run_id",
   "runId",
   "task_id",
@@ -2916,13 +3330,46 @@ const ACTIVITY_PAYLOAD_FILE_BODY_KEYS = new Set([
   "raw_content",
   "text",
 ]);
+const ACTIVITY_PAYLOAD_FULL_TEXT_KEYS = new Set([
+  ...ACTIVITY_PAYLOAD_FILE_BODY_KEYS,
+  "detail",
+]);
+
+function isReasoningActivityRecord(value: unknown): boolean {
+  const record = asRecord(value);
+  const data = asRecord(record.data);
+  const kind = str(record.kind, str(data.kind, ""))
+    .trim()
+    .toLowerCase();
+  const stepType = str(record.step_type, str(record.type, ""))
+    .trim()
+    .toLowerCase();
+  if (kind !== "reasoning_delta" && stepType !== "reasoning_delta") {
+    return false;
+  }
+  return isVisibleReasoningPhase(str(record.phase, str(data.phase, "")));
+}
+
+function shouldPreserveFullActivityPayloadString(
+  normalizedKey: string,
+  parent: unknown,
+): boolean {
+  return (
+    ACTIVITY_PAYLOAD_FULL_TEXT_KEYS.has(normalizedKey) &&
+    isReasoningActivityRecord(parent)
+  );
+}
 
 function isStreamLikeActivityRecord(value: unknown): boolean {
   const record = asRecord(value);
   const kind = str(record.kind, "").trim().toLowerCase();
+  const stepType = str(record.step_type, str(record.type, ""))
+    .trim()
+    .toLowerCase();
   if (
     kind === "console_chunk" ||
     kind === "reasoning_delta" ||
+    stepType === "reasoning_delta" ||
     kind === "argument_stream"
   ) {
     return true;
@@ -2947,20 +3394,33 @@ function formatActivityToolName(name: string): string {
   const normalized = (name || "").trim().toLowerCase();
   if (!normalized) return "Tool";
   const direct: Record<string, string> = {
-    app_deploy: "App deploy",
+    app_deploy: "Deploy App",
     build_check: "Build check",
+    code_execute: "Execute Code",
+    shell: "Execute Terminal",
     run_tests: "Test run",
     lint_check: "Lint check",
-    source_read: "Read files",
-    source_write: "Write files",
-    source_edit: "Edit files",
-    source_list: "List files",
-    source_search: "Search files",
+    file_read: "Read",
+    file_write: "Write",
+    file_patch: "Edit",
+    source_read: "Read",
+    source_write: "Write",
+    source_edit: "Edit",
+    source_list: "List",
+    source_search: "Search",
     frontend_build: "Frontend build",
     schedule_task: "Schedule task",
+    browser_auto: "Browser",
+    browser_navigate: "Browser Navigate",
+    browser_click: "Browser Click",
+    browser_type: "Browser Type",
+    browser_scroll: "Browser Scroll",
+    browser_snapshot: "Browser Snapshot",
+    browser_screenshot: "Browser Screenshot",
+    browser_console: "Browser Console",
     browse: "Open web page",
     web_search: "Web search",
-    agent_turn_loop: "Working",
+    agent_turn_loop: "Agent workflow",
   };
   if (direct[normalized]) return direct[normalized];
   return normalized
@@ -3022,6 +3482,7 @@ function formatActivityPayloadValue(value: unknown): string {
   if (value == null) return "null";
   if (typeof value === "string") {
     const trimmed = value.trim().replace(/\s+/g, " ");
+    if (/^\[omitted\s+\d+\s+chars?\]$/i.test(trimmed)) return "";
     if (!trimmed) return '""';
     return trimmed.length > 44
       ? `${trimmed.slice(0, 41).trimEnd()}...`
@@ -3088,7 +3549,9 @@ function formatActivityPayloadFieldLabel(key: string): string {
 function activityPayloadValueToCleanText(value: unknown): string {
   if (value == null) return "";
   if (typeof value === "string") {
-    return value.trim().replace(/\s+/g, " ");
+    const trimmed = value.trim().replace(/\s+/g, " ");
+    if (/^\[omitted\s+\d+\s+chars?\]$/i.test(trimmed)) return "";
+    return trimmed;
   }
   if (typeof value === "number" || typeof value === "boolean") {
     return String(value);
@@ -3397,9 +3860,17 @@ function summarizeJsonActivityPayload(value: unknown): string {
     return "";
   }
   if (kind.startsWith("delegation_")) {
+    const readable = readablePayloadFromValue(obj);
+    if (readable) {
+      return [readable.title, readable.detail]
+        .filter(Boolean)
+        .join(". ")
+        .replace(/\.\s*\./g, ".")
+        .trim();
+    }
     const agentName = str(obj.agent_name, "Agent").trim() || "Agent";
     const agentRole = str(obj.agent_role, "").trim();
-    const subject = agentRole ? `${agentName} - ${agentRole}` : agentName;
+    const subject = agentRole ? `${agentName} / ${agentRole}` : agentName;
     if (summary) return `${subject}. ${summary}`;
     return `${subject} shared a progress update.`;
   }
@@ -3625,6 +4096,55 @@ function stripAgentInternalReasoningLeaks(value: string): string {
   );
 }
 
+function streamedTextStartsNewSentence(text: string): boolean {
+  const trimmed = text.trimStart();
+  if (!trimmed) return false;
+  return /^[A-Z]/.test(trimmed);
+}
+
+function streamedTextEndsSentence(text: string): boolean {
+  return /[.!?]$/.test(text.trimEnd());
+}
+
+function shouldInsertStreamParagraphBoundary(
+  current: string,
+  incoming: string,
+): boolean {
+  if (!current || !incoming || /\s$/.test(current)) return false;
+  const next = incoming.trimStart();
+  if (next.length < 16) return false;
+  return streamedTextEndsSentence(current) && streamedTextStartsNewSentence(next);
+}
+
+function streamingResponseAppendText(current: string, incoming: string): string {
+  const normalized = (incoming || "").replace(/\r\n?/g, "\n");
+  if (!normalized) return "";
+  if (shouldInsertStreamParagraphBoundary(current, normalized)) {
+    return `\n\n${normalized.trimStart()}`;
+  }
+  return normalized;
+}
+
+function normalizeStreamedProseParagraphs(text: string): string {
+  return text
+    .split(/(```[\s\S]*?```)/g)
+    .map((part) =>
+      part.startsWith("```")
+        ? part
+        : part.replace(/([.!?])(?=[A-Z][^\n]{15,})/g, "$1\n\n"),
+    )
+    .join("");
+}
+
+function visibleStreamingTranscriptText(value: string): string {
+  const cleaned = stripAgentInternalReasoningLeaks(value);
+  if (!cleaned) return "";
+  return normalizeStreamedProseParagraphs(cleaned)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function sanitizeChatMessageForUi(value: unknown): unknown {
   const message = asRecord(value);
   if (Object.keys(message).length === 0) return value;
@@ -3706,7 +4226,11 @@ function activityStepType(step: JsonRecord): string {
 
 function activityToolNameFromStep(step: JsonRecord): string {
   const data = activityDataRecord(step.data);
-  return str(data.tool_name, str(data.name, str(step.tool_name, ""))).trim();
+  const direct = str(data.tool_name, str(data.name, str(step.tool_name, ""))).trim();
+  if (direct) return direct;
+  const title = str(step.title, "").trim();
+  const match = title.match(/^(?:tool result|tool event):\s*(.+)$/i);
+  return normalizeTranscriptContractKey(match?.[1] || "");
 }
 
 function transcriptStatusFromCard(
@@ -3780,11 +4304,9 @@ function isMainChatReasoningStep(step: JsonRecord): boolean {
   const stepType = activityStepType(step);
   const kind = str(data.kind, "").trim().toLowerCase();
   if (kind === "reasoning_delta" || stepType === "reasoning_delta") {
-    return true;
+    return isVisibleReasoningPhase(str(data.phase, str(step.phase, "")));
   }
-  const phase = agentLoopProgressPhaseFromStep(step);
-  if (!phase) return false;
-  return phase !== "tool_execution" && phase !== "tool_result";
+  return false;
 }
 
 function normalizeReasoningPhase(raw: unknown): string {
@@ -3794,6 +4316,16 @@ function normalizeReasoningPhase(raw: unknown): string {
     .replace(/[^a-z0-9_-]+/g, "_")
     .replace(/^_+|_+$/g, "");
   return phase || "reasoning";
+}
+
+function isVisibleReasoningPhase(raw: unknown): boolean {
+  const phase = normalizeReasoningPhase(raw);
+  return (
+    phase === "model" ||
+    phase === "model_summary" ||
+    phase === "reasoning" ||
+    phase === "reasoning_summary"
+  );
 }
 
 function reasoningStatusCopy(
@@ -3806,7 +4338,11 @@ function reasoningStatusCopy(
   const title =
     str(payload?.title, "").trim() ||
     str(payload?.label, "").trim() ||
-    formatActivityToolName(phase);
+    (phase === "model" || phase === "reasoning"
+      ? "Thinking"
+      : phase === "model_summary" || phase === "reasoning_summary"
+        ? "Reasoning summary"
+        : formatActivityToolName(phase));
   return {
     title,
     detail,
@@ -4213,6 +4749,10 @@ function ActivityPayloadDisclosure({
                 </Box>
               ))}
             </Box>
+          ) : payload.kind === "json" ? (
+            <Typography variant="body2" className="activity-detail-copy">
+              {payload.preview || "Structured details captured."}
+            </Typography>
           ) : (
             <Box component="pre" className="activity-payload-pre">
               {payload.body}
@@ -4265,97 +4805,54 @@ function activityTimelineCardsRenderEqual(
 const ActivityTimelineRow = memo(function ActivityTimelineRow({
   row,
   isActive,
-  payloadExpanded,
-  onTogglePayload,
+  onOpenDetails,
   detailed = false,
 }: {
   row: ActivityTimelineCard;
   isActive: boolean;
-  payloadExpanded: boolean;
-  onTogglePayload: () => void;
+  onOpenDetails?: () => void;
   detailed?: boolean;
 }) {
   const lineTone = activityToneColor(row.kind, row.tone);
   const summary = row.summary || row.detailFull || row.detail || "";
   const stepTypeLabel = row.stepType.replace(/[_-]+/g, " ").trim();
   const rawTitle = row.rawTitle.trim();
-  const detailBody =
-    detailed && row.rawDetailFull && row.rawDetailFull !== summary
-      ? row.rawDetailFull
-      : summary;
-  const payloadId = `activity-payload-${row.id}`.replace(
-    /[^a-zA-Z0-9_-]+/g,
-    "-",
-  );
+  const lineDetail = summary || (rawTitle && rawTitle !== row.label ? rawTitle : "");
   return (
-    <Box
-      className={`term-line activity-timeline-row${isActive ? " term-line-active" : ""}${detailed ? " activity-timeline-row-detailed" : ""}`}
+    <ButtonBase
+      component="button"
+      type="button"
+      className={`term-line activity-timeline-row activity-log-line${isActive ? " term-line-active" : ""}${detailed ? " activity-timeline-row-detailed" : ""}`}
+      onClick={onOpenDetails}
+      aria-label={`Open activity details for ${row.label}`}
     >
       <span className="term-prompt" style={{ color: lineTone }}>
         -
       </span>
-      <Box className="term-content activity-row-content">
-        <Stack
-          direction={{ xs: "column", sm: "row" }}
-          className="activity-row-head"
-          sx={{
-            alignItems: { xs: "flex-start", sm: "flex-start" },
-            justifyContent: "space-between",
-            gap: 0.75,
-          }}
+      <Box className="activity-log-main">
+        <span
+          className={`activity-kind-pill activity-kind-pill-${(row.kind || "update").toLowerCase()}`}
         >
-          <Box className="activity-row-copy">
-            <div className="term-label activity-row-label">{row.label}</div>
-            <Stack
-              direction="row"
-              spacing={0.75}
-              useFlexGap
-              className="activity-row-meta"
-              sx={{ flexWrap: "wrap" }}
-            >
-              <span
-                className={`activity-kind-pill activity-kind-pill-${(row.kind || "update").toLowerCase()}`}
-              >
-                {activityKindDisplayLabel(row.kind)}
-              </span>
-              {row.time ? (
-                <span className="activity-row-time">
-                  {formatTraceStepTime(row.time)}
-                </span>
-              ) : null}
-              {detailed && stepTypeLabel ? (
-                <span className="activity-row-time activity-row-step-type">
-                  {stepTypeLabel}
-                </span>
-              ) : null}
-              {detailed ? (
-                <span className="activity-row-time">#{row.index + 1}</span>
-              ) : null}
-            </Stack>
-          </Box>
-        </Stack>
-        {detailed && rawTitle && rawTitle !== row.label ? (
-          <div className="term-detail activity-row-raw-title">
-            Source title: {rawTitle}
-          </div>
-        ) : null}
-        {detailBody ? (
-          <div className="term-detail activity-row-summary">{detailBody}</div>
-        ) : null}
-        {row.payloadView ? (
-          <ActivityPayloadDisclosure
-            payload={row.payloadView}
-            expanded={payloadExpanded}
-            onToggle={onTogglePayload}
-            controlsId={payloadId}
-          />
+          {activityKindDisplayLabel(row.kind)}
+        </span>
+        <span className="activity-log-label" title={row.label}>
+          {row.label}
+        </span>
+        {lineDetail ? (
+          <span className="activity-log-detail" title={lineDetail}>
+            {lineDetail}
+          </span>
         ) : null}
       </Box>
-    </Box>
+      <span className="activity-log-meta">
+        {stepTypeLabel ? <span>{stepTypeLabel}</span> : null}
+        {row.time ? <span>{formatTraceStepTime(row.time)}</span> : null}
+        <span>#{row.index + 1}</span>
+      </span>
+    </ButtonBase>
   );
 }, (prev, next) =>
   prev.isActive === next.isActive &&
-  prev.payloadExpanded === next.payloadExpanded &&
   prev.detailed === next.detailed &&
   activityTimelineCardsRenderEqual(prev.row, next.row),
 );
@@ -4616,6 +5113,7 @@ function normalizeSwarmStatus(status: unknown): string {
   if (!normalized) return "running";
   if (normalized === "cancelled" || normalized === "canceled")
     return "interrupted";
+  if (normalized === "timeout" || normalized === "timed out") return "timed_out";
   if (normalized === "degraded") return "partial";
   return normalized;
 }
@@ -4625,6 +5123,8 @@ function swarmStatusChipColor(
 ): "default" | "success" | "warning" | "error" {
   switch (normalizeSwarmStatus(status)) {
     case "completed":
+    case "success":
+    case "done":
       return "success";
     case "partial":
     case "running":
@@ -4650,6 +5150,8 @@ function swarmStatusLabel(status: string): string {
     case "synthesizing":
       return "Synthesizing";
     case "completed":
+    case "success":
+    case "done":
       return "Completed";
     case "partial":
       return "Partial";
@@ -4677,6 +5179,12 @@ function formatSwarmElapsedMs(value: unknown): string {
   return remSecs > 0 ? `${mins}m ${remSecs}s` : `${mins}m`;
 }
 
+function swarmAgentTypeLabel(agent: SwarmChatAgent): string {
+  const role = agent.agentRole.trim();
+  if (role) return agent.isSpecialist ? `${role} specialist` : role;
+  return agent.isSpecialist ? "Specialist agent" : "Delegated agent";
+}
+
 function deriveSwarmRunStatus(
   agents: SwarmChatAgent[],
   fallback = "running",
@@ -4691,7 +5199,10 @@ function deriveSwarmRunStatus(
     return "running";
   }
   if (
-    agents.every((agent) => normalizeSwarmStatus(agent.status) === "completed")
+    agents.length > 0 &&
+    agents.every((agent) =>
+      ["completed", "success", "done"].includes(normalizeSwarmStatus(agent.status)),
+    )
   ) {
     return "completed";
   }
@@ -4701,7 +5212,9 @@ function deriveSwarmRunStatus(
     return "interrupted";
   }
   if (
-    agents.some((agent) => normalizeSwarmStatus(agent.status) === "completed")
+    agents.some((agent) =>
+      ["completed", "success", "done"].includes(normalizeSwarmStatus(agent.status)),
+    )
   ) {
     return "partial";
   }
@@ -4814,9 +5327,11 @@ function buildSwarmRunsFromStreamingSteps(
       str(payload.model_name, agent.modelName).trim() || agent.modelName;
     agent.task = str(payload.task, agent.task).trim() || agent.task;
     agent.summary = str(payload.summary, agent.summary).trim() || agent.summary;
+    const latestUpdate = str(step.detail, str(payload.summary, agent.latestUpdate)).trim();
     agent.latestUpdate =
-      str(step.detail, str(payload.summary, agent.latestUpdate)).trim() ||
-      agent.latestUpdate;
+      /^\[omitted\s+\d+\s+chars?\]$/i.test(latestUpdate)
+        ? agent.latestUpdate
+        : latestUpdate || agent.latestUpdate;
     agent.isSpecialist = toBool(payload.is_specialist) || agent.isSpecialist;
     if (Array.isArray(payload.depends_on)) {
       agent.dependsOn = payload.depends_on
@@ -4837,7 +5352,10 @@ function buildSwarmRunsFromStreamingSteps(
     } else if (kind === "delegation_agent_completed") {
       agent.status = normalizeSwarmStatus(str(payload.status, "completed"));
     } else if (kind === "delegation_agent_failed") {
-      agent.status = normalizeSwarmStatus(str(payload.status, "failed"));
+      const reason = str(payload.reason, "").trim();
+      agent.status = normalizeSwarmStatus(
+        str(payload.status, /timeout/i.test(reason) ? "timed_out" : "failed"),
+      );
     }
   });
 
@@ -5073,10 +5591,7 @@ function SwarmActivityPanel({
                                     color: "text.secondary",
                                   }}
                                 >
-                                  {agent.modelName ||
-                                    (agent.isSpecialist
-                                      ? "Specialist model"
-                                      : "Auto agent")}
+                                  {swarmAgentTypeLabel(agent)}
                                 </Typography>
                               </Box>
                               <Stack
@@ -5319,6 +5834,10 @@ function upsertPersistedReasoningStep(
   const delta = str(payload.content_delta, str(nested.content_delta, ""));
   const content = str(payload.content, str(nested.content, ""));
   const detail = str(payload.detail, str(nested.detail, fallbackDetail));
+  const done = toBool(payload.done) || toBool(nested.done);
+  const hasContentPayload = Boolean(
+    snapshot.trim() || delta.trim() || content.trim(),
+  );
 
   let nextText = currentText;
   if (snapshot.trim()) {
@@ -5330,7 +5849,7 @@ function upsertPersistedReasoningStep(
       currentText && !content.startsWith(currentText)
         ? `${currentText}${content}`
         : content;
-  } else if (detail.trim()) {
+  } else if (!(done && currentText.trim() && !hasContentPayload) && detail.trim()) {
     nextText = detail;
   }
   if (!nextText.trim()) return;
@@ -5349,7 +5868,7 @@ function upsertPersistedReasoningStep(
       stream_key: streamKey,
       content: nextText,
       content_snapshot: nextText,
-      done: toBool(payload.done) || toBool(nested.done),
+      done,
     },
     __streamKey: streamKey,
     timestamp: timestamp || str(existingStep?.timestamp, ""),
@@ -5468,19 +5987,29 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
       continue;
     }
 
-    if (kind === "plan_generated" || kind === "plan_revised") {
+    if (
+      kind === "plan_generated" ||
+      kind === "plan_revised" ||
+      kind === "plan_ready_for_confirmation"
+    ) {
       const normalizedPlan = normalizeExecutionPlanState(payload.plan);
       steps.push({
         step_type: kind,
         title:
           kind === "plan_generated"
             ? "Execution Plan"
-            : "Execution Plan Revised",
+            : kind === "plan_revised"
+              ? "Execution Plan Revised"
+              : "Plan Ready",
         detail:
           kind === "plan_generated"
             ? `${normalizedPlan?.steps.length || 0} steps planned`
-            : str(payload.reason, "Execution plan revised."),
+            : kind === "plan_revised"
+              ? str(payload.reason, "Execution plan revised.")
+              : `${normalizedPlan?.steps.length || 0} steps ready`,
         plan: payload.plan,
+        source: payload.source,
+        task_id: payload.task_id,
         data: payload,
         timestamp,
       });
@@ -5817,6 +6346,131 @@ function chatTurnAttachmentsFromFiles(files: File[]): ChatTurnAttachment[] {
   );
 }
 
+function compactExecutionPlanForPendingSnapshot(
+  rawPlan: unknown,
+): JsonRecord | null {
+  const plan = executionPlanFromStructuredValue(rawPlan);
+  if (!plan) return null;
+  return {
+    plan_id: plan.plan_id.slice(0, 160),
+    revision: plan.revision,
+    summary: plan.summary.slice(0, 2400),
+    steps: plan.steps.slice(0, 64).map((step) => {
+      const rawArguments = step.arguments;
+      const compactedArguments =
+        rawArguments && Object.keys(asRecord(rawArguments)).length > 0
+          ? asRecord(sanitizeActivityPayloadForUi(rawArguments))
+          : rawArguments ?? null;
+      return {
+        id: step.id,
+        title: step.title.slice(0, 260),
+        description: step.description.slice(0, 1800),
+        status: step.status.slice(0, 80),
+        action: step.action ? step.action.slice(0, 160) : null,
+        arguments: compactedArguments,
+        tool_hint: step.tool_hint ? step.tool_hint.slice(0, 180) : null,
+        substeps: step.substeps.slice(0, 32).map((substep) => ({
+          id: substep.id,
+          title: substep.title.slice(0, 260),
+          description: substep.description.slice(0, 1200),
+          status: substep.status.slice(0, 80),
+          tool_hint: substep.tool_hint
+            ? substep.tool_hint.slice(0, 180)
+            : null,
+        })),
+      };
+    }),
+  };
+}
+
+function compactPendingRunStepForSnapshot(rawStep: JsonRecord): JsonRecord {
+  const raw = asRecord(rawStep);
+  const data = asRecord(raw.data);
+  const dataPreview = asRecord(data._plan_preview);
+  const compacted: JsonRecord = {};
+  const putString = (key: string, value: unknown, maxLen: number) => {
+    const text = str(value, "").trim();
+    if (text) compacted[key] = text.slice(0, maxLen);
+  };
+  const putNumber = (key: string, value: unknown) => {
+    const numeric = typeof value === "number" ? value : num(value, Number.NaN);
+    if (Number.isFinite(numeric)) compacted[key] = numeric;
+  };
+
+  putString("icon", raw.icon, 64);
+  putString("title", raw.title, 220);
+  putString("detail", raw.detail, 900);
+  putString("step_type", raw.step_type, 80);
+  putString("source", raw.source || data.source || dataPreview.source, 80);
+  putString("__streamKey", raw.__streamKey, 180);
+  putString("task_id", raw.task_id || data.task_id, 160);
+  putString("conversation_id", raw.conversation_id || data.conversation_id, 160);
+  putString("run_id", raw.run_id || data.run_id, 160);
+  putString("plan_id", raw.plan_id || data.plan_id, 160);
+  putString("step_title", raw.step_title || data.step_title, 260);
+  putString("status", raw.status || data.status, 80);
+  putNumber("revision", raw.revision ?? data.revision);
+  putNumber("step_id", raw.step_id ?? data.step_id);
+
+  if (isReasoningActivityRecord(raw)) {
+    const phase = normalizeReasoningPhase(data.phase ?? raw.phase);
+    const contentSnapshot = str(
+      data.content_snapshot,
+      str(data.content, str(raw.detail, "")),
+    );
+    const contentDelta = str(data.content_delta, "");
+    const content = contentSnapshot || contentDelta;
+    if (content) compacted.detail = content;
+    compacted.data = {
+      kind: "reasoning_delta",
+      phase,
+      stream_key:
+        str(data.stream_key, str(raw.stream_key, str(raw.__streamKey, "")))
+          .trim() || `reasoning:${phase}`,
+      content,
+      content_snapshot: content,
+      done: toBool(data.done) || toBool(raw.done),
+    };
+    return compacted;
+  }
+
+  const plan =
+    compactExecutionPlanForPendingSnapshot(raw.plan) ||
+    compactExecutionPlanForPendingSnapshot(raw.plan_preview) ||
+    compactExecutionPlanForPendingSnapshot(raw._plan_preview) ||
+    compactExecutionPlanForPendingSnapshot(data.plan) ||
+    compactExecutionPlanForPendingSnapshot(data.current_plan) ||
+    compactExecutionPlanForPendingSnapshot(data.original_plan) ||
+    compactExecutionPlanForPendingSnapshot(dataPreview.current_plan) ||
+    compactExecutionPlanForPendingSnapshot(dataPreview.original_plan);
+  if (plan) compacted.plan = plan;
+
+  const compactedData = compactUnknown(raw.data, 800);
+  if (compactedData) compacted.data = compactedData;
+  return compacted;
+}
+
+function limitPendingRunStepsForSnapshot(steps: JsonRecord[]): JsonRecord[] {
+  if (steps.length <= CHAT_PENDING_STREAM_STEPS_MAX) return steps;
+  const keepIndexes = new Set<number>();
+  steps.forEach((step, index) => {
+    if (isMainChatReasoningStep(step)) keepIndexes.add(index);
+  });
+  let remaining = CHAT_PENDING_STREAM_STEPS_MAX;
+  for (let index = steps.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    if (keepIndexes.has(index)) continue;
+    keepIndexes.add(index);
+    remaining -= 1;
+  }
+  return steps.filter((_, index) => keepIndexes.has(index));
+}
+
+function compactPendingRunStepsForSnapshot(steps: JsonRecord[]): JsonRecord[] {
+  return limitPendingRunStepsForSnapshot(steps).map((step) =>
+    compactPendingRunStepForSnapshot(asRecord(step)),
+  );
+}
+
 function normalizeChatPendingRunSnapshot(
   raw: unknown,
 ): ChatPendingRunSnapshot | null {
@@ -5837,24 +6491,7 @@ function normalizeChatPendingRunSnapshot(
         )
       : "";
   const streamingSteps = Array.isArray(parsed.streamingSteps)
-    ? asRecords(parsed.streamingSteps)
-        .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
-        .map((rawStep) => {
-          const normalized: JsonRecord = {};
-          const icon = str(rawStep.icon, "").trim();
-          const title = str(rawStep.title, "").trim();
-          const detail = str(rawStep.detail, "").trim();
-          const stepType = str(rawStep.step_type, "").trim();
-          const source = str(rawStep.source, "").trim();
-          const data = compactUnknown(rawStep.data, 800);
-          if (icon) normalized.icon = icon.slice(0, 64);
-          if (title) normalized.title = title.slice(0, 220);
-          if (detail) normalized.detail = detail.slice(0, 900);
-          if (stepType) normalized.step_type = stepType.slice(0, 80);
-          if (source) normalized.source = source.slice(0, 80);
-          if (data) normalized.data = data;
-          return normalized;
-        })
+    ? compactPendingRunStepsForSnapshot(asRecords(parsed.streamingSteps))
     : [];
   const runId = typeof parsed.runId === "string" ? parsed.runId : "";
   const lastRunSeq =
@@ -6111,6 +6748,9 @@ function sanitizeActivityPayloadForUi(
   if (typeof value === "string") {
     if (shouldOmitActivityPayloadString(normalizedKey, parent)) {
       return value ? omittedStringLabel(value) : "";
+    }
+    if (shouldPreserveFullActivityPayloadString(normalizedKey, parent)) {
+      return value;
     }
     if (isStreamLikeActivityRecord(parent)) {
       return compactUiString(value, CHAT_ACTIVITY_STREAM_STRING_MAX_CHARS);
@@ -6656,6 +7296,14 @@ function normalizeOutboundHref(value?: string): string | null {
   ) {
     return null;
   }
+  if (
+    trimmed === "/apps" ||
+    trimmed.startsWith("/apps/") ||
+    trimmed === "/ui/documents" ||
+    trimmed.startsWith("/ui/documents?")
+  ) {
+    return trimmed;
+  }
   if (looksLikeUrl(trimmed)) return trimmed;
   if (trimmed.startsWith("//")) return `https:${trimmed}`;
   if (/^[a-z0-9.-]+\.[a-z]{2,}(?:[/:?#]|$)/i.test(trimmed)) {
@@ -6940,111 +7588,6 @@ function parseMarkdownFallbackBlocks(text: string): ChatMarkdownBlock[] {
   return blocks;
 }
 
-function headingTag(level: number): keyof JSX.IntrinsicElements {
-  if (level <= 1) return "h1";
-  if (level === 2) return "h2";
-  if (level === 3) return "h3";
-  if (level === 4) return "h4";
-  if (level === 5) return "h5";
-  return "h6";
-}
-
-function renderMarkdownFallback(
-  text: string,
-  options?: ChatMarkdownRenderOptions,
-): ReactNode[] {
-  let codeBlockIndex = 0;
-  return parseMarkdownFallbackBlocks(text).map((block, index) => {
-    const key = `md-fallback-${index}`;
-    if (block.type === "heading") {
-      const component = headingTag(block.level);
-      const className = `chat-md-heading chat-md-h${Math.min(6, Math.max(1, block.level))}`;
-      return (
-        <Typography key={key} component={component} className={className}>
-          {renderInlineMarkdown(block.text)}
-        </Typography>
-      );
-    }
-    if (block.type === "paragraph") {
-      return (
-        <Typography key={key} variant="body2" className="chat-md-paragraph">
-          {renderMarkdownLineBreaks(block.text)}
-        </Typography>
-      );
-    }
-    if (block.type === "ul" || block.type === "ol") {
-      return (
-        <Box key={key} component={block.type} className="chat-md-list">
-          {block.items.map((item, itemIndex) => (
-            <li key={`${key}-item-${itemIndex}`}>{renderInlineMarkdown(item)}</li>
-          ))}
-        </Box>
-      );
-    }
-    if (block.type === "blockquote") {
-      return (
-        <Box key={key} component="blockquote">
-          <Typography variant="body2" className="chat-md-paragraph">
-            {renderMarkdownLineBreaks(block.text)}
-          </Typography>
-        </Box>
-      );
-    }
-    if (block.type === "hr") {
-      return <Box key={key} component="hr" />;
-    }
-    if (block.type === "table") {
-      const [header = [], ...bodyRows] = block.rows;
-      return (
-        <Box key={key} sx={{ overflowX: "auto", my: 1 }}>
-          <table>
-            <thead>
-              <tr>
-                {header.map((cell, cellIndex) => (
-                  <th key={`${key}-h-${cellIndex}`}>
-                    {renderInlineMarkdown(cell)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {bodyRows.map((row, rowIndex) => (
-                <tr key={`${key}-r-${rowIndex}`}>
-                  {row.map((cell, cellIndex) => (
-                    <td key={`${key}-r-${rowIndex}-${cellIndex}`}>
-                      {renderInlineMarkdown(cell)}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Box>
-      );
-    }
-
-    const languageHint = block.language ? `language-${block.language}` : "";
-    if (isAgentArkChartFence(languageHint)) {
-      return <InlineAgentArkChart key={key} code={block.content} />;
-    }
-    const snippetIndex = codeBlockIndex++;
-    const fileName = inferCodePreviewFileName(languageHint, block.content);
-    const snippetId = options?.snippetNamespace
-      ? `${options.snippetNamespace}::snippet::${snippetIndex}`
-      : undefined;
-    return (
-      <InlineCodePreview
-        key={key}
-        code={block.content}
-        languageHint={languageHint}
-        fileName={fileName}
-        snippetId={snippetId}
-        onOpenInWorkspace={options?.onOpenSnippet}
-      />
-    );
-  });
-}
-
 function splitUrlTrailingPunctuation(
   value: string,
 ): { href: string; trailing: string } {
@@ -7068,492 +7611,87 @@ function handleChatLinkClick(event: React.MouseEvent<HTMLElement>): void {
   event.stopPropagation();
 }
 
-// Async-loaded react-markdown for proper GFM rendering
-let _ReactMarkdown: React.ComponentType<{
-  children: string;
-  remarkPlugins?: unknown[];
-  components?: Record<string, unknown>;
-}> | null = null;
-let _remarkGfm: unknown = null;
-let _mdReady = false;
-let _mdLoadPromise: Promise<void> | null = null;
-
-function ensureMarkdownLoaded(): Promise<void> {
-  if (_mdReady) return Promise.resolve();
-  if (_mdLoadPromise) return _mdLoadPromise;
-  _mdLoadPromise = Promise.all([
-    import("react-markdown").then((m) => {
-      _ReactMarkdown = m.default as typeof _ReactMarkdown;
-    }),
-    import("remark-gfm").then((m) => {
-      _remarkGfm = m.default;
-    }),
-  ]).then(() => {
-    _mdReady = true;
-  });
-  return _mdLoadPromise;
-}
-
-// Eagerly start loading
-ensureMarkdownLoaded();
-
 function MarkdownBody({
   text,
   snippetNamespace,
   onOpenSnippet,
 }: { text: string } & ChatMarkdownRenderOptions) {
-  const [ready, setReady] = useState(_mdReady);
-  useEffect(() => {
-    if (!ready) ensureMarkdownLoaded().then(() => setReady(true));
-  }, [ready]);
-
-  if (!ready || !_ReactMarkdown) {
-    return (
-      <>
-        {renderMarkdownFallback(text, {
-          snippetNamespace,
-          onOpenSnippet,
-        })}
-      </>
-    );
-  }
-
-  const Md = _ReactMarkdown;
   let blockIndex = 0;
-  return (
-    <Md
-      remarkPlugins={_remarkGfm ? [_remarkGfm as never] : []}
-      components={
-        {
-          h1: ({ children }: { children?: React.ReactNode }) => (
-            <Typography component="h1" className="chat-md-heading chat-md-h1">
-              {children}
-            </Typography>
-          ),
-          h2: ({ children }: { children?: React.ReactNode }) => (
-            <Typography component="h2" className="chat-md-heading chat-md-h2">
-              {children}
-            </Typography>
-          ),
-          h3: ({ children }: { children?: React.ReactNode }) => (
-            <Typography component="h3" className="chat-md-heading chat-md-h3">
-              {children}
-            </Typography>
-          ),
-          h4: ({ children }: { children?: React.ReactNode }) => (
-            <Typography component="h4" className="chat-md-heading chat-md-h4">
-              {children}
-            </Typography>
-          ),
-          p: ({ children }: { children?: React.ReactNode }) => (
-            <Typography variant="body2" className="chat-md-paragraph">
-              {children}
-            </Typography>
-          ),
-          a: ({
-            href,
-            children,
-          }: {
-            href?: string;
-            children?: React.ReactNode;
-          }) => {
-            const normalizedHref = normalizeOutboundHref(href);
-            if (!normalizedHref) return <span>{children}</span>;
-            return (
-              <a
-                className="chat-md-link"
-                href={normalizedHref}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={handleChatLinkClick}
-              >
-                {children}
-              </a>
-            );
-          },
-          img: ({
-            src,
-            alt,
-          }: {
-            src?: string;
-            alt?: string;
-          }) => {
-            const normalizedSrc = normalizeOutboundHref(src);
-            const label = str(alt, "").trim();
-            if (!normalizedSrc) {
-              return label ? (
-                <span className="chat-md-image-alt">{label}</span>
-              ) : null;
-            }
-            return (
-              <img
-                className="chat-md-image"
-                src={normalizedSrc}
-                alt={label}
-                loading="lazy"
-                referrerPolicy="no-referrer"
-                onError={(event) => {
-                  event.currentTarget.style.display = "none";
-                }}
-              />
-            );
-          },
-          pre: ({ children }: { children?: React.ReactNode }) => {
-            const extracted = extractMarkdownCodeBlock(children);
-            if (!extracted) {
-              return (
-                <pre className="chat-md-code">
-                  {reactNodeToPlainText(children)}
-                </pre>
-              );
-            }
-            if (isAgentArkChartFence(extracted.className)) {
-              return <InlineAgentArkChart code={extracted.code} />;
-            }
-            const snippetIndex = blockIndex++;
-            const fileName = inferCodePreviewFileName(
-              extracted.className,
-              extracted.code,
-            );
-            const snippetId = snippetNamespace
-              ? `${snippetNamespace}::snippet::${snippetIndex}`
-              : undefined;
-            return (
-              <InlineCodePreview
-                code={extracted.code}
-                languageHint={extracted.className}
-                fileName={fileName}
-                snippetId={snippetId}
-                onOpenInWorkspace={onOpenSnippet}
-              />
-            );
-          },
-          code: ({
-            children,
-            className,
-          }: {
-            children?: React.ReactNode;
-            className?: string;
-          }) => {
-            const normalizedClassName = str(className, "").trim();
-            return (
-              <code className={normalizedClassName || "chat-md-inline-code"}>
-                {children}
-              </code>
-            );
-          },
-          ul: ({ children }: { children?: React.ReactNode }) => (
-            <Box component="ul" className="chat-md-list">
-              {children}
-            </Box>
-          ),
-          ol: ({ children }: { children?: React.ReactNode }) => (
-            <Box component="ol" className="chat-md-list">
-              {children}
-            </Box>
-          ),
-          table: ({ children }: { children?: React.ReactNode }) => (
-            <Box sx={{ overflowX: "auto", my: 1 }}>
-              <table
-                style={{
-                  borderCollapse: "collapse",
-                  width: "100%",
-                  fontSize: "0.85rem",
-                }}
-              >
-                {children}
-              </table>
-            </Box>
-          ),
-          th: ({ children }: { children?: React.ReactNode }) => (
-            <th
-              style={{
-                border: "1px solid var(--ui-rgba-255-255-255-120)",
-                padding: "6px 10px",
-                textAlign: "left",
-                fontWeight: 600,
-              }}
-            >
-              {children}
-            </th>
-          ),
-          td: ({ children }: { children?: React.ReactNode }) => (
-            <td
-              style={{
-                border: "1px solid var(--ui-rgba-255-255-255-080)",
-                padding: "6px 10px",
-              }}
-            >
-              {children}
-            </td>
-          ),
-          blockquote: ({ children }: { children?: React.ReactNode }) => (
-            <Box
-              sx={{
-                borderLeft: "3px solid var(--ui-rgba-47-212-255-400)",
-                pl: 1.5,
-                my: 0.5,
-                color: "text.secondary",
-              }}
-            >
-              {children}
-            </Box>
-          ),
-          hr: () => (
-            <Box
-              component="hr"
-              sx={{
-                border: "none",
-                borderTop: "1px solid var(--ui-rgba-255-255-255-080)",
-                my: 1,
-              }}
-            />
-          ),
-        } as Record<string, unknown>
-      }
-    >
-      {text}
-    </Md>
-  );
-}
-
-type ChatSearchBriefItem = {
-  title: string;
-  body: string;
-};
-
-type ChatSearchBriefSection = {
-  title: string;
-  items: ChatSearchBriefItem[];
-};
-
-type ChatSearchBrief = {
-  intro: string;
-  sections: ChatSearchBriefSection[];
-  bottomLine: string;
-  followUp: string;
-};
-
-function cleanSearchBriefText(value: string): string {
-  return (value || "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/^\s*#{1,6}\s+/, "")
-    .replace(/^[_*]{1,3}|[_*]{1,3}$/g, "")
-    .replace(/[_*]{2}/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isSearchBriefDivider(line: string): boolean {
-  return /^-{3,}$/.test(line.trim());
-}
-
-function isSearchBriefBullet(line: string): boolean {
-  return /^\s*(?:[-*+]|\d+[.)])\s+/.test(line);
-}
-
-function parseSearchBriefHeading(line: string): string {
-  const cleaned = cleanSearchBriefText(line).replace(/:$/, "").trim();
-  if (!cleaned) return "";
-  if (cleaned.length > 72) return "";
-  if (/[.!?]$/.test(cleaned)) return "";
-  if (/^(bottom line|would you like|do you want|should i|want me to)\b/i.test(cleaned)) {
-    return "";
-  }
-  if (/^(here(?:'|’)s|here is|from the|based on|i found)\b/i.test(cleaned)) {
-    return "";
-  }
-  return /[a-z]/i.test(cleaned) ? cleaned : "";
-}
-
-function parseSearchBriefItem(line: string): ChatSearchBriefItem {
-  const content = line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim();
-  const boldLead = content.match(/^(\*\*|__)(.+?)\1\s*[:.-]?\s*(.*)$/);
-  if (boldLead) {
-    return {
-      title: cleanSearchBriefText(boldLead[2]).replace(/[.]$/, ""),
-      body: cleanSearchBriefText(boldLead[3] || ""),
-    };
-  }
-
-  const colonLead = content.match(/^([^:]{8,120}):\s+(.+)$/);
-  if (colonLead) {
-    return {
-      title: cleanSearchBriefText(colonLead[1]),
-      body: cleanSearchBriefText(colonLead[2]),
-    };
-  }
-
-  const sentenceLead = content.match(/^(.{16,150}?[.!?])\s+(.+)$/);
-  if (sentenceLead) {
-    return {
-      title: cleanSearchBriefText(sentenceLead[1]).replace(/[.]$/, ""),
-      body: cleanSearchBriefText(sentenceLead[2]),
-    };
-  }
-
-  return {
-    title: "",
-    body: cleanSearchBriefText(content),
-  };
-}
-
-function parseSearchBriefBottomLine(line: string): string {
-  const normalized = line.trim();
-  const match = normalized.match(/^\*{0,2}Bottom line:?\*{0,2}\s*(.*)$/i);
-  if (!match) return "";
-  return cleanSearchBriefText(match[1] || "");
-}
-
-function parseChatSearchBrief(text: string): ChatSearchBrief | null {
-  const source = (text || "").replace(/\r\n/g, "\n").trim();
-  if (!source || source.includes("```") || containsMarkdownTable(source)) {
-    return null;
-  }
-
-  const bulletCount = source
-    .split("\n")
-    .filter((line) => isSearchBriefBullet(line)).length;
-  if (bulletCount < 2) return null;
-
-  const hasSearchSignature =
-    /\b(latest|news|search|results?|summary|developments?|top stories|bottom line)\b/i.test(
-      source,
-    );
-  if (!hasSearchSignature) return null;
-
-  const rawLines = source
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line && !isSearchBriefDivider(line));
-  const introLines: string[] = [];
-  const sections: ChatSearchBriefSection[] = [];
-  let currentSection: ChatSearchBriefSection | null = null;
-  let bottomLine = "";
-  let followUp = "";
-
-  const ensureSection = () => {
-    if (!currentSection) {
-      currentSection = { title: "Key results", items: [] };
-      sections.push(currentSection);
-    }
-    return currentSection;
-  };
-
-  for (const line of rawLines) {
-    const bottom = parseSearchBriefBottomLine(line);
-    if (bottom) {
-      bottomLine = bottom;
-      currentSection = null;
-      continue;
-    }
-
-    const plainLine = cleanSearchBriefText(line);
-    if (/^(would you like|do you want|want me to|should i)\b/i.test(plainLine)) {
-      followUp = plainLine;
-      currentSection = null;
-      continue;
-    }
-
-    if (isSearchBriefBullet(line)) {
-      ensureSection().items.push(parseSearchBriefItem(line));
-      continue;
-    }
-
-    const heading = parseSearchBriefHeading(line);
-    if (heading) {
-      currentSection = { title: heading, items: [] };
-      sections.push(currentSection);
-      continue;
-    }
-
-    if (currentSection && currentSection.items.length > 0) {
-      const last = currentSection.items[currentSection.items.length - 1];
-      last.body = [last.body, plainLine].filter(Boolean).join(" ");
-      continue;
-    }
-
-    if (sections.length === 0 && !bottomLine) {
-      introLines.push(plainLine.replace(/:$/, ""));
-    }
-  }
-
-  const populatedSections = sections.filter((section) => section.items.length > 0);
-  if (populatedSections.length === 0) return null;
-
-  return {
-    intro: introLines.join(" ").trim(),
-    sections: populatedSections,
-    bottomLine,
-    followUp,
-  };
-}
-
-function renderChatSearchBrief(brief: ChatSearchBrief): ReactNode {
-  return (
-    <Box className="chat-search-brief">
-      {brief.intro ? (
-        <Typography component="div" className="chat-search-brief-kicker">
-          {renderInlineMarkdown(brief.intro)}
-        </Typography>
-      ) : null}
-
-      {brief.sections.map((section, sectionIndex) => (
-        <Box
-          component="section"
-          className="chat-search-brief-section"
-          key={`${section.title}-${sectionIndex}`}
+  const components: Components = {
+    a({ href, children }) {
+      const normalizedHref = normalizeOutboundHref(href);
+      if (!normalizedHref) return <span>{children}</span>;
+      return (
+        <a
+          className="chat-md-link"
+          href={normalizedHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={handleChatLinkClick}
         >
-          <Typography component="div" className="chat-search-brief-section-title">
-            {section.title}
-          </Typography>
-          <Box component="ol" className="chat-search-brief-list">
-            {section.items.map((item, itemIndex) => (
-              <Box
-                component="li"
-                className="chat-search-brief-item"
-                key={`${section.title}-${itemIndex}`}
-              >
-                <Box className="chat-search-brief-item-body">
-                  {item.title ? (
-                    <Typography
-                      component="div"
-                      className="chat-search-brief-item-title"
-                    >
-                      {renderInlineMarkdown(item.title)}
-                    </Typography>
-                  ) : null}
-                  {item.body ? (
-                    <Typography
-                      component="div"
-                      className="chat-search-brief-item-text"
-                    >
-                      {renderInlineMarkdown(item.body)}
-                    </Typography>
-                  ) : null}
-                </Box>
-              </Box>
-            ))}
-          </Box>
-        </Box>
-      ))}
+          {children}
+        </a>
+      );
+    },
+    img({ src, alt }) {
+      const normalizedSrc = normalizeOutboundHref(src);
+      const label = str(alt, "").trim();
+      if (!normalizedSrc) {
+        return label ? <span className="chat-md-image-alt">{label}</span> : null;
+      }
+      return (
+        <img
+          className="chat-md-image"
+          src={normalizedSrc}
+          alt={label}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={(event) => {
+            event.currentTarget.style.display = "none";
+          }}
+        />
+      );
+    },
+    pre({ children }) {
+      const extracted = extractMarkdownCodeBlock(children);
+      if (!extracted) {
+        return <pre className="chat-md-code">{reactNodeToPlainText(children)}</pre>;
+      }
+      if (isAgentArkChartFence(extracted.className)) {
+        return <InlineAgentArkChart code={extracted.code} />;
+      }
+      const snippetIndex = blockIndex++;
+      const fileName = inferCodePreviewFileName(
+        extracted.className,
+        extracted.code,
+      );
+      const snippetId = snippetNamespace
+        ? `${snippetNamespace}::snippet::${snippetIndex}`
+        : undefined;
+      return (
+        <InlineCodePreview
+          code={extracted.code}
+          languageHint={extracted.className}
+          fileName={fileName}
+          snippetId={snippetId}
+          onOpenInWorkspace={onOpenSnippet}
+        />
+      );
+    },
+    code({ children, className }) {
+      const normalizedClassName = str(className, "").trim();
+      return (
+        <code className={normalizedClassName || "chat-md-inline-code"}>
+          {children}
+        </code>
+      );
+    },
+  };
 
-      {brief.bottomLine ? (
-        <Box className="chat-search-brief-bottom">
-          <span className="chat-search-brief-label">Bottom line</span>
-          <Typography component="div" className="chat-search-brief-bottom-text">
-            {renderInlineMarkdown(brief.bottomLine)}
-          </Typography>
-        </Box>
-      ) : null}
-
-      {brief.followUp ? (
-        <Typography component="div" className="chat-search-brief-followup">
-          {renderInlineMarkdown(brief.followUp)}
-        </Typography>
-      ) : null}
-    </Box>
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      {text}
+    </ReactMarkdown>
   );
 }
 
@@ -7628,14 +7766,6 @@ function renderChatMarkdown(
 ): ReactNode {
   const normalizedText = normalizeChatMarkdownForDisplay(text);
   if (!normalizedText.trim()) return null;
-  const searchBrief = parseChatSearchBrief(normalizedText);
-  if (searchBrief) {
-    return (
-      <Box className="chat-markdown chat-markdown-search-brief">
-        {renderChatSearchBrief(searchBrief)}
-      </Box>
-    );
-  }
   return (
     <Box className="chat-markdown">
       <MarkdownBody
@@ -7865,7 +7995,10 @@ function trimResearchReportTail(text: string): string {
   return out.join("\n").trim();
 }
 
-function parseResearchReport(text: string): ResearchReportPreview | null {
+function parseResearchReport(
+  text: string,
+  options: { allowEvidenceThin?: boolean } = {},
+): ResearchReportPreview | null {
   const normalized = trimResearchReportTail(text);
   if (!normalized) return null;
   const lines = normalized.split("\n");
@@ -7964,7 +8097,8 @@ function parseResearchReport(text: string): ResearchReportPreview | null {
       summary,
       keyFindingCount,
       sourceCount,
-    )
+    ) &&
+    !options.allowEvidenceThin
   ) {
     return null;
   }
@@ -7988,6 +8122,51 @@ function parseResearchReport(text: string): ResearchReportPreview | null {
     evidenceBrief,
     content: normalized,
   };
+}
+
+function looksLikeResearchReportBody(text: string): boolean {
+  const normalized = trimResearchReportTail(text);
+  if (!normalized) return false;
+  if (splitResearchEvidenceBrief(normalized).evidenceBrief.trim()) return true;
+  const lines = normalized.split("\n").map((line) => line.trim());
+  const sectionLikeLines = lines.filter((line) =>
+    /^(#{2,6}\s+\S|\d+\.\s+\S)/.test(line),
+  ).length;
+  if (sectionLikeLines >= 2) return true;
+  const paragraphCount = normalized
+    .split(/\n{2,}/)
+    .map((block) => stripMarkdownDecorations(block).trim())
+    .filter((block) => block.length >= 120).length;
+  return normalized.length >= 1200 && paragraphCount >= 4;
+}
+
+function parseResearchReportWithContext(
+  text: string,
+  options: {
+    deepResearch?: boolean;
+    previousUserPrompt?: string;
+    conversationTitle?: string;
+  } = {},
+): ResearchReportPreview | null {
+  const direct = parseResearchReport(text);
+  if (direct || !options.deepResearch) return direct;
+  const normalized = trimResearchReportTail(text);
+  if (!normalized) return null;
+  if (!looksLikeResearchReportBody(normalized)) return null;
+  const title =
+    shortenAssistantExportText(
+      stripAttachmentContextMarker(
+        options.previousUserPrompt || options.conversationTitle || "",
+      ),
+      180,
+    ) || "Deep research report";
+  return parseResearchReport(`# Deep Research: ${title}\n\n${normalized}`, {
+    allowEvidenceThin: true,
+  });
+}
+
+function isDeepResearchAssistantMessage(message: JsonRecord): boolean {
+  return isDeepResearchPlanSource(str(message.model_used, ""));
 }
 
 function collectAssistantExportParagraphs(text: string): string[] {
@@ -8189,6 +8368,7 @@ function convertAgentArkChartFencesForExport(content: string): string {
 
 function cleanResearchReportMarkdownForExport(
   report: ResearchReportPreview,
+  options: { preserveChartFences?: boolean } = {},
 ): string {
   let body = (report.mainContent || report.content || "").trim();
   body = body.replace(
@@ -8199,12 +8379,409 @@ function cleanResearchReportMarkdownForExport(
     /^##\s+\*\*(.+?)\*\*\s*(?:-|:|\u2013|\u2014)+\s*(.+)$/gm,
     "## $1\n\n$2",
   );
-  body = convertAgentArkChartFencesForExport(body);
+  if (!options.preserveChartFences) {
+    body = convertAgentArkChartFencesForExport(body);
+  }
   const sources = extractMarkdownSection(report.evidenceBrief, "Sources");
   if (sources && !/^##\s+Sources\b/im.test(body)) {
     body = `${body.trim()}\n\n## Sources\n\n${sources.trim()}`;
   }
   return body.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function escapeDocumentHtml(value: string): string {
+  return (value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function safeDocumentHref(value: string): string {
+  const href = (value || "").trim();
+  if (!/^(https?:|mailto:|#)/i.test(href)) return "";
+  return escapeDocumentHtml(href);
+}
+
+function renderDocumentInlineMarkdown(value: string): string {
+  let html = escapeDocumentHtml(value);
+  html = html.replace(
+    /\[([^\]]+)\]\(([^)]+)\)/g,
+    (_match, label: string, href: string) => {
+      const safeHref = safeDocumentHref(
+        href.replace(/&amp;/g, "&").replace(/&quot;/g, '"'),
+      );
+      return safeHref ? `<a href="${safeHref}">${label}</a>` : label;
+    },
+  );
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  return html;
+}
+
+function markdownTableToDocumentHtml(rows: string[][]): string {
+  if (rows.length === 0) return "";
+  const [header = [], ...bodyRows] = rows;
+  const headerHtml = header
+    .map((cell) => `<th>${renderDocumentInlineMarkdown(cell)}</th>`)
+    .join("");
+  const bodyHtml = bodyRows
+    .map(
+      (row) =>
+        `<tr>${row
+          .map((cell) => `<td>${renderDocumentInlineMarkdown(cell)}</td>`)
+          .join("")}</tr>`,
+    )
+    .join("");
+  return `<table><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`;
+}
+
+function reportChartNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return null;
+  const parsed = Number(value.replace(/[$,%\s,]/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function reportChartText(value: unknown, fallback = ""): string {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return fallback;
+}
+
+function reportChartRows(value: unknown): JsonRecord[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is JsonRecord => {
+        const record = asRecord(item);
+        return Object.keys(record).length > 0;
+      })
+    : [];
+}
+
+function reportChartCategoryKey(spec: JsonRecord, rows: JsonRecord[]): string {
+  const explicit = reportChartText(spec.x);
+  if (explicit) return explicit;
+  const keys = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
+  return (
+    keys.find((key) => rows.some((row) => reportChartNumber(row[key]) == null)) ||
+    keys[0] ||
+    ""
+  );
+}
+
+function reportChartSeriesKeys(
+  spec: JsonRecord,
+  rows: JsonRecord[],
+  categoryKey: string,
+): string[] {
+  if (Array.isArray(spec.series)) {
+    const explicit = spec.series
+      .map((item) =>
+        typeof item === "string" ? item : reportChartText(asRecord(item).key),
+      )
+      .map((key) => key.trim())
+      .filter(Boolean);
+    if (explicit.length > 0) return explicit.slice(0, 4);
+  }
+  const keys = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
+  return keys
+    .filter(
+      (key) =>
+        key !== categoryKey &&
+        rows.some((row) => reportChartNumber(row[key]) != null),
+    )
+    .slice(0, 4);
+}
+
+function reportChartKind(spec: JsonRecord): string {
+  const kind = reportChartText(spec.type).toLowerCase();
+  return ["line", "area", "scatter", "pie", "doughnut"].includes(kind)
+    ? kind
+    : "bar";
+}
+
+function reportChartColor(index: number): string {
+  const colors = ["#78f2b0", "#d8ad78", "#b7a7ff", "#5f8f5f"];
+  return colors[index % colors.length] || colors[0];
+}
+
+function reportChartValueLabel(value: number): string {
+  if (Math.abs(value) >= 1000) return value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (Math.abs(value) >= 10) return value.toLocaleString(undefined, { maximumFractionDigits: 1 });
+  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function agentArkChartToReportHtml(rawJson: string): string {
+  try {
+    const spec = asRecord(JSON.parse(rawJson));
+    const rows = reportChartRows(spec.data).slice(0, 28);
+    if (rows.length === 0) return "";
+    const categoryKey = reportChartCategoryKey(spec, rows);
+    const seriesKeys = reportChartSeriesKeys(spec, rows, categoryKey);
+    if (!categoryKey || seriesKeys.length === 0) return "";
+    const title = reportChartText(spec.title, "Chart");
+    const subtitle = reportChartText(spec.subtitle);
+    const kind = reportChartKind(spec);
+    const values = rows.flatMap((row) =>
+      seriesKeys
+        .map((key) => reportChartNumber(row[key]))
+        .filter((value): value is number => value != null),
+    );
+    if (values.length === 0) return "";
+    const safeTitle = escapeDocumentHtml(title);
+    const safeSubtitle = subtitle
+      ? `<div class="report-chart-subtitle">${escapeDocumentHtml(subtitle)}</div>`
+      : "";
+
+    if (kind === "line" || kind === "area" || kind === "scatter") {
+      const width = 760;
+      const height = 320;
+      const left = 54;
+      const right = 24;
+      const top = 58;
+      const bottom = 52;
+      const plotWidth = width - left - right;
+      const plotHeight = height - top - bottom;
+      const min = Math.min(0, ...values);
+      const max = Math.max(...values);
+      const span = max === min ? 1 : max - min;
+      const xFor = (index: number) =>
+        left + (rows.length <= 1 ? plotWidth / 2 : (index / (rows.length - 1)) * plotWidth);
+      const yFor = (value: number) => top + plotHeight - ((value - min) / span) * plotHeight;
+      const seriesSvg = seriesKeys
+        .map((key, seriesIndex) => {
+          const points = rows
+            .map((row, rowIndex) => {
+              const value = reportChartNumber(row[key]);
+              return value == null ? null : { x: xFor(rowIndex), y: yFor(value), value };
+            })
+            .filter((point): point is { x: number; y: number; value: number } => point != null);
+          if (points.length === 0) return "";
+          const color = reportChartColor(seriesIndex);
+          const path = points
+            .map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(1)} ${point.y.toFixed(1)}`)
+            .join(" ");
+          const area =
+            kind === "area"
+              ? `<path d="${path} L ${points[points.length - 1].x.toFixed(1)} ${top + plotHeight} L ${points[0].x.toFixed(1)} ${top + plotHeight} Z" fill="${color}" opacity="0.12" />`
+              : "";
+          const markers = points
+            .map(
+              (point) =>
+                `<circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="${kind === "scatter" ? 4.5 : 3.2}" fill="${color}" />`,
+            )
+            .join("");
+          return `${area}<path d="${path}" fill="none" stroke="${color}" stroke-width="2.6" />${markers}`;
+        })
+        .join("");
+      const legend = seriesKeys
+        .map(
+          (key, index) =>
+            `<span><i style="background:${reportChartColor(index)}"></i>${escapeDocumentHtml(key)}</span>`,
+        )
+        .join("");
+      const labelStep = Math.max(1, Math.ceil(rows.length / 6));
+      const labels = rows
+        .map((row, index) => {
+          if (index % labelStep !== 0 && index !== rows.length - 1) return "";
+          return `<text x="${xFor(index).toFixed(1)}" y="${height - 18}" text-anchor="middle">${escapeDocumentHtml(reportChartText(row[categoryKey], String(index + 1))).slice(0, 16)}</text>`;
+        })
+        .join("");
+      return `<figure class="report-chart"><figcaption>${safeTitle}${safeSubtitle}</figcaption><div class="report-chart-legend">${legend}</div><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${safeTitle}"><rect x="0" y="0" width="${width}" height="${height}" rx="12" fill="#f8fbfd"/><line x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}" stroke="#b6c4cf"/><line x1="${left}" y1="${top}" x2="${left}" y2="${top + plotHeight}" stroke="#b6c4cf"/><text x="${left - 8}" y="${top + 6}" text-anchor="end">${escapeDocumentHtml(reportChartValueLabel(max))}</text><text x="${left - 8}" y="${top + plotHeight}" text-anchor="end">${escapeDocumentHtml(reportChartValueLabel(min))}</text>${seriesSvg}${labels}</svg></figure>`;
+    }
+
+    const firstSeries = seriesKeys[0];
+    const chartRows = rows
+      .map((row, index) => ({
+        label: reportChartText(row[categoryKey], String(index + 1)),
+        value: reportChartNumber(row[firstSeries]),
+      }))
+      .filter((row): row is { label: string; value: number } => row.value != null);
+    const max = Math.max(...chartRows.map((row) => Math.abs(row.value)), 1);
+    const bars = chartRows
+      .map((row) => {
+        const width = Math.max(2, Math.abs(row.value / max) * 100);
+        return `<div class="report-chart-row"><span>${escapeDocumentHtml(row.label)}</span><b><i style="width:${width.toFixed(1)}%"></i></b><em>${escapeDocumentHtml(reportChartValueLabel(row.value))}</em></div>`;
+      })
+      .join("");
+    return `<figure class="report-chart"><figcaption>${safeTitle}${safeSubtitle}</figcaption><div class="report-chart-bars">${bars}</div></figure>`;
+  } catch {
+    return "";
+  }
+}
+
+function markdownToDocumentHtml(markdown: string): string {
+  const lines = (markdown || "").replace(/\r\n/g, "\n").split("\n");
+  const html: string[] = [];
+  let paragraphLines: string[] = [];
+  let listMode: "ul" | "ol" | null = null;
+  let codeLines: string[] | null = null;
+  let codeLanguage = "";
+
+  const closeParagraph = () => {
+    if (paragraphLines.length === 0) return;
+    html.push(`<p>${renderDocumentInlineMarkdown(paragraphLines.join(" "))}</p>`);
+    paragraphLines = [];
+  };
+  const closeList = () => {
+    if (!listMode) return;
+    html.push(`</${listMode}>`);
+    listMode = null;
+  };
+  const openList = (mode: "ul" | "ol") => {
+    closeParagraph();
+    if (listMode === mode) return;
+    closeList();
+    listMode = mode;
+    html.push(`<${mode}>`);
+  };
+  const closeCode = () => {
+    if (!codeLines) return;
+    closeParagraph();
+    closeList();
+    const code = codeLines.join("\n");
+    const language = codeLanguage.trim().toLowerCase();
+    if (language === "agentark-chart") {
+      html.push(
+        agentArkChartToReportHtml(code) ||
+          `<pre>${escapeDocumentHtml(code)}</pre>`,
+      );
+    } else {
+      html.push(`<pre>${escapeDocumentHtml(code)}</pre>`);
+    }
+    codeLines = null;
+    codeLanguage = "";
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] || "";
+    const trimmed = line.trim();
+    if (/^```/.test(trimmed)) {
+      if (codeLines) {
+        closeCode();
+      } else {
+        closeParagraph();
+        closeList();
+        codeLanguage = trimmed.replace(/^```/, "").trim();
+        codeLines = [];
+      }
+      continue;
+    }
+    if (codeLines) {
+      codeLines.push(line);
+      continue;
+    }
+    const table = parseMarkdownFallbackTable(lines, index);
+    if (table) {
+      closeParagraph();
+      closeList();
+      html.push(markdownTableToDocumentHtml(table.rows));
+      index = table.nextIndex - 1;
+      continue;
+    }
+    if (!trimmed) {
+      closeParagraph();
+      closeList();
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      closeParagraph();
+      closeList();
+      const level = Math.min(6, Math.max(1, heading[1]?.length ?? 1));
+      html.push(
+        `<h${level}>${renderDocumentInlineMarkdown((heading[2] || "").trim())}</h${level}>`,
+      );
+      continue;
+    }
+    const unordered = trimmed.match(/^[-+*]\s+(.+)$/);
+    if (unordered) {
+      openList("ul");
+      html.push(`<li>${renderDocumentInlineMarkdown(unordered[1])}</li>`);
+      continue;
+    }
+    const ordered = trimmed.match(/^\d+\.\s+(.+)$/);
+    if (ordered) {
+      openList("ol");
+      html.push(`<li>${renderDocumentInlineMarkdown(ordered[1])}</li>`);
+      continue;
+    }
+    paragraphLines.push(trimmed);
+  }
+  closeCode();
+  closeParagraph();
+  closeList();
+  return html.join("\n");
+}
+
+function reportPrintHtml(title: string, markdown: string): string {
+  const safeTitle = escapeDocumentHtml(title || "AgentArk report");
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>${safeTitle}</title>
+  <style>
+    @page { size: A4; margin: 18mm 16mm; }
+    html { background: #f2f0eb; }
+    body { color: #17202a; font-family: Aptos, Calibri, Arial, sans-serif; font-size: 11pt; line-height: 1.55; }
+    h1, h2, h3, h4, h5, h6 { color: #214636; font-family: Georgia, "Times New Roman", serif; line-height: 1.25; margin: 1.1em 0 0.45em; }
+    h1 { font-size: 22pt; border-bottom: 2px solid #214636; padding-bottom: 8pt; }
+    h2 { font-size: 16pt; }
+    h3 { font-size: 13pt; }
+    p { margin: 0 0 0.75em; }
+    ul, ol { margin: 0.35em 0 0.8em 1.4em; padding: 0; }
+    li { margin: 0.2em 0; }
+    table { width: 100%; border-collapse: collapse; margin: 0.8em 0 1em; font-size: 9.5pt; }
+    th, td { border: 1px solid #b6c4cf; padding: 5pt 6pt; vertical-align: top; }
+    th { background: #214636; color: #fff; font-weight: 700; }
+    code, pre { font-family: Consolas, "Courier New", monospace; }
+    code { background: #eff5ef; color: #214636; padding: 1pt 3pt; }
+    pre { background: #252b36; color: #f8fafc; padding: 8pt; white-space: pre-wrap; }
+    a { color: #2f8f68; }
+    .report-chart { margin: 16pt 0; border: 1px solid #d2dde5; border-radius: 8pt; background: #fbfdff; padding: 10pt; break-inside: avoid; }
+    .report-chart figcaption { color: #214636; font-weight: 700; margin-bottom: 5pt; }
+    .report-chart-subtitle { color: #5d6b78; font-size: 9pt; font-weight: 400; margin-top: 2pt; }
+    .report-chart svg { display: block; width: 100%; height: auto; }
+    .report-chart text { fill: #456273; font-family: Aptos, Calibri, Arial, sans-serif; font-size: 10px; }
+    .report-chart-legend { display: flex; flex-wrap: wrap; gap: 8pt; margin: 4pt 0 6pt; color: #385064; font-size: 9pt; }
+    .report-chart-legend span { display: inline-flex; align-items: center; gap: 4pt; }
+    .report-chart-legend i { display: inline-block; width: 8pt; height: 8pt; border-radius: 999px; }
+    .report-chart-bars { display: grid; gap: 6pt; }
+    .report-chart-row { display: grid; grid-template-columns: minmax(88pt, 1fr) minmax(120pt, 2fr) auto; align-items: center; gap: 8pt; font-size: 9pt; }
+    .report-chart-row span { color: #2c465a; }
+    .report-chart-row b { display: block; height: 10pt; border-radius: 999px; background: #e5edf3; overflow: hidden; }
+    .report-chart-row i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #78f2b0, #d8ad78); }
+    .report-chart-row em { color: #214636; font-style: normal; font-weight: 700; }
+    .report-page { box-sizing: border-box; max-width: 184mm; min-height: 260mm; margin: 24px auto; padding: 22mm 18mm; background: #fffefb; box-shadow: 0 16px 54px rgba(21, 31, 44, 0.18); }
+    @media print {
+      html { background: #fff; }
+      body { margin: 0; }
+      .report-page { max-width: none; min-height: 0; margin: 0; padding: 0; box-shadow: none; }
+      table, pre, blockquote { break-inside: avoid; }
+      h1, h2, h3 { break-after: avoid; }
+    }
+  </style>
+</head>
+<body>
+<main class="report-page">
+${markdownToDocumentHtml(markdown)}
+</main>
+</body>
+</html>`;
+}
+
+function documentFileStem(value: string): string {
+  return (
+    (value || "research")
+      .replace(/[^\w.-]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .toLowerCase()
+      .slice(0, 96) || "research"
+  );
 }
 
 function formatExecutionPlanStatusLabel(status: string): string {
@@ -8502,10 +9079,104 @@ function positiveRunMetric(value: unknown): number | null {
   return amount;
 }
 
-function buildChatRunMetricItems(metrics: ChatRunMetrics): Array<{
-  label: string;
-  value: string;
-}> {
+const RUN_METRIC_INPUT_KEYS = [
+  "input_tokens",
+  "inputTokens",
+  "prompt_tokens",
+  "promptTokens",
+];
+const RUN_METRIC_OUTPUT_KEYS = [
+  "output_tokens",
+  "outputTokens",
+  "completion_tokens",
+  "completionTokens",
+];
+const RUN_METRIC_TOTAL_KEYS = ["total_tokens", "totalTokens"];
+const RUN_METRIC_CACHED_PROMPT_KEYS = [
+  "cached_prompt_tokens",
+  "cachedPromptTokens",
+  "cache_read_tokens",
+  "cacheReadTokens",
+];
+const RUN_METRIC_CACHE_CREATION_KEYS = [
+  "cache_creation_prompt_tokens",
+  "cacheCreationPromptTokens",
+  "cache_creation_tokens",
+  "cacheCreationTokens",
+];
+const RUN_METRIC_DURATION_KEYS = ["duration_ms", "durationMs"];
+const RUN_METRIC_FIRST_TOKEN_KEYS = [
+  "time_to_first_token_ms",
+  "timeToFirstTokenMs",
+  "first_token_ms",
+  "firstTokenMs",
+];
+
+function runMetricSourceRecords(payload: unknown): JsonRecord[] {
+  const obj = asRecord(payload);
+  const nested = asRecord(obj.payload);
+  return [
+    obj,
+    nested,
+    asRecord(obj.usage),
+    asRecord(nested.usage),
+    asRecord(obj.metrics),
+    asRecord(nested.metrics),
+  ].filter((record) => Object.keys(record).length > 0);
+}
+
+function positiveRunMetricFromPayload(
+  payload: unknown,
+  keys: readonly string[],
+): number | null {
+  for (const record of runMetricSourceRecords(payload)) {
+    for (const key of keys) {
+      const value = positiveRunMetric(record[key]);
+      if (value != null) return value;
+    }
+  }
+  return null;
+}
+
+function chatRunMetricsFromPayload(payload: unknown): ChatRunMetrics {
+  const inputTokens = positiveRunMetricFromPayload(payload, RUN_METRIC_INPUT_KEYS);
+  const outputTokens = positiveRunMetricFromPayload(payload, RUN_METRIC_OUTPUT_KEYS);
+  const explicitTotalTokens = positiveRunMetricFromPayload(
+    payload,
+    RUN_METRIC_TOTAL_KEYS,
+  );
+  const durationMs = positiveRunMetricFromPayload(payload, RUN_METRIC_DURATION_KEYS);
+  const cachedPromptTokens = positiveRunMetricFromPayload(
+    payload,
+    RUN_METRIC_CACHED_PROMPT_KEYS,
+  );
+  const cacheCreationPromptTokens = positiveRunMetricFromPayload(
+    payload,
+    RUN_METRIC_CACHE_CREATION_KEYS,
+  );
+  const timeToFirstTokenMs = positiveRunMetricFromPayload(
+    payload,
+    RUN_METRIC_FIRST_TOKEN_KEYS,
+  );
+  const totalTokens =
+    explicitTotalTokens ??
+    (inputTokens != null || outputTokens != null
+      ? (inputTokens ?? 0) + (outputTokens ?? 0)
+      : null);
+  return {
+    ...(inputTokens != null ? { inputTokens } : {}),
+    ...(outputTokens != null ? { outputTokens } : {}),
+    ...(totalTokens != null ? { totalTokens } : {}),
+    ...(cachedPromptTokens != null ? { cachedPromptTokens } : {}),
+    ...(cacheCreationPromptTokens != null
+      ? { cacheCreationPromptTokens }
+      : {}),
+    ...(durationMs != null ? { durationMs } : {}),
+    ...(timeToFirstTokenMs != null ? { timeToFirstTokenMs } : {}),
+  };
+}
+
+function buildChatRunMetricItems(metrics: ChatRunMetrics): ChatRunMetricItem[] {
   const nonNegativeMetric = (value: unknown): number => {
     const amount = num(value, 0);
     if (!Number.isFinite(amount) || amount < 0) return 0;
@@ -8513,17 +9184,53 @@ function buildChatRunMetricItems(metrics: ChatRunMetrics): Array<{
   };
   const inputTokens = nonNegativeMetric(metrics.inputTokens);
   const outputTokens = nonNegativeMetric(metrics.outputTokens);
+  const cachedPromptTokens = nonNegativeMetric(metrics.cachedPromptTokens);
+  const cacheCreationPromptTokens = nonNegativeMetric(
+    metrics.cacheCreationPromptTokens,
+  );
   const explicitTotalTokens = positiveRunMetric(metrics.totalTokens);
   const totalTokens =
     explicitTotalTokens ??
     inputTokens + outputTokens;
   if (totalTokens <= 0 && inputTokens <= 0 && outputTokens <= 0) return [];
 
-  return [
+  const items: ChatRunMetricItem[] = [
     { label: "Total tokens", value: Math.round(totalTokens).toLocaleString() },
     { label: "Input tokens", value: Math.round(inputTokens).toLocaleString() },
     { label: "Output tokens", value: Math.round(outputTokens).toLocaleString() },
   ];
+  if (cachedPromptTokens > 0) {
+    items.push({
+      label: "Cached prompt",
+      value: Math.round(cachedPromptTokens).toLocaleString(),
+    });
+  }
+  if (cacheCreationPromptTokens > 0) {
+    items.push({
+      label: "Cache write",
+      value: Math.round(cacheCreationPromptTokens).toLocaleString(),
+    });
+  }
+  return items;
+}
+
+function chatRunMetricMessageFieldsFromPayload(payload: unknown): JsonRecord {
+  const metrics = chatRunMetricsFromPayload(payload);
+  const fields: JsonRecord = {};
+  if (metrics.inputTokens != null) fields.input_tokens = metrics.inputTokens;
+  if (metrics.outputTokens != null) fields.output_tokens = metrics.outputTokens;
+  if (metrics.totalTokens != null) fields.total_tokens = metrics.totalTokens;
+  if (metrics.cachedPromptTokens != null) {
+    fields.cached_prompt_tokens = metrics.cachedPromptTokens;
+  }
+  if (metrics.cacheCreationPromptTokens != null) {
+    fields.cache_creation_prompt_tokens = metrics.cacheCreationPromptTokens;
+  }
+  if (metrics.durationMs != null) fields.duration_ms = metrics.durationMs;
+  if (metrics.timeToFirstTokenMs != null) {
+    fields.time_to_first_token_ms = metrics.timeToFirstTokenMs;
+  }
+  return fields;
 }
 
 function promptProposalStatusColor(
@@ -8886,7 +9593,7 @@ const CHAT_STARTER_CATEGORY_META: Record<
   advanced: {
     label: "Advanced",
     description:
-      "Internal operator prompts for ArkPulse, ArkSentinel, ArkEvolve, trace diagnostics, and system inspection.",
+      "Internal operator prompts for Pulse, Sentinel, Evolve, trace diagnostics, and system inspection.",
   },
 };
 
@@ -9023,6 +9730,51 @@ const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
     category: "browser",
   },
   {
+    id: "browser-research",
+    title: "Research with browser evidence",
+    summary:
+      "Open sources in the browser, collect evidence, and return a cited summary.",
+    prompt:
+      "Use the browser to research three reliable sources about the current state of local-first AI agents, capture the useful evidence, and summarize the tradeoffs.",
+    category: "browser",
+  },
+  {
+    id: "browser-form-fill",
+    title: "Fill a form",
+    summary:
+      "Navigate to a form, pause for private fields, and submit only after review.",
+    prompt:
+      "Open this form URL: <paste-url>. Fill the non-sensitive fields from the details I provide, pause for anything private, and ask me before submitting.",
+    category: "browser",
+  },
+  {
+    id: "browser-scrape-table",
+    title: "Extract page data",
+    summary:
+      "Open a page, inspect its structure, and return clean tabular data.",
+    prompt:
+      "Open this page: <paste-url>. Extract the main table or repeated list into structured rows with source links.",
+    category: "browser",
+  },
+  {
+    id: "browser-login-needed",
+    title: "Login-needed workflow",
+    summary:
+      "Start a browser task and hand control back when authentication is needed.",
+    prompt:
+      "Open this app: <paste-url>. If login is required, pause for browser handoff, then continue the workflow after I finish signing in.",
+    category: "browser",
+  },
+  {
+    id: "browser-verify-deploy",
+    title: "Verify a deployed app",
+    summary:
+      "Open a deployed app, check console errors, screenshots, and key flows.",
+    prompt:
+      "Open this deployed app URL: <paste-url>. Verify the main user flow, check for console errors, capture a screenshot, and report anything broken.",
+    category: "browser",
+  },
+  {
     id: "google-workspace-tools",
     title: "Check Google Workspace access",
     summary:
@@ -9048,9 +9800,9 @@ const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
   },
   {
     id: "arkpulse-latest-run",
-    title: "What was ArkPulse latest run?",
-    summary: "Inspect the latest ArkPulse run and summarize the main result.",
-    prompt: "What was ArkPulse latest run?",
+    title: "What was Pulse latest run?",
+    summary: "Inspect the latest Pulse run and summarize the main result.",
+    prompt: "What was Pulse latest run?",
     category: "advanced",
   },
   {
@@ -9095,11 +9847,11 @@ const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
   },
   {
     id: "arkpulse-running",
-    title: "Check whether ArkPulse is running",
+    title: "Check whether Pulse is running",
     summary:
-      "Inspect AgentArk directly and determine whether ArkPulse is running right now.",
+      "Inspect AgentArk directly and determine whether Pulse is running right now.",
     prompt:
-      "Without guessing, inspect AgentArk and tell me whether ArkPulse is running right now.",
+      "Without guessing, inspect AgentArk and tell me whether Pulse is running right now.",
     category: "advanced",
   },
   {
@@ -9130,11 +9882,11 @@ const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
   },
   {
     id: "arkpulse-vs-traces",
-    title: "Compare ArkPulse warnings with traces",
+    title: "Compare Pulse warnings with traces",
     summary:
-      "Check whether recent ArkPulse warnings line up with recent trace failures.",
+      "Check whether recent Pulse warnings line up with recent trace failures.",
     prompt:
-      "Compare recent ArkPulse warnings with recent trace failures and tell me if they line up.",
+      "Compare recent Pulse warnings with recent trace failures and tell me if they line up.",
     category: "advanced",
   },
 ];
@@ -9289,34 +10041,53 @@ const ChatComposerInput = memo(function ChatComposerInput({
           anchorEl={optionsAnchor}
           open={optionsOpen}
           onClose={closeComposerOptions}
-          anchorOrigin={{ vertical: "bottom", horizontal: "left" }}
-          transformOrigin={{ vertical: "top", horizontal: "left" }}
+          anchorOrigin={{ vertical: "top", horizontal: "left" }}
+          transformOrigin={{ vertical: "bottom", horizontal: "left" }}
         >
           <MenuItem
             className="chat-composer-menu-item"
             onClick={attachFilesFromMenu}
             disabled={isStreaming || composerLocked}
           >
-            <AttachFileRoundedIcon fontSize="small" />
-            <span>Upload files</span>
+            <span className="chat-composer-menu-icon">
+              <AttachFileRoundedIcon fontSize="small" />
+            </span>
+            <span className="chat-composer-menu-body">
+              <span className="chat-composer-menu-title">Upload files</span>
+              <span className="chat-composer-menu-caption">
+                PDFs, images, or text — up to 25 MB
+              </span>
+            </span>
           </MenuItem>
           <MenuItem
-            className="chat-composer-menu-item"
+            className={`chat-composer-menu-item is-toggle${
+              deepResearchEnabled && !deepResearchDisabled ? " is-active" : ""
+            }`}
             onClick={toggleDeepResearchFromMenu}
             disabled={isStreaming || composerLocked || deepResearchDisabled}
+            role="menuitemcheckbox"
+            aria-checked={deepResearchEnabled && !deepResearchDisabled}
           >
-            <Checkbox
-              size="small"
-              checked={deepResearchEnabled && !deepResearchDisabled}
-              tabIndex={-1}
-              disableRipple
-              disabled={deepResearchDisabled}
-              className="chat-composer-menu-check"
-            />
-            <span>Deep research</span>
+            <span className="chat-composer-menu-icon">
+              <TravelExploreRoundedIcon fontSize="small" />
+            </span>
+            <span className="chat-composer-menu-body">
+              <span className="chat-composer-menu-title">Deep research</span>
+              <span className="chat-composer-menu-caption">
+                Cited multi-source report with plan review
+              </span>
+            </span>
+            <span
+              className={`chat-composer-menu-switch${
+                deepResearchEnabled && !deepResearchDisabled ? " is-on" : ""
+              }`}
+              aria-hidden="true"
+            >
+              <span className="chat-composer-menu-switch-thumb" />
+            </span>
           </MenuItem>
         </Menu>
-        {isStreaming ? (
+        {isStreaming && TASK_CANCEL_CONTROLS_ENABLED ? (
           <IconButton
             size="small"
             className="chat-composer-stop-btn"
@@ -9331,7 +10102,11 @@ const ChatComposerInput = memo(function ChatComposerInput({
             id="chat-send-btn"
             size="small"
             className="chat-composer-send-btn"
-            disabled={composerLocked || (!draft.trim() && attachedFilesCount === 0)}
+            disabled={
+              isStreaming ||
+              composerLocked ||
+              (!draft.trim() && attachedFilesCount === 0)
+            }
             onClick={() => {
               void submitCurrentDraft();
             }}
@@ -9358,6 +10133,9 @@ function ChatPageInner({
   const [conversationId, setConversationId] = useState<string | null>(
     () => readChatRouteConversationId(),
   );
+  const [draftChatActive, setDraftChatActive] = useState(() =>
+    readChatDraftMode(),
+  );
   const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -9368,6 +10146,10 @@ function ChatPageInner({
   const [chatCredentialError, setChatCredentialError] = useState<string | null>(
     null,
   );
+  const [
+    dismissedCredentialPromptConversationIds,
+    setDismissedCredentialPromptConversationIds,
+  ] = useState<Set<string>>(() => new Set());
   const [isStreaming, setIsStreaming] = useState(false);
   const [liveRunStreamOpen, setLiveRunStreamOpen] = useState(false);
   const [isStoppingStream, setIsStoppingStream] = useState(false);
@@ -9420,6 +10202,8 @@ function ChatPageInner({
   const [starterAdvancedExpanded, setStarterAdvancedExpanded] = useState(false);
   const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
+  const [activityDetailRow, setActivityDetailRow] =
+    useState<ActivityTimelineCard | null>(null);
   const [expandedActivityPayloads, setExpandedActivityPayloads] = useState<
     Set<string>
   >(new Set());
@@ -9499,6 +10283,7 @@ function ChatPageInner({
   const streamAbortRef = useRef<AbortController | null>(null);
   const streamGenerationRef = useRef(0);
   const backgroundDetachGenerationsRef = useRef<Set<number>>(new Set());
+  const draftChatActiveRef = useRef(draftChatActive);
   const activeChatTaskIdRef = useRef<string | null>(null);
   const stopRequestedRef = useRef(false);
   const recentSendRef = useRef<{ fingerprint: string; at: number } | null>(
@@ -9543,24 +10328,29 @@ function ChatPageInner({
   const lastWorkspaceActivityRestoreSeedRef = useRef("");
   const reattachedRunIdRef = useRef("");
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
-  const queueComposerPrefill = (text: string) => {
+  const queueComposerPrefill = useCallback((text: string) => {
     setComposerPrefillRequest((prev) => ({
       text,
       seq: (prev?.seq ?? 0) + 1,
     }));
+  }, []);
+  const setDraftChatMode = (active: boolean) => {
+    draftChatActiveRef.current = active;
+    setDraftChatActive(active);
+    writeChatDraftMode(active);
   };
 
   useEffect(() => {
     if (typeof window === "undefined") return;
     let stored: string | null = null;
     try {
-      stored = window.sessionStorage.getItem("arkreflect.composerPrefill");
+      stored = window.sessionStorage.getItem(ARKREFLECT_COMPOSER_PREFILL_STORAGE_KEY);
     } catch {
       stored = null;
     }
     if (!stored) return;
     try {
-      window.sessionStorage.removeItem("arkreflect.composerPrefill");
+      window.sessionStorage.removeItem(ARKREFLECT_COMPOSER_PREFILL_STORAGE_KEY);
     } catch {
       // ignore — best-effort cleanup
     }
@@ -9568,6 +10358,33 @@ function ChatPageInner({
     // queueComposerPrefill is stable (uses setState updater); intentional one-shot mount effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const consumeComposerPrefill = () => {
+      let stored: string | null = null;
+      try {
+        stored = window.sessionStorage.getItem(CHAT_COMPOSER_PREFILL_STORAGE_KEY);
+      } catch {
+        stored = null;
+      }
+      if (!stored) return;
+      try {
+        window.sessionStorage.removeItem(CHAT_COMPOSER_PREFILL_STORAGE_KEY);
+      } catch {
+        // Best-effort cleanup.
+      }
+      queueComposerPrefill(stored);
+    };
+    consumeComposerPrefill();
+    window.addEventListener(CHAT_COMPOSER_PREFILL_EVENT, consumeComposerPrefill);
+    return () => {
+      window.removeEventListener(
+        CHAT_COMPOSER_PREFILL_EVENT,
+        consumeComposerPrefill,
+      );
+    };
+  }, [queueComposerPrefill]);
+
   const cancelStreamingTokenFlush = () => {
     if (
       typeof window !== "undefined" &&
@@ -9598,11 +10415,16 @@ function ChatPageInner({
       flushStreamingTokenBuffer();
     }, 80);
   };
-  const appendStreamingToken = (token: string) => {
-    if (!token) return;
-    streamingTokenBufferRef.current += token;
-    streamingResponseRef.current += token;
+  const appendStreamingToken = (token: string): string => {
+    const appendText = streamingResponseAppendText(
+      streamingResponseRef.current,
+      token,
+    );
+    if (!appendText) return "";
+    streamingTokenBufferRef.current += appendText;
+    streamingResponseRef.current += appendText;
     scheduleStreamingTokenFlush();
+    return appendText;
   };
   const recordRunEventSeq = (payload: unknown) => {
     const seq = num(asRecord(payload).seq, 0);
@@ -9619,10 +10441,6 @@ function ChatPageInner({
   const setLiveRunStreamOpenNow = (open: boolean) => {
     setLiveRunStreamOpen((prev) => (prev === open ? prev : open));
   };
-  const trimReasoningPreview = (value: string): string =>
-    value.length > CHAT_REASONING_PREVIEW_MAX_CHARS
-      ? value.slice(-CHAT_REASONING_PREVIEW_MAX_CHARS)
-      : value;
   const flushReasoningPreview = () => {
     reasoningPreviewFlushTimerRef.current = null;
     const next = reasoningPreviewDraftRef.current;
@@ -9645,9 +10463,16 @@ function ChatPageInner({
       return;
     }
     if (reasoningPreviewFlushTimerRef.current !== null) return;
+    const pendingLength = reasoningPreviewDraftRef.current?.content.length ?? 0;
+    const flushDelay =
+      pendingLength > 120_000
+        ? 750
+        : pendingLength > 60_000
+          ? 400
+          : CHAT_REASONING_PREVIEW_FLUSH_MS;
     reasoningPreviewFlushTimerRef.current = window.setTimeout(
       flushReasoningPreview,
-      CHAT_REASONING_PREVIEW_FLUSH_MS,
+      flushDelay,
     );
   };
   const setReasoningPreviewBuffered = (
@@ -9657,7 +10482,7 @@ function ChatPageInner({
   ) => {
     reasoningPreviewDraftRef.current = {
       phase,
-      content: trimReasoningPreview(content),
+      content,
     };
     scheduleReasoningPreviewFlush(immediate);
   };
@@ -10020,6 +10845,16 @@ function ChatPageInner({
   const activeConversationActivityLoading = Boolean(
     conversationId && (messagesQ.isLoading || selectedConversationQ.isLoading),
   );
+  const selectedConversationHasUnloadedMessages = Boolean(
+    conversationId && selectedMessageCount > 0 && messages.length === 0,
+  );
+  const selectedConversationAwaitingPersistedMessages = Boolean(
+    conversationId &&
+      messages.length === 0 &&
+      (activeConversationActivityLoading ||
+        selectedConversationHasUnloadedMessages ||
+        recentlyTouchedEmptyConversation),
+  );
   const deepResearchDisabled = Boolean(
     conversationId &&
       (activeConversationActivityLoading || activeConversationMessageCount > 0),
@@ -10099,6 +10934,14 @@ function ChatPageInner({
       const followup = str(payload.followup, "").trim();
       setChatCredentialError(null);
       setChatCredentialValues({});
+      if (conversationId) {
+        setDismissedCredentialPromptConversationIds((prev) => {
+          if (!prev.has(conversationId)) return prev;
+          const next = new Set(prev);
+          next.delete(conversationId);
+          return next;
+        });
+      }
       if (followup) {
         setChatNotice(followup);
       }
@@ -10107,6 +10950,32 @@ function ChatPageInner({
       });
       await queryClient.invalidateQueries({
         queryKey: ["chat-messages", conversationId],
+      });
+    },
+    onError: (err) => {
+      setChatCredentialError(normalizeChatError(errMessage(err)));
+    },
+  });
+  const dismissChatCredentialPromptMutation = useMutation({
+    mutationFn: () =>
+      api.rawDelete(
+        `/chat/credential-prompt?conversation_id=${encodeURIComponent(conversationId || "")}`,
+      ),
+    onSuccess: async () => {
+      setChatCredentialError(null);
+      setChatCredentialValues({});
+      if (conversationId) {
+        setDismissedCredentialPromptConversationIds((prev) => {
+          const next = new Set(prev);
+          next.add(conversationId);
+          return next;
+        });
+      }
+      setChatNotice(
+        "Secure credential request dismissed. You can add credentials later in Settings.",
+      );
+      await queryClient.invalidateQueries({
+        queryKey: ["chat-credential-prompt", conversationId],
       });
     },
     onError: (err) => {
@@ -10149,6 +11018,14 @@ function ChatPageInner({
   );
 
   useEffect(() => {
+    if (chatCredentialPromptVisible && conversationId) {
+      setDismissedCredentialPromptConversationIds((prev) => {
+        if (!prev.has(conversationId)) return prev;
+        const next = new Set(prev);
+        next.delete(conversationId);
+        return next;
+      });
+    }
     if (!chatCredentialPromptVisible) {
       setChatCredentialValues({});
       setChatCredentialError(null);
@@ -10176,6 +11053,7 @@ function ChatPageInner({
     chatCredentialPromptFields,
     chatCredentialPromptFingerprint,
     chatCredentialPromptVisible,
+    conversationId,
   ]);
 
   useEffect(() => {
@@ -10183,24 +11061,9 @@ function ChatPageInner({
       scheduleChatPendingRunSnapshotStore(null);
       return;
     }
-    const snapshotSteps = streamingSteps
-      .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
-      .map((step) => {
-        const compacted: JsonRecord = {};
-        const icon = str(step.icon, "").trim();
-        const title = str(step.title, "").trim();
-        const detail = str(step.detail, "").trim();
-        const stepType = str(step.step_type, "").trim();
-        const source = str(step.source, "").trim();
-        const data = compactUnknown(step.data, 800);
-        if (icon) compacted.icon = icon.slice(0, 64);
-        if (title) compacted.title = title.slice(0, 220);
-        if (detail) compacted.detail = detail.slice(0, 900);
-        if (stepType) compacted.step_type = stepType.slice(0, 80);
-        if (source) compacted.source = source.slice(0, 80);
-        if (data) compacted.data = data;
-        return compacted;
-      });
+    const snapshotSteps = compactPendingRunStepsForSnapshot(
+      asRecords(streamingSteps),
+    );
     scheduleChatPendingRunSnapshotStore({
       ...pendingRunSnapshot,
       message: pendingUserMessage ?? pendingRunSnapshot.message,
@@ -10225,7 +11088,14 @@ function ChatPageInner({
 
   useEffect(() => {
     conversationIdRef.current = conversationId;
+    if (conversationId && draftChatActiveRef.current) {
+      setDraftChatMode(false);
+    }
   }, [conversationId]);
+
+  useEffect(() => {
+    draftChatActiveRef.current = draftChatActive;
+  }, [draftChatActive]);
 
   useEffect(() => {
     writeChatRouteConversationId(conversationId);
@@ -10437,8 +11307,11 @@ function ChatPageInner({
 
   useEffect(() => {
     const pending = pendingRunSnapshot ?? loadChatPendingRunSnapshot();
+    const suppressPendingAutoSelect =
+      draftChatActive || draftChatActiveRef.current;
     if (pending) {
-      const shouldSelectPendingConversation = !conversationId;
+      const shouldSelectPendingConversation =
+        !conversationId && !suppressPendingAutoSelect;
       const viewingPendingConversation =
         conversationId === pending.conversationId;
       if (shouldSelectPendingConversation) {
@@ -10471,6 +11344,7 @@ function ChatPageInner({
 
     if (
       conversationId ||
+      suppressPendingAutoSelect ||
       (starredConversations.length === 0 && conversations.length === 0) ||
       typeof window === "undefined"
     ) {
@@ -10496,6 +11370,7 @@ function ChatPageInner({
     failedUserMessage,
     streamingResponse,
     streamingSteps.length,
+    draftChatActive,
   ]);
 
   useEffect(() => {
@@ -11251,9 +12126,9 @@ function ChatPageInner({
   ) => {
     setPendingRunSnapshot((prev) => {
       if (!prev) return prev;
-      const interruptedSteps = trimTrailingHeartbeatSteps(
-        streamingStepsRef.current,
-      ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+      const interruptedSteps = limitPendingRunStepsForSnapshot(
+        trimTrailingHeartbeatSteps(streamingStepsRef.current),
+      );
       const next = {
         ...prev,
         taskId: taskId || prev.taskId || "",
@@ -11341,11 +12216,44 @@ function ChatPageInner({
           ? { ...record, choices: preservedChoices }
           : record;
       });
+      const persistedAssistantKeys = new Set(
+        mergedRecords
+          .filter(
+            (record) =>
+              str(record.role, "").trim().toLowerCase() === "assistant",
+          )
+          .flatMap((record) => {
+            const content = stripAgentInternalReasoningLeaks(
+              str(record.content, ""),
+            ).trim();
+            const traceId = str(record.trace_id, str(record.traceId, "")).trim();
+            return [content ? `content:${content}` : "", traceId ? `trace:${traceId}` : ""].filter(Boolean);
+          }),
+      );
+      const optimisticAssistantRecords = previousRecords.filter((record) => {
+        if (!toBool(record.optimistic)) return false;
+        if (str(record.role, "").trim().toLowerCase() !== "assistant") {
+          return false;
+        }
+        const content = stripAgentInternalReasoningLeaks(
+          str(record.content, ""),
+        ).trim();
+        if (!content) return false;
+        const traceId = str(record.trace_id, str(record.traceId, "")).trim();
+        return !(
+          persistedAssistantKeys.has(`content:${content}`) ||
+          (traceId && persistedAssistantKeys.has(`trace:${traceId}`))
+        );
+      });
+      const visibleRecords =
+        optimisticAssistantRecords.length > 0
+          ? [...mergedRecords, ...optimisticAssistantRecords]
+          : mergedRecords;
       const nextPayload = Array.isArray(payload)
-        ? mergedRecords
-        : { ...asRecord(payload), messages: mergedRecords };
+        ? visibleRecords
+        : { ...asRecord(payload), messages: visibleRecords };
       queryClient.setQueryData(["chat-messages", id], nextPayload);
-      return mergedRecords;
+      return visibleRecords;
     },
     [queryClient],
   );
@@ -11354,16 +12262,31 @@ function ChatPageInner({
     async (
       targetConversationId: string,
       minAssistantMessages?: number,
+      options?: { settle?: boolean; minLatestAssistantCreatedAtMs?: number },
     ): Promise<void> => {
       const id = targetConversationId.trim();
       if (!id) return;
       let lastError: unknown = null;
       let fetched = false;
+      const shouldSettle = options?.settle === true;
+      const expectsFreshAssistant =
+        options?.minLatestAssistantCreatedAtMs != null;
       const hasExpectedAssistantCount = (records: JsonRecord[]) =>
         minAssistantMessages == null ||
         records.filter(
           (message) => str(message.role, "").trim().toLowerCase() === "assistant",
         ).length >= minAssistantMessages;
+      const hasFreshAssistant = (records: JsonRecord[]) => {
+        const minCreatedAtMs = options?.minLatestAssistantCreatedAtMs;
+        if (minCreatedAtMs == null) return true;
+        return records.some((message) => {
+          if (str(message.role, "").trim().toLowerCase() !== "assistant") {
+            return false;
+          }
+          const timestampMs = Date.parse(str(message.timestamp, ""));
+          return Number.isFinite(timestampMs) && timestampMs + 1000 >= minCreatedAtMs;
+        });
+      };
       for (const settleDelayMs of [0, 250, 750, 1500, 3000, 6000]) {
         if (settleDelayMs > 0) {
           await delay(settleDelayMs);
@@ -11372,7 +12295,13 @@ function ChatPageInner({
           const records = await fetchConversationMessagesIntoCache(id);
           fetched = true;
           lastError = null;
-          if (hasExpectedAssistantCount(records)) {
+          const waitedForPersistence =
+            !shouldSettle || settleDelayMs >= 1500;
+          if (
+            waitedForPersistence &&
+            hasExpectedAssistantCount(records) &&
+            hasFreshAssistant(records)
+          ) {
             return;
           }
         } catch (error) {
@@ -11384,7 +12313,7 @@ function ChatPageInner({
       if (!fetched && lastError) {
         throw lastError;
       }
-      if (minAssistantMessages != null) {
+      if (minAssistantMessages != null || expectsFreshAssistant) {
         throw new Error("The final assistant message has not been persisted yet.");
       }
     },
@@ -11404,6 +12333,7 @@ function ChatPageInner({
       const traceId = str(obj.trace_id, str(obj.traceId, "")).trim();
       const modelUsed = str(obj.model_used, str(obj.model, "")).trim();
       const choices = clarificationChoices(obj.choices);
+      const metricFields = chatRunMetricMessageFieldsFromPayload(payload);
       const timestamp = new Date().toISOString();
       queryClient.setQueryData(["chat-messages", id], (previous: unknown) => {
         const previousObj = asRecord(previous);
@@ -11422,15 +12352,24 @@ function ChatPageInner({
           return Boolean(traceId && messageTraceId === traceId);
         });
         if (alreadyPresentIndex >= 0) {
-          if (choices.length === 0) return previous;
           const existing = asRecord(records[alreadyPresentIndex]);
-          if (clarificationChoices(existing.choices).length > 0) return previous;
+          const shouldAddChoices =
+            choices.length > 0 &&
+            clarificationChoices(existing.choices).length === 0;
+          const shouldAddTraceId =
+            Boolean(traceId) &&
+            !str(existing.trace_id, str(existing.traceId, "")).trim();
+          const shouldAddMetrics = Object.keys(metricFields).length > 0;
+          if (!shouldAddChoices && !shouldAddTraceId && !shouldAddMetrics) {
+            return previous;
+          }
           const nextRecords = records.map((record, idx) =>
             idx === alreadyPresentIndex
               ? {
                   ...record,
-                  ...(traceId ? { trace_id: traceId } : {}),
-                  choices,
+                  ...(shouldAddTraceId ? { trace_id: traceId } : {}),
+                  ...(shouldAddMetrics ? metricFields : {}),
+                  ...(shouldAddChoices ? { choices } : {}),
                 }
               : record,
           );
@@ -11449,6 +12388,7 @@ function ChatPageInner({
           timestamp,
           model_used: modelUsed || "stream",
           trace_id: traceId,
+          ...metricFields,
           ...(choices.length > 0 ? { choices } : {}),
           optimistic: true,
         };
@@ -11462,6 +12402,38 @@ function ChatPageInner({
       });
     },
     [queryClient],
+  );
+
+  const recoverAssistantMessageFromLatestRun = useCallback(
+    async (
+      targetConversationId: string,
+      options?: { expectedRunId?: string; minRunUpdatedAtMs?: number },
+    ): Promise<boolean> => {
+      const id = targetConversationId.trim();
+      if (!id) return false;
+      const payload = asRecord(
+        await api.rawGet(`/conversations/${encodeURIComponent(id)}/latest-run`),
+      );
+      const run = asRecord(payload.run);
+      if (Object.keys(run).length === 0) return false;
+      const runConversationId = str(
+        run.conversation_id,
+        str(run.conversationId, id),
+      ).trim();
+      if (runConversationId && runConversationId !== id) return false;
+      const expectedRunId = str(options?.expectedRunId, "").trim();
+      const runId = str(run.id, "").trim();
+      if (expectedRunId && runId && runId !== expectedRunId) return false;
+      const assistantPayload = extractLatestRunAssistantContentPayload(
+        payload,
+        id,
+        expectedRunId || runId,
+      );
+      if (!assistantPayload) return false;
+      appendAssistantContentToConversationCache(id, assistantPayload);
+      return true;
+    },
+    [appendAssistantContentToConversationCache],
   );
 
   const removeApprovalChoicesFromConversationCache = useCallback(
@@ -11507,6 +12479,7 @@ function ChatPageInner({
       payload: unknown,
       fallbackConversationId = "",
       minAssistantMessages?: number,
+      options?: { settle?: boolean; minLatestAssistantCreatedAtMs?: number },
     ) => {
       const id = streamPayloadConversationId(payload, fallbackConversationId);
       if (!id) return;
@@ -11514,13 +12487,20 @@ function ChatPageInner({
       void refreshConversationMessagesAfterStream(
         id,
         minAssistantMessages,
-      ).catch(() => {
+        options,
+      ).catch(async () => {
+        const recovered = await recoverAssistantMessageFromLatestRun(id, {
+          expectedRunId: streamPayloadRunId(payload),
+          minRunUpdatedAtMs: options?.minLatestAssistantCreatedAtMs,
+        }).catch(() => false);
+        if (recovered) return;
         void queryClient.invalidateQueries({ queryKey: ["chat-messages", id] });
       });
     },
     [
       appendAssistantContentToConversationCache,
       queryClient,
+      recoverAssistantMessageFromLatestRun,
       refreshConversationMessagesAfterStream,
     ],
   );
@@ -11565,6 +12545,17 @@ function ChatPageInner({
     if (persistedSteps.length > 0) {
       setStreamingStepsNow(persistedSteps);
     }
+    const latestRunAssistantPayload = extractLatestRunAssistantContentPayload(
+      payload,
+      pendingConversationId,
+      expectedRunId || runId,
+    );
+    if (latestRunAssistantPayload) {
+      appendAssistantContentToConversationCache(
+        pendingConversationId,
+        latestRunAssistantPayload,
+      );
+    }
     if (runId) {
       setPendingRunSnapshot((prev) => {
         const base = prev ?? pendingRunSnapshotRef.current ?? snapshot;
@@ -11599,11 +12590,28 @@ function ChatPageInner({
       queryKey: ["chat-conversations"],
     });
     try {
-      await refreshConversationMessagesAfterStream(pendingConversationId);
+      await refreshConversationMessagesAfterStream(
+        pendingConversationId,
+        undefined,
+        {
+          settle: true,
+          minLatestAssistantCreatedAtMs: snapshot.startedAt,
+        },
+      );
     } catch {
-      await queryClient.invalidateQueries({
-        queryKey: ["chat-messages", pendingConversationId],
-      });
+      if (!latestRunAssistantPayload) {
+        const recovered = await recoverAssistantMessageFromLatestRun(
+          pendingConversationId,
+          {
+            expectedRunId: expectedRunId || runId,
+            minRunUpdatedAtMs: snapshot.startedAt,
+          },
+        ).catch(() => false);
+        if (recovered) return "terminal";
+        await queryClient.invalidateQueries({
+          queryKey: ["chat-messages", pendingConversationId],
+        });
+      }
     }
     return "terminal";
   }
@@ -12059,6 +13067,22 @@ function ChatPageInner({
 
   const streamedStepText = (value: JsonRecord): string => {
     const data = asRecord(value.data);
+    const stepType = normalizeStatusText(
+      str(value.step_type, str(value.type, "")),
+    );
+    const dataKind = normalizeStatusText(str(data.kind, ""));
+    const done = toBool(data.done) || toBool(value.done);
+    const contentText = str(
+      data.content_snapshot,
+      str(data.content, str(data.content_delta, "")),
+    );
+    if (
+      done &&
+      !contentText.trim() &&
+      (stepType === "reasoning_delta" || dataKind === "reasoning_delta")
+    ) {
+      return "";
+    }
     return str(
       data.content_snapshot,
       str(data.content, str(data.content_delta, str(value.detail, ""))),
@@ -12106,7 +13130,10 @@ function ChatPageInner({
   ): ActivityTimelineCard => {
     const stepType = str(step.step_type, str(step.type, "step")).toLowerCase();
     const title = str(step.title, "").trim();
-    const fullDetail = extractStepDetailText(step, 2800);
+    const reasoningStep = isMainChatReasoningStep(step);
+    const fullDetail = reasoningStep
+      ? streamedStepText(step) || extractStepDetailText(step, Number.MAX_SAFE_INTEGER)
+      : extractStepDetailText(step, 2800);
     const rawDetail = fullDetail.slice(0, 900);
     const progressPresentation = toolProgressPresentationFromStep(
       step,
@@ -12206,14 +13233,14 @@ function ChatPageInner({
     const stableId = getStreamingStepStableKey(step);
     const hideStructuredPayload =
       stepType === "checkpoint" || stepType === "run_status";
-    const hideRawPayload =
+    const hidePayloadView =
       hideStructuredPayload || stepType === "reasoning_delta";
     const rawDetailFull = hideStructuredPayload
       ? ""
       : humanDetailRaw
         ? fullDetail || rawDetail
         : "";
-    const payloadView = hideRawPayload
+    const payloadView = hidePayloadView
       ? null
       : buildActivityPayloadViewFromSources(step.data, rawDetailFull);
     const surface =
@@ -12233,7 +13260,7 @@ function ChatPageInner({
       detailFull,
       summary,
       rawDetailFull,
-      traceJson: hideRawPayload ? "" : fullTraceJson(step),
+      traceJson: hideStructuredPayload ? "" : fullTraceJson(step),
       payloadView,
       isHeartbeat: isHeartbeatStreamingStep(step),
       time,
@@ -12260,7 +13287,7 @@ function ChatPageInner({
         : "";
       const hideStructuredPayload =
         stepType === "checkpoint" || stepType === "run_status";
-      const hideRawPayload =
+      const hidePayloadView =
         hideStructuredPayload || stepType === "reasoning_delta";
       return {
         id:
@@ -12275,8 +13302,8 @@ function ChatPageInner({
         detailFull: "",
         summary: safeDetail,
         rawDetailFull: hideStructuredPayload ? "" : rawDetail,
-        traceJson: hideRawPayload ? "" : fullTraceJson(record),
-        payloadView: hideRawPayload
+        traceJson: hideStructuredPayload ? "" : fullTraceJson(record),
+        payloadView: hidePayloadView
           ? null
           : buildActivityPayloadViewFromSources(rawDetail, record.data),
         isHeartbeat: false,
@@ -12329,8 +13356,15 @@ function ChatPageInner({
       card: ActivityTimelineCard,
       fallbackDetail: string,
     ): ChatTranscriptActionDetail | null => {
+      const audit = transcriptCommandAuditFromCard(card);
+      const auditDetail =
+        type === "tool_start"
+          ? audit?.command || ""
+          : type === "tool_result"
+            ? audit?.output || ""
+            : "";
       const detail = compactTranscriptDetail(
-        card.summary || card.detail || fallbackDetail,
+        auditDetail || card.summary || card.detail || fallbackDetail,
       );
       if (!detail && type === "tool_progress") return null;
       return {
@@ -12480,6 +13514,7 @@ function ChatPageInner({
     for (let idx = 0; idx < steps.length; idx += 1) {
       const step = steps[idx];
       if (isHeartbeatStreamingStep(step)) continue;
+      if (isInternalChatTranscriptStep(step)) continue;
       const stepType = activityStepType(step);
       const card = safeBuildStepCard(step, idx);
       const internalReasoningText = modelInternalReasoningTextFromActivityStep(step);
@@ -12515,8 +13550,9 @@ function ChatPageInner({
           actionNames.length > 1
             ? `${actionNames.length} Actions`
             : actionTitle(toolName, card);
+        const audit = transcriptCommandAuditFromCard(card);
         const detail = compactTranscriptDetail(
-          card.summary || card.detail || str(step.detail, ""),
+          audit?.command || card.summary || card.detail || str(step.detail, ""),
         );
         const childDetail = buildActionDetail(
           "tool_start",
@@ -12545,8 +13581,9 @@ function ChatPageInner({
           latestAgentLoopActionKey ||
           (toolName ? toolName.trim().toLowerCase() : "agent-loop-actions");
         const status = transcriptStatusFromCard(card);
+        const audit = transcriptCommandAuditFromCard(card);
         const detail = compactTranscriptDetail(
-          card.summary || card.detail || str(step.detail, ""),
+          audit?.output || card.summary || card.detail || str(step.detail, ""),
         );
         const matchIndex = latestMatchingAction(syntheticKey);
         if (matchIndex >= 0) {
@@ -12598,8 +13635,10 @@ function ChatPageInner({
         pushPendingProse();
         const toolName = activityToolNameFromStep(step);
         const title = actionTitle(toolName, card);
+        const audit = transcriptCommandAuditFromCard(card);
         const detail = compactTranscriptDetail(
-          toolStartIntentText(data) ||
+          audit?.command ||
+            toolStartIntentText(data) ||
             card.summary ||
             card.detail ||
             str(step.detail, ""),
@@ -12669,8 +13708,9 @@ function ChatPageInner({
         const toolName = activityToolNameFromStep(step);
         const key = toolKey(toolName, card);
         const status = transcriptStatusFromCard(card);
+        const audit = transcriptCommandAuditFromCard(card);
         const detail = compactTranscriptDetail(
-          card.summary || card.detail || str(step.detail, ""),
+          audit?.output || card.summary || card.detail || str(step.detail, ""),
         );
         const matchIndex = latestMatchingAction(key);
         if (matchIndex >= 0) {
@@ -12874,15 +13914,10 @@ function ChatPageInner({
   };
 
   const detachStreamingRunToBackground = () => {
-    if ((!isStreaming && !streamLockRef.current) || !pendingRunSnapshot)
-      return false;
-    const backgroundSnapshot = movePendingRunSnapshotToBackground();
-    if (!backgroundSnapshot) {
-      setChatError(
-        "This chat has not been attached to a conversation yet. Wait a moment, then try again.",
-      );
-      return false;
-    }
+    if (!isStreaming && !streamLockRef.current) return false;
+    const backgroundSnapshot = pendingRunSnapshot
+      ? movePendingRunSnapshotToBackground()
+      : null;
     const streamGeneration = streamGenerationRef.current;
     if (streamGeneration > 0) {
       backgroundDetachGenerationsRef.current.add(streamGeneration);
@@ -12890,9 +13925,11 @@ function ChatPageInner({
     streamAbortRef.current?.abort();
     setPendingRunSnapshot(null);
     storeChatPendingRunSnapshotNow(null);
-    setChatNotice(
-      "Moved the active research run to the background. You can keep chatting elsewhere.",
-    );
+    if (backgroundSnapshot) {
+      setChatNotice(
+        "Moved the active run to the background. You can keep chatting elsewhere.",
+      );
+    }
     setPendingUserMessage(null);
     setFailedUserMessage(null);
     setStreamingResponseNow("");
@@ -12915,20 +13952,12 @@ function ChatPageInner({
   };
 
   const startNewConversation = (options?: { preserveCurrentRun?: boolean }) => {
+    setDraftChatMode(true);
     const preserveCurrentRun = options?.preserveCurrentRun ?? true;
     let detachedCurrentRun = false;
-    if (
-      preserveCurrentRun &&
-      (isStreaming || streamLockRef.current) &&
-      pendingRunSnapshot
-    ) {
-      if (!detachStreamingRunToBackground()) return;
+    if (preserveCurrentRun && (isStreaming || streamLockRef.current)) {
+      detachStreamingRunToBackground();
       detachedCurrentRun = true;
-    } else if (preserveCurrentRun && (isStreaming || streamLockRef.current)) {
-      setChatError(
-        "This run is still attaching to a conversation. Try New chat again in a moment.",
-      );
-      return;
     } else if (preserveCurrentRun && pendingRunSnapshot?.conversationId) {
       movePendingRunSnapshotToBackground();
     }
@@ -13000,18 +14029,14 @@ function ChatPageInner({
 
   const openConversationById = (id: string) => {
     if (!id) return;
+    setDraftChatMode(false);
     setChatError(null);
     if (conversationId === id) {
       writeChatRouteConversationId(id);
       return;
     }
-    if ((isStreaming || streamLockRef.current) && pendingRunSnapshot) {
-      if (!detachStreamingRunToBackground()) return;
-    } else if (isStreaming || streamLockRef.current) {
-      setChatError(
-        "This run is still attaching to a conversation. Try switching chats again in a moment.",
-      );
-      return;
+    if (isStreaming || streamLockRef.current) {
+      detachStreamingRunToBackground();
     } else if (
       pendingRunSnapshot?.conversationId &&
       pendingRunSnapshot.conversationId !== id
@@ -13499,20 +14524,26 @@ function ChatPageInner({
     previousUserPrompt,
     timestamp,
     traceId,
+    deepResearchHint = false,
   }: {
     content: string;
     headingHint?: string;
     previousUserPrompt?: string;
     timestamp?: string;
     traceId?: string;
+    deepResearchHint?: boolean;
   }) => {
     try {
       const normalizedContent = str(content, "").trim();
       if (!normalizedContent) throw new Error("Nothing to export.");
-      const report = parseResearchReport(normalizedContent);
       const prompt = (previousUserPrompt || "").trim();
       const conversationTitle =
         str(selectedConversation?.title, "").trim() || "research";
+      const report = parseResearchReportWithContext(normalizedContent, {
+        deepResearch: deepResearchHint,
+        previousUserPrompt: prompt,
+        conversationTitle,
+      });
       const cleanTraceId = str(traceId, "").trim();
       const traceSteps = cleanTraceId
         ? await getTraceStepsForExport(cleanTraceId)
@@ -13609,15 +14640,124 @@ function ChatPageInner({
     }
   };
 
+  const researchReportExportHtml = ({
+    report,
+    headingHint,
+    previousUserPrompt,
+    timestamp,
+    traceId,
+  }: {
+    report: ResearchReportPreview;
+    headingHint?: string;
+    previousUserPrompt?: string;
+    timestamp?: string;
+    traceId?: string;
+  }): { filenameStem: string; heading: string; html: string } => {
+    const heading =
+      str(headingHint, "").trim() ||
+      report.title ||
+      "Research report";
+    const lines = [
+      cleanResearchReportMarkdownForExport(report, {
+        preserveChartFences: true,
+      }),
+    ];
+    const prompt = str(previousUserPrompt, "").trim();
+    const details: string[] = [];
+    if (prompt) {
+      details.push("## Request", "", prompt, "");
+    }
+    details.push("## Report Details", "");
+    details.push("| Field | Value |");
+    details.push("| --- | --- |");
+    details.push(`| Conversation | ${conversationId || "Not available"} |`);
+    details.push(`| Assistant time | ${str(timestamp, "").trim() || "Not available"} |`);
+    details.push(`| Trace id | ${str(traceId, "").trim() || "Not available"} |`);
+    details.push(`| Exported at | ${new Date().toISOString()} |`);
+    lines.push(details.join("\n"));
+    return {
+      filenameStem: documentFileStem(heading),
+      heading,
+      html: reportPrintHtml(heading, lines.filter(Boolean).join("\n\n")),
+    };
+  };
+
+  const downloadResearchReportHtml = (request: {
+    report: ResearchReportPreview;
+    headingHint?: string;
+    previousUserPrompt?: string;
+    timestamp?: string;
+    traceId?: string;
+  }) => {
+    try {
+      const prepared = researchReportExportHtml(request);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      downloadTextFile(
+        `${prepared.filenameStem}-${stamp}.html`,
+        prepared.html,
+        "text/html;charset=utf-8",
+      );
+      setChatNotice("HTML report downloaded.");
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
+  const exportResearchReportPdf = (request: {
+    report: ResearchReportPreview;
+    headingHint?: string;
+    previousUserPrompt?: string;
+    timestamp?: string;
+    traceId?: string;
+  }) => {
+    try {
+      const prepared = researchReportExportHtml(request);
+      const printWindow = window.open("", "_blank", "width=980,height=1100");
+      if (!printWindow) {
+        setChatError("PDF export window was blocked. Allow pop-ups for AgentArk and try again.");
+        return;
+      }
+      printWindow.document.open();
+      printWindow.document.write(prepared.html);
+      printWindow.document.close();
+      printWindow.document.title = prepared.heading;
+      printWindow.focus();
+      printWindow.setTimeout(() => {
+        printWindow.focus();
+        printWindow.print();
+      }, 300);
+      setChatNotice("PDF export opened.");
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  };
+
   const exportAssistantMessage = async (
     message: JsonRecord,
     previousUserPrompt?: string,
   ) => {
+    const content = str(message.content, "").trim();
+    const report = parseResearchReportWithContext(content, {
+      deepResearch: isDeepResearchAssistantMessage(message),
+      previousUserPrompt,
+      conversationTitle: str(selectedConversation?.title, ""),
+    });
+    if (report) {
+      downloadResearchReportHtml({
+        report,
+        headingHint: report.title,
+        previousUserPrompt,
+        timestamp: str(message.timestamp, "").trim(),
+        traceId: str(message.trace_id, "").trim(),
+      });
+      return;
+    }
     await exportAssistantMarkdown({
-      content: str(message.content, "").trim(),
+      content,
       previousUserPrompt,
       timestamp: str(message.timestamp, "").trim(),
       traceId: str(message.trace_id, "").trim(),
+      deepResearchHint: isDeepResearchAssistantMessage(message),
     });
   };
 
@@ -13715,8 +14855,8 @@ function ChatPageInner({
               <Tooltip
                 title={
                   isStreaming
-                    ? "Download current report draft"
-                    : "Download report"
+                    ? "Export current draft as PDF"
+                    : "Export as PDF"
                 }
               >
                 <IconButton
@@ -13724,8 +14864,8 @@ function ChatPageInner({
                   className="chat-research-report-action"
                   onClick={(event) => {
                     event.stopPropagation();
-                    void exportAssistantMarkdown({
-                      content: report.content,
+                    exportResearchReportPdf({
+                      report,
                       headingHint: report.title,
                       previousUserPrompt,
                       timestamp,
@@ -13733,7 +14873,31 @@ function ChatPageInner({
                     });
                   }}
                 >
-                  <FileDownloadRoundedIcon fontSize="small" />
+                  <PictureAsPdfRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              <Tooltip
+                title={
+                  isStreaming
+                    ? "Download current draft as HTML"
+                    : "Download HTML report"
+                }
+              >
+                <IconButton
+                  size="small"
+                  className="chat-research-report-action"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    downloadResearchReportHtml({
+                      report,
+                      headingHint: report.title,
+                      previousUserPrompt,
+                      timestamp,
+                      traceId,
+                    });
+                  }}
+                >
+                  <ArticleRoundedIcon fontSize="small" />
                 </IconButton>
               </Tooltip>
               <Tooltip
@@ -13884,11 +15048,11 @@ function ChatPageInner({
               size="small"
               variant="outlined"
               className="chat-research-report-secondary-action"
-              startIcon={<FileDownloadRoundedIcon fontSize="small" />}
+              startIcon={<PictureAsPdfRoundedIcon fontSize="small" />}
               onClick={(event) => {
                 event.stopPropagation();
-                void exportAssistantMarkdown({
-                  content: report.content,
+                exportResearchReportPdf({
+                  report,
                   headingHint: report.title,
                   previousUserPrompt,
                   timestamp,
@@ -13896,7 +15060,25 @@ function ChatPageInner({
                 });
               }}
             >
-              Download Markdown
+              Export PDF
+            </Button>
+            <Button
+              size="small"
+              variant="outlined"
+              className="chat-research-report-secondary-action"
+              startIcon={<ArticleRoundedIcon fontSize="small" />}
+              onClick={(event) => {
+                event.stopPropagation();
+                downloadResearchReportHtml({
+                  report,
+                  headingHint: report.title,
+                  previousUserPrompt,
+                  timestamp,
+                  traceId,
+                });
+              }}
+            >
+              Download HTML
             </Button>
           </Box>
         </Box>
@@ -14201,14 +15383,16 @@ function ChatPageInner({
                 flexWrap: "wrap",
               }}
             >
-              <Button
-                size="small"
-                variant="outlined"
-                className="chat-plan-confirmation-action ghost"
-                onClick={() => void handlePlanConfirmationCancel()}
-              >
-                Cancel
-              </Button>
+              {TASK_CANCEL_CONTROLS_ENABLED ? (
+                <Button
+                  size="small"
+                  variant="outlined"
+                  className="chat-plan-confirmation-action ghost"
+                  onClick={() => void handlePlanConfirmationCancel()}
+                >
+                  Cancel
+                </Button>
+              ) : null}
               <Button
                 size="small"
                 variant="contained"
@@ -14771,36 +15955,45 @@ function ChatPageInner({
     return next;
   };
 
+  const limitStepsPreservingReasoning = (
+    steps: JsonRecord[],
+    maxSteps: number,
+  ): JsonRecord[] => {
+    if (steps.length <= maxSteps) return steps;
+    const keepIndexes = new Set<number>();
+    let heartbeatIndex = -1;
+    steps.forEach((step, index) => {
+      if (isMainChatReasoningStep(step)) keepIndexes.add(index);
+      if (heartbeatIndex < 0 && isHeartbeatStreamingStep(step)) {
+        heartbeatIndex = index;
+      }
+    });
+    const heartbeatReserved =
+      heartbeatIndex >= 0 && !keepIndexes.has(heartbeatIndex) ? 1 : 0;
+    let remaining = Math.max(0, maxSteps - keepIndexes.size - heartbeatReserved);
+    for (let index = steps.length - 1; index >= 0 && remaining > 0; index -= 1) {
+      if (keepIndexes.has(index) || index === heartbeatIndex) continue;
+      keepIndexes.add(index);
+      remaining -= 1;
+    }
+    if (heartbeatIndex >= 0) keepIndexes.add(heartbeatIndex);
+    return steps.filter((_, index) => keepIndexes.has(index));
+  };
+
   const limitStreamingStepsForUi = (steps: JsonRecord[]): JsonRecord[] => {
     if (steps.length <= CHAT_STREAMING_STEPS_UI_MAX) return steps;
-    const heartbeat = steps.find((row) => isHeartbeatStreamingStep(row));
-    const next = steps
-      .filter((row) => !isHeartbeatStreamingStep(row))
-      .slice(-CHAT_STREAMING_STEPS_UI_MAX);
-    if (
-      heartbeat &&
-      next.length < CHAT_STREAMING_STEPS_UI_MAX &&
-      !next.some((row) => isHeartbeatStreamingStep(row))
-    ) {
-      return [...next, heartbeat];
-    }
-    return next;
+    return limitStepsPreservingReasoning(
+      steps,
+      CHAT_STREAMING_STEPS_UI_MAX,
+    );
   };
 
   const limitActivityStepsForRender = (steps: JsonRecord[]): JsonRecord[] => {
     if (steps.length <= CHAT_WORKSPACE_ACTIVITY_RENDER_MAX) return steps;
-    const heartbeat = steps.find((row) => isHeartbeatStreamingStep(row));
-    const next = steps
-      .filter((row) => !isHeartbeatStreamingStep(row))
-      .slice(-CHAT_WORKSPACE_ACTIVITY_RENDER_MAX);
-    if (
-      heartbeat &&
-      next.length < CHAT_WORKSPACE_ACTIVITY_RENDER_MAX &&
-      !next.some((row) => isHeartbeatStreamingStep(row))
-    ) {
-      return [...next, heartbeat];
-    }
-    return next;
+    return limitStepsPreservingReasoning(
+      steps,
+      CHAT_WORKSPACE_ACTIVITY_RENDER_MAX,
+    );
   };
 
   const countMeaningfulActivityCards = (
@@ -14930,7 +16123,7 @@ function ChatPageInner({
         });
         markPendingRunAwaitingPlanConfirmation(taskId);
         setChatNotice(
-          `${planConfirmationDisplayLabel(planSource)} ready. Review it, then Start or Cancel.`,
+          `${planConfirmationDisplayLabel(planSource)} ready. Review it, then Start.`,
         );
       }
     }
@@ -15309,11 +16502,10 @@ function ChatPageInner({
     );
     const done = toBool(payloadObj.done);
     if (!phase) return;
+    if (!isVisibleReasoningPhase(phase)) return;
 
     const current = reasoningProgressByPhaseRef.current[phase] || "";
-    const nextContent = trimReasoningPreview(
-      snapshot || (done ? current : `${current}${delta}`),
-    );
+    const nextContent = snapshot || (done ? current : `${current}${delta}`);
     reasoningProgressByPhaseRef.current[phase] = nextContent;
     setReasoningPreviewBuffered(phase, nextContent, done);
 
@@ -15322,7 +16514,9 @@ function ChatPageInner({
     const presentation = reasoningStatusCopy(phase, detail, payloadObj);
     const now = Date.now();
     const lastEmit = reasoningActivityEmitRef.current[streamKey] || 0;
-    const shouldEmit = done || now - lastEmit >= 750;
+    const activityEmitInterval =
+      detail.length > 120_000 ? 2500 : detail.length > 60_000 ? 1500 : 750;
+    const shouldEmit = done || now - lastEmit >= activityEmitInterval;
     if (shouldEmit) {
       reasoningActivityEmitRef.current[streamKey] = now;
       pushStreamingStep({
@@ -15349,8 +16543,12 @@ function ChatPageInner({
   ) => {
     followActivityConsole();
     const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
-    if (str(payloadObj.kind, "").trim().toLowerCase() === "turn_completed") {
+    const progressKind = str(payloadObj.kind, "").trim().toLowerCase();
+    if (progressKind === "turn_completed") {
       return;
+    }
+    if (progressKind.startsWith("delegation_")) {
+      setWorkspaceOpen(true);
     }
     // Backward compatibility for older streams that carried reasoning deltas
     // as tool progress. Current streams use dedicated `reasoning_delta` events.
@@ -15387,7 +16585,7 @@ function ChatPageInner({
       progressPresentation,
     );
 
-    const isDraftFile = str(payloadObj.kind, "") === "draft_file";
+    const isDraftFile = progressKind === "draft_file";
     if (isDraftFile) {
       const fileName = normalizeWorkspaceFileName(
         payloadObj.file ?? payloadObj.path,
@@ -15579,11 +16777,13 @@ function ChatPageInner({
         pendingRunSnapshot.streamingResponse ||
         ""
       ).slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
-      streamingSteps: trimTrailingHeartbeatSteps(
-        streamingStepsRef.current.length > 0
-          ? streamingStepsRef.current
-          : streamingSteps,
-      ).slice(-CHAT_PENDING_STREAM_STEPS_MAX),
+      streamingSteps: limitPendingRunStepsForSnapshot(
+        trimTrailingHeartbeatSteps(
+          streamingStepsRef.current.length > 0
+            ? streamingStepsRef.current
+            : streamingSteps,
+        ),
+      ),
     };
   };
 
@@ -15659,11 +16859,13 @@ function ChatPageInner({
         )
       : "";
     const preservedResumeSteps = preservedResumeSnapshot
-      ? trimTrailingHeartbeatSteps(
-          asRecords(preservedResumeSnapshot.streamingSteps).map((step) =>
-            ensureActivityStepTime(step),
+      ? limitPendingRunStepsForSnapshot(
+          trimTrailingHeartbeatSteps(
+            asRecords(preservedResumeSnapshot.streamingSteps).map((step) =>
+              ensureActivityStepTime(step),
+            ),
           ),
-        ).slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+        )
       : [];
     let activeMessage = isResumeMode ? "" : message.trim();
     const activeMessagePreview = maskSensitiveChatPreview(activeMessage);
@@ -15712,6 +16914,7 @@ function ChatPageInner({
         targetConversationId = createdId;
         setConversationPage(0);
         setConversationId(createdId);
+        setDraftChatMode(false);
       } catch (err) {
         streamLockRef.current = false;
         setChatError(
@@ -15719,6 +16922,9 @@ function ChatPageInner({
         );
         return false;
       }
+    }
+    if (targetConversationId) {
+      setDraftChatMode(false);
     }
     const attachmentFingerprint = files
       .map((file) => `${file.name}:${file.size}:${file.lastModified}`)
@@ -15849,6 +17055,35 @@ function ChatPageInner({
     let streamError: string | null = null;
     let latestStreamingResponse = preservedResumeResponse;
     const streamStartedAt = Date.now();
+    const streamDetachedToBackground = () =>
+      backgroundDetachGenerationsRef.current.has(streamGeneration);
+    const updateDetachedBackgroundSnapshot = (
+      patch: Partial<ChatPendingRunSnapshot>,
+    ) => {
+      const detachedConversationId = str(
+        patch.conversationId,
+        targetConversationId || initialPendingSnapshot.conversationId || "",
+      ).trim();
+      if (!detachedConversationId) return;
+      setBackgroundRunSnapshots((prev) => {
+        const existing =
+          prev[detachedConversationId] || {
+            ...initialPendingSnapshot,
+            conversationId: detachedConversationId,
+          };
+        const nextSnapshot: ChatPendingRunSnapshot = {
+          ...existing,
+          ...patch,
+          conversationId: detachedConversationId,
+        };
+        const next = {
+          ...prev,
+          [detachedConversationId]: nextSnapshot,
+        };
+        storeChatBackgroundRunSnapshots(next);
+        return next;
+      });
+    };
     const initialAssistantMessageCount =
       targetConversationId && targetConversationId === conversationId
         ? messages.filter(
@@ -15862,14 +17097,12 @@ function ChatPageInner({
       const next: ChatRunMetrics = {};
       const observedElapsedMs = Math.max(1, Date.now() - streamStartedAt);
       const hasVisibleContent = str(obj.content, "").length > 0;
-      const inputTokens = positiveRunMetric(obj.input_tokens);
-      const outputTokens = positiveRunMetric(obj.output_tokens);
-      const totalTokens = positiveRunMetric(obj.total_tokens);
-      const durationMs = positiveRunMetric(obj.duration_ms);
-      const timeToFirstTokenMs = positiveRunMetric(obj.time_to_first_token_ms);
-      if (inputTokens != null) next.inputTokens = inputTokens;
-      if (outputTokens != null) next.outputTokens = outputTokens;
-      if (totalTokens != null) next.totalTokens = totalTokens;
+      const parsedMetrics = chatRunMetricsFromPayload(payload);
+      if (parsedMetrics.inputTokens != null) next.inputTokens = parsedMetrics.inputTokens;
+      if (parsedMetrics.outputTokens != null) next.outputTokens = parsedMetrics.outputTokens;
+      if (parsedMetrics.totalTokens != null) next.totalTokens = parsedMetrics.totalTokens;
+      const durationMs = parsedMetrics.durationMs;
+      const timeToFirstTokenMs = parsedMetrics.timeToFirstTokenMs;
       if (durationMs != null) {
         next.durationMs = Math.max(durationMs, observedElapsedMs);
       }
@@ -15906,6 +17139,15 @@ function ChatPageInner({
         str(obj.cid, str(obj.conversationId, "")),
       );
       const runId = str(obj.run_id, "");
+      if (streamDetachedToBackground()) {
+        if (cid || runId) {
+          updateDetachedBackgroundSnapshot({
+            ...(cid ? { conversationId: cid } : {}),
+            ...(runId ? { runId } : {}),
+          });
+        }
+        return;
+      }
       if (cid) {
         resolvedConversationId = cid;
         setPendingRunSnapshot((prev) => {
@@ -15946,6 +17188,7 @@ function ChatPageInner({
     const handlePlanStreamEvent = (eventName: string, payload: unknown) => {
       recordRunEventSeq(payload);
       absorbConversationId(payload);
+      if (streamDetachedToBackground()) return;
       if (eventName === "run_status") {
         absorbRunMetrics(payload);
         const runStatusStep = buildRunStatusActivityStep(payload);
@@ -15955,6 +17198,7 @@ function ChatPageInner({
             payload,
             resolvedConversationId || targetConversationId,
             initialAssistantMessageCount + 1,
+            { settle: true, minLatestAssistantCreatedAtMs: streamStartedAt },
           );
         }
         return;
@@ -16007,25 +17251,39 @@ function ChatPageInner({
               : undefined,
             {
               signal: abortController.signal,
-              onOpen: () => setLiveRunStreamOpenNow(true),
+              onOpen: () => {
+                if (!streamDetachedToBackground()) setLiveRunStreamOpenNow(true);
+              },
               onEvent: handlePlanStreamEvent,
               onToken: (token) => {
+                if (streamDetachedToBackground()) return;
                 markFirstStreamingToken();
-                latestStreamingResponse += token;
-                appendStreamingToken(token);
+                latestStreamingResponse += appendStreamingToken(token);
               },
               onThinking: (step) => {
+                if (streamDetachedToBackground()) return;
                 absorbConversationId(step);
                 handleStreamThinking(step);
               },
               onReasoningDelta: (payload) => {
+                if (streamDetachedToBackground()) return;
                 absorbConversationId(payload);
                 handleStreamReasoningDeltaPayload(payload);
               },
-              onToolStart: handleStreamToolStart,
-              onToolResult: handleStreamToolResult,
-              onToolProgress: handleStreamToolProgress,
+              onToolStart: (name, payload) => {
+                if (streamDetachedToBackground()) return;
+                handleStreamToolStart(name, payload);
+              },
+              onToolResult: (name, content, payload) => {
+                if (streamDetachedToBackground()) return;
+                handleStreamToolResult(name, content, payload);
+              },
+              onToolProgress: (name, content, payload) => {
+                if (streamDetachedToBackground()) return;
+                handleStreamToolProgress(name, content, payload);
+              },
               onTaskStarted: (payload) => {
+                if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
                 const description = str(payload.description, "Task");
                 if (!taskId) return;
@@ -16061,6 +17319,7 @@ function ChatPageInner({
                 });
               },
               onTaskStatus: (payload) => {
+                if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
                 const description = str(payload.description, "Task");
                 const status = str(payload.status, "");
@@ -16069,6 +17328,7 @@ function ChatPageInner({
                     payload,
                     resolvedConversationId || targetConversationId,
                     initialAssistantMessageCount + 1,
+                    { settle: true, minLatestAssistantCreatedAtMs: streamStartedAt },
                   );
                 }
                 if (!taskId || !status) return;
@@ -16106,6 +17366,7 @@ function ChatPageInner({
                 });
               },
               onContent: (payload) => {
+                if (streamDetachedToBackground()) return;
                 const text = stripAgentInternalReasoningLeaks(
                   str(payload.content, ""),
                 );
@@ -16123,14 +17384,17 @@ function ChatPageInner({
                 absorbConversationId(payload);
               },
               onDone: (payload) => {
+                if (streamDetachedToBackground()) return;
                 absorbConversationId(payload);
                 refreshConversationMessagesFromStreamPayload(
                   payload,
                   resolvedConversationId || targetConversationId,
                   initialAssistantMessageCount + 1,
+                  { settle: true, minLatestAssistantCreatedAtMs: streamStartedAt },
                 );
               },
               onError: (messageText) => {
+                if (streamDetachedToBackground()) return;
                 streamError = normalizeChatError(messageText);
               },
             },
@@ -16152,25 +17416,39 @@ function ChatPageInner({
             },
             {
               signal: abortController.signal,
-              onOpen: () => setLiveRunStreamOpenNow(true),
+              onOpen: () => {
+                if (!streamDetachedToBackground()) setLiveRunStreamOpenNow(true);
+              },
               onEvent: handlePlanStreamEvent,
               onToken: (token) => {
+                if (streamDetachedToBackground()) return;
                 markFirstStreamingToken();
-                latestStreamingResponse += token;
-                appendStreamingToken(token);
+                latestStreamingResponse += appendStreamingToken(token);
               },
               onThinking: (step) => {
+                if (streamDetachedToBackground()) return;
                 absorbConversationId(step);
                 handleStreamThinking(step);
               },
               onReasoningDelta: (payload) => {
+                if (streamDetachedToBackground()) return;
                 absorbConversationId(payload);
                 handleStreamReasoningDeltaPayload(payload);
               },
-              onToolStart: handleStreamToolStart,
-              onToolResult: handleStreamToolResult,
-              onToolProgress: handleStreamToolProgress,
+              onToolStart: (name, payload) => {
+                if (streamDetachedToBackground()) return;
+                handleStreamToolStart(name, payload);
+              },
+              onToolResult: (name, content, payload) => {
+                if (streamDetachedToBackground()) return;
+                handleStreamToolResult(name, content, payload);
+              },
+              onToolProgress: (name, content, payload) => {
+                if (streamDetachedToBackground()) return;
+                handleStreamToolProgress(name, content, payload);
+              },
               onTaskStarted: (payload) => {
+                if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
                 const description = str(payload.description, "Task");
                 if (!taskId) return;
@@ -16204,6 +17482,7 @@ function ChatPageInner({
                 });
               },
               onTaskStatus: (payload) => {
+                if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
                 const description = str(payload.description, "Task");
                 const status = str(payload.status, "");
@@ -16212,6 +17491,7 @@ function ChatPageInner({
                     payload,
                     resolvedConversationId || targetConversationId,
                     initialAssistantMessageCount + 1,
+                    { settle: true, minLatestAssistantCreatedAtMs: streamStartedAt },
                   );
                 }
                 if (!taskId || !status) return;
@@ -16249,6 +17529,7 @@ function ChatPageInner({
                 });
               },
               onContent: (payload) => {
+                if (streamDetachedToBackground()) return;
                 const text = stripAgentInternalReasoningLeaks(
                   str(payload.content, ""),
                 );
@@ -16266,14 +17547,17 @@ function ChatPageInner({
                 absorbConversationId(payload);
               },
               onDone: (payload) => {
+                if (streamDetachedToBackground()) return;
                 absorbConversationId(payload);
                 refreshConversationMessagesFromStreamPayload(
                   payload,
                   resolvedConversationId || targetConversationId,
                   initialAssistantMessageCount + 1,
+                  { settle: true, minLatestAssistantCreatedAtMs: streamStartedAt },
                 );
               },
               onError: (messageText) => {
+                if (streamDetachedToBackground()) return;
                 streamError = normalizeChatError(messageText);
               },
             },
@@ -16301,6 +17585,24 @@ function ChatPageInner({
       const completedStreamingSteps = trimTrailingHeartbeatSteps(
         streamingStepsRef.current,
       );
+      const completedStreamingPlan =
+        extractExecutionPlanFromTraceSteps(completedStreamingSteps);
+      const planConfirmationTaskIdFromStream = (() => {
+        for (let idx = completedStreamingSteps.length - 1; idx >= 0; idx -= 1) {
+          const step = asRecord(completedStreamingSteps[idx]);
+          const stepType = str(step.step_type, "").trim().toLowerCase();
+          if (
+            stepType === "plan_ready_for_confirmation" ||
+            stepType === "plan_generated" ||
+            stepType === "plan_revised"
+          ) {
+            const taskId = str(step.task_id, "").trim();
+            if (taskId) return taskId;
+          }
+        }
+        return "";
+      })();
+      const finalPlanTaskId = finalTaskId || planConfirmationTaskIdFromStream;
       const latestRunStatusFromStream = extractLatestRunStatusSummary(
         completedStreamingSteps,
       );
@@ -16313,7 +17615,14 @@ function ChatPageInner({
             stepType === "plan_ready_for_confirmation" ||
             stepType === "plan_step_update"
           );
-        }) || !!extractExecutionPlanFromTraceSteps(completedStreamingSteps);
+        }) || !!completedStreamingPlan;
+      const awaitingPlanConfirmationFromStream =
+        !isResumeMode &&
+        shouldKeepPlanInApprovalState(
+          completedStreamingPlan,
+          completedStreamingSteps,
+          "fresh",
+        );
       const explicitPlanningFailure = extractExecutionPlanFailureFromTraceSteps(
         completedStreamingSteps,
       ).trim();
@@ -16360,6 +17669,42 @@ function ChatPageInner({
       } else if (terminalPlanningFailure) {
         setExecutionPlanFailure(terminalPlanningFailureDetail);
         setPlanConfirmation(null);
+      } else if (awaitingPlanConfirmationFromStream) {
+        const planSource =
+          extractPlanConfirmationSourceFromSteps(completedStreamingSteps) ||
+          (deepResearch ? PLAN_CONFIRMATION_SOURCE_DEEP_RESEARCH : "execution");
+        const nextPlan = resetExecutionPlanProgress(completedStreamingPlan);
+        if (isDeepResearchPlanSource(planSource)) {
+          if (nextPlan) {
+            setExecutionPlan(nextPlan);
+            setExecutionPlanFailure("");
+          }
+          markPendingRunAwaitingPlanConfirmation(finalPlanTaskId);
+          setPlanConfirmation((prev) => {
+            if (
+              prev &&
+              prev.stage === "awaiting_confirmation" &&
+              prev.originalPlan &&
+              prev.draft
+            ) {
+              return {
+                ...prev,
+                taskId: finalPlanTaskId || prev.taskId,
+                editing: false,
+              };
+            }
+            const originalPlan = prev?.originalPlan ?? nextPlan;
+            return {
+              stage: "awaiting_confirmation",
+              taskId: finalPlanTaskId || prev?.taskId || null,
+              source: planSource,
+              originalPlan,
+              draft: createPlanConfirmationDraft(originalPlan),
+              editing: false,
+              messageId: prev?.messageId ?? null,
+            };
+          });
+        }
       }
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       await queryClient.invalidateQueries({
@@ -16372,10 +17717,15 @@ function ChatPageInner({
       await queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
       if (!detachedToBackground && !streamError && !wasStopped) {
         setFailedUserMessage(null);
+        const currentPendingSnapshotPhase = str(
+          pendingRunSnapshotRef.current?.phase,
+          "",
+        ).trim();
         if (
           !!str(planConfirmation?.source, "").trim() &&
-          pendingSnapshotPhase !== "awaiting_confirmation" &&
-          pendingSnapshotPhase !== "interrupted"
+          !awaitingPlanConfirmationFromStream &&
+          currentPendingSnapshotPhase !== "awaiting_confirmation" &&
+          currentPendingSnapshotPhase !== "interrupted"
         ) {
           setPlanConfirmation(null);
         }
@@ -16410,11 +17760,27 @@ function ChatPageInner({
             await refreshConversationMessagesAfterStream(
               resolvedConversationId,
               initialAssistantMessageCount + 1,
+              {
+                settle: true,
+                minLatestAssistantCreatedAtMs: streamStartedAt,
+              },
             );
           } catch {
-            await queryClient.invalidateQueries({
-              queryKey: ["chat-messages", resolvedConversationId],
-            });
+            const recovered = await recoverAssistantMessageFromLatestRun(
+              resolvedConversationId,
+              {
+                expectedRunId: str(
+                  pendingRunSnapshotRef.current?.runId,
+                  "",
+                ).trim(),
+                minRunUpdatedAtMs: streamStartedAt,
+              },
+            ).catch(() => false);
+            if (!recovered) {
+              await queryClient.invalidateQueries({
+                queryKey: ["chat-messages", resolvedConversationId],
+              });
+            }
           }
         }
       }
@@ -16437,7 +17803,7 @@ function ChatPageInner({
         const completedStatusMessage =
           opts.statusSource === "sentinel"
             ? "Sentinel launch completed. Review Chat for the result."
-            : "ArkPulse fix completed. Review Chat for the result.";
+            : "Pulse fix completed. Review Chat for the result.";
         window.dispatchEvent(
           new CustomEvent<ChatRunStatusDetail>(CHAT_RUN_STATUS_EVENT, {
             detail: {
@@ -16454,14 +17820,14 @@ function ChatPageInner({
       } else if (wasStopped) {
         setFailedUserMessage(null);
         const activeSnapshot = pendingRunSnapshotRef.current;
-        const interruptedSteps = trimTrailingHeartbeatSteps(
-          streamingStepsRef.current,
-        ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+        const interruptedSteps = limitPendingRunStepsForSnapshot(
+          trimTrailingHeartbeatSteps(streamingStepsRef.current),
+        );
         const fallbackInterruptedSteps =
           interruptedSteps.length > 0
             ? interruptedSteps
-            : asRecords(activeSnapshot?.streamingSteps).slice(
-                -CHAT_PENDING_STREAM_STEPS_MAX,
+            : limitPendingRunStepsForSnapshot(
+                asRecords(activeSnapshot?.streamingSteps),
               );
         const interruptedConversationId =
           resolvedConversationId ||
@@ -16535,9 +17901,9 @@ function ChatPageInner({
           setExecutionPlanExpanded(false);
           setStreamingResponseNow(preservedResumeResponse);
         } else if (streamError && !isResumeMode && !sensitiveMessage) {
-          const interruptedSteps = trimTrailingHeartbeatSteps(
-            streamingStepsRef.current,
-          ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+          const interruptedSteps = limitPendingRunStepsForSnapshot(
+            trimTrailingHeartbeatSteps(streamingStepsRef.current),
+          );
           const activeSnapshot = pendingRunSnapshotRef.current;
           const interruptedSnapshot: ChatPendingRunSnapshot = {
             ...initialPendingSnapshot,
@@ -16639,6 +18005,10 @@ function ChatPageInner({
         ),
       ),
     );
+    const reattachStartedAtMs = Math.max(
+      0,
+      num(pendingRunSnapshot?.startedAt, 0),
+    );
 
     const absorbRunPayload = (payload: unknown) => {
       const obj = asRecord(payload);
@@ -16647,6 +18017,10 @@ function ChatPageInner({
         str(obj.cid, str(obj.conversationId, pendingConversationId)),
       );
       const nextRunId = str(obj.run_id, runId);
+      const metrics = chatRunMetricsFromPayload(payload);
+      if (Object.keys(metrics).length > 0) {
+        setStreamingRunMetrics((prev) => ({ ...(prev ?? {}), ...metrics }));
+      }
       setPendingRunSnapshot((prev) => {
         const base = prev ??
           pendingRunSnapshotRef.current ?? {
@@ -16716,6 +18090,11 @@ function ChatPageInner({
               refreshConversationMessagesFromStreamPayload(
                 payload,
                 pendingConversationId,
+                undefined,
+                {
+                  settle: true,
+                  minLatestAssistantCreatedAtMs: reattachStartedAtMs,
+                },
               );
             }
             return;
@@ -16734,8 +18113,7 @@ function ChatPageInner({
           }
         },
         onToken: (token) => {
-          latestStreamingResponse += token;
-          appendStreamingToken(token);
+          latestStreamingResponse += appendStreamingToken(token);
         },
         onThinking: (step) => {
           absorbRunPayload(step);
@@ -16765,6 +18143,11 @@ function ChatPageInner({
             refreshConversationMessagesFromStreamPayload(
               payload,
               pendingConversationId,
+              undefined,
+              {
+                settle: true,
+                minLatestAssistantCreatedAtMs: reattachStartedAtMs,
+              },
             );
           }
           setStreamingResponseChoices(clarificationChoices(payload.choices));
@@ -16809,7 +18192,26 @@ function ChatPageInner({
             queryKey: ["chat-conversations"],
           });
           void queryClient.invalidateQueries({ queryKey: ["tasks"] });
-          void refreshConversationMessagesAfterStream(pendingConversationId);
+          void refreshConversationMessagesAfterStream(
+            pendingConversationId,
+            undefined,
+            {
+              settle: true,
+              minLatestAssistantCreatedAtMs: reattachStartedAtMs,
+            },
+          ).catch(async () => {
+            const recovered = await recoverAssistantMessageFromLatestRun(
+              pendingConversationId,
+              {
+                expectedRunId: runId,
+                minRunUpdatedAtMs: reattachStartedAtMs,
+              },
+            ).catch(() => false);
+            if (recovered) return;
+            void queryClient.invalidateQueries({
+              queryKey: ["chat-messages", pendingConversationId],
+            });
+          });
         },
       })
       .catch(async (error) => {
@@ -16889,7 +18291,9 @@ function ChatPageInner({
     reattachTaskId,
     conversationId,
     isStreaming,
+    pendingRunSnapshot?.startedAt,
     queryClient,
+    recoverAssistantMessageFromLatestRun,
     refreshConversationMessagesAfterStream,
     refreshConversationMessagesFromStreamPayload,
   ]);
@@ -17676,7 +19080,7 @@ function ChatPageInner({
     pendingUserMessageAlreadyPersisted,
   ]);
   const visibleStreamingResponse = hasLivePendingThread
-    ? stripAgentInternalReasoningLeaks(streamingResponse)
+    ? visibleStreamingTranscriptText(streamingResponse)
     : "";
   const computerTokenPreview = useMemo(() => {
     if (!visibleStreamingResponse) return "";
@@ -17696,9 +19100,6 @@ function ChatPageInner({
       ),
     [pendingRunSnapshot?.streamingSteps, streamingSteps],
   );
-  const streamingResearchReport = showStreamingAssistant
-    ? parseResearchReport(visibleStreamingResponse)
-    : null;
   const streamingResearchPrompt =
     visiblePendingUserMessage ||
     (() => {
@@ -17709,6 +19110,13 @@ function ChatPageInner({
       }
       return "";
     })();
+  const streamingResearchReport = showStreamingAssistant
+    ? parseResearchReportWithContext(visibleStreamingResponse, {
+        deepResearch: isDeepResearchPlanSource(planConfirmation?.source),
+        previousUserPrompt: streamingResearchPrompt,
+        conversationTitle: str(selectedConversation?.title, ""),
+      })
+    : null;
   const completedProgressSnapshot =
     !hasPendingSnapshotForConversation && conversationId
       ? completedProgressMessagesByConversation[conversationId] || null
@@ -17777,7 +19185,8 @@ function ChatPageInner({
     visibleFailedUserMessage ||
     isStreamingForCurrentConversation ||
     hasLivePendingThread ||
-    visibleStreamingResponse.trim(),
+    visibleStreamingResponse.trim() ||
+    selectedConversationAwaitingPersistedMessages,
   );
   const hasRenderableThread = messages.length > 0 || hasLiveThreadActivity;
   const showEmptyHero =
@@ -17908,16 +19317,16 @@ function ChatPageInner({
       if (rawMessageChoices.length > 0 && idx === latestChoiceMessageIndex) {
         messageChoices = rawMessageChoices;
       }
-      const researchReport = isAssistant
-        ? parseResearchReport(renderedContent)
-        : null;
       const previousUserPrompt = previousUserPromptByIndex.get(idx) || "";
+      const researchReport = isAssistant
+        ? parseResearchReportWithContext(renderedContent, {
+            deepResearch: isDeepResearchAssistantMessage(message),
+            previousUserPrompt,
+            conversationTitle: str(selectedConversation?.title, ""),
+          })
+        : null;
       const traceId = str(message.trace_id, "").trim();
       const hasTrace = !isUser && !!traceId;
-      const messageInputTokens = !isUser ? num(message.input_tokens, 0) : 0;
-      const messageOutputTokens = !isUser ? num(message.output_tokens, 0) : 0;
-      const messageTotalTokens = !isUser ? num(message.total_tokens, 0) : 0;
-      const messageDurationMs = !isUser ? num(message.duration_ms, 0) : 0;
       const markdownNode =
         !isUser && !researchReport
           ? renderChatMarkdown(renderedContent, {
@@ -17925,6 +19334,9 @@ function ChatPageInner({
               onOpenSnippet: openCodePreviewInWorkspace,
             })
           : null;
+      const runMetricItems = isAssistant
+        ? buildChatRunMetricItems(chatRunMetricsFromPayload(message))
+        : [];
       return {
         message,
         idx,
@@ -17941,14 +19353,16 @@ function ChatPageInner({
         previousUserPrompt,
         traceId,
         hasTrace,
-        messageInputTokens,
-        messageOutputTokens,
-        messageTotalTokens,
-        messageDurationMs,
         markdownNode,
+        runMetricItems,
       };
     });
-  }, [messages, previousUserPromptByIndex, openCodePreviewInWorkspace]);
+  }, [
+    messages,
+    previousUserPromptByIndex,
+    openCodePreviewInWorkspace,
+    selectedConversation?.title,
+  ]);
   const latestAssistantTraceSteps = useMemo(
     () => (latestAssistantTraceId ? traceStepsById[latestAssistantTraceId] || [] : []),
     [latestAssistantTraceId, traceStepsById],
@@ -18065,6 +19479,7 @@ function ChatPageInner({
   const showPlanConfirmationCard =
     planConfirmationIsDeepResearch &&
     (isPlanningDeepResearch ||
+      isAwaitingPlanConfirmation ||
       composerAwaitingPlanConfirmation ||
       isRunningPlanConfirmation ||
       isCompletedPlanConfirmation ||
@@ -18082,6 +19497,10 @@ function ChatPageInner({
     ? planConfirmationEnabledCount > 0
       ? `Will expand these ${planConfirmationEnabledCount} approved step${planConfirmationEnabledCount === 1 ? "" : "s"} into live execution after you press Start.`
       : "Select at least one step to continue."
+    : isAwaitingPlanConfirmation
+      ? planConfirmationEnabledCount > 0
+        ? `Will expand these ${planConfirmationEnabledCount} approved step${planConfirmationEnabledCount === 1 ? "" : "s"} into live execution after you press Start.`
+        : "Select at least one step to continue."
     : isRunningPlanConfirmation
       ? "This is the approved plan. Live substeps and status updates should stay attached here while the run executes."
       : isCompletedPlanConfirmation
@@ -18573,11 +19992,26 @@ function ChatPageInner({
     return meaningful.length > 0 ? meaningful : workspaceCards;
   }, [hasPendingSnapshotForConversation, showStreamingAssistant, workspaceCards]);
   // Build compact per-assistant-message transcript rows from persisted traces.
-  // This keeps prior tool actions visible after a new turn begins, while the
-  // Computer pane remains the owner of full trace/output detail.
+  // This keeps prior tool actions visible after a new turn begins. Rows stay
+  // collapsed in chat, and expanded rows reveal exact structured input/output.
   const perMessageTraceTranscriptById = useMemo(() => {
-    return {} as Record<string, ChatTranscriptItem[]>;
-  }, []);
+    const byMessageId: Record<string, ChatTranscriptItem[]> = {};
+    for (const bundle of messageRenderBundle) {
+      if (!bundle.isAssistant || !bundle.traceId) continue;
+      const steps = traceStepsById[bundle.traceId] || [];
+      if (steps.length === 0) continue;
+      const items = buildChatTranscriptItemsFromSteps(
+        steps,
+        `message-trace:${bundle.messageId}:${bundle.traceId}`,
+        28,
+        { complete: true },
+      ).filter((item) => item.kind !== "prose");
+      if (items.length > 0) {
+        byMessageId[bundle.messageId] = items;
+      }
+    }
+    return byMessageId;
+  }, [buildChatTranscriptItemsFromSteps, messageRenderBundle, traceStepsById]);
   const latestWorkspaceCard = pickPrimaryActivityCard(workspaceCards);
   const progressRows = useMemo(() => {
     const seen = new Set<string>();
@@ -18671,10 +20105,12 @@ function ChatPageInner({
       liveStreamOpenForCurrentConversation ||
       hasFocusedDraftStream ||
       hasPendingSnapshotForConversation);
+  const computerRunMetricItems = useMemo(
+    () => (streamingRunMetrics ? buildChatRunMetricItems(streamingRunMetrics) : []),
+    [streamingRunMetrics],
+  );
   const streamingRunMetricItems =
-    streamingRunMetrics && !currentRunStillActiveForMetrics
-      ? buildChatRunMetricItems(streamingRunMetrics)
-      : [];
+    !currentRunStillActiveForMetrics ? computerRunMetricItems : [];
   const hasVisibleStreamingReply = Boolean(visibleStreamingResponse.trim());
   const hasLiveWorkActivity = false;
   const showLiveExecutionPanel = false;
@@ -18814,8 +20250,14 @@ function ChatPageInner({
   const latestRunStatus = str(latestRunStatusSummary?.status, "")
     .trim()
     .toLowerCase();
+  const chatCredentialPromptDismissed =
+    !!conversationId &&
+    dismissedCredentialPromptConversationIds.has(conversationId) &&
+    !chatCredentialPromptVisible;
   const credentialActionNeeded =
-    latestRunStatus === "needs_credentials" && !chatCredentialPromptVisible;
+    latestRunStatus === "needs_credentials" &&
+    !chatCredentialPromptVisible &&
+    !chatCredentialPromptDismissed;
   const credentialUiActive =
     chatCredentialPromptVisible || credentialActionNeeded;
   const searchIssueText = [
@@ -18874,6 +20316,14 @@ function ChatPageInner({
   const consoleProgressSummary = workspaceConsoleCards.length
     ? consoleEventCountLabel
     : progressSummary;
+  const activityDetailPayloadKey = activityDetailRow
+    ? `activity-detail:${activityDetailRow.id}`
+    : "";
+  const activityDetailReadableDetail =
+    activityDetailRow?.rawDetailFull &&
+    looksLikeStructuredActivityText(activityDetailRow.rawDetailFull)
+      ? summarizeActivityDetail(activityDetailRow.rawDetailFull)
+      : "";
   const executionPlanCompletedCount = displayedExecutionPlan.filter(
     (step) => step.status === "completed",
   ).length;
@@ -19454,6 +20904,7 @@ function ChatPageInner({
         isStreaming={isStreamingForCurrentConversation}
         startedAt={pendingSnapshotStartedAt || null}
         tokenPreview={deferredComputerTokenPreview}
+        runMetrics={computerRunMetricItems}
         reasoningPreview={reasoningStream?.content || ""}
         reasoningPhase={reasoningStream?.phase || ""}
         taskProgress={computerTaskProgress}
@@ -19517,6 +20968,12 @@ function ChatPageInner({
             Current focus: {nowDoingLabel}. Tool output and runtime activity stay here.
           </Typography>
         </Box>
+        <SwarmActivityPanel
+          runs={swarmActivityRuns}
+          interrupted={showInterruptedRunCard}
+          expandedPayloads={expandedActivityPayloads}
+          onTogglePayload={toggleExpandedActivityPayload}
+        />
         <Box className="term-shell">
           <Box className="term-titlebar">
             <Typography variant="caption" className="term-titlebar-text">
@@ -19555,16 +21012,12 @@ function ChatPageInner({
               workspaceConsoleCards.map((row, idx) => {
                 const isLast = idx === workspaceConsoleCards.length - 1;
                 const isActive = isLast && isStreamingForCurrentConversation;
-                const payloadKey = `live:${row.id}`;
                 return (
                   <ActivityTimelineRow
                     key={`activity-${row.id}`}
                     row={row}
                     isActive={isActive}
-                    payloadExpanded={expandedActivityPayloads.has(payloadKey)}
-                    onTogglePayload={() =>
-                      toggleExpandedActivityPayload(payloadKey)
-                    }
+                    onOpenDetails={() => setActivityDetailRow(row)}
                     detailed
                   />
                 );
@@ -19936,14 +21389,16 @@ function ChatPageInner({
   }, [workspaceConsoleCards.length, activityAutoFollow, isStreaming]);
 
   const composerPlaceholder =
-    composerLockedForPlanConfirmation
+    credentialUiActive
+      ? "Use the secure credential form above"
+      : composerLockedForPlanConfirmation
       ? `Preparing the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
       : composerAwaitingPlanConfirmation
-        ? "Ask for changes to the plan, or press Start / Cancel."
+        ? "Ask for changes to the plan, or press Start."
         : "Message (Enter to send, Shift+Enter for newline)";
 
   const emptyComposerPlaceholder =
-    composerLockedForPlanConfirmation || composerAwaitingPlanConfirmation
+    credentialUiActive || composerLockedForPlanConfirmation || composerAwaitingPlanConfirmation
       ? composerPlaceholder
       : "How can I help you today?";
 
@@ -20008,12 +21463,95 @@ function ChatPageInner({
       </Box>
     ) : null;
 
+  const renderRunMetricPills = (
+    items: ChatRunMetricItem[],
+    keyPrefix: string,
+    ariaLabel: string,
+    extraClassName = "",
+  ) =>
+    items.length > 0 ? (
+      <Box
+        className={`chat-run-metrics${extraClassName ? ` ${extraClassName}` : ""}`}
+        aria-label={ariaLabel}
+      >
+        {items.map((item) => (
+          <span className="chat-run-metric" key={`${keyPrefix}:${item.label}`}>
+            <span className="chat-run-metric-label">{item.label}</span>
+            <span className="chat-run-metric-value">{item.value}</span>
+          </span>
+        ))}
+      </Box>
+    ) : null;
+
   const renderTranscriptStatusIcon = (
     status: ChatTranscriptActionStatus,
   ): ReactNode => {
     if (status === "done") return <CheckCircleRoundedIcon fontSize="inherit" />;
     if (status === "issue") return <ErrorOutlineRoundedIcon fontSize="inherit" />;
     return <span className="chat-transcript-running-indicator" />;
+  };
+
+  const renderTranscriptActionDetail = (
+    parentId: string,
+    entry: ChatTranscriptActionDetail,
+    entryIdx: number,
+  ) => {
+    const audit = transcriptCommandAuditFromCard(entry.card);
+    return (
+      <Box
+        key={`${parentId}:detail:${entry.id}:${entryIdx}`}
+        className={`chat-transcript-action-detail-shell${audit ? " has-audit" : ""}`}
+      >
+        <button
+          type="button"
+          className={`chat-transcript-action-detail-row status-${entry.status}`}
+          onClick={() => handleActivateStep(entry.card.id)}
+          aria-label={`${entry.label}${entry.detail ? `: ${entry.detail}` : ""}`}
+        >
+          <span
+            className="chat-transcript-action-detail-dot"
+            aria-hidden="true"
+          />
+          <span className="chat-transcript-action-detail-copy">
+            <span className="chat-transcript-action-detail-label">
+              {entry.label}
+            </span>
+            {entry.detail ? (
+              <span className="chat-transcript-action-detail-text">
+                {entry.detail}
+              </span>
+            ) : null}
+          </span>
+        </button>
+        {audit ? (
+          <Box
+            className="chat-transcript-command-audit"
+            aria-label={`${entry.label} command and output`}
+          >
+            {audit.command ? (
+              <Box className="chat-transcript-command-block">
+                <span className="chat-transcript-command-label">
+                  {audit.commandLabel}
+                </span>
+                <Box component="pre" className="chat-transcript-command-pre">
+                  {audit.command}
+                </Box>
+              </Box>
+            ) : null}
+            {audit.output ? (
+              <Box className="chat-transcript-command-block">
+                <span className="chat-transcript-command-label">
+                  {audit.outputLabel}
+                </span>
+                <Box component="pre" className="chat-transcript-command-pre">
+                  {audit.output}
+                </Box>
+              </Box>
+            ) : null}
+          </Box>
+        ) : null}
+      </Box>
+    );
   };
 
   const renderChatTranscriptItems = (
@@ -20087,30 +21625,9 @@ function ChatPageInner({
                 </button>
                 <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
                   <Box className="chat-transcript-action-details chat-transcript-reasoning-details">
-                    {item.details.map((entry, entryIdx) => (
-                      <button
-                        key={`${item.id}:detail:${entry.id}:${entryIdx}`}
-                        type="button"
-                        className={`chat-transcript-action-detail-row status-${entry.status}`}
-                        onClick={() => handleActivateStep(entry.card.id)}
-                        aria-label={`${entry.label}${entry.detail ? `: ${entry.detail}` : ""}`}
-                      >
-                        <span
-                          className="chat-transcript-action-detail-dot"
-                          aria-hidden="true"
-                        />
-                        <span className="chat-transcript-action-detail-copy">
-                          <span className="chat-transcript-action-detail-label">
-                            {entry.label}
-                          </span>
-                          {entry.detail ? (
-                            <span className="chat-transcript-action-detail-text">
-                              {entry.detail}
-                            </span>
-                          ) : null}
-                        </span>
-                      </button>
-                    ))}
+                    {item.details.map((entry, entryIdx) =>
+                      renderTranscriptActionDetail(item.id, entry, entryIdx),
+                    )}
                   </Box>
                 </Collapse>
               </Box>
@@ -20168,30 +21685,9 @@ function ChatPageInner({
               </button>
               <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
                 <Box className="chat-transcript-action-details">
-                  {item.details.map((entry, entryIdx) => (
-                    <button
-                      key={`${item.id}:detail:${entry.id}:${entryIdx}`}
-                      type="button"
-                      className={`chat-transcript-action-detail-row status-${entry.status}`}
-                      onClick={() => handleActivateStep(entry.card.id)}
-                      aria-label={`${entry.label}${entry.detail ? `: ${entry.detail}` : ""}`}
-                    >
-                      <span
-                        className="chat-transcript-action-detail-dot"
-                        aria-hidden="true"
-                      />
-                      <span className="chat-transcript-action-detail-copy">
-                        <span className="chat-transcript-action-detail-label">
-                          {entry.label}
-                        </span>
-                        {entry.detail ? (
-                          <span className="chat-transcript-action-detail-text">
-                            {entry.detail}
-                          </span>
-                        ) : null}
-                      </span>
-                    </button>
-                  ))}
+                  {item.details.map((entry, entryIdx) =>
+                    renderTranscriptActionDetail(item.id, entry, entryIdx),
+                  )}
                 </Box>
               </Collapse>
             </Box>
@@ -20203,7 +21699,7 @@ function ChatPageInner({
   const renderComposerInput = (placeholder: string) => (
     <ChatComposerInput
       attachedFilesCount={attachedFiles.length}
-      composerLocked={composerLockedForPlanConfirmation}
+      composerLocked={composerLockedForPlanConfirmation || credentialUiActive}
       deepResearchDisabled={deepResearchDisabled}
       deepResearchEnabled={deepResearchEnabled}
       isStoppingStream={isStoppingStream}
@@ -20405,7 +21901,7 @@ function ChatPageInner({
                       className="chat-empty-logo"
                     />
                     <Typography variant="h4" className="chat-empty-title">
-                      {conversationId ? "Draft chat" : "AgentArk"}
+                      {conversationId ? "Conversation" : "AgentArk"}
                     </Typography>
                   </Box>
                   <Box className="chat-empty-composer-wrap">
@@ -20623,20 +22119,9 @@ function ChatPageInner({
                       previousUserPrompt,
                       traceId,
                       hasTrace,
-                      messageInputTokens,
-                      messageOutputTokens,
-                      messageTotalTokens,
-                      messageDurationMs,
                       markdownNode,
+                      runMetricItems,
                     } = bundle;
-                    const runMetricItems = isAssistant
-                      ? buildChatRunMetricItems({
-                          inputTokens: messageInputTokens,
-                          outputTokens: messageOutputTokens,
-                          totalTokens: messageTotalTokens,
-                          durationMs: messageDurationMs,
-                        })
-                      : [];
                     const messageTranscriptItems = isAssistant
                       ? perMessageTraceTranscriptById[messageId] || []
                       : [];
@@ -20786,28 +22271,14 @@ function ChatPageInner({
                                           traceId,
                                         })
                                       : markdownNode}
+                                    {renderRunMetricPills(
+                                      runMetricItems,
+                                      `response-metrics:${messageId}`,
+                                      "Response token usage",
+                                      "chat-run-metrics-response",
+                                    )}
                                   </>
                                 )}
-                                {runMetricItems.length > 0 ? (
-                                  <Box
-                                    className="chat-run-metrics"
-                                    aria-label="Run metrics"
-                                  >
-                                    {runMetricItems.map((item) => (
-                                      <span
-                                        className="chat-run-metric"
-                                        key={`${messageId}:${item.label}`}
-                                      >
-                                        <span className="chat-run-metric-label">
-                                          {item.label}
-                                        </span>
-                                        <span className="chat-run-metric-value">
-                                          {item.value}
-                                        </span>
-                                      </span>
-                                    ))}
-                                  </Box>
-                                ) : null}
                                 {!isUser
                                   ? renderClarificationChoiceGroup(
                                       messageId,
@@ -20849,6 +22320,18 @@ function ChatPageInner({
                         )}
                       </Box>
                       {renderUserAvatar("chat-avatar-pending")}
+                    </Box>
+                  ) : null}
+
+                  {selectedConversationAwaitingPersistedMessages &&
+                  messages.length === 0 ? (
+                    <Box className="chat-row chat-thinking-inline">
+                      {renderAgentAvatar("chat-avatar-working")}
+                      <span className="chat-thinking-text">
+                        {activeConversationActivityLoading
+                          ? "Loading conversation..."
+                          : "Waiting for the first saved message..."}
+                      </span>
                     </Box>
                   ) : null}
 
@@ -20943,7 +22426,8 @@ function ChatPageInner({
                             liveChatTranscriptItems,
                             "interrupted-transcript",
                           )}
-                          <Box>
+                          {TASK_RETRY_CONTROLS_ENABLED ? (
+                            <Box>
                               <Button
                                 size="small"
                                 variant="outlined"
@@ -20976,6 +22460,7 @@ function ChatPageInner({
                                 {interruptedTaskId ? "Resume" : "Retry"}
                               </Button>
                             </Box>
+                          ) : null}
                         </Stack>
                       </Box>
                     </Box>
@@ -20996,7 +22481,9 @@ function ChatPageInner({
                     </Box>
                   ) : (
                     <>
-                      {(isPlanningDeepResearch || isRunningPlanConfirmation) &&
+                      {(isPlanningDeepResearch ||
+                        isAwaitingPlanConfirmation ||
+                        isRunningPlanConfirmation) &&
                       !hasVisibleStreamingReply ? (
                         <Box className="chat-row chat-row-plan-confirmation">
                           {renderAgentAvatar("chat-avatar-working")}
@@ -21416,6 +22903,7 @@ function ChatPageInner({
                       variant="contained"
                       disabled={
                         submitChatCredentialPromptMutation.isPending ||
+                        dismissChatCredentialPromptMutation.isPending ||
                         isStreaming
                       }
                       onClick={() => {
@@ -21428,6 +22916,21 @@ function ChatPageInner({
                             chatCredentialPrompt.submit_label,
                             "Save securely",
                           )}
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={
+                        submitChatCredentialPromptMutation.isPending ||
+                        dismissChatCredentialPromptMutation.isPending
+                      }
+                      onClick={() => {
+                        dismissChatCredentialPromptMutation.mutate();
+                      }}
+                    >
+                      {dismissChatCredentialPromptMutation.isPending
+                        ? "Dismissing..."
+                        : "Fill in Settings later"}
                     </Button>
                     {str(chatCredentialPrompt.fallback_command, "").trim() ? (
                       <Typography
@@ -21747,6 +23250,105 @@ function ChatPageInner({
           ? renderComputerPaneContent(true)
           : renderActivityPanelContent(true)}
       </Drawer>
+      <Dialog
+        open={!!activityDetailRow}
+        onClose={() => setActivityDetailRow(null)}
+        maxWidth="md"
+        fullWidth
+        slotProps={{
+          paper: { className: "activity-detail-dialog" },
+        }}
+      >
+        <DialogTitle className="activity-detail-title">
+          <Stack
+            direction="row"
+            spacing={1}
+            sx={{
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+            }}
+          >
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="subtitle1" className="activity-detail-heading">
+                {activityDetailRow?.label || "Activity details"}
+              </Typography>
+              <Typography variant="caption" className="activity-detail-meta">
+                {[
+                  activityDetailRow?.kind
+                    ? activityKindDisplayLabel(activityDetailRow.kind)
+                    : "",
+                  activityDetailRow?.stepType
+                    ? activityDetailRow.stepType.replace(/[_-]+/g, " ")
+                    : "",
+                  activityDetailRow?.time
+                    ? formatTraceStepTime(activityDetailRow.time)
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join(" | ")}
+              </Typography>
+            </Box>
+            <IconButton size="small" onClick={() => setActivityDetailRow(null)}>
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers className="activity-detail-content">
+          {activityDetailRow ? (
+            <Stack spacing={1.25}>
+              {activityDetailRow.summary ? (
+                <Box className="activity-detail-section">
+                  <Typography variant="caption" className="activity-detail-label">
+                    Summary
+                  </Typography>
+                  <Typography variant="body2" className="activity-detail-copy">
+                    {activityDetailRow.summary}
+                  </Typography>
+                </Box>
+              ) : null}
+              {activityDetailRow.rawTitle &&
+              activityDetailRow.rawTitle !== activityDetailRow.label ? (
+                <Box className="activity-detail-section">
+                  <Typography variant="caption" className="activity-detail-label">
+                    Source title
+                  </Typography>
+                  <Typography variant="body2" className="activity-detail-copy">
+                    {activityDetailRow.rawTitle}
+                  </Typography>
+                </Box>
+              ) : null}
+              {activityDetailRow.rawDetailFull ? (
+                <Box className="activity-detail-section">
+                  <Typography variant="caption" className="activity-detail-label">
+                    Detail
+                  </Typography>
+                  {activityDetailReadableDetail ? (
+                    <Typography variant="body2" className="activity-detail-copy">
+                      {activityDetailReadableDetail}
+                    </Typography>
+                  ) : (
+                    <Box component="pre" className="activity-detail-pre">
+                      {activityDetailRow.rawDetailFull}
+                    </Box>
+                  )}
+                </Box>
+              ) : null}
+              {activityDetailRow.payloadView ? (
+                <ActivityPayloadDisclosure
+                  payload={activityDetailRow.payloadView}
+                  expanded={expandedActivityPayloads.has(
+                    activityDetailPayloadKey,
+                  )}
+                  onToggle={() =>
+                    toggleExpandedActivityPayload(activityDetailPayloadKey)
+                  }
+                  controlsId={activityDetailPayloadKey || "activity-detail"}
+                />
+              ) : null}
+            </Stack>
+          ) : null}
+        </DialogContent>
+      </Dialog>
       {/* Code Viewer Dialog */}
       <Dialog
         open={codeViewerOpen && isShowingSnippetPreview}
@@ -21916,14 +23518,14 @@ function ChatPageInner({
               </Typography>
             </Box>
             <Stack direction="row" spacing={0.5}>
-              <Tooltip title="Download report">
+              <Tooltip title="Export as PDF">
                 <span>
                   <IconButton
                     size="small"
                     onClick={() => {
                       if (!researchReportDialog) return;
-                      void exportAssistantMarkdown({
-                        content: researchReportDialog.report.content,
+                      exportResearchReportPdf({
+                        report: researchReportDialog.report,
                         headingHint: researchReportDialog.report.title,
                         previousUserPrompt:
                           researchReportDialog.previousUserPrompt,
@@ -21932,7 +23534,27 @@ function ChatPageInner({
                       });
                     }}
                   >
-                    <FileDownloadRoundedIcon fontSize="small" />
+                    <PictureAsPdfRoundedIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Tooltip title="Download HTML report">
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={() => {
+                      if (!researchReportDialog) return;
+                      downloadResearchReportHtml({
+                        report: researchReportDialog.report,
+                        headingHint: researchReportDialog.report.title,
+                        previousUserPrompt:
+                          researchReportDialog.previousUserPrompt,
+                        timestamp: researchReportDialog.timestamp,
+                        traceId: researchReportDialog.traceId,
+                      });
+                    }}
+                  >
+                    <ArticleRoundedIcon fontSize="small" />
                   </IconButton>
                 </span>
               </Tooltip>
@@ -21947,45 +23569,37 @@ function ChatPageInner({
         </DialogTitle>
         <DialogContent dividers className="chat-research-report-dialog-content">
           {researchReportDialog ? (
-            <Stack spacing={1.5}>
-              <Box className="chat-research-report-paper">
-                {renderChatMarkdown(
-                  researchReportDialog.report.mainContent ||
-                    researchReportDialog.report.content,
-                  {
-                    snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-main`,
-                    onOpenSnippet: openCodePreviewInWorkspace,
-                  },
-                )}
-              </Box>
+            <Box className="chat-research-report-paper">
+              {renderChatMarkdown(
+                researchReportDialog.report.mainContent ||
+                  researchReportDialog.report.content,
+                {
+                  snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-main`,
+                  onOpenSnippet: openCodePreviewInWorkspace,
+                },
+              )}
               {researchReportDialog.report.evidenceBrief ? (
-                <Accordion className="chat-research-report-evidence">
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                    <Box>
-                      <Typography
-                        variant="subtitle2"
-                        className="chat-research-report-evidence-title"
-                      >
-                        Evidence brief and source checks
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        className="chat-research-report-evidence-meta"
-                      >
-                        Raw evidence used for the synthesis, including source
-                        reliability charts when available.
-                      </Typography>
-                    </Box>
-                  </AccordionSummary>
-                  <AccordionDetails>
-                    {renderChatMarkdown(researchReportDialog.report.evidenceBrief, {
-                      snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-evidence`,
-                      onOpenSnippet: openCodePreviewInWorkspace,
-                    })}
-                  </AccordionDetails>
-                </Accordion>
+                <Box className="chat-research-report-evidence-inline">
+                  <Typography
+                    variant="subtitle2"
+                    className="chat-research-report-evidence-title"
+                  >
+                    Evidence brief and source checks
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    className="chat-research-report-evidence-meta"
+                  >
+                    Raw evidence used for the synthesis, including source
+                    reliability charts when available.
+                  </Typography>
+                  {renderChatMarkdown(researchReportDialog.report.evidenceBrief, {
+                    snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-evidence`,
+                    onOpenSnippet: openCodePreviewInWorkspace,
+                  })}
+                </Box>
               ) : null}
-            </Stack>
+            </Box>
           ) : null}
         </DialogContent>
         <DialogActions className="chat-research-report-dialog-actions">
@@ -21993,8 +23607,8 @@ function ChatPageInner({
             variant="outlined"
             onClick={() => {
               if (!researchReportDialog) return;
-              void exportAssistantMarkdown({
-                content: researchReportDialog.report.content,
+              exportResearchReportPdf({
+                report: researchReportDialog.report,
                 headingHint: researchReportDialog.report.title,
                 previousUserPrompt: researchReportDialog.previousUserPrompt,
                 timestamp: researchReportDialog.timestamp,
@@ -22002,7 +23616,22 @@ function ChatPageInner({
               });
             }}
           >
-            Download
+            Export PDF
+          </Button>
+          <Button
+            variant="outlined"
+            onClick={() => {
+              if (!researchReportDialog) return;
+              downloadResearchReportHtml({
+                report: researchReportDialog.report,
+                headingHint: researchReportDialog.report.title,
+                previousUserPrompt: researchReportDialog.previousUserPrompt,
+                timestamp: researchReportDialog.timestamp,
+                traceId: researchReportDialog.traceId,
+              });
+            }}
+          >
+            Download HTML
           </Button>
           <Button
             variant="contained"
@@ -22570,7 +24199,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
     if (!traceKind.startsWith("self_evolve.")) return;
 
     const status = str(step.type, str(step.step_type, "info")).trim() || "info";
-    const title = str(step.title, "ArkEvolve").trim();
+    const title = str(step.title, "Evolve").trim();
     const detail = str(step.detail, "").trim();
     const chips: string[] = [];
     const evidence: string[] = [];
@@ -22581,7 +24210,6 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       const request = str(data.request, "").trim();
       chips.push(`Mode ${mode}`);
       if (toBool(data.apply_promotion)) chips.push("Promotion enabled");
-      if (toBool(data.allow_code_writes)) chips.push("Code writes allowed");
       const canaryRollout = num(data.canary_rollout_percent, -1);
       if (canaryRollout > 0) chips.push(`Canary ${canaryRollout}%`);
       rationale = request;
@@ -22816,26 +24444,6 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       const successGain = num(replay.success_gain, Number.NaN);
       if (Number.isFinite(successGain))
         evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
-    } else if (traceKind === "self_evolve.code.blocked") {
-      chips.push("Code evolution");
-      chips.push("Blocked");
-      rationale = str(data.request, "").trim();
-    } else if (traceKind === "self_evolve.code.result") {
-      const filesChanged = stringList(data.files_changed);
-      const securityWarnings = stringList(data.security_warnings);
-      const iterations = num(data.iterations_used, 0);
-      chips.push(
-        `${filesChanged.length} file${filesChanged.length === 1 ? "" : "s"}`,
-      );
-      chips.push(`${iterations} iteration${iterations === 1 ? "" : "s"}`);
-      if (toBool(data.push_recommended)) chips.push("Push suggested");
-      rationale = str(data.diff_summary, "").trim();
-      if (filesChanged.length)
-        evidence.push(`Files changed: ${filesChanged.join(", ")}`);
-      if (securityWarnings.length)
-        evidence.push(`Security warnings: ${securityWarnings.join(" | ")}`);
-      const error = str(data.error, "").trim();
-      if (error) evidence.push(`Error: ${error}`);
     } else if (
       traceKind === "self_evolve.manual_action.result" ||
       traceKind === "self_evolve.manual_action.request"
@@ -23089,7 +24697,7 @@ function buildEvolutionEvidenceCards(
 
       let detail = `Captured ${runCount} related run${runCount === 1 ? "" : "s"} for comparison.`;
       let rationale =
-        "ArkEvolve is still collecting enough examples to decide whether a product change is warranted.";
+        "Evolve is still collecting enough examples to decide whether a product change is warranted.";
 
       if (isPreferencePattern) {
         detail = `Captured an explicit user correction that should steer similar requests from the start.`;
@@ -23106,14 +24714,14 @@ function buildEvolutionEvidenceCards(
       } else if (completedCount > 0 && failedCount > 0) {
         detail = `Observed ${runCount} related runs with mixed outcomes. The latest path completed, but earlier attempts show the routing still needs refinement.`;
         rationale =
-          "ArkEvolve can use the failures to narrow when the alternate path should be avoided.";
+          "Evolve can use the failures to narrow when the alternate path should be avoided.";
       } else if (failedCount > 0) {
         detail = `Observed ${runCount} failed run${runCount === 1 ? "" : "s"}${dominantBlocker ? `, mostly blocked by ${dominantBlocker}` : ""}.`;
         rationale =
           "This is evidence for a guardrail or tighter trigger before retrying the same path.";
       } else if (completedCount === 1) {
         detail =
-          "Observed one completed run. ArkEvolve usually waits for repetition before treating it as a stable lesson.";
+          "Observed one completed run. Evolve usually waits for repetition before treating it as a stable lesson.";
         rationale =
           "A single success is useful context, but not enough to claim that behavior improved.";
       }
@@ -23408,7 +25016,7 @@ function EvolutionReviewEvidenceStrip({
                   <Typography
                     key={`${section.label}-${idx}`}
                     variant="caption"
-                    sx={{ color: "#d8edff", display: "block" }}
+                    sx={{ color: "#fff8ed", display: "block" }}
                   >
                     - {line}
                   </Typography>
@@ -23713,7 +25321,7 @@ function learningCandidateReviewEvidence(
     proposed: cleanEvidenceLines([str(row.preview, ""), str(row.title, "")]),
     impact: cleanEvidenceLines([
       `Confidence ${confidence}.`,
-      "ArkEvolve will measure impact after approval if this change goes live.",
+      "Evolve will measure impact after approval if this change goes live.",
     ]),
   };
 }

@@ -502,10 +502,7 @@ fn extract_skill_name_from_frontmatter(content: &str) -> Option<String> {
     None
 }
 
-fn yaml_string_field<'a>(
-    mapping: &'a serde_yaml::Mapping,
-    key: &str,
-) -> Option<&'a str> {
+fn yaml_string_field<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
     mapping
         .get(serde_yaml::Value::String(key.to_string()))
         .and_then(|value| value.as_str())
@@ -594,17 +591,15 @@ fn extract_relative_skill_references(content: &str) -> Vec<String> {
             continue;
         }
         let last_segment = normalized.rsplit('/').next().unwrap_or(normalized);
-        let has_file_extension = last_segment
-            .rsplit_once('.')
-            .is_some_and(|(_, ext)| {
-                !ext.is_empty()
-                    && ext.len() <= 8
-                    && ext
-                        .chars()
-                        .next()
-                        .is_some_and(|ch| ch.is_ascii_alphabetic())
-                    && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
-            });
+        let has_file_extension = last_segment.rsplit_once('.').is_some_and(|(_, ext)| {
+            !ext.is_empty()
+                && ext.len() <= 8
+                && ext
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic())
+                && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        });
         let has_relative_prefix = normalized.starts_with("./") || normalized.starts_with("../");
         let has_structural_path_shape = normalized.contains('/')
             && (has_relative_prefix
@@ -1525,9 +1520,53 @@ fn inject_model_into_frontmatter(content: &str, model: &str) -> String {
     format!("---\n{}\n---\n\n{}", rendered, content)
 }
 
-const SKILL_IMPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
-const GITHUB_SKILL_ARCHIVE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const SKILL_IMPORT_DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SKILL_IMPORT_DEFAULT_FETCH_TIMEOUT_SECS: u64 = 120;
+const GITHUB_SKILL_ARCHIVE_DEFAULT_MAX_BYTES: usize = 32 * 1024 * 1024;
 const GITHUB_SKILL_ARCHIVE_MAX_ENTRIES: usize = 20_000;
+
+fn skill_import_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn skill_import_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn skill_import_max_bytes() -> usize {
+    skill_import_env_usize(
+        "AGENTARK_SKILL_IMPORT_MAX_BYTES",
+        SKILL_IMPORT_DEFAULT_MAX_BYTES,
+        64 * 1024,
+        64 * 1024 * 1024,
+    )
+}
+
+fn github_skill_archive_max_bytes() -> usize {
+    skill_import_env_usize(
+        "AGENTARK_GITHUB_SKILL_ARCHIVE_MAX_BYTES",
+        GITHUB_SKILL_ARCHIVE_DEFAULT_MAX_BYTES,
+        1024 * 1024,
+        128 * 1024 * 1024,
+    )
+}
+
+fn skill_import_fetch_timeout_secs() -> u64 {
+    skill_import_env_u64(
+        "AGENTARK_SKILL_IMPORT_FETCH_TIMEOUT_SECS",
+        SKILL_IMPORT_DEFAULT_FETCH_TIMEOUT_SECS,
+        5,
+        600,
+    )
+}
 
 fn skill_import_fetch_user_agent() -> String {
     format!(
@@ -1558,7 +1597,9 @@ fn skill_import_fetch_headers() -> Result<reqwest::header::HeaderMap, String> {
 
 fn skill_import_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(
+            skill_import_fetch_timeout_secs(),
+        ))
         .redirect(reqwest::redirect::Policy::none())
         .default_headers(skill_import_fetch_headers()?)
         .build()
@@ -1585,8 +1626,13 @@ async fn fetch_text_with_redirects(
             .map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-            if bytes.len() > SKILL_IMPORT_MAX_BYTES {
-                return Err("Import content too large".to_string());
+            let max_bytes = skill_import_max_bytes();
+            if bytes.len() > max_bytes {
+                return Err(format!(
+                    "Import content too large ({} bytes, max {})",
+                    bytes.len(),
+                    max_bytes
+                ));
             }
             return Ok(String::from_utf8_lossy(&bytes).to_string());
         }
@@ -1866,7 +1912,8 @@ async fn collect_github_skill_urls_from_archive(
                 continue;
             }
         };
-        match fetch_bytes_with_redirects(client, validated, 3, GITHUB_SKILL_ARCHIVE_MAX_BYTES).await
+        match fetch_bytes_with_redirects(client, validated, 3, github_skill_archive_max_bytes())
+            .await
         {
             Ok(bytes) => {
                 archive_bytes = Some(bytes);

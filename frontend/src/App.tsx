@@ -56,7 +56,7 @@ import {
 import { Orbit as OrbitIcon } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import useMediaQuery from "@mui/material/useMediaQuery";
-import { api } from "./api/client";
+import { api, ApiRequestError } from "./api/client";
 import {
   formatUiRelativeDateTimeMeta,
   setUiTimeZoneOverride,
@@ -76,12 +76,13 @@ import {
 import { OverviewPane } from "./components/OverviewPane";
 import { LibraryPane } from "./components/LibraryPane";
 import { useUiStore } from "./store/uiStore";
-import type { Task } from "./types";
+import type { ApprovalLogEntry, Task } from "./types";
 import { PRODUCT_CATEGORY, PRODUCT_NAME } from "./brand";
 
 const REFRESH_MS = 8000;
 const PING_STALE_MS = 30_000;
 const APPROVAL_FALLBACK_POLL_MS = 2500;
+const AUTO_REFRESH_IDLE_PAUSE_MS = 5 * 60 * 1000;
 const NAV_HIDDEN_STORAGE_KEY = "agentark.ui.navHidden";
 
 function memoizeModuleLoader<T>(
@@ -97,6 +98,65 @@ function memoizeModuleLoader<T>(
     }
     return pending;
   };
+}
+
+function useAutoRefreshWhileActive(enabled: boolean): boolean {
+  const [idle, setIdle] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !enabled) {
+      setIdle(false);
+      return undefined;
+    }
+
+    let idleTimer: number | null = null;
+    const clearIdleTimer = () => {
+      if (idleTimer !== null) {
+        window.clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    const scheduleIdle = () => {
+      clearIdleTimer();
+      idleTimer = window.setTimeout(() => {
+        setIdle(true);
+      }, AUTO_REFRESH_IDLE_PAUSE_MS);
+    };
+    const markActive = () => {
+      setIdle(false);
+      scheduleIdle();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        clearIdleTimer();
+        setIdle(true);
+        return;
+      }
+      markActive();
+    };
+    const events: Array<keyof WindowEventMap> = [
+      "pointerdown",
+      "keydown",
+      "wheel",
+      "touchstart",
+    ];
+
+    markActive();
+    for (const eventName of events) {
+      window.addEventListener(eventName, markActive, { passive: true });
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      clearIdleTimer();
+      for (const eventName of events) {
+        window.removeEventListener(eventName, markActive);
+      }
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [enabled]);
+
+  return enabled && !idle;
 }
 
 const loadApprovalPromptOverlayModule = memoizeModuleLoader(() =>
@@ -411,31 +471,31 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       {
         key: "sentinel",
-        label: "ArkSentinel",
+        label: "Sentinel",
         icon: <NotificationsActiveRoundedIcon fontSize="small" />,
         tooltip: "Review automation checks and suggestions.",
       },
       {
         key: "evolution",
-        label: "ArkEvolve",
+        label: "Evolve",
         icon: <AutoGraphRoundedIcon fontSize="small" />,
         tooltip: "Inspect experiments that improve AgentArk.",
       },
       {
         key: "arkmemory",
-        label: "ArkMemory",
+        label: "Memory",
         icon: <MemoryRoundedIcon fontSize="small" />,
         tooltip: "Review stored knowledge and preferences.",
       },
       {
         key: "arkreflect",
-        label: "ArkReflect",
+        label: "Reflect",
         icon: <BubbleChartRoundedIcon fontSize="small" />,
         tooltip: "Explore patterns and self-review insights.",
       },
       {
         key: "arkpulse",
-        label: "ArkPulse",
+        label: "Pulse",
         icon: <MonitorHeartRoundedIcon fontSize="small" />,
         tooltip: "Monitor system health and cleanup findings.",
       },
@@ -452,10 +512,10 @@ const NAV_GROUPS: NavGroup[] = [
         tooltip: "See scheduled, running, and completed tasks.",
       },
       {
-        key: "sessions",
-        label: "Browser Sessions",
+        key: "browser",
+        label: "Browser",
         icon: <HistoryRoundedIcon fontSize="small" />,
-        tooltip: "Manage live browser handoff sessions.",
+        tooltip: "Manage browser profiles and live handoff sessions.",
       },
       {
         key: "status",
@@ -648,6 +708,14 @@ function pickTasks(value: unknown): Task[] {
   return Array.isArray(record.tasks) ? (record.tasks as Task[]) : [];
 }
 
+function pickApprovalLogEntries(value: unknown): ApprovalLogEntry[] {
+  if (Array.isArray(value)) return value as ApprovalLogEntry[];
+  const record = asRecord(value);
+  return Array.isArray(record.approvals)
+    ? (record.approvals as ApprovalLogEntry[])
+    : [];
+}
+
 function notifTimeAgo(raw?: string | null): { label: string; tip: string } {
   if (!raw) return { label: "", tip: "" };
   return formatUiRelativeDateTimeMeta(raw, { fallback: raw });
@@ -708,12 +776,14 @@ function normalizeTaskStatus(status: unknown): string {
     .toLowerCase()
     .replace(/[^a-z]/g, "");
   if (compact.includes("awaitingapproval")) return "awaiting_approval";
+  if (compact.includes("expiredneedsreapproval")) return "expired";
   return compact;
 }
 
 function hasRenderableApprovalTask(task: Task): boolean {
   const approvalTask = task as Task & { arguments?: Record<string, unknown> };
-  if (normalizeTaskStatus(approvalTask.status) !== "awaiting_approval")
+  const status = normalizeTaskStatus(approvalTask.status);
+  if (status !== "awaiting_approval" && status !== "expired")
     return false;
   const description = String(approvalTask.description || "").trim();
   if (description && description !== UNAVAILABLE_APPROVAL_DESCRIPTION)
@@ -726,6 +796,26 @@ function hasRenderableApprovalTask(task: Task): boolean {
     Boolean(String(approval.risk_level || "").trim()) ||
     Boolean(String(approval.risk_score || "").trim()) ||
     Boolean(String(approval.source || "").trim())
+  );
+}
+
+function parseJsonRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string") return asRecord(value);
+  try {
+    return asRecord(JSON.parse(value));
+  } catch {
+    return {};
+  }
+}
+
+function hasRenderableApprovalLogEntry(entry: ApprovalLogEntry): boolean {
+  const status = String(entry.status || "").trim().toLowerCase();
+  if (status !== "pending" && status !== "expired") return false;
+  const payload = parseJsonRecord(entry.arguments);
+  if (Array.isArray(payload.calls) && payload.calls.length > 0) return true;
+  return Boolean(
+    String(entry.action_name || "").trim() ||
+      String(entry.rule_name || "").trim(),
   );
 }
 
@@ -783,6 +873,69 @@ type NotificationActionTarget = {
   view: ViewKey;
   label: string;
   settingsTab?: number | null;
+  search?: string;
+};
+
+type ApprovalDecisionTarget = {
+  kind: "task" | "direct_chat";
+  id: string;
+};
+
+function approvalDecisionTargetKey(target: ApprovalDecisionTarget): string {
+  return `${target.kind}:${target.id}`;
+}
+
+type TraceSectionTarget = "history" | "agentark" | "sync" | "exports" | "security";
+
+const TRACE_SECTION_LABELS: Record<TraceSectionTarget, string> = {
+  history: "Runs",
+  agentark: "Runtime",
+  sync: "Sync",
+  exports: "Exports",
+  security: "Security",
+};
+
+const TRACE_SECTION_TARGETS = new Set<TraceSectionTarget>([
+  "history",
+  "agentark",
+  "sync",
+  "exports",
+  "security",
+]);
+
+function traceSectionFromStructuredValue(value: unknown): TraceSectionTarget | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (!normalized) return null;
+  const compact = normalized.replace(/-/g, "");
+  if (TRACE_SECTION_TARGETS.has(normalized as TraceSectionTarget)) {
+    return normalized as TraceSectionTarget;
+  }
+  if (TRACE_SECTION_TARGETS.has(compact as TraceSectionTarget)) {
+    return compact as TraceSectionTarget;
+  }
+  return null;
+}
+
+function traceSearchForSection(section: TraceSectionTarget): string {
+  return section === "history"
+    ? ""
+    : `?section=${encodeURIComponent(section)}`;
+}
+
+function traceNotificationTarget(section: TraceSectionTarget): NotificationActionTarget {
+  const label = TRACE_SECTION_LABELS[section];
+  return {
+    view: "trace",
+    label: section === "history" ? "Open Trace" : `Open Trace ${label}`,
+    search: traceSearchForSection(section),
+  };
+}
+
+const NOTIFICATION_SOURCE_TARGETS: Record<string, NotificationActionTarget> = {
+  // `source` is a typed notification source emitted by the integration sync
+  // subsystem, not user-facing wording. Route it to the matching Trace tab.
+  integration_sync: traceNotificationTarget("sync"),
 };
 
 function viewFromStructuredValue(value: unknown): ViewKey | null {
@@ -839,8 +992,28 @@ function notificationActionTarget(notification: {
   ];
   for (const candidate of candidates) {
     const view = viewFromStructuredValue(candidate);
-    if (view) return { view, label: `Open ${viewLabel(view)}` };
+    if (!view) continue;
+    if (view === "trace") {
+      const sectionCandidates = [
+        metadata.target_section,
+        metadata.targetSection,
+        metadata.section,
+        action.target_section,
+        action.targetSection,
+        action.section,
+      ];
+      for (const sectionCandidate of sectionCandidates) {
+        const section = traceSectionFromStructuredValue(sectionCandidate);
+        if (section) return traceNotificationTarget(section);
+      }
+    }
+    return { view, label: `Open ${viewLabel(view)}` };
   }
+  const sourceTarget =
+    NOTIFICATION_SOURCE_TARGETS[
+      (notification.source || "").trim().toLowerCase()
+    ];
+  if (sourceTarget) return sourceTarget;
   return { view: "overview", label: "Open Mission Control" };
 }
 
@@ -905,6 +1078,7 @@ export default function App() {
     refetchInterval: false,
   });
   const autoRefresh = useUiStore((s) => s.autoRefresh);
+  const activeAutoRefresh = useAutoRefreshWhileActive(autoRefresh);
   const selectedNotificationId = useUiStore((s) => s.selectedNotificationId);
   const openNotification = useUiStore((s) => s.openNotification);
   const closeNotification = useUiStore((s) => s.closeNotification);
@@ -953,12 +1127,15 @@ export default function App() {
   >("all");
   const [notificationsStreamConnected, setNotificationsStreamConnected] =
     useState(false);
-  const [approvalBusyTaskId, setApprovalBusyTaskId] = useState<string | null>(
+  const [approvalBusyTargetKey, setApprovalBusyTargetKey] = useState<string | null>(
     null,
   );
   const [approvalPopupError, setApprovalPopupError] = useState<string | null>(
     null,
   );
+  const [dismissedApprovalTargetKeys, setDismissedApprovalTargetKeys] = useState<
+    string[]
+  >([]);
   const desktopNavCollapsed = !isMobileShell && navHidden;
   const preloadAppView = useCallback(
     (
@@ -1005,6 +1182,7 @@ export default function App() {
         setMobileNavOpen(false);
       }
       setViewState(nextView);
+      window.dispatchEvent(new Event("agentark:navigation"));
     },
     [isMobileShell, preloadAppView],
   );
@@ -1106,7 +1284,7 @@ export default function App() {
         status,
       };
     },
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    refetchInterval: activeAutoRefresh ? REFRESH_MS : false,
     retry: 0,
   });
   const approvalTasksQ = useQuery({
@@ -1114,21 +1292,35 @@ export default function App() {
     queryFn: () => api.rawGet("/tasks?limit=200"),
     refetchInterval: notificationsStreamConnected
       ? false
-      : APPROVAL_FALLBACK_POLL_MS,
-    refetchIntervalInBackground: !notificationsStreamConnected,
+      : activeAutoRefresh
+        ? APPROVAL_FALLBACK_POLL_MS
+        : false,
+    refetchIntervalInBackground:
+      !notificationsStreamConnected && activeAutoRefresh,
+  });
+  const approvalLogQ = useQuery({
+    queryKey: ["approval-popup-log"],
+    queryFn: () => api.getApprovalLog(80),
+    refetchInterval: notificationsStreamConnected
+      ? false
+      : activeAutoRefresh
+        ? APPROVAL_FALLBACK_POLL_MS
+        : false,
+    refetchIntervalInBackground:
+      !notificationsStreamConnected && activeAutoRefresh,
   });
 
   const notificationsQ = useQuery({
     queryKey: ["notifications"],
     queryFn: api.getNotifications,
     refetchInterval:
-      autoRefresh && !notificationsStreamConnected ? REFRESH_MS : false,
+      activeAutoRefresh && !notificationsStreamConnected ? REFRESH_MS : false,
   });
   const notificationsCountQ = useQuery({
     queryKey: ["notifications-count"],
     queryFn: () => api.rawGet("/notifications/count"),
     refetchInterval:
-      autoRefresh && !notificationsStreamConnected ? REFRESH_MS : false,
+      activeAutoRefresh && !notificationsStreamConnected ? REFRESH_MS : false,
   });
   const notifications = Array.isArray(notificationsQ.data)
     ? notificationsQ.data
@@ -1137,9 +1329,15 @@ export default function App() {
     () => pickTasks(approvalTasksQ.data),
     [approvalTasksQ.data],
   );
+  const approvalLogEntries = useMemo(
+    () => pickApprovalLogEntries(approvalLogQ.data),
+    [approvalLogQ.data],
+  );
   const approvalPopupVisible = useMemo(
-    () => approvalTasks.some((task) => hasRenderableApprovalTask(task)),
-    [approvalTasks],
+    () =>
+      approvalTasks.some((task) => hasRenderableApprovalTask(task)) ||
+      approvalLogEntries.some((entry) => hasRenderableApprovalLogEntry(entry)),
+    [approvalTasks, approvalLogEntries],
   );
   const visibleNotifications = useMemo(
     () =>
@@ -1200,6 +1398,9 @@ export default function App() {
       if (includeApprovalTasks) {
         void queryClient.invalidateQueries({
           queryKey: ["approval-popup-tasks"],
+        });
+        void queryClient.invalidateQueries({
+          queryKey: ["approval-popup-log"],
         });
         void queryClient.invalidateQueries({ queryKey: ["tasks"] });
         void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
@@ -1392,6 +1593,9 @@ export default function App() {
       await queryClient.invalidateQueries({
         queryKey: ["approval-popup-tasks"],
       });
+      await queryClient.invalidateQueries({
+        queryKey: ["approval-popup-log"],
+      });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
       await queryClient.invalidateQueries({ queryKey: ["briefing"] });
@@ -1404,13 +1608,111 @@ export default function App() {
         queryKey: ["autonomy-unread-notifications"],
       });
     },
+    onError: (error, payload) => {
+      const staleApproval =
+        error instanceof ApiRequestError &&
+        (error.status === 410 || error.code === "approval_stale");
+      if (staleApproval) {
+        const key = approvalDecisionTargetKey({ kind: "task", id: payload.id });
+        setDismissedApprovalTargetKeys((current) =>
+          current.includes(key) ? current : [...current, key],
+        );
+        setApprovalPopupError(null);
+      } else {
+        setApprovalPopupError(
+          error instanceof Error ? error.message : "Failed to update approval.",
+        );
+      }
+      void queryClient.invalidateQueries({
+        queryKey: ["approval-popup-tasks"],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["approval-popup-log"],
+      });
+    },
+    onSettled: () => {
+      setApprovalBusyTargetKey(null);
+    },
+  });
+  const directChatApprovalDecisionMutation = useMutation({
+    mutationFn: async (payload: {
+      id: string;
+      decision: "approve" | "reject";
+    }) =>
+      api.rawPost(
+        `/chat/tool-approvals/${encodeURIComponent(payload.id)}/decision`,
+        { decision: payload.decision },
+      ),
+    onSuccess: async () => {
+      setApprovalPopupError(null);
+      await queryClient.invalidateQueries({
+        queryKey: ["approval-popup-log"],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["notifications"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["notifications-count"],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["autonomy-unread-notifications"],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversation"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-messages"] });
+    },
     onError: (error) => {
       setApprovalPopupError(
         error instanceof Error ? error.message : "Failed to update approval.",
       );
+      void queryClient.invalidateQueries({
+        queryKey: ["approval-popup-log"],
+      });
     },
     onSettled: () => {
-      setApprovalBusyTaskId(null);
+      setApprovalBusyTargetKey(null);
+    },
+  });
+  const approvalDismissMutation = useMutation({
+    mutationFn: async (payload: {
+      target: ApprovalDecisionTarget;
+      comment?: string;
+    }) => api.dismissApproval(payload.target.id, payload.comment),
+    onMutate: async (payload) => {
+      const key = approvalDecisionTargetKey(payload.target);
+      setDismissedApprovalTargetKeys((current) =>
+        current.includes(key) ? current : [...current, key],
+      );
+      return { key };
+    },
+    onSuccess: async () => {
+      setApprovalPopupError(null);
+      await queryClient.invalidateQueries({
+        queryKey: ["approval-popup-tasks"],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["approval-popup-log"],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["notifications"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["notifications-count"],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["autonomy-unread-notifications"],
+      });
+    },
+    onError: (error, _payload, context) => {
+      if (context?.key) {
+        setDismissedApprovalTargetKeys((current) =>
+          current.filter((key) => key !== context.key),
+        );
+      }
+      setApprovalPopupError(
+        error instanceof Error ? error.message : "Failed to dismiss approval.",
+      );
+    },
+    onSettled: () => {
+      setApprovalBusyTargetKey(null);
     },
   });
 
@@ -1420,8 +1722,31 @@ export default function App() {
     comment?: string,
   ) => {
     setApprovalPopupError(null);
-    setApprovalBusyTaskId(id);
+    setApprovalBusyTargetKey(approvalDecisionTargetKey({ kind: "task", id }));
     approvalDecisionMutation.mutate({ id, decision, comment });
+  };
+
+  const handleApprovalPopupDecision = (
+    target: ApprovalDecisionTarget,
+    decision: "approve" | "reject",
+    comment?: string,
+  ) => {
+    setApprovalPopupError(null);
+    setApprovalBusyTargetKey(approvalDecisionTargetKey(target));
+    if (target.kind === "direct_chat") {
+      directChatApprovalDecisionMutation.mutate({ id: target.id, decision });
+      return;
+    }
+    approvalDecisionMutation.mutate({ id: target.id, decision, comment });
+  };
+
+  const handleApprovalPopupDismiss = (
+    target: ApprovalDecisionTarget,
+    comment?: string,
+  ) => {
+    setApprovalPopupError(null);
+    setApprovalBusyTargetKey(approvalDecisionTargetKey(target));
+    approvalDismissMutation.mutate({ target, comment });
   };
 
   const openSettingsView = useCallback(
@@ -1461,7 +1786,7 @@ export default function App() {
         openSettingsView("arkpulse");
         return;
       }
-      navigateToView(target.view);
+      navigateToView(target.view, false, target.search || "");
     },
     [closeNotification, markReadMutation, navigateToView, openSettingsView],
   );
@@ -1665,7 +1990,7 @@ export default function App() {
                 </Tooltip>
               ) : null}
               <Box className="shell-brand-mark">
-                <img src="/logo.svg" alt="AgentArk" width={36} height={36} />
+                <img src="/logo.svg" alt="AgentArk" width={28} height={28} />
               </Box>
               <Box className="shell-brand-copy">
                 <Typography variant="caption" className="shell-kicker">
@@ -1725,6 +2050,8 @@ export default function App() {
                   onMouseEnter={() => preloadAppView("settings")}
                   onFocus={() => preloadAppView("settings")}
                   onTouchStart={() => preloadAppView("settings")}
+                  aria-label="Open settings"
+                  data-tour-target="settings-trigger"
                 >
                   <SettingsRoundedIcon />
                 </IconButton>
@@ -1757,7 +2084,7 @@ export default function App() {
                   />
                 ) : activeView === "library" ? (
                   <LibraryPane
-                    autoRefresh={settingsModalOpen ? false : autoRefresh}
+                    autoRefresh={settingsModalOpen ? false : activeAutoRefresh}
                     showAdvanced={showAdvanced}
                     onNavigateToView={
                       navigateToView as (
@@ -1773,7 +2100,7 @@ export default function App() {
                         ? "chat"
                         : (workspaceView as WorkspaceView)
                     }
-                    autoRefresh={settingsModalOpen ? false : autoRefresh}
+                    autoRefresh={settingsModalOpen ? false : activeAutoRefresh}
                     showAdvanced={showAdvanced}
                     onNavigateToView={
                       navigateToView as (
@@ -1803,15 +2130,14 @@ export default function App() {
       <Suspense fallback={null}>
         <ApprovalPromptOverlay
           tasks={approvalTasks}
-          busyTaskId={approvalBusyTaskId}
+          approvalLogs={approvalLogEntries}
+          busyTargetKey={approvalBusyTargetKey}
           errorMessage={approvalPopupError}
-          onApprove={(id, comment) =>
-            handleApprovalDecision(id, "approve", comment)
-          }
-          onReject={(id, comment) =>
-            handleApprovalDecision(id, "reject", comment)
-          }
+          onDecide={handleApprovalPopupDecision}
+          onDismiss={handleApprovalPopupDismiss}
           onOpenTasks={() => navigateToView("tasks")}
+          onOpenChat={() => navigateToView("chat")}
+          hiddenTargetKeys={dismissedApprovalTargetKeys}
         />
       </Suspense>
       <Dialog

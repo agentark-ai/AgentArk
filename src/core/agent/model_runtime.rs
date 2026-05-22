@@ -386,6 +386,7 @@ impl Agent {
                 timeout_ms,
                 "supervised model candidate start"
             );
+            let request_timeout_ms = (timeout_ms > 0).then_some(timeout_ms);
             let result = if let Some(token_tx) = stream_tx.clone() {
                 crate::core::execution::execute_supervised_transport_chat_stream_with_policy(
                     &self.execution_supervisor,
@@ -398,7 +399,7 @@ impl Agent {
                     if app_delivery_stream {
                         None
                     } else {
-                        Some(timeout_ms.max(1))
+                        request_timeout_ms
                     },
                     token_tx,
                     app_delivery_stream,
@@ -415,7 +416,7 @@ impl Agent {
                     user_message,
                     memories,
                     actions,
-                    Some(timeout_ms.max(1)),
+                    request_timeout_ms,
                     &self.config.model_privacy,
                     false,
                 )

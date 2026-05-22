@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
 use crate::core::prompt_fragments::{
+    PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY, PromptFragment, PromptFragmentBundleProfile,
     default_prompt_fragment_bundle, parse_prompt_fragment_bundle_profile,
-    required_prompt_fragment_ids, sanitize_prompt_fragment_bundle, PromptFragment,
-    PromptFragmentBundleProfile, PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
+    required_prompt_fragment_ids, sanitize_prompt_fragment_bundle,
 };
 
 pub(crate) const PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH: &str =
@@ -23,6 +23,13 @@ pub(crate) const PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH: &str =
 
 const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
 const MAX_FRAGMENT_TOKEN_REGRESSION_RATIO: f64 = 0.15;
+const IMMUTABLE_SPINE_FRAGMENT_IDS: &[&str] = &[
+    "spine.identity",
+    "spine.non_evolvable_safety",
+    "spine.authorization_and_credentials",
+    "spine.primitive_schema_summary",
+    "spine.tool_result_contract",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct PromptFragmentBundleDiffSummary {
@@ -95,8 +102,10 @@ struct PromptFragmentBundleEvaluation {
     score: f64,
     required_fragments_enabled: bool,
     has_enabled_fragments: bool,
+    immutable_spine_fragments_untouched: bool,
     efficiency: PromptFragmentEfficiencyMetrics,
     disabled_required_fragment_ids: Vec<String>,
+    forbidden_immutable_spine_fragment_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +176,16 @@ pub(crate) async fn evaluate_external_prompt_fragment_candidates(
         right_eval
             .required_fragments_enabled
             .cmp(&left_eval.required_fragments_enabled)
-            .then_with(|| right_eval.has_enabled_fragments.cmp(&left_eval.has_enabled_fragments))
+            .then_with(|| {
+                right_eval
+                    .immutable_spine_fragments_untouched
+                    .cmp(&left_eval.immutable_spine_fragments_untouched)
+            })
+            .then_with(|| {
+                right_eval
+                    .has_enabled_fragments
+                    .cmp(&left_eval.has_enabled_fragments)
+            })
             .then_with(|| {
                 left_eval
                     .efficiency
@@ -204,18 +222,22 @@ pub(crate) async fn evaluate_external_prompt_fragment_candidates(
     let promoted = changed
         && best_eval.has_enabled_fragments
         && best_eval.required_fragments_enabled
+        && best_eval.immutable_spine_fragments_untouched
         && token_regression_ratio <= MAX_FRAGMENT_TOKEN_REGRESSION_RATIO;
     let promotion_gate = render_prompt_fragment_promotion_gate(
         promoted,
         changed,
         best_eval.required_fragments_enabled,
         best_eval.has_enabled_fragments,
+        &best_eval.forbidden_immutable_spine_fragment_ids,
         token_regression_ratio,
     );
     let wins = usize::from(best_eval.required_fragments_enabled)
+        + usize::from(best_eval.immutable_spine_fragments_untouched)
         + usize::from(best_eval.has_enabled_fragments)
         + usize::from(token_regression_ratio <= MAX_FRAGMENT_TOKEN_REGRESSION_RATIO);
     let losses = usize::from(!best_eval.required_fragments_enabled)
+        + usize::from(!best_eval.immutable_spine_fragments_untouched)
         + usize::from(!best_eval.has_enabled_fragments)
         + usize::from(token_regression_ratio > MAX_FRAGMENT_TOKEN_REGRESSION_RATIO);
     let notes = build_prompt_fragment_notes(
@@ -364,17 +386,25 @@ fn evaluate_prompt_fragment_bundle(
         .filter(|id| !enabled_ids.contains(**id))
         .map(|id| (*id).to_string())
         .collect::<Vec<_>>();
-    let invariant_checks = 2usize;
-    let passed_invariant_checks =
-        usize::from(disabled_required_fragment_ids.is_empty()) + usize::from(!enabled.is_empty());
+    let forbidden_immutable_spine_fragment_ids = enabled
+        .iter()
+        .filter(|fragment| IMMUTABLE_SPINE_FRAGMENT_IDS.contains(&fragment.id.as_str()))
+        .map(|fragment| fragment.id.clone())
+        .collect::<Vec<_>>();
+    let invariant_checks = 3usize;
+    let passed_invariant_checks = usize::from(disabled_required_fragment_ids.is_empty())
+        + usize::from(forbidden_immutable_spine_fragment_ids.is_empty())
+        + usize::from(!enabled.is_empty());
     let score = passed_invariant_checks as f64 / invariant_checks as f64;
 
     PromptFragmentBundleEvaluation {
         score: round4(score),
         required_fragments_enabled: disabled_required_fragment_ids.is_empty(),
         has_enabled_fragments: efficiency.enabled_fragments > 0,
+        immutable_spine_fragments_untouched: forbidden_immutable_spine_fragment_ids.is_empty(),
         efficiency,
         disabled_required_fragment_ids,
+        forbidden_immutable_spine_fragment_ids,
     }
 }
 
@@ -488,6 +518,7 @@ fn render_prompt_fragment_promotion_gate(
     changed: bool,
     required_fragments_enabled: bool,
     has_enabled_fragments: bool,
+    forbidden_immutable_spine_fragment_ids: &[String],
     token_regression_ratio: f64,
 ) -> String {
     if promoted {
@@ -501,6 +532,12 @@ fn render_prompt_fragment_promotion_gate(
     }
     if !required_fragments_enabled {
         return "candidate disables a required baseline prompt fragment".to_string();
+    }
+    if !forbidden_immutable_spine_fragment_ids.is_empty() {
+        return format!(
+            "candidate attempts to override immutable spine fragment(s): {}",
+            forbidden_immutable_spine_fragment_ids.join(", ")
+        );
     }
     if token_regression_ratio > MAX_FRAGMENT_TOKEN_REGRESSION_RATIO {
         return format!(
@@ -525,6 +562,19 @@ fn build_prompt_fragment_notes(
         notes.push(format!(
             "Required prompt fragments disabled: {}.",
             candidate_eval.disabled_required_fragment_ids.join(", ")
+        ));
+    }
+    if candidate_eval.immutable_spine_fragments_untouched {
+        notes.push("Immutable spine prompt fragments remain controlled by code.".to_string());
+    } else if !candidate_eval
+        .forbidden_immutable_spine_fragment_ids
+        .is_empty()
+    {
+        notes.push(format!(
+            "Immutable spine fragment override rejected: {}.",
+            candidate_eval
+                .forbidden_immutable_spine_fragment_ids
+                .join(", ")
         ));
     }
     let token_delta = candidate_eval
@@ -619,6 +669,26 @@ pub(crate) fn prompt_fragment_candidate_benchmark_profile() -> serde_json::Value
         "surface": "prompt_fragment_bundle",
         "objective": "Improve selectable agent-loop guidance fragments while preserving required safety and turn-contract invariants.",
         "required_invariants": required_prompt_fragment_ids(),
+        "spine_fragment_contract": {
+            "immutable_surfaces": [
+                "spine.identity",
+                "spine.non_evolvable_safety",
+                "spine.authorization_and_credentials",
+                "spine.primitive_schema_summary",
+                "spine.tool_result_contract"
+            ],
+            "allowed_evolvable_fragment_ids": [
+                "spine.tool_use_style_policy",
+                "spine.source_grounding_policy",
+                "spine.artifact_delivery_policy",
+                "spine.background_automation_policy",
+                "spine.memory_policy",
+                "spine.repair_policy",
+                "spine.final_answer_policy"
+            ],
+            "selection_policy": "Spine includes the core fragment set every turn. Do not propose phrase-routed fragment selection; future selection must be semantic or capability-based and eval-proven.",
+            "schema_contract": "Primitive tool names and argument schemas remain runtime contracts; prompt fragments may summarize tool-use style but must not redefine tool availability."
+        },
         "semantic_contract": {
             "preserve_multi_outcome_turns": true,
             "conversation_history_resolves_references_without_overriding_current_turn": true,
@@ -630,7 +700,7 @@ pub(crate) fn prompt_fragment_candidate_benchmark_profile() -> serde_json::Value
             "updated_at": "optional RFC3339 timestamp",
             "fragments": [{
                 "id": "stable internal fragment id",
-                "surface": "agent_loop or all",
+                "surface": "agent_loop, spine, or all",
                 "body": "fragment guidance text",
                 "scope_tags": ["semantic routing tags"],
                 "always_on": false,
@@ -644,4 +714,43 @@ pub(crate) fn prompt_fragment_candidate_benchmark_profile() -> serde_json::Value
             "reject_empty_enabled_bundle": true
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_fragment_candidates_cannot_override_immutable_spine_fragments() {
+        let mut bundle = default_prompt_fragment_bundle();
+        bundle.fragments.push(PromptFragment {
+            id: "spine.non_evolvable_safety".to_string(),
+            surface: "spine".to_string(),
+            body: "Attempted safety override.".to_string(),
+            scope_tags: Vec::new(),
+            always_on: true,
+            priority: 0,
+            est_tokens: 8,
+            enabled: true,
+        });
+
+        let evaluation = evaluate_prompt_fragment_bundle(&bundle);
+
+        assert!(!evaluation.immutable_spine_fragments_untouched);
+        assert_eq!(
+            evaluation.forbidden_immutable_spine_fragment_ids,
+            vec!["spine.non_evolvable_safety".to_string()]
+        );
+        assert!(
+            render_prompt_fragment_promotion_gate(
+                false,
+                true,
+                true,
+                true,
+                &evaluation.forbidden_immutable_spine_fragment_ids,
+                0.0,
+            )
+            .contains("immutable spine fragment")
+        );
+    }
 }

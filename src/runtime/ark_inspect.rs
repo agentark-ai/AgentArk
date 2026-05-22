@@ -6,7 +6,7 @@ use super::ActionRuntime;
 pub(super) fn action_def() -> crate::actions::ActionDef {
     crate::actions::ActionDef {
         name: "ark_inspect".to_string(),
-        description: "Generic read-only Ark inspection for live/local AgentArk state. Use when the user asks for evidence that may require the control API, deployed app registry, stored database telemetry, schema discovery, structured DB reads, traces, logs, tasks, integrations, files, workspace state, analytics, current model/provider selection, model access/readiness, failover/provider health, model/provider usage, recent conversations, work history, personal activity patterns, or other internal runtime data. The runtime injects AgentArk API auth server-side; never include credentials in arguments.".to_string(),
+        description: "Generic read-only Ark inspection for live/local AgentArk state. Use when the user asks for evidence that may require the control API, deployed app registry, stored database telemetry, schema discovery, structured DB reads, traces, logs, tasks, integrations, files, workspace state, analytics, current model/provider selection, model access/readiness, failover/provider health, model/provider usage, recent conversations, work history, personal activity patterns, recent attention, avoidance, recurring themes, inferred mindset, or other internal runtime data. The runtime injects AgentArk API auth server-side; never include credentials in arguments.".to_string(),
         version: "1.0.0".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -19,7 +19,7 @@ pub(super) fn action_def() -> crate::actions::ActionDef {
                 "surface": {
                     "type": "string",
                     "enum": ["overview", "apps", "activity", "analytics", "models", "gateway_ops", "arkpulse", "sentinel", "evolution", "trace", "moltbook"],
-                    "description": "Internal AgentArk surface to inspect when operation=surface. Use models for current model/provider selection, configured slots, readiness, access, and failover/provider health. Use analytics for usage, cost, token, model, channel, and purpose reports; use activity for recent user chats, work objects, and local signals that support reflective pattern summaries. For specific AgentArk-owned data/reporting needs, use api_catalog then api_get. Default: overview."
+                    "description": "Internal AgentArk surface to inspect when operation=surface. Use models for current model/provider selection, configured slots, readiness, access, and failover/provider health. Use analytics for usage, cost, token, model, channel, and purpose reports; use activity for recent user chats, work objects, Reflect-derived work units, Sentinel background signals, and local signals that support reflective pattern summaries about behavior, attention, avoidance, recurring themes, and follow-through. For specific AgentArk-owned data/reporting needs, use api_catalog then api_get. Default: overview."
                 },
                 "limit": {
                     "type": "integer",
@@ -665,6 +665,7 @@ async fn activity_surface(
                 "interval_secs": watcher.interval_secs,
                 "timeout_secs": watcher.timeout_secs,
                 "notify_channel": watcher.notify_channel,
+                "repeat_on_match": watcher.repeat_on_match,
                 "status": watcher.status,
                 "created_at": watcher.created_at,
                 "last_poll_at": watcher.last_poll_at,
@@ -807,7 +808,7 @@ async fn activity_surface(
     Ok(serde_json::json!({
         "surface": "activity",
         "generated_at": chrono::Utc::now().to_rfc3339(),
-        "evidence_policy": "Use this read-only local evidence to answer reflective questions about recent activity, work patterns, recurring interests, blockers, habits, focus, or follow-through. Treat it as evidence, not proof; avoid overclaiming when the evidence is thin.",
+        "evidence_policy": "Use this read-only local evidence to answer reflective questions about recent activity, work patterns, recurring interests, blockers, habits, focus, avoidance, inferred mindset, or follow-through. Treat it as evidence, not proof; avoid overclaiming when the evidence is thin.",
         "recent_conversations": recent_conversations,
         "recent_user_messages": recent_user_messages,
         "recent_tasks": recent_tasks,

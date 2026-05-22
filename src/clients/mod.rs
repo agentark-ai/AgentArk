@@ -2,7 +2,7 @@ pub mod executor_client;
 mod internal_auth;
 pub mod workspace_client;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::net::IpAddr;
 
 pub use executor_client::{
@@ -10,9 +10,10 @@ pub use executor_client::{
     ExecutorClient, ExecutorClientConfig, StackMemoryStatsResponse,
 };
 pub(crate) use internal_auth::{
-    describe_internal_service_tokens, load_internal_service_token_from_default_config_dir,
-    load_or_create_internal_service_token, read_persisted_internal_service_token,
-    restore_internal_service_token, rotate_internal_service_token, InternalServiceKind,
+    InternalServiceKind, describe_internal_service_tokens,
+    load_internal_service_token_from_default_config_dir, load_or_create_internal_service_token,
+    read_persisted_internal_service_token, restore_internal_service_token,
+    rotate_internal_service_token,
 };
 pub use workspace_client::{WorkspaceClient, WorkspaceClientConfig};
 
@@ -114,21 +115,27 @@ mod tests {
 
     #[test]
     fn allows_http_for_internal_service_dns_names() {
-        assert!(validate_internal_service_base_url(
-            "http://agentark-workspace:8992",
-            "Workspace service"
-        )
-        .is_ok());
-        assert!(validate_internal_service_base_url(
-            "http://workspace.default.svc.cluster.local:8992",
-            "Workspace service"
-        )
-        .is_ok());
-        assert!(validate_internal_service_base_url(
-            "http://host.docker.internal:8992",
-            "Workspace service"
-        )
-        .is_ok());
+        assert!(
+            validate_internal_service_base_url(
+                "http://agentark-workspace:8992",
+                "Workspace service"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_internal_service_base_url(
+                "http://workspace.default.svc.cluster.local:8992",
+                "Workspace service"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_internal_service_base_url(
+                "http://host.docker.internal:8992",
+                "Workspace service"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -150,8 +157,10 @@ mod tests {
     fn rejects_http_for_public_hosts() {
         let error = validate_internal_service_base_url("http://example.com", "Executor service")
             .expect_err("public http host should be rejected");
-        assert!(error
-            .to_string()
-            .contains("insecure plain HTTP for a non-internal host"));
+        assert!(
+            error
+                .to_string()
+                .contains("insecure plain HTTP for a non-internal host")
+        );
     }
 }

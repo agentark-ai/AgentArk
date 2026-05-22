@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::core::config::SecureConfigManager;
 use crate::core::integration_auth::{
-    manifest_all_storage_targets, manifest_from_extension_pack, IntegrationAuthManifest,
+    IntegrationAuthManifest, manifest_all_storage_targets, manifest_from_extension_pack,
 };
 use crate::extension_packs::{
     AuthTransportBinding, ExtensionPackAuthMode, ExtensionPackManifest, ExtensionPackRegistry,

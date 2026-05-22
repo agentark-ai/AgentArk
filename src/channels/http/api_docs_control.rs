@@ -103,6 +103,12 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "Chat",
     );
     add(
+        "/chat/credential-prompt",
+        "DELETE",
+        "Dismiss pending chat credential prompt",
+        "Chat",
+    );
+    add(
         "/gateway/channels",
         "GET",
         "List channel gateway status",
@@ -430,13 +436,13 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
     add(
         "/reflect",
         "GET",
-        "Get cached ArkReflect clusters and daily digest status across chat, ArkOrbit, apps, goals, watchers, Sentinel, ArkPulse, ArkEvolve, usage, memory, and workflows",
+        "Get cached Reflect clusters and daily digest status across chat, ArkOrbit, apps, goals, watchers, Sentinel, Pulse, Evolve, usage, memory, and workflows",
         "Analytics",
     );
     add(
         "/reflect/refresh",
         "POST",
-        "Queue a guarded ArkReflect background refresh for a selected time range",
+        "Queue a guarded Reflect background refresh for a selected time range",
         "Analytics",
     );
 
@@ -697,7 +703,7 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "Memory",
     );
     for (path, method, description) in [
-        ("/arkmemory/summary", "GET", "ArkMemory operations summary"),
+        ("/arkmemory/summary", "GET", "Memory operations summary"),
         ("/arkmemory/queue", "GET", "List staged memory candidates"),
         (
             "/arkmemory/queue/{id}/approve",
@@ -735,7 +741,7 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
             "Apply or acknowledge memory cleanup findings",
         ),
     ] {
-        add(path, method, description, "ArkMemory");
+        add(path, method, description, "Memory");
     }
 
     // --- Notifications ---

@@ -19,7 +19,7 @@ const STAGES: Array<{
   number: string;
   title: string;
   detail: string;
-  tone: "cyan" | "blue" | "violet" | "teal";
+  tone: "cyan" | "violet" | "teal";
 }> = [
   {
     id: "observe",
@@ -33,7 +33,7 @@ const STAGES: Array<{
     number: "02",
     title: "Understand",
     detail: "Extracting patterns from traces and context",
-    tone: "blue",
+    tone: "teal",
   },
   {
     id: "plan",
@@ -47,7 +47,7 @@ const STAGES: Array<{
     number: "04",
     title: "Act",
     detail: "Running tools, skills, apps, and automations",
-    tone: "blue",
+    tone: "teal",
   },
   {
     id: "reflect",
@@ -77,14 +77,14 @@ export function AgentCognitionLoop({
   learningQueueCount,
 }: AgentCognitionLoopProps) {
   const surfaces = [
-    { label: "ArkMemory", value: `${memoryCount}` },
+    { label: "Memory", value: `${memoryCount}` },
     { label: "Skills", value: `${skillCount}` },
     { label: "Apps", value: `${appCount}` },
     { label: "Integrations", value: `${integrationCount}` },
-    { label: "ArkEvolve", value: selfEvolveEnabled ? "ON" : "OFF" },
+    { label: "Evolve", value: selfEvolveEnabled ? "ON" : "OFF" },
     { label: "Learning", value: `${learningQueueCount}` },
     { label: "Trace", value: `${traceCount}` },
-    { label: "ArkPulse", value: latencyMs == null ? "-" : `${Math.round(latencyMs)}ms` },
+    { label: "Pulse", value: latencyMs == null ? "-" : `${Math.round(latencyMs)}ms` },
   ];
 
   return (

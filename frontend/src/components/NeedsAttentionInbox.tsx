@@ -11,6 +11,7 @@ import {
 } from "@mui/material";
 import CheckCircleOutlineRoundedIcon from "@mui/icons-material/CheckCircleOutlineRounded";
 import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
+import { TASK_RETRY_CONTROLS_ENABLED } from "../lib/featureFlags";
 import type { Notification, Task } from "../types";
 
 export type AttentionItem = {
@@ -402,7 +403,7 @@ export function NeedsAttentionInbox({
                               Reject
                             </Button>
                           </>
-                        ) : item.kind === "failed" ? (
+                        ) : item.kind === "failed" && TASK_RETRY_CONTROLS_ENABLED ? (
                           <Button
                             variant="outlined"
                             size="small"

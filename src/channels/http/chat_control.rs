@@ -35,9 +35,14 @@ fn chat_turn_timeout_secs() -> u64 {
     std::env::var("AGENTARK_CHAT_TURN_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value >= 30)
-        .unwrap_or(900)
-        .min(7_200)
+        .map(|value| {
+            if value == 0 {
+                0
+            } else {
+                value.clamp(30, 7_200)
+            }
+        })
+        .unwrap_or(0)
 }
 
 fn chat_stream_idle_timeout_secs() -> u64 {
@@ -141,26 +146,37 @@ where
             }
         };
         let timeout_secs = chat_turn_timeout_secs();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            std::panic::AssertUnwindSafe(future).catch_unwind(),
-        )
-        .await;
-        let result = match outcome {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(payload)) => {
-                let panic = chat_worker_panic_payload_to_string(payload);
-                tracing::error!(
-                    task = task_name,
-                    panic = %panic,
-                    "Chat worker task panicked"
-                );
-                Err(format!("Chat worker task panicked: {}", panic))
+        let guarded = std::panic::AssertUnwindSafe(future).catch_unwind();
+        let result = if timeout_secs > 0 {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), guarded).await {
+                Ok(Ok(output)) => Ok(output),
+                Ok(Err(payload)) => {
+                    let panic = chat_worker_panic_payload_to_string(payload);
+                    tracing::error!(
+                        task = task_name,
+                        panic = %panic,
+                        "Chat worker task panicked"
+                    );
+                    Err(format!("Chat worker task panicked: {}", panic))
+                }
+                Err(_) => Err(format!(
+                    "Chat worker task '{}' timed out after {} seconds",
+                    task_name, timeout_secs
+                )),
             }
-            Err(_) => Err(format!(
-                "Chat worker task '{}' timed out after {} seconds",
-                task_name, timeout_secs
-            )),
+        } else {
+            match guarded.await {
+                Ok(output) => Ok(output),
+                Err(payload) => {
+                    let panic = chat_worker_panic_payload_to_string(payload);
+                    tracing::error!(
+                        task = task_name,
+                        panic = %panic,
+                        "Chat worker task panicked"
+                    );
+                    Err(format!("Chat worker task panicked: {}", panic))
+                }
+            }
         };
         let _ = tx.send(result);
     });
@@ -216,57 +232,30 @@ pub(super) fn build_request_execution_hints(
     caller: Option<&crate::actions::ActionCallerPrincipal>,
     surface: crate::actions::ActionExecutionSurface,
     direct_user_intent: bool,
-    attachments: Vec<crate::core::ChatAttachmentHint>,
-) -> crate::core::RequestExecutionHints {
-    build_request_execution_hints_with_arkorbit(
-        caller,
-        surface,
-        direct_user_intent,
-        attachments,
-        None,
-    )
-}
-
-/// Variant that also threads ArkOrbit per-call context through to the agent
-/// loop. The context is structural (orbit id, widget summary, optional
-/// `agent_instructions`); routing/inference are unchanged.
-pub(super) fn build_request_execution_hints_with_arkorbit(
-    caller: Option<&crate::actions::ActionCallerPrincipal>,
-    surface: crate::actions::ActionExecutionSurface,
-    direct_user_intent: bool,
-    attachments: Vec<crate::core::ChatAttachmentHint>,
-    arkorbit_context: Option<serde_json::Value>,
-) -> crate::core::RequestExecutionHints {
-    build_request_execution_hints_with_context(
-        caller,
-        surface,
-        direct_user_intent,
-        attachments,
-        arkorbit_context,
-        None,
-    )
-}
-
-pub(super) fn build_request_execution_hints_with_context(
-    caller: Option<&crate::actions::ActionCallerPrincipal>,
-    surface: crate::actions::ActionExecutionSurface,
-    direct_user_intent: bool,
-    attachments: Vec<crate::core::ChatAttachmentHint>,
-    arkorbit_context: Option<serde_json::Value>,
-    accepted_suggestion_context: Option<serde_json::Value>,
 ) -> crate::core::RequestExecutionHints {
     crate::core::RequestExecutionHints {
         turn_timing_id: None,
         caller_principal: caller.cloned(),
         execution_surface: surface,
         direct_user_intent,
-        secret_offered: None,
-        attachments,
-        saved_user_facts_context: None,
         recorded_user_message_id: None,
-        arkorbit_context,
-        accepted_suggestion_context,
+        attachments_present: false,
+        attachments: Vec::new(),
+        arkorbit_context: None,
+        recent_actionable_artifacts: Vec::new(),
     }
+}
+
+fn attach_chat_request_context_to_hints(
+    mut hints: crate::core::RequestExecutionHints,
+    attachments_present: bool,
+    attachments: Vec<crate::core::ChatAttachmentHint>,
+    arkorbit_context: Option<serde_json::Value>,
+) -> crate::core::RequestExecutionHints {
+    hints.attachments_present = attachments_present || !attachments.is_empty();
+    hints.attachments = attachments;
+    hints.arkorbit_context = arkorbit_context;
+    hints
 }
 
 pub(super) fn build_direct_action_auth_context(
@@ -788,6 +777,9 @@ pub(super) async fn chat(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.chars().take(64).collect::<String>());
+    let attachments_present = request.attachments_present || !request.attachments.is_empty();
+    let attachments = request.attachments.clone();
+    let arkorbit_context = request.arkorbit_context.clone();
     if let Some(execution_mode) = execution_mode.as_deref() {
         tracing::debug!(
             execution_mode,
@@ -802,27 +794,43 @@ pub(super) async fn chat(
     if request.arkorbit_context.is_some() {
         tracing::debug!("Chat request included ArkOrbit structural context");
     }
-    let attachments = request.attachments.clone();
-    let arkorbit_context = request.arkorbit_context.clone();
     let caller_principal = maybe_caller.as_ref().map(|Extension(value)| value.clone());
     let agent_for_chat = state.agent.clone();
+    let persisted_user_message = match persist_chat_stream_user_message_before_run(
+        &state,
+        &channel,
+        conversation_id.as_deref(),
+        &message,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let conversation_id = Some(persisted_user_message.conversation_id.clone());
+    let recorded_user_message_id = Some(persisted_user_message.message_id.clone());
 
     let result = {
         let worker = run_chat_worker_task("http_chat_turn", async move {
             let agent_snapshot = Agent::snapshot(&agent_for_chat).await;
+            let mut hints = attach_chat_request_context_to_hints(
+                build_request_execution_hints(
+                    caller_principal.as_ref(),
+                    crate::actions::ActionExecutionSurface::Chat,
+                    true,
+                ),
+                attachments_present,
+                attachments,
+                arkorbit_context,
+            );
+            hints.recorded_user_message_id = recorded_user_message_id;
             agent_snapshot
-                .process_message_with_meta_and_hints(
+                .process_message_prerecorded_with_meta_and_hints(
                     &message,
                     &channel,
                     conversation_id.as_deref(),
                     project_id.as_deref(),
-                    build_request_execution_hints_with_arkorbit(
-                        caller_principal.as_ref(),
-                        crate::actions::ActionExecutionSurface::Chat,
-                        true,
-                        attachments,
-                        arkorbit_context,
-                    ),
+                    hints,
                 )
                 .await
         })
@@ -1182,7 +1190,7 @@ pub(super) fn normalize_stream_heartbeat_status(status: &str) -> String {
 
 fn stream_surface_display_name(name: &str) -> String {
     if name.trim().eq_ignore_ascii_case("agent_turn_loop") {
-        return "Working".to_string();
+        return "Agent workflow".to_string();
     }
 
     let cleaned = name
@@ -1440,6 +1448,11 @@ fn stream_surface_payload(
 ) -> serde_json::Value {
     let (renderer_id, fallback) = stream_surface_renderer(name, payload);
     let display_name = stream_surface_display_name(name);
+    let is_agent_loop_progress = name.trim().eq_ignore_ascii_case("agent_turn_loop")
+        && payload
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "agent_loop_progress");
     let surface_title = payload
         .get("label")
         .or_else(|| payload.get("title"))
@@ -1450,7 +1463,7 @@ fn stream_surface_payload(
     let run_id = payload.get("run_id").and_then(|value| value.as_str());
     let sequence = payload.get("seq").and_then(|value| value.as_u64());
     let mut input = Vec::new();
-    if status == "running" || status == "pending" {
+    if (status == "running" || status == "pending") && !is_agent_loop_progress {
         input.push(serde_json::json!({
             "role": "arguments",
             "contentType": "application/json",
@@ -1472,7 +1485,13 @@ fn stream_surface_payload(
     let mut output = Vec::new();
     if let Some(content) = content.filter(|value| !value.trim().is_empty()) {
         output.push(serde_json::json!({
-            "role": if renderer_id == "agentark.terminal.transcript.v1" { "transcript" } else { "output" },
+            "role": if is_agent_loop_progress {
+                "progress"
+            } else if renderer_id == "agentark.terminal.transcript.v1" {
+                "transcript"
+            } else {
+                "output"
+            },
             "contentType": if renderer_id == "agentark.terminal.transcript.v1" { "text/x-agentark-terminal-transcript" } else { "text/plain" },
             "text": content,
         }));
@@ -1589,11 +1608,20 @@ pub(super) fn normalize_stream_event_for_sse(
             let normalized_phase = phase.trim();
             let phase_visible = {
                 let normalized = normalized_phase.to_ascii_lowercase();
-                normalized.ends_with("_summary") || normalized.contains("summary")
+                matches!(
+                    normalized.as_str(),
+                    "model" | "model_summary" | "reasoning" | "reasoning_summary"
+                )
             };
             if !phase_visible {
                 return (None, String::new());
             }
+            let normalized_phase_lower = normalized_phase.to_ascii_lowercase();
+            let title = match normalized_phase_lower.as_str() {
+                "model" | "reasoning" => "Thinking",
+                "model_summary" | "reasoning_summary" => "Reasoning summary",
+                _ => "Reasoning",
+            };
             let stream_key = if normalized_phase.is_empty() {
                 "reasoning:active".to_string()
             } else {
@@ -1602,9 +1630,9 @@ pub(super) fn normalize_stream_event_for_sse(
             let detail = if !content_delta.trim().is_empty() {
                 content_delta.trim().to_string()
             } else if done {
-                "Reasoning summary completed.".to_string()
+                format!("{title} completed.")
             } else {
-                "Reasoning summary in progress.".to_string()
+                format!("{title} in progress.")
             };
             let content = content_delta.clone();
             (
@@ -1613,7 +1641,7 @@ pub(super) fn normalize_stream_event_for_sse(
                     serde_json::json!({
                         "kind": "reasoning_delta",
                         "phase": normalized_phase,
-                        "title": "Reasoning summary",
+                        "title": title,
                         "detail": detail,
                         "content": content,
                         "content_delta": content_delta,
@@ -2204,7 +2232,7 @@ fn deep_research_plan_focus_label(message: &str) -> (String, Vec<String>) {
         .map(|item| deep_research_plan_text(&item, 96))
         .filter(|item| !item.trim().is_empty())
         .filter(|item| seen.insert(item.to_ascii_lowercase()))
-        .take(4)
+        .take(8)
         .collect::<Vec<_>>();
     (objective, items)
 }
@@ -2230,42 +2258,77 @@ fn deep_research_plan_step(
     }
 }
 
+fn deep_research_focus_scope(focus_items: &[String]) -> String {
+    if focus_items.is_empty() {
+        "Cover the user's requested dimensions and note any evidence gaps.".to_string()
+    } else {
+        format!("Cover requested dimensions: {}.", focus_items.join("; "))
+    }
+}
+
+fn deep_research_focus_substeps(focus_items: &[String]) -> Vec<crate::core::PlanSubstep> {
+    focus_items
+        .iter()
+        .enumerate()
+        .map(|(index, focus)| crate::core::PlanSubstep {
+            id: index + 1,
+            title: deep_research_plan_text(focus, 96),
+            description: "Extract cited evidence for this requested dimension and flag gaps."
+                .to_string(),
+            tool_hint: Some("research".to_string()),
+            status: Some(crate::core::PlanStepStatus::Pending),
+        })
+        .collect()
+}
+
 fn default_deep_research_plan(message: &str, task_id: &str) -> crate::core::ExecutionPlan {
     let (objective, focus_items) = deep_research_plan_focus_label(message);
-    let mut steps = Vec::new();
-    steps.push(deep_research_plan_step(
-        1,
-        format!("Frame {}", objective),
-        "Turn the request into source requirements, freshness needs, and verification criteria.",
-        message,
-    ));
-    steps.push(deep_research_plan_step(
-        2,
-        format!("Search evidence for {}", objective),
-        "Gather diverse primary, recent, comparative, and skeptical source candidates.",
-        message,
-    ));
-    for focus in focus_items {
-        let id = steps.len() + 1;
-        steps.push(deep_research_plan_step(
-            id,
-            format!("Investigate {}", focus),
-            "Read selected sources for this requested dimension and extract cited evidence.",
+    let topic = deep_research_plan_text(&objective, 72);
+    let focus_scope = deep_research_focus_scope(&focus_items);
+    let mut steps = vec![
+        deep_research_plan_step(
+            1,
+            format!("Frame {}", topic),
+            format!(
+                "Turn {} into source requirements, freshness needs, and verification criteria. {}",
+                objective, focus_scope
+            ),
             message,
-        ));
+        ),
+        deep_research_plan_step(
+            2,
+            format!("Search evidence on {}", topic),
+            "Scan primary, recent, comparative, skeptical, and data-bearing source angles for this topic.",
+            message,
+        ),
+        deep_research_plan_step(
+            3,
+            format!("Select strongest sources for {}", topic),
+            "Rank candidate sources for relevance to the topic, dimension coverage, diversity, recency, and primary-source value.",
+            message,
+        ),
+        deep_research_plan_step(
+            4,
+            format!("Read evidence across {}", topic),
+            "Open selected sources, extract cited evidence for every requested dimension, and identify coverage gaps or contradictions.",
+            message,
+        ),
+        deep_research_plan_step(
+            5,
+            format!("Synthesize recommendation on {}", topic),
+            "Compare positions, surface tradeoffs and uncertainty, add grounded charts when applicable, and write the final cited report.",
+            message,
+        ),
+    ];
+    if let Some(read_step) = steps.get_mut(3) {
+        read_step.substeps = deep_research_focus_substeps(&focus_items);
     }
-    steps.push(deep_research_plan_step(
-        steps.len() + 1,
-        format!("Synthesize {}", objective),
-        "Compare the evidence, surface disagreements or gaps, and write the cited report.",
-        message,
-    ));
 
     crate::core::ExecutionPlan {
         plan_id: deep_research_plan_id(task_id),
         revision: 1,
         summary: format!(
-            "Research {} with source discovery, evidence reading, verification, and cited synthesis.",
+            "{}: source discovery, evidence reading, verification, and cited synthesis.",
             objective
         ),
         steps,
@@ -2345,11 +2408,7 @@ fn deep_research_plan_actions(
         .filter(|action| action.name.trim().eq_ignore_ascii_case("research"))
         .cloned()
         .collect::<Vec<_>>();
-    if scoped.is_empty() {
-        actions
-    } else {
-        scoped
-    }
+    if scoped.is_empty() { actions } else { scoped }
 }
 
 async fn generate_deep_research_plan_preview(
@@ -2358,6 +2417,12 @@ async fn generate_deep_research_plan_preview(
     task_id: &str,
 ) -> crate::core::ExecutionPlan {
     let fallback = default_deep_research_plan(message, task_id);
+    if std::env::var("AGENTARK_DEEP_RESEARCH_LLM_PLAN")
+        .map(|value| value.trim().eq_ignore_ascii_case("0"))
+        .unwrap_or(true)
+    {
+        return fallback;
+    }
     let actions = agent
         .runtime
         .list_enabled_actions()
@@ -2388,29 +2453,20 @@ async fn generate_deep_research_plan_preview(
     };
     let plan = normalize_deep_research_plan(plan, message, task_id);
     let relevance = crate::core::planner::assess_confirmation_plan_relevance(message, &plan);
-    if relevance.accepted {
-        plan
-    } else {
-        fallback
-    }
+    if relevance.accepted { plan } else { fallback }
 }
 
 fn deep_research_step_for_phase(plan: &crate::core::ExecutionPlan, phase: &str) -> (usize, String) {
     let count = plan.steps.len().max(1);
     let ordinal = match phase.trim().to_ascii_lowercase().as_str() {
         "planning" => 1,
-        "searching" | "ranking" => {
-            if count >= 4 {
-                2
-            } else {
-                1
-            }
-        }
+        "searching" => 2,
+        "ranking" => 3,
         "reading" => {
             if count >= 4 {
-                3
+                4
             } else if count >= 3 {
-                2
+                3
             } else {
                 count
             }
@@ -2426,6 +2482,38 @@ fn deep_research_step_for_phase(plan: &crate::core::ExecutionPlan, phase: &str) 
         .unwrap_or((ordinal, format!("Research step {}", ordinal)))
 }
 
+fn deep_research_plan_step_status_for_stream(status: &str) -> crate::core::PlanStepStatus {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "completed" => crate::core::PlanStepStatus::Completed,
+        "failed" => crate::core::PlanStepStatus::Failed,
+        "skipped" => crate::core::PlanStepStatus::Skipped,
+        "running" => crate::core::PlanStepStatus::Running,
+        _ => crate::core::PlanStepStatus::Pending,
+    }
+}
+
+fn deep_research_substeps_for_step_update(
+    plan: &crate::core::ExecutionPlan,
+    step_id: usize,
+    status: &str,
+) -> Vec<crate::core::PlanSubstep> {
+    let next_status = deep_research_plan_step_status_for_stream(status);
+    plan.steps
+        .iter()
+        .find(|step| step.id == step_id)
+        .map(|step| {
+            step.substeps
+                .iter()
+                .cloned()
+                .map(|mut substep| {
+                    substep.status = Some(next_status);
+                    substep
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn send_deep_research_plan_step_update(
     tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
     live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
@@ -2437,6 +2525,7 @@ async fn send_deep_research_plan_step_update(
     status: &str,
     detail: impl Into<String>,
 ) {
+    let substeps = deep_research_substeps_for_step_update(plan, step_id, status);
     send_chat_stream_event(
         tx,
         live_runs,
@@ -2452,6 +2541,7 @@ async fn send_deep_research_plan_step_update(
             "step_title": step_title,
             "status": status,
             "detail": detail.into(),
+            "substeps": substeps,
         }),
         crate::core::RunEventPriority::High,
     )
@@ -2488,6 +2578,9 @@ async fn persist_deep_research_chat_message(
         conversation_id: conversation_id.to_string(),
         role: role.to_string(),
         content: content.to_string(),
+        tool_calls_json: None,
+        tool_call_id: None,
+        provider_message_json: None,
         timestamp: chrono::Utc::now().to_rfc3339(),
         model_used: model_used.map(str::to_string),
         trace_id: trace_id.map(str::to_string),
@@ -2551,13 +2644,18 @@ fn deep_research_error_message(error: &anyhow::Error) -> String {
     }
 }
 
-fn deep_research_synthesis_timeout_ms() -> u64 {
+fn deep_research_synthesis_timeout_ms() -> Option<u64> {
     std::env::var("AGENTARK_DEEP_RESEARCH_SYNTHESIS_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value >= 30_000)
-        .unwrap_or(300_000)
-        .min(900_000)
+        .map(|value| {
+            if value == 0 {
+                0
+            } else {
+                value.clamp(30_000, 900_000)
+            }
+        })
+        .filter(|value| *value > 0)
 }
 
 fn strip_leading_markdown_title(markdown: &str) -> String {
@@ -2604,9 +2702,13 @@ async fn synthesize_deep_research_report(
 
     let system = r#"You are AgentArk's deep research synthesis engine.
 
-Write like a senior research analyst. Use only the supplied evidence brief and its numbered sources. Do not invent facts, citations, dates, statistics, source titles, or URLs. If the evidence is thin, conflicting, or missing for part of the request, say so directly and explain what would need verification.
+Write like a senior research analyst producing a polished decision-grade report. Use only the supplied evidence brief and its numbered sources. Do not invent facts, citations, dates, statistics, source titles, URLs, chart data, or confidence levels. If the evidence is thin, conflicting, or missing for part of the request, say so directly and explain what would need verification.
 
-The report must be rigorous, detailed, and useful: synthesize implications, tradeoffs, uncertainties, counterarguments, and practical options. Format it like a clean analyst report: start with a concise executive summary, use numbered or clearly ordered sections, include compact Markdown tables when they improve comparison or planning, and keep paragraphs readable. Adapt headings to the user's underlying research intent instead of mirroring surface wording. Cite material claims with bracketed source numbers such as [1] or [2, 4]. Do not include a Sources section, chart fences, or raw JSON because AgentArk appends the evidence brief separately."#;
+The report must be meaningfully deep, not a shallow summary. Synthesize what the evidence implies; compare competing positions; separate supported findings from assumptions; surface tradeoffs, uncertainty, counterarguments, constraints, and practical options; and preserve source grounding for every material claim with bracketed citations such as [1] or [2, 4]. Organize sections around the user's underlying research need and the evidence structure, not around surface wording.
+
+Use compact Markdown tables when they make comparison, options, risks, timelines, actors, source reliability, or evidence coverage easier to scan. Include fenced `agentark-chart` JSON only when the evidence contains concrete comparable numbers, percentages, dates, counts, ratings, or grouped categories that make a visual materially clearer than prose or a table. When charts are justified, include them near the relevant analysis using this shape: `title`, `type`, `x`, `series`, `data`, and `height`. Do not chart qualitative claims without numeric support.
+
+Do not include a Sources section because AgentArk appends the evidence brief separately."#;
 
     let evidence = if evidence_report.chars().count() > 45_000 {
         let trimmed = evidence_report.chars().take(45_000).collect::<String>();
@@ -2618,19 +2720,21 @@ The report must be rigorous, detailed, and useful: synthesize implications, trad
         evidence_report.to_string()
     };
     let user = format!(
-        "Original research request:\n{}\n\nEvidence brief:\n{}\n\nWrite the deep research report now. Include an executive summary, detailed analysis organized around the request's real dimensions, compact tables for comparisons or options when useful, the strongest case for and against the likely conclusion, practical recommendations or options, and evidence gaps/open questions. Keep every substantive claim grounded in the supplied numbered sources.",
+        "Original research request:\n{}\n\nEvidence brief:\n{}\n\nWrite the deep research report now. Include an executive summary, detailed analysis organized around the request's real dimensions, compact tables for comparisons or options when useful, charts or plots only when the evidence contains concrete comparable values, the strongest case for and against the likely conclusion, practical recommendations or options, and evidence gaps/open questions. Keep every substantive claim grounded in the supplied numbered sources.",
         query.trim(),
         evidence.trim()
     );
     let llm = agent
         .llm_for_role(&crate::core::ModelRole::Research)
         .clone();
-    let response = tokio::time::timeout(
-        std::time::Duration::from_millis(deep_research_synthesis_timeout_ms()),
-        llm.chat_with_system_bounded(system, &user, 8_000),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("research model synthesis timed out"))??;
+    let synthesis_call = llm.chat_with_system_bounded(system, &user, 8_000);
+    let response = if let Some(timeout_ms) = deep_research_synthesis_timeout_ms() {
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), synthesis_call)
+            .await
+            .map_err(|_| anyhow::anyhow!("research model synthesis timed out"))??
+    } else {
+        synthesis_call.await?
+    };
     let synthesis = response.content.trim();
     if synthesis.is_empty() {
         return Err(anyhow::anyhow!(
@@ -2934,13 +3038,13 @@ async fn run_approved_deep_research_stream(
 
     let research_args = crate::actions::research::ResearchArgs {
         query: message.to_string(),
-        max_sources: 12,
+        max_sources: 24,
         _include_sources: true,
         backend: None,
         depth: crate::actions::research::ResearchDepth::Deep,
-        min_primary_sources: 2,
+        min_primary_sources: 4,
         freshness_window_days: None,
-        followup_rounds: 2,
+        followup_rounds: 4,
     };
     let research_result = crate::actions::research::execute_research_with_progress(
         &research_args,
@@ -3314,12 +3418,11 @@ pub(super) struct ChatStreamRunRequest {
     pub(super) recorded_user_message_id: Option<String>,
     pub(super) deep_research: bool,
     pub(super) plan_confirmation_mode: Option<String>,
+    pub(super) attachments_present: bool,
     pub(super) attachments: Vec<crate::core::ChatAttachmentHint>,
+    pub(super) arkorbit_context: Option<serde_json::Value>,
     pub(super) caller_principal: Option<crate::actions::ActionCallerPrincipal>,
     pub(super) task_mode: ChatStreamTaskMode,
-    /// Per-call ArkOrbit structural context. Threaded into request hints so
-    /// the agent loop can read it without changing model selection.
-    pub(super) arkorbit_context: Option<serde_json::Value>,
     pub(super) accepted_suggestion: Option<AcceptedChatSuggestionRun>,
 }
 
@@ -3343,10 +3446,11 @@ pub(super) fn chat_stream_run_request_from_persisted_user_message(
         recorded_user_message_id: Some(persisted_user_message.message_id),
         deep_research: request.deep_research,
         plan_confirmation_mode: request.plan_confirmation_mode,
+        attachments_present: request.attachments_present || !request.attachments.is_empty(),
         attachments: request.attachments,
+        arkorbit_context: request.arkorbit_context,
         caller_principal,
         task_mode: ChatStreamTaskMode::CreateIfNeeded,
-        arkorbit_context: request.arkorbit_context,
         accepted_suggestion,
     }
 }
@@ -3410,6 +3514,9 @@ pub(super) async fn persist_chat_stream_user_message_before_run(
         conversation_id: conversation_id.clone(),
         role: "user".to_string(),
         content: safe_message,
+        tool_calls_json: None,
+        tool_call_id: None,
+        provider_message_json: None,
         timestamp: now,
         model_used: None,
         trace_id: None,
@@ -3431,21 +3538,6 @@ pub(super) async fn persist_chat_stream_user_message_before_run(
     Ok(PersistedChatStreamUserMessage {
         conversation_id,
         message_id,
-    })
-}
-
-fn accepted_chat_suggestion_context_value(
-    suggestion: &ChatAutomationSuggestion,
-) -> serde_json::Value {
-    serde_json::json!({
-        "suggestion_id": suggestion.id,
-        "accepted_kind": suggestion.kind,
-        "title": suggestion.title,
-        "detail": suggestion.detail,
-        "goal_title": suggestion.goal_title,
-        "goal_detail": suggestion.goal_detail,
-        "conversation_id": suggestion.conversation_id,
-        "source_message_id": suggestion.source_message_id,
     })
 }
 
@@ -3658,26 +3750,6 @@ async fn upsert_chat_stream_execution_run(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let trace_id = wait_for_chat_stream_trace_link(storage, trace_id).await;
-    if let Some(conversation_id) = normalized_conversation_id.as_deref() {
-        let conversation = crate::storage::entities::conversation::Model {
-            id: conversation_id.to_string(),
-            title: truncate_stream_task_text(message, 80),
-            channel: channel.to_string(),
-            project_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            message_count: 0,
-            archived: false,
-            starred: false,
-        };
-        if let Err(error) = storage.create_conversation_if_absent(&conversation).await {
-            tracing::warn!(
-                "Failed to ensure chat stream conversation '{}' before run persistence: {}",
-                conversation_id,
-                error
-            );
-        }
-    }
     let created_at = if status == crate::core::ExecutionRunStatus::Accepted {
         now.clone()
     } else {
@@ -3733,13 +3805,11 @@ pub(super) fn spawn_chat_stream_response(
     let project_id: Option<String> = None;
     let deep_research = request.deep_research;
     let plan_confirmation_mode = request.plan_confirmation_mode.clone();
+    let attachments_present = request.attachments_present;
     let attachments = request.attachments.clone();
-    let caller_principal = request.caller_principal.clone();
     let arkorbit_context = request.arkorbit_context.clone();
+    let caller_principal = request.caller_principal.clone();
     let accepted_suggestion = request.accepted_suggestion.clone();
-    let accepted_suggestion_context = accepted_suggestion
-        .as_ref()
-        .map(|accepted| accepted_chat_suggestion_context_value(&accepted.suggestion));
     let task_mode = request.task_mode.clone();
     let app_state = state.clone();
     let stream_request_id = uuid::Uuid::new_v4().to_string();
@@ -4413,11 +4483,11 @@ pub(super) fn spawn_chat_stream_response(
             let conversation_id = conversation_id.clone();
             let project_id = project_id.clone();
             let trace_ref = trace_ref.clone();
-            let attachments = attachments.clone();
             let caller_principal = caller_principal.clone();
-            let arkorbit_context = arkorbit_context.clone();
-            let accepted_suggestion_context = accepted_suggestion_context.clone();
             let recorded_user_message_id = request_recorded_user_message_id.clone();
+            let attachments_present = attachments_present;
+            let attachments = attachments.clone();
+            let arkorbit_context = arkorbit_context.clone();
             tokio::spawn(async move {
                 let agent_snapshot = Agent::snapshot(&agent_ref).await;
                 if resume_existing_chat_task {
@@ -4429,23 +4499,28 @@ pub(super) fn spawn_chat_stream_response(
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            build_request_execution_hints_with_arkorbit(
-                                caller_principal.as_ref(),
-                                crate::actions::ActionExecutionSurface::Chat,
-                                true,
+                            attach_chat_request_context_to_hints(
+                                build_request_execution_hints(
+                                    caller_principal.as_ref(),
+                                    crate::actions::ActionExecutionSurface::Chat,
+                                    true,
+                                ),
+                                attachments_present,
                                 attachments.clone(),
                                 arkorbit_context.clone(),
                             ),
                         )
                         .await
                 } else if user_message_already_recorded {
-                    let mut hints = build_request_execution_hints_with_context(
-                        caller_principal.as_ref(),
-                        crate::actions::ActionExecutionSurface::Chat,
-                        true,
-                        attachments,
-                        arkorbit_context,
-                        accepted_suggestion_context,
+                    let mut hints = attach_chat_request_context_to_hints(
+                        build_request_execution_hints(
+                            caller_principal.as_ref(),
+                            crate::actions::ActionExecutionSurface::Chat,
+                            true,
+                        ),
+                        attachments_present,
+                        attachments.clone(),
+                        arkorbit_context.clone(),
                     );
                     hints.recorded_user_message_id = recorded_user_message_id;
                     agent_snapshot
@@ -4468,13 +4543,15 @@ pub(super) fn spawn_chat_stream_response(
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            build_request_execution_hints_with_context(
-                                caller_principal.as_ref(),
-                                crate::actions::ActionExecutionSurface::Chat,
-                                true,
+                            attach_chat_request_context_to_hints(
+                                build_request_execution_hints(
+                                    caller_principal.as_ref(),
+                                    crate::actions::ActionExecutionSurface::Chat,
+                                    true,
+                                ),
+                                attachments_present,
                                 attachments,
                                 arkorbit_context,
-                                accepted_suggestion_context,
                             ),
                         )
                         .await
@@ -4751,6 +4828,8 @@ pub(super) fn spawn_chat_stream_response(
                     "input_tokens": effective_input_tokens,
                     "output_tokens": effective_output_tokens,
                     "total_tokens": effective_total_tokens,
+                    "cached_prompt_tokens": processed.cached_prompt_tokens,
+                    "cache_creation_prompt_tokens": processed.cache_creation_prompt_tokens,
                     "duration_ms": wall_duration_ms,
                     "trace_duration_ms": trace_metric_snapshot["duration_ms"],
                     "time_to_first_token_ms": first_content_ms,
@@ -4790,6 +4869,8 @@ pub(super) fn spawn_chat_stream_response(
                         "input_tokens": content["input_tokens"],
                         "output_tokens": content["output_tokens"],
                         "total_tokens": content["total_tokens"],
+                        "cached_prompt_tokens": content["cached_prompt_tokens"],
+                        "cache_creation_prompt_tokens": content["cache_creation_prompt_tokens"],
                         "duration_ms": content["duration_ms"],
                         "trace_duration_ms": content["trace_duration_ms"],
                         "time_to_first_token_ms": content["time_to_first_token_ms"],
@@ -5378,19 +5459,22 @@ pub(super) async fn chat_stream(
         };
         let (tx, rx) =
             tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(4);
-        crate::spawn_logged!("src/channels/http.rs:direct_chat_approval_submit", async move {
-            let event_name = if payload.get("error").is_some() {
-                "error"
-            } else {
-                "content"
-            };
-            let _ = tx
-                .send(Ok(Event::default()
-                    .event(event_name)
-                    .data(payload.to_string())))
-                .await;
-            let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
-        });
+        crate::spawn_logged!(
+            "src/channels/http.rs:direct_chat_approval_submit",
+            async move {
+                let event_name = if payload.get("error").is_some() {
+                    "error"
+                } else {
+                    "content"
+                };
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event(event_name)
+                        .data(payload.to_string())))
+                    .await;
+                let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
+            }
+        );
 
         return Sse::new(cap_sse_lifetime(
             tokio_stream::wrappers::ReceiverStream::new(rx),

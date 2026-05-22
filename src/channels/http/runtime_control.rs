@@ -541,11 +541,7 @@ pub(super) async fn build_runtime_health_payload(
         && blocking_startup_issue_count == 0;
     let overall_ok = if readiness_mode { ready } else { true };
     let status_text = if readiness_mode {
-        if ready {
-            "ok"
-        } else {
-            "not_ready"
-        }
+        if ready { "ok" } else { "not_ready" }
     } else if healthy {
         "ok"
     } else {
@@ -889,7 +885,10 @@ pub(super) async fn get_conversation_latest_run(
             .into_response();
     };
 
-    let events = agent.load_persisted_run_events(&run.id).await;
+    let events = match agent.subscribe_live_run(&run.id, Some(0)).await {
+        Some((events, _rx)) => events,
+        None => agent.load_persisted_run_events(&run.id).await,
+    };
 
     (
         StatusCode::OK,
@@ -1879,13 +1878,22 @@ pub(super) async fn get_approval_log(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
     let agent = state.agent.read().await;
+    if let Err(error) = agent.repair_settings_authorized_approval_tasks().await {
+        tracing::warn!(
+            error = %error,
+            "Failed to repair settings-authorized approval tasks before loading approval log"
+        );
+    }
     match agent
         .encrypted_storage
         .get_approval_log_decrypted(limit, offset)
         .await
     {
-        Ok(log) => Json(serde_json::json!({ "approvals": log, "limit": limit, "offset": offset }))
-            .into_response(),
+        Ok(mut log) => {
+            reconcile_stale_task_approval_rows(&agent, &mut log).await;
+            Json(serde_json::json!({ "approvals": log, "limit": limit, "offset": offset }))
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1894,6 +1902,151 @@ pub(super) async fn get_approval_log(
         )
             .into_response(),
     }
+}
+
+async fn reconcile_stale_task_approval_rows(
+    agent: &Agent,
+    rows: &mut [crate::storage::entities::approval_log::Model],
+) {
+    let tasks = agent.tasks.read().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for row in rows {
+        if row.status.as_str() != "pending" || approval_row_is_direct_chat(row) {
+            continue;
+        }
+        if row.action_name == "daily_brief" {
+            if let Err(error) = agent
+                .storage
+                .resolve_approval_request(&row.id, "stale", "settings_authorized_cleanup")
+                .await
+            {
+                tracing::warn!(
+                    approval_id = %row.id,
+                    error = %error,
+                    "failed to reconcile settings-authorized daily brief approval row"
+                );
+                continue;
+            }
+            row.status = "stale".to_string();
+            row.resolved_at = Some(now.clone());
+            row.resolved_by = Some("settings_authorized_cleanup".to_string());
+            continue;
+        }
+        let Ok(task_id) = uuid::Uuid::parse_str(&row.id) else {
+            continue;
+        };
+        let actionable = tasks.all().iter().any(|task| {
+            task.id == task_id
+                && matches!(
+                    task.status,
+                    TaskStatus::AwaitingApproval | TaskStatus::ExpiredNeedsReapproval
+                )
+        });
+        if actionable {
+            continue;
+        }
+        if let Err(error) = agent
+            .storage
+            .resolve_approval_request(&row.id, "stale", "reconcile")
+            .await
+        {
+            tracing::warn!(
+                approval_id = %row.id,
+                error = %error,
+                "failed to reconcile stale task approval row"
+            );
+            continue;
+        }
+        row.status = "stale".to_string();
+        row.resolved_at = Some(now.clone());
+        row.resolved_by = Some("reconcile".to_string());
+    }
+}
+
+fn approval_row_is_direct_chat(row: &crate::storage::entities::approval_log::Model) -> bool {
+    if row.rule_name == "direct_chat_chain_explicit_user_approval"
+        || row.action_name == "__agentark_direct_chat_chain__"
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(&row.arguments)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|object| object.get("calls").is_some() && object.get("expires_at").is_some())
+}
+
+/// Dismiss an approval row or stale approval popup entry without running the action.
+pub(super) async fn dismiss_approval(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<ApprovalDecisionRequest>>,
+) -> Response {
+    let note = body
+        .as_ref()
+        .and_then(|payload| payload.0.comment.as_deref().or(payload.0.reason.as_deref()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Approval dismissed.");
+    let agent = state.agent.read().await;
+    let mut found = false;
+
+    if let Ok(task_id) = uuid::Uuid::parse_str(&id) {
+        match agent.reject_task_request(task_id, "api", note).await {
+            Ok(Some(_)) => {
+                found = true;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to dismiss task approval: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match agent.storage.get_approval_request(&id).await {
+        Ok(Some(row)) => {
+            if matches!(row.status.as_str(), "pending" | "expired") {
+                if let Err(error) = agent
+                    .storage
+                    .resolve_approval_request(&id, "dismissed", "api")
+                    .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to dismiss approval: {}", error),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+            found = true;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load approval: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "dismissed",
+            "found": found,
+        })),
+    )
+        .into_response()
 }
 
 /// Get security event log (persisted in database), with pagination and optional event type filter.
@@ -2077,6 +2230,7 @@ pub(super) async fn get_watchers(State(state): State<AppState>) -> Json<serde_js
                 "status_error": status_error,
                 "interval_secs": w.interval_secs,
                 "timeout_secs": w.timeout_secs,
+                "repeat_on_match": w.repeat_on_match,
                 "poll_count": w.poll_count,
                 "created_at": w.created_at.to_rfc3339(),
                 "last_poll_at": w.last_poll_at.map(|t| t.to_rfc3339()),
@@ -2132,6 +2286,7 @@ pub(super) async fn get_watchers(State(state): State<AppState>) -> Json<serde_js
                     "status_error": status_error,
                     "interval_secs": serde_json::Value::Null,
                     "timeout_secs": serde_json::Value::Null,
+                    "repeat_on_match": serde_json::Value::Null,
                     "poll_count": state.attempt_count,
                     "created_at": created_at,
                     "last_poll_at": state.last_run_at,

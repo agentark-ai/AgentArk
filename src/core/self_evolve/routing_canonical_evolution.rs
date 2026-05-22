@@ -1,11 +1,11 @@
 //! Routing-canonical evolution support.
 //!
-//! This module treats routing canonicals as data artifacts. ArkEvolve can
+//! This module treats routing canonicals as data artifacts. Evolve can
 //! propose semantic canonical changes from replay evidence, gate them, then
 //! promote them into the existing security canonical overlay without changing
 //! router prompt text.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

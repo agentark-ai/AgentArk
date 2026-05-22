@@ -42,6 +42,8 @@ export type OrbitChatUsage = {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
+  cached_prompt_tokens?: number;
+  cache_creation_prompt_tokens?: number;
   cost_usd?: number;
   estimated?: boolean;
   duration_ms?: number;

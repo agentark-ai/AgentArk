@@ -4,8 +4,8 @@ pub mod entities;
 mod migrations;
 
 use crate::crypto::KeyManager;
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sea_orm::entity::prelude::PgVector;
 use sea_orm::sea_query::{
     Alias, Expr, Func, OnConflict, Order, PostgresQueryBuilder, Query, SimpleExpr,
@@ -39,6 +39,8 @@ pub struct HousekeepingStatus {
 pub struct LearnedFactRecord {
     pub id: String,
     pub fact: String,
+    pub key: Option<String>,
+    pub value: String,
     pub confidence: f32,
     pub sources: String,
     pub created_at: String,
@@ -119,6 +121,8 @@ pub struct ExecutionTraceMessageMetrics {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    pub cached_prompt_tokens: i64,
+    pub cache_creation_prompt_tokens: i64,
     pub time_to_first_token_ms: Option<i64>,
 }
 
@@ -336,19 +340,21 @@ mod database_config_tests {
 
     #[test]
     fn test_database_guard_rejects_live_agentark_database() {
-        assert!(ensure_database_url_is_test_scoped(
-            "postgres://agentark:secret@127.0.0.1/agentark"
-        )
-        .is_err());
+        assert!(
+            ensure_database_url_is_test_scoped("postgres://agentark:secret@127.0.0.1/agentark")
+                .is_err()
+        );
         assert!(!database_is_test_scoped("agentark"));
     }
 
     #[test]
     fn test_database_guard_accepts_isolated_test_database() {
-        assert!(ensure_database_url_is_test_scoped(
-            "postgres://agentark:secret@127.0.0.1/agentark_test_123"
-        )
-        .is_ok());
+        assert!(
+            ensure_database_url_is_test_scoped(
+                "postgres://agentark:secret@127.0.0.1/agentark_test_123"
+            )
+            .is_ok()
+        );
         assert!(database_is_test_scoped("agentark_test_123"));
     }
 }
@@ -433,6 +439,14 @@ fn decrypt_optional_storage_string(value: Option<String>) -> Option<String> {
     value.map(|inner| decrypt_storage_string(&inner))
 }
 
+fn decrypt_message_model(model: &mut message::Model) {
+    model.content = decrypt_storage_string(&model.content);
+    model.tool_calls_json = decrypt_optional_storage_string(model.tool_calls_json.take());
+    model.tool_call_id = decrypt_optional_storage_string(model.tool_call_id.take());
+    model.provider_message_json =
+        decrypt_optional_storage_string(model.provider_message_json.take());
+}
+
 fn trace_time_to_first_token_ms(steps_json: &str) -> Option<i64> {
     let steps: Vec<crate::core::ExecutionStep> = serde_json::from_str(steps_json).ok()?;
     steps.into_iter().find_map(|step| {
@@ -454,6 +468,46 @@ fn trace_time_to_first_token_ms(steps_json: &str) -> Option<i64> {
                     .map(|value| value.min(i64::MAX as u64) as i64)
             })
     })
+}
+
+fn trace_prompt_cache_metrics(steps_json: &str) -> (i64, i64) {
+    let Ok(steps) = serde_json::from_str::<Vec<crate::core::ExecutionStep>>(steps_json) else {
+        return (0, 0);
+    };
+    let mut cached_prompt_tokens = 0i64;
+    let mut cache_creation_prompt_tokens = 0i64;
+    for step in steps {
+        let Some(data) = step.data.as_deref() else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if payload.get("event").and_then(|value| value.as_str()) != Some("model_completed") {
+            continue;
+        }
+        cached_prompt_tokens = cached_prompt_tokens.saturating_add(
+            payload
+                .get("cache_read_tokens")
+                .and_then(|value| {
+                    value
+                        .as_i64()
+                        .or_else(|| value.as_u64().map(|v| v.min(i64::MAX as u64) as i64))
+                })
+                .unwrap_or_default(),
+        );
+        cache_creation_prompt_tokens = cache_creation_prompt_tokens.saturating_add(
+            payload
+                .get("cache_creation_tokens")
+                .and_then(|value| {
+                    value
+                        .as_i64()
+                        .or_else(|| value.as_u64().map(|v| v.min(i64::MAX as u64) as i64))
+                })
+                .unwrap_or_default(),
+        );
+    }
+    (cached_prompt_tokens, cache_creation_prompt_tokens)
 }
 
 fn pgvector_sql_literal(embedding: &PgVector) -> String {
@@ -752,6 +806,33 @@ fn learned_fact_category_from_metadata(metadata: &serde_json::Value) -> String {
         .to_string()
 }
 
+fn learned_fact_key_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get("key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub(super) fn learned_fact_value_from_content(key: Option<&str>, content: &str) -> String {
+    let trimmed = content.trim();
+    if let Some(key) = key.map(str::trim).filter(|value| !value.is_empty()) {
+        let prefix = format!("{key}:");
+        if let Some(value) = trimmed.strip_prefix(&prefix) {
+            return value.trim().to_string();
+        }
+        return trimmed.to_string();
+    }
+    if let Some((candidate_key, value)) = trimmed.split_once(':') {
+        let candidate_key = candidate_key.trim();
+        if !candidate_key.is_empty() && !candidate_key.chars().any(char::is_whitespace) {
+            return value.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 fn learned_fact_from_experience_item(item: experience_item::Model) -> LearnedFactRecord {
     let sources = item
         .metadata
@@ -770,9 +851,28 @@ fn learned_fact_from_experience_item(item: experience_item::Model) -> LearnedFac
     )
     .to_string();
     let topics = learned_fact_topics_from_metadata(&item.metadata);
+    let key = learned_fact_key_from_metadata(&item.metadata);
+    let value = learned_fact_value_from_content(key.as_deref(), &item.content);
+    let (key, value) = match key {
+        Some(raw_key) => {
+            let allow_value_suffix_repair =
+                memory_category == crate::core::memory_schema::MEMORY_CATEGORY_PROFILE_FACT;
+            match crate::core::memory_schema::repair_memory_slot_key_and_value(
+                &raw_key,
+                &value,
+                allow_value_suffix_repair,
+            ) {
+                Some((key, repaired_value)) => (Some(key), repaired_value.unwrap_or(value)),
+                None => (Some(raw_key), value),
+            }
+        }
+        None => (None, value),
+    };
     LearnedFactRecord {
         id: item.id,
         fact: item.content,
+        key,
+        value,
         confidence: item.confidence.clamp(0.0, 1.0) as f32,
         sources,
         created_at: item.created_at,
@@ -782,6 +882,70 @@ fn learned_fact_from_experience_item(item: experience_item::Model) -> LearnedFac
         memory_kind,
         memory_category,
         topics,
+    }
+}
+
+#[cfg(test)]
+mod learned_fact_record_tests {
+    use super::*;
+
+    fn learned_fact_test_item(
+        content: &str,
+        metadata: serde_json::Value,
+    ) -> experience_item::Model {
+        let now = "2026-05-22T00:00:00Z".to_string();
+        experience_item::Model {
+            id: "memory-1".to_string(),
+            kind: "personal_fact".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            title: "Learned user memory".to_string(),
+            content: content.to_string(),
+            normalized_key: "user_memory::user_name_alex::permanent".to_string(),
+            confidence: 0.95,
+            support_count: 1,
+            contradiction_count: 0,
+            status: "active".to_string(),
+            metadata,
+            last_supported_at: Some(now.clone()),
+            last_contradicted_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn learned_fact_value_uses_structured_key_as_schema_prefix() {
+        assert_eq!(
+            learned_fact_value_from_content(Some("user_first_name"), "user_first_name: Alex"),
+            "Alex"
+        );
+    }
+
+    #[test]
+    fn learned_fact_value_does_not_strip_unrelated_prefix_when_key_is_known() {
+        assert_eq!(
+            learned_fact_value_from_content(Some("user_first_name"), "display_name: Alex"),
+            "display_name: Alex"
+        );
+    }
+
+    #[test]
+    fn learned_fact_record_repairs_existing_key_that_contains_value() {
+        let record = learned_fact_from_experience_item(learned_fact_test_item(
+            "user_name_alex: The user's name is Alex.",
+            serde_json::json!({
+                "key": "user_name_alex",
+                "memory_kind": "identity",
+                "memory_category": "profile_fact",
+                "topics": ["identity"],
+            }),
+        ));
+
+        assert_eq!(record.key.as_deref(), Some("user_name"));
+        assert_eq!(record.value, "Alex");
     }
 }
 
@@ -1423,9 +1587,42 @@ impl Storage {
                 .decrypt_string(&row.content)
                 .unwrap_or_else(|_| row.content.clone());
             let encrypted = new_key.encrypt_string(&plaintext)?;
+            let tool_calls_json = row
+                .tool_calls_json
+                .as_deref()
+                .map(|value| {
+                    let plaintext = old_key
+                        .decrypt_string(value)
+                        .unwrap_or_else(|_| value.to_string());
+                    new_key.encrypt_string(&plaintext)
+                })
+                .transpose()?;
+            let tool_call_id = row
+                .tool_call_id
+                .as_deref()
+                .map(|value| {
+                    let plaintext = old_key
+                        .decrypt_string(value)
+                        .unwrap_or_else(|_| value.to_string());
+                    new_key.encrypt_string(&plaintext)
+                })
+                .transpose()?;
+            let provider_message_json = row
+                .provider_message_json
+                .as_deref()
+                .map(|value| {
+                    let plaintext = old_key
+                        .decrypt_string(value)
+                        .unwrap_or_else(|_| value.to_string());
+                    new_key.encrypt_string(&plaintext)
+                })
+                .transpose()?;
             message::ActiveModel {
                 id: Unchanged(row.id),
                 content: Set(encrypted),
+                tool_calls_json: Set(tool_calls_json),
+                tool_call_id: Set(tool_call_id),
+                provider_message_json: Set(provider_message_json),
                 ..Default::default()
             }
             .update(&txn)
@@ -1985,6 +2182,8 @@ impl Storage {
             prompt_tokens: Set(usage.prompt_tokens),
             completion_tokens: Set(usage.completion_tokens),
             total_tokens: Set(usage.total_tokens),
+            cached_prompt_tokens: Set(usage.cached_prompt_tokens),
+            cache_creation_prompt_tokens: Set(usage.cache_creation_prompt_tokens),
             estimated: Set(usage.estimated),
             cost_usd: Set(usage.cost_usd),
         }
@@ -3271,6 +3470,8 @@ impl Storage {
             .map(|row| {
                 let task_description = decrypt_storage_string(&row.task_description);
                 let chat_id = row.chat_id.map(|value| decrypt_storage_string(&value));
+                let profile_id = row.profile_id.map(|value| decrypt_storage_string(&value));
+                let profile_name = row.profile_name.map(|value| decrypt_storage_string(&value));
                 let status_detail = row
                     .status_detail
                     .map(|value| decrypt_storage_string(&value));
@@ -3281,6 +3482,8 @@ impl Storage {
                     task_description,
                     channel: row.channel,
                     chat_id,
+                    profile_id,
+                    profile_name,
                     status_detail,
                     action_history: serde_json::from_str(&action_history_json).unwrap_or_default(),
                     created_at: row.created_at,
@@ -3302,6 +3505,8 @@ impl Storage {
         };
         let task_description = decrypt_storage_string(&row.task_description);
         let chat_id = row.chat_id.map(|value| decrypt_storage_string(&value));
+        let profile_id = row.profile_id.map(|value| decrypt_storage_string(&value));
+        let profile_name = row.profile_name.map(|value| decrypt_storage_string(&value));
         let status_detail = row
             .status_detail
             .map(|value| decrypt_storage_string(&value));
@@ -3313,6 +3518,8 @@ impl Storage {
                 task_description,
                 channel: row.channel,
                 chat_id,
+                profile_id,
+                profile_name,
                 status_detail,
                 action_history: serde_json::from_str(&action_history_json).unwrap_or_default(),
                 created_at: row.created_at,
@@ -3331,6 +3538,8 @@ impl Storage {
             task_description: Set(encrypt_storage_string(&session.task_description)?),
             channel: Set(session.channel.clone()),
             chat_id: Set(encrypt_optional_storage_string(session.chat_id.as_deref())?),
+            profile_id: Set(encrypt_optional_storage_string(session.profile_id.as_deref())?),
+            profile_name: Set(encrypt_optional_storage_string(session.profile_name.as_deref())?),
             status_detail: Set(encrypt_optional_storage_string(
                 session.status_detail.as_deref(),
             )?),
@@ -3347,6 +3556,8 @@ impl Storage {
                     browser_session::Column::TaskDescription,
                     browser_session::Column::Channel,
                     browser_session::Column::ChatId,
+                    browser_session::Column::ProfileId,
+                    browser_session::Column::ProfileName,
                     browser_session::Column::StatusDetail,
                     browser_session::Column::ActionHistoryJson,
                     browser_session::Column::UpdatedAt,
@@ -3665,7 +3876,6 @@ impl Storage {
 
     // ==================== Experience Graph ====================
 
-    #[allow(dead_code)]
     pub async fn upsert_experience_run(&self, run: &experience_run::Model) -> Result<()> {
         experience_run::Entity::insert(experience_run::ActiveModel {
             id: Set(run.id.clone()),
@@ -4526,6 +4736,34 @@ impl Storage {
         Self::update_experience_item_status_conn(&txn, id, status).await?;
         txn.commit().await?;
         Ok(())
+    }
+
+    pub async fn update_experience_item_content(
+        &self,
+        id: &str,
+        content: &str,
+    ) -> Result<Option<experience_item::Model>> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let txn = self.db.begin().await?;
+        let Some(previous) = experience_item::Entity::find_by_id(id.to_string())
+            .one(&txn)
+            .await?
+        else {
+            txn.commit().await?;
+            return Ok(None);
+        };
+        let mut next = previous.clone();
+        next.content = content.to_string();
+        next.updated_at = chrono::Utc::now().to_rfc3339();
+        if previous.content != next.content {
+            next.embedding = None;
+        }
+        Self::upsert_experience_item_conn(&txn, &next).await?;
+        txn.commit().await?;
+        Ok(Some(next))
     }
 
     pub async fn list_experience_items_between(
@@ -6661,6 +6899,36 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn upsert_swarm_agent(&self, agent: &swarm_agent::Model) -> Result<()> {
+        swarm_agent::Entity::insert(swarm_agent::ActiveModel {
+            id: Set(agent.id.clone()),
+            name: Set(agent.name.clone()),
+            agent_type: Set(agent.agent_type.clone()),
+            llm_provider: Set(agent.llm_provider.clone()),
+            capabilities: Set(agent.capabilities.clone()),
+            system_prompt: Set(agent.system_prompt.clone()),
+            access_scope: Set(agent.access_scope.clone()),
+            enabled: Set(agent.enabled),
+            created_at: Set(agent.created_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(swarm_agent::Column::Id)
+                .update_columns([
+                    swarm_agent::Column::Name,
+                    swarm_agent::Column::AgentType,
+                    swarm_agent::Column::LlmProvider,
+                    swarm_agent::Column::Capabilities,
+                    swarm_agent::Column::SystemPrompt,
+                    swarm_agent::Column::AccessScope,
+                    swarm_agent::Column::Enabled,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
     /// Get all swarm agents
     pub async fn get_swarm_agents(&self) -> Result<Vec<swarm_agent::Model>> {
         let agents = swarm_agent::Entity::find().all(&self.db).await?;
@@ -6805,8 +7073,13 @@ impl Storage {
         &self,
         parent_task_id: &str,
     ) -> Result<Vec<swarm_delegation::Model>> {
+        let row_id_prefix = format!("{parent_task_id}::");
         let mut delegations = swarm_delegation::Entity::find()
-            .filter(swarm_delegation::Column::ParentTaskId.eq(parent_task_id.to_string()))
+            .filter(
+                Condition::any()
+                    .add(swarm_delegation::Column::ParentTaskId.eq(parent_task_id.to_string()))
+                    .add(swarm_delegation::Column::Id.starts_with(row_id_prefix)),
+            )
             .order_by_asc(swarm_delegation::Column::CreatedAt)
             .limit(Self::MAX_SWARM_DELEGATION_ROWS_PER_QUERY)
             .all(&self.db)
@@ -6914,8 +7187,13 @@ impl Storage {
         summary: &str,
     ) -> Result<u64> {
         let now = chrono::Utc::now().to_rfc3339();
+        let row_id_prefix = format!("{parent_task_id}::");
         let rows = swarm_delegation::Entity::find()
-            .filter(swarm_delegation::Column::ParentTaskId.eq(parent_task_id.to_string()))
+            .filter(
+                Condition::any()
+                    .add(swarm_delegation::Column::ParentTaskId.eq(parent_task_id.to_string()))
+                    .add(swarm_delegation::Column::Id.starts_with(row_id_prefix)),
+            )
             .filter(swarm_delegation::Column::CompletedAt.is_null())
             .all(&self.db)
             .await?;
@@ -7016,7 +7294,7 @@ impl Storage {
 
     /// Find semantically similar derived work units outside a selected time window.
     /// This is intentionally bounded and backed by the semantic_work_units HNSW
-    /// index so ArkReflect can compare the current recap to history without
+    /// index so Reflect can compare the current recap to history without
     /// scanning old rows.
     pub async fn nearest_semantic_work_units_outside_window(
         &self,
@@ -7345,6 +7623,44 @@ impl Storage {
             .filter(execution_run::Column::ConversationId.eq(id.to_string()))
             .all(&txn)
             .await?;
+        let experience_run_rows = experience_run::Entity::find()
+            .filter(experience_run::Column::ConversationId.eq(id.to_string()))
+            .all(&txn)
+            .await?;
+        let experience_run_ids = experience_run_rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let experience_item_rows = experience_item::Entity::find()
+            .filter(experience_item::Column::ConversationId.eq(id.to_string()))
+            .all(&txn)
+            .await?;
+        let experience_item_ids = experience_item_rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let memory_operation_rows = if experience_item_ids.is_empty() {
+            Vec::new()
+        } else {
+            memory_operation::Entity::find()
+                .filter(
+                    Condition::any()
+                        .add(
+                            memory_operation::Column::TargetMemoryId
+                                .is_in(experience_item_ids.clone()),
+                        )
+                        .add(
+                            memory_operation::Column::AppliedMemoryId
+                                .is_in(experience_item_ids.clone()),
+                        ),
+                )
+                .all(&txn)
+                .await?
+        };
+        let memory_operation_ids = memory_operation_rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
         let mut trace_ids = std::collections::BTreeSet::new();
         for row in &message_rows {
             if let Some(trace_id) = row
@@ -7384,6 +7700,93 @@ impl Storage {
             .filter(message::Column::ConversationId.eq(id))
             .exec(&txn)
             .await?;
+        if !experience_item_ids.is_empty() {
+            memory_evidence_link::Entity::delete_many()
+                .filter(memory_evidence_link::Column::MemoryId.is_in(experience_item_ids.clone()))
+                .exec(&txn)
+                .await?;
+            learning_candidate::Entity::delete_many()
+                .filter(learning_candidate::Column::ApprovedRef.is_in(experience_item_ids.clone()))
+                .exec(&txn)
+                .await?;
+            experience_edge::Entity::delete_many()
+                .filter(
+                    Condition::any()
+                        .add(
+                            Condition::all()
+                                .add(experience_edge::Column::SourceKind.eq("experience_item"))
+                                .add(
+                                    experience_edge::Column::SourceRef
+                                        .is_in(experience_item_ids.clone()),
+                                ),
+                        )
+                        .add(
+                            Condition::all()
+                                .add(experience_edge::Column::TargetKind.eq("experience_item"))
+                                .add(
+                                    experience_edge::Column::TargetRef
+                                        .is_in(experience_item_ids.clone()),
+                                ),
+                        ),
+                )
+                .exec(&txn)
+                .await?;
+            recall_event::Entity::delete_many()
+                .filter(
+                    Condition::any()
+                        .add(recall_event::Column::MemoryId.is_in(experience_item_ids.clone()))
+                        .add(
+                            recall_event::Column::RelatedMemoryId
+                                .is_in(experience_item_ids.clone()),
+                        )
+                        .add(
+                            Condition::all()
+                                .add(recall_event::Column::SourceKind.eq("experience_item"))
+                                .add(
+                                    recall_event::Column::SourceRef
+                                        .is_in(experience_item_ids.clone()),
+                                ),
+                        ),
+                )
+                .exec(&txn)
+                .await?;
+        }
+        if !memory_operation_ids.is_empty() {
+            memory_evidence_link::Entity::delete_many()
+                .filter(
+                    memory_evidence_link::Column::OperationId.is_in(memory_operation_ids.clone()),
+                )
+                .exec(&txn)
+                .await?;
+            let candidate_ids = memory_operation_ids
+                .iter()
+                .map(|operation_id| format!("memory-candidate-{operation_id}"))
+                .collect::<Vec<_>>();
+            learning_candidate::Entity::delete_many()
+                .filter(learning_candidate::Column::Id.is_in(candidate_ids))
+                .exec(&txn)
+                .await?;
+            memory_operation::Entity::delete_many()
+                .filter(memory_operation::Column::Id.is_in(memory_operation_ids))
+                .exec(&txn)
+                .await?;
+        }
+        if !experience_run_ids.is_empty() {
+            experience_edge::Entity::delete_many()
+                .filter(experience_edge::Column::SourceRunId.is_in(experience_run_ids.clone()))
+                .exec(&txn)
+                .await?;
+            experience_run::Entity::delete_many()
+                .filter(experience_run::Column::Id.is_in(experience_run_ids))
+                .exec(&txn)
+                .await?;
+        }
+        if !experience_item_ids.is_empty() {
+            experience_item::Entity::delete_many()
+                .filter(experience_item::Column::Id.is_in(experience_item_ids))
+                .exec(&txn)
+                .await?;
+        }
         operational_log::Entity::delete_many()
             .filter(operational_log::Column::ConversationId.eq(id.to_string()))
             .exec(&txn)
@@ -7432,11 +7835,18 @@ impl Storage {
     /// Insert a message
     pub async fn insert_message(&self, msg: &message::Model) -> Result<()> {
         let content = encrypt_storage_string(&msg.content)?;
+        let tool_calls_json = encrypt_optional_storage_string(msg.tool_calls_json.as_deref())?;
+        let tool_call_id = encrypt_optional_storage_string(msg.tool_call_id.as_deref())?;
+        let provider_message_json =
+            encrypt_optional_storage_string(msg.provider_message_json.as_deref())?;
         let insert_result = message::ActiveModel {
             id: Set(msg.id.clone()),
             conversation_id: Set(msg.conversation_id.clone()),
             role: Set(msg.role.clone()),
             content: Set(content.clone()),
+            tool_calls_json: Set(tool_calls_json.clone()),
+            tool_call_id: Set(tool_call_id.clone()),
+            provider_message_json: Set(provider_message_json.clone()),
             timestamp: Set(msg.timestamp.clone()),
             model_used: Set(msg.model_used.clone()),
             trace_id: Set(msg.trace_id.clone()),
@@ -7455,6 +7865,9 @@ impl Storage {
                     conversation_id: Set(msg.conversation_id.clone()),
                     role: Set(msg.role.clone()),
                     content: Set(content),
+                    tool_calls_json: Set(tool_calls_json),
+                    tool_call_id: Set(tool_call_id),
+                    provider_message_json: Set(provider_message_json),
                     timestamp: Set(msg.timestamp.clone()),
                     model_used: Set(msg.model_used.clone()),
                     trace_id: Set(None),
@@ -7520,7 +7933,7 @@ impl Storage {
             .one(&self.db)
             .await?;
         if let Some(message) = &mut message {
-            message.content = decrypt_storage_string(&message.content);
+            decrypt_message_model(message);
         }
         Ok(message)
     }
@@ -7540,7 +7953,7 @@ impl Storage {
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
-            msg.content = decrypt_storage_string(&msg.content);
+            decrypt_message_model(msg);
         }
         Ok(msgs)
     }
@@ -7563,7 +7976,7 @@ impl Storage {
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
-            msg.content = decrypt_storage_string(&msg.content);
+            decrypt_message_model(msg);
         }
         Ok(msgs)
     }
@@ -7582,7 +7995,7 @@ impl Storage {
             .await?;
         msgs.reverse();
         for msg in &mut msgs {
-            msg.content = decrypt_storage_string(&msg.content);
+            decrypt_message_model(msg);
         }
         Ok(msgs)
     }
@@ -7613,7 +8026,7 @@ impl Storage {
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
-            msg.content = decrypt_storage_string(&msg.content);
+            decrypt_message_model(msg);
         }
         Ok(msgs)
     }
@@ -7629,7 +8042,7 @@ impl Storage {
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
-            msg.content = decrypt_storage_string(&msg.content);
+            decrypt_message_model(msg);
         }
         Ok(msgs)
     }
@@ -8732,11 +9145,15 @@ impl Storage {
         Ok(rows
             .into_iter()
             .map(|row| {
+                let (cached_prompt_tokens, cache_creation_prompt_tokens) =
+                    trace_prompt_cache_metrics(&row.steps_json);
                 let metrics = ExecutionTraceMessageMetrics {
                     duration_ms: row.duration_ms.map(i64::from),
                     input_tokens: i64::from(row.input_tokens),
                     output_tokens: i64::from(row.output_tokens),
                     total_tokens: i64::from(row.total_tokens),
+                    cached_prompt_tokens,
+                    cache_creation_prompt_tokens,
                     time_to_first_token_ms: trace_time_to_first_token_ms(&row.steps_json),
                 };
                 (row.id, metrics)
@@ -8873,9 +9290,9 @@ impl Storage {
         Ok(result.rows_affected)
     }
 
-    // ==================== ArkPulse History ====================
+    // ==================== Pulse History ====================
 
-    /// Insert an ArkPulse history event row.
+    /// Insert an Pulse history event row.
     pub async fn insert_arkpulse_event(&self, event: &arkpulse_event::Model) -> Result<()> {
         arkpulse_event::Entity::insert(arkpulse_event::ActiveModel {
             id: Set(event.id.clone()),
@@ -8898,7 +9315,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Count persisted ArkPulse history rows.
+    /// Count persisted Pulse history rows.
     pub async fn count_arkpulse_events(&self) -> Result<u64> {
         arkpulse_event::Entity::find()
             .count(&self.db)
@@ -8906,7 +9323,7 @@ impl Storage {
             .map_err(Into::into)
     }
 
-    /// List ArkPulse history rows (newest first).
+    /// List Pulse history rows (newest first).
     pub async fn list_arkpulse_events(&self, limit: u64) -> Result<Vec<arkpulse_event::Model>> {
         let mut rows = arkpulse_event::Entity::find()
             .order_by_desc(arkpulse_event::Column::Timestamp)
@@ -8922,7 +9339,7 @@ impl Storage {
         Ok(rows)
     }
 
-    /// List ArkPulse history rows inside a bounded time window.
+    /// List Pulse history rows inside a bounded time window.
     #[allow(dead_code)]
     pub async fn list_arkpulse_events_between(
         &self,
@@ -8946,7 +9363,7 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Delete ArkPulse history rows older than the provided cutoff.
+    /// Delete Pulse history rows older than the provided cutoff.
     pub async fn delete_arkpulse_events_before(&self, cutoff_rfc3339: &str) -> Result<u64> {
         let result = arkpulse_event::Entity::delete_many()
             .filter(arkpulse_event::Column::Timestamp.lt(cutoff_rfc3339.to_string()))
@@ -8955,7 +9372,7 @@ impl Storage {
         Ok(result.rows_affected)
     }
 
-    /// Delete ArkPulse history rows by explicit IDs.
+    /// Delete Pulse history rows by explicit IDs.
     pub async fn delete_arkpulse_events_by_ids(&self, ids: &[String]) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
@@ -8967,7 +9384,7 @@ impl Storage {
         Ok(result.rows_affected)
     }
 
-    /// Return ArkPulse history IDs that exceed the latest retained window.
+    /// Return Pulse history IDs that exceed the latest retained window.
     pub async fn list_arkpulse_event_ids_beyond_latest(
         &self,
         keep_latest: u64,

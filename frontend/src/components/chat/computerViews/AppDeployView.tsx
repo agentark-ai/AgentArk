@@ -31,12 +31,82 @@ interface DeployPayload {
   files: DeployFile[];
 }
 
+interface ServiceSummary {
+  id?: string;
+  title?: string;
+  url?: string;
+  status?: string;
+  type?: string;
+  running?: boolean;
+  enabled?: boolean;
+}
+
+interface ServiceManagePayload {
+  status?: string;
+  message?: string;
+  service?: ServiceSummary;
+  services: ServiceSummary[];
+  serviceCount?: number;
+  query?: string;
+  serviceId?: string;
+}
+
+interface ParsedPayload {
+  deploy: DeployPayload;
+  serviceManage?: ServiceManagePayload;
+}
+
 function safeParse(body: string): unknown {
   try {
     return JSON.parse(body);
   } catch {
     return null;
   }
+}
+
+function extractFirstJsonObject(body: string): unknown {
+  const start = body.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let idx = start; idx < body.length; idx += 1) {
+    const ch = body[idx];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+    } else if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return safeParse(body.slice(start, idx + 1));
+    }
+  }
+  return null;
+}
+
+function parseStructuredBody(body: string): unknown {
+  return safeParse(body) || extractFirstJsonObject(body);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -115,7 +185,52 @@ function mergeDeployFiles(
   return Array.from(merged.values());
 }
 
-function parsePayload(card: ChatStepCard): DeployPayload {
+function normalizeService(value: unknown): ServiceSummary | undefined {
+  const rec = asRecord(value);
+  if (!rec) return undefined;
+  const id = asString(rec.id) || asString(rec.app_id) || asString(rec.service_id);
+  const title = asString(rec.title) || asString(rec.name);
+  const url = asString(rec.url) || asString(rec.access_url);
+  const status = asString(rec.status);
+  const type = asString(rec.type) || asString(rec.kind);
+  const running = typeof rec.running === "boolean" ? rec.running : undefined;
+  const enabled = typeof rec.enabled === "boolean" ? rec.enabled : undefined;
+  if (!id && !title && !url && !status) return undefined;
+  return { id, title, url, status, type, running, enabled };
+}
+
+function parseServiceManagePayload(parsed: unknown): ServiceManagePayload | undefined {
+  const rec = asRecord(parsed);
+  if (!rec) return undefined;
+  const data = asRecord(rec.data);
+  const candidates = data ? [data, rec] : [rec];
+  for (const candidate of candidates) {
+    const tool = asString(candidate.tool) || asString(rec.tool);
+    const hasServiceShape =
+      Boolean(candidate.service) ||
+      Array.isArray(candidate.services) ||
+      candidate.service_count !== undefined ||
+      candidate.service_id !== undefined;
+    if (tool !== "service_manage" && !hasServiceShape) continue;
+    const services = Array.isArray(candidate.services)
+      ? candidate.services.map(normalizeService).filter((item): item is ServiceSummary => Boolean(item))
+      : [];
+    const service = normalizeService(candidate.service);
+    const serviceCount = asNumber(candidate.service_count) ?? services.length + (service ? 1 : 0);
+    return {
+      status: asString(candidate.status) || asString(rec.status),
+      message: asString(candidate.message) || asString(rec.detail) || asString(candidate.detail),
+      service,
+      services,
+      serviceCount,
+      query: asString(candidate.query),
+      serviceId: asString(candidate.service_id),
+    };
+  }
+  return undefined;
+}
+
+function parsePayload(card: ChatStepCard): ParsedPayload {
   const surfaceUrl = firstSurfaceUri(card);
   const surfaceFiles = normalizeFiles(
     surfacePayloads(card)
@@ -137,26 +252,29 @@ function parsePayload(card: ChatStepCard): DeployPayload {
     card.detail ||
     card.summary ||
     "";
-  const parsed = safeParse(body);
+  const parsed = parseStructuredBody(body);
   let appId: string | undefined;
   let url: string | undefined = surfaceUrl || undefined;
   let files: DeployFile[] = surfaceFiles;
+  const serviceManage = parseServiceManagePayload(parsed);
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const rec = parsed as Record<string, unknown>;
-    if (typeof rec.app_id === "string") appId = rec.app_id;
-    if (typeof rec.url === "string") url = rec.url;
-    else if (typeof rec.app_url === "string") url = rec.app_url;
-    else if (typeof rec.dashboard_url === "string") url = rec.dashboard_url;
-    files = normalizeFiles(rec.files);
-    if (files.length === 0) files = normalizeFiles(rec.sources);
-    if (files.length === 0 && Array.isArray(rec.file_names)) {
-      files = (rec.file_names as unknown[])
+    const data = asRecord(rec.data);
+    const source = data || rec;
+    if (typeof source.app_id === "string") appId = source.app_id;
+    if (typeof source.url === "string") url = source.url;
+    else if (typeof source.app_url === "string") url = source.app_url;
+    else if (typeof source.dashboard_url === "string") url = source.dashboard_url;
+    files = normalizeFiles(source.files);
+    if (files.length === 0) files = normalizeFiles(source.sources);
+    if (files.length === 0 && Array.isArray(source.file_names)) {
+      files = (source.file_names as unknown[])
         .filter((value): value is string => typeof value === "string")
         .filter(isDeployFilePath)
         .map((path) => ({ path }));
     }
   }
-  return { appId, url, files };
+  return { deploy: { appId, url, files }, serviceManage };
 }
 
 function formatKb(bytes?: number): string | null {
@@ -166,12 +284,107 @@ function formatKb(bytes?: number): string | null {
   return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
 }
 
+function ServiceManageView({
+  card,
+  payload,
+}: {
+  card: ChatStepCard;
+  payload: ServiceManagePayload;
+}) {
+  const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
+  const rows = payload.service
+    ? [payload.service]
+    : payload.services;
+  const title = card.label || "Service manage";
+  const status = payload.status || (rows.length > 0 ? "ok" : "empty");
+  const statusClass = status.replace(/[^a-z0-9_-]/gi, "_");
+  const copyUrl = (url?: string) => {
+    if (!url) return;
+    void navigator.clipboard.writeText(url).then(() => {
+      setCopiedUrl(url);
+      window.setTimeout(() => setCopiedUrl(null), 1500);
+    });
+  };
+
+  return (
+    <Box className="cview cview-deploy cview-service-manage">
+      <Box className="cview-deploy-head">
+        <Box className="cview-deploy-title">
+          <Typography component="span" variant="subtitle2">{title}</Typography>
+          <Box component="span" className={`cview-service-status cview-service-status-${statusClass}`}>
+            {status}
+          </Box>
+        </Box>
+      </Box>
+      {payload.message ? (
+        <Typography variant="body2" className="cview-service-message">
+          {payload.message}
+        </Typography>
+      ) : null}
+      <Box className="cview-deploy-files-head">
+        <Typography component="span" variant="caption">Managed services</Typography>
+        <Typography component="span" variant="caption">{payload.serviceCount ?? rows.length}</Typography>
+      </Box>
+      {rows.length === 0 ? (
+        <Typography variant="body2" className="cview-service-empty">
+          No matching managed app or service is registered.
+        </Typography>
+      ) : (
+        <Box className="cview-service-list" role="list">
+          {rows.slice(0, 8).map((service, idx) => {
+            const label = service.title || service.id || "Managed service";
+            return (
+              <Box className="cview-service-row" role="listitem" key={`${service.id || label}-${idx}`}>
+                <Box className="cview-service-row-main">
+                  <Typography component="span" variant="body2" title={label}>
+                    {label}
+                  </Typography>
+                  <span className="cview-service-row-meta">
+                    {[service.id, service.type, service.status].filter(Boolean).join(" · ")}
+                  </span>
+                </Box>
+                <Box className="cview-deploy-actions">
+                  <Tooltip title="Open in new tab">
+                    <span>
+                      <IconButton
+                        size="small"
+                        disabled={!service.url}
+                        onClick={() => service.url && window.open(service.url, "_blank", "noopener,noreferrer")}
+                        aria-label="Open managed service"
+                      >
+                        <OpenInNewRounded fontSize="small" />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                  <Tooltip title={copiedUrl === service.url ? "Copied" : "Copy URL"}>
+                    <span>
+                      <IconButton
+                        size="small"
+                        disabled={!service.url}
+                        onClick={() => copyUrl(service.url)}
+                        aria-label="Copy managed service URL"
+                      >
+                        <ContentCopyRounded fontSize="small" />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </Box>
+              </Box>
+            );
+          })}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
 export function AppDeployView({
   card,
   onOpenFile,
   workspaceFiles = [],
 }: AppDeployViewProps) {
-  const payload = useMemo(() => parsePayload(card), [card]);
+  const parsed = useMemo(() => parsePayload(card), [card]);
+  const payload = parsed.deploy;
   const files = useMemo(
     () => mergeDeployFiles(payload.files, workspaceFiles),
     [payload.files, workspaceFiles],
@@ -186,6 +399,10 @@ export function AppDeployView({
       window.setTimeout(() => setCopied(false), 1500);
     });
   };
+
+  if (parsed.serviceManage) {
+    return <ServiceManageView card={card} payload={parsed.serviceManage} />;
+  }
 
   return (
     <Box className="cview cview-deploy">

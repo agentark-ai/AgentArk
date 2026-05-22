@@ -1,4 +1,3 @@
-import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import {
   Alert,
   Box,
@@ -9,7 +8,6 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
-  IconButton,
   Stack,
   Tab,
   Table,
@@ -19,14 +17,13 @@ import {
   TableHead,
   TableRow,
   Tabs,
-  Tooltip,
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
-import MemoryPage from "./MemoryPage";
+import CurrentMemoryPage from "./MemoryPage";
 import {
   asRecord,
   errMessage,
@@ -43,6 +40,18 @@ const HEALTH_FINDINGS_PAGE_SIZE = 2;
 
 function arkmemoryHistoryEventVisible(event: JsonRecord): boolean {
   const type = str(event.event_type, "").trim();
+  const hasCurrentMemoryState = Object.prototype.hasOwnProperty.call(
+    event,
+    "memory_current_exists",
+  );
+  const currentMemoryMissing =
+    hasCurrentMemoryState && !toBool(event.memory_current_exists);
+  if (
+    currentMemoryMissing &&
+    (type === "memory_created" || type === "memory_updated")
+  ) {
+    return false;
+  }
   return [
     "memory_created",
     "memory_updated",
@@ -78,6 +87,72 @@ function arkmemoryHistoryTypeLabel(event: JsonRecord): string {
     default:
       return "Change";
   }
+}
+
+function arkmemoryHistoryChipPalette(label: string): {
+  color: string;
+  borderColor: string;
+  background: string;
+} {
+  switch (label) {
+    case "Added":
+      return {
+        color: "#7be3a1",
+        borderColor: "rgba(123, 227, 161, 0.34)",
+        background: "rgba(123, 227, 161, 0.08)",
+      };
+    case "Updated":
+      return {
+        color: "#d8ad78",
+        borderColor: "rgba(216, 173, 120, 0.34)",
+        background: "rgba(216, 173, 120, 0.08)",
+      };
+    case "Archived":
+      return {
+        color: "#e3c47b",
+        borderColor: "rgba(227, 196, 123, 0.34)",
+        background: "rgba(227, 196, 123, 0.08)",
+      };
+    case "Consolidated":
+      return {
+        color: "#b07bd9",
+        borderColor: "rgba(176, 123, 217, 0.34)",
+        background: "rgba(176, 123, 217, 0.08)",
+      };
+    case "Rollback":
+      return {
+        color: "#c8d8c9",
+        borderColor: "rgba(200, 216, 201, 0.34)",
+        background: "rgba(200, 216, 201, 0.08)",
+      };
+    case "Rejected":
+      return {
+        color: "#e37b8a",
+        borderColor: "rgba(227, 123, 138, 0.34)",
+        background: "rgba(227, 123, 138, 0.08)",
+      };
+    default:
+      return {
+        color: "rgba(220, 220, 220, 0.78)",
+        borderColor: "rgba(255, 255, 255, 0.18)",
+        background: "rgba(255, 255, 255, 0.04)",
+      };
+  }
+}
+
+function arkmemoryHistoryPreviewParts(preview: string): {
+  key: string;
+  value: string;
+} {
+  const colonIdx = preview.indexOf(":");
+  if (colonIdx > 0 && colonIdx < 80) {
+    const key = preview.slice(0, colonIdx).trim();
+    const value = preview.slice(colonIdx + 1).trim();
+    if (key.length > 0 && value.length > 0 && !/\s/.test(key)) {
+      return { key, value };
+    }
+  }
+  return { key: "", value: preview };
 }
 
 function arkmemoryHistoryMemoryTitle(event: JsonRecord): string {
@@ -233,15 +308,15 @@ function healthSourceTitle(source: JsonRecord): string {
   return "Source message";
 }
 
-type ArkMemoryPageProps = {
+type MemoryPageProps = {
   autoRefresh: boolean;
   onNavigateToView?: (view: string, replace?: boolean) => void;
 };
 
-export default function ArkMemoryPage({
+export default function MemoryPage({
   autoRefresh,
   onNavigateToView,
-}: ArkMemoryPageProps) {
+}: MemoryPageProps) {
   const queryClient = useQueryClient();
   const [historyPage, setHistoryPage] = useState(0);
   const [historyDialogEvent, setHistoryDialogEvent] = useState<JsonRecord | null>(null);
@@ -253,7 +328,7 @@ export default function ArkMemoryPage({
   const [healthDetailsOpen, setHealthDetailsOpen] = useState(false);
   const [healthPage, setHealthPage] = useState(0);
   const [captureDetailsOpen, setCaptureDetailsOpen] = useState(false);
-  const invalidateArkMemory = async () => {
+  const invalidateMemory = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["arkmemory-summary"] }),
       queryClient.invalidateQueries({ queryKey: ["arkmemory-queue"] }),
@@ -293,7 +368,7 @@ export default function ArkMemoryPage({
       api.rawPost(`/arkmemory/queue/${encodeURIComponent(id)}/approve`),
     onSuccess: async () => {
       setNotice("Memory queue item applied.");
-      await invalidateArkMemory();
+      await invalidateMemory();
     },
   });
   const rejectQueueMutation = useMutation({
@@ -301,7 +376,7 @@ export default function ArkMemoryPage({
       api.rawPost(`/arkmemory/queue/${encodeURIComponent(id)}/reject`),
     onSuccess: async () => {
       setNotice("Memory queue item rejected.");
-      await invalidateArkMemory();
+      await invalidateMemory();
     },
   });
   const rollbackMutation = useMutation({
@@ -309,7 +384,7 @@ export default function ArkMemoryPage({
       api.rawPost(`/arkmemory/ledger/${encodeURIComponent(id)}/rollback`),
     onSuccess: async () => {
       setNotice("Memory restored from history.");
-      await invalidateArkMemory();
+      await invalidateMemory();
     },
   });
   const applyHealthMutation = useMutation({
@@ -325,7 +400,7 @@ export default function ArkMemoryPage({
       }),
     onSuccess: async () => {
       setNotice("Memory health finding marked reviewed.");
-      await invalidateArkMemory();
+      await invalidateMemory();
     },
   });
 
@@ -419,37 +494,6 @@ export default function ArkMemoryPage({
     rejectQueueMutation.error ||
     rollbackMutation.error ||
     applyHealthMutation.error;
-  const memoryTabValue =
-    memoryTab === "current" ? 0 : memoryTab === "queue" ? 1 : showQueueTab ? 2 : 1;
-
-  const statItems: Array<{
-    label: string;
-    value: number;
-    helper: string;
-    onClick?: () => void;
-  }> = [
-    { label: "Current Memory", value: memoryTotal, helper: "Stored items" },
-    ...(showQueueTab
-      ? [
-          {
-            label: "Pending Review",
-            value: queueItems.length,
-            helper: "Memory changes",
-          },
-        ]
-      : []),
-    ...(pendingConsolidation > 0
-      ? [
-          {
-            label: "Queued",
-            value: pendingConsolidation,
-            helper: "Consolidating",
-            onClick: () => setCaptureDetailsOpen(true),
-          },
-        ]
-      : []),
-    { label: "History", value: historyEvents.length, helper: "Changes and rollbacks" },
-  ];
   const emptyState = (copy: string) => (
     <Typography variant="body2" sx={{ color: "text.secondary" }}>
       {copy}
@@ -460,14 +504,8 @@ export default function ArkMemoryPage({
     <WorkspacePageShell spacing={1.5}>
       <WorkspacePageHeader
         eyebrow="ARK CORE"
-        title="ArkMemory"
-        description={
-          <>
-            ArkMemory is what the agent remembers about you and your work.
-            <br />
-            ArkMemory separates profile facts, assistant preferences, work preferences, domain memory, user data, and useful knowledge gathered from chats and background signals.
-          </>
-        }
+        title="Memory"
+        description="Durable facts, preferences, and knowledge Memory keeps about you."
       />
       {notice ? (
         <Alert severity="success" onClose={() => setNotice(null)}>
@@ -477,28 +515,10 @@ export default function ArkMemoryPage({
       {firstError ? (
         <Alert severity="error">{errMessage(firstError)}</Alert>
       ) : null}
-      <Stack
-        direction="row"
-        spacing={0.45}
-        sx={{ alignItems: "center", color: "text.secondary" }}
-      >
-        <Tooltip
-          title="ArkMemory consolidates background signals outside the active chat, so newly saved memories take a little time to show up here."
-          arrow
-          placement="top-start"
-        >
-          <IconButton
-            size="small"
-            aria-label="ArkMemory consolidation timing details"
-            sx={{ p: 0.2, color: "text.secondary" }}
-          >
-            <InfoOutlinedIcon sx={{ fontSize: 16 }} />
-          </IconButton>
-        </Tooltip>
-        <Typography variant="body2" sx={{ color: "text.secondary" }}>
-          New memories may take a moment to appear.
-        </Typography>
-      </Stack>
+      {/* Removed "New memories may take a moment to appear" toast — it's
+          static once-and-done copy that became noise on every visit. The
+          consolidation tooltip lives on the inline "Queued" stat chip
+          below when pendingConsolidation > 0. */}
       {pendingConsolidation > 0 ? (
         <Alert
           severity="info"
@@ -513,8 +533,8 @@ export default function ArkMemoryPage({
           }
         >
           {pendingConsolidation === 1
-            ? "1 memory signal is queued for ArkMemory consolidation."
-            : `${pendingConsolidation} memory signals are queued for ArkMemory consolidation.`}
+            ? "1 memory signal is queued for Memory consolidation."
+            : `${pendingConsolidation} memory signals are queued for Memory consolidation.`}
         </Alert>
       ) : null}
       {failedCaptureCount > 0 ? (
@@ -576,28 +596,12 @@ export default function ArkMemoryPage({
         </Box>
       ) : null}
 
-      <Box className="list-shell stat-strip">
-        {statItems.map((item) =>
-          item.onClick ? (
-            <button
-              key={item.label}
-              type="button"
-              className="stat-strip-item stat-strip-button"
-              onClick={item.onClick}
-            >
-              <span className="stat-strip-label">{item.label}</span>
-              <span className="stat-strip-value">{item.value}</span>
-              <span className="stat-strip-helper">{item.helper}</span>
-            </button>
-          ) : (
-            <div key={item.label} className="stat-strip-item">
-              <span className="stat-strip-label">{item.label}</span>
-              <span className="stat-strip-value">{item.value}</span>
-              <span className="stat-strip-helper">{item.helper}</span>
-            </div>
-          ),
-        )}
-      </Box>
+      {/* Stat chips removed: counts for Current Memory / History already
+          render inside their tabs immediately below this header, and
+          transient state (Pending Review, Queued, Failed) already
+          surfaces through the Alert banners above. Two channels —
+          tabs for counts, alerts for transient state — instead of
+          three competing channels. */}
 
       <Dialog
         open={healthDetailsOpen}
@@ -965,7 +969,7 @@ export default function ArkMemoryPage({
         maxWidth="md"
         fullWidth
       >
-        <DialogTitle>ArkMemory Consolidation</DialogTitle>
+        <DialogTitle>Memory Consolidation</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.25}>
             {summaryQ.isLoading ? (
@@ -1085,33 +1089,40 @@ export default function ArkMemoryPage({
         </DialogActions>
       </Dialog>
 
-      <Tabs
-        value={memoryTabValue}
-        onChange={(_event, next) => {
-          if (next === 0) {
-            setMemoryTab("current");
-            return;
-          }
-          if (showQueueTab && next === 1) {
-            setMemoryTab("queue");
-            return;
-          }
-          setMemoryTab("history");
-        }}
-        variant="scrollable"
-        allowScrollButtonsMobile
-        sx={{
-          minHeight: 0,
-          "& .MuiTab-root": { minHeight: 0, py: 0.5, fontSize: "0.8rem" },
-        }}
+      <Box
+        className="list-shell workspace-page-subnav-shell"
+        data-tour-target="arkmemory-tabs"
       >
-        <Tab label="Current Memory" />
-        {showQueueTab ? <Tab label={`Pending Review (${queueItems.length})`} /> : null}
-        <Tab label={`History (${historyEvents.length})`} />
-      </Tabs>
+        <Stack
+          direction="row"
+          sx={{
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <Tabs
+            value={memoryTab}
+            onChange={(_event, next) => {
+              if (next === "current" || next === "queue" || next === "history") {
+                setMemoryTab(next);
+              }
+            }}
+            variant="scrollable"
+            allowScrollButtonsMobile
+            className="workspace-page-subnav-tabs"
+            sx={{ flex: 1 }}
+          >
+            <Tab value="current" label={`Current Memory (${memoryTotal})`} />
+            {showQueueTab ? (
+              <Tab value="queue" label={`Pending Review (${queueItems.length})`} />
+            ) : null}
+            <Tab value="history" label={`History (${historyEvents.length})`} />
+          </Tabs>
+        </Stack>
+      </Box>
 
       {memoryTab === "current" ? (
-        <MemoryPage
+        <CurrentMemoryPage
           autoRefresh={autoRefresh}
           showHeader={false}
           showScopeControls={false}
@@ -1186,7 +1197,7 @@ export default function ArkMemoryPage({
                         </TableCell>
                         <TableCell>{str(item.candidate_type)}</TableCell>
                         <TableCell
-                          title="How sure ArkMemory is about this candidate, based on repeated signals."
+                          title="How sure Memory is about this candidate, based on repeated signals."
                         >
                           {`${(num(item.confidence, 0) * 100).toFixed(0)}%`}
                         </TableCell>
@@ -1246,7 +1257,7 @@ export default function ArkMemoryPage({
               );
               if (usefulHistory.length === 0) {
                 return emptyState(
-                  "No memory changes to show yet. Once ArkMemory adds, updates, or retires a saved fact, preference, or note, the change shows up here so you can review or undo it.",
+                  "No memory changes to show yet. Once Memory adds, updates, or retires a saved fact, preference, or note, the change shows up here so you can review or undo it.",
                 );
               }
               const pageCount = Math.max(
@@ -1258,7 +1269,7 @@ export default function ArkMemoryPage({
               const slice = usefulHistory.slice(start, start + HISTORY_PAGE_SIZE);
               return (
                 <>
-                  <Stack spacing={0.4}>
+                  <Stack spacing={0.6}>
                     {slice.map((event, idx) => {
                       const id = str(event.id, `history-${start + idx}`);
                       const created = humanTs(str(event.created_at, "-"));
@@ -1277,6 +1288,11 @@ export default function ArkMemoryPage({
                           : "";
                       const restoreTargetId = directRestoreId || linkedRestoreId;
                       const preview = arkmemoryHistoryPreview(event);
+                      const typeLabel = arkmemoryHistoryTypeLabel(event);
+                      const typePalette =
+                        arkmemoryHistoryChipPalette(typeLabel);
+                      const previewParts =
+                        arkmemoryHistoryPreviewParts(preview);
                       return (
                         <Box
                           key={id}
@@ -1292,17 +1308,27 @@ export default function ArkMemoryPage({
                           sx={{
                             display: "flex",
                             alignItems: "center",
-                            gap: 1,
-                            px: 1.25,
-                            py: 0.9,
-                            borderRadius: 1,
-                            border: "1px solid transparent",
+                            gap: 1.25,
+                            px: 1.5,
+                            py: 1.1,
+                            borderRadius: 1.5,
+                            border: "1px solid rgba(255, 255, 255, 0.06)",
+                            background: "rgba(255, 255, 255, 0.018)",
                             cursor: "pointer",
                             transition:
                               "background 0.16s ease, border-color 0.16s ease",
+                            "& .arkmemory-history-chevron": {
+                              opacity: 0.45,
+                              transition:
+                                "opacity 0.16s ease, transform 0.16s ease",
+                            },
                             "&:hover": {
-                              background: "var(--ui-rgba-255-255-255-035)",
-                              borderColor: "var(--ui-rgba-255-255-255-080)",
+                              background: "rgba(255, 255, 255, 0.04)",
+                              borderColor: "rgba(255, 255, 255, 0.14)",
+                              "& .arkmemory-history-chevron": {
+                                opacity: 0.95,
+                                transform: "translateX(2px)",
+                              },
                             },
                             "&:focus-visible": {
                               outline: "2px solid #78f2b0",
@@ -1313,49 +1339,123 @@ export default function ArkMemoryPage({
                           <Chip
                             size="small"
                             variant="outlined"
-                            label={arkmemoryHistoryTypeLabel(event)}
-                            sx={{ flex: "0 0 auto" }}
+                            label={typeLabel}
+                            sx={{
+                              flex: "0 0 auto",
+                              height: 22,
+                              fontSize: "0.66rem",
+                              fontWeight: 600,
+                              letterSpacing: "0.06em",
+                              textTransform: "uppercase",
+                              color: typePalette.color,
+                              borderColor: typePalette.borderColor,
+                              background: typePalette.background,
+                              "& .MuiChip-label": { px: 1 },
+                            }}
                           />
                           {revertedAt ? (
                             <Chip
                               size="small"
                               variant="outlined"
                               label="Restored"
-                              sx={{ flex: "0 0 auto" }}
+                              sx={{
+                                flex: "0 0 auto",
+                                height: 22,
+                                fontSize: "0.66rem",
+                                fontWeight: 500,
+                                letterSpacing: "0.06em",
+                                textTransform: "uppercase",
+                                color: "rgba(200, 216, 201, 0.85)",
+                                borderColor: "rgba(200, 216, 201, 0.3)",
+                                background: "rgba(200, 216, 201, 0.06)",
+                                "& .MuiChip-label": { px: 1 },
+                              }}
                             />
                           ) : restoreTargetId ? (
                             <Chip
                               size="small"
                               variant="outlined"
                               label="Restorable"
-                              sx={{ flex: "0 0 auto" }}
+                              sx={{
+                                flex: "0 0 auto",
+                                height: 22,
+                                fontSize: "0.66rem",
+                                fontWeight: 500,
+                                letterSpacing: "0.06em",
+                                textTransform: "uppercase",
+                                color: "rgba(220, 220, 220, 0.65)",
+                                borderColor: "rgba(255, 255, 255, 0.16)",
+                                background: "transparent",
+                                "& .MuiChip-label": { px: 1 },
+                              }}
                             />
                           ) : null}
-                          <Typography
+                          <Box
                             sx={{
                               flex: 1,
                               minWidth: 0,
-                              fontSize: "0.84rem",
-                              color: "var(--text-primary)",
-                              whiteSpace: "nowrap",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: 0.2,
                             }}
                           >
-                            {preview}
-                          </Typography>
+                            {previewParts.key ? (
+                              <Typography
+                                sx={{
+                                  fontFamily: "var(--font-mono)",
+                                  fontSize: "0.68rem",
+                                  letterSpacing: "0.04em",
+                                  color: "rgba(220, 220, 220, 0.55)",
+                                  lineHeight: 1.1,
+                                  whiteSpace: "nowrap",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                }}
+                              >
+                                {previewParts.key}
+                              </Typography>
+                            ) : null}
+                            <Typography
+                              sx={{
+                                fontSize: "0.86rem",
+                                color: "var(--text-primary)",
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                lineHeight: 1.3,
+                              }}
+                            >
+                              {previewParts.value}
+                            </Typography>
+                          </Box>
                           <Typography
                             variant="caption"
                             sx={{
-                              color: "text.secondary",
+                              color: "rgba(220, 220, 220, 0.55)",
                               flex: "0 0 auto",
                               fontFamily: "var(--font-mono)",
-                              fontSize: "0.7rem",
+                              fontSize: "0.68rem",
+                              letterSpacing: "0.02em",
+                              whiteSpace: "nowrap",
                             }}
                             title={created.tip}
                           >
                             {created.label}
                           </Typography>
+                          <Box
+                            className="arkmemory-history-chevron"
+                            aria-hidden="true"
+                            sx={{
+                              flex: "0 0 auto",
+                              color: "rgba(220, 220, 220, 0.5)",
+                              fontSize: "1.05rem",
+                              lineHeight: 1,
+                              ml: 0.25,
+                              userSelect: "none",
+                            }}
+                          >
+                            ›
+                          </Box>
                         </Box>
                       );
                     })}
@@ -1412,12 +1512,25 @@ export default function ArkMemoryPage({
 
       {/* History detail dialog. Opens when a row is clicked; shows the
           full saved content, all event metadata, and the restore action
-          if the change is reversible. */}
+          if the change is reversible. Styled to match the sleek row
+          aesthetic — semantic chip colors, key/value preview, mono
+          metadata labels. */}
       <Dialog
         open={historyDialogEvent !== null}
         onClose={() => setHistoryDialogEvent(null)}
         maxWidth="sm"
         fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              background: "rgba(14, 14, 16, 0.96)",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              borderRadius: 2,
+              backdropFilter: "blur(8px)",
+              backgroundImage: "none",
+            },
+          },
+        }}
       >
         {historyDialogEvent ? (
           (() => {
@@ -1444,112 +1557,235 @@ export default function ArkMemoryPage({
                 ? "Restores the archived source memory behind this consolidation."
                 : "Restores the previous memory snapshot recorded for this change.";
             const preview = arkmemoryHistoryPreview(event);
+            const typeLabel = arkmemoryHistoryTypeLabel(event);
+            const typePalette = arkmemoryHistoryChipPalette(typeLabel);
+            const previewParts = arkmemoryHistoryPreviewParts(preview);
+            const metaRows: Array<{ label: string; value: string; mono?: boolean }> = [
+              { label: "Event", value: type || "—", mono: true },
+              { label: "Memory", value: str(event.memory_id, "—"), mono: true },
+            ];
+            if (relatedMemoryId) {
+              metaRows.push({
+                label: "Related memory",
+                value: relatedMemoryId,
+                mono: true,
+              });
+            }
+            metaRows.push({ label: "Actor", value: str(event.actor, "—") });
+            metaRows.push({ label: "Recorded", value: created.tip });
+            if (revertedAt) {
+              metaRows.push({
+                label: "Restored at",
+                value: humanTs(revertedAt).tip,
+              });
+            }
             return (
               <>
                 <DialogTitle
                   sx={{
                     display: "flex",
-                    alignItems: "center",
+                    flexDirection: "column",
                     gap: 1,
-                    flexWrap: "wrap",
+                    pb: 1.5,
+                    pt: 2,
+                    px: 2.5,
+                    borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
                   }}
                 >
-                  <Chip
-                    size="small"
-                    variant="outlined"
-                    label={arkmemoryHistoryTypeLabel(event)}
-                  />
-                  {revertedAt ? (
+                  <Stack
+                    direction="row"
+                    spacing={0.75}
+                    sx={{ alignItems: "center", flexWrap: "wrap" }}
+                  >
                     <Chip
                       size="small"
                       variant="outlined"
-                      label="Restored"
+                      label={typeLabel}
+                      sx={{
+                        height: 22,
+                        fontSize: "0.66rem",
+                        fontWeight: 600,
+                        letterSpacing: "0.06em",
+                        textTransform: "uppercase",
+                        color: typePalette.color,
+                        borderColor: typePalette.borderColor,
+                        background: typePalette.background,
+                        "& .MuiChip-label": { px: 1 },
+                      }}
                     />
-                  ) : restoreTargetId ? (
-                    <Chip
-                      size="small"
-                      variant="outlined"
-                      label="Restorable"
-                    />
-                  ) : null}
+                    {revertedAt ? (
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label="Restored"
+                        sx={{
+                          height: 22,
+                          fontSize: "0.66rem",
+                          fontWeight: 500,
+                          letterSpacing: "0.06em",
+                          textTransform: "uppercase",
+                          color: "rgba(200, 216, 201, 0.85)",
+                          borderColor: "rgba(200, 216, 201, 0.3)",
+                          background: "rgba(200, 216, 201, 0.06)",
+                          "& .MuiChip-label": { px: 1 },
+                        }}
+                      />
+                    ) : restoreTargetId ? (
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label="Restorable"
+                        sx={{
+                          height: 22,
+                          fontSize: "0.66rem",
+                          fontWeight: 500,
+                          letterSpacing: "0.06em",
+                          textTransform: "uppercase",
+                          color: "rgba(220, 220, 220, 0.65)",
+                          borderColor: "rgba(255, 255, 255, 0.16)",
+                          background: "transparent",
+                          "& .MuiChip-label": { px: 1 },
+                        }}
+                      />
+                    ) : null}
+                    <Box sx={{ flex: 1 }} />
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "rgba(220, 220, 220, 0.55)",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "0.68rem",
+                        letterSpacing: "0.02em",
+                      }}
+                    >
+                      {created.label}
+                    </Typography>
+                  </Stack>
                   <Typography
-                    variant="subtitle1"
-                    sx={{ flex: 1, fontWeight: 600 }}
+                    sx={{
+                      fontSize: "1rem",
+                      fontWeight: 600,
+                      color: "var(--text-primary)",
+                      lineHeight: 1.35,
+                    }}
                   >
                     {arkmemoryHistoryTitle(event)}
                   </Typography>
                 </DialogTitle>
-                <DialogContent dividers>
-                  <Stack spacing={1.5}>
+                <DialogContent sx={{ px: 2.5, py: 2 }}>
+                  <Stack spacing={2}>
                     {preview ? (
                       <Box
                         sx={{
-                          p: 1.25,
-                          borderRadius: 1,
-                          border: "1px solid var(--surface-border)",
-                          background: "var(--surface-bg-elevated-stronger, rgba(255,255,255,0.02))",
+                          p: 1.5,
+                          borderRadius: 1.5,
+                          border: "1px solid rgba(255, 255, 255, 0.08)",
+                          background: "rgba(255, 255, 255, 0.022)",
                         }}
                       >
+                        {previewParts.key ? (
+                          <Typography
+                            sx={{
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "0.7rem",
+                              letterSpacing: "0.04em",
+                              color: "rgba(220, 220, 220, 0.55)",
+                              mb: 0.5,
+                            }}
+                          >
+                            {previewParts.key}
+                          </Typography>
+                        ) : null}
                         <Typography
                           sx={{
-                            fontSize: "0.88rem",
-                            lineHeight: 1.6,
+                            fontSize: "0.92rem",
+                            lineHeight: 1.55,
                             color: "var(--text-primary)",
                             whiteSpace: "pre-wrap",
                             wordBreak: "break-word",
                           }}
                         >
-                          {preview}
+                          {previewParts.value}
                         </Typography>
                       </Box>
                     ) : null}
-                    <Box className="metadata-box">
-                      <Stack spacing={0.6}>
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "text.secondary" }}
-                        >
-                          Event: {type || "-"}
-                        </Typography>
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "text.secondary" }}
-                        >
-                          Memory: {str(event.memory_id, "-")}
-                        </Typography>
-                        {relatedMemoryId ? (
-                          <Typography
-                            variant="caption"
-                            sx={{ color: "text.secondary" }}
+                    <Box
+                      sx={{
+                        borderRadius: 1.5,
+                        border: "1px solid rgba(255, 255, 255, 0.06)",
+                        background: "rgba(255, 255, 255, 0.012)",
+                      }}
+                    >
+                      <Stack divider={null}>
+                        {metaRows.map((row, mIdx) => (
+                          <Stack
+                            key={row.label}
+                            direction="row"
+                            sx={{
+                              px: 1.5,
+                              py: 0.85,
+                              gap: 1.5,
+                              alignItems: "baseline",
+                              borderTop:
+                                mIdx === 0
+                                  ? "none"
+                                  : "1px solid rgba(255, 255, 255, 0.04)",
+                            }}
                           >
-                            Related memory: {relatedMemoryId}
-                          </Typography>
-                        ) : null}
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "text.secondary" }}
-                        >
-                          Actor: {str(event.actor, "-")}
-                        </Typography>
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "text.secondary" }}
-                        >
-                          Recorded: {created.tip}
-                        </Typography>
+                            <Typography
+                              sx={{
+                                fontFamily: "var(--font-mono)",
+                                fontSize: "0.68rem",
+                                letterSpacing: "0.04em",
+                                color: "rgba(220, 220, 220, 0.52)",
+                                textTransform: "uppercase",
+                                flex: "0 0 110px",
+                                lineHeight: 1.4,
+                              }}
+                            >
+                              {row.label}
+                            </Typography>
+                            <Typography
+                              sx={{
+                                flex: 1,
+                                minWidth: 0,
+                                fontFamily: row.mono
+                                  ? "var(--font-mono)"
+                                  : undefined,
+                                fontSize: row.mono ? "0.78rem" : "0.84rem",
+                                color: "var(--text-primary)",
+                                wordBreak: "break-all",
+                                lineHeight: 1.4,
+                              }}
+                            >
+                              {row.value}
+                            </Typography>
+                          </Stack>
+                        ))}
                       </Stack>
                     </Box>
                     {restoreTargetId ? (
                       <Typography
                         variant="caption"
-                        sx={{ color: "text.secondary" }}
+                        sx={{
+                          color: "rgba(220, 220, 220, 0.55)",
+                          fontSize: "0.74rem",
+                          lineHeight: 1.5,
+                        }}
                       >
                         {restoreHelp}
                       </Typography>
                     ) : null}
                   </Stack>
                 </DialogContent>
-                <DialogActions>
+                <DialogActions
+                  sx={{
+                    px: 2.5,
+                    py: 1.5,
+                    borderTop: "1px solid rgba(255, 255, 255, 0.06)",
+                    gap: 1,
+                  }}
+                >
                   {restoreTargetId ? (
                     <Button
                       size="small"
@@ -1560,11 +1796,24 @@ export default function ArkMemoryPage({
                         rollbackMutation.mutate(restoreTargetId);
                         setHistoryDialogEvent(null);
                       }}
+                      sx={{
+                        textTransform: "none",
+                        fontSize: "0.78rem",
+                        fontWeight: 500,
+                      }}
                     >
                       {restoreLabel}
                     </Button>
                   ) : null}
-                  <Button onClick={() => setHistoryDialogEvent(null)}>
+                  <Button
+                    onClick={() => setHistoryDialogEvent(null)}
+                    size="small"
+                    sx={{
+                      textTransform: "none",
+                      fontSize: "0.78rem",
+                      color: "rgba(220, 220, 220, 0.75)",
+                    }}
+                  >
                     Close
                   </Button>
                 </DialogActions>

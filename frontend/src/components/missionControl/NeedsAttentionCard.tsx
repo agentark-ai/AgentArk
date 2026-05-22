@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { NeuralPanel } from "./NeuralPanel";
 import { buildAttentionItems } from "../NeedsAttentionInbox";
+import { TASK_RETRY_CONTROLS_ENABLED } from "../../lib/featureFlags";
 import type { AttentionItem } from "../NeedsAttentionInbox";
 import type { Notification, Task } from "../../types";
 
@@ -125,7 +126,7 @@ export function NeedsAttentionCard({
         </div>
       );
     }
-    if (item.kind === "failed") {
+    if (item.kind === "failed" && TASK_RETRY_CONTROLS_ENABLED) {
       return (
         <div className="nw-actions" style={{ marginTop: 6 }}>
           <button

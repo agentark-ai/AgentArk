@@ -4,7 +4,7 @@
 //! Authenticates via personal access token (GITHUB_TOKEN env var or secure config).
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -449,7 +449,7 @@ impl GitHubConnector {
                 return Err(anyhow!(
                     "Unsupported search_type '{}'. Use: repos, issues, code",
                     other
-                ))
+                ));
             }
         };
 
@@ -549,7 +549,7 @@ impl Integration for GitHubConnector {
         let url = match self.build_url(&["user"], &[]) {
             Ok(url) => url,
             Err(error) => {
-                return IntegrationStatus::Error(format!("Invalid GitHub URL: {}", error))
+                return IntegrationStatus::Error(format!("Invalid GitHub URL: {}", error));
             }
         };
         match self.authed_request(reqwest::Method::GET, url.as_str()) {

@@ -23,6 +23,7 @@ import type {
   IntegrationSyncStatus,
   BrowserProfilesResponse,
   BrowserSessionsResponse,
+  ApprovalLogEntry,
   GatewayChannelsResponse,
   GatewayOpsOverview,
   GatewayRoutingResponse,
@@ -74,6 +75,31 @@ function extractErrorMessage(text: string): string {
     return message || trimmed;
   } catch {
     return trimmed;
+  }
+}
+
+export class ApiRequestError extends Error {
+  status: number;
+  code?: string;
+
+  constructor(message: string, status: number, code?: string) {
+    super(message || `Request failed (${status})`);
+    this.name = "ApiRequestError";
+    this.status = status;
+    if (code !== undefined) this.code = code;
+  }
+}
+
+function extractErrorCode(text: string): string | undefined {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    return typeof parsed.code === "string" && parsed.code.trim()
+      ? parsed.code.trim()
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -325,17 +351,21 @@ export async function request<T>(path: string, init?: RequestOptions): Promise<T
   const doFetch = () => fetchWithOptionalTimeout(path, init);
   let res = await doFetch();
   if (!res.ok) {
-    let text = extractErrorMessage(await res.text());
+    let rawText = await res.text();
+    let text = extractErrorMessage(rawText);
+    let code = extractErrorCode(rawText);
     if (isMissingAuthError(res.status, text)) {
       await refreshUiSessionCookie();
       res = await doFetch();
       if (!res.ok) {
-        text = extractErrorMessage(await res.text());
-        throw new Error(text || `Request failed (${res.status})`);
+        rawText = await res.text();
+        text = extractErrorMessage(rawText);
+        code = extractErrorCode(rawText);
+        throw new ApiRequestError(text || `Request failed (${res.status})`, res.status, code);
       }
       return (await res.json()) as T;
     }
-    throw new Error(text || `Request failed (${res.status})`);
+    throw new ApiRequestError(text || `Request failed (${res.status})`, res.status, code);
   }
   return (await res.json()) as T;
 }
@@ -803,6 +833,20 @@ export const api = {
       Array.isArray((raw as { notifications?: unknown }).notifications)
     ) {
       return (raw as { notifications: Notification[] }).notifications;
+    }
+    return [];
+  },
+  getApprovalLog: async (limit = 80) => {
+    const raw = await request<unknown>(
+      `/approvals/log?limit=${encodeURIComponent(String(limit))}`,
+    );
+    if (Array.isArray(raw)) return raw as ApprovalLogEntry[];
+    if (
+      raw &&
+      typeof raw === "object" &&
+      Array.isArray((raw as { approvals?: unknown }).approvals)
+    ) {
+      return (raw as { approvals: ApprovalLogEntry[] }).approvals;
     }
     return [];
   },
@@ -1382,6 +1426,11 @@ export const api = {
     }),
   rejectTask: (id: string, comment?: string) =>
     request<{ status: string }>(`/tasks/${encodeURIComponent(id)}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ comment: comment?.trim() || undefined })
+    }),
+  dismissApproval: (id: string, comment?: string) =>
+    request<{ status: string; found?: boolean }>(`/approvals/${encodeURIComponent(id)}/dismiss`, {
       method: "POST",
       body: JSON.stringify({ comment: comment?.trim() || undefined })
     }),

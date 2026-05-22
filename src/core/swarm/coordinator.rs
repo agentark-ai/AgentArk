@@ -7,7 +7,7 @@ use super::registry::AgentRegistry;
 use super::specialist::{SpecialistAgent, SpecialistConfig};
 use crate::actions::ActionDef;
 use crate::core::llm::LlmClient;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,6 +19,8 @@ use uuid::Uuid;
 pub struct SwarmConfig {
     #[serde(default = "default_max_specialists")]
     pub max_specialists: usize,
+    /// Legacy compatibility field. A value of `0` means delegated agents wait
+    /// until completion; active swarm execution no longer applies this cap.
     #[serde(default = "default_timeout")]
     pub default_timeout_secs: u64,
     #[serde(default)]
@@ -29,14 +31,14 @@ fn default_max_specialists() -> usize {
     5
 }
 fn default_timeout() -> u64 {
-    60
+    0
 }
 
 impl Default for SwarmConfig {
     fn default() -> Self {
         Self {
             max_specialists: 5,
-            default_timeout_secs: 60,
+            default_timeout_secs: 0,
             specialists: vec![],
         }
     }
@@ -230,7 +232,7 @@ impl SwarmManager {
             task,
             &[],
             &[],
-            Some(self.config.default_timeout_secs.saturating_mul(1000)),
+            None,
         )
         .await?;
 
@@ -284,97 +286,81 @@ impl SwarmManager {
             return Err(anyhow!("No suitable specialist found for task"));
         }
 
-        // Step 2: Execute sub-tasks concurrently
-        let mut handles = vec![];
-
-        for (agent_id, sub_task) in &sub_tasks {
-            if let Some(specialist) = specialists.get(agent_id) {
-                let specialist = specialist.clone();
-                let sub_task = sub_task.clone();
-                let context = context.to_string();
-                let agent_id = agent_id.clone();
-                let system_prompt_override = specialist_prompt_bundle.map(|bundle| {
-                    crate::core::self_evolve::specialist_prompt_evolution::render_specialist_role_prompt(
-                        bundle,
-                        &specialist.config().agent_type,
-                    )
-                });
-                let registry = &self.registry;
-                let bus = &self.bus;
-                let task_id = Uuid::new_v4();
-
-                registry.update_status(&agent_id, AgentStatus::Busy).await;
-                bus.broadcast(SwarmEvent::TaskStarted {
-                    task_id,
-                    agent_id: agent_id.clone(),
-                });
-
-                let handle = tokio::spawn(async move {
-                    let task_start = std::time::Instant::now();
-                    let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        specialist.execute_task_with_prompt(
-                            &sub_task,
-                            &context,
-                            system_prompt_override,
-                        ),
-                    )
-                    .await;
-
-                    let elapsed = task_start.elapsed().as_millis() as u64;
-
-                    match result {
-                        Ok(Ok(content)) => DelegationResult {
-                            task_id,
-                            agent_id: agent_id.clone(),
-                            agent_name: specialist.config().name.clone(),
-                            success: true,
-                            content,
-                            confidence: 0.8,
-                            execution_time_ms: elapsed,
-                            error: None,
-                        },
-                        Ok(Err(e)) => DelegationResult {
-                            task_id,
-                            agent_id: agent_id.clone(),
-                            agent_name: specialist.config().name.clone(),
-                            success: false,
-                            content: String::new(),
-                            confidence: 0.0,
-                            execution_time_ms: elapsed,
-                            error: Some(e.to_string()),
-                        },
-                        Err(_) => DelegationResult {
-                            task_id,
-                            agent_id: agent_id.clone(),
-                            agent_name: specialist.config().name.clone(),
-                            success: false,
-                            content: String::new(),
-                            confidence: 0.0,
-                            execution_time_ms: elapsed,
-                            error: Some("Timeout".to_string()),
-                        },
-                    }
-                });
-                handles.push(handle);
-            }
-        }
-
-        // Collect results
+        // Step 2: Execute sub-tasks with bounded concurrency.
         let mut sub_results = vec![];
         let mut agents_used = vec![];
-        for handle in handles {
-            if let Ok(result) = handle.await {
-                self.registry
-                    .update_status(&result.agent_id, AgentStatus::Idle)
-                    .await;
-                self.bus.broadcast(SwarmEvent::TaskCompleted {
-                    task_id: result.task_id,
-                    agent_id: result.agent_id.clone(),
-                    success: result.success,
-                });
-                agents_used.push(result.agent_name.clone());
-                sub_results.push(result);
+        for chunk in sub_tasks.chunks(3) {
+            let mut handles = vec![];
+            for (agent_id, sub_task) in chunk {
+                if let Some(specialist) = specialists.get(agent_id) {
+                    let specialist = specialist.clone();
+                    let sub_task = sub_task.clone();
+                    let context = context.to_string();
+                    let agent_id = agent_id.clone();
+                    let system_prompt_override = specialist_prompt_bundle.map(|bundle| {
+                        crate::core::self_evolve::specialist_prompt_evolution::render_specialist_role_prompt(
+                            bundle,
+                            &specialist.config().agent_type,
+                        )
+                    });
+                    let registry = &self.registry;
+                    let bus = &self.bus;
+                    let task_id = Uuid::new_v4();
+
+                    registry.update_status(&agent_id, AgentStatus::Busy).await;
+                    bus.broadcast(SwarmEvent::TaskStarted {
+                        task_id,
+                        agent_id: agent_id.clone(),
+                    });
+
+                    let handle = tokio::spawn(async move {
+                        let task_start = std::time::Instant::now();
+                        let result = specialist
+                            .execute_task_with_prompt(&sub_task, &context, system_prompt_override)
+                            .await;
+
+                        let elapsed = task_start.elapsed().as_millis() as u64;
+
+                        match result {
+                            Ok(content) => DelegationResult {
+                                task_id,
+                                agent_id: agent_id.clone(),
+                                agent_name: specialist.config().name.clone(),
+                                success: true,
+                                content,
+                                confidence: 0.8,
+                                execution_time_ms: elapsed,
+                                error: None,
+                            },
+                            Err(e) => DelegationResult {
+                                task_id,
+                                agent_id: agent_id.clone(),
+                                agent_name: specialist.config().name.clone(),
+                                success: false,
+                                content: String::new(),
+                                confidence: 0.0,
+                                execution_time_ms: elapsed,
+                                error: Some(e.to_string()),
+                            },
+                        }
+                    });
+                    handles.push(handle);
+                }
+            }
+
+            for handle in handles {
+                if let Ok(result) = handle.await {
+                    self.registry
+                        .update_status(&result.agent_id, AgentStatus::Idle)
+                        .await;
+                    self.bus.broadcast(SwarmEvent::TaskCompleted {
+                        task_id: result.task_id,
+                        agent_id: result.agent_id.clone(),
+                        success: result.success,
+                    });
+                    agents_used.push(result.agent_name.clone());
+                    sub_results.push(result);
+                }
             }
         }
 
@@ -421,7 +407,7 @@ impl SwarmManager {
                 "Synthesize the results",
                 &[],
                 &[],
-                Some(self.config.default_timeout_secs.saturating_mul(1000)),
+                None,
             )
             .await?;
             aggregated.content

@@ -14,6 +14,10 @@ pub struct Model {
     #[sea_orm(nullable)]
     pub chat_id: Option<String>,
     #[sea_orm(nullable)]
+    pub profile_id: Option<String>,
+    #[sea_orm(nullable)]
+    pub profile_name: Option<String>,
+    #[sea_orm(nullable)]
     pub status_detail: Option<String>,
     pub action_history_json: String,
     pub created_at: String,

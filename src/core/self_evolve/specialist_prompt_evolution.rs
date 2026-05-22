@@ -20,8 +20,8 @@ use crate::core::prompt_policy::{
 };
 
 use super::promotion_gate::{
-    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
-    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
+    PromotionGateCheck, PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
+    promotion_gate_report, render_legacy_promotion_gate,
 };
 use super::prompt_evolution::PromptSurfaceProfile;
 

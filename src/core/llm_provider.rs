@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -537,10 +537,9 @@ pub async fn resolve_openai_request_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_openai_base_url, openai_provider_label,
-        prompt_cache_capability_for_openai_request, PromptCacheCapability, CODEX_CLI_BASE_URL,
-        HUGGINGFACE_API_BASE_URL, OPENAI_PROVIDER_ID, OPENROUTER_API_BASE_URL,
-        OPENROUTER_PROVIDER_ID,
+        CODEX_CLI_BASE_URL, HUGGINGFACE_API_BASE_URL, OPENAI_PROVIDER_ID, OPENROUTER_API_BASE_URL,
+        OPENROUTER_PROVIDER_ID, PromptCacheCapability, normalize_openai_base_url,
+        openai_provider_label, prompt_cache_capability_for_openai_request,
     };
 
     #[test]

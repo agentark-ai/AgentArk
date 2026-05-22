@@ -4,19 +4,19 @@
 //! configuration, Bot Framework / Graph-friendly outbound payload builders, and
 //! inbound activity handling that persists reply destinations before handing
 //! the message to the agent core.
-use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use once_cell::sync::Lazy;
 use ring::signature::{self, RsaPublicKeyComponents};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
-use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
 use crate::core::Agent;
+use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
 use crate::storage::Storage;
 
 type SharedAgent = Arc<RwLock<Agent>>;
@@ -1284,11 +1284,7 @@ pub async fn handle_activity(
     if let (Some(from), Some(bot_app_id)) = (
         activity.from.as_ref().and_then(|identity| {
             let id = identity.id.trim();
-            if id.is_empty() {
-                None
-            } else {
-                Some(id)
-            }
+            if id.is_empty() { None } else { Some(id) }
         }),
         config
             .bot_app_id
@@ -1563,8 +1559,10 @@ mod tests {
         assert!(state.recent.len() <= MAX_RECENT_ACTIVITY_IDS);
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn record_activity_id_is_idempotent_for_retries() {
         let _dir = tempfile::tempdir().unwrap();
@@ -1573,11 +1571,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!record_teams_activity_id(&storage, "activity-1")
-            .await
-            .unwrap());
-        assert!(record_teams_activity_id(&storage, "activity-1")
-            .await
-            .unwrap());
+        assert!(
+            !record_teams_activity_id(&storage, "activity-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            record_teams_activity_id(&storage, "activity-1")
+                .await
+                .unwrap()
+        );
     }
 }

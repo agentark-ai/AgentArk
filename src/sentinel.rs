@@ -1,4 +1,4 @@
-//! ArkSentinel - AgentArk's Background Guardian
+//! Sentinel - AgentArk's Background Guardian
 //!
 //! A unified background daemon that keeps AgentArk alive and proactive 24/7:
 //!
@@ -7,16 +7,16 @@
 //! - **Watcher poller**: Evaluates watch conditions and triggers on match
 //! - **Experience learning**: Consolidates execution evidence into learned memory
 //! - **Approval expiry**: Cleans up stale approval requests
-//! - **ArkPulse**: Periodically wakes the agent to reflect and act proactively
+//! - **Pulse**: Periodically wakes the agent to reflect and act proactively
 //!
 //! All loops run inside a single tokio task with staggered intervals.
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::channels;
@@ -68,7 +68,7 @@ static WATCHER_POLL_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
         .filter(|value| *value > 0)
         .unwrap_or(30)
 });
-// Supervision budget for ArkSentinel's internal maintenance jobs only.
+// Supervision budget for Sentinel's internal maintenance jobs only.
 // This does not apply to foreground chat requests or long-running user work.
 static SENTINEL_JOB_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
     std::env::var("AGENTARK_SENTINEL_JOB_TIMEOUT_SECS")
@@ -98,37 +98,6 @@ static WATCHER_TRIGGER_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
         .filter(|value| *value > 0)
         .unwrap_or(45)
 });
-
-fn watcher_browse_search_fallback_args(
-    watcher: &crate::core::watcher::Watcher,
-) -> Option<serde_json::Value> {
-    if !watcher.poll_action.eq_ignore_ascii_case("browse") {
-        return None;
-    }
-    let url = watcher
-        .poll_arguments
-        .get("url")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    let description = watcher.description.trim();
-    let query = if !description.is_empty() && !url.is_empty() {
-        format!("{} {}", description, url)
-    } else if !description.is_empty() {
-        description.to_string()
-    } else if !url.is_empty() {
-        url.to_string()
-    } else {
-        String::new()
-    };
-    if query.trim().is_empty() {
-        return None;
-    }
-    Some(serde_json::json!({
-        "query": query,
-        "num_results": 8
-    }))
-}
 
 struct PulseRunGuard;
 
@@ -212,7 +181,7 @@ mod tests {
 
     #[test]
     fn arkpulse_auth_failures_alone_are_not_security_incidents() {
-        let thresholds = ArkPulseSecurityThresholds {
+        let thresholds = PulseSecurityThresholds {
             auth_failures: 2,
             rate_limit_hits: 10,
             unauthorized_channel: 10,
@@ -296,7 +265,7 @@ mod tests {
             0,
             0,
             None,
-            ArkPulseSecurityThresholds::default(),
+            PulseSecurityThresholds::default(),
             &[auth_finding],
         );
         assert!(message.contains("2 failed task(s)"));
@@ -404,7 +373,7 @@ async fn run_with_busy_deferral<F, Fut>(
             let Some(_maintenance_guard) = try_start_sentinel_maintenance() else {
                 if defers >= max_defers {
                     tracing::debug!(
-                        "ArkSentinel: {} skipped (another maintenance job still active after {} defers)",
+                        "Sentinel: {} skipped (another maintenance job still active after {} defers)",
                         label,
                         max_defers
                     );
@@ -413,7 +382,7 @@ async fn run_with_busy_deferral<F, Fut>(
 
                 defers += 1;
                 tracing::debug!(
-                    "ArkSentinel: {} waiting for another maintenance job; deferring {}/{} for {} minutes",
+                    "Sentinel: {} waiting for another maintenance job; deferring {}/{} for {} minutes",
                     label,
                     defers,
                     max_defers,
@@ -422,15 +391,15 @@ async fn run_with_busy_deferral<F, Fut>(
                 tokio::time::sleep(Duration::from_secs((defer_minutes * 60) as u64)).await;
                 continue;
             };
-            tracing::debug!("ArkSentinel: {} started", label);
+            tracing::debug!("Sentinel: {} started", label);
             match tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), job()).await
             {
                 Ok(()) => {
-                    tracing::debug!("ArkSentinel: {} completed", label);
+                    tracing::debug!("Sentinel: {} completed", label);
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "ArkSentinel: {} timed out after {}s",
+                        "Sentinel: {} timed out after {}s",
                         label,
                         *SENTINEL_JOB_TIMEOUT_SECS
                     );
@@ -441,7 +410,7 @@ async fn run_with_busy_deferral<F, Fut>(
 
         if defers >= max_defers {
             tracing::debug!(
-                "ArkSentinel: {} skipped (busy after {} defers)",
+                "Sentinel: {} skipped (busy after {} defers)",
                 label,
                 max_defers
             );
@@ -450,7 +419,7 @@ async fn run_with_busy_deferral<F, Fut>(
 
         defers += 1;
         tracing::debug!(
-            "ArkSentinel: {} busy; deferring {}/{} for {} minutes",
+            "Sentinel: {} busy; deferring {}/{} for {} minutes",
             label,
             defers,
             max_defers,
@@ -469,14 +438,14 @@ where
         .is_err()
     {
         tracing::warn!(
-            "ArkSentinel: {} loop timed out after {}s",
+            "Sentinel: {} loop timed out after {}s",
             label,
             *SENTINEL_JOB_TIMEOUT_SECS
         );
     }
 }
 
-/// A single ArkPulse event for the UI log
+/// A single Pulse event for the UI log
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulseEvent {
     pub timestamp: String,
@@ -524,7 +493,7 @@ pub struct PulseDetails {
     /// Deployed apps health
     #[serde(default)]
     pub deployed_apps: Vec<AppPulseInfo>,
-    /// Deterministic ArkPulse doctor findings
+    /// Deterministic Pulse doctor findings
     #[serde(default)]
     pub doctor_findings: Vec<DoctorFinding>,
     /// 0..100 score where 100 means healthier posture
@@ -866,7 +835,7 @@ fn build_knowledge_growth_notification(findings: &[DoctorFinding]) -> Option<(St
         .collect::<Vec<_>>()
         .join(" | ");
     let body = format!(
-        "AgentArk kept your documents and memories intact, but the durable knowledge store is getting large ({detail}). Open ArkPulse to review capacity and Postgres maintenance before latency or backup times drift."
+        "AgentArk kept your documents and memories intact, but the durable knowledge store is getting large ({detail}). Open Pulse to review capacity and Postgres maintenance before latency or backup times drift."
     );
     Some((signature, body))
 }
@@ -1056,17 +1025,17 @@ async fn log_pulse_event(storage: &crate::storage::Storage, event: PulseEvent) {
     migrate_legacy_pulse_log_storage(storage).await;
 
     let Some(row) = pulse_event_to_row(&event) else {
-        tracing::warn!("ArkPulse event could not be serialized for persistent storage");
+        tracing::warn!("Pulse event could not be serialized for persistent storage");
         return;
     };
     if let Err(error) = storage.insert_arkpulse_event(&row).await {
-        tracing::warn!("Failed to persist ArkPulse event row: {}", error);
+        tracing::warn!("Failed to persist Pulse event row: {}", error);
         return;
     }
     prune_pulse_event_rows(storage).await;
 }
 
-/// Get the ArkPulse log from storage
+/// Get the Pulse log from storage
 pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
     migrate_legacy_pulse_log(agent).await;
 
@@ -1096,7 +1065,7 @@ pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
                     .await
                 {
                     tracing::warn!(
-                        "Failed to prune stale ArkPulse app events while loading log: {}",
+                        "Failed to prune stale Pulse app events while loading log: {}",
                         error
                     );
                 }
@@ -1105,7 +1074,7 @@ pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
             events
         }
         Err(error) => {
-            tracing::warn!("Failed to load ArkPulse event rows: {}", error);
+            tracing::warn!("Failed to load Pulse event rows: {}", error);
             Vec::new()
         }
     }
@@ -1417,7 +1386,7 @@ async fn prune_pulse_event_rows(storage: &crate::storage::Storage) {
     let cutoff =
         (chrono::Utc::now() - chrono::Duration::days(MAX_PULSE_EVENT_AGE_DAYS)).to_rfc3339();
     if let Err(error) = storage.delete_arkpulse_events_before(&cutoff).await {
-        tracing::warn!("Failed to prune stale ArkPulse rows: {}", error);
+        tracing::warn!("Failed to prune stale Pulse rows: {}", error);
     }
     match storage
         .list_arkpulse_event_ids_beyond_latest(MAX_PULSE_EVENTS as u64)
@@ -1425,12 +1394,12 @@ async fn prune_pulse_event_rows(storage: &crate::storage::Storage) {
     {
         Ok(extra_ids) if !extra_ids.is_empty() => {
             if let Err(error) = storage.delete_arkpulse_events_by_ids(&extra_ids).await {
-                tracing::warn!("Failed to prune excess ArkPulse rows: {}", error);
+                tracing::warn!("Failed to prune excess Pulse rows: {}", error);
             }
         }
         Ok(_) => {}
         Err(error) => {
-            tracing::warn!("Failed to enumerate excess ArkPulse rows: {}", error);
+            tracing::warn!("Failed to enumerate excess Pulse rows: {}", error);
         }
     }
 }
@@ -1439,7 +1408,7 @@ async fn migrate_legacy_pulse_log_storage(storage: &crate::storage::Storage) {
     let existing_rows = match storage.count_arkpulse_events().await {
         Ok(count) => count,
         Err(error) => {
-            tracing::warn!("Failed to count ArkPulse history rows: {}", error);
+            tracing::warn!("Failed to count Pulse history rows: {}", error);
             return;
         }
     };
@@ -1461,11 +1430,11 @@ async fn migrate_legacy_pulse_log_storage(storage: &crate::storage::Storage) {
 
     for event in &events {
         let Some(row) = pulse_event_to_row(event) else {
-            tracing::warn!("Skipping legacy ArkPulse event migration due to serialization failure");
+            tracing::warn!("Skipping legacy Pulse event migration due to serialization failure");
             return;
         };
         if let Err(error) = storage.insert_arkpulse_event(&row).await {
-            tracing::warn!("Failed to migrate legacy ArkPulse event row: {}", error);
+            tracing::warn!("Failed to migrate legacy Pulse event row: {}", error);
             return;
         }
     }
@@ -1894,11 +1863,11 @@ async fn detect_ws_hint_async(app_dir: PathBuf) -> bool {
     {
         Ok(Ok(has_hint)) => has_hint,
         Ok(Err(error)) => {
-            tracing::warn!("ArkPulse WS hint worker failed: {}", error);
+            tracing::warn!("Pulse WS hint worker failed: {}", error);
             false
         }
         Err(_) => {
-            tracing::warn!("ArkPulse WS hint worker timed out after 5s");
+            tracing::warn!("Pulse WS hint worker timed out after 5s");
             false
         }
     }
@@ -2328,7 +2297,7 @@ async fn run_attack_surface_checks(
                 "/tunnel/status",
                 "Tunnel status probe failed",
                 format!("Authenticated status probe returned {}", resp.status()),
-                "ArkPulse could not verify managed tunnel state from control plane.",
+                "Pulse could not verify managed tunnel state from control plane.",
                 "Verify API auth and tunnel control endpoints".to_string(),
             );
         }
@@ -2340,7 +2309,7 @@ async fn run_attack_surface_checks(
                 "/tunnel/status",
                 "Tunnel status probe request failed",
                 e.to_string(),
-                "ArkPulse could not verify tunnel process state.",
+                "Pulse could not verify tunnel process state.",
                 "Check local control plane reachability".to_string(),
             );
         }
@@ -2648,7 +2617,7 @@ async fn run_resource_checks(
     ctx: &PulseDoctorContext,
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
-    security_thresholds: ArkPulseSecurityThresholds,
+    security_thresholds: PulseSecurityThresholds,
     findings: &mut Vec<DoctorFinding>,
 ) {
     match ctx.storage.database_size_bytes().await {
@@ -2749,7 +2718,7 @@ async fn run_resource_checks(
                     "Durable knowledge store is large",
                     format!("{} | thresholds crossed: {}", knowledge_store_counts_summary(&counts), reasons),
                     "Documents and memories are durable by design, so growth needs monitoring and Postgres capacity planning rather than silent deletion.",
-                    "Open ArkPulse, review knowledge volume, and schedule Postgres vacuum/backup capacity checks".to_string(),
+                    "Open Pulse, review knowledge volume, and schedule Postgres vacuum/backup capacity checks".to_string(),
                 );
             }
             Some("medium") => {
@@ -2767,7 +2736,7 @@ async fn run_resource_checks(
                     "Durable knowledge growth warning",
                     format!("{} | planning thresholds crossed: {}", knowledge_store_counts_summary(&counts), reasons),
                     "Documents and memories are being retained as intended, but the knowledge store is large enough to justify capacity monitoring.",
-                    "Review ArkPulse trends and plan Postgres maintenance before latency or backup times drift".to_string(),
+                    "Review Pulse trends and plan Postgres maintenance before latency or backup times drift".to_string(),
                 );
             }
             _ => {}
@@ -2872,7 +2841,7 @@ async fn run_resource_checks(
                         format_mb(max),
                         ratio * 100.0
                     ),
-                    "Sustained memory growth can degrade ArkPulse, background workers, and API responsiveness.",
+                    "Sustained memory growth can degrade Pulse, background workers, and API responsiveness.",
                     "Review retention settings and recent runtime workload before memory pressure reaches eviction thresholds".to_string(),
                 );
             }
@@ -2926,7 +2895,7 @@ async fn run_data_safety_checks(
                 "Managed backup failed",
                 error.evidence,
                 "AgentArk could not create or refresh its framework-managed Postgres backup.",
-                "Check the AgentArk data volume permissions and Postgres backup tooling; ArkPulse will retry automatically.".to_string(),
+                "Check the AgentArk data volume permissions and Postgres backup tooling; Pulse will retry automatically.".to_string(),
             );
             "failed".to_string()
         }
@@ -3029,7 +2998,7 @@ async fn run_data_safety_checks(
                 "memory capture pipeline",
                 "Failed memory captures detected",
                 format!("{} memory capture event(s) are in failed state", count),
-                "Some user facts may be missing from ArkMemory until the capture pipeline is reviewed.",
+                "Some user facts may be missing from Memory until the capture pipeline is reviewed.",
                 "Review failed memory captures and model health".to_string(),
                 DoctorRemediationSpec::ReadonlyInvestigation {
                     topic: DoctorReadonlyInvestigationTopic::MemoryCaptureHealth,
@@ -3064,7 +3033,7 @@ async fn run_data_safety_checks(
                 "Memory operations need review",
                 format!("{} staged memory operation(s) are queued or failed", count),
                 "Long-lived review backlog can delay or block user-memory corrections.",
-                "Open ArkMemory queue and resolve staged operations".to_string(),
+                "Open Memory queue and resolve staged operations".to_string(),
             );
         }
         Ok(_) => {}
@@ -3104,7 +3073,7 @@ async fn run_managed_artifact_hygiene_checks(
                 "Archive retention could not be pruned",
                 error.to_string(),
                 "AgentArk could not inspect or prune managed archive entries.",
-                "Check data directory permissions; ArkPulse will retry on the next run".to_string(),
+                "Check data directory permissions; Pulse will retry on the next run".to_string(),
             );
             crate::core::artifact_hygiene::ArchiveRetentionSummary::default()
         }
@@ -3121,7 +3090,7 @@ async fn run_managed_artifact_hygiene_checks(
             "Data lifecycle retention needs review",
             lifecycle_warnings.join(" | "),
             "Loose or disabled retention lets logs, traces, sessions, and automation history grow in Postgres.",
-            "Open Settings > Data Lifecycle and tighten retention windows; ArkPulse will not bypass DB policy".to_string(),
+            "Open Settings > Data Lifecycle and tighten retention windows; Pulse will not bypass DB policy".to_string(),
         );
     }
 
@@ -3163,7 +3132,7 @@ async fn run_managed_artifact_hygiene_checks(
                     artifact_cleanup_summary(&candidates)
                 ),
                 "AgentArk-owned runtime artifacts can outlive their active use, but user data and durable memory are excluded from cleanup.",
-                "Open ArkPulse cleanup review and archive selected managed artifacts".to_string(),
+                "Open Pulse cleanup review and archive selected managed artifacts".to_string(),
             );
         }
         Ok(_) => {}
@@ -3176,7 +3145,7 @@ async fn run_managed_artifact_hygiene_checks(
                 "Managed artifact cleanup could not be evaluated",
                 error.to_string(),
                 "AgentArk could not inspect owned runtime artifact roots.",
-                "Check data directory permissions; ArkPulse will retry on the next run".to_string(),
+                "Check data directory permissions; Pulse will retry on the next run".to_string(),
             );
         }
     }
@@ -3560,7 +3529,7 @@ async fn run_doctor_checks(
     http_client: &reqwest::Client,
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
-    security_thresholds: ArkPulseSecurityThresholds,
+    security_thresholds: PulseSecurityThresholds,
 ) -> PulseDoctorReport {
     let mut findings: Vec<DoctorFinding> = Vec::new();
     let mut sections: Vec<PulseScanSection> = Vec::new();
@@ -3737,10 +3706,10 @@ async fn run_doctor_checks(
         match tokio::time::timeout(Duration::from_secs(20), task).await {
             Ok(Ok(app_findings)) => findings.extend(app_findings),
             Ok(Err(error)) => {
-                tracing::warn!("ArkPulse app scan worker failed: {}", error);
+                tracing::warn!("Pulse app scan worker failed: {}", error);
             }
             Err(_) => {
-                tracing::warn!("ArkPulse app scan worker timed out after 20s");
+                tracing::warn!("Pulse app scan worker timed out after 20s");
             }
         }
     }
@@ -3795,7 +3764,7 @@ async fn run_doctor_checks(
     PulseDoctorReport { findings, sections }
 }
 
-/// ArkSentinel configuration (loaded from settings, with sensible defaults)
+/// Sentinel configuration (loaded from settings, with sensible defaults)
 pub struct SentinelConfig {
     /// How often to check process health (seconds) - used by http.rs process watchdog
     pub _process_check_interval: u64,
@@ -3815,11 +3784,11 @@ pub struct SentinelConfig {
     pub pattern_induction_interval: u64,
     /// How often to generate approval-gated learning candidates (seconds)
     pub candidate_generation_interval: u64,
-    /// How often to apply learned ArkMemory health-review feedback (seconds)
+    /// How often to apply learned Memory health-review feedback (seconds)
     pub arkmemory_learned_review_interval: u64,
     /// How often to expire old approvals (seconds)
     pub approval_expiry_interval: u64,
-    /// How often to run ArkPulse (seconds, 0 = disabled)
+    /// How often to run Pulse (seconds, 0 = disabled)
     pub pulse_interval: u64,
     /// How often to check for unused deployed apps (seconds).
     /// Notifications sent once per day per unused app.
@@ -3895,7 +3864,7 @@ fn watcher_sleep_duration(
         .min(max_sleep)
 }
 
-/// Start all ArkSentinel background loops. Returns join handles for graceful shutdown.
+/// Start all Sentinel background loops. Returns join handles for graceful shutdown.
 pub fn start(
     agent: SharedAgent,
     config: SentinelConfig,
@@ -4193,16 +4162,16 @@ pub fn start(
                     break;
                 }
                 record_loop_heartbeat(&agent, SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY).await;
-                tracing::debug!("ArkSentinel: approval_expiry started");
+                tracing::debug!("Sentinel: approval_expiry started");
                 match tokio::time::timeout(
                     Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
                     run_approval_expiry(&agent),
                 )
                 .await
                 {
-                    Ok(()) => tracing::debug!("ArkSentinel: approval_expiry completed"),
+                    Ok(()) => tracing::debug!("Sentinel: approval_expiry completed"),
                     Err(_) => tracing::warn!(
-                        "ArkSentinel: approval_expiry timed out after {}s",
+                        "Sentinel: approval_expiry timed out after {}s",
                         *SENTINEL_JOB_TIMEOUT_SECS
                     ),
                 }
@@ -4210,7 +4179,7 @@ pub fn start(
         })
     });
 
-    // -- ArkPulse (proactive agent wake-up) -------------------------------
+    // -- Pulse (proactive agent wake-up) -------------------------------
     if config.pulse_interval > 0 {
         handles.push({
             let agent = agent.clone();
@@ -4285,7 +4254,7 @@ pub fn start(
                         || {
                             let agent = agent.clone();
                             async move {
-                                tracing::debug!("ArkSentinel: auto_analysis tick started");
+                                tracing::debug!("Sentinel: auto_analysis tick started");
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(45),
                                     channels::http::run_autonomy_analysis_tick(
@@ -4305,13 +4274,13 @@ pub fn start(
                                                 .get("skipped")
                                                 .and_then(|value| value.as_bool())
                                                 .unwrap_or(false),
-                                            "ArkSentinel: auto_analysis tick completed"
+                                            "Sentinel: auto_analysis tick completed"
                                         );
                                     }
                                     Err(_) => {
                                         tracing::warn!(
                                             timeout_secs = 45,
-                                            "ArkSentinel: auto_analysis tick timed out"
+                                            "Sentinel: auto_analysis tick timed out"
                                         );
                                     }
                                 }
@@ -4376,22 +4345,22 @@ pub fn start(
                         let agent_guard = agent.read().await;
                         agent_guard.runtime.clone()
                     };
-                    tracing::debug!("ArkSentinel: container_reaper started");
+                    tracing::debug!("Sentinel: container_reaper started");
                     let result = tokio::time::timeout(
                         Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
                         async move { runtime.reconcile_orphan_containers().await },
                     )
                     .await;
                     match result {
-                        Ok(Ok(_)) => tracing::debug!("ArkSentinel: container_reaper completed"),
+                        Ok(Ok(_)) => tracing::debug!("Sentinel: container_reaper completed"),
                         Ok(Err(error)) => {
                             tracing::warn!(
-                                "ArkSentinel: sandbox container reconciliation failed: {}",
+                                "Sentinel: sandbox container reconciliation failed: {}",
                                 error
                             );
                         }
                         Err(_) => tracing::warn!(
-                            "ArkSentinel: container_reaper timed out after {}s",
+                            "Sentinel: container_reaper timed out after {}s",
                             *SENTINEL_JOB_TIMEOUT_SECS
                         ),
                     }
@@ -4431,7 +4400,7 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, background_session_consolidation={}s, heuristic_reflection={}s, pattern_induction={}s, candidate_generation={}s, arkmemory_learned_review={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
+        "Sentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, background_session_consolidation={}s, heuristic_reflection={}s, pattern_induction={}s, candidate_generation={}s, arkmemory_learned_review={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
         config.scheduler_interval,
         config.watcher_interval,
         if config.integration_sync_interval > 0 {
@@ -4481,16 +4450,16 @@ async fn run_scheduler(agent: &SharedAgent) {
     let due_tasks = agent_snapshot.take_due_tasks(autonomy_paused).await;
 
     if autonomy_paused && due_tasks.is_empty() {
-        tracing::debug!("ArkSentinel: scheduler paused for non-reminder tasks");
+        tracing::debug!("Sentinel: scheduler paused for non-reminder tasks");
     }
 
     if !due_tasks.is_empty() {
-        tracing::info!("ArkSentinel: {} scheduled task(s) due", due_tasks.len());
+        tracing::info!("Sentinel: {} scheduled task(s) due", due_tasks.len());
     }
 
     for task in due_tasks {
         tracing::info!(
-            "ArkSentinel: queueing supervised task '{}' (action={})",
+            "Sentinel: queueing supervised task '{}' (action={})",
             task.description,
             task.action
         );
@@ -4534,7 +4503,7 @@ async fn notify_preferred_channel_bounded(
     {
         Ok(()) => {}
         Err(_) => tracing::warn!(
-            "ArkSentinel: {} preferred-channel notification timed out after {}s",
+            "Sentinel: {} preferred-channel notification timed out after {}s",
             context,
             *SENTINEL_NOTIFY_TIMEOUT_SECS
         ),
@@ -4572,16 +4541,14 @@ fn watcher_timeout_uses_preferred_fallback(channel: &str) -> bool {
 
 async fn run_watchers(agent: &SharedAgent) {
     if is_agent_autonomy_paused(agent).await {
-        tracing::debug!("ArkSentinel: watchers skipped (agent paused)");
+        tracing::debug!("Sentinel: watchers skipped (agent paused)");
         return;
     }
     let agent_snapshot = Agent::snapshot(agent).await;
-    let (watcher_manager, background_sessions, runtime, notification_store) = {
+    let (watcher_manager, notification_store) = {
         let agent_guard = agent.read().await;
         (
             agent_guard.watcher_manager.clone(),
-            agent_guard.background_sessions.clone(),
-            agent_guard.runtime.clone(),
             agent_guard.notification_store(),
         )
     };
@@ -4657,74 +4624,17 @@ async fn run_watchers(agent: &SharedAgent) {
         let Some(watcher) = watcher_manager.begin_poll(watcher.id).await else {
             continue;
         };
-        let poll_result = {
-            let authorization =
-                crate::core::automation::runtime_authorization_context_from_arguments(
-                    &watcher.poll_arguments,
-                    crate::actions::ActionExecutionSurface::Background,
-                );
-            if let Err(error) = Agent::enforce_background_session_policy_for_action_shared(
-                &background_sessions,
-                runtime.as_ref(),
-                &watcher.poll_action,
-                &watcher.poll_arguments,
-            )
-            .await
-            {
-                Err(anyhow::anyhow!(error))
-            } else {
-                let poll_attempt = match tokio::time::timeout(
-                    Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
-                    runtime.execute_action_with_context(
-                        &watcher.poll_action,
-                        &watcher.poll_arguments,
-                        &authorization,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "Watcher poll timed out after {} seconds",
-                        *WATCHER_POLL_TIMEOUT_SECS
-                    )),
-                };
-                match poll_attempt {
-                    Ok(result) => Ok(result),
-                    Err(error) => {
-                        let error_text = error.to_string();
-                        if let Some(fallback_args) = watcher_browse_search_fallback_args(&watcher) {
-                            let fallback_result = tokio::time::timeout(
-                                Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
-                                runtime.execute_action_with_context(
-                                    "web_search",
-                                    &fallback_args,
-                                    &authorization,
-                                ),
-                            )
-                            .await;
-                            match fallback_result {
-                                Ok(Ok(search_output)) => Ok(format!(
-                                    "Browse failed ({}). Search fallback used for this watcher poll.\n\n{}",
-                                    error_text, search_output
-                                )),
-                                Ok(Err(search_error)) => Err(anyhow::anyhow!(
-                                    "{}; search fallback failed: {}",
-                                    error_text,
-                                    search_error
-                                )),
-                                Err(_) => Err(anyhow::anyhow!(
-                                    "{}; search fallback timed out after {} seconds",
-                                    error_text,
-                                    *WATCHER_POLL_TIMEOUT_SECS
-                                )),
-                            }
-                        } else {
-                            Err(error)
-                        }
-                    }
-                }
-            }
+        let poll_result = match tokio::time::timeout(
+            Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
+            agent_snapshot.run_model_routed_spine_for_watcher_poll(&watcher),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "Watcher spine poll timed out after {} seconds",
+                *WATCHER_POLL_TIMEOUT_SECS
+            )),
         };
 
         let new_count = watcher.poll_count;
@@ -4753,13 +4663,11 @@ async fn run_watchers(agent: &SharedAgent) {
                     );
                     continue;
                 }
-                let matched = if let Some(outcome) =
-                    Agent::evaluate_watch_condition_without_llm(
-                        &watcher.condition,
-                        &result,
-                        watcher.last_result.as_deref(),
-                    )
-                {
+                let matched = if let Some(outcome) = Agent::evaluate_watch_condition_without_llm(
+                    &watcher.condition,
+                    &result,
+                    watcher.last_result.as_deref(),
+                ) {
                     match outcome {
                         Ok(matched) => matched,
                         Err(error_text) => {
@@ -4842,7 +4750,7 @@ async fn run_watchers(agent: &SharedAgent) {
                         .await;
                         if result.is_err() {
                             tracing::warn!(
-                                "ArkSentinel: watcher trigger follow-up timed out after {}s",
+                                "Sentinel: watcher trigger follow-up timed out after {}s",
                                 *WATCHER_TRIGGER_TIMEOUT_SECS
                             );
                         }
@@ -4854,7 +4762,7 @@ async fn run_watchers(agent: &SharedAgent) {
                 watcher_manager
                     .record_poll_error(watcher.id, new_count, error_text.clone())
                     .await;
-                tracing::debug!("ArkSentinel: watcher {} poll error: {}", watcher.id, e);
+                tracing::debug!("Sentinel: watcher {} poll error: {}", watcher.id, e);
             }
         }
     }
@@ -4901,7 +4809,7 @@ async fn run_integration_sync(agent: &SharedAgent) {
         crate::core::integration_sync::context_from_agent(&agent, Some(shared_agent.clone()))
     };
     if let Err(error) = crate::core::integration_sync::run_due_syncs(&ctx).await {
-        tracing::warn!("ArkSentinel: integration sync failed: {}", error);
+        tracing::warn!("Sentinel: integration sync failed: {}", error);
     }
 }
 
@@ -4921,7 +4829,7 @@ async fn run_experience_consolidation_job(agent: &SharedAgent) {
         Ok(processed) if processed > 0 => {
             let completed_at = chrono::Utc::now();
             tracing::info!(
-                "ArkSentinel: experience consolidation processed {} run(s), {} memory candidate(s)",
+                "Sentinel: experience consolidation processed {} run(s), {} memory candidate(s)",
                 processed,
                 deferred_memory_processed
             );
@@ -4948,7 +4856,7 @@ async fn run_experience_consolidation_job(agent: &SharedAgent) {
         Ok(_) if deferred_memory_processed > 0 => {
             let completed_at = chrono::Utc::now();
             tracing::info!(
-                "ArkSentinel: experience consolidation processed {} deferred memory candidate(s)",
+                "Sentinel: experience consolidation processed {} deferred memory candidate(s)",
                 deferred_memory_processed
             );
             persist_background_learning_job_result(
@@ -4992,7 +4900,7 @@ async fn run_experience_consolidation_job(agent: &SharedAgent) {
         }
         Err(error) => {
             let completed_at = chrono::Utc::now();
-            tracing::debug!("ArkSentinel: experience consolidation skipped: {}", error);
+            tracing::debug!("Sentinel: experience consolidation skipped: {}", error);
             persist_background_learning_job_result(
                 &storage,
                 background_learning_job_update(
@@ -5029,7 +4937,7 @@ async fn run_pattern_induction_job(agent: &SharedAgent) {
         Ok(processed) if processed > 0 => {
             let completed_at = chrono::Utc::now();
             tracing::info!(
-                "ArkSentinel: pattern induction updated {} pattern(s)",
+                "Sentinel: pattern induction updated {} pattern(s)",
                 processed
             );
             persist_background_learning_job_result(
@@ -5068,7 +4976,7 @@ async fn run_pattern_induction_job(agent: &SharedAgent) {
         }
         Err(error) => {
             let completed_at = chrono::Utc::now();
-            tracing::debug!("ArkSentinel: pattern induction skipped: {}", error);
+            tracing::debug!("Sentinel: pattern induction skipped: {}", error);
             persist_background_learning_job_result(
                 &storage,
                 background_learning_job_update(
@@ -5097,7 +5005,7 @@ async fn run_heuristic_reflection_job(agent: &SharedAgent) {
         Ok(stats) if stats.changed() => {
             let completed_at = chrono::Utc::now();
             tracing::info!(
-                "ArkSentinel: heuristic reflection created {} and merged {} heuristic(s)",
+                "Sentinel: heuristic reflection created {} and merged {} heuristic(s)",
                 stats.heuristics_created,
                 stats.heuristics_merged
             );
@@ -5183,7 +5091,7 @@ async fn run_candidate_generation_job(agent: &SharedAgent) {
         Ok(processed) if processed > 0 => {
             let completed_at = chrono::Utc::now();
             tracing::info!(
-                "ArkSentinel: candidate generation updated {} draft(s)",
+                "Sentinel: candidate generation updated {} draft(s)",
                 processed
             );
             persist_background_learning_job_result(
@@ -5222,7 +5130,7 @@ async fn run_candidate_generation_job(agent: &SharedAgent) {
         }
         Err(error) => {
             let completed_at = chrono::Utc::now();
-            tracing::debug!("ArkSentinel: candidate generation skipped: {}", error);
+            tracing::debug!("Sentinel: candidate generation skipped: {}", error);
             persist_background_learning_job_result(
                 &storage,
                 background_learning_job_update(
@@ -5275,7 +5183,7 @@ async fn run_arkmemory_learned_review_job(agent: &SharedAgent) {
                 .unwrap_or(0);
             if auto_reviewed > 0 {
                 tracing::info!(
-                    "ArkSentinel: ArkMemory learned reviewer auto-reviewed {} capture finding(s)",
+                    "Sentinel: Memory learned reviewer auto-reviewed {} capture finding(s)",
                     auto_reviewed
                 );
             }
@@ -5305,7 +5213,7 @@ async fn run_arkmemory_learned_review_job(agent: &SharedAgent) {
         }
         Err(error) => {
             let completed_at = chrono::Utc::now();
-            tracing::debug!("ArkSentinel: ArkMemory learned review skipped: {}", error);
+            tracing::debug!("Sentinel: Memory learned review skipped: {}", error);
             persist_background_learning_job_result(
                 &storage,
                 background_learning_job_update(
@@ -5313,7 +5221,7 @@ async fn run_arkmemory_learned_review_job(agent: &SharedAgent) {
                     "failed",
                     started_at,
                     completed_at,
-                    format!("ArkMemory learned review skipped: {}", error),
+                    format!("Memory learned review skipped: {}", error),
                     false,
                     serde_json::json!({
                         "error": error.to_string(),
@@ -5336,12 +5244,12 @@ async fn run_approval_expiry(agent: &SharedAgent) {
         (agent_guard.storage.clone(), agent_guard.tasks.clone())
     };
     if let Err(e) = storage.expire_old_approvals(APPROVAL_EXPIRY_SECS).await {
-        tracing::debug!("ArkSentinel: approval expiry check: {}", e);
+        tracing::debug!("Sentinel: approval expiry check: {}", e);
     }
     if let Err(e) =
         Agent::expire_stale_approval_tasks_shared(&storage, &tasks, APPROVAL_EXPIRY_SECS).await
     {
-        tracing::debug!("ArkSentinel: stale approval task expiry check: {}", e);
+        tracing::debug!("Sentinel: stale approval task expiry check: {}", e);
     }
     {
         let agent_guard = agent.read().await;
@@ -5397,14 +5305,14 @@ fn build_pulse_log_summary(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ArkPulseSecurityThresholds {
+struct PulseSecurityThresholds {
     auth_failures: u64,
     rate_limit_hits: u64,
     unauthorized_channel: u64,
     combined: u64,
 }
 
-impl Default for ArkPulseSecurityThresholds {
+impl Default for PulseSecurityThresholds {
     fn default() -> Self {
         let defaults = crate::core::AutonomySettings::default();
         Self {
@@ -5502,7 +5410,7 @@ async fn maybe_emit_autonomy_pause_nudge(agent: &SharedAgent, autonomy_paused: b
         return;
     }
 
-    let message = "Autonomy has been paused for at least 7 days. Consider enabling it again so AgentArk can resume ArkPulse health checks, watchers, background learning, suggestion scans, and proactive optimizations. Scheduled reminders still fire while autonomy is paused.";
+    let message = "Autonomy has been paused for at least 7 days. Consider enabling it again so AgentArk can resume Pulse health checks, watchers, background learning, suggestion scans, and proactive optimizations. Scheduled reminders still fire while autonomy is paused.";
     {
         let guard = agent.read().await;
         guard
@@ -5532,9 +5440,9 @@ async fn maybe_emit_autonomy_pause_nudge(agent: &SharedAgent, autonomy_paused: b
 
 async fn load_arkpulse_security_thresholds(
     storage: &crate::storage::Storage,
-) -> ArkPulseSecurityThresholds {
+) -> PulseSecurityThresholds {
     let parsed = load_autonomy_settings_snapshot(storage).await;
-    ArkPulseSecurityThresholds {
+    PulseSecurityThresholds {
         auth_failures: parsed.arkpulse_auth_failures_threshold.max(1) as u64,
         rate_limit_hits: parsed.arkpulse_rate_limit_hits_threshold.max(1) as u64,
         unauthorized_channel: parsed.arkpulse_unauthorized_channel_threshold.max(1) as u64,
@@ -5553,7 +5461,7 @@ async fn is_agent_autonomy_paused(agent: &SharedAgent) -> bool {
 
 fn is_security_incident(
     security: Option<&crate::core::SecuritySnapshot>,
-    thresholds: ArkPulseSecurityThresholds,
+    thresholds: PulseSecurityThresholds,
 ) -> bool {
     let Some(sec) = security else {
         return false;
@@ -5566,7 +5474,7 @@ fn is_security_incident(
 
 fn has_correlated_abuse_spike(
     sec: &crate::core::SecuritySnapshot,
-    thresholds: ArkPulseSecurityThresholds,
+    thresholds: PulseSecurityThresholds,
 ) -> bool {
     if sec.rate_limit_hits >= thresholds.rate_limit_hits {
         return true;
@@ -5672,7 +5580,7 @@ fn build_critical_notification(
     dead_apps: usize,
     health_errors: usize,
     security: Option<&crate::core::SecuritySnapshot>,
-    thresholds: ArkPulseSecurityThresholds,
+    thresholds: PulseSecurityThresholds,
     doctor_findings: &[DoctorFinding],
 ) -> (String, Vec<String>) {
     let mut flags: Vec<String> = Vec::new();
@@ -5692,7 +5600,7 @@ fn build_critical_notification(
     if health_errors > 0 {
         flags.push("service_error".to_string());
         reasons.push(format!("{} service health check error(s)", health_errors));
-        actions.push("Fix failing service checks shown in ArkPulse details.".to_string());
+        actions.push("Fix failing service checks shown in Pulse details.".to_string());
     }
 
     if let Some(sec) = security {
@@ -5744,19 +5652,18 @@ fn build_critical_notification(
 
     if reasons.is_empty() {
         (
-            "ArkPulse critical incident detected. Open ArkPulse details for diagnostics."
-                .to_string(),
+            "Pulse critical incident detected. Open Pulse details for diagnostics.".to_string(),
             vec!["critical".to_string()],
         )
     } else if actions.is_empty() {
         (
-            format!("ArkPulse critical incident: {}.", reasons.join(", ")),
+            format!("Pulse critical incident: {}.", reasons.join(", ")),
             flags,
         )
     } else {
         (
             format!(
-                "ArkPulse critical incident: {}. Immediate actions: {}",
+                "Pulse critical incident: {}. Immediate actions: {}",
                 reasons.join(", "),
                 actions.join(" ")
             ),
@@ -5766,19 +5673,19 @@ fn build_critical_notification(
 }
 
 // ===========================================================================
-// ArkPulse - proactive agent wake-up
+// Pulse - proactive agent wake-up
 // ===========================================================================
 
 pub async fn run_pulse(agent: &SharedAgent) {
     if is_agent_autonomy_paused(agent).await {
-        tracing::debug!("ArkPulse skipped (agent paused)");
+        tracing::debug!("Pulse skipped (agent paused)");
         return;
     }
     if PULSE_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        tracing::debug!("ArkPulse skipped (already running)");
+        tracing::debug!("Pulse skipped (already running)");
         return;
     }
     let _pulse_guard = PulseRunGuard;
@@ -5800,7 +5707,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 status: "ok".to_string(),
                 summary: "Checked due integration syncs before diagnostics.".to_string(),
                 detail:
-                    "Ran the connector scheduler first so ArkPulse used the freshest integration state."
+                    "Ran the connector scheduler first so Pulse used the freshest integration state."
                         .to_string(),
                 duration_ms: integration_started.elapsed().as_millis() as u64,
                 metrics: vec![pulse_metric(
@@ -5809,7 +5716,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 )],
             }),
             Err(error) => {
-                tracing::debug!("ArkPulse integration probe skipped: {}", error);
+                tracing::debug!("Pulse integration probe skipped: {}", error);
                 pulse_scan_log.push(PulseScanSection {
                     id: "integration_sync".to_string(),
                     title: "Integration sync".to_string(),
@@ -5990,21 +5897,21 @@ pub async fn run_pulse(agent: &SharedAgent) {
         let fact_count = match pulse_ctx.storage.count_facts(None).await {
             Ok(count) => count as usize,
             Err(error) => {
-                tracing::warn!("ArkPulse failed to count learned facts: {}", error);
+                tracing::warn!("Pulse failed to count learned facts: {}", error);
                 0
             }
         };
         let document_count = match pulse_ctx.storage.count_documents(None).await {
             Ok(count) => count,
             Err(error) => {
-                tracing::warn!("ArkPulse failed to count documents: {}", error);
+                tracing::warn!("Pulse failed to count documents: {}", error);
                 0
             }
         };
         let document_chunk_count = match pulse_ctx.storage.count_document_chunks().await {
             Ok(count) => count,
             Err(error) => {
-                tracing::warn!("ArkPulse failed to count document chunks: {}", error);
+                tracing::warn!("Pulse failed to count document chunks: {}", error);
                 0
             }
         };
@@ -6260,7 +6167,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                     security_persisted = true;
                     security_events.commit_snapshot(&sec_snapshot);
                     tracing::info!(
-                        "ArkPulse security: injections={}, auth_fail={}, rate_limit={}, unauth={}",
+                        "Pulse security: injections={}, auth_fail={}, rate_limit={}, unauth={}",
                         sec_snapshot.injection_attempts,
                         sec_snapshot.auth_failures,
                         sec_snapshot.rate_limit_hits,
@@ -6269,7 +6176,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "Failed to persist ArkPulse security logs; counters retained for retry: {}",
+                        "Failed to persist Pulse security logs; counters retained for retry: {}",
                         error
                     );
                 }
@@ -6528,7 +6435,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         || health_error_count > 0;
 
     if !has_any_signal {
-        tracing::debug!("ArkPulse: all clear");
+        tracing::debug!("Pulse: all clear");
         let summary = "All clear, no issues detected".to_string();
         details.scan_finished_at = chrono::Utc::now().to_rfc3339();
         details.scan_duration_ms = pulse_started.elapsed().as_millis() as u64;
@@ -6538,7 +6445,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             title: "Notification outcome".to_string(),
             status: "ok".to_string(),
             summary: "No user notification was sent because the run was clear.".to_string(),
-            detail: "ArkPulse logged the run silently for operator review.".to_string(),
+            detail: "Pulse logged the run silently for operator review.".to_string(),
             duration_ms: 0,
             metrics: vec![pulse_metric("Outcome", "none")],
         });
@@ -6582,10 +6489,10 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 "ok".to_string()
             },
             summary: if growth_notification.is_some() {
-                "ArkPulse emitted a throttled growth warning without escalating a critical alert."
+                "Pulse emitted a throttled growth warning without escalating a critical alert."
                     .to_string()
             } else {
-                "ArkPulse recorded non-critical context without sending a user-facing alert."
+                "Pulse recorded non-critical context without sending a user-facing alert."
                     .to_string()
             },
             detail: "Run history was saved so you can review the context later.".to_string(),
@@ -6610,7 +6517,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             details,
         };
         log_pulse_event(&storage, event).await;
-        tracing::debug!("ArkPulse: non-critical signals recorded, no user notification sent");
+        tracing::debug!("Pulse: non-critical signals recorded, no user notification sent");
         return;
     }
 
@@ -6658,14 +6565,13 @@ pub async fn run_pulse(agent: &SharedAgent) {
             "warning".to_string()
         },
         summary: if should_emit_alert {
-            "ArkPulse emitted a critical alert for this run.".to_string()
+            "Pulse emitted a critical alert for this run.".to_string()
         } else if should_notify_user {
-            "ArkPulse suppressed a duplicate alert inside the cooldown window.".to_string()
+            "Pulse suppressed a duplicate alert inside the cooldown window.".to_string()
         } else if growth_notification.is_some() {
-            "ArkPulse emitted a growth warning without escalating a critical alert.".to_string()
+            "Pulse emitted a growth warning without escalating a critical alert.".to_string()
         } else {
-            "ArkPulse recorded the issue in history without pushing a user-facing alert."
-                .to_string()
+            "Pulse recorded the issue in history without pushing a user-facing alert.".to_string()
         },
         detail: format!("Preferred channel target: {}", brief_channel),
         duration_ms: 0,
@@ -6676,16 +6582,16 @@ pub async fn run_pulse(agent: &SharedAgent) {
     });
     if should_emit_alert {
         notification_store
-            .emit_notification("ArkPulse Critical", &alert_text, "error", "arkpulse")
+            .emit_notification("Pulse Critical", &alert_text, "error", "arkpulse")
             .await;
     } else if should_notify_user {
         tracing::debug!(
-            "ArkPulse: suppressed duplicate critical notification within {}s cooldown",
+            "Pulse: suppressed duplicate critical notification within {}s cooldown",
             ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS
         );
     } else {
         tracing::debug!(
-            "ArkPulse: alert recorded without user notification (below ultra-severe threshold)"
+            "Pulse: alert recorded without user notification (below ultra-severe threshold)"
         );
     }
     if let Some((signature, body)) = growth_notification {
@@ -6699,12 +6605,12 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 )
                 .await;
             tracing::warn!(
-                "ArkPulse: emitted throttled knowledge growth notification (cooldown={}s)",
+                "Pulse: emitted throttled knowledge growth notification (cooldown={}s)",
                 ARKPULSE_GROWTH_NOTIFY_COOLDOWN_SECS
             );
         } else {
             tracing::debug!(
-                "ArkPulse: suppressed duplicate knowledge growth notification within {}s cooldown",
+                "Pulse: suppressed duplicate knowledge growth notification within {}s cooldown",
                 ARKPULSE_GROWTH_NOTIFY_COOLDOWN_SECS
             );
         }
@@ -6723,17 +6629,17 @@ pub async fn run_pulse(agent: &SharedAgent) {
     if should_emit_alert {
         notify_preferred_channel_bounded(agent, &alert_text, "arkpulse").await;
         tracing::info!(
-            "ArkPulse: critical alert sent to preferred channel ({})",
+            "Pulse: critical alert sent to preferred channel ({})",
             brief_channel
         );
     } else if should_notify_user {
         tracing::debug!(
-            "ArkPulse: duplicate critical alert not pushed to preferred channel ({})",
+            "Pulse: duplicate critical alert not pushed to preferred channel ({})",
             brief_channel
         );
     } else {
         tracing::debug!(
-            "ArkPulse: preferred-channel notification skipped (below ultra-severe threshold) ({})",
+            "Pulse: preferred-channel notification skipped (below ultra-severe threshold) ({})",
             brief_channel
         );
     }

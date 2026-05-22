@@ -1,5 +1,6 @@
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
 const { randomUUID } = require('crypto');
 const { chromium } = require('playwright');
 
@@ -13,6 +14,7 @@ const HEADLESS = /^(1|true|yes|on)$/i.test(process.env.PLAYWRIGHT_HEADLESS || ''
 const LIVE_VIEW_PORT = Number.parseInt(process.env.PLAYWRIGHT_LIVE_VIEW_PORT || '6080', 10) || 6080;
 const LIVE_VIEW_PATH = process.env.PLAYWRIGHT_LIVE_VIEW_PATH || '/vnc.html?autoconnect=1&resize=remote&path=websockify';
 const LIVE_VIEW_ENABLED = !HEADLESS && Boolean(process.env.DISPLAY);
+const PROFILE_ROOT = process.env.PLAYWRIGHT_PROFILE_ROOT || path.join(process.env.AGENTARK_DATA || '/app/data', 'browser-profiles');
 
 // Active browser sessions: id -> { context, page, mode, claimed, claimedAt, lastActivity, cleanupTimer, diagnostics }
 const sessions = new Map();
@@ -60,7 +62,85 @@ async function sessionStatePayload(session) {
     live_view_enabled: LIVE_VIEW_ENABLED,
     live_view_port: LIVE_VIEW_ENABLED ? LIVE_VIEW_PORT : null,
     live_view_path: LIVE_VIEW_ENABLED ? LIVE_VIEW_PATH : null,
+    profile_id: session.profileId || null,
+    profile_name: session.profileName || null,
   };
+}
+
+function safeProfileId(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  const safe = value.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120);
+  return safe || '';
+}
+
+function profileStorageStatePath(profileId) {
+  const safeId = safeProfileId(profileId);
+  if (!safeId) return '';
+  return path.join(PROFILE_ROOT, safeId, 'storage-state.json');
+}
+
+async function saveSessionProfileState(session) {
+  if (!session || !session.storageStatePath) return;
+  try {
+    await fs.promises.mkdir(path.dirname(session.storageStatePath), { recursive: true });
+    await session.context.storageState({ path: session.storageStatePath });
+  } catch (e) {
+    console.warn(`Failed to save browser profile state for ${session.profileId || 'profile'}: ${e.message}`);
+  }
+}
+
+async function settlePage(page, timeoutMs = 2500) {
+  try {
+    await page.waitForLoadState('domcontentloaded', { timeout: timeoutMs });
+  } catch (_) {}
+}
+
+async function readPageSnapshot(page) {
+  await settlePage(page);
+  return page.evaluate(() => {
+    const body = document.body;
+    const bodyText = body ? body.innerText.substring(0, 5000) : '';
+    const results = [];
+    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [onclick]';
+    const els = document.querySelectorAll(interactiveSelectors);
+    for (let i = 0; i < Math.min(els.length, 50); i++) {
+      const el = els[i];
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      const tag = el.tagName.toLowerCase();
+      const type = el.getAttribute('type') || '';
+      const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().substring(0, 80);
+      const name = el.getAttribute('name') || '';
+      const id = el.id || '';
+      const href = el.getAttribute('href') || '';
+      results.push({
+        index: results.length,
+        tag, type, text, name, id, href,
+        x: Math.round(rect.x + rect.width / 2),
+        y: Math.round(rect.y + rect.height / 2),
+      });
+    }
+    return {
+      title: document.title || '',
+      url: window.location.href,
+      body_text: bodyText,
+      elements: results,
+    };
+  });
+}
+
+async function readPageSnapshotWithRetry(page) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await readPageSnapshot(page);
+    } catch (e) {
+      lastError = e;
+      await page.waitForTimeout(200 + attempt * 250).catch(() => {});
+    }
+  }
+  throw lastError || new Error('Unable to read page snapshot');
 }
 
 function touchSession(session) {
@@ -90,6 +170,7 @@ async function destroySession(id) {
   const session = sessions.get(id);
   if (!session) return;
   if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  await saveSessionProfileState(session);
   try { await session.context.close(); } catch (_) {}
   sessions.delete(id);
   console.log(`Session ${id} destroyed (${sessions.size} remaining)`);
@@ -105,10 +186,23 @@ app.post('/session', async (req, res) => {
   try {
     const b = await ensureBrowser();
     const requestedMode = String(req.body?.mode || '').trim().toLowerCase() || (HEADLESS ? 'headless' : 'interactive');
-    const context = await b.newContext({
+    const profile = req.body?.profile && typeof req.body.profile === 'object' ? req.body.profile : null;
+    const profileId = safeProfileId(profile?.id || req.body?.profile_id);
+    const profileName = String(profile?.name || req.body?.profile_name || '').trim();
+    const storageStatePath = profileId ? profileStorageStatePath(profileId) : '';
+    const contextOptions = {
       viewport: { width: 1280, height: 720 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    });
+    };
+    if (storageStatePath && fs.existsSync(storageStatePath)) {
+      try {
+        JSON.parse(fs.readFileSync(storageStatePath, 'utf8'));
+        contextOptions.storageState = storageStatePath;
+      } catch (e) {
+        console.warn(`Ignoring unreadable browser profile state ${storageStatePath}: ${e.message}`);
+      }
+    }
+    const context = await b.newContext(contextOptions);
     const page = await context.newPage();
     const id = randomUUID();
     const session = {
@@ -121,6 +215,9 @@ app.post('/session', async (req, res) => {
       lastActivity: Date.now(),
       cleanupTimer: null,
       diagnostics: [],
+      profileId,
+      profileName,
+      storageStatePath,
     };
     page.on('console', (msg) => {
       const type = msg.type();
@@ -231,6 +328,19 @@ app.post('/session/:id/navigate', async (req, res) => {
   }
 });
 
+// Navigate back
+app.post('/session/:id/back', async (req, res) => {
+  const session = sessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  touchSession(session);
+  try {
+    await session.page.goBack({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    res.json({ status: 'ok', url: session.page.url(), title: await session.page.title() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Take screenshot
 app.get('/session/:id/screenshot', async (req, res) => {
   const session = sessions.get(req.params.id);
@@ -261,7 +371,8 @@ app.post('/session/:id/click', async (req, res) => {
     } else {
       return res.status(400).json({ error: 'Provide selector, text, or x/y coordinates' });
     }
-    await session.page.waitForTimeout(500); // brief settle
+    await session.page.waitForTimeout(250);
+    await settlePage(session.page);
     res.json({ status: 'ok' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -288,6 +399,7 @@ app.post('/session/:id/type', async (req, res) => {
       }
       await session.page.keyboard.type(text || '', { delay: 30 });
     }
+    await settlePage(session.page, 1000);
     res.json({ status: 'ok' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -319,7 +431,8 @@ app.post('/session/:id/press', async (req, res) => {
   try {
     const { key } = req.body;
     await session.page.keyboard.press(key);
-    await session.page.waitForTimeout(300);
+    await session.page.waitForTimeout(250);
+    await settlePage(session.page);
     res.json({ status: 'ok' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -332,44 +445,8 @@ app.get('/session/:id/content', async (req, res) => {
   if (!session) return res.status(404).json({ error: 'Session not found' });
   touchSession(session);
   try {
-    const page = session.page;
-    const title = await page.title();
-    const url = page.url();
-
-    // Extract visible text (truncated)
-    const bodyText = await page.evaluate(() => {
-      const body = document.body;
-      if (!body) return '';
-      // Get text, strip excess whitespace
-      return body.innerText.substring(0, 5000);
-    });
-
-    // Extract interactive elements with their labels
-    const elements = await page.evaluate(() => {
-      const results = [];
-      const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [onclick]';
-      const els = document.querySelectorAll(interactiveSelectors);
-      for (let i = 0; i < Math.min(els.length, 50); i++) {
-        const el = els[i];
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        const tag = el.tagName.toLowerCase();
-        const type = el.getAttribute('type') || '';
-        const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().substring(0, 80);
-        const name = el.getAttribute('name') || '';
-        const id = el.id || '';
-        const href = el.getAttribute('href') || '';
-        results.push({
-          index: results.length,
-          tag, type, text, name, id, href,
-          x: Math.round(rect.x + rect.width / 2),
-          y: Math.round(rect.y + rect.height / 2),
-        });
-      }
-      return results;
-    });
-
-    res.json({ title, url, body_text: bodyText, elements, diagnostics: session.diagnostics || [] });
+    const snapshot = await readPageSnapshotWithRetry(session.page);
+    res.json({ ...snapshot, diagnostics: session.diagnostics || [] });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

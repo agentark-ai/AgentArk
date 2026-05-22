@@ -4,7 +4,7 @@
 //! existing encrypted KV store instead of introducing new relational tables.
 
 use anyhow::{Context, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::core::AgentConfig;
 use crate::storage::Storage;

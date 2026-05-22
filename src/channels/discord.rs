@@ -2,7 +2,7 @@
 //!
 //! This module provides self-contained config, delivery, and ingestion
 //! helpers for later channel-tree wiring.
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures::{Sink, SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};

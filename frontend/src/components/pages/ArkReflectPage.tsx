@@ -32,7 +32,6 @@ import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 import ThumbUpAltRoundedIcon from "@mui/icons-material/ThumbUpAltRounded";
 import TaskAltRoundedIcon from "@mui/icons-material/TaskAltRounded";
-import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
 import WorkHistoryRoundedIcon from "@mui/icons-material/WorkHistoryRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
@@ -52,13 +51,13 @@ import {
 } from "../arkReflect/reflectNarrative";
 import { asRecord, errMessage, num, pickRecords, str } from "./pageHelpers";
 
-type ArkReflectPageProps = {
+type ReflectPageProps = {
   autoRefresh: boolean;
   onNavigateToView?: (view: string, replace?: boolean) => void;
 };
 
 type ReflectPeriod = "daily" | "weekly" | "monthly";
-type ReflectStoryTab = "overview" | "topics" | "latest" | "timeline";
+type ReflectStoryTab = "overview" | "topics" | "latest" | "review";
 
 type ReflectUnit = {
   id: string;
@@ -233,17 +232,17 @@ const PERIOD_OPTIONS: { value: ReflectPeriod; label: string }[] = [
 ];
 
 const SOURCE_DISPLAY: Record<string, { label: string; group: string; color: string }> = {
-  conversation: { label: "Chat", group: "Conversation work", color: "#4E8DFF" },
-  orbit_chat: { label: "ArkOrbit", group: "Orbit conversations", color: "#7C5CFF" },
+  conversation: { label: "Chat", group: "Conversation work", color: "#78F2B0" },
+  orbit_chat: { label: "ArkOrbit", group: "Orbit conversations", color: "#B7A7FF" },
   experience_item: { label: "Memory", group: "What AgentArk learned", color: "#21B573" },
   procedural_pattern: { label: "Workflows", group: "Working patterns", color: "#E6A93D" },
   app: { label: "Apps", group: "Apps built", color: "#00A8A8" },
   goal: { label: "Goals", group: "Goals and progress", color: "#FF7A45" },
   watcher: { label: "Watchers", group: "Background watchers", color: "#D94F70" },
   sentinel: { label: "Sentinel", group: "Safety and checks", color: "#A96DFF" },
-  arkpulse: { label: "ArkPulse", group: "System health", color: "#00B8D9" },
-  arkevolve: { label: "ArkEvolve", group: "Agent improvements", color: "#C58A00" },
-  llm_usage: { label: "Usage", group: "Agent usage", color: "#8FA3BF" },
+  arkpulse: { label: "Pulse", group: "System health", color: "#78F2B0" },
+  arkevolve: { label: "Evolve", group: "Agent improvements", color: "#C58A00" },
+  llm_usage: { label: "Usage", group: "Agent usage", color: "#C8D8C9" },
 };
 
 const SOURCE_ORDER = [
@@ -385,7 +384,7 @@ function asSuggestedFollowup(value: unknown): ReflectSuggestedFollowup | null {
     detail: str(raw.detail, ""),
     prompt: str(raw.prompt, ""),
     status: str(raw.status, "ready"),
-    source_label: str(raw.source_label, "ArkReflect"),
+    source_label: str(raw.source_label, "Reflect"),
     occurred_at: str(raw.occurred_at, ""),
     conversation_id: str(raw.conversation_id, "") || null,
     source_unit_id: str(raw.source_unit_id, "") || null,
@@ -434,7 +433,7 @@ function asReflectCluster(value: unknown): ReflectCluster | null {
     unit_count: num(raw.unit_count, 0),
     message_count: num(raw.message_count, 0),
     source_mix,
-    color: str(raw.color, "#2F80ED"),
+    color: str(raw.color, "#78F2B0"),
     related_history: asRelatedHistory(raw.related_history),
     units: pickRecords(raw, "units")
       .map(asReflectUnit)
@@ -640,8 +639,8 @@ function narrativeLines(
     focusLabel !== "No activity yet" && focusLabel !== "No clear user-facing focus yet";
   return [
     hasUserFacingFocus
-      ? `ArkReflect grouped ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} in this range. The clearest user-facing thread is ${focusLabel.toLowerCase()}.`
-      : `ArkReflect grouped ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} in this range, but the strongest signals are background or not actionable enough to promote.`,
+      ? `Reflect grouped ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} in this range. The clearest user-facing thread is ${focusLabel.toLowerCase()}.`
+      : `Reflect grouped ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} in this range, but the strongest signals are background or not actionable enough to promote.`,
     `${styleText}.`,
     `AgentArk also captured ${learnedCount} learned signal${learnedCount === 1 ? "" : "s"} and ${backgroundCount} background event${backgroundCount === 1 ? "" : "s"}.`,
     recurringCount > 0
@@ -695,7 +694,7 @@ function meaningfulForSourceCounts(counts: ReflectSourceCounts | undefined): num
 }
 
 function sourceMeta(source: string) {
-  return SOURCE_DISPLAY[source] ?? { label: "Work", group: "Mixed work", color: "#8FA3BF" };
+  return SOURCE_DISPLAY[source] ?? { label: "Work", group: "Mixed work", color: "#C8D8C9" };
 }
 
 function dominantSource(cluster: ReflectCluster): string {
@@ -719,8 +718,12 @@ function followupHasSourceEvidence(item: ReflectSuggestedFollowup): boolean {
 }
 
 function isDisplayableOpportunity(item: ReflectSuggestedFollowup): boolean {
-  if (item.kind === "recovery_advice") return true;
   if (item.kind === "latest_developments") return true;
+  return false;
+}
+
+function isReviewThreadFollowup(item: ReflectSuggestedFollowup): boolean {
+  if (item.kind === "recovery_advice") return true;
   return false;
 }
 
@@ -860,8 +863,8 @@ function digestStatusTitle(response: ReflectResponse | undefined): string {
 function digestStatusDetail(response: ReflectResponse | undefined, fetching: boolean): string {
   if (!response) {
     return fetching
-      ? "Loading today's ArkReflect status."
-      : "Today status appears here after ArkReflect has cached activity.";
+      ? "Loading today's Reflect status."
+      : "Today status appears here after Reflect has cached activity.";
   }
   const digest = response.daily_digest_status;
   const total = totalForSourceCounts(response.source_counts);
@@ -881,7 +884,7 @@ function digestStatusDetail(response: ReflectResponse | undefined, fetching: boo
     return `Sent for ${digest.target_date || "the selected day"} at ${formatUiDateTime(digest.last_sent_at)}.`;
   }
   if (digest.status === "skipped_quiet") {
-    return "ArkReflect checked the day and found nothing worth notifying you about.";
+    return "Reflect checked the day and found nothing worth notifying you about.";
   }
   if (digest.status === "preparing") {
     return "AgentArk is refreshing the daily work units in the background.";
@@ -1012,7 +1015,7 @@ function latestDevelopmentSummary(item: ReflectSuggestedFollowup): string {
   if (item.search_error) return compactText(item.search_error, 180);
   return item.search_results.length > 0
     ? "Sources are cached. The plain-language insight will appear after the background synthesis worker finishes."
-    : compactText(item.detail || "Opportunity classified. Source enrichment is queued.", 180);
+    : compactText(item.detail || "Next step queued for source checking.", 180);
 }
 
 function latestUpdateSummary(item: ReflectSuggestedFollowup): string {
@@ -1030,7 +1033,7 @@ function latestDevelopmentMeta(item: ReflectSuggestedFollowup): string {
 }
 
 function followupWhatThisIs(item: ReflectSuggestedFollowup): string {
-  const origin = item.source_label || "ArkReflect";
+  const origin = item.source_label || "Reflect";
   if (item.kind === "latest_developments") {
     if (item.feedback?.renewed_after_feedback) {
       return `Renewed source-backed interest from ${origin}; this reappeared after earlier feedback.`;
@@ -1038,15 +1041,12 @@ function followupWhatThisIs(item: ReflectSuggestedFollowup): string {
     if (item.latest_summary) return `Source-backed insight inferred from ${origin}.`;
     if (item.search_results.length > 0) return `Current-source check inferred from ${origin}; summary worker pending.`;
     if (item.status === "failed") return `Current-source check inferred from ${origin}; source fetch failed.`;
-    return `Classified opportunity from ${origin}; source enrichment is queued.`;
+    return `Next step from ${origin}; source check is queued.`;
   }
   if (item.kind === "recovery_advice") {
     return `Recovery item from ${origin}; a prior run needs follow-up.`;
   }
-  if (item.kind === "continue_theme") {
-    return `Reflected theme from ${origin}; useful to continue or convert into an action.`;
-  }
-  return `ArkReflect follow-up from ${origin}.`;
+  return `Reflect next step from ${origin}.`;
 }
 
 function latestReflectedTopic(item: ReflectSuggestedFollowup): string {
@@ -1054,12 +1054,11 @@ function latestReflectedTopic(item: ReflectSuggestedFollowup): string {
 }
 
 function followupChatContext(item: ReflectSuggestedFollowup): string {
-  const isContinueTheme = item.kind === "continue_theme";
   const lines = [
-    `${isContinueTheme ? "ArkReflect review item" : "ArkReflect follow-up"}: ${item.title}`,
+    `Reflect next step: ${item.title}`,
     `Type: ${followupKindLabel(item.kind)}`,
     `Status: ${followupStatusLabel(item)}`,
-    `Origin: ${item.source_label || "ArkReflect"}`,
+    `Origin: ${item.source_label || "Reflect"}`,
     `Why surfaced: ${followupWhatThisIs(item)}`,
     item.detail ? `Reflect detail: ${item.detail}` : "",
     item.latest_summary ? `Source-backed insight:\n${item.latest_summary}` : "",
@@ -1077,27 +1076,18 @@ function followupChatContext(item: ReflectSuggestedFollowup): string {
       );
     }
   }
-  if (isContinueTheme) {
-    lines.push(
-      `Chat starting point: ${item.prompt.trim() || `Review this reflected thread: ${item.title.trim()}`}`,
-      "Launch mode: review this ArkReflect handoff in chat first. Do not build, deploy, restart, schedule, or create durable work from this handoff alone; ask for the concrete next action if it is not explicit.",
-    );
-  } else {
-    lines.push(`Requested next step: ${item.prompt.trim() || item.title.trim()}`);
-  }
+  lines.push(`Requested next step: ${item.prompt.trim() || item.title.trim()}`);
   return lines.join("\n\n");
 }
 
 function followupKindLabel(kind: string): string {
   switch (kind) {
     case "latest_developments":
-      return "Source insight";
+      return "Source check";
     case "recovery_advice":
       return "Needs review";
-    case "continue_theme":
-      return "Continue";
     default:
-      return "Follow-up";
+      return "Next step";
   }
 }
 
@@ -1116,11 +1106,9 @@ function followupStatusLabel(item: ReflectSuggestedFollowup): string {
 function followupActionLabel(kind: string): string {
   switch (kind) {
     case "latest_developments":
-      return "Launch in Chat";
+      return "Open in Chat";
     case "recovery_advice":
       return "Review in new Chat";
-    case "continue_theme":
-      return "Review in Chat";
     default:
       return "Start new Chat";
   }
@@ -1139,6 +1127,17 @@ function storeChatPendingLaunch(snapshot: ChatPendingLaunch): void {
   }
 }
 
+function safeExternalHttpUrl(raw: string | undefined): string | null {
+  const value = (raw || "").trim();
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function quietStatus(
   response: ReflectResponse | undefined,
   fetching: boolean,
@@ -1147,7 +1146,7 @@ function quietStatus(
   if (!response) {
     return {
       title: fetching ? "Loading your recap" : "Recap is ready when activity is available",
-      detail: "ArkReflect reads cached reflection data first, then updates quietly in the background.",
+      detail: "Reflect reads cached reflection data first, then updates quietly in the background.",
       active: fetching,
     };
   }
@@ -1165,7 +1164,7 @@ function quietStatus(
     return {
       title: "Still collecting data",
       detail:
-        "ArkReflect does not have enough cached work units for this range yet. The recap will appear here once activity is available.",
+        "Reflect does not have enough cached work units for this range yet. The recap will appear here once activity is available.",
       active: false,
     };
   }
@@ -1183,11 +1182,11 @@ function quietStatus(
   };
 }
 
-export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkReflectPageProps) {
+export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPageProps) {
   const queryClient = useQueryClient();
   const [period, setPeriod] = useState<ReflectPeriod>("weekly");
   const [anchor, setAnchor] = useState(() => toDateInputValue(new Date()));
-  const [storyTab, setStoryTab] = useState<ReflectStoryTab>("overview");
+  const [storyTab, setStoryTab] = useState<ReflectStoryTab>("latest");
   const [selectedFollowupId, setSelectedFollowupId] = useState<string | null>(null);
   const [topicPage, setTopicPage] = useState(0);
   const [opportunityPage, setOpportunityPage] = useState(0);
@@ -1235,7 +1234,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     onMutate: () => {
       setLocalRefreshRunning(true);
       setRefreshNotice(
-        "ArkReflect is running. This page is locked until the current refresh finishes.",
+        "Reflect is running. This page is locked until the current refresh finishes.",
       );
     },
     onSuccess: (result) => {
@@ -1243,7 +1242,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
         setLocalRefreshRunning(true);
         setRefreshNotice(
           result.detail ||
-            "ArkReflect is running. This page is locked until the current refresh finishes.",
+            "Reflect is running. This page is locked until the current refresh finishes.",
         );
       } else {
         setLocalRefreshRunning(false);
@@ -1276,7 +1275,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     refreshMutation.data?.refresh_status.started_at ||
     refreshMutation.data?.refresh_status.requested_at ||
     "";
-  const runArkReflectNow = () => {
+  const runReflectNow = () => {
     if (isReflectRunning) return;
     refreshMutation.mutate();
   };
@@ -1285,7 +1284,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     if (backendRefreshRunning) {
       setLocalRefreshRunning(true);
       setRefreshNotice(
-        "ArkReflect is running. This page is locked until the current refresh finishes.",
+        "Reflect is running. This page is locked until the current refresh finishes.",
       );
       return;
     }
@@ -1326,7 +1325,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
       launchMode: "message",
       message,
       newConversation: true,
-      source: "ArkReflect",
+      source: "Reflect",
     });
     onNavigateToView?.("chat");
     if (!onNavigateToView && typeof window !== "undefined") {
@@ -1334,8 +1333,9 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     }
   };
   const openSearchResult = (result: ReflectSearchResult) => {
-    if (!result.url || typeof window === "undefined") return;
-    window.open(result.url, "_blank", "noopener,noreferrer");
+    const safeUrl = safeExternalHttpUrl(result.url);
+    if (!safeUrl || typeof window === "undefined") return;
+    window.open(safeUrl, "_blank", "noopener,noreferrer");
   };
   // Reused by the narrative hero's "Try this in Chat" CTA. Same
   // sessionStorage handoff pattern as the existing followup launcher
@@ -1354,6 +1354,10 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     if (!onNavigateToView && typeof window !== "undefined") {
       window.location.href = "/ui/chat";
     }
+  };
+  const showNextStepDetails = () => {
+    setStoryTab("latest");
+    setShowDetails(true);
   };
   // Map the technical ReflectResponse into the novice-friendly narrative
   // shape. Pure mapping — no decisions, no string composition. The
@@ -1543,9 +1547,9 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   const sourceSignalCount = totalForSourceCounts(response?.source_counts);
   const emptyStateDetail = response
     ? totalUnits > 0
-      ? `ArkReflect has ${totalUnits} reflected work unit${totalUnits === 1 ? "" : "s"} for this range and is still grouping them into focus areas.`
+      ? `Reflect has ${totalUnits} reflected work unit${totalUnits === 1 ? "" : "s"} for this range and is still grouping them into focus areas.`
       : sourceSignalCount > 0
-      ? `ArkReflect has ${sourceSignalCount} source signal${sourceSignalCount === 1 ? "" : "s"} in this range and is preparing the reflected work units for the recap.`
+      ? `Reflect has ${sourceSignalCount} source signal${sourceSignalCount === 1 ? "" : "s"} in this range and is preparing the reflected work units for the recap.`
       : "No reflected work units are cached for this range yet. Keep working normally; this panel will turn into the recap after chat, ArkOrbit, apps, goals, watchers, or background systems produce activity."
     : status.detail;
   const emptyStateChip =
@@ -1697,7 +1701,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
       backgroundColor: "transparent",
       tooltip: {
         backgroundColor: "rgba(6, 11, 16, 0.96)",
-        borderColor: "rgba(120, 200, 220, 0.4)",
+        borderColor: "rgba(130, 170, 160, 0.4)",
         borderWidth: 1,
         padding: [8, 12],
         textStyle: {
@@ -1720,12 +1724,12 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             left: "center",
             top: "middle",
             children: [
-              { type: "circle", shape: { cx: 0, cy: 0, r: 3 }, style: { fill: "transparent", stroke: "rgba(120,200,220,0.55)", lineWidth: 1 } },
-              { type: "circle", shape: { cx: 0, cy: 0, r: 1 }, style: { fill: "rgba(120,200,220,0.7)" } },
-              { type: "line", shape: { x1: -10, y1: 0, x2: -5, y2: 0 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
-              { type: "line", shape: { x1: 5, y1: 0, x2: 10, y2: 0 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
-              { type: "line", shape: { x1: 0, y1: -10, x2: 0, y2: -5 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
-              { type: "line", shape: { x1: 0, y1: 5, x2: 0, y2: 10 }, style: { stroke: "rgba(120,200,220,0.45)", lineWidth: 1 } },
+              { type: "circle", shape: { cx: 0, cy: 0, r: 3 }, style: { fill: "transparent", stroke: "rgba(130,170,160,0.55)", lineWidth: 1 } },
+              { type: "circle", shape: { cx: 0, cy: 0, r: 1 }, style: { fill: "rgba(130,170,160,0.7)" } },
+              { type: "line", shape: { x1: -10, y1: 0, x2: -5, y2: 0 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 5, y1: 0, x2: 10, y2: 0 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 0, y1: -10, x2: 0, y2: -5 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 0, y1: 5, x2: 0, y2: 10 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
             ],
           },
           {
@@ -1734,7 +1738,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             top: 12,
             style: {
               text: `PANORAMA - ${clusters.length.toString().padStart(2, "0")} TRACES`,
-              fill: "rgba(120, 200, 220, 0.55)",
+              fill: "rgba(130, 170, 160, 0.55)",
               font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
             },
           },
@@ -1744,7 +1748,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             bottom: 12,
             style: {
               text: "FOCUS MAP",
-              fill: "rgba(120, 200, 220, 0.45)",
+              fill: "rgba(130, 170, 160, 0.45)",
               font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
               textAlign: "right",
             },
@@ -1795,7 +1799,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     const data = buckets.map((count) => ({
       value: count,
       itemStyle: {
-        color: count === 0 ? "rgba(120, 200, 220, 0.10)" : "rgba(120, 200, 220, 0.78)",
+        color: count === 0 ? "rgba(130, 170, 160, 0.10)" : "rgba(130, 170, 160, 0.78)",
         borderColor: count === peak ? "rgba(180, 230, 250, 0.95)" : "transparent",
         borderWidth: count === peak ? 0.6 : 0,
       },
@@ -1805,7 +1809,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
       tooltip: {
         trigger: "axis",
         backgroundColor: "rgba(6, 11, 16, 0.96)",
-        borderColor: "rgba(120, 200, 220, 0.4)",
+        borderColor: "rgba(130, 170, 160, 0.4)",
         borderWidth: 1,
         padding: [6, 10],
         textStyle: {
@@ -1813,7 +1817,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
           fontSize: 11,
           fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
         },
-        axisPointer: { type: "shadow", shadowStyle: { color: "rgba(120, 200, 220, 0.06)" } },
+        axisPointer: { type: "shadow", shadowStyle: { color: "rgba(130, 170, 160, 0.06)" } },
         formatter: (params: Array<{ dataIndex: number; value: number }>) => {
           const p = params?.[0];
           if (!p) return "";
@@ -1829,7 +1833,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
         data: buckets.map((_, i) => i),
         boundaryGap: true,
         axisTick: { show: false },
-        axisLine: { lineStyle: { color: "rgba(120, 200, 220, 0.18)" } },
+        axisLine: { lineStyle: { color: "rgba(130, 170, 160, 0.18)" } },
         axisLabel: {
           color: "rgba(180, 210, 225, 0.5)",
           fontSize: 9,
@@ -1891,21 +1895,13 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     topicPage * TOPIC_PAGE_SIZE + TOPIC_PAGE_SIZE,
   );
   const leadCluster = topicRows[0] ?? sortedClusters[0] ?? null;
-  const replayUnits = useMemo(
-    () =>
-      allUnits
-        .filter((unit) => Number.isFinite(Date.parse(unit.occurred_at)))
-        .sort((left, right) => Date.parse(left.occurred_at) - Date.parse(right.occurred_at))
-        .slice(0, 6),
-    [allUnits],
-  );
-  const showWeeklyReplay = replayUnits.length >= 3;
   const recoveryFollowups = suggestedFollowups.filter((item) => item.kind === "recovery_advice");
   const latestFollowups = suggestedFollowups.filter((item) => item.kind === "latest_developments");
   const sourceBackedLatestFollowups = latestFollowups.filter(followupHasSourceEvidence);
   const opportunityFollowups = suggestedFollowups.filter(isDisplayableOpportunity);
+  const reviewThreadFollowups = suggestedFollowups.filter(isReviewThreadFollowup);
   const selectedFollowup =
-    opportunityFollowups.find((item) => item.id === selectedFollowupId) ?? null;
+    [...opportunityFollowups, ...reviewThreadFollowups].find((item) => item.id === selectedFollowupId) ?? null;
   const latestSourceCount = latestFollowups.reduce((sum, item) => sum + item.search_results.length, 0);
   const latestReadyCount = sourceBackedLatestFollowups.filter((item) => item.status === "ready").length;
   const latestQueuedCount = latestFollowups.filter((item) => item.status === "queued").length;
@@ -1922,7 +1918,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
       tooltip: {
         trigger: "item",
         backgroundColor: "rgba(6, 11, 16, 0.96)",
-        borderColor: "rgba(120, 200, 220, 0.4)",
+        borderColor: "rgba(130, 170, 160, 0.4)",
         borderWidth: 1,
         textStyle: {
           color: "#dceaf2",
@@ -1956,7 +1952,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
             formatter: "{b}\n{c}",
           },
-          labelLine: { length: 8, length2: 5, lineStyle: { color: "rgba(120, 200, 220, 0.35)" } },
+          labelLine: { length: 8, length2: 5, lineStyle: { color: "rgba(130, 170, 160, 0.35)" } },
           data: sourceRows.map((source) => ({ name: source.label, value: source.count })),
           animationDuration: 800,
           animationEasing: "cubicOut",
@@ -1967,9 +1963,14 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   );
   useEffect(() => {
     if (!selectedFollowupId) return;
-    if (opportunityFollowups.some((item) => item.id === selectedFollowupId)) return;
+    if (
+      opportunityFollowups.some((item) => item.id === selectedFollowupId) ||
+      reviewThreadFollowups.some((item) => item.id === selectedFollowupId)
+    ) {
+      return;
+    }
     setSelectedFollowupId(null);
-  }, [opportunityFollowups, selectedFollowupId]);
+  }, [opportunityFollowups, reviewThreadFollowups, selectedFollowupId]);
   useEffect(() => {
     if (topicPage < topicPageCount) return;
     setTopicPage(Math.max(0, topicPageCount - 1));
@@ -1978,14 +1979,6 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     if (opportunityPage < opportunityPageCount) return;
     setOpportunityPage(Math.max(0, opportunityPageCount - 1));
   }, [opportunityPage, opportunityPageCount]);
-  const keyMoments = useMemo(
-    () =>
-      uniqueByVisibleMeaning(
-        replayUnits.slice().reverse(),
-        (unit) => `${unitDisplayTitle(unit)} ${unit.summary || unit.content_preview}`,
-      ).slice(0, 6),
-    [replayUnits],
-  );
   const hasProblems =
     recoveryFollowups.length > 0 ||
     Boolean(response?.refresh_status.last_error) ||
@@ -1999,13 +1992,13 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   const hasGroupingStatus =
     (response?.embedding_status.total_units ?? 0) > 0 ||
     Boolean(response?.embedding_status.detail);
-  const hasStudioSide = hasTodayStatus || opportunityFollowups.length > 0 || hasGroupingStatus;
+  const hasStudioSide = opportunityFollowups.length > 0 || reviewThreadFollowups.length > 0;
   const whatWentWrong =
     response?.refresh_status.last_error ||
     recoveryFollowups[0]?.detail ||
     (response?.embedding_status.mode !== "semantic" && totalUnits > 0
       ? "Semantic grouping is still catching up, so some patterns may be grouped by source activity first."
-      : "No major failure stood out in the reflected data. The main risk is letting the next step remain implicit.");
+      : "No major failure stood out in the reflected data. The main risk is leaving the next step implicit.");
   const overviewStats = [
     {
       label: "Topics found",
@@ -2020,8 +2013,8 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
         latestSourceCount > 0
           ? `${latestSourceCount} current-source result${latestSourceCount === 1 ? "" : "s"} cached for reflected topics.`
           : latestFollowups.length > 0
-            ? `${latestFollowups.length} reflected topic${latestFollowups.length === 1 ? "" : "s"} queued for source-backed checks.`
-            : "No reflected topic currently needs an external source check.",
+            ? `${latestFollowups.length} next step${latestFollowups.length === 1 ? "" : "s"} queued for source checking.`
+            : "No next steps are queued yet.",
       tone: "var(--cyan)",
     },
     ...(hasProblems
@@ -2049,19 +2042,19 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
       : []),
   ];
   const storyTabs = [
+    { value: "latest" as const, label: "Next Steps", short: "Next Steps", count: opportunityFollowups.length },
     { value: "overview" as const, label: "Overview", short: "Overview", count: totalUnits },
     ...(topClusters.length > 0
       ? [{ value: "topics" as const, label: "Topics", short: "Topics", count: topicRows.length }]
       : []),
-    { value: "latest" as const, label: "Opportunities", short: "Opportunities", count: opportunityFollowups.length },
-    ...(showWeeklyReplay
-      ? [{ value: "timeline" as const, label: "Timeline", short: "Timeline", count: replayUnits.length }]
+    ...(reviewThreadFollowups.length > 0
+      ? [{ value: "review" as const, label: "Recovery", short: "Recovery", count: reviewThreadFollowups.length }]
       : []),
   ];
 
   useEffect(() => {
     if (storyTabs.some((tab) => tab.value === storyTab)) return;
-    setStoryTab("overview");
+    setStoryTab("latest");
   }, [storyTab, storyTabs]);
 
   const renderStoryView = () => {
@@ -2093,7 +2086,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     };
     const focusTitle =
       focusLabel === "No activity yet"
-        ? "ArkReflect is waiting for a clear focus."
+        ? "Reflect is waiting for a clear focus."
         : focusLabel === "No clear user-facing focus yet"
           ? "No user-facing focus yet"
           : `User-facing focus: ${focusLabel}`;
@@ -2106,7 +2099,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             chips for stats that are already in the tabs below. Removed
             entirely. The tab strip beneath is now the first visible
             element inside "Show details", which is the right job for it
-            (navigate between overview/topics/opportunities/timeline). */}
+            (navigate between overview/topics/next steps/review threads). */}
         <Box
           className="arkreflect-motion-panel"
           sx={{
@@ -2224,7 +2217,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                       {hasProblems
                         ? whatWentWrong
                         : leadCluster
-                          ? `${leadCluster.unit_count} item${leadCluster.unit_count === 1 ? "" : "s"} support the leading topic. ${latestFollowups.length} reflected topic${latestFollowups.length === 1 ? "" : "s"} can be checked against current sources.`
+                          ? `${leadCluster.unit_count} item${leadCluster.unit_count === 1 ? "" : "s"} support the leading topic. ${latestFollowups.length} possible next step${latestFollowups.length === 1 ? "" : "s"} can be checked against current sources.`
                           : "When enough activity exists, this area explains the strongest thread and why it is worth attention."}
                     </Typography>
                   </Box>
@@ -2257,6 +2250,26 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                     sx={{ mt: 1, borderRadius: "8px" }}
                   >
                     {followupActionLabel(opportunityFollowups[0].kind)}
+                  </Button>
+                </Box>
+              ) : null}
+              {reviewThreadFollowups.length > 0 ? (
+                <Box sx={{ ...panelSx, p: 1.35 }}>
+                  <Typography sx={labelSx}>Review threads</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1.35rem", mt: 0.55 }}>
+                    {reviewThreadFollowups.length}
+                  </Typography>
+                  <Typography sx={{ ...bodySx, mt: 0.65 }}>
+                    Failed or stalled reflected work stays separate from source-checked next steps.
+                  </Typography>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<WorkHistoryRoundedIcon />}
+                    onClick={() => setStoryTab("review")}
+                    sx={{ mt: 1, borderRadius: "8px" }}
+                  >
+                    Review threads
                   </Button>
                 </Box>
               ) : null}
@@ -2372,13 +2385,16 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
         <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35 }}>
           <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1.2 }}>
             <Box>
-              <Typography sx={labelSx}>Opportunities</Typography>
+              <Typography sx={labelSx}>Next steps</Typography>
               <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
-                Useful pursuits and follow-ups from this recap
+                What to do after this recap
+              </Typography>
+              <Typography sx={{ ...bodySx, mt: 0.55, maxWidth: 720 }}>
+                These are actionable threads Reflect can open in Chat, with source checks shown when current information is useful.
               </Typography>
             </Box>
             <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
-              <Chip className="arkreflect-pill" icon={<TaskAltRoundedIcon />} label={`${opportunityFollowups.length} item${opportunityFollowups.length === 1 ? "" : "s"}`} />
+              <Chip className="arkreflect-pill" icon={<TaskAltRoundedIcon />} label={`${opportunityFollowups.length} next step${opportunityFollowups.length === 1 ? "" : "s"}`} />
               {sourceBackedLatestFollowups.length > 0 ? (
                 <Chip className="arkreflect-pill" icon={<SearchRoundedIcon />} label={`${latestSourceCount || sourceBackedLatestFollowups.length} source-backed`} />
               ) : null}
@@ -2406,24 +2422,24 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                   </Box>
                   <Typography sx={{ ...titleSx, fontSize: { xs: "1.15rem", md: "1.35rem" } }}>
                     {isReflectRunning
-                      ? "Finding opportunities"
-                      : "No opportunities ready for this range"}
+                      ? "Looking for useful next steps"
+                      : "No next steps ready for this range yet"}
                   </Typography>
                   <Typography sx={bodySx}>
                     {isReflectRunning
-                      ? "ArkReflect is refreshing this range. Any useful source check, recovery path, or follow-up will appear here."
+                      ? "Reflect is refreshing this range. Useful next steps will appear here when there is something worth acting on."
                       : totalUnits > 0
-                        ? "This range has reflected activity, but nothing is actionable enough to show as an opportunity yet."
-                        : "No reflected activity is cached for this range yet. This tab stays available while ArkReflect waits for enough activity."}
+                        ? "This range has activity, but nothing has been promoted into a clear next step yet. Run Reflect to re-check the range."
+                        : "No activity is cached for this range yet. This tab stays available so users always know where next steps will appear."}
                   </Typography>
                   <Button
                     variant="outlined"
                     startIcon={<RefreshRoundedIcon />}
                     disabled={isReflectRunning}
-                    onClick={runArkReflectNow}
+                    onClick={runReflectNow}
                     sx={{ alignSelf: "flex-start", borderRadius: "8px" }}
                   >
-                    {isReflectRunning ? "Running ArkReflect" : "Run ArkReflect now"}
+                    {isReflectRunning ? "Running Reflect" : "Run Reflect now"}
                   </Button>
                 </Stack>
               </Box>
@@ -2461,12 +2477,12 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                     cursor: "pointer",
                     background:
                       isLatest && item.search_results.length > 0
-                        ? "linear-gradient(90deg, rgba(0, 184, 217, 0.08), rgba(255,255,255,0.02))"
+                        ? "linear-gradient(90deg, rgba(120, 242, 176, 0.08), rgba(255,255,255,0.02))"
                         : "var(--ui-rgba-255-255-255-020)",
                     transition: "border-color 180ms ease, background 180ms ease, transform 180ms ease",
                     "&:hover": {
-                      borderColor: "rgba(88, 224, 255, 0.34)",
-                      background: "rgba(88, 224, 255, 0.055)",
+                      borderColor: "rgba(120, 242, 176, 0.34)",
+                      background: "rgba(120, 242, 176, 0.055)",
                       transform: "translateY(-1px)",
                     },
                   }}
@@ -2531,56 +2547,85 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
         </Box>
         ) : null}
 
-        {storyTab === "timeline" && showWeeklyReplay ? (
+        {storyTab === "review" ? (
           <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35 }}>
-            <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ justifyContent: "space-between", mb: 1 }}>
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1.2 }}>
               <Box>
-                <Typography sx={labelSx}>Timeline</Typography>
+                <Typography sx={labelSx}>Review threads</Typography>
                 <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
-                  How the period unfolded
+                  Recovery items that need attention
                 </Typography>
               </Box>
-              <Chip className="arkreflect-pill" icon={<TimelineRoundedIcon />} label={`${replayUnits.length} moments`} />
+              <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
+                <Chip className="arkreflect-pill" icon={<WorkHistoryRoundedIcon />} label={`${reviewThreadFollowups.length} review item${reviewThreadFollowups.length === 1 ? "" : "s"}`} />
+                {recoveryFollowups.length > 0 ? (
+                  <Chip size="small" variant="outlined" label={`${recoveryFollowups.length} recovery`} />
+                ) : null}
+              </Stack>
             </Stack>
-            <Grid2 container spacing={1.2}>
-              <Grid2 size={{ xs: 12, lg: 5 }}>
-                <ReactECharts option={activityOption} style={{ height: 190, width: "100%" }} />
-              </Grid2>
-              <Grid2 size={{ xs: 12, lg: 7 }}>
-                <Box
-                  sx={{
-                    display: "grid",
-                    gridTemplateColumns: { xs: "1fr", sm: "repeat(2, minmax(0, 1fr))", xl: "repeat(3, minmax(0, 1fr))" },
-                    gap: 1,
-                  }}
-                >
-                  {keyMoments.map((unit, index) => (
-                    <Box
-                      key={unit.id}
-                      sx={{
-                        p: 1,
-                        minHeight: 112,
-                        border: "1px solid var(--surface-border)",
-                        borderRadius: "8px",
-                        background: index === 0 ? "var(--ui-rgba-57-208-255-060)" : "var(--ui-rgba-255-255-255-020)",
-                      }}
-                    >
-                      <Typography sx={labelSx}>
-                        Moment {String(index + 1).padStart(2, "0")} - {formatUiDateTime(unit.occurred_at, { fallback: "time pending" })}
+            <Stack spacing={1}>
+              {reviewThreadFollowups.map((item) => {
+                const itemIcon =
+                  item.kind === "recovery_advice" ? (
+                    <AutoGraphRoundedIcon fontSize="small" />
+                  ) : (
+                    <TaskAltRoundedIcon fontSize="small" />
+                  );
+                return (
+                  <Box
+                    key={item.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSelectedFollowupId(item.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedFollowupId(item.id);
+                      }
+                    }}
+                    sx={{
+                      display: "grid",
+                      gridTemplateColumns: { xs: "1fr", md: "34px minmax(0, 1fr) auto" },
+                      gap: 1,
+                      alignItems: "start",
+                      p: { xs: 1.05, md: 1.2 },
+                      border: "1px solid var(--surface-border)",
+                      borderRadius: "8px",
+                      cursor: "pointer",
+                      background: "var(--ui-rgba-255-255-255-020)",
+                      transition: "border-color 180ms ease, background 180ms ease, transform 180ms ease",
+                      "&:hover": {
+                        borderColor: "rgba(120, 242, 176, 0.34)",
+                        background: "rgba(120, 242, 176, 0.055)",
+                        transform: "translateY(-1px)",
+                      },
+                    }}
+                  >
+                    <Box sx={{ color: item.kind === "recovery_advice" ? "var(--red)" : "var(--green)", pt: 0.25 }}>
+                      {itemIcon}
+                    </Box>
+                    <Box sx={{ minWidth: 0 }}>
+                      <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", flexWrap: "wrap", rowGap: 0.5 }}>
+                        <Typography sx={{ ...titleSx, fontSize: "1.05rem" }}>
+                          {item.title}
+                        </Typography>
+                        <Chip size="small" variant="outlined" label={followupKindLabel(item.kind)} />
+                        <Chip size="small" variant="outlined" label={followupStatusLabel(item)} />
+                      </Stack>
+                      <Typography variant="caption" sx={{ display: "block", mt: 0.45, color: "var(--text-dim)" }}>
+                        {followupWhatThisIs(item)}
                       </Typography>
-                      <Typography sx={{ fontWeight: 800, mt: 0.65 }}>{unitDisplayTitle(unit)}</Typography>
                       <Typography sx={{ ...bodySx, mt: 0.45 }}>
-                        {firstNonDuplicateText(
-                          [unit.summary, unit.content_preview, sourceMeta(unit.source_kind).group],
-                          unitDisplayTitle(unit),
-                          150,
-                        ) || sourceMeta(unit.source_kind).group}
+                        {item.detail || "Review this failed or stalled reflected item in Chat, decide the recovery path, or dismiss it if it is stale."}
                       </Typography>
                     </Box>
-                  ))}
-                </Box>
-              </Grid2>
-            </Grid2>
+                    <Box sx={{ justifySelf: { xs: "start", md: "end" } }}>
+                      {renderFollowupControls(item, false)}
+                    </Box>
+                  </Box>
+                );
+              })}
+            </Stack>
           </Box>
         ) : null}
       </Stack>
@@ -2591,13 +2636,8 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     <WorkspacePageShell spacing={1.4}>
       <WorkspacePageHeader
         eyebrow="ARK CORE"
-        title="ArkReflect"
-        description={
-          <span>
-            ArkReflect shows what happened, which topics need current sources,
-            and the next action you can launch in Chat.
-          </span>
-        }
+        title="Reflect"
+        description="Visual retrospective of recent chats, memory, and background work — semantic clusters, narrative summary, source coverage, and rhythm."
         actions={
           <Box
             sx={{
@@ -2632,7 +2672,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
               value={period}
               onChange={(_, value) => value && setPeriod(value)}
               disabled={isReflectRunning}
-              aria-label="ArkReflect period"
+              aria-label="Reflect period"
               sx={{
                 bgcolor: "rgba(255,255,255,0.06)",
                 borderRadius: 2,
@@ -2671,15 +2711,15 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                 },
               }}
             />
-            <Tooltip title="Run ArkReflect for this date range now">
+            <Tooltip title="Run Reflect for this date range now">
               <Button
                 variant="outlined"
-                onClick={runArkReflectNow}
+                onClick={runReflectNow}
                 disabled={isReflectRunning}
                 startIcon={<RefreshRoundedIcon />}
                 sx={{ minHeight: 40 }}
               >
-                {isReflectRunning ? "Running ArkReflect" : "Run ArkReflect now"}
+                {isReflectRunning ? "Running Reflect" : "Run Reflect now"}
               </Button>
             </Tooltip>
           </Box>
@@ -2700,7 +2740,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
           <Stack spacing={1}>
             <Box>
               {refreshNotice ||
-                "ArkReflect is running. This page is locked until the current refresh finishes."}
+                "Reflect is running. This page is locked until the current refresh finishes."}
             </Box>
             <LinearProgress sx={{ borderRadius: 999 }} />
           </Stack>
@@ -2718,6 +2758,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
         showDetails={showDetails}
         onToggleDetails={() => setShowDetails((value) => !value)}
         onLaunchPrompt={launchHeroPrompt}
+        onShowNextSteps={showNextStepDetails}
       />
 
       {/* === ARKREFLECT STORY VIEW === */}
@@ -2727,7 +2768,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
           className="arkreflect-status"
           sx={{
             p: { xs: 2.2, md: 3 },
-            border: "1px solid rgba(120, 200, 220, 0.18)",
+            border: "1px solid rgba(130, 170, 160, 0.18)",
             borderRadius: "3px",
             background:
               "linear-gradient(180deg, rgba(7, 13, 18, 0.96), rgba(5, 9, 12, 0.94))",
@@ -2744,11 +2785,11 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                 width: 46,
                 height: 46,
                 borderRadius: "6px",
-                border: "1px solid rgba(120, 200, 220, 0.28)",
+                border: "1px solid rgba(130, 170, 160, 0.28)",
                 color: "var(--cyan-glow)",
                 display: "grid",
                 placeItems: "center",
-                background: "rgba(120, 200, 220, 0.07)",
+                background: "rgba(130, 170, 160, 0.07)",
                 flex: "0 0 auto",
               }}
             >
@@ -2804,7 +2845,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                 <Box
                   sx={{
                     p: 1.4,
-                    border: "1px solid rgba(120, 200, 220, 0.12)",
+                    border: "1px solid rgba(130, 170, 160, 0.12)",
                     borderRadius: "3px",
                     background: "rgba(255,255,255,0.025)",
                     minHeight: 78,
@@ -2883,7 +2924,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
               <Typography variant="caption" sx={{ color: "var(--text-dim)", display: "block", mt: 0.45 }}>
                 {selectedFollowup.kind === "latest_developments"
                   ? latestDevelopmentMeta(selectedFollowup)
-                  : `${selectedFollowup.source_label || "ArkReflect"} - ${formatUiDateTime(selectedFollowup.occurred_at, { fallback: "recently" })}`}
+                  : `${selectedFollowup.source_label || "Reflect"} - ${formatUiDateTime(selectedFollowup.occurred_at, { fallback: "recently" })}`}
               </Typography>
             </DialogTitle>
             <DialogContent dividers sx={{ borderColor: "var(--surface-border)" }}>
@@ -2918,40 +2959,43 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                   </Typography>
                   <Stack spacing={0.85}>
                     {selectedFollowup.search_results.length > 0 ? (
-                      selectedFollowup.search_results.map((result, index) => (
-                        <Box
-                          key={`${selectedFollowup.id}-${result.url || index}`}
-                          sx={{
-                            p: 1,
-                            border: "1px solid rgba(120, 200, 220, 0.14)",
-                            borderRadius: "8px",
-                            background: "rgba(255,255,255,0.025)",
-                          }}
-                        >
-                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", gap: 1 }}>
-                            <Box sx={{ minWidth: 0 }}>
-                              <Typography sx={{ fontWeight: 850 }}>{compactText(stripInlineMarkup(result.title), 120)}</Typography>
-                              <Typography variant="caption" sx={{ color: "var(--text-dim)" }}>
-                                {result.source || "Source"}{result.published_date ? ` - ${result.published_date}` : ""}
-                              </Typography>
-                              <Typography sx={{ color: "var(--text-secondary)", lineHeight: 1.55, mt: 0.55 }}>
-                                {compactText(stripInlineMarkup(result.snippet || result.url), 220)}
-                              </Typography>
+                      selectedFollowup.search_results.map((result, index) => {
+                          const safeUrl = safeExternalHttpUrl(result.url);
+                          return (
+                            <Box
+                              key={`${selectedFollowup.id}-${result.url || index}`}
+                              sx={{
+                                p: 1,
+                                border: "1px solid rgba(130, 170, 160, 0.14)",
+                                borderRadius: "8px",
+                                background: "rgba(255,255,255,0.025)",
+                              }}
+                            >
+                              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", gap: 1 }}>
+                                <Box sx={{ minWidth: 0 }}>
+                                  <Typography sx={{ fontWeight: 850 }}>{compactText(stripInlineMarkup(result.title), 120)}</Typography>
+                                  <Typography variant="caption" sx={{ color: "var(--text-dim)" }}>
+                                    {result.source || "Source"}{result.published_date ? ` - ${result.published_date}` : ""}
+                                  </Typography>
+                                  <Typography sx={{ color: "var(--text-secondary)", lineHeight: 1.55, mt: 0.55 }}>
+                                    {compactText(stripInlineMarkup(result.snippet || result.url), 220)}
+                                  </Typography>
+                                </Box>
+                                {safeUrl ? (
+                                  <Button
+                                    size="small"
+                                    variant="outlined"
+                                    endIcon={<OpenInNewRoundedIcon />}
+                                    onClick={() => openSearchResult(result)}
+                                    sx={{ borderRadius: "8px", alignSelf: { xs: "flex-start", sm: "center" }, flex: "0 0 auto" }}
+                                  >
+                                    Open
+                                  </Button>
+                                ) : null}
+                              </Stack>
                             </Box>
-                            {result.url ? (
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                endIcon={<OpenInNewRoundedIcon />}
-                                onClick={() => openSearchResult(result)}
-                                sx={{ borderRadius: "8px", alignSelf: { xs: "flex-start", sm: "center" }, flex: "0 0 auto" }}
-                              >
-                                Open
-                              </Button>
-                            ) : null}
-                          </Stack>
-                        </Box>
-                      ))
+                          );
+                      })
                     ) : (
                       <Typography sx={{ color: "var(--text-secondary)" }}>
                         {selectedFollowup.search_error || selectedFollowup.detail || "No sources are cached for this insight yet."}

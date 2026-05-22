@@ -1,10 +1,10 @@
 //! Background watcher system — poll-until-condition-then-act
 //!
-//! Allows the agent to spawn short-lived background watchers that:
+//! Allows the agent to spawn background watchers that:
 //! 1. Poll an action (e.g. gmail_scan) at a regular interval
 //! 2. Check a condition against the result (e.g. "not empty", "contains keyword")
 //! 3. When triggered: execute a chain of follow-up actions via the agent
-//! 4. Self-terminate after trigger or timeout
+//! 4. Self-terminate after trigger or timeout, unless configured to repeat
 //!
 //! Watchers are persisted in the database so they survive container restarts.
 #![allow(dead_code)]
@@ -153,7 +153,10 @@ impl WatchCondition {
             return match self.evaluation_mode {
                 WatchConditionEvaluationMode::CurrentState => description.to_string(),
                 WatchConditionEvaluationMode::Change => {
-                    format!("{} (compare against the previous successful poll)", description)
+                    format!(
+                        "{} (compare against the previous successful poll)",
+                        description
+                    )
                 }
             };
         }
@@ -348,6 +351,9 @@ pub struct Watcher {
     pub timeout_secs: u64,
     /// Channel to notify when triggered or timed out
     pub notify_channel: String,
+    /// Keep polling after a matched condition and send a notification for each match.
+    #[serde(default)]
+    pub repeat_on_match: bool,
     /// Current status
     pub status: WatcherStatus,
     /// When the watcher was created
@@ -650,6 +656,7 @@ impl WatcherManager {
         existing.interval_secs = watcher.interval_secs;
         existing.timeout_secs = watcher.timeout_secs;
         existing.notify_channel = watcher.notify_channel;
+        existing.repeat_on_match = watcher.repeat_on_match;
         existing.status = WatcherStatus::Active;
         existing.created_at = Utc::now();
         existing.last_poll_at = None;
@@ -858,8 +865,10 @@ impl WatcherManager {
     /// Mark a watcher as triggered
     pub async fn mark_triggered(&self, id: Uuid, result: String) {
         if let Some(w) = self.watchers.write().await.get_mut(&id) {
-            w.status = WatcherStatus::Triggered;
             w.trigger_result = Some(truncate_for_storage(&result, MAX_STORED_RESULT_CHARS));
+            if !w.repeat_on_match {
+                w.status = WatcherStatus::Triggered;
+            }
         }
         self.persist_one(id).await;
     }
@@ -1224,6 +1233,7 @@ mod tests {
             interval_secs: 60,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             notify_channel: "telegram".to_string(),
+            repeat_on_match: false,
             status: WatcherStatus::Active,
             created_at: Utc::now(),
             last_poll_at: None,

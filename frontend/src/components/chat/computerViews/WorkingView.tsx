@@ -1,7 +1,7 @@
 // Live working view shown while the agent is mid-turn but has not emitted a
 // tool artifact yet.
 
-import { useEffect, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useRef, useState } from "react";
 import Box from "@mui/material/Box";
 import IconButton from "@mui/material/IconButton";
 import Tooltip from "@mui/material/Tooltip";
@@ -29,17 +29,11 @@ export interface WorkingViewProps {
 const REASONING_PHASE_LABELS: Record<string, string> = {
   classifier: "Reviewing intent",
   planner: "Planning",
-  model: "Reasoning",
+  model: "Thinking",
   model_summary: "Reasoning summary",
+  reasoning: "Thinking",
+  reasoning_summary: "Reasoning summary",
 };
-const WORKING_PREVIEW_MAX_CHARS = 12_000;
-
-function tailPreview(value: string): string {
-  return value.length > WORKING_PREVIEW_MAX_CHARS
-    ? value.slice(-WORKING_PREVIEW_MAX_CHARS)
-    : value;
-}
-
 function normalizeStartedAt(value: WorkingViewProps["startedAt"]): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -98,12 +92,15 @@ export function WorkingView({
   // the assistant stream has not started — structural fallback, no phrase
   // matching.
   const isReasoning = !assistantContent && Boolean(reasoningContent);
-  const previewContent = tailPreview(assistantContent || reasoningContent);
+  const previewContent = assistantContent || reasoningContent;
   const previewMode = isReasoning
     ? "reasoning"
     : assistantContent
       ? "assistant"
       : "empty";
+  const deferredPreviewContent = useDeferredValue(previewContent);
+  const renderedPreviewContent =
+    isReasoning && !persisted ? deferredPreviewContent : previewContent;
   const reasoningPill =
     isReasoning && reasoningPhase
       ? REASONING_PHASE_LABELS[reasoningPhase] || null
@@ -138,7 +135,7 @@ export function WorkingView({
     const node = previewRef.current;
     if (!node || !followPreviewRef.current) return;
     node.scrollTop = node.scrollHeight;
-  }, [previewContent]);
+  }, [renderedPreviewContent]);
 
   const handlePreviewScroll = () => {
     const node = previewRef.current;
@@ -203,7 +200,11 @@ export function WorkingView({
         <Box className="cview-working-preview-fade" aria-hidden="true" />
         {previewContent ? (
           <pre ref={previewRef} onScroll={handlePreviewScroll}>
-            <LinkifiedText text={previewContent} />
+            {isReasoning ? (
+              renderedPreviewContent
+            ) : (
+              <LinkifiedText text={renderedPreviewContent} />
+            )}
           </pre>
         ) : (
           <Typography variant="body2" className="cview-working-preview-empty">

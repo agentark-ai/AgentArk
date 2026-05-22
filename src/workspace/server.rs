@@ -1,12 +1,12 @@
 use crate::workspace::protocol::{BlobResponse, InternalServiceHealth, WorkspaceStatusResponse};
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::IntoResponse,
     routing::{get, put},
-    Json, Router,
 };
 use serde_json::json;
 use std::collections::BTreeMap;

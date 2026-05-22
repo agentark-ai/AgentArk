@@ -22,7 +22,15 @@ const REFRESH_MS = 8000;
 
 type DrawerView = Extract<
   WorkspaceView,
-  "tasks" | "apps" | "documents" | "skills" | "swarm" | "trace" | "status" | "goals"
+  | "tasks"
+  | "apps"
+  | "documents"
+  | "skills"
+  | "swarm"
+  | "browser"
+  | "trace"
+  | "status"
+  | "goals"
 >;
 
 type Props = {
@@ -76,6 +84,7 @@ const DRAWER_VIEWS: Array<{ view: DrawerView; label: string; detail: string }> =
   { view: "documents", label: "Files", detail: "Knowledge, uploads, and workspace documents." },
   { view: "skills", label: "Skills", detail: "Reusable capabilities and imports." },
   { view: "swarm", label: "Agents", detail: "Specialist agents and live roster." },
+  { view: "browser", label: "Browser", detail: "Profiles, handoffs, and live browser runs." },
   { view: "trace", label: "Trace", detail: "Execution history and tool telemetry." },
   { view: "status", label: "Background Work", detail: "Monitors, reminders, and follow-ups." },
   { view: "goals", label: "Goals", detail: "Long-running intent and outcomes." },

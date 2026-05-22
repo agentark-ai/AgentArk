@@ -34,6 +34,7 @@ type Pulse = {
 
 const ALPHANUMERICS = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
 const TARGET_FRAME_MS = 1000 / 24;
+const IDLE_PAUSE_MS = 2 * 60 * 1000;
 
 function rand(min: number, max: number) {
   return min + Math.random() * (max - min);
@@ -63,8 +64,10 @@ function initAmberCascades(canvas: HTMLCanvasElement) {
   let dpr = 1;
   let raf = 0;
   let frameTimer = 0;
+  let idleTimer = 0;
   let lastTime = 0;
   let stopped = false;
+  let idle = false;
   let fragments: Fragment[] = [];
   let nodes: SignalNode[] = [];
   let pulses: Pulse[] = [];
@@ -240,6 +243,13 @@ function initAmberCascades(canvas: HTMLCanvasElement) {
     }
   };
 
+  const clearIdleTimer = () => {
+    if (idleTimer) {
+      window.clearTimeout(idleTimer);
+      idleTimer = 0;
+    }
+  };
+
   const renderFrame = (timeMs: number, animate: boolean) => {
     const dt = Math.min((timeMs - (lastTime || timeMs)) / 1000, 0.05);
     lastTime = timeMs;
@@ -252,7 +262,7 @@ function initAmberCascades(canvas: HTMLCanvasElement) {
   };
 
   const scheduleFrame = () => {
-    if (stopped || reduced || document.visibilityState === "hidden") return;
+    if (stopped || idle || reduced || document.visibilityState === "hidden") return;
     if (raf || frameTimer) return;
     frameTimer = window.setTimeout(() => {
       frameTimer = 0;
@@ -270,13 +280,38 @@ function initAmberCascades(canvas: HTMLCanvasElement) {
   };
 
   const onPointer = (event: PointerEvent) => {
+    markActive();
     if (reduced || document.visibilityState === "hidden") return;
     disturb(event.clientX, event.clientY);
   };
 
+  const markIdle = () => {
+    if (stopped || idle) return;
+    idle = true;
+    cancelScheduledFrame();
+    drawStatic();
+  };
+
+  const markActive = () => {
+    if (stopped || document.visibilityState === "hidden") return;
+    const wasIdle = idle;
+    idle = false;
+    clearIdleTimer();
+    idleTimer = window.setTimeout(markIdle, IDLE_PAUSE_MS);
+    if (wasIdle && !reduced) {
+      lastTime = 0;
+      scheduleFrame();
+    }
+  };
+
   const onVisibilityChange = () => {
     cancelScheduledFrame();
-    if (document.visibilityState === "hidden") return;
+    if (document.visibilityState === "hidden") {
+      clearIdleTimer();
+      idle = true;
+      return;
+    }
+    markActive();
     lastTime = 0;
     if (reduced) {
       drawStatic();
@@ -287,8 +322,11 @@ function initAmberCascades(canvas: HTMLCanvasElement) {
 
   resize();
   window.addEventListener("resize", resize);
+  window.addEventListener("keydown", markActive);
+  window.addEventListener("wheel", markActive, { passive: true });
   document.addEventListener("visibilitychange", onVisibilityChange);
   canvas.addEventListener("pointerdown", onPointer);
+  markActive();
   if (reduced) {
     drawStatic();
   } else {
@@ -298,7 +336,10 @@ function initAmberCascades(canvas: HTMLCanvasElement) {
   return () => {
     stopped = true;
     cancelScheduledFrame();
+    clearIdleTimer();
     window.removeEventListener("resize", resize);
+    window.removeEventListener("keydown", markActive);
+    window.removeEventListener("wheel", markActive);
     document.removeEventListener("visibilitychange", onVisibilityChange);
     canvas.removeEventListener("pointerdown", onPointer);
   };

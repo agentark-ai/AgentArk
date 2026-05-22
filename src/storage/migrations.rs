@@ -1,6 +1,6 @@
 use anyhow::Result;
 use sea_orm::sea_query::{
-    extension::postgres::Extension, Index, IndexCreateStatement, PostgresQueryBuilder,
+    Index, IndexCreateStatement, PostgresQueryBuilder, extension::postgres::Extension,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Schema, Statement};
 
@@ -50,8 +50,7 @@ async fn ensure_optional_sql(
     Ok(())
 }
 
-const ACTION_CATALOG_INDEX_HNSW_SQL: &str =
-    "CREATE INDEX IF NOT EXISTS idx_action_catalog_index_embedding_hnsw \
+const ACTION_CATALOG_INDEX_HNSW_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_action_catalog_index_embedding_hnsw \
      ON action_catalog_index USING hnsw (embedding vector_cosine_ops) \
      WHERE enabled = true AND embedding IS NOT NULL";
 
@@ -891,7 +890,7 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         backend,
         "semantic_work_units",
         "embedding",
-        // ArkReflect's selected-range clustering is computed from cached rows,
+        // Reflect's selected-range clustering is computed from cached rows,
         // but this index is used for cross-period related-history lookups over
         // derived work units. Raw chat messages are not embedded into this table.
         "CREATE INDEX IF NOT EXISTS idx_semantic_work_units_embedding_hnsw \
@@ -1886,7 +1885,7 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{vector_type_has_dimensions, ACTION_CATALOG_INDEX_HNSW_SQL};
+    use super::{ACTION_CATALOG_INDEX_HNSW_SQL, vector_type_has_dimensions};
 
     #[test]
     fn vector_type_dimension_detection_requires_explicit_dimensions() {

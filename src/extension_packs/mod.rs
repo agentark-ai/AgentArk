@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use regex::Regex;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1333,7 +1333,10 @@ fn bundled_catalog() -> Vec<ExtensionPackManifest> {
                 oauth2: None,
                 exports: ExtensionPackAuthExportSpec {
                     env: BTreeMap::from([
-                        ("GWS_AUTH_HEADER".to_string(), "authorization_header".to_string()),
+                        (
+                            "GWS_AUTH_HEADER".to_string(),
+                            "authorization_header".to_string(),
+                        ),
                         ("GWS_ACCESS_TOKEN".to_string(), "access_token".to_string()),
                         ("GWS_REFRESH_TOKEN".to_string(), "refresh_token".to_string()),
                     ]),
@@ -1346,14 +1349,24 @@ fn bundled_catalog() -> Vec<ExtensionPackManifest> {
             features: vec![
                 ("mail.list", "List Gmail messages", true, "gmail_scan"),
                 ("mail.send", "Send or reply in Gmail", false, "gmail_reply"),
-                ("calendar.list_events", "List Calendar events", true, "calendar_list"),
+                (
+                    "calendar.list_events",
+                    "List Calendar events",
+                    true,
+                    "calendar_list",
+                ),
                 (
                     "calendar.create_event",
                     "Create Calendar events",
                     false,
                     "calendar_create",
                 ),
-                ("files.search", "Search Google Drive", true, "google_drive_search"),
+                (
+                    "files.search",
+                    "Search Google Drive",
+                    true,
+                    "google_drive_search",
+                ),
                 ("files.read", "Read Google Docs", true, "google_docs_read"),
                 (
                     "chat.list_spaces",
@@ -1389,7 +1402,10 @@ fn bundled_catalog() -> Vec<ExtensionPackManifest> {
                     "google drive".to_string(),
                 ],
                 binaries: vec!["gws".to_string()],
-                domains: vec!["googleapis.com".to_string(), "workspace.google.com".to_string()],
+                domains: vec![
+                    "googleapis.com".to_string(),
+                    "workspace.google.com".to_string(),
+                ],
                 ..ExtensionPackDiscoverySpec::default()
             },
             runtime: ExtensionPackRuntimeSpec {
@@ -4812,9 +4828,11 @@ fn required_secrets_for_imported_auth(
             vec!["api_key".to_string()]
         }
         CustomApiAuthMode::Bearer | CustomApiAuthMode::OAuth2 => {
-            vec![imported_secret_path(requested_mode, preview_mode)
-                .unwrap_or("access_token")
-                .to_string()]
+            vec![
+                imported_secret_path(requested_mode, preview_mode)
+                    .unwrap_or("access_token")
+                    .to_string(),
+            ]
         }
     }
 }
@@ -5762,13 +5780,13 @@ fn scalar_to_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        auth_profile_material_for_secret_backed_pack, connection_secret_key,
-        imported_auth_contract, manifest_uses_connection_secret, required_secrets_for_auth_mode,
         ExtensionConnectionState, ExtensionPackAuthMode, ExtensionPackAuthSpec,
         ExtensionPackBinding, ExtensionPackConnection, ExtensionPackConnectionUpsertRequest,
         ExtensionPackEventRecord, ExtensionPackManifest, ExtensionPackRegistry,
         ExtensionPackRuntimeStateRecord, ExtensionPackSourceKind, ExtensionPackTrustLevel,
-        InstalledExtensionPack, PackFeatureManifest,
+        InstalledExtensionPack, PackFeatureManifest, auth_profile_material_for_secret_backed_pack,
+        connection_secret_key, imported_auth_contract, manifest_uses_connection_secret,
+        required_secrets_for_auth_mode,
     };
     use crate::core::auth_profiles::{
         AuthProfileControlPlane, AuthProfileKind, AuthProfileMaterial, AuthProfileScope,
@@ -5880,8 +5898,10 @@ mod tests {
         }
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn secret_backed_external_oauth_pack_without_oauth_spec_can_be_ready() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5961,8 +5981,10 @@ mod tests {
         assert_eq!(view.state, ExtensionConnectionState::Ready);
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn draft_pack_with_ready_connection_registers_runtime_actions() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6056,8 +6078,10 @@ mod tests {
         }));
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn delete_pack_removes_owned_state_and_secret_namespace() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6252,26 +6276,36 @@ mod tests {
 
         assert!(!registry.installed.contains_key(&manifest.id));
         assert!(!registry.connections.contains_key(&connection_id));
-        assert!(registry
-            .events
-            .iter()
-            .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id)));
-        assert!(registry
-            .get_connection_secret(&manifest.id, &connection_id)
-            .expect("lookup deleted secret")
-            .is_none());
-        assert!(registry
-            .get_connection_secret(&manifest.id, "orphan")
-            .expect("lookup orphan secret")
-            .is_none());
-        assert!(registry
-            .get_connection_secret("github", "default")
-            .expect("lookup unrelated secret")
-            .is_some());
-        assert!(AuthProfileControlPlane::get(&storage, &auth_profile_id)
-            .await
-            .expect("read deleted profile")
-            .is_none());
+        assert!(
+            registry
+                .events
+                .iter()
+                .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id))
+        );
+        assert!(
+            registry
+                .get_connection_secret(&manifest.id, &connection_id)
+                .expect("lookup deleted secret")
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_connection_secret(&manifest.id, "orphan")
+                .expect("lookup orphan secret")
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_connection_secret("github", "default")
+                .expect("lookup unrelated secret")
+                .is_some()
+        );
+        assert!(
+            AuthProfileControlPlane::get(&storage, &auth_profile_id)
+                .await
+                .expect("read deleted profile")
+                .is_none()
+        );
         assert!(!runtime_dir.exists());
         assert!(
             AuthProfileControlPlane::get(&storage, &unrelated_profile.id)
@@ -6287,18 +6321,24 @@ mod tests {
         );
         reloaded.sync_from_storage().await.expect("reload registry");
         assert!(!reloaded.installed.contains_key(&manifest.id));
-        assert!(!reloaded
-            .connections
-            .values()
-            .any(|connection| connection.pack_id.eq_ignore_ascii_case(&manifest.id)));
-        assert!(reloaded
-            .events
-            .iter()
-            .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id)));
+        assert!(
+            !reloaded
+                .connections
+                .values()
+                .any(|connection| connection.pack_id.eq_ignore_ascii_case(&manifest.id))
+        );
+        assert!(
+            reloaded
+                .events
+                .iter()
+                .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id))
+        );
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn delete_pack_rejects_bundled_registry_packs() {
         let dir = tempfile::tempdir().expect("tempdir");

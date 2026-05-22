@@ -5,9 +5,9 @@ export const appTheme = createTheme({
   palette: {
     mode: "dark",
     primary: {
-      main: "#39d0ff",
-      light: "#8de8ff",
-      dark: "#1979c9",
+      main: "#78f2b0",
+      light: "#a8ffd0",
+      dark: "#2f8f68",
     },
     secondary: {
       main: "#f0e2cf",
@@ -23,7 +23,7 @@ export const appTheme = createTheme({
       main: "#ff9b9b",
     },
     info: {
-      main: "#7ce7ff",
+      main: "#78f2b0",
     },
     background: {
       default: "#0a0a0a",
@@ -124,9 +124,9 @@ export const appTheme = createTheme({
     MuiCardContent: {
       styleOverrides: {
         root: {
-          padding: "12px",
+          padding: "10px",
           "&:last-child": {
-            paddingBottom: "12px",
+            paddingBottom: "10px",
           },
         },
       },
@@ -568,7 +568,7 @@ export const appTheme = createTheme({
     MuiToolbar: {
       styleOverrides: {
         regular: {
-          minHeight: 50,
+          minHeight: 44,
         },
       },
     },

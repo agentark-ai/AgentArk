@@ -3,7 +3,7 @@
 //! Social network integration for AI agents with strict outbound privacy guards.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use regex::Regex;

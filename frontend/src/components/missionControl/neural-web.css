@@ -47,6 +47,7 @@
 }
 
 .overview-shell.nw-shell {
+  --nw-page-gutter: 16px;
   height: 100%;
   max-height: 100%;
   overflow: hidden auto;
@@ -54,7 +55,7 @@
   scrollbar-gutter: stable;
   min-height: 0;
   box-sizing: border-box;
-  padding-bottom: clamp(18px, 1.4vw, 26px);
+  padding: var(--nw-page-gutter);
 }
 
 .nw-noise {
@@ -201,16 +202,23 @@
 
 /* User dashboard composition. */
 .nw-dashboard {
-  --nw-dashboard-left: clamp(270px, 16vw, 310px);
   --nw-dashboard-rail: clamp(380px, 27vw, 520px);
-  --nw-dashboard-right: clamp(620px, 41vw, 780px);
-  --nw-dashboard-gap: clamp(10px, 0.85vw, 16px);
-  --nw-dashboard-row: clamp(150px, 19.2dvh, 184px);
-  --nw-dashboard-main-height: calc(var(--nw-dashboard-row) + var(--nw-dashboard-row) + var(--nw-dashboard-row) + var(--nw-dashboard-row) + var(--nw-dashboard-gap) + var(--nw-dashboard-gap) + var(--nw-dashboard-gap));
-  --nw-dashboard-graph-height: calc(var(--nw-dashboard-row) + var(--nw-dashboard-row) + var(--nw-dashboard-row) + var(--nw-dashboard-gap) + var(--nw-dashboard-gap));
+  --nw-dashboard-gap: 16px;
+  --nw-dashboard-card-radius: 14px;
+  --nw-card-min-sm: clamp(150px, 17dvh, 176px);
+  --nw-card-min-md: clamp(230px, 26dvh, 252px);
+  --nw-card-min-lg: calc(var(--nw-dashboard-row-1) + var(--nw-dashboard-row-2) + var(--nw-dashboard-row-3) + var(--nw-dashboard-gap) + var(--nw-dashboard-gap));
+  --nw-dashboard-row: var(--nw-card-min-sm);
+  --nw-dashboard-row-1: var(--nw-card-min-sm);
+  --nw-dashboard-row-2: var(--nw-card-min-md);
+  --nw-dashboard-row-3: var(--nw-card-min-sm);
+  --nw-dashboard-row-4: var(--nw-card-min-sm);
+  --nw-dashboard-main-height: calc(var(--nw-dashboard-row-1) + var(--nw-dashboard-row-2) + var(--nw-dashboard-row-3) + var(--nw-dashboard-row-4) + var(--nw-dashboard-gap) + var(--nw-dashboard-gap) + var(--nw-dashboard-gap));
+  --nw-dashboard-graph-height: var(--nw-card-min-lg);
+  --nw-dashboard-tall-card: calc(var(--nw-dashboard-row-3) + var(--nw-dashboard-row-4) + var(--nw-dashboard-gap));
   display: flex;
   flex-direction: column;
-  gap: clamp(8px, 0.7vw, 12px);
+  gap: var(--nw-dashboard-gap);
   min-width: 0;
   width: 100%;
   height: auto;
@@ -355,7 +363,7 @@
 }
 
 .nw-dashboard-statusbar--split .nw-status-cell--model {
-  padding-left: 8px;
+  padding-left: 34px;
 }
 
 @media (max-width: 1500px) {
@@ -527,7 +535,9 @@
 }
 
 .nw-dashboard-main--mission {
-  grid-template-columns: var(--nw-dashboard-left) minmax(430px, 1fr) var(--nw-dashboard-right);
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  grid-template-rows: minmax(0, var(--nw-dashboard-main-height));
+  gap: var(--nw-dashboard-gap);
   align-items: stretch;
   min-height: var(--nw-dashboard-main-height);
   height: auto;
@@ -543,20 +553,20 @@
 }
 
 .nw-dashboard-primary--mission {
-  grid-template-rows: minmax(var(--nw-dashboard-graph-height), auto) minmax(var(--nw-dashboard-row), auto);
-  align-content: start;
+  grid-template-rows: var(--nw-dashboard-graph-height) var(--nw-dashboard-row-4);
+  align-content: stretch;
   min-height: var(--nw-dashboard-main-height);
   height: auto;
 }
 
 .nw-dashboard-primary--mission .nw-dashboard-graph-panel {
-  min-height: var(--nw-dashboard-graph-height);
-  height: auto;
+  min-height: 0;
+  height: 100%;
 }
 
 .nw-dashboard-primary--mission > .nw-panel--runtime {
-  min-height: var(--nw-dashboard-row);
-  height: auto;
+  min-height: 0;
+  height: 100%;
 }
 
 .nw-dashboard-primary--mission > .nw-panel--runtime .nw-row-list {
@@ -637,31 +647,107 @@
 }
 
 .nw-dashboard-stack {
-  display: flex;
-  flex-direction: column;
+  display: grid;
   gap: var(--nw-dashboard-gap);
   min-width: 0;
   align-items: stretch;
 }
 
 .nw-dashboard-stack--left {
-  display: grid;
-  grid-template-rows: minmax(var(--nw-dashboard-row), auto) minmax(var(--nw-dashboard-row), auto) minmax(var(--nw-dashboard-row), auto);
+  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-tall-card);
   min-height: var(--nw-dashboard-main-height);
-  height: auto;
-  align-content: start;
-  overflow: visible;
+  height: 100%;
+  align-content: stretch;
+  overflow: hidden;
 }
 
 .nw-dashboard-stack--left > .nw-panel {
-  min-height: var(--nw-dashboard-row);
+  min-height: 0;
+  height: 100%;
 }
 
 .nw-dashboard-stack--right {
-  height: auto;
+  height: 100%;
   min-height: 0;
-  overflow: visible;
+  overflow: hidden;
   padding-right: 0;
+}
+
+.mission-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--nw-dashboard-gap);
+  align-items: stretch;
+}
+
+.left-stack {
+  grid-column: span 3;
+  display: grid;
+  gap: var(--nw-dashboard-gap);
+}
+
+.center-stack {
+  grid-column: span 4;
+  display: grid;
+  gap: var(--nw-dashboard-gap);
+}
+
+.right-stack {
+  grid-column: span 5;
+  display: grid;
+  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-row-3) var(--nw-dashboard-row-4);
+  gap: var(--nw-dashboard-gap);
+}
+
+.nw-dashboard-right-row {
+  min-width: 0;
+  min-height: 0;
+}
+
+.right-two {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--nw-dashboard-gap);
+}
+
+.right-three {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--nw-dashboard-gap);
+}
+
+.mission-grid .nw-panel,
+.mission-grid .nw-dashboard-graph-panel,
+.mission-grid .overview-inline-note {
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  border-radius: var(--nw-dashboard-card-radius);
+  overflow: hidden;
+}
+
+.mission-grid .nw-panel::before,
+.mission-grid .nw-dashboard-graph-panel::before {
+  border-radius: var(--nw-dashboard-card-radius);
+}
+
+.mission-grid .nw-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.mission-grid .nw-panel > :not(.nw-panel-h),
+.mission-grid .nw-dashboard-graph {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.mission-grid .nw-row-list,
+.mission-grid .nw-learning-list,
+.mission-grid .nw-integration-list,
+.mission-grid .nw-tool-list,
+.mission-grid .nw-health-list {
+  overflow: hidden;
 }
 
 .nw-dashboard-right-grid {
@@ -2206,8 +2292,7 @@
 
 @media (min-width: 1181px) and (max-height: 790px) {
   .overview-shell.nw-shell {
-    padding-top: 7px;
-    padding-bottom: 7px;
+    padding: var(--nw-page-gutter);
   }
 
   .nw-grid {
@@ -2494,6 +2579,106 @@
   .nw-actions--split {
     grid-template-columns: 1fr;
   }
+}
+
+@media (min-width: 1024px) and (max-width: 1279px) {
+  .nw-dashboard-main--mission.mission-grid {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    grid-template-rows: max-content max-content;
+    grid-auto-rows: max-content;
+    min-height: max-content;
+    height: max-content;
+    overflow: visible;
+  }
+
+  .mission-grid .left-stack {
+    grid-column: span 4;
+    display: grid;
+    grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-tall-card);
+    min-height: var(--nw-dashboard-main-height);
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .mission-grid .center-stack {
+    grid-column: span 8;
+    display: grid;
+    grid-template-rows: var(--nw-dashboard-graph-height) var(--nw-dashboard-row-4);
+    min-height: var(--nw-dashboard-main-height);
+    height: 100%;
+  }
+
+  .mission-grid .right-stack {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-row-3) var(--nw-dashboard-row-4);
+    min-height: var(--nw-dashboard-main-height);
+    height: 100%;
+    overflow: hidden;
+  }
+}
+
+@media (max-width: 1023px) {
+  .nw-dashboard-main--mission.mission-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+    grid-auto-rows: max-content;
+    align-items: start;
+    min-height: max-content;
+    height: max-content;
+    overflow: visible;
+  }
+
+  .mission-grid .left-stack,
+  .mission-grid .center-stack,
+  .mission-grid .right-stack {
+    grid-column: 1;
+    display: grid;
+    grid-template-rows: none;
+    grid-auto-rows: auto;
+    align-self: start;
+    min-height: max-content;
+    height: max-content;
+    overflow: visible;
+  }
+
+  .mission-grid .nw-dashboard-right-row {
+    min-height: max-content;
+    height: max-content;
+  }
+
+  .mission-grid .right-two,
+  .mission-grid .right-three {
+    grid-template-columns: 1fr;
+  }
+
+  .mission-grid .nw-panel,
+  .mission-grid .overview-inline-note {
+    min-height: var(--nw-dashboard-row);
+    height: auto;
+  }
+
+  .mission-grid .nw-dashboard-graph-panel {
+    min-height: 520px;
+    height: auto;
+  }
+}
+
+@media (max-width: 760px) {
+.mission-grid .nw-dashboard-graph-panel {
+    min-height: 460px;
+  }
+}
+
+.mission-grid .nw-panel,
+.mission-grid .nw-dashboard-graph-panel,
+.mission-grid .overview-inline-note {
+  border-radius: var(--nw-dashboard-card-radius);
+}
+
+.mission-grid .nw-panel::before,
+.mission-grid .nw-dashboard-graph-panel::before {
+  border-radius: var(--nw-dashboard-card-radius);
 }
 
 /* floating tiles centered above and below the graph */

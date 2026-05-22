@@ -107,6 +107,7 @@ Requirements:
 - Any retry/repair plan must explicitly state a maximum attempts cap.
 - If any delegated path failed, timed out, or panicked, state what completed and what still needs follow-up.
 - Include a compact evidence summary for actions used.
+- Format the final answer as valid GitHub Flavored Markdown.
 - Keep the response concise and practical."#
         .to_string()
 }
@@ -140,6 +141,7 @@ pub fn primary_response_policy_v1() -> String {
 - For a turn that is only social chat or a durable user fact/preference update, respond with natural warmth and one brief, relevant follow-up question or useful observation; avoid cold one-line acknowledgements.
 - When work completed, say what changed, where the result lives, and any important caveats.
 - When blocked, state the blocker, the safest next step, and any missing input briefly.
+- Return chat-ready GitHub Flavored Markdown: paragraphs, bullets, links, tables, and fenced code blocks. Do not return raw tool envelopes, console dumps, HTML, or diagnostic JSON as the final answer unless the user explicitly asked for that raw artifact.
 - Keep the answer concise by default and avoid filler."#
         .to_string()
 }
@@ -151,6 +153,7 @@ pub fn primary_response_instruction_template_v1() -> String {
 - Prefer concrete status over abstract explanation.
 - Distinguish clearly between completed work, remaining follow-up, and uncertainty.
 - If tool output is mixed, state what is confirmed before mentioning what still needs verification.
+- Emit valid GitHub Flavored Markdown that can render directly in chat.
 - Mention adaptive behavior only when the user asks how AgentArk learns or improves over time."#
         .to_string()
 }

@@ -45,7 +45,7 @@ fn default_max_sources() -> usize {
 }
 
 fn default_deep_max_sources() -> usize {
-    12
+    24
 }
 
 fn default_include_sources() -> bool {
@@ -62,6 +62,50 @@ fn default_followup_rounds() -> usize {
 
 const MAX_RESEARCH_FETCH_REDIRECTS: usize = 3;
 const MAX_RESEARCH_FETCH_BYTES: usize = 2 * 1024 * 1024;
+
+fn research_content_type_is_textual(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return true;
+    };
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if mime.is_empty() {
+        return true;
+    }
+    mime.starts_with("text/")
+        || matches!(
+            mime.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/xhtml+xml"
+                | "application/javascript"
+                | "application/ecmascript"
+        )
+        || mime.ends_with("+json")
+        || mime.ends_with("+xml")
+}
+
+fn research_body_is_binary(body: &[u8]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return true;
+    };
+    let mut sampled = 0usize;
+    let mut controls = 0usize;
+    for ch in text.chars().take(4096) {
+        sampled = sampled.saturating_add(1);
+        if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+            controls = controls.saturating_add(1);
+        }
+    }
+    sampled > 0 && controls > sampled / 20
+}
 
 /// Research depth level
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -504,7 +548,7 @@ impl ResearchClient {
             return args.min_primary_sources;
         }
         if matches!(args.depth, ResearchDepth::Deep) {
-            return self.effective_max_sources(args).min(2);
+            return self.effective_max_sources(args).min(4);
         }
         0
     }
@@ -514,7 +558,7 @@ impl ResearchClient {
             return args.followup_rounds;
         }
         if matches!(args.depth, ResearchDepth::Deep) {
-            return 2;
+            return 4;
         }
         0
     }
@@ -856,7 +900,7 @@ impl ResearchClient {
             .collect_ranked_results(
                 &args.query,
                 &queries,
-                4,
+                6,
                 &args.backend,
                 progress,
                 "phase-status:research:searching",
@@ -941,6 +985,7 @@ impl ResearchClient {
         let mut findings = self.deduplicate_findings(findings);
         let mut key_findings = self.cluster_findings(&findings);
         let mut contradictions = self.detect_contradictions(&findings, &sources);
+        let mut focus_gaps = self.focus_items_without_findings(&args.query, &findings);
         let mut open_questions =
             self.derive_open_questions(&args.query, &sources, &findings, &contradictions);
 
@@ -949,13 +994,15 @@ impl ResearchClient {
             let coverage = self.research_coverage(&sources, freshness_window_days);
             let primary_gap = coverage.primary_sources < min_primary_sources;
             let freshness_gap = freshness_window_days.is_some() && coverage.recent_sources == 0;
-            let unresolved = !open_questions.is_empty() || !contradictions.is_empty();
+            let unresolved =
+                !focus_gaps.is_empty() || !open_questions.is_empty() || !contradictions.is_empty();
             if remaining_slots == 0 || (!primary_gap && !freshness_gap && !unresolved) {
                 break;
             }
 
             let followup_queries = self.generate_followup_queries(
                 &args.query,
+                &focus_gaps,
                 &open_questions,
                 &contradictions,
                 primary_gap,
@@ -984,7 +1031,7 @@ impl ResearchClient {
                 .collect_ranked_results(
                     &args.query,
                     &followup_queries,
-                    3,
+                    5,
                     &args.backend,
                     progress,
                     "phase-status:research:searching",
@@ -1000,7 +1047,7 @@ impl ResearchClient {
 
             let followup_results = self.select_diverse_results(
                 followup_results_by_url.into_values().collect(),
-                remaining_slots.min(4),
+                remaining_slots.min(6),
                 prefer_primary_sources,
                 min_primary_sources.saturating_sub(coverage.primary_sources),
                 if coverage.recent_sources > 0 {
@@ -1036,6 +1083,7 @@ impl ResearchClient {
             findings = self.deduplicate_findings(findings);
             key_findings = self.cluster_findings(&findings);
             contradictions = self.detect_contradictions(&findings, &sources);
+            focus_gaps = self.focus_items_without_findings(&args.query, &findings);
             open_questions =
                 self.derive_open_questions(&args.query, &sources, &findings, &contradictions);
         }
@@ -1086,8 +1134,8 @@ impl ResearchClient {
             sources,
             related_topics: self.extract_related_topics(&all_results, &args.query),
         };
-        let min_deep_sources = max_sources.min(5);
-        let min_deep_findings = max_sources.min(5);
+        let min_deep_sources = max_sources.min(8);
+        let min_deep_findings = max_sources.min(8);
         ensure_research_result_has_evidence(
             &result,
             progress,
@@ -1250,7 +1298,7 @@ impl ResearchClient {
                         }
                         let score = self.research_rank_score(
                             &result,
-                            query,
+                            &search_query.text,
                             prefer_primary_sources,
                             search_query.category,
                             freshness_window_days,
@@ -1298,12 +1346,13 @@ impl ResearchClient {
         &self,
         results: &[SearchResult],
         query: &str,
-        query_terms: &[String],
+        _query_terms: &[String],
         sources: &mut Vec<Source>,
         findings: &mut Vec<Finding>,
         progress: Option<&ResearchProgressReporter>,
         stream_key: &str,
     ) {
+        let relevance_term_sets = self.research_relevance_term_sets(query);
         let total_after_batch = sources.len() + results.len();
         for result in results {
             let source_index = sources.len();
@@ -1331,7 +1380,7 @@ impl ResearchClient {
                     if key_points.is_empty() {
                         if let Some(finding) = self.build_snippet_finding(
                             &result.snippet,
-                            query_terms,
+                            &relevance_term_sets,
                             source_index,
                             (0.58 + reliability * 0.25 + self.search_result_recency_bonus(result))
                                 .min(0.92),
@@ -1369,7 +1418,7 @@ impl ResearchClient {
                     }
                     if let Some(finding) = self.build_snippet_finding(
                         &result.snippet,
-                        query_terms,
+                        &relevance_term_sets,
                         source_index,
                         (0.44 + reliability * 0.2 + self.search_result_recency_bonus(result))
                             .min(0.8),
@@ -1451,6 +1500,11 @@ impl ResearchClient {
         for _ in 0..=MAX_RESEARCH_FETCH_REDIRECTS {
             let response = self.http_client.get(current.clone()).send().await?;
             if response.status().is_success() {
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
                 if let Some(length) = response.content_length() {
                     if length > MAX_RESEARCH_FETCH_BYTES as u64 {
                         return Err(anyhow!("Fetched content is too large"));
@@ -1459,6 +1513,13 @@ impl ResearchClient {
                 let bytes = response.bytes().await?;
                 if bytes.len() > MAX_RESEARCH_FETCH_BYTES {
                     return Err(anyhow!("Fetched content is too large"));
+                }
+                if !research_content_type_is_textual(content_type.as_deref())
+                    || research_body_is_binary(&bytes)
+                {
+                    return Err(anyhow!(
+                        "Fetched content is not readable text and should be handled as a resource"
+                    ));
                 }
                 return Ok((current, String::from_utf8_lossy(&bytes).into_owned()));
             }
@@ -1692,6 +1753,67 @@ impl ResearchClient {
             .collect()
     }
 
+    fn research_relevance_term_sets(&self, query: &str) -> Vec<Vec<String>> {
+        let (objective, focus_items) = research_request_outline(query);
+        let mut sets = Vec::new();
+        let objective_terms = self.normalized_query_terms(&objective);
+        if !objective_terms.is_empty() {
+            sets.push(objective_terms);
+        }
+        for focus in focus_items {
+            let terms = self.normalized_query_terms(&focus);
+            if !terms.is_empty()
+                && !sets
+                    .iter()
+                    .any(|existing| self.term_sets_overlap(existing, &terms) > 0.82)
+            {
+                sets.push(terms);
+            }
+        }
+        if sets.is_empty() {
+            let fallback_terms = self.normalized_query_terms(query);
+            if !fallback_terms.is_empty() {
+                sets.push(fallback_terms);
+            }
+        }
+        sets
+    }
+
+    fn term_sets_overlap(&self, left: &[String], right: &[String]) -> f32 {
+        if left.is_empty() || right.is_empty() {
+            return 0.0;
+        }
+        let right_terms = right.iter().collect::<HashSet<_>>();
+        let overlap = left
+            .iter()
+            .filter(|term| right_terms.contains(term))
+            .count();
+        overlap as f32 / left.len().min(right.len()) as f32
+    }
+
+    fn best_text_relevance_score(&self, text: &str, term_sets: &[Vec<String>]) -> Option<f32> {
+        term_sets
+            .iter()
+            .filter_map(|terms| self.text_relevance_score(text, terms))
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    fn focus_items_without_findings(&self, query: &str, findings: &[Finding]) -> Vec<String> {
+        let (_, focus_items) = research_request_outline(query);
+        focus_items
+            .into_iter()
+            .filter(|focus| {
+                let terms = self.normalized_query_terms(focus);
+                !terms.is_empty()
+                    && !findings.iter().any(|finding| {
+                        self.text_relevance_score(&finding.content, &terms)
+                            .is_some()
+                    })
+            })
+            .take(8)
+            .collect()
+    }
+
     fn normalize_relevance_token(&self, token: &str) -> String {
         let token = token.trim().to_ascii_lowercase();
         if token.len() <= 4 {
@@ -1772,7 +1894,7 @@ impl ResearchClient {
     fn build_snippet_finding(
         &self,
         snippet: &str,
-        query_terms: &[String],
+        relevance_term_sets: &[Vec<String>],
         source_index: usize,
         confidence: f32,
     ) -> Option<Finding> {
@@ -1780,7 +1902,10 @@ impl ResearchClient {
         if content.is_empty() {
             return None;
         }
-        if self.text_relevance_score(content, query_terms).is_none() {
+        if self
+            .best_text_relevance_score(content, relevance_term_sets)
+            .is_none()
+        {
             return None;
         }
         Some(Finding {
@@ -1793,7 +1918,7 @@ impl ResearchClient {
 
     /// Extract key points from content relevant to the query
     fn extract_key_points(&self, content: &str, query: &str) -> Vec<String> {
-        let query_terms = self.normalized_query_terms(query);
+        let relevance_term_sets = self.research_relevance_term_sets(query);
         let mut candidates: Vec<(String, f32)> = Vec::new();
 
         for sentence in content.split(['.', '!', '?', '\n']) {
@@ -1803,7 +1928,8 @@ impl ResearchClient {
             }
 
             let sentence_lower = sentence.to_lowercase();
-            let Some(mut score) = self.text_relevance_score(sentence, &query_terms) else {
+            let Some(mut score) = self.best_text_relevance_score(sentence, &relevance_term_sets)
+            else {
                 continue;
             };
             if sentence.chars().any(|ch| ch.is_ascii_digit()) {
@@ -1835,7 +1961,7 @@ impl ResearchClient {
                 continue;
             }
             key_points.push(candidate);
-            if key_points.len() >= 5 {
+            if key_points.len() >= 8 {
                 break;
             }
         }
@@ -2125,7 +2251,7 @@ impl ResearchClient {
                 .partial_cmp(&a.confidence)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        clustered_findings.truncate(6);
+        clustered_findings.truncate(14);
         clustered_findings
     }
 
@@ -2472,7 +2598,7 @@ impl ResearchClient {
             };
             queries.push(ResearchQuery {
                 category,
-                text: combine_research_query_terms(&objective, &[focus.as_str()]),
+                text: combine_research_query_terms(focus, &[objective.as_str()]),
             });
         }
 
@@ -2486,6 +2612,7 @@ impl ResearchClient {
     fn generate_followup_queries(
         &self,
         query: &str,
+        focus_gaps: &[String],
         open_questions: &[String],
         contradictions: &[String],
         primary_gap: bool,
@@ -2509,6 +2636,16 @@ impl ResearchClient {
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Recent,
                 text: combine_research_query_terms(&objective, &[&current_year]),
+            });
+        }
+        for focus in focus_gaps.iter().skip(round.saturating_mul(3)).take(4) {
+            queries.push(ResearchQuery {
+                category: ResearchQueryCategory::General,
+                text: combine_research_query_terms(focus, &[objective.as_str()]),
+            });
+            queries.push(ResearchQuery {
+                category: ResearchQueryCategory::Primary,
+                text: combine_research_query_terms(focus, &["data evidence report"]),
             });
         }
         for question in open_questions.iter().take(2) {
@@ -2806,7 +2943,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_research_defaults_to_twelve_sources() {
+    fn deep_research_defaults_to_twenty_four_sources() {
         let client = test_client();
         let args = ResearchArgs {
             query: "open source ai agent release strategy".to_string(),
@@ -2819,7 +2956,7 @@ mod tests {
             followup_rounds: 0,
         };
 
-        assert_eq!(client.effective_max_sources(&args), 12);
+        assert_eq!(client.effective_max_sources(&args), 24);
     }
 
     #[test]
@@ -2892,8 +3029,8 @@ mod tests {
             followup_rounds: 0,
         };
 
-        assert_eq!(client.effective_min_primary_sources(&args), 2);
-        assert_eq!(client.effective_followup_rounds(&args), 2);
+        assert_eq!(client.effective_min_primary_sources(&args), 4);
+        assert_eq!(client.effective_followup_rounds(&args), 4);
         assert_eq!(
             client.effective_freshness_window_days(&args, &args.query),
             Some(365)

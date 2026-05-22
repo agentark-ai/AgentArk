@@ -1,4 +1,4 @@
-//! Automatic replay/evidence gate for reviewable ArkEvolve candidates.
+//! Automatic replay/evidence gate for reviewable Evolve candidates.
 //!
 //! This gate deliberately relies on structured runtime evidence instead of user
 //! phrasing: candidate type, evidence references, run outcome state, correction
@@ -11,15 +11,15 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 use crate::storage::{
-    experience_item, experience_run, learning_candidate, procedural_pattern, Storage,
+    Storage, experience_item, experience_run, learning_candidate, procedural_pattern,
 };
 
-use super::routing_canonical_evolution::{
-    parse_routing_canonical_candidate, ROUTING_CANONICAL_CANDIDATE_TYPE,
-};
 use super::router_learning::{
-    validate_router_learning_candidate, RouterLearningCandidatePayload,
-    ROUTER_LEARNING_CANDIDATE_TYPE,
+    ROUTER_LEARNING_CANDIDATE_TYPE, RouterLearningCandidatePayload,
+    validate_router_learning_candidate,
+};
+use super::routing_canonical_evolution::{
+    ROUTING_CANONICAL_CANDIDATE_TYPE, parse_routing_canonical_candidate,
 };
 
 const DEFAULT_MIN_EVIDENCE_SAMPLES: usize = 2;
@@ -348,7 +348,14 @@ fn evaluate_candidate_with_evidence(
         "memory_add" | "memory_update" | "memory_retract" => {
             evaluate_memory_operation(candidate, evidence, confidence)
         }
-        "skill_patch" => evaluate_skill_patch(candidate, evidence, confidence),
+        "skill_patch" => gate_result(
+            candidate,
+            evidence,
+            confidence,
+            "blocked",
+            false,
+            "Evolve learning does not create or modify skills".to_string(),
+        ),
         "strategy" | "workflow" => evaluate_structured_candidate(candidate, evidence, confidence),
         "turn_decision" | "turn_routing_policy" | "routing_policy" => {
             evaluate_turn_decision_candidate(candidate, evidence, confidence)
@@ -533,64 +540,6 @@ fn evaluate_structured_candidate(
         "passed",
         true,
         "structured replay evidence supports approval".to_string(),
-    )
-}
-
-fn evaluate_skill_patch(
-    candidate: &learning_candidate::Model,
-    mut evidence: EvidenceBundle,
-    confidence: f64,
-) -> CandidateReplayGateResult {
-    let baseline = candidate.proposed_content.get("impact_baseline");
-    let baseline_samples = baseline
-        .and_then(|value| value.get("matched_runs").or_else(|| value.get("samples")))
-        .and_then(json_usize)
-        .unwrap_or_default();
-    let baseline_failure_rate = baseline
-        .and_then(|value| value.get("failure_rate"))
-        .and_then(json_f64)
-        .unwrap_or_default();
-    let baseline_tool_error_rate = baseline
-        .and_then(|value| value.get("tool_error_rate"))
-        .and_then(json_f64)
-        .unwrap_or_default();
-    if baseline_samples > evidence.samples {
-        evidence.samples = baseline_samples;
-    }
-    if baseline_failure_rate > 0.0 || baseline_tool_error_rate > 0.0 {
-        evidence.signals.push(format!(
-            "skill baseline evidence: matched_runs={}, failure_rate={:.2}, tool_error_rate={:.2}",
-            baseline_samples, baseline_failure_rate, baseline_tool_error_rate
-        ));
-    }
-
-    if evidence.samples < DEFAULT_MIN_EVIDENCE_SAMPLES {
-        return gate_result(
-            candidate,
-            evidence,
-            confidence,
-            "needs_more_data",
-            false,
-            "not enough skill replay evidence for approval".to_string(),
-        );
-    }
-    if confidence < DEFAULT_MIN_CONFIDENCE {
-        return gate_result(
-            candidate,
-            evidence,
-            confidence,
-            "blocked",
-            false,
-            "skill candidate confidence is below replay-gate threshold".to_string(),
-        );
-    }
-    gate_result(
-        candidate,
-        evidence,
-        confidence,
-        "passed",
-        true,
-        "skill replay evidence supports review approval".to_string(),
     )
 }
 
@@ -893,10 +842,6 @@ fn experience_run_corrected(run: &experience_run::Model) -> bool {
     run.correction_state == "corrected"
 }
 
-fn json_usize(value: &Value) -> Option<usize> {
-    value.as_u64().map(|value| value as usize)
-}
-
 fn json_i64_field(value: &Value, key: &str) -> Option<i64> {
     value
         .get(key)
@@ -904,7 +849,15 @@ fn json_i64_field(value: &Value, key: &str) -> Option<i64> {
 }
 
 fn json_f64(value: &Value) -> Option<f64> {
-    value.as_f64().or_else(|| value.as_u64().map(|v| v as f64))
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|value| value as f64))
+        .or_else(|| value.as_u64().map(|value| value as f64))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+        })
 }
 
 fn ratio(numerator: usize, denominator: usize) -> f64 {
@@ -965,6 +918,17 @@ mod tests {
         );
         assert!(!result.allow_approval);
         assert_eq!(result.status, "needs_more_data");
+    }
+
+    #[test]
+    fn skill_patch_candidates_are_blocked_from_ark_evolve() {
+        let result = evaluate_candidate_with_evidence(
+            &candidate("skill_patch", 0.99, serde_json::json!({})),
+            EvidenceBundle::default(),
+        );
+        assert!(!result.allow_approval);
+        assert_eq!(result.status, "blocked");
+        assert!(result.reason.contains("does not create or modify skills"));
     }
 
     fn turn_decision_run(id: &str) -> experience_run::Model {
@@ -1032,10 +996,12 @@ mod tests {
         assert_eq!(result.avg_total_tokens, 1280.0);
         assert_eq!(result.max_total_tokens, 1280);
         assert_eq!(result.avg_cost_usd, 0.002);
-        assert!(result
-            .signals
-            .iter()
-            .any(|signal| signal.contains("turn decision evidence")));
+        assert!(
+            result
+                .signals
+                .iter()
+                .any(|signal| signal.contains("turn decision evidence"))
+        );
     }
 
     #[test]

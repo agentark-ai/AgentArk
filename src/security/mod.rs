@@ -39,15 +39,15 @@ pub use action_guard::ActionGuard;
 pub use model_hardening::protect_system_prompt;
 #[allow(unused_imports)]
 pub use model_input::{
-    render_model_input_fallback, sanitize_model_input_json, sanitize_model_input_text,
     CurrentChatPiiPolicy, ModelInputContext, ModelInputPrivacyDecision,
     ModelInputPrivacyJsonResult, ModelInputPrivacyMode, ModelInputPrivacyTextResult,
-    ModelPrivacyConfig,
+    ModelPrivacyConfig, render_model_input_fallback, sanitize_model_input_json,
+    sanitize_model_input_text,
 };
 pub use normalize::normalize_for_analysis;
 pub use outbound::{
-    check_outbound_text, format_outbound_privacy_block, sanitize_outbound_json,
-    OutboundPrivacyDecision, OutboundPrivacyPolicy,
+    OutboundPrivacyDecision, OutboundPrivacyPolicy, check_outbound_text,
+    format_outbound_privacy_block, sanitize_outbound_json,
 };
 pub use pii::redact_pii;
 pub use trust_boundary::{
@@ -241,6 +241,33 @@ static SECRET_ASSIGNMENT_PATTERN: Lazy<Regex> = Lazy::new(|| {
     )
     .unwrap()
 });
+static LABELED_CREDENTIAL_VALUE_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?ix)
+        (?P<prefix>
+            \b(?:
+                api\s*[-_]?\s*key
+                | access\s*[-_]?\s*token
+                | auth(?:entication)?\s*[-_]?\s*token
+                | bearer\s*[-_]?\s*token
+                | client\s*[-_]?\s*secret
+                | secret\s*[-_]?\s*key
+                | password
+                | passwd
+                | pwd
+                | credential
+            )\b
+            (?:
+                \s*(?:is|as|for|value|=|:|-)\s*
+            ){0,4}
+            ['"]?
+        )
+        (?P<value>[A-Za-z0-9][A-Za-z0-9_\-./+=]{7,})
+        (?P<suffix>['"]?)
+        "#,
+    )
+    .unwrap()
+});
 static ENV_STYLE_SECRET_ASSIGNMENT_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*)[^\s]{16,}").unwrap()
 });
@@ -359,6 +386,50 @@ fn is_likely_identifier_slug(value: &str) -> bool {
         })
 }
 
+fn is_lowercase_identifier_version_part(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    is_lowercase_word_segment(value)
+        || value.chars().all(|ch| ch.is_ascii_digit())
+        || is_safe_identifier_version_segment(value)
+        || is_uuid_hex_group(value)
+        || (value.len() <= 12
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+            && value.chars().any(|ch| ch.is_ascii_lowercase())
+            && value.chars().any(|ch| ch.is_ascii_digit()))
+}
+
+fn is_likely_public_identifier_version(value: &str) -> bool {
+    let trimmed = value.trim();
+    if !trimmed.chars().any(|ch| matches!(ch, '-' | '_' | '.')) {
+        return false;
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    let segments: Vec<&str> = trimmed
+        .split(['-', '_', '.'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    let word_segments = segments
+        .iter()
+        .filter(|segment| is_lowercase_word_segment(segment))
+        .count();
+    word_segments >= 1
+        && segments
+            .iter()
+            .all(|segment| is_lowercase_identifier_version_part(segment))
+}
+
 fn is_likely_public_slug_filename(value: &str) -> bool {
     let trimmed = value.trim();
     let Some((stem, extension)) = trimmed.rsplit_once('.') else {
@@ -374,6 +445,51 @@ fn is_likely_public_slug_filename(value: &str) -> bool {
         return false;
     }
     is_likely_identifier_slug(stem)
+}
+
+fn is_likely_namespaced_public_identifier(source: &str, span: RedactionSpan) -> bool {
+    if char_before(source, span.start) != Some('/') {
+        return false;
+    }
+    let namespace_start = source[..span.start.saturating_sub(1)]
+        .rfind(|ch: char| !opaque_token_shape_char(ch))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let namespace = source[namespace_start..span.start.saturating_sub(1)].trim();
+    if namespace.len() < 2
+        || namespace.len() > 48
+        || !namespace.chars().any(|ch| ch.is_ascii_alphabetic())
+        || !namespace
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return false;
+    }
+
+    let value = source[span.start..span.end].trim();
+    if value.contains('=') || value.contains('+') {
+        return false;
+    }
+    if is_likely_identifier_slug(value)
+        || is_likely_public_identifier_version(value)
+        || is_likely_public_slug_filename(value)
+    {
+        return true;
+    }
+    if !value.chars().any(|ch| matches!(ch, '-' | '_' | '.')) {
+        return false;
+    }
+    let segments = value
+        .split(['-', '_', '.'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    segments.len() >= 2
+        && segments
+            .iter()
+            .any(|segment| segment.chars().any(|ch| ch.is_ascii_alphabetic()))
+        && segments
+            .iter()
+            .all(|segment| segment.chars().all(|ch| ch.is_ascii_alphanumeric()))
 }
 
 fn is_identifier_segment(value: &str) -> bool {
@@ -407,6 +523,7 @@ fn is_opaque_token_shape(value: &str) -> bool {
         && !trimmed.chars().any(char::is_whitespace)
         && trimmed.chars().all(opaque_token_shape_char)
         && !is_likely_identifier_slug(trimmed)
+        && !is_likely_public_identifier_version(trimmed)
         && !is_likely_public_slug_filename(trimmed)
         && !is_likely_code_expression_token(trimmed)
         && opaque_token_has_secret_signal(trimmed)
@@ -438,7 +555,10 @@ fn apply_opaque_token_redaction(
 
         if let Some(start) = run_start.take() {
             let candidate = &source[start..idx];
-            if is_opaque_token_shape(candidate) {
+            let span = RedactionSpan { start, end: idx };
+            if is_opaque_token_shape(candidate)
+                && !is_likely_namespaced_public_identifier(&source, span)
+            {
                 redacted.push_str(&source[last..start]);
                 redacted.push_str("[REDACTED_SECRET]");
                 last = idx;
@@ -449,7 +569,13 @@ fn apply_opaque_token_redaction(
 
     if let Some(start) = run_start {
         let candidate = &source[start..];
-        if is_opaque_token_shape(candidate) {
+        let span = RedactionSpan {
+            start,
+            end: source.len(),
+        };
+        if is_opaque_token_shape(candidate)
+            && !is_likely_namespaced_public_identifier(&source, span)
+        {
             redacted.push_str(&source[last..start]);
             redacted.push_str("[REDACTED_SECRET]");
             last = source.len();
@@ -463,6 +589,56 @@ fn apply_opaque_token_redaction(
     redacted.push_str(&source[last..]);
     *text = redacted;
     redactions.push(format!("opaque_token x{}", count));
+    push_secret_kind(kinds, SecretInputType::ApiKeyOrToken);
+}
+
+fn is_contextual_credential_value(value: &str) -> bool {
+    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | '.' | ',' | ';'));
+    trimmed.chars().count() >= 8
+        && !is_redaction_placeholder_token(trimmed)
+        && !trimmed.starts_with("http://")
+        && !trimmed.starts_with("https://")
+        && !trimmed.chars().any(char::is_whitespace)
+        && trimmed.chars().all(opaque_token_shape_char)
+        && (trimmed.chars().count() >= 16
+            || trimmed.chars().any(|ch| ch.is_ascii_digit())
+            || trimmed
+                .chars()
+                .any(|ch| matches!(ch, '_' | '-' | '.' | '=' | '+' | '/')))
+}
+
+fn apply_labeled_credential_value_redaction(
+    text: &mut String,
+    redactions: &mut Vec<String>,
+    kinds: &mut Vec<SecretInputType>,
+) {
+    let source = text.clone();
+    let mut redacted = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+
+    for captures in LABELED_CREDENTIAL_VALUE_PATTERN.captures_iter(&source) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(value_match) = captures.name("value") else {
+            continue;
+        };
+        if full_match.start() < cursor || !is_contextual_credential_value(value_match.as_str()) {
+            continue;
+        }
+        redacted.push_str(&source[cursor..value_match.start()]);
+        redacted.push_str("[REDACTED_SECRET]");
+        cursor = value_match.end();
+        count += 1;
+    }
+
+    if count == 0 {
+        return;
+    }
+    redacted.push_str(&source[cursor..]);
+    *text = redacted;
+    redactions.push(format!("labeled_credential x{}", count));
     push_secret_kind(kinds, SecretInputType::ApiKeyOrToken);
 }
 
@@ -777,6 +953,7 @@ pub fn redact_secret_input(text: &str) -> SecretRedactionResult {
         "moltbook_token",
         SecretInputType::ApiKeyOrToken,
     );
+    apply_labeled_credential_value_redaction(&mut redacted, &mut redactions, &mut kinds);
     apply_payment_credential_redaction(&mut redacted, &mut redactions, &mut kinds);
     apply_opaque_token_redaction(&mut redacted, &mut redactions, &mut kinds);
 
@@ -868,6 +1045,16 @@ mod tests {
     }
 
     #[test]
+    fn test_secret_redaction_masks_labeled_low_entropy_credentials() {
+        let result = redact_secret_input("my provider api key asdas-asdasd-asdasdasd-asdasd");
+
+        assert!(result.had_secret());
+        assert_eq!(result.primary_kind(), Some(SecretInputType::ApiKeyOrToken));
+        assert!(!result.text.contains("asdas-asdasd-asdasdasd-asdasd"));
+        assert!(result.text.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
     fn test_secret_redaction_keeps_plain_prose() {
         let result = redact_secret_input("I live in Madhyam, Kolkata and prefer concise answers.");
 
@@ -880,6 +1067,10 @@ mod tests {
             "memory_capture_events",
             "routing-policy-default-v2",
             "prompt-candidate-550e8400-e29b-41d4-a716-446655440000",
+            "baidu/ernie-4.5-vl-424b-a47b",
+            "deepseek/deepseek-v4-pro",
+            "Recent model failures: baidu/ernie-4.5-turbo-128k-preview hit a capability limit.",
+            "Model: provider-a/frontier.reasoning-v4-pro-2026",
         ] {
             let result = redact_secret_input(value);
             assert!(!result.had_secret(), "unexpected redaction for {value}");

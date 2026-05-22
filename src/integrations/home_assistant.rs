@@ -1,7 +1,7 @@
 //! Home Assistant integration.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};

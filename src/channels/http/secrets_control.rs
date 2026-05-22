@@ -652,6 +652,26 @@ pub(super) async fn get_chat_credential_prompt(
         .into_response()
 }
 
+pub(super) async fn dismiss_chat_credential_prompt(
+    State(state): State<AppState>,
+    Query(query): Query<ChatCredentialPromptQuery>,
+) -> Response {
+    let conversation_id = query.conversation_id.trim();
+    if conversation_id.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "conversation_id is required");
+    }
+    let agent = state.agent.read().await;
+    agent.dismiss_chat_credential_prompt(conversation_id).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "dismissed",
+            "present": false,
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn submit_chat_credential_prompt(
     State(state): State<AppState>,
     Json(request): Json<ChatCredentialPromptSubmitRequest>,

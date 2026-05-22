@@ -4,9 +4,11 @@
 //! and they are auto-spawned from the model pool. User-configured specialists
 //! act as priority boosters — preferred when they match, but never required.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -21,8 +23,8 @@ use super::swarm::specialist::SpecialistAgent;
 use super::swarm::{AgentAccessScope, SwarmActivityAgent, SwarmActivityTracker};
 use super::{DegradationNote, DelegationStatus, FailureKind, StreamEvent};
 use crate::actions::ActionDef;
-use crate::core::queue_stream_event;
 use crate::core::PromptMemory;
+use crate::core::queue_stream_event;
 
 fn compact_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -286,7 +288,7 @@ impl DelegatedTaskPacket {
         };
 
         let action_section = if self.action_scope.is_empty() {
-            "No task-scoped actions were attached.".to_string()
+            "No action context was attached.".to_string()
         } else {
             self.action_scope
                 .iter()
@@ -328,7 +330,7 @@ impl DelegatedTaskPacket {
 ## Coordinator Notes\n{}\n\n\
 ## Dependency Outputs\n{}\n\n\
 ## Relevant Memory\n{}\n\n\
-## Allowed Actions\n{}\n\n\
+## Action Context\n{}\n\n\
 ## Execution Contract\n{}",
             self.delegation_id,
             self.agent_name,
@@ -496,8 +498,7 @@ fn classify_agent_failure(error: &anyhow::Error) -> (DelegationStatus, FailureKi
         return (
             DelegationStatus::TimedOut,
             FailureKind::Timeout,
-            "Retry the delegated step with a longer timeout or continue with the completed work."
-                .to_string(),
+            "Retry the delegated step or continue with the completed work.".to_string(),
         );
     }
     (
@@ -617,16 +618,24 @@ fn build_fallback_delegation_response(
 ) -> super::llm::LlmResponse {
     let completed: Vec<String> = results
         .iter()
-        .filter(|result| result.status == DelegationStatus::Completed)
+        .filter(|result| {
+            result.status == DelegationStatus::Completed && !result.content.trim().is_empty()
+        })
         .map(|result| {
             let metadata = render_agent_result_metadata(result)
                 .map(|value| format!(" ({})", value))
                 .unwrap_or_default();
+            let label = result
+                .agent_name
+                .as_deref()
+                .unwrap_or(result.agent_type.as_str());
             format!(
-                "- {}{}: {}",
-                compact_text(&result.task, 100),
+                "- {} / {}{}: {}\n  {}",
+                label,
+                result.agent_type,
                 metadata,
-                compact_text(&result.content, 220)
+                compact_text(&result.task, 160),
+                compact_text(&result.content, 900)
             )
         })
         .collect();
@@ -674,6 +683,9 @@ fn build_fallback_delegation_response(
             "I couldn't complete the delegated execution cleanly for this request: {}.",
             compact_text(original_task, 160)
         )
+    } else if follow_up.is_empty() {
+        "The delegated work completed, but the final synthesis pass did not return separate user-facing text. Here are the usable results."
+            .to_string()
     } else {
         "I completed part of this request, but some delegated work degraded and needs follow-up."
             .to_string()
@@ -689,13 +701,34 @@ fn build_fallback_delegation_response(
     }
 }
 
-const RESEARCHER_CALLSIGNS: &[&str] = &["Orbit", "Beacon", "Drift"];
-const CODER_CALLSIGNS: &[&str] = &["Forge", "Vector", "Patch"];
-const ANALYST_CALLSIGNS: &[&str] = &["Atlas", "Prism", "Ledger"];
-const WRITER_CALLSIGNS: &[&str] = &["Quill", "Echo", "Verse"];
-const VALIDATOR_CALLSIGNS: &[&str] = &["Aegis", "Sentinel", "Vanta"];
-const PLANNER_CALLSIGNS: &[&str] = &["Helix", "Orion", "Northstar"];
-const CUSTOM_CALLSIGNS: &[&str] = &["Nova", "Relay", "Flux"];
+const RESEARCHER_CALLSIGNS: &[&str] = &[
+    "Orbit", "Beacon", "Drift", "Survey", "Scout", "Mosaic", "Index", "Archive",
+];
+const CODER_CALLSIGNS: &[&str] = &[
+    "Forge", "Vector", "Patch", "Kernel", "Cipher", "Module", "Socket", "Turing",
+];
+const ANALYST_CALLSIGNS: &[&str] = &[
+    "Atlas", "Prism", "Ledger", "Signal", "Metric", "Summit", "Delta", "Axiom",
+];
+const WRITER_CALLSIGNS: &[&str] = &[
+    "Quill", "Echo", "Verse", "Draft", "Lumen", "Script", "Fable", "Brief",
+];
+const VALIDATOR_CALLSIGNS: &[&str] = &[
+    "Aegis", "Sentinel", "Vanta", "Keystone", "Anchor", "Audit", "Proof", "Verity",
+];
+const PLANNER_CALLSIGNS: &[&str] = &[
+    "Helix",
+    "Orion",
+    "Northstar",
+    "Meridian",
+    "Compass",
+    "Nexus",
+    "Pioneer",
+    "Route",
+];
+const CUSTOM_CALLSIGNS: &[&str] = &[
+    "Nova", "Relay", "Flux", "Quartz", "Vertex", "Arc", "Pulse", "Beacon",
+];
 
 fn cool_name_pool(agent_type: &SubAgentType) -> &'static [&'static str] {
     match agent_type {
@@ -714,6 +747,22 @@ pub fn cool_name_for_auto_agent(index: usize, agent_type: &SubAgentType) -> Stri
     pool[index % pool.len()].to_string()
 }
 
+fn cool_name_for_auto_agent_in_run(
+    index: usize,
+    agent_type: &SubAgentType,
+    run_seed: &str,
+) -> String {
+    let pool = cool_name_pool(agent_type);
+    if pool.is_empty() {
+        return "Agent".to_string();
+    }
+    let mut hasher = DefaultHasher::new();
+    run_seed.hash(&mut hasher);
+    index.hash(&mut hasher);
+    agent_type.name().hash(&mut hasher);
+    pool[(hasher.finish() as usize) % pool.len()].to_string()
+}
+
 fn has_generic_agent_name(name: &str, agent_type: &SubAgentType) -> bool {
     let trimmed = name.trim();
     trimmed.is_empty()
@@ -728,6 +777,20 @@ pub fn display_name_for_specialist(name: &str, agent_type: &SubAgentType) -> Str
     let trimmed = name.trim();
     if has_generic_agent_name(trimmed, agent_type) {
         cool_name_for_auto_agent(0, agent_type)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn display_name_for_specialist_in_run(
+    name: &str,
+    agent_type: &SubAgentType,
+    index: usize,
+    run_seed: &str,
+) -> String {
+    let trimmed = name.trim();
+    if has_generic_agent_name(trimmed, agent_type) {
+        cool_name_for_auto_agent_in_run(index, agent_type, run_seed)
     } else {
         trimmed.to_string()
     }
@@ -961,8 +1024,11 @@ pub struct AgentExecResult {
 pub struct TaskRouterConfig {
     /// Max concurrent agents
     pub _max_concurrent: usize,
-    /// Timeout per agent in seconds
-    pub agent_timeout_secs: u64,
+    /// Legacy field retained for config/API compatibility.
+    ///
+    /// Delegated agents are not hard-capped by this router; they run until
+    /// they finish or the parent run is interrupted.
+    pub _agent_timeout_secs: u64,
     /// Minimum confidence for a specialist to be used over ephemeral
     pub specialist_threshold: f32,
 }
@@ -971,7 +1037,7 @@ impl Default for TaskRouterConfig {
     fn default() -> Self {
         Self {
             _max_concurrent: 5,
-            agent_timeout_secs: 60,
+            _agent_timeout_secs: 0,
             specialist_threshold: 0.3,
         }
     }
@@ -1093,7 +1159,8 @@ impl TaskRouter {
             };
 
             if let Some((name, specialist)) = specialist_match {
-                let display_name = display_name_for_specialist(&name, &agent_type);
+                let display_name =
+                    display_name_for_specialist_in_run(&name, &agent_type, index, delegation_id);
                 let agent_id = specialist.id().to_string();
                 // Trace: specialist matched
                 {
@@ -1170,7 +1237,8 @@ impl TaskRouter {
                     primary_llm,
                 );
                 let model_name = llm.model_name().to_string();
-                let auto_agent_name = cool_name_for_auto_agent(assignments.len(), &agent_type);
+                let auto_agent_name =
+                    cool_name_for_auto_agent_in_run(assignments.len(), &agent_type, delegation_id);
                 let agent_id = spec
                     .plan_step_id
                     .map(|step_id| format!("{}:plan-step:{}", delegation_id, step_id))
@@ -1386,7 +1454,41 @@ impl TaskRouter {
             };
 
             match aggregate_result {
-                Ok(response) => response,
+                Ok(response) => {
+                    if response.content.trim().is_empty() {
+                        let detail = if response.tool_calls.is_empty() {
+                            "The synthesis pass returned no user-facing text.".to_string()
+                        } else {
+                            format!(
+                                "The synthesis pass returned {} tool call(s) but no user-facing text.",
+                                response.tool_calls.len()
+                            )
+                        };
+                        degradation.push(DegradationNote {
+                            kind: "delegation_synthesis".to_string(),
+                            summary: "delegated synthesis fallback".to_string(),
+                            detail: Some(detail.clone()),
+                        });
+                        {
+                            let mut t = trace.write().await;
+                            t.steps.push(super::agent::ExecutionStep {
+                                icon: "[fallback]".to_string(),
+                                title: "Delegation Synthesis Fallback".to_string(),
+                                detail: format!(
+                                    "The synthesis pass did not return user-facing text, so {} returned a best-effort summary.",
+                                    crate::branding::PRODUCT_NAME
+                                ),
+                                step_type: "warning".to_string(),
+                                data: Some(detail),
+                                timestamp: chrono::Utc::now(),
+                                duration_ms: None,
+                            });
+                        }
+                        build_fallback_delegation_response(message, &results)
+                    } else {
+                        response
+                    }
+                }
                 Err(error) => {
                     let error_text = compact_text(&error.to_string(), 240);
                     degradation.push(DegradationNote {
@@ -1843,7 +1945,11 @@ impl TaskRouter {
                     .to_string(),
                 "Use dependency outputs as upstream truth unless they conflict with the user request."
                     .to_string(),
-                "Prefer the attached scoped actions and do not assume unrelated tools are available."
+                "Treat action context as capability context, not as proof that an action ran."
+                    .to_string(),
+                "Do not claim an action was executed unless an actual action result is present in the packet."
+                    .to_string(),
+                "If the task needs evidence that is not present, state the missing evidence or verification needed instead of fabricating it."
                     .to_string(),
                 "Return the highest-signal result for your task, including risks or missing follow-up if relevant."
                     .to_string(),
@@ -1916,9 +2022,23 @@ impl TaskRouter {
         artifacts: &[String],
         completed_at: Option<String>,
     ) -> Result<()> {
+        if matches!(&assignment.kind, AssignmentKind::Ephemeral(_)) {
+            let agent_row = crate::storage::entities::swarm_agent::Model {
+                id: assignment.agent_id.clone(),
+                name: assignment.display_name.clone(),
+                agent_type: assignment.agent_type.name(),
+                llm_provider: assignment.model_name.clone(),
+                capabilities: "[]".to_string(),
+                system_prompt: None,
+                access_scope: "{}".to_string(),
+                enabled: 0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            storage.upsert_swarm_agent(&agent_row).await?;
+        }
         let row = crate::storage::entities::swarm_delegation::Model {
             id: delegation_row_id(delegation_id, &assignment.agent_id),
-            parent_task_id: Some(delegation_id.to_string()),
+            parent_task_id: None,
             agent_id: assignment.agent_id.clone(),
             task_description: assignment.spec.task.clone(),
             result: Some(serde_json::to_string(&self.build_checkpoint_payload(
@@ -2087,6 +2207,7 @@ impl TaskRouter {
                                 "elapsed_ms": restored.execution_time_ms,
                                 "is_specialist": restored.is_specialist,
                                 "restored": true,
+                                "output_preview": compact_text(&restored.content, 1800),
                                 "plan_step_id": assignment.spec.plan_step_id,
                             }),
                         );
@@ -2192,6 +2313,7 @@ impl TaskRouter {
                     "elapsed_ms": restored.execution_time_ms,
                     "is_specialist": restored.is_specialist,
                     "restored": true,
+                    "output_preview": compact_text(&restored.content, 1800),
                     "plan_step_id": plan_step_id,
                 }),
             );
@@ -2293,7 +2415,6 @@ impl TaskRouter {
                     &acts,
                 );
                 let ctx = packet.render_markdown();
-                let timeout = self.config.agent_timeout_secs;
                 let dependency_count = assignment.spec.depends_on.len();
                 let plan_step_id = assignment.spec.plan_step_id;
                 let memory_count = mems.len();
@@ -2439,40 +2560,60 @@ impl TaskRouter {
                             heartbeat_handle,
                             tokio::spawn(async move {
                                 let start = std::time::Instant::now();
-                                let result = tokio::time::timeout(
-                                    std::time::Duration::from_secs(timeout),
-                                    specialist.execute_task_with_scope_and_prompt(
+                                let result = specialist
+                                    .execute_task_with_scope_and_prompt(
                                         &task,
                                         &ctx,
                                         &mems,
-                                        &acts,
+                                        &[],
                                         Some(specialist_system_prompt),
-                                    ),
-                                )
-                                .await;
+                                        None,
+                                    )
+                                    .await;
                                 let elapsed = start.elapsed().as_millis() as u64;
                                 let model = specialist.model_name();
                                 match result {
-                                    Ok(Ok(content)) => Ok(AgentExecResult {
-                                        agent_id,
-                                        agent_type: agent_type.name(),
-                                        task,
-                                        is_specialist: true,
-                                        agent_name: Some(display_name),
-                                        model_name: model,
-                                        content,
-                                        llm_response: None,
-                                        execution_time_ms: elapsed,
-                                        status: DelegationStatus::Completed,
-                                        failure_kind: None,
-                                        next_action_hint: None,
-                                        confidence: Some(1.0),
-                                        artifacts: Vec::new(),
-                                    }),
-                                    Ok(Err(e)) => Err(anyhow!("Specialist error: {}", e)),
-                                    Err(elapsed) => Err(anyhow::Error::new(elapsed).context(
-                                        format!("Specialist timed out after {}s", timeout),
-                                    )),
+                                    Ok(content) => {
+                                        let content = content.trim().to_string();
+                                        let empty = content.is_empty();
+                                        Ok(AgentExecResult {
+                                            agent_id,
+                                            agent_type: agent_type.name(),
+                                            task,
+                                            is_specialist: true,
+                                            agent_name: Some(display_name),
+                                            model_name: model,
+                                            content: if empty {
+                                                "Delegated path returned no user-facing result."
+                                                    .to_string()
+                                            } else {
+                                                content
+                                            },
+                                            llm_response: None,
+                                            execution_time_ms: elapsed,
+                                            status: if empty {
+                                                DelegationStatus::Failed
+                                            } else {
+                                                DelegationStatus::Completed
+                                            },
+                                            failure_kind: if empty {
+                                                Some(FailureKind::InternalPostProcess)
+                                            } else {
+                                                None
+                                            },
+                                            next_action_hint: if empty {
+                                                Some(
+                                                    "Retry with a clearer scoped task or run the required verification in the parent tool loop."
+                                                        .to_string(),
+                                                )
+                                            } else {
+                                                None
+                                            },
+                                            confidence: Some(1.0),
+                                            artifacts: Vec::new(),
+                                        })
+                                    }
+                                    Err(e) => Err(anyhow!("Specialist error: {}", e)),
                                 }
                             }),
                         ));
@@ -2499,32 +2640,58 @@ impl TaskRouter {
                                     delegated_policy_v2_block(),
                                     ctx
                                 );
-                                let result = tokio::time::timeout(
-                                    std::time::Duration::from_secs(timeout),
-                                    llm.chat(&prompt, &task, &mems, &acts),
-                                )
-                                .await;
+                                let result = llm.chat(&prompt, &task, &mems, &[]).await;
                                 let elapsed = start.elapsed().as_millis() as u64;
                                 match result {
-                                    Ok(Ok(resp)) => Ok(AgentExecResult {
-                                        agent_id,
-                                        agent_type: agent_type.name(),
-                                        task,
-                                        is_specialist: false,
-                                        agent_name: Some(display_name),
-                                        model_name,
-                                        content: resp.content.clone(),
-                                        llm_response: Some(resp),
-                                        execution_time_ms: elapsed,
-                                        status: DelegationStatus::Completed,
-                                        failure_kind: None,
-                                        next_action_hint: None,
-                                        confidence: Some(1.0),
-                                        artifacts: Vec::new(),
-                                    }),
-                                    Ok(Err(e)) => Err(anyhow!("Agent error: {}", e)),
-                                    Err(elapsed) => Err(anyhow::Error::new(elapsed)
-                                        .context(format!("Agent timed out after {}s", timeout))),
+                                    Ok(resp) => {
+                                        let content = resp.content.trim().to_string();
+                                        let requested_tool_count = resp.tool_calls.len();
+                                        let (status, failure_kind, next_action_hint, result_text) =
+                                            if content.is_empty() && requested_tool_count > 0 {
+                                                (
+                                                    DelegationStatus::Failed,
+                                                    Some(FailureKind::ToolContractFailure),
+                                                    Some(
+                                                        "Run required tools in the parent loop or retry with a worker path that can execute those tools."
+                                                            .to_string(),
+                                                    ),
+                                                    format!(
+                                                        "Delegated path requested {} tool call(s) but returned no final result.",
+                                                        requested_tool_count
+                                                    ),
+                                                )
+                                            } else if content.is_empty() {
+                                                (
+                                                    DelegationStatus::Failed,
+                                                    Some(FailureKind::InternalPostProcess),
+                                                    Some(
+                                                        "Retry with a clearer scoped task."
+                                                            .to_string(),
+                                                    ),
+                                                    "Delegated path returned no user-facing result."
+                                                        .to_string(),
+                                                )
+                                            } else {
+                                                (DelegationStatus::Completed, None, None, content)
+                                            };
+                                        Ok(AgentExecResult {
+                                            agent_id,
+                                            agent_type: agent_type.name(),
+                                            task,
+                                            is_specialist: false,
+                                            agent_name: Some(display_name),
+                                            model_name,
+                                            content: result_text,
+                                            llm_response: Some(resp),
+                                            execution_time_ms: elapsed,
+                                            status,
+                                            failure_kind,
+                                            next_action_hint,
+                                            confidence: Some(1.0),
+                                            artifacts: Vec::new(),
+                                        })
+                                    }
+                                    Err(e) => Err(anyhow!("Agent error: {}", e)),
                                 }
                             }),
                         ));
@@ -2534,10 +2701,12 @@ impl TaskRouter {
 
             // Collect results
             for (idx, is_specialist, heartbeat_stop_tx, heartbeat_handle, handle) in handles {
+                let agent_outcome = handle.await;
                 let _ = heartbeat_stop_tx.send(true);
-                match handle.await {
+                let _ = heartbeat_handle.await;
+                match agent_outcome {
                     Ok(Ok(result)) => {
-                        let _ = heartbeat_handle.await;
+                        let result_completed = result.status == DelegationStatus::Completed;
                         // Trace: agent completed
                         {
                             let mut t = trace.write().await;
@@ -2557,14 +2726,22 @@ impl TaskRouter {
                             };
                             t.steps.push(super::agent::ExecutionStep {
                                 icon: "\u{26A1}".to_string(), // lightning
-                                title: format!("{} completed", tag),
+                                title: if result_completed {
+                                    format!("{} completed", tag)
+                                } else {
+                                    format!("{} degraded", tag)
+                                },
                                 detail: format!(
                                     "Model: {} | {}ms | {} chars",
                                     result.model_name,
                                     result.execution_time_ms,
                                     result.content.len()
                                 ),
-                                step_type: "success".to_string(),
+                                step_type: if result_completed {
+                                    "success".to_string()
+                                } else {
+                                    "warning".to_string()
+                                },
                                 data: render_agent_result_metadata(&result),
                                 timestamp: chrono::Utc::now(),
                                 duration_ms: Some(result.execution_time_ms),
@@ -2575,9 +2752,13 @@ impl TaskRouter {
                                 .update_agent(
                                     delegation_id,
                                     &result.agent_id,
-                                    "completed",
+                                    result.status.as_str(),
                                     &compact_text(&result.content, 220),
-                                    Some("Delegated work completed."),
+                                    Some(if result_completed {
+                                        "Delegated work completed."
+                                    } else {
+                                        "Delegated work returned no usable final result."
+                                    }),
                                     Some(result.execution_time_ms),
                                 )
                                 .await;
@@ -2587,20 +2768,38 @@ impl TaskRouter {
                                 trace,
                                 token_tx,
                                 plan_step_id,
-                                PlanStepStatus::Completed,
-                                Some(format!(
-                                    "{} completed delegated work.",
-                                    result
-                                        .agent_name
-                                        .as_deref()
-                                        .unwrap_or(result.agent_type.as_str())
-                                )),
+                                if result_completed {
+                                    PlanStepStatus::Completed
+                                } else {
+                                    PlanStepStatus::Failed
+                                },
+                                Some(if result_completed {
+                                    format!(
+                                        "{} completed delegated work.",
+                                        result
+                                            .agent_name
+                                            .as_deref()
+                                            .unwrap_or(result.agent_type.as_str())
+                                    )
+                                } else {
+                                    format!(
+                                        "{} returned no usable final result.",
+                                        result
+                                            .agent_name
+                                            .as_deref()
+                                            .unwrap_or(result.agent_type.as_str())
+                                    )
+                                }),
                             )
                             .await;
                         }
                         emit_delegation_event(
                             token_tx,
-                            "delegation_agent_completed",
+                            if result_completed {
+                                "delegation_agent_completed"
+                            } else {
+                                "delegation_agent_failed"
+                            },
                             delegation_id,
                             agent_status_summary(&result),
                             serde_json::json!({
@@ -2609,9 +2808,12 @@ impl TaskRouter {
                                 "agent_role": result.agent_type.clone(),
                                 "model_name": result.model_name.clone(),
                                 "task": result.task.clone(),
-                                "status": "completed",
+                                "status": result.status.as_str(),
                                 "elapsed_ms": result.execution_time_ms,
                                 "is_specialist": result.is_specialist,
+                                "failure_kind": result.failure_kind.as_ref().map(|kind| kind.as_str()),
+                                "next_action_hint": result.next_action_hint.clone(),
+                                "output_preview": compact_text(&result.content, 1800),
                                 "plan_step_id": assignments[idx].spec.plan_step_id,
                             }),
                         );
@@ -2626,7 +2828,11 @@ impl TaskRouter {
                                     idx,
                                     &assignments[idx],
                                     result.status.as_str(),
-                                    "Delegated work completed.",
+                                    if result_completed {
+                                        "Delegated work completed."
+                                    } else {
+                                        "Delegated work returned no usable final result."
+                                    },
                                     &compact_text(&result.content, 220),
                                     Some(&result.content),
                                     Some(result.execution_time_ms),
@@ -2650,7 +2856,6 @@ impl TaskRouter {
                         completed[idx] = true;
                     }
                     Ok(Err(e)) => {
-                        let _ = heartbeat_handle.await;
                         tracing::warn!("Agent {} failed: {}", idx, e);
                         let (status, failure_kind, next_action_hint) = classify_agent_failure(&e);
                         // Create a failure result so we can continue
@@ -2712,6 +2917,7 @@ impl TaskRouter {
                                     "status": result.status.as_str(),
                                     "reason": result.failure_kind.as_ref().map(|kind| format!("{:?}", kind)),
                                     "is_specialist": result.is_specialist,
+                                    "output_preview": compact_text(&result.content, 1800),
                                     "plan_step_id": assignments[idx].spec.plan_step_id,
                                 }),
                             );
@@ -2750,7 +2956,6 @@ impl TaskRouter {
                         completed[idx] = true;
                     }
                     Err(e) => {
-                        let _ = heartbeat_handle.await;
                         tracing::error!("Agent {} panicked: {}", idx, e);
                         results[idx] = Some(AgentExecResult {
                             agent_id: assignments[idx].agent_id.clone(),
@@ -2813,6 +3018,7 @@ impl TaskRouter {
                                     "status": result.status.as_str(),
                                     "reason": "panic",
                                     "is_specialist": result.is_specialist,
+                                    "output_preview": compact_text(&result.content, 1800),
                                     "plan_step_id": assignments[idx].spec.plan_step_id,
                                 }),
                             );
@@ -2866,7 +3072,7 @@ impl TaskRouter {
         prompt_bundle: &crate::core::self_evolve::PromptBundleProfile,
         results: &[AgentExecResult],
         memories: &[PromptMemory],
-        actions: &[ActionDef],
+        _actions: &[ActionDef],
     ) -> Result<super::llm::LlmResponse> {
         let mut results_text: String = results
             .iter()
@@ -2940,27 +3146,12 @@ impl TaskRouter {
             },
         );
 
-        let mut wanted_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for result in results {
-            if let Some(resp) = &result.llm_response {
-                for tc in &resp.tool_calls {
-                    wanted_tools.insert(tc.name.clone());
-                }
-            }
-        }
-        let filtered_actions: Vec<ActionDef> = actions
-            .iter()
-            .filter(|a| wanted_tools.contains(&a.name))
-            .cloned()
-            .collect();
-
         let synth_system_prompt =
             crate::core::self_evolve::prompt_evolution::render_synthesis_system_prompt(
                 prompt_bundle,
             );
 
-        llm.chat(&synth_system_prompt, &prompt, memories, &filtered_actions)
-            .await
+        llm.chat(&synth_system_prompt, &prompt, memories, &[]).await
     }
 }
 
@@ -3056,11 +3247,13 @@ mod tests {
 
         assert_eq!(degradation.len(), 1);
         assert_eq!(degradation[0].kind, "delegation");
-        assert!(degradation[0]
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("panicked"));
+        assert!(
+            degradation[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("panicked")
+        );
     }
 
     #[test]
@@ -3099,9 +3292,11 @@ mod tests {
             &[degraded_result(DelegationStatus::TimedOut)],
         );
 
-        assert!(response
-            .content
-            .contains("couldn't complete the delegated execution cleanly"));
+        assert!(
+            response
+                .content
+                .contains("couldn't complete the delegated execution cleanly")
+        );
         assert!(response.content.contains("Still needs follow-up"));
     }
 
@@ -3151,7 +3346,7 @@ mod tests {
         assert!(rendered.contains("## Delegated Task Packet"));
         assert!(rendered.contains("## Dependency Outputs"));
         assert!(rendered.contains("## Relevant Memory"));
-        assert!(rendered.contains("## Allowed Actions"));
+        assert!(rendered.contains("## Action Context"));
         assert!(rendered.contains("Forge"));
         assert!(rendered.contains("file_write"));
     }
@@ -3301,7 +3496,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        let err = anyhow::Error::new(elapsed).context("Specialist timed out after 60s");
+        let err = anyhow::Error::new(elapsed).context("Specialist deadline elapsed");
         let (status, kind, _hint) = classify_agent_failure(&err);
         assert_eq!(status, DelegationStatus::TimedOut);
         assert_eq!(kind, FailureKind::Timeout);

@@ -79,6 +79,8 @@ pub(super) struct LlmAnalyticsTotals {
     prompt_tokens: i64,
     completion_tokens: i64,
     total_tokens: i64,
+    cached_prompt_tokens: i64,
+    cache_creation_prompt_tokens: i64,
     request_count: i64,
     estimated_count: i64,
     cost_usd: Option<f64>,
@@ -90,14 +92,20 @@ pub(super) struct LlmAnalyticsPoint {
     prompt_tokens: i64,
     completion_tokens: i64,
     total_tokens: i64,
+    cached_prompt_tokens: i64,
+    cache_creation_prompt_tokens: i64,
     request_count: i64,
     primary_prompt_tokens: i64,
     primary_completion_tokens: i64,
     primary_total_tokens: i64,
+    primary_cached_prompt_tokens: i64,
+    primary_cache_creation_prompt_tokens: i64,
     primary_request_count: i64,
     helper_prompt_tokens: i64,
     helper_completion_tokens: i64,
     helper_total_tokens: i64,
+    helper_cached_prompt_tokens: i64,
+    helper_cache_creation_prompt_tokens: i64,
     helper_request_count: i64,
     cost_usd: Option<f64>,
 }
@@ -111,6 +119,8 @@ pub(super) struct LlmAnalyticsBreakdownRow {
     prompt_tokens: i64,
     completion_tokens: i64,
     total_tokens: i64,
+    cached_prompt_tokens: i64,
+    cache_creation_prompt_tokens: i64,
     request_count: i64,
     cost_usd: Option<f64>,
 }
@@ -570,6 +580,8 @@ pub(super) async fn llm_analytics_endpoint(
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
         request_count: 0,
         estimated_count: 0,
         cost_usd: Some(0.0),
@@ -586,11 +598,15 @@ pub(super) async fn llm_analytics_endpoint(
         let pt = r.prompt_tokens as i64;
         let ct = r.completion_tokens as i64;
         let tt = r.total_tokens as i64;
+        let cached_pt = r.cached_prompt_tokens as i64;
+        let cache_created_pt = r.cache_creation_prompt_tokens as i64;
         let cost = resolve_usage_row_cost_usd(&r, &provider, &openrouter_prices);
 
         totals.prompt_tokens += pt;
         totals.completion_tokens += ct;
         totals.total_tokens += tt;
+        totals.cached_prompt_tokens += cached_pt;
+        totals.cache_creation_prompt_tokens += cache_created_pt;
         totals.request_count += 1;
         if r.estimated {
             totals.estimated_count += 1;
@@ -608,32 +624,44 @@ pub(super) async fn llm_analytics_endpoint(
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
                 request_count: 0,
                 primary_prompt_tokens: 0,
                 primary_completion_tokens: 0,
                 primary_total_tokens: 0,
+                primary_cached_prompt_tokens: 0,
+                primary_cache_creation_prompt_tokens: 0,
                 primary_request_count: 0,
                 helper_prompt_tokens: 0,
                 helper_completion_tokens: 0,
                 helper_total_tokens: 0,
+                helper_cached_prompt_tokens: 0,
+                helper_cache_creation_prompt_tokens: 0,
                 helper_request_count: 0,
                 cost_usd: Some(0.0),
             });
         entry.prompt_tokens += pt;
         entry.completion_tokens += ct;
         entry.total_tokens += tt;
+        entry.cached_prompt_tokens += cached_pt;
+        entry.cache_creation_prompt_tokens += cache_created_pt;
         entry.request_count += 1;
         match analytics_purpose_kind(&r.channel, &r.purpose) {
             "helper" => {
                 entry.helper_prompt_tokens += pt;
                 entry.helper_completion_tokens += ct;
                 entry.helper_total_tokens += tt;
+                entry.helper_cached_prompt_tokens += cached_pt;
+                entry.helper_cache_creation_prompt_tokens += cache_created_pt;
                 entry.helper_request_count += 1;
             }
             _ => {
                 entry.primary_prompt_tokens += pt;
                 entry.primary_completion_tokens += ct;
                 entry.primary_total_tokens += tt;
+                entry.primary_cached_prompt_tokens += cached_pt;
+                entry.primary_cache_creation_prompt_tokens += cache_created_pt;
                 entry.primary_request_count += 1;
             }
         }
@@ -654,12 +682,16 @@ pub(super) async fn llm_analytics_endpoint(
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
                 request_count: 0,
                 cost_usd: Some(0.0),
             });
         model_row.prompt_tokens += pt;
         model_row.completion_tokens += ct;
         model_row.total_tokens += tt;
+        model_row.cached_prompt_tokens += cached_pt;
+        model_row.cache_creation_prompt_tokens += cache_created_pt;
         model_row.request_count += 1;
         match (&mut model_row.cost_usd, cost) {
             (Some(sum), Some(c)) => *sum += c,
@@ -678,12 +710,16 @@ pub(super) async fn llm_analytics_endpoint(
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
                 request_count: 0,
                 cost_usd: Some(0.0),
             });
         ch_row.prompt_tokens += pt;
         ch_row.completion_tokens += ct;
         ch_row.total_tokens += tt;
+        ch_row.cached_prompt_tokens += cached_pt;
+        ch_row.cache_creation_prompt_tokens += cache_created_pt;
         ch_row.request_count += 1;
         match (&mut ch_row.cost_usd, cost) {
             (Some(sum), Some(c)) => *sum += c,
@@ -702,12 +738,16 @@ pub(super) async fn llm_analytics_endpoint(
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
                 request_count: 0,
                 cost_usd: Some(0.0),
             });
         pur_row.prompt_tokens += pt;
         pur_row.completion_tokens += ct;
         pur_row.total_tokens += tt;
+        pur_row.cached_prompt_tokens += cached_pt;
+        pur_row.cache_creation_prompt_tokens += cache_created_pt;
         pur_row.request_count += 1;
         match (&mut pur_row.cost_usd, cost) {
             (Some(sum), Some(c)) => *sum += c,

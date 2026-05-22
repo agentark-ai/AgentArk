@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     core::{
-        browser_profiles::BrowserProfileControlPlane, gateway,
-        model_failover::ModelFailoverControlPlane, nodes::NodeControlPlane, Agent, AgentConfig,
+        Agent, AgentConfig, browser_profiles::BrowserProfileControlPlane, gateway,
+        model_failover::ModelFailoverControlPlane, nodes::NodeControlPlane,
     },
     sentinel::{self, DoctorFinding, PulseEvent},
 };
@@ -301,7 +301,7 @@ fn build_pulse_summary(
 
     GatewayOpsServiceSummary {
         id: "arkpulse".to_string(),
-        title: "ArkPulse".to_string(),
+        title: "Pulse".to_string(),
         status: status.to_string(),
         summary,
         details,
@@ -448,7 +448,7 @@ fn build_pulse_check(latest_pulse: Option<&PulseEvent>) -> GatewayOpsOperatorChe
             let passed = event.status.trim().eq_ignore_ascii_case("ok");
             GatewayOpsOperatorCheck {
                 id: "arkpulse_recent".to_string(),
-                title: "Latest ArkPulse run".to_string(),
+                title: "Latest Pulse run".to_string(),
                 passed,
                 severity: severity_from_pulse_status(&event.status).to_string(),
                 message: event.message.trim().to_string(),
@@ -463,10 +463,10 @@ fn build_pulse_check(latest_pulse: Option<&PulseEvent>) -> GatewayOpsOperatorChe
         }
         None => GatewayOpsOperatorCheck {
             id: "arkpulse_recent".to_string(),
-            title: "Latest ArkPulse run".to_string(),
+            title: "Latest Pulse run".to_string(),
             passed: false,
             severity: "info".to_string(),
-            message: "No ArkPulse events are available yet.".to_string(),
+            message: "No Pulse events are available yet.".to_string(),
             details: None,
         },
     }
@@ -482,7 +482,7 @@ fn build_pulse_highlights(latest_pulse: Option<&PulseEvent>) -> Vec<GatewayOpsHi
     highlights.push(GatewayOpsHighlight {
         source: "pulse".to_string(),
         severity: severity.clone(),
-        title: format!("ArkPulse {}", event.status.trim()),
+        title: format!("Pulse {}", event.status.trim()),
         message: event.message.trim().to_string(),
         target: None,
         note: if event.summary.trim().is_empty() {

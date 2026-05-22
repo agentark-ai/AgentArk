@@ -3,7 +3,7 @@
 //! Implements W3C DID Core specification with did:key method
 //! Based on arXiv:2511.02841 "AI Agents with DIDs and VCs"
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
 use rand::RngExt;

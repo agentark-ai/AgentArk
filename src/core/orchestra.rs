@@ -12,8 +12,9 @@ pub struct OrchestraConfig {
     pub max_concurrent_agents: usize,
     /// Maximum depth of sub-agent delegation
     pub max_delegation_depth: u32,
-    /// Timeout for sub-agent execution in seconds
-    pub agent_timeout_secs: u64,
+    /// Legacy compatibility field. `0` means sub-agents wait until completion.
+    #[serde(default, alias = "agent_timeout_secs")]
+    pub _agent_timeout_secs: u64,
     /// Whether sub-agents can create their own sub-agents
     pub allow_nested_delegation: bool,
     /// Default capabilities for all sub-agents
@@ -25,7 +26,7 @@ impl Default for OrchestraConfig {
         Self {
             max_concurrent_agents: 5,
             max_delegation_depth: 3,
-            agent_timeout_secs: 60,
+            _agent_timeout_secs: 0,
             allow_nested_delegation: true,
             default_capabilities: vec!["reasoning".to_string(), "analysis".to_string()],
         }

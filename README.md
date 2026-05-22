@@ -22,9 +22,9 @@
 <p align="center">
   A self-hosted runtime for the full agent lifecycle.<br>
   Build agents from structured prompts, tools, and integrations. Deploy them as live apps, scheduled automations, conditional watchers, or chat sessions.<br>
-  Monitor every step through ArkSentinel with action traces, failure classification, and drift detection. Secure every capability boundary with intent classification, output guards, approval gates, and per-action authorization.<br>
+  Monitor every step through Sentinel with action traces, failure classification, and drift detection. Secure every capability boundary with intent classification, output guards, approval gates, and per-action authorization.<br>
   Self-evolve prompts, classifiers, routing policies, and specialist behavior from your own usage.<br>
-  Review your day, week, or month through ArkReflect: a local visual panorama of where chat, ArkOrbit, apps, goals, watchers, memory, background agents, usage, and learned workflows clustered.<br>
+  Review your day, week, or month through Reflect: a local visual panorama of where chat, ArkOrbit, apps, goals, watchers, memory, background agents, usage, and learned workflows clustered.<br>
   Chat, memory, devices, integrations, and reviewable actions, all in one place, all on your machine, private by default.<br>
   <code>~3.1GB Docker image &middot; ~500MB idle, ~1GB RAM steady-state under load (5 containers, embeddings loaded) &middot; AES-256-GCM encrypted &middot; model-agnostic</code>
 </p>
@@ -32,6 +32,7 @@
 <p align="center">
   <a href="#install">Install</a> &middot;
   <a href="#features">Features</a> &middot;
+  <a href="#ark-core-systems">Ark Core</a> &middot;
   <a href="#configuration">Configuration</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#security">Security</a> &middot;
@@ -99,52 +100,7 @@ Your data stays with you. Your secrets are encrypted. You keep the final say on 
 | **Integration layer** | Gmail, Calendar, Telegram, WhatsApp, Slack, webhooks, APIs, MCP servers, and custom packs |
 | **Device layer**      | Companion device pairing, scoped grants, and high-risk command approvals                  |
 | **Safety layer**      | Sandboxing, secrets, policy checks, action review, and trace history                      |
-| **Evolution layer**   | ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, and ArkPulse working together              |
-
----
-
-## Architecture
-
-```text
-User Interfaces
-Web UI | Chat | CLI | Channels | Devices
-        |
-        v
-AgentArk Control Plane
-Mission Control | Chat | Approvals | Settings
-        |
-        v
-AI OS Subsystems
-ArkMemory | ArkReflect | ArkSentinel | ArkEvolve | ArkPulse
-Tasks | Watchers | Apps | Skills | Agents
-        |
-        v
-Execution and Integration Layer
-Sandbox | Browser | Webhooks | APIs | Messaging | Companion Devices
-        |
-        v
-Private Storage
-Postgres | Documents | Secrets | Traces | Audit Logs
-```
-
-**Control Plane** - local web UI, approvals, settings, routing, and runtime supervision
-**AI OS Subsystems** - memory, background follow-up, learning, health checks, tasks, watchers, apps, skills, and agents
-**Execution Layer** - WASM (Wasmtime) + Docker isolation for code execution, browser automation, app deployment, and integration calls
-
-### ArkCore Systems
-
-ArkCore is the operating layer inside AgentArk that keeps memory, follow-up work, learning, and health checks connected instead of treating them as separate tools.
-
-| System                                        | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| :-------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **[ArkMemory](assets/docs/arkmemory.md)**     | Reviews current memory, staged changes, provenance, health, and checks. It reconciles session evidence into durable memory with source attribution, review, rollback, and retention-managed audit history.                                                                                                                                                                                                                                                        |
-| **[ArkReflect](assets/docs/arkreflect.md)**   | Turns selected days, weeks, or months into a visual retrospective with semantic clusters, narrative summary, source coverage, working-style rhythm, background-agent activity, and examples. It reads cached derived work units by default and refreshes in background so the UI and API do not block on heavy clustering. Its optional Daily Digest is off by default, runs only after quiet windows, and sends nothing when the day had no meaningful activity. |
-| **[ArkSentinel](assets/docs/arksentinel.md)** | Spots follow-ups, routine work, and unattended issues, then suggests or handles the next step when policy allows it.                                                                                                                                                                                                                                                                                                                                              |
-| **[ArkEvolve](assets/docs/arkevolve.md)**     | Gives plain-language status for what AgentArk learned, what improved, what is still being tested, and what needs review before promotion.                                                                                                                                                                                                                                                                                                                         |
-| **[ArkPulse](assets/docs/arkpulse.md)**       | Runs system health checks across runtime, config, integrations, security posture, storage, and automation reliability, then surfaces actionable findings.                                                                                                                                                                                                                                                                                                         |
-| **[ArkOrbit](assets/docs/arkorbit.md)**       | Canvas-style workspace where the agent builds and live-updates widgets, files, and inline tools alongside a chat surface — a sandboxed orbit-agent runtime separate from main chat.                                                                                                                                                                                                                                                                               |
-
-> **Deep dives:** [ArkMemory](assets/docs/arkmemory.md) · [ArkReflect](assets/docs/arkreflect.md) · [ArkSentinel](assets/docs/arksentinel.md) · [ArkEvolve](assets/docs/arkevolve.md) · [ArkPulse](assets/docs/arkpulse.md) · [ArkOrbit](assets/docs/arkorbit.md) - each is a standalone technical reference covering the data model, pipeline, HTTP API, UI surface, and known limits.
+| **Evolution layer**   | Memory, Reflect, Sentinel, Evolve, and Pulse working together              |
 
 ---
 
@@ -188,7 +144,7 @@ The supported install path uses Docker Compose defaults plus named Docker volume
 
 ### Managed backups
 
-ArkPulse creates framework-managed backups automatically. By default, AgentArk checks for a fresh managed backup every 14 days and only creates one when Sentinel sees the system as idle; if chats, app work, browser sessions, sandbox containers, or heavy background work are active, the backup is deferred and retried later. Backup work runs in background tasks and child processes, not on the main API request path.
+Pulse creates framework-managed backups automatically. By default, AgentArk checks for a fresh managed backup every 14 days and only creates one when Sentinel sees the system as idle; if chats, app work, browser sessions, sandbox containers, or heavy background work are active, the backup is deferred and retried later. Backup work runs in background tasks and child processes, not on the main API request path.
 
 Backups are written under `/app/data/backups` as timestamped artifacts:
 
@@ -196,7 +152,7 @@ Backups are written under `/app/data/backups` as timestamped artifacts:
 - `agentark-managed-*.data.tar.gz` - archive of `/app/data`, excluding the backup directory itself.
 - `agentark-managed-*.config.tar.gz` - archive of `/app/config` when that config volume is present.
 
-AgentArk creates the backup directory itself. If backup creation fails, ArkPulse raises a critical data-safety finding and notifies the user; users should not be asked to create the backup folder manually.
+AgentArk creates the backup directory itself. If backup creation fails, Pulse raises a critical data-safety finding and notifies the user; users should not be asked to create the backup folder manually.
 
 For full install recovery, also keep an operator volume backup from `./scripts/start.sh backup` or `scripts\start.bat backup`. The automatic managed backup intentionally does not copy the raw `agentark-secrets` volume into `/app/data/backups`; that volume contains install-managed encryption material and should be exported only as part of an intentional, access-controlled backup.
 
@@ -206,7 +162,7 @@ For full install recovery, also keep an operator volume backup from `./scripts/s
 docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d
 ```
 
-The bundled Docker runtime includes Lightpanda for fast free-content fetching and the ArkEvolve GEPA optimizer runtime with DSPy. GEPA uses the same active model configured in AgentArk's Models settings; there is no separate GEPA key, model, button, or `.env` setup. ArkEvolve runs this optimizer automatically only after AgentArk is quiet, enough completed work exists, and the daily cost guardrail allows it. The UI surfaces this as Background improvement status, queue, evidence, and latest result.
+The bundled Docker runtime includes Lightpanda for fast free-content fetching and the Evolve GEPA optimizer runtime with DSPy. GEPA uses the same active model configured in AgentArk's Models settings; there is no separate GEPA key, model, button, or `.env` setup. Evolve runs this optimizer automatically only after AgentArk is quiet, enough completed work exists, and the daily cost guardrail allows it. The UI surfaces this as Background improvement status, queue, evidence, and latest result.
 
 For operator inspection, GEPA reads recent evidence from `experience_runs`. Its config, scheduler state, budget ledger, and latest result live in `kv_store` under `gepa_optimizer_config_v1`, `gepa_optimizer_auto_state_v1`, `gepa_optimizer_budget_ledger_v1`, and `gepa_optimizer_last_result_v1`. Queue/run artifacts are file-backed under `/app/.agentark/self_evolve/gepa/{pending,running,completed,failed,runs}`.
 
@@ -217,7 +173,7 @@ These numbers are for the supported Docker Compose install. They were measured f
 | Item                                    | Current expectation                                                                                                                                                                                                                                                                                                                                             |
 | :-------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Full AgentArk Docker image              | `agentark:dev` measured at **3.07 GB**. Published full-runtime linux/amd64 images should be in the same range; run `docker image ls agentark:dev` or `docker image ls ghcr.io/agentark-ai/agentark` for the exact local size.                                                                                                                                   |
-| Bundled ArkEvolve GEPA runtime          | Adds the small `/app/bridges/gepa_optimizer` bridge plus a Python venv with DSPy and model-client dependencies. Expect roughly **120-250 MB** additional uncompressed image size, varying with Python dependency versions.                                                                                                                                      |
+| Bundled Evolve GEPA runtime          | Adds the small `/app/bridges/gepa_optimizer` bridge plus a Python venv with DSPy and model-client dependencies. Expect roughly **120-250 MB** additional uncompressed image size, varying with Python dependency versions.                                                                                                                                      |
 | AgentArk process startup                | **5-10 ms measured** for the Rust binary command startup inside the rebuilt container. This excludes Docker Compose dependency ordering and Postgres health checks.                                                                                                                                                                                             |
 | Full local rebuild                      | About **12 minutes** on the measured Docker Desktop build with warm dependency caches. The Rust release binary compile dominated the build at **11m 38s**; frontend production build was about **11s**. Clean Docker/Cargo/npm caches can be longer.                                                                                                            |
 | Docker stack ready after image exists   | **47.3 seconds measured** from stopped containers to all services healthy with `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait` on Docker Desktop using the local `agentark:dev` image. This includes Postgres, workspace, executor, control, dependency ordering, and healthcheck intervals. Clean pulls/builds are not included. |
@@ -286,7 +242,7 @@ The native CLI is not the recommended way to use AgentArk. Use the Web UI for no
 The CLI exists mainly for development, diagnostics, and operator checks inside a configured runtime:
 
 ```bash
-agentark --pulse                 # run ArkPulse health check
+agentark --pulse                 # run Pulse health check
 agentark --chat                  # developer/operator chat path
 agentark --setup                 # legacy CLI setup path
 ```
@@ -376,18 +332,64 @@ docker compose down -v                          # stop and full reset
 
 ---
 
+## Architecture
+
+```text
+User Interfaces
+Web UI | Chat | CLI | Channels | Devices
+        |
+        v
+AgentArk Control Plane
+Mission Control | Chat | Approvals | Settings
+        |
+        v
+AI OS Subsystems
+Memory | Reflect | Sentinel | Evolve | Pulse
+Tasks | Watchers | Apps | Skills | Agents
+        |
+        v
+Execution and Integration Layer
+Sandbox | Browser | Webhooks | APIs | Messaging | Companion Devices
+        |
+        v
+Private Storage
+Postgres | Documents | Secrets | Traces | Audit Logs
+```
+
+**Control Plane** - local web UI, approvals, settings, routing, and runtime supervision
+**AI OS Subsystems** - memory, background follow-up, learning, health checks, tasks, watchers, apps, skills, and agents
+**Execution Layer** - WASM (Wasmtime) + Docker isolation for code execution, browser automation, app deployment, and integration calls
+
+### Ark Core Systems
+
+Ark Core is the left-nav group for the five core operating surfaces. The product uses short names in the UI and in chat answers: **Memory**, **Reflect**, **Sentinel**, **Evolve**, and **Pulse**.
+
+| System | Plain meaning | Open it when the user wants to... | Default next step | Docs |
+| :----- | :------------ | :-------------------------------- | :---------------- | :--- |
+| **Memory** | Durable facts, preferences, user data, reusable knowledge, provenance, review, and rollback. | Save or inspect something the agent should remember later. | Review **Memory > Current Memory** and approve, edit, or remove captured items. | [Memory docs](assets/docs/arkmemory.md) |
+| **Reflect** | Day, week, and month retrospectives over local work, source coverage, patterns, and background-agent activity. | Understand what happened recently without reading every chat or trace. | Open the weekly view first, then drill into topics or refresh if the cache is stale. | [Reflect docs](assets/docs/arkreflect.md) |
+| **Sentinel** | Supervision, follow-ups, routines, observations, approvals, and background learning status. | See what needs attention or what the system is watching in the background. | Check pending proposals and approve, reject, snooze, or let safe routine work continue. | [Sentinel docs](assets/docs/arksentinel.md) |
+| **Evolve** | Learning lifecycle for prompts, routing, policies, specialist behavior, tests, canaries, and rollback. | Ask what AgentArk learned, what improved, or what is waiting for review. | Start with the simplified overview, then inspect experiments or review queue items. | [Evolve docs](assets/docs/arkevolve.md) |
+| **Pulse** | Runtime health, configuration, integrations, storage, security posture, and safe remediation guidance. | Check whether AgentArk is healthy or why something is failing. | Review the highest-risk finding first, then run or approve safe fixes where available. | [Pulse docs](assets/docs/arkpulse.md) |
+
+ArkOrbit is adjacent to Ark Core: it is the canvas workspace where the agent builds and live-updates widgets, files, and inline tools alongside chat. See [ArkOrbit docs](assets/docs/arkorbit.md).
+
+For deeper technical detail, each system has a standalone reference covering its data model, pipeline, HTTP API, UI surface, and known limits.
+
+---
+
 ## How It Stacks Up
 
 ### Feature comparison
 
 | Capability                 | AgentArk                                                                                                                                                                                                                                                                                                     | OpenClaw                                                                                                   | Agent Zero                                                                                                 | Hermes Agent                                                                                                                                        |
 | :------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Primary scope**          | Self-improving personal AI Agent OS for chat, memory, tasks, apps, integrations, devices, and audit, with ArkEvolve turning completed work, corrections, tool outcomes, and benchmarks into reviewed memory, procedures, prompt/classifier/specialist updates, routing/strategy policy, and skill candidates | Any-OS gateway that connects chat apps to AI agents                                                        | General-purpose autonomous computer assistant                                                              | Self-improving terminal agent with a built-in learning loop that creates skills from experience and builds a user model across sessions             |
+| **Primary scope**          | Self-improving personal AI Agent OS for chat, memory, tasks, apps, integrations, devices, and audit, with Evolve turning completed work, corrections, tool outcomes, and benchmarks into reviewed memory, procedures, prompt/classifier/specialist updates, and routing/strategy policy | Any-OS gateway that connects chat apps to AI agents                                                        | General-purpose autonomous computer assistant                                                              | Self-improving terminal agent with a built-in learning loop that creates skills from experience and builds a user model across sessions             |
 | **UI / control plane**     | Mission Control web UI, approvals, settings, trace, apps, and CLI                                                                                                                                                                                                                                            | Browser Control UI served by the gateway                                                                   | Web UI with interactive streamed output                                                                    | Full TUI with multiline editing, slash-command autocomplete, interrupt-and-redirect, and streaming tool output; no web dashboard                    |
-| **Memory**                 | ArkMemory with episodic, semantic, procedural memory, provenance, review, rollback, and retention                                                                                                                                                                                                            | Memory core plus optional dreaming/background consolidation                                                | Vector/FAISS memory, knowledge base, project memory, and memory dashboard                                  | Agent-curated memory with periodic nudges, FTS5 full-text session search with LLM summarization, and Honcho dialectic user modeling                 |
-| **Background work**        | ArkSentinel with tasks, watchers, routines, schedules, and follow-up loops                                                                                                                                                                                                                                   | Cron jobs, dreaming schedules, gateway events, nodes                                                       | Planning/scheduling and autonomous workflows                                                               | Built-in cron scheduler that delivers daily reports, nightly backups, and weekly audits to any connected platform in natural language               |
-| **Health / operations**    | ArkPulse health checks across runtime, config, integrations, security posture, storage, and automation reliability                                                                                                                                                                                           | Gateway health, event log, node status, and cron visibility                                                | Web UI session state, memory dashboard, and container status                                               | `hermes doctor` diagnostic plus `/compress`, `/usage`, and `/insights` slash commands                                                               |
-| **Learning / adaptation**  | ArkEvolve with self-tune, experience consolidation, heuristic reflection, procedural pattern induction, skill impact tracking, routing-policy benchmarks, prompt/classifier/specialist prompt evolution, tests on past examples, limited live rollout, change history, review, and rollback                  | No reviewed self-editing agent loop documented                                                             | No reviewed self-editing agent loop documented                                                             | Agent-authored skills that self-improve during use, plus Atropos RL environments and trajectory compression for training future tool-calling models |
+| **Memory**                 | Memory with episodic, semantic, procedural memory, provenance, review, rollback, and retention                                                                                                                                                                                                            | Memory core plus optional dreaming/background consolidation                                                | Vector/FAISS memory, knowledge base, project memory, and memory dashboard                                  | Agent-curated memory with periodic nudges, FTS5 full-text session search with LLM summarization, and Honcho dialectic user modeling                 |
+| **Background work**        | Sentinel with tasks, watchers, routines, schedules, and follow-up loops                                                                                                                                                                                                                                   | Cron jobs, dreaming schedules, gateway events, nodes                                                       | Planning/scheduling and autonomous workflows                                                               | Built-in cron scheduler that delivers daily reports, nightly backups, and weekly audits to any connected platform in natural language               |
+| **Health / operations**    | Pulse health checks across runtime, config, integrations, security posture, storage, and automation reliability                                                                                                                                                                                           | Gateway health, event log, node status, and cron visibility                                                | Web UI session state, memory dashboard, and container status                                               | `hermes doctor` diagnostic plus `/compress`, `/usage`, and `/insights` slash commands                                                               |
+| **Learning / adaptation**  | Evolve with self-tune, experience consolidation, heuristic reflection, procedural pattern induction, routing-policy benchmarks, prompt/classifier/specialist prompt evolution, tests on past examples, limited live rollout, change history, review, and rollback; skills remain separately designed or installed capabilities | No reviewed self-editing agent loop documented                                                             | No reviewed self-editing agent loop documented                                                             | Agent-authored skills that self-improve during use, plus Atropos RL environments and trajectory compression for training future tool-calling models |
 | **Messaging / channels**   | Web, CLI, Telegram, WhatsApp, Slack, webhooks, MCP, and custom channels                                                                                                                                                                                                                                      | Discord, Google Chat, iMessage, Matrix, Teams, Signal, Slack, Telegram, WhatsApp, Zalo, WebChat, and nodes | Web UI first; external API, MCP, and A2A connectivity                                                      | Telegram, Discord, Slack, WhatsApp, Signal, CLI, and Home Assistant through a single gateway, with voice memo transcription                         |
 | **Execution isolation**    | WASM sandbox, Docker runtime, approval gates, guarded action review, and execution proofs                                                                                                                                                                                                                    | Managed browser profile, pairing, node scopes, and exec approvals                                          | Dockerized Linux environment                                                                               | Six pluggable terminal backends: local, Docker, SSH, Daytona, Singularity, and Modal                                                                |
 | **Security / trust model** | Cross-layer capability vocabulary, scoped grants, semantic action review, signed action integrity, approval escalation, abuse throttling, output guards, secret redaction, and security events                                                                                                               | Gateway auth, browser/device pairing, node scopes, and exec approval controls                              | Docker isolation plus user-configurable prompts/tools; docs warn it can perform dangerous computer actions | Command approval, DM pairing, and container isolation                                                                                               |
@@ -396,7 +398,7 @@ docker compose down -v                          # stop and full reset
 | **Multi-agent**            | Specialist agents, delegation, routing, and swarms                                                                                                                                                                                                                                                           | Agent sessions and routed harnesses; node-backed capabilities                                              | Subordinate agents and A2A                                                                                 | Isolated subagents spawned for parallel workstreams                                                                                                 |
 | **Device / app layer**     | Generated apps, app runtime, companion-device grants, and scoped approvals                                                                                                                                                                                                                                   | Mobile/headless nodes with pairing and command surfaces                                                    | Operates a Docker computer; companion-device grant system not documented                                   | Runs on Linux, macOS, WSL2, and Android via Termux; Home Assistant integration via gateway; managed app runtime not documented                      |
 
-> **On "self-improving":** AgentArk and Hermes Agent use the phrase for different systems. AgentArk's self-evolve loop is broader and more controlled: completed or corrected runs become memory, lessons, and procedural patterns; ArkEvolve proposes changes to prompts, request classification, specialist prompts, tool/routing strategy, routing policy, and skills; review candidates are gate-checked before approval, while prompt and policy candidates are benchmarked before limited live rollout; changes keep history, impact signals, automatic stops for clear prompt regressions, and rollback or disable paths where supported. Hermes' main docs show a strong learning loop centered on agent-managed skills, bounded persistent memory, session search, and user modeling; they do not show a comparable multi-surface approval-and-rollout system. Same word, different mechanism and scope.
+> **On "self-improving":** AgentArk and Hermes Agent use the phrase for different systems. AgentArk's self-evolve loop is broader and more controlled: completed or corrected runs become memory, lessons, and procedural patterns; Evolve proposes changes to prompts, request classification, specialist prompts, tool/routing strategy, and routing policy; review candidates are gate-checked before approval, while prompt and policy candidates are benchmarked before limited live rollout; changes keep history, impact signals, automatic stops for clear prompt regressions, and rollback or disable paths where supported. Skills in AgentArk are separately designed or installed capability packages, not the storage layer for learned facts or routine Evolve output. Hermes' main docs show a strong learning loop centered on agent-managed skills, bounded persistent memory, session search, and user modeling; they do not show a comparable multi-surface approval-and-rollout system. Same word, different mechanism and scope.
 
 Source notes: [OpenClaw overview](https://docs.openclaw.ai/), [OpenClaw Control UI](https://docs.openclaw.ai/web/control-ui), [OpenClaw browser](https://docs.openclaw.ai/tools/browser), [OpenClaw nodes](https://docs.openclaw.ai/nodes), [OpenClaw memory dreaming](https://docs.openclaw.ai/concepts/memory), [Hermes Agent GitHub](https://github.com/NousResearch/hermes-agent), [Hermes skills](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills), [Hermes memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory), [Hermes checkpoints](https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback), [Agent Zero GitHub](https://github.com/agent0ai/agent-zero), [Agent Zero memory](https://www.agent-zero.ai/p/docs/memory/), [Agent Zero architecture](https://www.agent-zero.ai/p/architecture/).
 
@@ -435,9 +437,9 @@ AgentArk's framework compensates instead:
 
 - **Self-heal and retry** catches malformed tool calls, schema errors, and failed dispatches before they reach you
 - **Model failover** rotates through your configured providers when one rate-limits or errors, without breaking the conversation
-- **ArkMemory** retrieves your preferences instead of asking the model to re-derive them every session
+- **Memory** retrieves your preferences instead of asking the model to re-derive them every session
 - **Capability correlation and approval gates** catch unsafe outputs at the policy layer, not the model layer
-- **ArkEvolve** reinforces prompt shapes that succeed, so the same model performs better over time
+- **Evolve** reinforces prompt shapes that succeed, so the same model performs better over time
 - **Structured validation** enforces JSON schemas, SSRF checks, and output sanitization independent of the model's reasoning
 
 Net result: a $0.10-$0.50/1M-token model on AgentArk produces reliable results for workloads that would require $3-$15/1M on a thin wrapper.
@@ -461,8 +463,8 @@ You choose the trade-off at runtime. The core stays the same.
 | **Sub-Agent Orchestration** | Researcher, Coder, Analyst, Writer, Validator - auto-selected per task                                                                                                       |
 | **Self-Evolve Engine**      | Prompt evolution, policy tuning, strategy learning, and routing benchmarks                                                                                                   |
 | **Self-Tune**               | Learns your style from local history, tracks tool success rates, adjusts autonomy                                                                                            |
-| **ArkMemory**               | Current memory, provenance, review, rollback, and three-tier memory across episodic conversations, semantic facts, and procedural actions                                    |
-| **ArkReflect**              | Local day/week/month panorama showing where work clustered across chat, ArkOrbit, apps, goals, watchers, memory, Sentinel, ArkPulse, ArkEvolve, usage, and learned workflows |
+| **Memory**               | Current memory, provenance, review, rollback, and three-tier memory across episodic conversations, semantic facts, and procedural actions                                    |
+| **Reflect**              | Local day/week/month panorama showing where work clustered across chat, ArkOrbit, apps, goals, watchers, memory, Sentinel, Pulse, Evolve, usage, and learned workflows |
 | **Live App Deployment**     | Deploy static or dynamic apps from chat - Node, Python, HTML, and more                                                                                                       |
 | **Goal Autopilot**          | Goal → plan → scheduled execution → recurring progress reports                                                                                                               |
 | **Predictive Nudges**       | Early warnings for missed deadlines, overdue pressure, recommended next actions                                                                                              |
@@ -585,8 +587,8 @@ Full details: [SECURITY.md](SECURITY.md) and [VERIFY.md](VERIFY.md)
 
 - **Secure first** - encrypted secrets, approvals, sandboxing, and verifiable records
 - **Daily by default** - briefs, reminders, follow-up, and messaging delivery are first-class
-- **Memory that compounds** - ArkMemory builds on previous preferences, facts, sources, and reviewed memory changes
-- **Self-evolving** - corrections, tool outcomes, and benchmarks improve local memory, lessons, procedures, prompts, classifiers, specialist prompts, routing, strategy, and skills
+- **Memory that compounds** - Memory builds on previous preferences, facts, sources, and reviewed memory changes
+- **Self-evolving** - corrections, tool outcomes, and benchmarks improve local memory, lessons, procedures, prompts, classifiers, specialist prompts, routing, and strategy; skills remain separately designed or installed capabilities
 - **Chat-first** - talk to it naturally, not through config files or flowcharts
 - **Power when needed** - tasks, watchers, apps, integrations, and swarm agents for deeper work
 - **Model-agnostic** - OpenAI, Anthropic, Google, Ollama, or any OpenAI-compatible endpoint
@@ -610,9 +612,9 @@ Full details: [SECURITY.md](SECURITY.md) and [VERIFY.md](VERIFY.md)
 
 Full interactive API docs available at **http://localhost:8990/docs#/** after starting AgentArk.
 
-### ArkReflect queries
+### Reflect queries
 
-ArkReflect is cached-read by default. Normal reads should use `GET /reflect`; heavy source scans, embedding, and refresh work are queued separately so the web UI and backend do not hang while a retrospective is prepared.
+Reflect is cached-read by default. Normal reads should use `GET /reflect`; heavy source scans, embedding, and refresh work are queued separately so the web UI and backend do not hang while a retrospective is prepared.
 
 ```bash
 # Read the cached weekly reflection for an explicit UTC range.
@@ -627,9 +629,9 @@ curl "http://localhost:8990/reflect?period=monthly&from=2026-05-01T00:00:00Z&to=
 
 Supported `period` values are `daily`, `weekly`, and `monthly`. `from` and `to` are RFC3339 timestamps; omit them to use the default window for the selected period. Responses include `clusters`, `source_counts`, `baseline_source_counts`, `embedding_status`, `refresh_status`, `cache_status`, `related_history`, and `unclustered_units`.
 
-ArkReflect does not store raw per-message chat embeddings. It creates retention-managed `semantic_work_units` from derived summaries and source metadata, embeds those work units, then clusters and compares them across time windows.
+Reflect does not store raw per-message chat embeddings. It creates retention-managed `semantic_work_units` from derived summaries and source metadata, embeds those work units, then clusters and compares them across time windows.
 
-ArkReflect Daily Digest can be enabled in Settings. When enabled, AgentArk prepares a short LLM-written recap after a quiet end-of-day window, stores it in the notification feed, and attempts the selected notification channel. If the structured activity gate finds nothing meaningful, no notification is sent.
+Reflect Daily Digest can be enabled in Settings. When enabled, AgentArk prepares a short LLM-written recap after a quiet end-of-day window, stores it in the notification feed, and attempts the selected notification channel. If the structured activity gate finds nothing meaningful, no notification is sent.
 
 ---
 
@@ -673,8 +675,11 @@ RUST_LOG=info,agentark=debug ./scripts/start.sh     # agent internals only
 
 - Support multiple accounts per provider across integrations, channels, and reasoning, with workspace-level account management and selection. Project-specific selection can be revisited in phase 2.
 - Let users refine an active chat run with extra instructions while AgentArk is still working.
+- Re-enable retry, resume, and cancel controls after they are implemented end to end across chat, tasks, traces, streaming state, and backend execution. These controls are intentionally hidden until the future workflow is reliable and usable.
 - Add external database support through a dedicated Databases page with read-only schema inspection and conversational querying. Planned providers: Postgres, Supabase, MySQL, Snowflake, and Databricks SQL.
 - Add local-only message history querying through user-approved companion devices. Planned flow: a user asks AgentArk to search messages, AgentArk sends a typed `messages.search` command to a paired local companion, the user approves the exact query/scope/time range, and only bounded results return to AgentArk. Initial target is macOS iMessage via a local companion because iOS cannot expose Messages history to browser or app companions; WhatsApp, Telegram, SMS, and other local app stores require separate companion support where the platform permits it.
+- Explore optional Zero toolchain support for small reusable native helper tools. AgentArk would use it only when a task or repo needs Zero, because its structured compiler diagnostics and explicit capability model can help agents repair and permission-check generated tools without making Zero a default runtime dependency.
+- Explore install-time capability selection after the default runtime is stable. The current plan is to keep the one-command install low-friction and ship the full runtime by default, then add plain installer questions for larger or privileged capabilities such as Playwright/browser automation, Google Workspace tooling, private networking, and tunnel support. Recommended capabilities should stay selected by default, non-interactive installs should use the recommended defaults automatically, and AgentArk should show size, credential, privilege, health-check, and restart/recreate implications before changing installed capabilities. Settings should eventually let users add or remove these capability packs later without turning startup into a flag matrix.
 - ArkOrbit is in development for a future release as a dynamic app and widget deployment surface.
 - Optional GPU-accelerated learning for power users. Entirely opt-in and self-hosted - your data never leaves your machine, and any improvement is gated by AgentArk's existing rollout-and-promotion pipeline so your live agent only changes when a candidate clearly beats it.
   - Phase 1 (consumer GPU): lightweight on-device learning that makes routine decisions and evaluation faster and cheaper.
@@ -725,14 +730,14 @@ For documentation generators such as DeepWiki, these are the main product concep
 
 | Area                   | Start here                                                                                                                               | Notes                                                                                                                                         |
 | :--------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- |
-| Product shell          | `frontend/src/App.tsx`, `frontend/src/components/NativeWorkspace.tsx`, `frontend/src/styles.css`                                         | Navigation, responsive shell, Mission Control, Chat, ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, ArkPulse, and settings surfaces           |
-| API surface            | `src/channels/http.rs`, `src/channels/http/*`                                                                                            | HTTP routes, settings, integrations, companion devices, model control, webhooks, ArkReflect, ArkPulse, ArkSentinel, and ArkMemory panels      |
+| Product shell          | `frontend/src/App.tsx`, `frontend/src/components/NativeWorkspace.tsx`, `frontend/src/styles.css`                                         | Navigation, responsive shell, Mission Control, Chat, Memory, Reflect, Sentinel, Evolve, Pulse, and settings surfaces           |
+| API surface            | `src/channels/http.rs`, `src/channels/http/*`                                                                                            | HTTP routes, settings, integrations, companion devices, model control, webhooks, Reflect, Pulse, Sentinel, and Memory panels      |
 | Agent runtime          | `src/core/agent.rs`, `src/core/agent/*`, `src/runtime/mod.rs`                                                                            | Tool planning, execution loop, approvals, sandboxing, task routing, generated apps, action traces, and response delivery                      |
-| Memory and learning    | `src/core/learning.rs`, `src/core/memory_dedup.rs`, `src/storage/entities/experience_item.rs`                                            | User facts, preferences, ArkMemory views, semantic deduplication, provenance, review, rollback, and consolidation                             |
-| ArkReflect             | `src/channels/http/reflect_control.rs`, `src/storage/entities/semantic_work_unit.rs`, `frontend/src/components/pages/ArkReflectPage.tsx` | Cached local retrospectives, derived semantic work units, day/week/month clustering, source coverage, related-history lookup, and Panorama UI |
-| ArkSentinel            | `src/sentinel.rs`, `src/channels/http/sentinel_panel.rs`, `src/core/autonomy.rs`                                                         | Follow-up scanning, routine detection, health findings, proposals, scheduled work, and automation nudges                                      |
-| ArkEvolve              | `src/core/self_evolve/*`, `src/core/agent/tool_execution.rs`                                                                             | Prompt, policy, classifier, and specialist evolution with canaries, replay evaluation, promotion gates, and rollback                          |
-| ArkPulse               | `src/sentinel.rs`, `src/core/observability.rs`, `src/core/release_updates.rs`                                                            | Runtime health checks, remediation hints, operational findings, update status, and system readiness surfaces                                  |
+| Memory and learning    | `src/core/learning.rs`, `src/core/memory_dedup.rs`, `src/storage/entities/experience_item.rs`                                            | User facts, preferences, Memory views, semantic deduplication, provenance, review, rollback, and consolidation                             |
+| Reflect             | `src/channels/http/reflect_control.rs`, `src/storage/entities/semantic_work_unit.rs`, `frontend/src/components/pages/ArkReflectPage.tsx` | Cached local retrospectives, derived semantic work units, day/week/month clustering, source coverage, related-history lookup, and Panorama UI |
+| Sentinel            | `src/sentinel.rs`, `src/channels/http/sentinel_panel.rs`, `src/core/autonomy.rs`                                                         | Follow-up scanning, routine detection, health findings, proposals, scheduled work, and automation nudges                                      |
+| Evolve              | `src/core/self_evolve/*`, `src/core/agent/tool_execution.rs`                                                                             | Prompt, policy, classifier, and specialist evolution with canaries, replay evaluation, promotion gates, and rollback                          |
+| Pulse               | `src/sentinel.rs`, `src/core/observability.rs`, `src/core/release_updates.rs`                                                            | Runtime health checks, remediation hints, operational findings, update status, and system readiness surfaces                                  |
 | Integrations and packs | `src/extension_packs/mod.rs`, `src/channels/http/integrations.rs`, `frontend/src/components/IntegrationsPanel.tsx`                       | Extension packs, messaging channels, OAuth/setup wizards, custom APIs, MCP, webhooks, install/delete cleanup, and secrets handling            |
 | Companion devices      | `src/core/companion.rs`, `src/channels/http/companion_control.rs`, `frontend/src/components/CompanionDevicesPanel.tsx`                   | Pairing, scoped grants, high-risk approvals, audit trail, device commands, and queued actions                                                 |
 | Storage and secrets    | `src/storage/*`, `src/core/config.rs`, `src/core/secrets.rs`, `src/storage/encrypted.rs`                                                 | Postgres entities, schema setup, encrypted config, secret storage, retention, cleanup, and audit data                                         |
@@ -741,12 +746,12 @@ Key flows worth documenting:
 
 - Chat request -> plan/tool loop -> trace -> response -> memory and automation updates.
 - Memory capture -> semantic deduplication -> review and provenance -> rollback when needed.
-- Background session, task, or watcher -> ArkSentinel follow-up -> approval or scheduled action.
-- ArkReflect refresh -> bounded source scan -> derived semantic work units -> cached clusters and visual recap.
+- Background session, task, or watcher -> Sentinel follow-up -> approval or scheduled action.
+- Reflect refresh -> bounded source scan -> derived semantic work units -> cached clusters and visual recap.
 - Integration install or delete -> config, secrets, files, and audit cleanup.
-- App generation and deployment -> sandbox/runtime -> private or public access -> ArkPulse health checks.
-- ArkEvolve review candidate -> past-example test -> approval or rejection -> apply or leave unchanged.
-- ArkEvolve prompt/policy candidate -> benchmark -> limited live rollout or promotion -> stop, disable, or rollback where supported.
+- App generation and deployment -> sandbox/runtime -> private or public access -> Pulse health checks.
+- Evolve review candidate -> past-example test -> approval or rejection -> apply or leave unchanged.
+- Evolve prompt/policy candidate -> benchmark -> limited live rollout or promotion -> stop, disable, or rollback where supported.
 
 ---
 

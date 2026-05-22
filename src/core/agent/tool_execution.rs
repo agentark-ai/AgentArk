@@ -19,6 +19,22 @@ pub(crate) fn tool_result_envelope_error_string(tool_name: &str, error: &anyhow:
     if let Some(action_err) = error.downcast_ref::<crate::actions::ActionError>() {
         return action_err.to_envelope(tool_name).to_string();
     }
+    if let Some(presented) = present_user_safe_tool_failure(error) {
+        return serde_json::json!({
+            "status": "error",
+            "tool": tool_name,
+            "domain": "validation",
+            "reason": presented.reason,
+            "message": presented.message,
+            "failure_class": presented.failure_class,
+            "retryable": presented.retryable,
+            "operational_outcome": presented.operational_outcome,
+            "remediation": {
+                "type": if presented.retryable { "use_alternative" } else { "none" }
+            }
+        })
+        .to_string();
+    }
     // Try to recover an envelope from a pre-formatted "ERR/domain/reason: msg"
     // string that may have come back from a sub-tool call.
     let message = error.to_string();
@@ -46,6 +62,42 @@ pub(crate) fn tool_result_envelope_ok_string(tool_name: &str, result_text: &str)
             return parsed.to_string();
         }
     }
+    if let Some(outcome) = super::tool_responses::structured_tool_result_outcome(result_text) {
+        if outcome.state != super::tool_responses::StructuredToolOutcomeState::Success {
+            let status = match outcome.state {
+                super::tool_responses::StructuredToolOutcomeState::Success => "ok",
+                super::tool_responses::StructuredToolOutcomeState::Failure => "error",
+                super::tool_responses::StructuredToolOutcomeState::NeedsInput => "needs_input",
+            };
+            let reason = outcome.reason.unwrap_or_else(|| match outcome.state {
+                super::tool_responses::StructuredToolOutcomeState::Success => "success".to_string(),
+                super::tool_responses::StructuredToolOutcomeState::Failure => {
+                    "reported_failure".to_string()
+                }
+                super::tool_responses::StructuredToolOutcomeState::NeedsInput => {
+                    "needs_input".to_string()
+                }
+            });
+            let message = outcome.message.unwrap_or_else(|| {
+                if let Some(exit_code) = outcome.exit_code {
+                    format!("The tool exited with code {exit_code}.")
+                } else {
+                    "The tool reported that the requested action did not complete.".to_string()
+                }
+            });
+            let mut envelope = serde_json::json!({
+                "status": status,
+                "tool": tool_name,
+                "reason": reason,
+                "message": message,
+                "result": result_text,
+            });
+            if let Some(exit_code) = outcome.exit_code {
+                envelope["exit_code"] = serde_json::json!(exit_code);
+            }
+            return envelope.to_string();
+        }
+    }
     serde_json::json!({
         "status": "ok",
         "tool": tool_name,
@@ -54,10 +106,7 @@ pub(crate) fn tool_result_envelope_ok_string(tool_name: &str, result_text: &str)
     .to_string()
 }
 
-fn parse_structured_action_error_text(
-    tool_name: &str,
-    message: &str,
-) -> Option<serde_json::Value> {
+fn parse_structured_action_error_text(tool_name: &str, message: &str) -> Option<serde_json::Value> {
     // Format: "ERR/<domain>/<reason>: <text>"
     let trimmed = message.trim_start();
     let rest = trimmed.strip_prefix("ERR/")?;
@@ -127,6 +176,7 @@ fn list_watchers_live_row(watcher: &crate::core::watcher::Watcher) -> serde_json
         "status_error": status_error,
         "interval_secs": watcher.interval_secs,
         "timeout_secs": watcher.timeout_secs,
+        "repeat_on_match": watcher.repeat_on_match,
         "poll_count": watcher.poll_count,
         "created_at": watcher.created_at.to_rfc3339(),
         "last_poll_at": watcher.last_poll_at.as_ref().map(|value| value.to_rfc3339()),
@@ -187,6 +237,7 @@ fn list_watchers_history_row(
         "status_error": status_error,
         "interval_secs": serde_json::Value::Null,
         "timeout_secs": serde_json::Value::Null,
+        "repeat_on_match": serde_json::Value::Null,
         "poll_count": state.attempt_count,
         "created_at": created_at,
         "last_poll_at": state.last_run_at,
@@ -265,6 +316,7 @@ fn resolve_gepa_workspace_path(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserSafeToolFailure {
     message: String,
+    reason: &'static str,
     failure_class: crate::core::FailureClass,
     retryable: bool,
     operational_outcome: &'static str,
@@ -339,20 +391,68 @@ fn typed_tool_error_fields(error: &anyhow::Error) -> Option<TypedToolErrorFields
             scope: None,
             detail: None,
         })
+        .or_else(|| {
+            error
+                .downcast_ref::<crate::runtime::ToolPathAccessError>()
+                .map(|error| TypedToolErrorFields {
+                    code: match error {
+                        crate::runtime::ToolPathAccessError::OutsideAllowedRoots { .. } => {
+                            "runtime/outside_allowed_roots".to_string()
+                        }
+                    },
+                    scope: Some("filesystem".to_string()),
+                    detail: Some(error.to_string()),
+                })
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(|error| TypedToolErrorFields {
+                    code: match error.kind() {
+                        std::io::ErrorKind::NotFound => "io/not_found".to_string(),
+                        std::io::ErrorKind::PermissionDenied => "io/permission_denied".to_string(),
+                        _ => "io/failed".to_string(),
+                    },
+                    scope: Some("filesystem".to_string()),
+                    detail: Some(error.to_string()),
+                })
+        })
 }
 
 fn present_user_safe_tool_failure(error: &anyhow::Error) -> Option<UserSafeToolFailure> {
-    match error.downcast_ref::<crate::runtime::ToolPathAccessError>() {
-        Some(crate::runtime::ToolPathAccessError::OutsideAllowedRoots { .. }) => {
-            Some(UserSafeToolFailure {
-                message: "The requested file path is not available in this runtime. It can only access files inside the workspace and configured data directories.".to_string(),
+    if let Some(error) = error.downcast_ref::<crate::runtime::ToolPathAccessError>() {
+        return match error {
+            crate::runtime::ToolPathAccessError::OutsideAllowedRoots { .. } => {
+                Some(UserSafeToolFailure {
+                    message: "The requested file path is not available in this runtime. It can only access files inside the workspace and configured data directories.".to_string(),
+                    reason: "outside_allowed_roots",
+                    failure_class: crate::core::FailureClass::Validation,
+                    retryable: true,
+                    operational_outcome: "validation_error",
+                })
+            }
+        };
+    }
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => Some(UserSafeToolFailure {
+                message: "The requested file does not exist in the current runtime.".to_string(),
+                reason: "not_found",
                 failure_class: crate::core::FailureClass::Validation,
                 retryable: true,
                 operational_outcome: "validation_error",
-            })
-        }
-        None => None,
-    }
+            }),
+            std::io::ErrorKind::PermissionDenied => Some(UserSafeToolFailure {
+                message: "The requested file path is not readable in the current runtime."
+                    .to_string(),
+                reason: "permission_denied",
+                failure_class: crate::core::FailureClass::Validation,
+                retryable: true,
+                operational_outcome: "validation_error",
+            }),
+            _ => None,
+        })
 }
 
 fn code_execute_has_input_files(arguments: &serde_json::Value) -> bool {
@@ -686,6 +786,126 @@ impl RaisedCredentialPromptKind {
     }
 }
 
+fn work_manage_operation(arguments: &serde_json::Value) -> String {
+    arguments
+        .get("operation")
+        .or_else(|| arguments.get("op"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "read" => "status".to_string(),
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| "status".to_string())
+}
+
+fn work_manage_id(arguments: &serde_json::Value, primary_field: &str) -> Option<String> {
+    arguments
+        .get(primary_field)
+        .or_else(|| arguments.get("id"))
+        .or_else(|| arguments.get("work_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn work_manage_reference_text(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("reference_text")
+        .or_else(|| arguments.get("query"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn normalized_work_text(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_space = true;
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            last_was_space = false;
+        } else if !last_was_space {
+            out.push(' ');
+            last_was_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn work_text_matches_reference(haystack: &str, reference: &str) -> bool {
+    let haystack = normalized_work_text(haystack);
+    let reference = normalized_work_text(reference);
+    reference.len() >= 3 && (haystack.contains(&reference) || reference.contains(&haystack))
+}
+
+fn scheduled_task_reference_blob(task: &crate::core::Task) -> String {
+    let args = serde_json::to_string(&task.arguments).unwrap_or_default();
+    format!(
+        "{}\n{}\n{}\n{}",
+        task.id, task.description, task.action, args
+    )
+}
+
+fn watcher_reference_blob(watcher: &crate::core::watcher::Watcher) -> String {
+    let poll_args = serde_json::to_string(&watcher.poll_arguments).unwrap_or_default();
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        watcher.id, watcher.description, watcher.poll_action, watcher.on_trigger, poll_args
+    )
+}
+
+fn scheduled_task_status_label(status: &crate::core::TaskStatus) -> &'static str {
+    match status {
+        crate::core::TaskStatus::Pending => "pending",
+        crate::core::TaskStatus::AwaitingApproval => "awaiting_approval",
+        crate::core::TaskStatus::ExpiredNeedsReapproval => "expired_needs_reapproval",
+        crate::core::TaskStatus::Paused => "paused",
+        crate::core::TaskStatus::InProgress => "in_progress",
+        crate::core::TaskStatus::Completed => "completed",
+        crate::core::TaskStatus::Failed { .. } => "failed",
+        crate::core::TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn scheduled_task_work_row(task: &crate::core::Task) -> serde_json::Value {
+    let status_error = match &task.status {
+        crate::core::TaskStatus::Failed { error } => Some(error.clone()),
+        _ => None,
+    };
+    serde_json::json!({
+        "id": task.id.to_string(),
+        "description": task.description,
+        "action": task.action,
+        "arguments": task.arguments,
+        "status": scheduled_task_status_label(&task.status),
+        "status_error": status_error,
+        "created_at": task.created_at.to_rfc3339(),
+        "scheduled_for": task.scheduled_for.map(|value| value.to_rfc3339()),
+        "cron": task.cron,
+        "result": task.result,
+    })
+}
+
+fn durable_work_not_found(kind: &str, operation: &str, id: &str) -> String {
+    render_tool_completion_marker_with_data(
+        "background_work_manage",
+        "failed",
+        &format!("{} `{}` was not found.", kind, id),
+        serde_json::json!({
+            "success": false,
+            "kind": kind,
+            "operation": operation,
+            "id": id,
+            "reason": "not_found",
+        }),
+    )
+}
 impl Agent {
     fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
         match value {
@@ -885,6 +1105,72 @@ impl Agent {
         crate::core::self_tune::record_user_rejection(&self.storage).await;
     }
 
+    fn delegated_result_text_for_tool_output(
+        result: &crate::core::task_router::DelegatedResult,
+    ) -> String {
+        let direct = result.final_response.content.trim();
+        if !direct.is_empty() {
+            return direct.to_string();
+        }
+
+        let completed = result
+            .agent_results
+            .iter()
+            .filter(|item| {
+                item.status == crate::core::DelegationStatus::Completed
+                    && !item.content.trim().is_empty()
+            })
+            .take(8)
+            .map(|item| {
+                let name = item
+                    .agent_name
+                    .as_deref()
+                    .unwrap_or(item.agent_type.as_str());
+                format!(
+                    "### {} / {}\n{}",
+                    name,
+                    item.agent_type,
+                    safe_truncate(item.content.trim(), 2_000)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if !completed.is_empty() {
+            return format!(
+                "Delegated work completed, but no separate synthesis text was returned. Usable agent outputs:\n\n{}",
+                completed.join("\n\n")
+            );
+        }
+
+        let degraded = result
+            .agent_results
+            .iter()
+            .take(8)
+            .map(|item| {
+                let name = item
+                    .agent_name
+                    .as_deref()
+                    .unwrap_or(item.agent_type.as_str());
+                format!(
+                    "- {} / {} [{}]: {}",
+                    name,
+                    item.agent_type,
+                    item.status.as_str(),
+                    safe_truncate(item.content.trim(), 240)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if degraded.is_empty() {
+            "Delegated work finished without a usable agent result.".to_string()
+        } else {
+            format!(
+                "Delegated work finished without a usable synthesis. Agent statuses:\n{}",
+                degraded.join("\n")
+            )
+        }
+    }
+
     async fn handle_delegate_tool_call(
         &self,
         arguments: &serde_json::Value,
@@ -897,6 +1183,24 @@ impl Agent {
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                arguments
+                    .get("tasks")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str())
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .enumerate()
+                            .map(|(index, item)| format!("{}. {item}", index + 1))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|value| !value.trim().is_empty())
+            })
         else {
             return serde_json::json!({
                 "ok": false,
@@ -916,7 +1220,7 @@ impl Agent {
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let mut delegated_message = task.to_string();
+        let mut delegated_message = task;
         if !context.is_empty() {
             delegated_message.push_str("\n\nContext:\n");
             delegated_message.push_str(context);
@@ -939,21 +1243,23 @@ impl Agent {
         let active_specialist_prompt_bundle = self
             .active_specialist_prompt_bundle_for_message(&delegated_message)
             .await;
-        let mut decision = self
-            .route_query(&delegated_message, &actions, &active_prompt_bundle)
-            .await;
-        decision.needs_delegation = true;
-        if decision.sub_agents.len() < 2 {
-            decision.sub_agents = self.forced_swarm_specs(&delegated_message, &actions);
-        }
-        decision.confidence = decision.confidence.max(0.96);
-        decision.reasoning = if decision.reasoning.trim().is_empty() {
-            "Explicit multi-agent capability execution.".to_string()
-        } else {
-            format!(
-                "{} | Explicit multi-agent capability execution.",
-                decision.reasoning.trim()
-            )
+        let orchestration_required = arguments
+            .get("orchestration_required")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        let decision = crate::core::task_router::RoutingDecision {
+            needs_delegation: true,
+            complexity: QueryComplexity::Complex,
+            sub_agents: self.forced_swarm_specs(&delegated_message, &actions),
+            reasoning: if orchestration_required {
+                "Delegation was explicitly requested by the tool arguments.".to_string()
+            } else {
+                "The spine selected the delegate primitive for this outcome.".to_string()
+            },
+            confidence: 0.96,
+            should_clarify: false,
+            clarification_question: None,
         };
 
         let system_prompt = match self
@@ -1038,6 +1344,7 @@ impl Agent {
                         })
                     })
                     .collect::<Vec<_>>();
+                let final_result = Self::delegated_result_text_for_tool_output(&result);
                 serde_json::json!({
                     "ok": true,
                     "status": "completed",
@@ -1046,7 +1353,7 @@ impl Agent {
                     "delegation_status": result.delegation_status.as_str(),
                     "agents_used": agents,
                     "degradation": degradation,
-                    "final_result": crate::security::redact_pii(&result.final_response.content),
+                    "final_result": crate::security::redact_pii(&final_result),
                 })
                 .to_string()
             }
@@ -4051,6 +4358,7 @@ impl Agent {
         message_hint: Option<&str>,
         authorization: &crate::actions::ActionAuthorizationContext,
         conversation_id: Option<&str>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> String {
         // If this turn is already explicit-approval (re-run after Approve
         // click), skip the preflight and go straight to execution. The
@@ -4111,12 +4419,735 @@ impl Agent {
                 Some(authorization),
                 conversation_id,
                 None,
+                stream_tx,
             )
             .await
         {
             Ok(result_text) => tool_result_envelope_ok_string(action_name, &result_text),
             Err(error) => tool_result_envelope_error_string(action_name, &error),
         }
+    }
+
+    async fn handle_manage_actions_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
+    ) -> Result<String> {
+        let resource = arguments
+            .get("resource")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "skill".to_string());
+        let result = if resource == "skill_marketplace" {
+            self.handle_skill_marketplace_manage_action(arguments)
+                .await?
+        } else {
+            self.handle_skill_manage_action(arguments, authorization)
+                .await?
+        };
+        let status = result
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("ok")
+            .to_string();
+        let detail = result
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Skills updated.")
+            .to_string();
+        Ok(render_tool_completion_marker_with_data(
+            "manage_actions",
+            &status,
+            &detail,
+            result,
+        ))
+    }
+
+    async fn handle_skill_manage_action(
+        &self,
+        arguments: &serde_json::Value,
+        authorization: Option<&crate::actions::ActionAuthorizationContext>,
+    ) -> Result<serde_json::Value> {
+        let operation = action_text_arg(arguments, "operation")
+            .unwrap_or_else(|| "list".to_string())
+            .to_ascii_lowercase();
+        let name = action_text_arg(arguments, "name").or_else(|| action_text_arg(arguments, "id"));
+        let surface = skills_surface_json();
+        let result = match operation.as_str() {
+            "create" | "update" | "import" | "install" => {
+                let url = action_text_arg(arguments, "url")
+                    .or_else(|| action_text_arg(arguments, "source_url"))
+                    .or_else(|| action_text_arg(arguments, "install_url"));
+                let content = action_text_arg(arguments, "content")
+                    .or_else(|| action_text_arg(arguments, "markdown"));
+                let enabled = arguments
+                    .get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+                let security_confirmed = arguments
+                    .get("security_confirmed")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let allow_duplicate = arguments
+                    .get("allow_duplicate")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let model = action_text_arg(arguments, "model");
+                let preview = if let Some(url) = url.clone().filter(|_| content.is_none()) {
+                    crate::channels::http::actions::import_action_from_url_shared(
+                        self,
+                        &url,
+                        name.as_deref(),
+                        false,
+                        model.as_deref(),
+                        true,
+                        false,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{}", error))?
+                } else {
+                    let preview_content = content.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Skill {} requires complete SKILL.md content or a raw SKILL.md URL.",
+                            operation
+                        )
+                    })?;
+                    crate::channels::http::actions::import_action_from_content_with_agent(
+                        self,
+                        "chat://skills",
+                        preview_content,
+                        name.as_deref(),
+                        false,
+                        model.as_deref(),
+                        true,
+                        false,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{}", error))?
+                };
+                if let Some(gate) =
+                    skill_chat_review_gate_result(&preview, &operation, security_confirmed)
+                {
+                    return Ok(gate);
+                }
+                let imported = if let Some(url) = url.filter(|_| content.is_none()) {
+                    crate::channels::http::actions::import_action_from_url_shared(
+                        self,
+                        &url,
+                        name.as_deref(),
+                        allow_duplicate,
+                        model.as_deref(),
+                        false,
+                        enabled,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{}", error))?
+                } else {
+                    let content = content.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Skill {} requires complete SKILL.md content or a raw SKILL.md URL.",
+                            operation
+                        )
+                    })?;
+                    crate::channels::http::actions::import_action_from_content_with_agent(
+                        self,
+                        "chat://skills",
+                        content,
+                        name.as_deref(),
+                        allow_duplicate,
+                        model.as_deref(),
+                        false,
+                        enabled,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{}", error))?
+                };
+                self.refresh_action_catalog_index("skill_chat_manage").await;
+                merge_objects_json(
+                    imported,
+                    serde_json::json!({
+                        "resource": "skill",
+                        "operation": operation,
+                        "surface": surface,
+                    }),
+                )
+            }
+            "delete" => {
+                let name =
+                    name.ok_or_else(|| anyhow::anyhow!("Skill delete requires a skill name."))?;
+                let deleted = self.runtime.delete_action(&name).await?;
+                if deleted {
+                    self.refresh_action_catalog_index("skill_chat_delete").await;
+                    serde_json::json!({
+                        "status": "ok",
+                        "resource": "skill",
+                        "operation": "delete",
+                        "name": name,
+                        "message": "Skill deleted. You can manage remaining skills in Skills.",
+                        "surface": surface,
+                    })
+                } else {
+                    anyhow::bail!("Skill '{}' cannot be deleted or was not found.", name);
+                }
+            }
+            "enable" | "disable" => {
+                let name = name.ok_or_else(|| {
+                    anyhow::anyhow!("Skill enable/disable requires a skill name.")
+                })?;
+                let enabled = operation == "enable";
+                let changed = self.runtime.set_action_enabled(&name, enabled).await?;
+                if changed {
+                    self.refresh_action_catalog_index("skill_chat_enabled_changed")
+                        .await;
+                    serde_json::json!({
+                        "status": "ok",
+                        "resource": "skill",
+                        "operation": operation,
+                        "name": name,
+                        "enabled": enabled,
+                        "message": if enabled { "Skill enabled." } else { "Skill disabled." },
+                        "surface": surface,
+                    })
+                } else {
+                    anyhow::bail!(
+                        "Skill '{}' was not found or cannot be enabled/disabled.",
+                        name
+                    );
+                }
+            }
+            "read" | "status" => {
+                let name = name
+                    .ok_or_else(|| anyhow::anyhow!("Skill read/status requires a skill name."))?;
+                let Some((info, content)) = self.runtime.get_action_content(&name).await? else {
+                    anyhow::bail!("Skill '{}' was not found.", name);
+                };
+                serde_json::json!({
+                    "status": "ok",
+                    "resource": "skill",
+                    "operation": operation,
+                    "name": info.name,
+                    "description": info.description,
+                    "enabled": self.runtime.is_action_enabled(&name).await,
+                    "source": format!("{:?}", info.source).to_ascii_lowercase(),
+                    "content": if operation == "read" { serde_json::Value::String(content) } else { serde_json::Value::Null },
+                    "message": "Skill found. You can manage it in Skills.",
+                    "surface": surface,
+                })
+            }
+            "test" => {
+                let name =
+                    name.ok_or_else(|| anyhow::anyhow!("Skill test requires a skill name."))?;
+                let test_args = arguments
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let default_auth;
+                let auth_context = if let Some(auth) = authorization {
+                    auth
+                } else {
+                    default_auth = crate::actions::ActionAuthorizationContext::default();
+                    &default_auth
+                };
+                let output = self
+                    .runtime
+                    .execute_action_with_context(&name, &test_args, auth_context)
+                    .await?;
+                serde_json::json!({
+                    "status": "ok",
+                    "resource": "skill",
+                    "operation": "test",
+                    "name": name,
+                    "output": output,
+                    "message": "Skill test finished. You can manage it in Skills.",
+                    "surface": surface,
+                })
+            }
+            "list" => {
+                let actions = self.runtime.list_actions().await?;
+                let mut skills = Vec::new();
+                for action in actions {
+                    let enabled = self.runtime.is_action_enabled(&action.name).await;
+                    skills.push(serde_json::json!({
+                        "name": action.name,
+                        "description": action.description,
+                        "version": action.version,
+                        "source": format!("{:?}", action.source).to_ascii_lowercase(),
+                        "enabled": enabled,
+                    }));
+                }
+                serde_json::json!({
+                    "status": "ok",
+                    "resource": "skill",
+                    "operation": "list",
+                    "skills": skills,
+                    "message": "Skills listed.",
+                    "surface": surface,
+                })
+            }
+            other => anyhow::bail!("Unsupported skill operation '{}'.", other),
+        };
+        Ok(result)
+    }
+
+    async fn handle_skill_marketplace_manage_action(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let operation = action_text_arg(arguments, "operation")
+            .unwrap_or_else(|| "list".to_string())
+            .to_ascii_lowercase();
+        let storage = self.storage.clone();
+        let surface = skills_surface_json();
+        match operation.as_str() {
+            "create" => {
+                let url = action_text_arg(arguments, "url").ok_or_else(|| {
+                    anyhow::anyhow!("Skill marketplace create requires a marketplace URL.")
+                })?;
+                let request = crate::core::skill_marketplaces::SkillMarketplaceUpsertRequest {
+                    id: action_text_arg(arguments, "id"),
+                    name: action_text_arg(arguments, "name"),
+                    url,
+                    enabled: arguments.get("enabled").and_then(|value| value.as_bool()),
+                };
+                let (status, marketplace) =
+                    crate::core::skill_marketplaces::upsert_marketplace(&storage, None, request)
+                        .await?;
+                Ok(serde_json::json!({
+                    "status": status,
+                    "resource": "skill_marketplace",
+                    "operation": "create",
+                    "marketplace": marketplace,
+                    "message": "Skill marketplace saved. You can manage it in Skills.",
+                    "surface": surface,
+                }))
+            }
+            "update" => {
+                let target = marketplace_target(arguments)?;
+                let marketplaces =
+                    crate::core::skill_marketplaces::load_marketplaces(&storage).await?;
+                let existing = resolve_marketplace(&marketplaces, &target)?;
+                let existing_id = existing.id.clone();
+                let request = crate::core::skill_marketplaces::SkillMarketplaceUpsertRequest {
+                    id: Some(existing_id.clone()),
+                    name: action_text_arg(arguments, "name")
+                        .or_else(|| Some(existing.name.clone())),
+                    url: action_text_arg(arguments, "url").unwrap_or_else(|| existing.url.clone()),
+                    enabled: arguments
+                        .get("enabled")
+                        .and_then(|value| value.as_bool())
+                        .or(Some(existing.enabled)),
+                };
+                let (status, marketplace) = crate::core::skill_marketplaces::upsert_marketplace(
+                    &storage,
+                    Some(&existing_id),
+                    request,
+                )
+                .await?;
+                Ok(serde_json::json!({
+                    "status": status,
+                    "resource": "skill_marketplace",
+                    "operation": "update",
+                    "marketplace": marketplace,
+                    "message": "Skill marketplace updated. You can manage it in Skills.",
+                    "surface": surface,
+                }))
+            }
+            "enable" | "disable" => {
+                let target = marketplace_target(arguments)?;
+                let marketplaces =
+                    crate::core::skill_marketplaces::load_marketplaces(&storage).await?;
+                let existing = resolve_marketplace(&marketplaces, &target)?;
+                let existing_id = existing.id.clone();
+                let enabled = operation == "enable";
+                let request = crate::core::skill_marketplaces::SkillMarketplaceUpsertRequest {
+                    id: Some(existing_id.clone()),
+                    name: Some(existing.name.clone()),
+                    url: existing.url.clone(),
+                    enabled: Some(enabled),
+                };
+                let (status, marketplace) = crate::core::skill_marketplaces::upsert_marketplace(
+                    &storage,
+                    Some(&existing_id),
+                    request,
+                )
+                .await?;
+                Ok(serde_json::json!({
+                    "status": status,
+                    "resource": "skill_marketplace",
+                    "operation": operation,
+                    "marketplace": marketplace,
+                    "message": if enabled { "Skill marketplace enabled." } else { "Skill marketplace disabled." },
+                    "surface": surface,
+                }))
+            }
+            "delete" => {
+                let target = marketplace_target(arguments)?;
+                let marketplaces =
+                    crate::core::skill_marketplaces::load_marketplaces(&storage).await?;
+                let existing = resolve_marketplace(&marketplaces, &target)?;
+                let existing_id = existing.id.clone();
+                crate::core::skill_marketplaces::remove_marketplace(&storage, &existing_id).await?;
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "skill_marketplace",
+                    "operation": "delete",
+                    "id": existing_id,
+                    "message": "Skill marketplace deleted. You can manage remaining marketplaces in Skills.",
+                    "surface": surface,
+                }))
+            }
+            "refresh" => {
+                let target = marketplace_target(arguments)?;
+                let marketplaces =
+                    crate::core::skill_marketplaces::load_marketplaces(&storage).await?;
+                let existing = resolve_marketplace(&marketplaces, &target)?;
+                let existing_id = existing.id.clone();
+                let marketplace =
+                    crate::core::skill_marketplaces::refresh_marketplace(&storage, &existing_id)
+                        .await?;
+                Ok(serde_json::json!({
+                    "status": if marketplace.last_error.is_some() { "warning" } else { "ok" },
+                    "resource": "skill_marketplace",
+                    "operation": "refresh",
+                    "marketplace": marketplace,
+                    "message": "Skill marketplace refreshed. You can manage it in Skills.",
+                    "surface": surface,
+                }))
+            }
+            "read" | "status" => {
+                let target = marketplace_target(arguments)?;
+                let marketplaces =
+                    crate::core::skill_marketplaces::load_marketplaces(&storage).await?;
+                let marketplace = resolve_marketplace(&marketplaces, &target)?;
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "skill_marketplace",
+                    "operation": operation,
+                    "marketplace": marketplace,
+                    "message": "Skill marketplace found. You can manage it in Skills.",
+                    "surface": surface,
+                }))
+            }
+            "list" => {
+                let marketplaces =
+                    crate::core::skill_marketplaces::load_marketplaces(&storage).await?;
+                let installers_count: usize = marketplaces
+                    .iter()
+                    .map(|marketplace| marketplace.installers.len())
+                    .sum();
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "skill_marketplace",
+                    "operation": "list",
+                    "marketplaces": marketplaces,
+                    "installers_count": installers_count,
+                    "message": "Skill marketplaces listed.",
+                    "surface": surface,
+                }))
+            }
+            other => anyhow::bail!("Unsupported skill marketplace operation '{}'.", other),
+        }
+    }
+
+    fn browser_profile_selector_from_tool(arguments: &serde_json::Value) -> Option<String> {
+        action_text_arg(arguments, "profile_id").or_else(|| action_text_arg(arguments, "profile"))
+    }
+
+    fn browser_profile_candidates_payload(
+        candidates: &[crate::core::BrowserProfileResolveCandidate],
+    ) -> serde_json::Value {
+        serde_json::Value::Array(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "id": candidate.profile.id.clone(),
+                        "name": candidate.profile.name.clone(),
+                        "score": candidate.score,
+                        "login_state": candidate.profile.login_state,
+                        "target_kind": candidate.profile.target_kind,
+                        "tags": candidate.profile.tags.clone(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    async fn resolve_browser_profile_for_tool(
+        &self,
+        selector: Option<String>,
+    ) -> anyhow::Result<
+        std::result::Result<Option<crate::core::BrowserProfileRecord>, serde_json::Value>,
+    > {
+        let Some(selector) = selector else {
+            return Ok(Ok(None));
+        };
+        match crate::core::BrowserProfileControlPlane::resolve(&self.storage, &selector).await? {
+            crate::core::BrowserProfileResolveOutcome::Resolved { profile, .. } => {
+                Ok(Ok(Some(profile)))
+            }
+            crate::core::BrowserProfileResolveOutcome::Ambiguous { candidates } => Ok(Err(
+                serde_json::json!({
+                    "success": false,
+                    "reason": "browser_profile_ambiguous",
+                    "profile_selector": selector,
+                    "candidates": Self::browser_profile_candidates_payload(&candidates),
+                }),
+            )),
+            crate::core::BrowserProfileResolveOutcome::NotFound { candidates } => Ok(Err(
+                serde_json::json!({
+                    "success": false,
+                    "reason": "browser_profile_not_found",
+                    "profile_selector": selector,
+                    "candidates": Self::browser_profile_candidates_payload(&candidates),
+                }),
+            )),
+        }
+    }
+
+    async fn wait_for_browser_auto_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::core::browser_session::BrowserSessionView> {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(120);
+        loop {
+            let view = self.browser_sessions.describe_session(session_id).await?;
+            match view.status.as_str() {
+                "active" => {}
+                _ => return Some(view),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Some(view);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(750)).await;
+        }
+    }
+
+    async fn handle_browser_auto_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        channel: &str,
+        conversation_id: Option<&str>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        let action = action_text_arg(arguments, "action").unwrap_or_else(|| "start_session".to_string());
+        if action != "start_session" {
+            return Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                "failed",
+                "browser_auto supports only start_session.",
+                serde_json::json!({
+                    "success": false,
+                    "reason": "unsupported_browser_auto_action",
+                    "action": action,
+                }),
+            ));
+        }
+
+        let url = action_text_arg(arguments, "url");
+        let task = action_text_arg(arguments, "task")
+            .or_else(|| url.as_ref().map(|url| format!("Open {}", url)))
+            .unwrap_or_default();
+        let task = if let Some(url) = url.as_ref() {
+            format!("Open {}. {}", url, task)
+        } else {
+            task
+        };
+        let task = task.trim().to_string();
+        if task.is_empty() {
+            return Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                "needs_input",
+                "A browser task description or URL is required.",
+                serde_json::json!({
+                    "success": false,
+                    "reason": "browser_task_required",
+                }),
+            ));
+        }
+
+        let profile =
+            match self
+                .resolve_browser_profile_for_tool(Self::browser_profile_selector_from_tool(arguments))
+                .await?
+            {
+                Ok(profile) => profile,
+                Err(payload) => {
+                    let reason = payload
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("browser_profile_unresolved");
+                    let message = if reason == "browser_profile_ambiguous" {
+                        "More than one saved browser profile matches the requested profile. Choose one profile id or name."
+                    } else {
+                        "No saved browser profile matched the requested profile."
+                    };
+                    return Ok(render_tool_completion_marker_with_data(
+                        "browser_auto",
+                        "needs_input",
+                        message,
+                        payload,
+                    ));
+                }
+            };
+        let profile_context =
+            profile
+                .as_ref()
+                .map(|profile| crate::core::browser_session::BrowserSessionProfileContext {
+                    profile_id: profile.id.clone(),
+                    profile_name: Some(profile.name.clone()),
+                });
+        let stream_target = stream_tx.cloned();
+        let notify_fn: std::sync::Arc<
+            dyn Fn(crate::core::browser_session::BrowserSessionNotification) + Send + Sync,
+        > = std::sync::Arc::new(move |notification| {
+            let Some(tx) = stream_target.as_ref() else {
+                return;
+            };
+            let kind = match notification.kind {
+                crate::core::browser_session::BrowserSessionNotificationKind::Progress => {
+                    "progress"
+                }
+                crate::core::browser_session::BrowserSessionNotificationKind::NeedsInput => {
+                    "needs_input"
+                }
+                crate::core::browser_session::BrowserSessionNotificationKind::Notice => "notice",
+                crate::core::browser_session::BrowserSessionNotificationKind::Completed => {
+                    "completed"
+                }
+                crate::core::browser_session::BrowserSessionNotificationKind::Failed => "failed",
+                crate::core::browser_session::BrowserSessionNotificationKind::Closed => "closed",
+            };
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolProgress {
+                    name: "browser_auto".to_string(),
+                    content: notification.message.clone(),
+                    payload: Some(serde_json::json!({
+                        "session_id": notification.session_id,
+                        "kind": kind,
+                        "has_screenshot": notification.screenshot.is_some(),
+                    })),
+                },
+            );
+        });
+        let started = self
+            .browser_sessions
+            .start_session_with_profile(
+                &task,
+                channel,
+                conversation_id,
+                profile_context,
+                self.llm.clone(),
+                notify_fn,
+            )
+            .await?;
+        if let Some(profile) = profile.as_ref() {
+            let _ = crate::core::BrowserProfileControlPlane::record_session(
+                &self.storage,
+                crate::core::BrowserProfileSessionRecord {
+                    profile_id: profile.id.clone(),
+                    session_id: Some(started.session_id.clone()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    outcome: "started".to_string(),
+                    channel: Some(channel.to_string()),
+                    note: Some(task.clone()),
+                    url,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        let checkpoint = self
+            .wait_for_browser_auto_checkpoint(&started.session_id)
+            .await;
+        let profile_json = profile.as_ref().map(|profile| {
+            serde_json::json!({
+                "id": profile.id.clone(),
+                "name": profile.name.clone(),
+            })
+        });
+        if let Some(view) = checkpoint {
+            let status = view.status.clone();
+            let detail = match status.as_str() {
+                "waiting_for_operator" | "operator_claimed" | "awaiting_resume" => view
+                    .question
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("The browser task needs user input to continue.")
+                    .to_string(),
+                "failed" | "interrupted" => view
+                    .reason
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("The browser task failed.")
+                    .to_string(),
+                "ready" | "completed" => view
+                    .summary
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("The browser task reached a stable checkpoint.")
+                    .to_string(),
+                _ => "The managed browser task is still running. Do not state the requested browser outcome as complete until a later browser status confirms it.".to_string(),
+            };
+            let data = serde_json::json!({
+                "success": !matches!(status.as_str(), "failed" | "interrupted"),
+                "session_id": started.session_id,
+                "reused_existing": started.reused_existing,
+                "task": task,
+                "profile": profile_json,
+                "session": view,
+            });
+            return match status.as_str() {
+                "waiting_for_operator" | "operator_claimed" | "awaiting_resume" => {
+                    Ok(render_tool_completion_marker_with_data(
+                        "browser_auto",
+                        "needs_input",
+                        &detail,
+                        data,
+                    ))
+                }
+                "failed" | "interrupted" => {
+                    Ok(render_tool_completion_marker_with_data(
+                        "browser_auto",
+                        "failed",
+                        &detail,
+                        data,
+                    ))
+                }
+                "ready" | "completed" => {
+                    Ok(render_tool_completion_marker_with_data(
+                        "browser_auto",
+                        "completed",
+                        &detail,
+                        data,
+                    ))
+                }
+                _ => Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "running",
+                    &detail,
+                    data,
+                )),
+            };
+        }
+        Ok(render_tool_completion_marker_with_data(
+            "browser_auto",
+            "running",
+            &format!(
+                "Started managed browser session {}. The requested browser outcome is not complete yet.",
+                started.session_id
+            ),
+            serde_json::json!({
+                "success": true,
+                "session_id": started.session_id,
+                "reused_existing": started.reused_existing,
+                "task": task,
+                "profile": profile_json,
+            }),
+        ))
     }
 
     pub(crate) async fn execute_action_with_hooks(
@@ -4128,6 +5159,7 @@ impl Agent {
         authorization: Option<&crate::actions::ActionAuthorizationContext>,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<String> {
         let event_id = uuid::Uuid::new_v4().to_string();
         self.fire_action_hook(
@@ -4167,20 +5199,106 @@ impl Agent {
             Ok(durable_orchestration_action_result(
                 "watch",
                 "Watcher",
-                self.handle_watch(arguments, channel, conversation_id, project_id, authorization)
-                    .await,
+                self.handle_watch(
+                    arguments,
+                    channel,
+                    conversation_id,
+                    project_id,
+                    authorization,
+                )
+                .await,
                 |value| crate::runtime::parse_watch_completion(value).is_some(),
             ))
+        } else if action_name.eq_ignore_ascii_case("background_session_manage") {
+            Ok(self
+                .handle_background_session_manage(arguments, conversation_id)
+                .await
+                .unwrap_or_else(|| {
+                    render_tool_completion_marker_with_data(
+                        "background_session_manage",
+                        "failed",
+                        "AgentArk could not resolve that background session operation.",
+                        serde_json::json!({
+                            "success": false,
+                            "reason": "missing_background_session_manage_result",
+                        }),
+                    )
+                }))
+        } else if action_name.eq_ignore_ascii_case("work_manage")
+            || action_name.eq_ignore_ascii_case("background_work_manage")
+        {
+            Ok(self
+                .handle_work_manage_tool_call(arguments, conversation_id)
+                .await)
+        } else if action_name.eq_ignore_ascii_case("service_manage") {
+            self.handle_service_manage_tool_call(arguments, stream_tx, channel, conversation_id)
+                .await
+        } else if action_name.eq_ignore_ascii_case("browser_auto") {
+            self.handle_browser_auto_tool_call(arguments, channel, conversation_id, stream_tx)
+                .await
+        } else if action_name.eq_ignore_ascii_case("delegate") {
+            let trace_ref = Arc::new(RwLock::new(ExecutionTrace {
+                id: uuid::Uuid::new_v4().to_string(),
+                message: message_hint.unwrap_or_default().to_string(),
+                channel: channel.to_string(),
+                started_at: Some(chrono::Utc::now()),
+                ..ExecutionTrace::default()
+            }));
+            let result = self
+                .handle_delegate_tool_call(arguments, channel, &trace_ref, stream_tx)
+                .await;
+            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&result) {
+                if payload
+                    .get("ok")
+                    .and_then(|value| value.as_bool())
+                    .is_some_and(|ok| !ok)
+                {
+                    let detail = payload
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Delegation failed.");
+                    return Err(crate::actions::structured_action_error_for_action(
+                        action_name,
+                        crate::actions::ActionErrorReason::Failed,
+                        detail,
+                    ));
+                }
+            }
+            Ok(result)
+        } else if action_name.eq_ignore_ascii_case("manage_actions") {
+            self.handle_manage_actions_tool_call(arguments, authorization)
+                .await
         } else if let Some(auth_context) = authorization {
             self.runtime
-                .execute_action_with_context(action_name, arguments, auth_context)
+                .execute_action_payload_with_context(action_name, arguments, auth_context)
                 .await
+                .map(|payload| {
+                    crate::runtime::ActionRuntime::render_tool_payload_for_legacy(
+                        action_name,
+                        payload,
+                    )
+                })
         } else {
-            self.runtime.execute_action(action_name, arguments).await
+            self.runtime
+                .execute_action_payload(action_name, arguments)
+                .await
+                .map(|payload| {
+                    crate::runtime::ActionRuntime::render_tool_payload_for_legacy(
+                        action_name,
+                        payload,
+                    )
+                })
         };
 
         match execution {
             Ok(result) => {
+                let result = crate::runtime::ActionRuntime::render_tool_payload_for_legacy(
+                    action_name,
+                    crate::runtime::ActionRuntime::tool_payload_from_legacy_output(
+                        action_name,
+                        result,
+                    ),
+                );
                 self.fire_action_hook(
                     crate::hooks::HookTrigger::PostAction,
                     channel,
@@ -4568,7 +5686,7 @@ impl Agent {
             let client = match crate::core::net::build_internal_control_client(4) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::debug!("ArkPulse refresh client init failed: {}", e);
+                    tracing::debug!("Pulse refresh client init failed: {}", e);
                     return;
                 }
             };
@@ -4579,13 +5697,13 @@ impl Agent {
             match req.send().await {
                 Ok(resp) => {
                     tracing::debug!(
-                        "ArkPulse refresh trigger after {} returned {}",
+                        "Pulse refresh trigger after {} returned {}",
                         reason,
                         resp.status()
                     );
                 }
                 Err(e) => {
-                    tracing::debug!("ArkPulse refresh trigger after {} failed: {}", reason, e);
+                    tracing::debug!("Pulse refresh trigger after {} failed: {}", reason, e);
                 }
             }
         });
@@ -5814,6 +6932,924 @@ impl Agent {
         }
         Ok(formatted)
     }
+
+    fn normalize_service_manage_deploy_arguments(
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut deploy = arguments.as_object().cloned().unwrap_or_default();
+        let operation = deploy
+            .get("operation")
+            .and_then(|value| value.as_str())
+            .unwrap_or("create")
+            .trim()
+            .to_ascii_lowercase();
+        let kind = deploy
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("auto")
+            .trim()
+            .to_ascii_lowercase();
+
+        deploy.remove("operation");
+        deploy.remove("kind");
+        deploy.remove("query");
+
+        if let Some(service_id) = deploy.remove("service_id") {
+            if !deploy.contains_key("app_id") {
+                deploy.insert("app_id".to_string(), service_id);
+            }
+        }
+        if let Some(name) = deploy.remove("name") {
+            if !deploy.contains_key("title") {
+                deploy.insert("title".to_string(), name);
+            }
+        }
+        if let Some(public) = deploy.remove("public") {
+            if !deploy.contains_key("expose_public") {
+                deploy.insert("expose_public".to_string(), public);
+            }
+        }
+        if let Some(environment) = deploy.remove("environment") {
+            if !deploy.contains_key("config") {
+                deploy.insert("config".to_string(), environment);
+            }
+        }
+        if let Some(start_command) = deploy.get("start_command").cloned() {
+            if !deploy.contains_key("entry_command") {
+                deploy.insert("entry_command".to_string(), start_command);
+            }
+        }
+
+        if operation == "patch" && !deploy.contains_key("mode") {
+            deploy.insert("mode".to_string(), serde_json::json!("patch"));
+        }
+
+        match kind.as_str() {
+            "static" => {
+                if !deploy.contains_key("entry_command")
+                    && !deploy.contains_key("start_command")
+                    && !deploy.contains_key("repo_url")
+                    && !deploy.contains_key("runtime_required")
+                {
+                    deploy.insert("runtime_required".to_string(), serde_json::json!(false));
+                }
+            }
+            "process" => {
+                if !deploy.contains_key("runtime_required") {
+                    deploy.insert("runtime_required".to_string(), serde_json::json!(true));
+                }
+            }
+            "repo" => {
+                deploy
+                    .entry("service_mode".to_string())
+                    .or_insert_with(|| serde_json::json!("auto"));
+            }
+            _ => {}
+        }
+
+        serde_json::Value::Object(deploy)
+    }
+
+    fn service_manage_control_call(
+        operation: &str,
+        arguments: &serde_json::Value,
+    ) -> crate::core::llm::ToolCall {
+        let mut control = serde_json::Map::new();
+        if let Some(service_id) = arguments
+            .get("service_id")
+            .or_else(|| arguments.get("app_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            control.insert("app_id".to_string(), serde_json::json!(service_id));
+        }
+        if let Some(query) = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            control.insert("query".to_string(), serde_json::json!(query));
+        }
+        if let Some(name) = arguments
+            .get("name")
+            .or_else(|| arguments.get("title"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            control.insert("title".to_string(), serde_json::json!(name));
+        }
+        if let Some(bundle_id) = arguments
+            .get("bundle_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            control.insert("bundle_id".to_string(), serde_json::json!(bundle_id));
+        }
+
+        crate::core::llm::ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: format!("service_manage.{}", operation),
+            arguments: serde_json::Value::Object(control),
+        }
+    }
+
+    async fn resolve_service_manage_target(
+        &self,
+        arguments: &serde_json::Value,
+        apps: &[serde_json::Value],
+    ) -> Option<String> {
+        if let Some(service_id) = arguments
+            .get("service_id")
+            .or_else(|| arguments.get("app_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(service_id.to_string());
+        }
+
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
+        let ranked = Self::rank_deployed_apps(query, apps);
+        Self::select_best_ranked_app(query, &ranked).map(|(_, app_id, _, _)| app_id.clone())
+    }
+
+    async fn service_manage_target_not_found_payload(
+        &self,
+        arguments: &serde_json::Value,
+        apps: &[serde_json::Value],
+    ) -> serde_json::Value {
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
+        let ranked = Self::rank_deployed_apps(query, apps);
+        serde_json::json!({
+            "status": "not_found",
+            "service_id": serde_json::Value::Null,
+            "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+            "services": Self::summarize_ranked_apps_for_user(&ranked, 10),
+        })
+    }
+
+    pub(crate) async fn handle_service_manage_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        request_channel: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<String> {
+        let operation = arguments
+            .get("operation")
+            .and_then(|value| value.as_str())
+            .unwrap_or("status")
+            .trim()
+            .to_ascii_lowercase();
+
+        let output = match operation.as_str() {
+            "create" | "update" | "patch" => {
+                let deploy_args = Self::normalize_service_manage_deploy_arguments(arguments);
+                let llm_env = self.app_model_env_vars();
+                let raw = crate::actions::app::app_deploy(
+                    &self.config_dir,
+                    &self.data_dir,
+                    &deploy_args,
+                    &self.app_registry,
+                    &llm_env,
+                    stream_tx.cloned(),
+                )
+                .await?;
+                let mut parsed = serde_json::from_str::<serde_json::Value>(&raw)
+                    .unwrap_or_else(|_| serde_json::json!({ "status": "ok", "raw": raw }));
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tool".to_string(), serde_json::json!("service_manage"));
+                    if let Some(app_id) = obj
+                        .get("app_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                    {
+                        obj.insert("service_id".to_string(), serde_json::json!(app_id.clone()));
+                        if let Some(cid) = conversation_id {
+                            let title = obj
+                                .get("title")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("Service");
+                            let url = obj
+                                .get("url")
+                                .and_then(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| format!("/apps/{}/", app_id));
+                            self.persist_last_deployed_app_context(cid, &app_id, title, &url)
+                                .await;
+                        }
+                    }
+                }
+                parsed
+            }
+            "start" | "restart" => {
+                let call = Self::service_manage_control_call("restart", arguments);
+                let raw = self
+                    .handle_app_restart_tool_call(
+                        &call,
+                        stream_tx,
+                        request_channel,
+                        conversation_id,
+                    )
+                    .await?;
+                let mut parsed = serde_json::from_str::<serde_json::Value>(&raw)
+                    .unwrap_or_else(|_| serde_json::json!({ "status": "ok", "raw": raw }));
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tool".to_string(), serde_json::json!("service_manage"));
+                    if let Some(app_id) = obj.get("app_id").cloned() {
+                        obj.insert("service_id".to_string(), app_id);
+                    }
+                }
+                parsed
+            }
+            "stop" => {
+                let call = Self::service_manage_control_call("stop", arguments);
+                let raw = self
+                    .handle_app_stop_tool_call(&call, stream_tx, request_channel)
+                    .await?;
+                let mut parsed = serde_json::from_str::<serde_json::Value>(&raw)
+                    .unwrap_or_else(|_| serde_json::json!({ "status": "ok", "raw": raw }));
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tool".to_string(), serde_json::json!("service_manage"));
+                    if let Some(app_id) = obj.get("app_id").cloned() {
+                        obj.insert("service_id".to_string(), app_id);
+                    }
+                }
+                parsed
+            }
+            "delete" => {
+                let call = Self::service_manage_control_call("delete", arguments);
+                let raw = self
+                    .handle_app_delete_tool_call(&call, stream_tx, request_channel)
+                    .await?;
+                let mut parsed = serde_json::from_str::<serde_json::Value>(&raw)
+                    .unwrap_or_else(|_| serde_json::json!({ "status": "ok", "raw": raw }));
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tool".to_string(), serde_json::json!("service_manage"));
+                    if let Some(app_id) = obj.get("app_id").cloned() {
+                        obj.insert("service_id".to_string(), app_id);
+                    }
+                }
+                parsed
+            }
+            "list" => {
+                let services = self.app_registry.list().await;
+                serde_json::json!({
+                    "status": "ok",
+                    "tool": "service_manage",
+                    "services": services,
+                })
+            }
+            "status" | "logs" => {
+                let apps = self.app_registry.list().await;
+                if operation == "status"
+                    && arguments.get("service_id").is_none()
+                    && arguments.get("app_id").is_none()
+                    && arguments.get("query").is_none()
+                {
+                    serde_json::json!({
+                        "status": "ok",
+                        "tool": "service_manage",
+                        "services": apps,
+                    })
+                } else if let Some(service_id) =
+                    self.resolve_service_manage_target(arguments, &apps).await
+                {
+                    let app = apps.iter().find(|row| {
+                        row.get("id").and_then(|value| value.as_str()) == Some(service_id.as_str())
+                    });
+                    if operation == "logs" {
+                        if let Some(app_dir) = self.app_registry.get_dir(&service_id).await {
+                            let max_bytes = arguments
+                                .get("max_bytes")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(8192)
+                                .clamp(1024, 65536)
+                                as usize;
+                            let log_tail = crate::actions::app::read_local_runtime_log_tail(
+                                &app_dir, max_bytes,
+                            )
+                            .await;
+                            serde_json::json!({
+                                "status": "ok",
+                                "tool": "service_manage",
+                                "service_id": service_id,
+                                "logs": log_tail,
+                            })
+                        } else {
+                            self.service_manage_target_not_found_payload(arguments, &apps)
+                                .await
+                        }
+                    } else if let Some(app) = app {
+                        serde_json::json!({
+                            "status": "ok",
+                            "tool": "service_manage",
+                            "service_id": service_id,
+                            "service": app,
+                        })
+                    } else {
+                        self.service_manage_target_not_found_payload(arguments, &apps)
+                            .await
+                    }
+                } else {
+                    self.service_manage_target_not_found_payload(arguments, &apps)
+                        .await
+                }
+            }
+            _ => {
+                anyhow::bail!(
+                    "service_manage operation must be one of create, update, patch, start, restart, stop, status, logs, list, delete"
+                );
+            }
+        };
+
+        let formatted = serde_json::to_string_pretty(&output)?;
+        if let Some(tx) = stream_tx {
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: "service_manage".to_string(),
+                    content: formatted.clone(),
+                },
+            );
+        }
+        Ok(formatted)
+    }
+
+    pub(crate) async fn handle_work_manage_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        conversation_id: Option<&str>,
+    ) -> String {
+        let operation = work_manage_operation(arguments);
+        let kind = arguments
+            .get("kind")
+            .or_else(|| arguments.get("resource_kind"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+
+        if matches!(kind.as_deref(), Some("scheduled_task" | "task"))
+            || arguments.get("task_id").is_some()
+        {
+            return self
+                .handle_scheduled_task_work_manage(arguments, &operation)
+                .await;
+        }
+        if matches!(kind.as_deref(), Some("watcher")) || arguments.get("watcher_id").is_some() {
+            return self.handle_watcher_work_manage(arguments, &operation).await;
+        }
+
+        let mut mapped = serde_json::Map::new();
+        mapped.insert("operation".to_string(), serde_json::json!(operation));
+        if let Some(work_id) = arguments
+            .get("work_id")
+            .or_else(|| arguments.get("background_session_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            mapped.insert(
+                "background_session_id".to_string(),
+                serde_json::json!(work_id),
+            );
+        }
+        if let Some(reference_text) = arguments
+            .get("reference_text")
+            .or_else(|| arguments.get("query"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            mapped.insert(
+                "reference_text".to_string(),
+                serde_json::json!(reference_text),
+            );
+        }
+        if let Some(delivery_channel) = arguments
+            .get("delivery_channel")
+            .or_else(|| arguments.get("report_to"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            mapped.insert(
+                "delivery_channel".to_string(),
+                serde_json::json!(delivery_channel),
+            );
+        }
+        if let Some(include_closed) = arguments.get("include_closed").cloned() {
+            mapped.insert("include_closed".to_string(), include_closed);
+        }
+
+        let raw = self
+            .handle_background_session_manage(&serde_json::Value::Object(mapped), conversation_id)
+            .await
+            .unwrap_or_else(|| {
+                render_tool_completion_marker_with_data(
+                    "background_work_manage",
+                    "failed",
+                    "AgentArk could not resolve that work-management operation.",
+                    serde_json::json!({
+                        "success": false,
+                        "reason": "missing_work_manage_result",
+                    }),
+                )
+            });
+
+        raw.replace("background_session_manage", "background_work_manage")
+    }
+
+    async fn handle_scheduled_task_work_manage(
+        &self,
+        arguments: &serde_json::Value,
+        operation: &str,
+    ) -> String {
+        if operation == "list" {
+            let tasks = self.tasks.read().await.all().to_vec();
+            let rows = tasks
+                .iter()
+                .map(scheduled_task_work_row)
+                .collect::<Vec<_>>();
+            let detail = format!("Found {} scheduled task(s).", rows.len());
+            return render_tool_completion_marker_with_data(
+                "background_work_manage",
+                "completed",
+                &detail,
+                serde_json::json!({
+                    "kind": "scheduled_task",
+                    "operation": operation,
+                    "task_count": rows.len(),
+                    "tasks": rows,
+                }),
+            );
+        }
+
+        let task_id = match work_manage_id(arguments, "task_id") {
+            Some(task_id) => task_id,
+            None => {
+                let Some(reference) = work_manage_reference_text(arguments) else {
+                    return render_tool_completion_marker_with_data(
+                        "background_work_manage",
+                        "failed",
+                        "Scheduled task operation requires task_id or reference_text.",
+                        serde_json::json!({
+                            "success": false,
+                            "kind": "scheduled_task",
+                            "operation": operation,
+                            "reason": "missing_task_reference",
+                        }),
+                    );
+                };
+                let matches = {
+                    let tasks = self.tasks.read().await;
+                    tasks
+                        .all()
+                        .iter()
+                        .filter(|task| {
+                            work_text_matches_reference(
+                                &scheduled_task_reference_blob(task),
+                                &reference,
+                            )
+                        })
+                        .map(scheduled_task_work_row)
+                        .collect::<Vec<_>>()
+                };
+                match matches.as_slice() {
+                    [only] => only
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    [] => {
+                        return render_tool_completion_marker_with_data(
+                            "background_work_manage",
+                            "completed",
+                            "No scheduled task matched that reference.",
+                            serde_json::json!({
+                                "success": true,
+                                "kind": "scheduled_task",
+                                "operation": operation,
+                                "status": "not_found",
+                                "reference_text": reference,
+                                "terminal_observation": true,
+                            }),
+                        );
+                    }
+                    _ => {
+                        return render_tool_completion_marker_with_data(
+                            "background_work_manage",
+                            "failed",
+                            "More than one scheduled task matched that reference.",
+                            serde_json::json!({
+                                "success": false,
+                                "kind": "scheduled_task",
+                                "operation": operation,
+                                "reason": "ambiguous_reference",
+                                "reference_text": reference,
+                                "matches": matches,
+                            }),
+                        );
+                    }
+                }
+            }
+        };
+        let task_uuid = match uuid::Uuid::parse_str(&task_id) {
+            Ok(id) => id,
+            Err(error) => {
+                return render_tool_completion_marker_with_data(
+                    "background_work_manage",
+                    "failed",
+                    &format!("Invalid task_id `{}`: {}.", task_id, error),
+                    serde_json::json!({
+                        "success": false,
+                        "kind": "scheduled_task",
+                        "operation": operation,
+                        "task_id": task_id,
+                        "reason": "invalid_task_id",
+                    }),
+                );
+            }
+        };
+
+        if matches!(operation, "status" | "read") {
+            let task = self
+                .tasks
+                .read()
+                .await
+                .all()
+                .iter()
+                .find(|task| task.id == task_uuid)
+                .cloned();
+            let Some(task) = task else {
+                return durable_work_not_found("scheduled_task", operation, &task_id);
+            };
+            let detail = "Scheduled task status loaded.".to_string();
+            return render_tool_completion_marker_with_data(
+                "background_work_manage",
+                "completed",
+                &detail,
+                serde_json::json!({
+                    "kind": "scheduled_task",
+                    "operation": operation,
+                    "task_id": task_id,
+                    "task": scheduled_task_work_row(&task),
+                    "object_refs": [{"kind": "task", "id": task_id}],
+                }),
+            );
+        }
+
+        if operation == "delete" {
+            let removed_live = self.tasks.write().await.remove(task_uuid);
+            let storage_result = self.storage.delete_task(&task_id).await;
+            self.background_sessions
+                .remove_child_references(&[task_id.clone()], &[], Some("agent"))
+                .await;
+            if let Err(error) = storage_result {
+                return render_tool_completion_marker_with_data(
+                    "background_work_manage",
+                    "failed",
+                    &format!("Failed to delete scheduled task: {}", error),
+                    serde_json::json!({
+                        "success": false,
+                        "kind": "scheduled_task",
+                        "operation": operation,
+                        "task_id": task_id,
+                        "reason": "storage_delete_failed",
+                    }),
+                );
+            }
+            let detail = "Deleted scheduled task.".to_string();
+            return render_tool_completion_marker_with_data(
+                "background_work_manage",
+                "completed",
+                &detail,
+                serde_json::json!({
+                    "kind": "scheduled_task",
+                    "operation": operation,
+                    "task_id": task_id,
+                    "deleted_live": removed_live,
+                    "object_refs": [{"kind": "task", "id": task_id}],
+                }),
+            );
+        }
+
+        let changed;
+        let updated_task = {
+            let mut tasks = self.tasks.write().await;
+            let Some(task) = tasks.get_mut(task_uuid) else {
+                return durable_work_not_found("scheduled_task", operation, &task_id);
+            };
+            let before = task.status.clone();
+            match operation {
+                "pause" => {
+                    if matches!(
+                        task.status,
+                        crate::core::TaskStatus::Pending
+                            | crate::core::TaskStatus::AwaitingApproval
+                            | crate::core::TaskStatus::ExpiredNeedsReapproval
+                            | crate::core::TaskStatus::InProgress
+                    ) {
+                        task.status = crate::core::TaskStatus::Paused;
+                    }
+                }
+                "resume" => {
+                    if matches!(task.status, crate::core::TaskStatus::Paused) {
+                        task.status = crate::core::TaskStatus::Pending;
+                    }
+                }
+                "stop" | "cancel" => {
+                    if !matches!(
+                        task.status,
+                        crate::core::TaskStatus::Completed | crate::core::TaskStatus::Cancelled
+                    ) {
+                        task.status = crate::core::TaskStatus::Cancelled;
+                        task.result = Some("Cancelled by user.".to_string());
+                    }
+                }
+                "update_delivery" => {
+                    let delivery_channel = normalize_automation_notification_channel(
+                        arguments
+                            .get("delivery_channel")
+                            .or_else(|| arguments.get("report_to"))
+                            .and_then(|value| value.as_str()),
+                    );
+                    let mut next_args = task.arguments.clone();
+                    if let Some(object) = next_args.as_object_mut() {
+                        object.insert(
+                            "report_to".to_string(),
+                            serde_json::Value::String(delivery_channel),
+                        );
+                    } else {
+                        next_args = serde_json::json!({"report_to": delivery_channel});
+                    }
+                    task.arguments = next_args;
+                }
+                _ => {
+                    return render_tool_completion_marker_with_data(
+                        "background_work_manage",
+                        "failed",
+                        &format!("Unsupported scheduled task operation `{}`.", operation),
+                        serde_json::json!({
+                            "success": false,
+                            "kind": "scheduled_task",
+                            "operation": operation,
+                            "task_id": task_id,
+                            "reason": "unsupported_operation",
+                        }),
+                    );
+                }
+            }
+            changed = before != task.status || operation == "update_delivery";
+            Some(task.clone())
+        };
+
+        if let Some(task) = updated_task.as_ref() {
+            let persist_result = match operation {
+                "pause" | "resume" => match serde_json::to_string(&task.status) {
+                    Ok(status) => self.storage.update_task_status(&task_id, &status).await,
+                    Err(error) => Err(error.into()),
+                },
+                "stop" | "cancel" => match serde_json::to_string(&task.status) {
+                    Ok(status) => {
+                        self.storage
+                            .update_task_status_and_result(
+                                &task_id,
+                                &status,
+                                task.result.as_deref(),
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                "update_delivery" => match serde_json::to_string(&task.arguments) {
+                    Ok(arguments) => {
+                        self.storage
+                            .update_task(&task_id, None, Some(arguments), None, None)
+                            .await
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                _ => Ok(()),
+            };
+            if let Err(error) = persist_result {
+                return render_tool_completion_marker_with_data(
+                    "background_work_manage",
+                    "failed",
+                    &format!("Failed to persist scheduled task operation: {}", error),
+                    serde_json::json!({
+                        "success": false,
+                        "kind": "scheduled_task",
+                        "operation": operation,
+                        "task_id": task_id,
+                        "reason": "storage_update_failed",
+                    }),
+                );
+            }
+        }
+
+        let detail = format!("Scheduled task {} completed.", operation);
+        render_tool_completion_marker_with_data(
+            "background_work_manage",
+            "completed",
+            &detail,
+            serde_json::json!({
+                "kind": "scheduled_task",
+                "operation": operation,
+                "task_id": task_id,
+                "changed": changed,
+                "task": updated_task.as_ref().map(scheduled_task_work_row),
+                "object_refs": [{"kind": "task", "id": task_id}],
+            }),
+        )
+    }
+
+    async fn handle_watcher_work_manage(
+        &self,
+        arguments: &serde_json::Value,
+        operation: &str,
+    ) -> String {
+        if operation == "list" {
+            return self
+                .execute_direct_list_watchers_tool(arguments)
+                .await
+                .unwrap_or_else(|error| error.to_string());
+        }
+        let watcher_id = match work_manage_id(arguments, "watcher_id") {
+            Some(watcher_id) => watcher_id,
+            None => {
+                let Some(reference) = work_manage_reference_text(arguments) else {
+                    return render_tool_completion_marker_with_data(
+                        "background_work_manage",
+                        "failed",
+                        "Watcher operation requires watcher_id or reference_text.",
+                        serde_json::json!({
+                            "success": false,
+                            "kind": "watcher",
+                            "operation": operation,
+                            "reason": "missing_watcher_reference",
+                        }),
+                    );
+                };
+                let matches = self
+                    .watcher_manager
+                    .list()
+                    .await
+                    .into_iter()
+                    .filter(|watcher| {
+                        work_text_matches_reference(&watcher_reference_blob(watcher), &reference)
+                    })
+                    .map(|watcher| list_watchers_live_row(&watcher))
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [only] => only
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    [] => {
+                        return render_tool_completion_marker_with_data(
+                            "background_work_manage",
+                            "completed",
+                            "No watcher matched that reference.",
+                            serde_json::json!({
+                                "success": true,
+                                "kind": "watcher",
+                                "operation": operation,
+                                "status": "not_found",
+                                "reference_text": reference,
+                                "terminal_observation": true,
+                            }),
+                        );
+                    }
+                    _ => {
+                        return render_tool_completion_marker_with_data(
+                            "background_work_manage",
+                            "failed",
+                            "More than one watcher matched that reference.",
+                            serde_json::json!({
+                                "success": false,
+                                "kind": "watcher",
+                                "operation": operation,
+                                "reason": "ambiguous_reference",
+                                "reference_text": reference,
+                                "matches": matches,
+                            }),
+                        );
+                    }
+                }
+            }
+        };
+        let watcher_uuid = match uuid::Uuid::parse_str(&watcher_id) {
+            Ok(id) => id,
+            Err(error) => {
+                return render_tool_completion_marker_with_data(
+                    "background_work_manage",
+                    "failed",
+                    &format!("Invalid watcher_id `{}`: {}.", watcher_id, error),
+                    serde_json::json!({
+                        "success": false,
+                        "kind": "watcher",
+                        "operation": operation,
+                        "watcher_id": watcher_id,
+                        "reason": "invalid_watcher_id",
+                    }),
+                );
+            }
+        };
+        if matches!(operation, "status" | "read") {
+            let Some(watcher) = self.watcher_manager.get(watcher_uuid).await else {
+                return durable_work_not_found("watcher", operation, &watcher_id);
+            };
+            let detail = "Watcher status loaded.".to_string();
+            return render_tool_completion_marker_with_data(
+                "background_work_manage",
+                "completed",
+                &detail,
+                serde_json::json!({
+                    "kind": "watcher",
+                    "operation": operation,
+                    "watcher_id": watcher_id,
+                    "watcher": list_watchers_live_row(&watcher),
+                    "object_refs": [{"kind": "watcher", "id": watcher_id}],
+                }),
+            );
+        }
+        if operation == "delete" {
+            return self
+                .execute_direct_watcher_delete_tool(&serde_json::json!({"watcher_id": watcher_id}))
+                .await
+                .unwrap_or_else(|error| error.to_string())
+                .replace("watcher_delete", "background_work_manage");
+        }
+        let changed = match operation {
+            "pause" => self.watcher_manager.pause(watcher_uuid).await,
+            "resume" => self.watcher_manager.resume(watcher_uuid).await,
+            "stop" | "cancel" => self.watcher_manager.cancel(watcher_uuid).await,
+            "update_delivery" => {
+                let delivery_channel = normalize_automation_notification_channel(
+                    arguments
+                        .get("delivery_channel")
+                        .or_else(|| arguments.get("report_to"))
+                        .and_then(|value| value.as_str()),
+                );
+                self.watcher_manager
+                    .set_notify_channel(watcher_uuid, &delivery_channel)
+                    .await
+            }
+            _ => {
+                return render_tool_completion_marker_with_data(
+                    "background_work_manage",
+                    "failed",
+                    &format!("Unsupported watcher operation `{}`.", operation),
+                    serde_json::json!({
+                        "success": false,
+                        "kind": "watcher",
+                        "operation": operation,
+                        "watcher_id": watcher_id,
+                        "reason": "unsupported_operation",
+                    }),
+                );
+            }
+        };
+        let watcher = self.watcher_manager.get(watcher_uuid).await;
+        if let Some(watcher) = watcher.as_ref() {
+            let status_label = Self::watcher_supervisor_status_label(&watcher.status);
+            self.sync_watcher_supervisor_state(watcher, Some(status_label.as_str()), None)
+                .await;
+        }
+        let detail = format!("Watcher {} completed.", operation);
+        render_tool_completion_marker_with_data(
+            "background_work_manage",
+            "completed",
+            &detail,
+            serde_json::json!({
+                "kind": "watcher",
+                "operation": operation,
+                "watcher_id": watcher_id,
+                "changed": changed,
+                "watcher": watcher.as_ref().map(list_watchers_live_row),
+                "object_refs": [{"kind": "watcher", "id": watcher_id}],
+            }),
+        )
+    }
     /// Handle self-evolve tool call with policy-first evolution defaults.
     async fn gepa_idle_check(
         &self,
@@ -5938,6 +7974,7 @@ impl Agent {
         &self,
         kind: crate::core::self_evolve::gepa_bridge::GepaJobKind,
         request: &str,
+        metadata: serde_json::Value,
         run_id: Option<String>,
         export_path: Option<String>,
         candidates_path: Option<String>,
@@ -5950,6 +7987,7 @@ impl Agent {
             job_id: format!("gepa-job-{}", uuid::Uuid::new_v4().simple()),
             kind,
             request: request.to_string(),
+            metadata,
             run_id,
             export_path,
             candidates_path,
@@ -6002,11 +8040,43 @@ impl Agent {
         self.queue_gepa_job(
             crate::core::self_evolve::gepa_bridge::GepaJobKind::Run,
             request,
+            serde_json::Value::Null,
             None,
             None,
             None,
             quiet_window_seconds,
             crate::core::self_evolve::gepa_bridge::GepaPromotionSettings::default(),
+            crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds(),
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn queue_gepa_prompt_optimization_run(
+        &self,
+        proposal_id: &str,
+        request: &str,
+        quiet_window_seconds: i64,
+    ) -> Result<String> {
+        self.queue_gepa_job(
+            crate::core::self_evolve::gepa_bridge::GepaJobKind::Run,
+            request,
+            serde_json::json!({
+                "source": "prompt_optimization_approval",
+                "proposal_id": proposal_id,
+            }),
+            None,
+            None,
+            None,
+            quiet_window_seconds,
+            crate::core::self_evolve::gepa_bridge::GepaPromotionSettings {
+                apply_promotion: true,
+                canary_rollout_percent: 20,
+                canary_min_samples_per_version: 25,
+                canary_min_success_gain: 0.03,
+                canary_max_sign_test_p_value: 0.10,
+                replay_log_limit: 160,
+            },
             crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds(),
             true,
         )
@@ -6847,7 +8917,7 @@ impl Agent {
         if !enabled {
             return Ok(serde_json::json!({
                 "status": "disabled",
-                "message": "Self-evolution is currently disabled. Enable it in Settings > Advanced > ArkEvolve."
+                "message": "Self-evolution is currently disabled. Enable it in Settings > Advanced > Evolve."
             })
             .to_string());
         }
@@ -6873,17 +8943,12 @@ impl Agent {
             })
             .to_string());
         }
-        let allow_code_writes = call
-            .arguments
-            .get("allow_code_writes")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let apply_promotion_requested = call
             .arguments
             .get("apply_promotion")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let apply_promotion = false;
+        let apply_promotion = apply_promotion_requested;
         let canary_rollout_percent = call
             .arguments
             .get("canary_rollout_percent")
@@ -6969,10 +9034,12 @@ impl Agent {
             "Self-Evolve Request",
             format!(
                 "Requested {} evolution for {}.",
-                if mode == "code" || mode == "codebase" {
-                    "code"
-                } else if mode == "prompt" {
+                if mode == "prompt" {
                     "prompt"
+                } else if mode == "specialist_prompt" {
+                    "specialist prompt"
+                } else if mode.starts_with("gepa_") {
+                    "GEPA"
                 } else {
                     "policy"
                 },
@@ -6983,7 +9050,6 @@ impl Agent {
                 "trace_kind": "self_evolve.request",
                 "request": request.clone(),
                 "mode": mode.clone(),
-                "allow_code_writes": allow_code_writes,
                 "apply_promotion": apply_promotion,
                 "apply_promotion_requested": apply_promotion_requested,
                 "promotion_requires_user_acceptance": true,
@@ -7054,6 +9120,7 @@ impl Agent {
                         .queue_gepa_job(
                             kind,
                             &request,
+                            serde_json::Value::Null,
                             gepa_run_id.clone(),
                             gepa_export_path.clone(),
                             gepa_candidates_path.clone(),
@@ -7914,111 +9981,6 @@ impl Agent {
                 )
                 .await
             }
-            "code" | "codebase" => {
-                if !allow_code_writes {
-                    push_trace_step(
-                        trace_ref,
-                        "[warn]",
-                        "Code Evolution Blocked",
-                        &format!(
-                            "Code evolution requires explicit `allow_code_writes=true` before {} will modify its own code.",
-                            crate::branding::PRODUCT_NAME
-                        ),
-                        "warning",
-                        Some(serde_json::json!({
-                            "trace_kind": "self_evolve.code.blocked",
-                            "request": request.clone(),
-                            "mode": "code",
-                            "allow_code_writes": allow_code_writes,
-                        })),
-                        None,
-                    )
-                    .await;
-                    return Ok(serde_json::json!({
-                        "status": "blocked",
-                        "mode": "code",
-                        "message": "Code evolution is disabled by default. Re-run self_evolve with mode='code' and allow_code_writes=true after policy evolution is stable."
-                    })
-                    .to_string());
-                }
-
-                let code_start = std::time::Instant::now();
-                let config = crate::core::self_evolve::SelfEvolveConfig {
-                    max_iterations: 25,
-                    max_build_fix_cycles: 5,
-                    project_root,
-                };
-                let evolve_agent = crate::core::self_evolve::SelfEvolveAgent::new(config, llm);
-                let result = evolve_agent.execute(&request).await?;
-
-                if let Some(tx) = stream_tx {
-                    let status_msg = if result.success {
-                        let mut msg = format!(
-                            "Code evolution complete: {} files changed in {} iterations",
-                            result.files_changed.len(),
-                            result.iterations_used
-                        );
-                        if result.push_recommended {
-                            msg.push_str(
-                                ". Local changes are ready; ask the user whether to push to remote.",
-                            );
-                        }
-                        msg
-                    } else {
-                        format!(
-                            "Code evolution failed: {}",
-                            result.error.as_deref().unwrap_or("unknown error")
-                        )
-                    };
-                    queue_stream_event(
-                        tx,
-                        StreamEvent::ToolResult {
-                            name: "self_evolve".to_string(),
-                            content: status_msg,
-                        },
-                    );
-                }
-
-                push_trace_step(
-                    trace_ref,
-                    if result.success { "[ok]" } else { "[error]" },
-                    if result.success {
-                        "Code Evolution Completed"
-                    } else {
-                        "Code Evolution Failed"
-                    },
-                    if result.success {
-                        format!(
-                            "Changed {} files over {} iteration(s).",
-                            result.files_changed.len(),
-                            result.iterations_used
-                        )
-                    } else {
-                        format!(
-                            "Code evolution failed after {} iteration(s).",
-                            result.iterations_used
-                        )
-                    },
-                    if result.success { "success" } else { "error" },
-                    Some(serde_json::json!({
-                        "trace_kind": "self_evolve.code.result",
-                        "request": request.clone(),
-                        "mode": "code",
-                        "success": result.success,
-                        "diff_summary": result.diff_summary.clone(),
-                        "files_changed": result.files_changed.clone(),
-                        "iterations_used": result.iterations_used,
-                        "error": result.error.clone(),
-                        "security_warnings": result.security_warnings.clone(),
-                        "push_recommended": result.push_recommended,
-                        "push_suggestion": result.push_suggestion.clone(),
-                    })),
-                    Some(code_start.elapsed().as_millis() as u64),
-                )
-                .await;
-
-                Ok(serde_json::to_string_pretty(&result)?)
-            }
             _ => {
                 push_trace_step(
                     trace_ref,
@@ -8037,7 +9999,7 @@ impl Agent {
                 Ok(serde_json::json!({
                     "status": "error",
                     "message": format!(
-                        "Unsupported self_evolve mode '{}'. Use mode='policy' (default), mode='prompt', mode='specialist_prompt', mode='gepa_export', mode='gepa_run', mode='gepa_import', mode='gepa_status', or mode='code'.",
+                        "Unsupported self_evolve mode '{}'. Use mode='policy' (default), mode='prompt', mode='specialist_prompt', mode='gepa_export', mode='gepa_run', mode='gepa_import', or mode='gepa_status'.",
                         mode
                     ),
                 })
@@ -8424,11 +10386,164 @@ impl Agent {
         // Fallback
         std::path::PathBuf::from(".")
     }
-
 }
 
 fn tool_call_results_response(results: Vec<String>) -> String {
     results.join("\n")
+}
+
+fn action_text_arg(arguments: &serde_json::Value, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn skills_surface_json() -> serde_json::Value {
+    serde_json::json!({
+        "label": "Skills",
+        "path": "/skills",
+        "manage_hint": "Open Skills to review, edit, enable, disable, test, import, delete, or manage marketplaces."
+    })
+}
+
+fn skill_chat_review_gate_result(
+    preview: &serde_json::Value,
+    operation: &str,
+    confirmed_non_blocking_risk: bool,
+) -> Option<serde_json::Value> {
+    let security = preview.get("security").unwrap_or(&serde_json::Value::Null);
+    let blocked = security
+        .get("blocked")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || preview
+            .get("status")
+            .and_then(|value| value.as_str())
+            .is_some_and(|status| status == "blocked");
+    let risk_band = security
+        .get("risk_band")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let risk_score = security
+        .get("risk_score_10")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    let warnings = security
+        .get("warnings")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let matched_rules = security
+        .get("matched_rules")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let findings = security
+        .get("findings")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let review_summary = security
+        .get("review_summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let non_blocking_risk =
+        !warnings.is_empty() || matches!(risk_band, "review" | "risky" | "unknown");
+
+    if blocked {
+        return Some(serde_json::json!({
+            "status": "blocked",
+            "resource": "skill",
+            "operation": operation,
+            "name": preview.get("name").cloned().unwrap_or(serde_json::Value::Null),
+            "message": format!("Skill {} blocked by security review. Risk band: {}; score: {:.1}/10.", operation, risk_band, risk_score),
+            "review": {
+                "risk_band": risk_band,
+                "risk_score_10": risk_score,
+                "warnings": warnings,
+                "findings": findings,
+                "matched_rules": matched_rules,
+                "summary": review_summary,
+            },
+            "surface": skills_surface_json(),
+            "confirmation": {
+                "required": false,
+                "allowed": false,
+                "reason": "blocked_by_skill_security_policy"
+            }
+        }));
+    }
+
+    if non_blocking_risk && !confirmed_non_blocking_risk {
+        return Some(serde_json::json!({
+            "status": "needs_input",
+            "resource": "skill",
+            "operation": operation,
+            "name": preview.get("name").cloned().unwrap_or(serde_json::Value::Null),
+            "message": format!("Skill {} needs confirmation before saving. Risk band: {}; score: {:.1}/10.", operation, risk_band, risk_score),
+            "review": {
+                "risk_band": risk_band,
+                "risk_score_10": risk_score,
+                "warnings": warnings,
+                "findings": findings,
+                "matched_rules": matched_rules,
+                "summary": review_summary,
+            },
+            "surface": skills_surface_json(),
+            "confirmation": {
+                "required": true,
+                "allowed": true,
+                "reason": "non_blocking_skill_security_risk",
+                "retry_with": {
+                    "resource": "skill",
+                    "operation": operation,
+                    "security_confirmed": true
+                }
+            }
+        }));
+    }
+
+    None
+}
+
+fn merge_objects_json(
+    mut base: serde_json::Value,
+    overlay: serde_json::Value,
+) -> serde_json::Value {
+    if let (Some(base_obj), Some(overlay_obj)) = (base.as_object_mut(), overlay.as_object()) {
+        for (key, value) in overlay_obj {
+            base_obj.insert(key.clone(), value.clone());
+        }
+        base
+    } else {
+        overlay
+    }
+}
+
+fn marketplace_target(arguments: &serde_json::Value) -> Result<String> {
+    action_text_arg(arguments, "id")
+        .or_else(|| action_text_arg(arguments, "name"))
+        .or_else(|| action_text_arg(arguments, "query"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Skill marketplace operation requires a marketplace id or name.")
+        })
+}
+
+fn resolve_marketplace<'a>(
+    marketplaces: &'a [crate::core::skill_marketplaces::SkillMarketplace],
+    target: &str,
+) -> Result<&'a crate::core::skill_marketplaces::SkillMarketplace> {
+    let target = target.trim();
+    let target_lower = target.to_ascii_lowercase();
+    marketplaces
+        .iter()
+        .find(|marketplace| {
+            marketplace.id == target
+                || marketplace.id.to_ascii_lowercase() == target_lower
+                || marketplace.name.to_ascii_lowercase() == target_lower
+        })
+        .ok_or_else(|| anyhow::anyhow!("Skill marketplace '{}' was not found.", target))
 }
 
 fn durable_orchestration_action_result(
@@ -8497,6 +10612,148 @@ mod tests {
     }
 
     #[test]
+    fn ok_envelope_reclassifies_structured_failure_result() {
+        let raw_result = json!({
+            "output": "tool stderr explains the failure",
+            "error": null,
+            "exit_code": 1
+        })
+        .to_string();
+        let envelope = tool_result_envelope_ok_string("runner", &raw_result);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&envelope).expect("envelope should be json");
+
+        assert_eq!(
+            parsed.get("status").and_then(|value| value.as_str()),
+            Some("error")
+        );
+        assert_eq!(
+            parsed.get("exit_code").and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert!(
+            parsed
+                .get("message")
+                .and_then(|value| value.as_str())
+                .is_some_and(|message| message.contains("tool stderr explains the failure"))
+        );
+        assert_eq!(
+            super::super::tool_responses::tool_result_completion_success(&envelope),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn work_reference_matching_is_normalized_for_resource_followups() {
+        let stored = "8f0ed937-0063-44d7-adf4-68ac854b4033\nReminder: scheduled for today at 5:45 PM IST\nnotify telegram";
+
+        assert!(work_text_matches_reference(
+            stored,
+            "reminder scheduled for today at 5:45 pm ist"
+        ));
+        assert!(work_text_matches_reference(
+            stored,
+            "8f0ed937-0063-44d7-adf4-68ac854b4033"
+        ));
+        assert!(!work_text_matches_reference(stored, "zz"));
+        assert!(!work_text_matches_reference(
+            stored,
+            "unrelated background work"
+        ));
+    }
+
+    #[test]
+    fn skill_chat_review_gate_blocks_policy_blocked_skills_with_score() {
+        let preview = json!({
+            "status": "blocked",
+            "name": "risky-skill",
+            "security": {
+                "blocked": true,
+                "risk_band": "blocked",
+                "risk_score_10": 9.2,
+                "warnings": ["exfiltration risk"],
+                "findings": [{"id": "network-write"}],
+                "matched_rules": [{"id": "skill.network.write"}],
+                "review_summary": "Attempts external writes."
+            }
+        });
+
+        let gate = skill_chat_review_gate_result(&preview, "import", false)
+            .expect("blocked review should stop the save");
+
+        assert_eq!(
+            gate.get("status").and_then(|value| value.as_str()),
+            Some("blocked")
+        );
+        assert_eq!(
+            gate.pointer("/confirmation/required")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(
+            gate.get("message")
+                .and_then(|value| value.as_str())
+                .is_some_and(|message| message.contains("9.2/10"))
+        );
+    }
+
+    #[test]
+    fn skill_chat_review_gate_requires_confirmation_for_non_blocking_risk() {
+        let preview = json!({
+            "status": "preview",
+            "name": "network-helper",
+            "security": {
+                "blocked": false,
+                "risk_band": "review",
+                "risk_score_10": 6.4,
+                "warnings": ["Uses network access"],
+                "findings": [{"id": "network"}],
+                "matched_rules": [{"id": "skill.network"}],
+                "review_summary": "Network-capable skill."
+            }
+        });
+
+        let gate = skill_chat_review_gate_result(&preview, "update", false)
+            .expect("warning review should ask for confirmation");
+
+        assert_eq!(
+            gate.get("status").and_then(|value| value.as_str()),
+            Some("needs_input")
+        );
+        assert_eq!(
+            gate.pointer("/confirmation/retry_with/security_confirmed")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            gate.pointer("/confirmation/retry_with/operation")
+                .and_then(|value| value.as_str()),
+            Some("update")
+        );
+        assert!(
+            gate.get("message")
+                .and_then(|value| value.as_str())
+                .is_some_and(|message| message.contains("6.4/10"))
+        );
+    }
+
+    #[test]
+    fn skill_chat_review_gate_allows_confirmed_non_blocking_risk() {
+        let preview = json!({
+            "status": "preview",
+            "name": "network-helper",
+            "security": {
+                "blocked": false,
+                "risk_band": "review",
+                "risk_score_10": 6.4,
+                "warnings": ["Uses network access"]
+            }
+        });
+
+        assert!(skill_chat_review_gate_result(&preview, "import", true).is_none());
+    }
+
+    #[test]
     fn durable_orchestration_result_fails_when_handler_does_not_commit() {
         let result = durable_orchestration_action_result("watch", "Watcher", None, |value| {
             crate::runtime::parse_watch_completion(value).is_some()
@@ -8513,7 +10770,7 @@ mod tests {
                 .contains("No durable object was created")
         );
         assert_eq!(
-            super::super::agent_loop::tool_result_completion_success(&result),
+            super::super::tool_responses::tool_result_completion_success(&result),
             Some(false)
         );
     }
@@ -8531,7 +10788,7 @@ mod tests {
 
         assert_eq!(completion.status, "needs_input");
         assert_eq!(
-            super::super::agent_loop::tool_result_completion_success(&result),
+            super::super::tool_responses::tool_result_completion_success(&result),
             Some(false)
         );
     }
@@ -8553,7 +10810,7 @@ mod tests {
 
         assert_eq!(result, committed);
         assert_eq!(
-            super::super::agent_loop::tool_result_completion_success(&result),
+            super::super::tool_responses::tool_result_completion_success(&result),
             Some(true)
         );
     }
@@ -8573,6 +10830,7 @@ mod tests {
             presented.failure_class,
             crate::core::FailureClass::Validation
         );
+        assert_eq!(presented.reason, "outside_allowed_roots");
         assert!(presented.retryable);
         assert!(presented.message.contains("workspace"));
         assert!(!presented.message.contains("/tmp"));
@@ -8661,6 +10919,66 @@ mod tests {
         let exact_match = Agent::select_best_ranked_app("becf46bb", &exact_ranked)
             .expect("exact app id should still resolve without clarification");
         assert_eq!(exact_match.1, "becf46bb");
+    }
+
+    #[test]
+    fn service_manage_normalization_maps_typed_schema_to_existing_app_runtime() {
+        let normalized = Agent::normalize_service_manage_deploy_arguments(&json!({
+            "operation": "create",
+            "service_id": "demo",
+            "name": "Demo Service",
+            "kind": "process",
+            "source_dir": "workspace/demo",
+            "source_paths": ["server.js"],
+            "start_command": "node server.js",
+            "environment": {"BASE_URL": "https://example.com"},
+            "public": true
+        }));
+
+        assert_eq!(
+            normalized.get("app_id").and_then(|v| v.as_str()),
+            Some("demo")
+        );
+        assert_eq!(
+            normalized.get("title").and_then(|v| v.as_str()),
+            Some("Demo Service")
+        );
+        assert_eq!(
+            normalized.get("entry_command").and_then(|v| v.as_str()),
+            Some("node server.js")
+        );
+        assert_eq!(
+            normalized.get("config").and_then(|v| v.get("BASE_URL")),
+            Some(&json!("https://example.com"))
+        );
+        assert_eq!(
+            normalized.get("expose_public").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("runtime_required").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(normalized.get("operation").is_none());
+        assert!(normalized.get("service_id").is_none());
+    }
+
+    #[test]
+    fn service_manage_patch_uses_patch_mode_without_user_phrase_checks() {
+        let normalized = Agent::normalize_service_manage_deploy_arguments(&json!({
+            "operation": "patch",
+            "service_id": "demo",
+            "file_patches": [{"path": "index.html", "patch": "@@\n-old\n+new\n"}]
+        }));
+
+        assert_eq!(
+            normalized.get("mode").and_then(|v| v.as_str()),
+            Some("patch")
+        );
+        assert_eq!(
+            normalized.get("app_id").and_then(|v| v.as_str()),
+            Some("demo")
+        );
     }
 
     #[test]

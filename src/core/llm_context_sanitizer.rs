@@ -17,7 +17,10 @@ pub(crate) fn sanitize_prompt_text(input: &str) -> String {
     if let Ok(value) = serde_json::from_str::<Value>(&normalized) {
         let sanitized = sanitize_json_value(&value, None, 0);
         return serde_json::to_string(&sanitized).unwrap_or_else(|_| {
-            truncate_text(&compact_large_text_payloads(&normalized), MAX_PROMPT_TEXT_CHARS)
+            truncate_text(
+                &compact_large_text_payloads(&normalized),
+                MAX_PROMPT_TEXT_CHARS,
+            )
         });
     }
     truncate_text(
@@ -26,7 +29,9 @@ pub(crate) fn sanitize_prompt_text(input: &str) -> String {
     )
 }
 
-pub(crate) fn sanitize_conversation_history(history: &[ConversationMessage]) -> Vec<ConversationMessage> {
+pub(crate) fn sanitize_conversation_history(
+    history: &[ConversationMessage],
+) -> Vec<ConversationMessage> {
     history
         .iter()
         .filter_map(|message| {
@@ -86,7 +91,10 @@ fn sanitize_json_object(map: &Map<String, Value>, depth: usize) -> Value {
     let mut out = Map::new();
     for key in keys.into_iter().take(MAX_OBJECT_FIELDS) {
         if let Some(value) = map.get(&key) {
-            out.insert(key.clone(), sanitize_json_value(value, Some(&key), depth + 1));
+            out.insert(
+                key.clone(),
+                sanitize_json_value(value, Some(&key), depth + 1),
+            );
         }
     }
     if omitted > 0 {
@@ -164,7 +172,10 @@ fn sanitize_json_object_fields(map: &Map<String, Value>, depth: usize) -> Value 
     let mut out = Map::new();
     for key in keys.into_iter().take(MAX_OBJECT_FIELDS) {
         if let Some(value) = map.get(&key) {
-            out.insert(key.clone(), sanitize_json_value(value, Some(&key), depth + 1));
+            out.insert(
+                key.clone(),
+                sanitize_json_value(value, Some(&key), depth + 1),
+            );
         }
     }
     if omitted > 0 {
@@ -286,7 +297,10 @@ fn is_supported_message_role(role: &str) -> bool {
 }
 
 fn is_tool_or_function_role(role: &str) -> bool {
-    matches!(role.trim().to_ascii_lowercase().as_str(), "tool" | "function")
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "tool" | "function"
+    )
 }
 
 fn has_tool_pairing_marker(map: &Map<String, Value>) -> bool {
@@ -393,11 +407,18 @@ mod tests {
         .to_string();
 
         let sanitized: Value = serde_json::from_str(&sanitize_prompt_text(&raw)).unwrap();
-        let history = sanitized.get("tool_history").and_then(Value::as_array).unwrap();
+        let history = sanitized
+            .get("tool_history")
+            .and_then(Value::as_array)
+            .unwrap();
 
         assert_eq!(history.len(), MAX_TOOL_HISTORY_ITEMS + 1);
         assert_eq!(
-            history.first().unwrap().get("status").and_then(Value::as_str),
+            history
+                .first()
+                .unwrap()
+                .get("status")
+                .and_then(Value::as_str),
             Some("older_tool_history_omitted")
         );
     }

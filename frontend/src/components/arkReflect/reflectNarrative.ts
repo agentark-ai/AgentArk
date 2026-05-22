@@ -354,7 +354,7 @@ export function nextStep(input: NarrativeInput): NextStep {
     reason:
       top.detail.trim().length > 0
         ? top.detail.trim()
-        : `Suggested from ${top.source_label || "ArkReflect"}.`,
+        : `Suggested from ${top.source_label || "Reflect"}.`,
     prompt: top.prompt,
   };
 }

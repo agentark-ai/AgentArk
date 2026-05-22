@@ -281,11 +281,11 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
         : resp?.by_purpose || [];
 
   const palette = [
-    "#2fd4ff",
+    "#d8ad78",
     "#14f195",
     "#fbbf24",
     "#d946ef",
-    "#60a5fa",
+    "#b7a7ff",
     "#f97316",
   ];
   const analyticsSeries = resp?.series || [];
@@ -334,10 +334,15 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     : 100;
   const chartTokens = useMemo(
     () => ({
-      tooltipBg: resolveCssToken("--ui-rgba-6-14-28-950"),
-      tooltipBorder: resolveCssToken("--ui-rgba-84-198-255-250"),
-      axisLine: resolveCssToken("--ui-rgba-108-156-212-250"),
-      splitLine: resolveCssToken("--ui-rgba-108-156-212-100"),
+      tooltipBg: resolveCssToken("--cyber-panel"),
+      tooltipBorder: "rgba(120, 242, 176, 0.24)",
+      axisLine: "rgba(130, 170, 160, 0.28)",
+      splitLine: "rgba(130, 170, 160, 0.14)",
+      axisLabel: "#c8d8c9",
+      tooltipText: "#fff8ed",
+      legendText: "#d8d0c4",
+      zoomBorder: "rgba(130, 170, 160, 0.22)",
+      zoomFill: "rgba(120, 242, 176, 0.14)",
     }),
     [],
   );
@@ -352,6 +357,20 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
   const totalTokenBucketSeries = analyticsSeries.map((point) =>
     num(point.total_tokens, 0),
   );
+  const cachedPromptTokensTotal = num(totals?.cached_prompt_tokens, 0);
+  const cacheCreationPromptTokensTotal = num(
+    totals?.cache_creation_prompt_tokens,
+    0,
+  );
+  const promptTokensTotal = num(totals?.prompt_tokens, 0);
+  const cachedPromptBucketSeries = analyticsSeries.map((point) =>
+    num(point.cached_prompt_tokens, 0),
+  );
+  const cacheCreationPromptBucketSeries = analyticsSeries.map((point) =>
+    num(point.cache_creation_prompt_tokens, 0),
+  );
+  const cacheReadShare =
+    promptTokensTotal > 0 ? cachedPromptTokensTotal / promptTokensTotal : 0;
   const activeRangeLabel =
     activeRange === "custom"
       ? `Custom / ${formatUiDateRange(appliedCustomFrom, appliedCustomTo)}`
@@ -430,6 +449,13 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
       value: `${(helperTokenShare * 100).toFixed(1)}%`,
       detail: `${compactNumber(helperTokensTotal)} helper tokens in range`,
     },
+    {
+      label: "Prompt cache",
+      value: `${compactNumber(cachedPromptTokensTotal)} read`,
+      detail: `${compactNumber(cacheCreationPromptTokensTotal)} written / ${(
+        cacheReadShare * 100
+      ).toFixed(1)}% read share`,
+    },
   ];
   const railCards = [
     {
@@ -452,11 +478,19 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
       chartType: "line" as const,
     },
     {
+      label: "Prompt cache",
+      value: `${compactNumber(cachedPromptTokensTotal)} read`,
+      detail: `${compactNumber(cacheCreationPromptTokensTotal)} cache-write tokens`,
+      values: cachedPromptBucketSeries,
+      color: "#60a5fa",
+      chartType: "line" as const,
+    },
+    {
       label: "Total requests",
       value: requestsValue,
       detail: `${analyticsSeries.length} bucket${analyticsSeries.length === 1 ? "" : "s"} in range`,
       values: requestBucketSeries,
-      color: "#2fd4ff",
+      color: "#d8ad78",
       chartType: "bar" as const,
     },
   ];
@@ -861,14 +895,14 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                       px: 1.1,
                       py: 0.7,
                       borderRadius: 999,
-                      border: "1px solid var(--ui-rgba-108-156-212-180)",
+                      border: "1px solid rgba(130, 170, 160, 0.18)",
                       background:
                         "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
                     }}
                   >
                     <Typography
                       variant="caption"
-                      sx={{ color: "#dbe7f3", whiteSpace: "nowrap" }}
+                      sx={{ color: "#fff8ed", whiteSpace: "nowrap" }}
                     >
                       {pill}
                     </Typography>
@@ -903,7 +937,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
             <Box
               sx={{
                 borderRadius: "12px",
-                border: "1px solid var(--ui-rgba-108-156-212-120)",
+                border: "1px solid rgba(130, 170, 160, 0.12)",
                 background:
                   "linear-gradient(180deg, var(--ui-rgba-17-17-20-920), var(--ui-rgba-12-18-28-960))",
                 px: { xs: 0.9, md: 1.3 },
@@ -939,10 +973,10 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                           end: 100,
                           height: 18,
                           bottom: 6,
-                          borderColor: "rgba(108, 156, 212, 0.2)",
-                          fillerColor: "rgba(47, 212, 255, 0.14)",
-                          handleStyle: { color: "#8fb2d1" },
-                          textStyle: { color: "#8fb2d1" },
+                          borderColor: chartTokens.zoomBorder,
+                          fillerColor: chartTokens.zoomFill,
+                          handleStyle: { color: chartTokens.axisLabel },
+                          textStyle: { color: chartTokens.axisLabel },
                         },
                       ]
                     : undefined,
@@ -950,7 +984,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                     trigger: "axis",
                     backgroundColor: chartTokens.tooltipBg,
                     borderColor: chartTokens.tooltipBorder,
-                    textStyle: { color: "#d8edff" },
+                    textStyle: { color: chartTokens.tooltipText },
                     formatter: (
                       params: Array<{
                         axisValue?: string;
@@ -974,7 +1008,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                     data: analyticsBucketLabels,
                     axisTick: { show: false },
                     axisLabel: {
-                      color: "#8fb2d1",
+                      color: chartTokens.axisLabel,
                       fontSize: 10,
                       interval: 0,
                       formatter: (value: string, index: number) =>
@@ -991,7 +1025,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   yAxis: {
                     type: "value",
                     axisLabel: {
-                      color: "#8fb2d1",
+                      color: chartTokens.axisLabel,
                       formatter: (value: number) => formatUsd(value),
                     },
                     splitLine: {
@@ -1053,7 +1087,11 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
             <Box
               sx={{
                 display: "grid",
-                gridTemplateColumns: { xs: "1fr", md: "repeat(3, minmax(0, 1fr))" },
+                gridTemplateColumns: {
+                  xs: "1fr",
+                  md: "repeat(2, minmax(0, 1fr))",
+                  lg: "repeat(4, minmax(0, 1fr))",
+                },
                 gap: 1,
               }}
             >
@@ -1063,7 +1101,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   sx={{
                     minWidth: 0,
                     borderRadius: "10px",
-                    border: "1px solid var(--ui-rgba-108-156-212-120)",
+                    border: "1px solid rgba(130, 170, 160, 0.12)",
                     background:
                       "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
                     px: 1.15,
@@ -1080,7 +1118,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                     variant="subtitle1"
                     sx={{
                       mt: 0.25,
-                      color: "#e8f4ff",
+                      color: "#fff8ed",
                       fontWeight: 700,
                       overflow: "hidden",
                       textOverflow: "ellipsis",
@@ -1116,7 +1154,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   sx={{
                     minWidth: 0,
                     borderRadius: "12px",
-                    border: "1px solid var(--ui-rgba-108-156-212-120)",
+                    border: "1px solid rgba(130, 170, 160, 0.12)",
                     background:
                       "linear-gradient(180deg, var(--ui-rgba-17-17-20-920), var(--ui-rgba-12-18-28-920))",
                     px: 1.2,
@@ -1173,7 +1211,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                 sx={{
                   minWidth: 0,
                   borderRadius: "12px",
-                  border: "1px solid var(--ui-rgba-108-156-212-120)",
+                  border: "1px solid rgba(130, 170, 160, 0.12)",
                   background:
                     "linear-gradient(180deg, var(--ui-rgba-17-17-20-920), var(--ui-rgba-12-18-28-920))",
                   px: 1.2,
@@ -1216,7 +1254,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                             <Typography
                               variant="body2"
                               sx={{
-                                color: "#e8f4ff",
+                                color: "#fff8ed",
                                 minWidth: 0,
                                 overflow: "hidden",
                                 textOverflow: "ellipsis",
@@ -1237,7 +1275,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                             sx={{
                               height: 5,
                               borderRadius: 999,
-                              background: "var(--ui-rgba-108-156-212-060)",
+                              background: "rgba(130, 170, 160, 0.08)",
                               overflow: "hidden",
                             }}
                           >
@@ -1302,7 +1340,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
             >
               <Typography
                 variant="h6"
-                sx={{ color: "#e8f4ff", fontWeight: 600 }}
+                sx={{ color: "#fff8ed", fontWeight: 600 }}
               >
                 Routing Policy Performance
               </Typography>
@@ -1344,7 +1382,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                         sx={{
                           minWidth: 0,
                           borderRadius: "10px",
-                          border: "1px solid var(--ui-rgba-108-156-212-120)",
+                          border: "1px solid rgba(130, 170, 160, 0.12)",
                           background:
                             "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
                           px: 1,
@@ -1361,7 +1399,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                           variant="subtitle2"
                           sx={{
                             mt: 0.2,
-                            color: "#e8f4ff",
+                            color: "#fff8ed",
                             overflow: "hidden",
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
@@ -1428,7 +1466,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
           >
             <Typography
               variant="subtitle1"
-              sx={{ color: "#e8f4ff", fontWeight: 600, mb: 0.25 }}
+              sx={{ color: "#fff8ed", fontWeight: 600, mb: 0.25 }}
             >
               Tokens Over Time
             </Typography>
@@ -1441,7 +1479,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
               }}
             >
               All LLM traffic, split into primary response generation vs
-              helper/classifier passes.
+              helper/classifier passes, with prompt cache reads and writes.
             </Typography>
             <ReactECharts
               style={{ height: 248 }}
@@ -1470,34 +1508,34 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                         end: 100,
                         height: 18,
                         bottom: 6,
-                        borderColor: "rgba(108, 156, 212, 0.2)",
-                        fillerColor: "rgba(47, 212, 255, 0.14)",
-                        handleStyle: { color: "#8fb2d1" },
-                        textStyle: { color: "#8fb2d1" },
+                        borderColor: chartTokens.zoomBorder,
+                        fillerColor: chartTokens.zoomFill,
+                        handleStyle: { color: chartTokens.axisLabel },
+                        textStyle: { color: chartTokens.axisLabel },
                       },
                     ]
                   : undefined,
                 legend: {
                   top: 0,
-                  textStyle: { color: "#9fc3e6", fontSize: 11 },
+                  textStyle: { color: chartTokens.legendText, fontSize: 11 },
                 },
                 tooltip: {
                   trigger: "axis",
                   backgroundColor: chartTokens.tooltipBg,
                   borderColor: chartTokens.tooltipBorder,
-                  textStyle: { color: "#d8edff" },
+                  textStyle: { color: chartTokens.tooltipText },
                 },
                 xAxis: {
                   type: "category",
                   data: analyticsBucketLabels,
-                  axisLabel: { color: "#8fb2d1", fontSize: 10 },
+                  axisLabel: { color: chartTokens.axisLabel, fontSize: 10 },
                   axisLine: {
                     lineStyle: { color: chartTokens.axisLine },
                   },
                 },
                 yAxis: {
                   type: "value",
-                  axisLabel: { color: "#8fb2d1" },
+                  axisLabel: { color: chartTokens.axisLabel },
                   splitLine: {
                     lineStyle: { color: chartTokens.splitLine },
                   },
@@ -1506,7 +1544,9 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   {
                     type: "line",
                     name: "Primary prompt",
-                    data: analyticsSeries.map((point) => point.primary_prompt_tokens),
+                    data: analyticsSeries.map(
+                      (point) => point.primary_prompt_tokens,
+                    ),
                     smooth: true,
                     areaStyle: { opacity: 0.12 },
                     lineStyle: { color: "#14f195", width: 2 },
@@ -1520,13 +1560,15 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                     ),
                     smooth: true,
                     areaStyle: { opacity: 0.12 },
-                    lineStyle: { color: "#2fd4ff", width: 2 },
-                    itemStyle: { color: "#2fd4ff" },
+                    lineStyle: { color: "#d8ad78", width: 2 },
+                    itemStyle: { color: "#d8ad78" },
                   },
                   {
                     type: "line",
                     name: "Helper prompt",
-                    data: analyticsSeries.map((point) => point.helper_prompt_tokens),
+                    data: analyticsSeries.map(
+                      (point) => point.helper_prompt_tokens,
+                    ),
                     smooth: true,
                     lineStyle: { color: "#fbbf24", width: 2, type: "dashed" },
                     itemStyle: { color: "#fbbf24" },
@@ -1540,6 +1582,22 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                     smooth: true,
                     lineStyle: { color: "#c084fc", width: 2, type: "dashed" },
                     itemStyle: { color: "#c084fc" },
+                  },
+                  {
+                    type: "line",
+                    name: "Prompt cache read",
+                    data: cachedPromptBucketSeries,
+                    smooth: true,
+                    lineStyle: { color: "#60a5fa", width: 2, type: "dashed" },
+                    itemStyle: { color: "#60a5fa" },
+                  },
+                  {
+                    type: "line",
+                    name: "Prompt cache write",
+                    data: cacheCreationPromptBucketSeries,
+                    smooth: true,
+                    lineStyle: { color: "#fb923c", width: 2, type: "dashed" },
+                    itemStyle: { color: "#fb923c" },
                   },
                 ],
               }}
@@ -1579,7 +1637,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                 mb: 1.1,
                 px: 0.45,
                 borderRadius: 1.2,
-                border: "1px solid var(--ui-rgba-108-156-212-120)",
+                border: "1px solid rgba(130, 170, 160, 0.12)",
                 background:
                   "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
               }}
@@ -1623,6 +1681,8 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                       </TableCell>
                       <TableCell align="right">Requests</TableCell>
                       <TableCell align="right">Tokens</TableCell>
+                      <TableCell align="right">Cache read</TableCell>
+                      <TableCell align="right">Cache write</TableCell>
                       <TableCell align="right">Cost</TableCell>
                     </TableRow>
                   </TableHead>
@@ -1641,6 +1701,15 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                           </TableCell>
                           <TableCell align="right">
                             {num(row.total_tokens, 0).toLocaleString()}
+                          </TableCell>
+                          <TableCell align="right">
+                            {num(row.cached_prompt_tokens, 0).toLocaleString()}
+                          </TableCell>
+                          <TableCell align="right">
+                            {num(
+                              row.cache_creation_prompt_tokens,
+                              0,
+                            ).toLocaleString()}
                           </TableCell>
                           <TableCell align="right">
                             {formatUsd(row.cost_usd, 4)}

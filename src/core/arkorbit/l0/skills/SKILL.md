@@ -18,7 +18,7 @@ Security policy:
 
 Available firmware modules:
 
-- `app-shell/index.js`: renders generic declarative mini-app specs from a widget registry entry's `spec` object. Prefer this for simple app/dashboard/card widgets only when the spec contains enough app-specific summary/content, metrics, sections, rows/items, actions, source/fetch bindings, and visual direction to produce a useful first screen. Use custom JavaScript for richer interaction, custom layout, parsing, simulation, or app behavior that the declarative shell cannot express.
+- `app-shell/index.js`: renders compact declarative mini-app specs from a widget registry entry's `spec` object. Prefer this for ordinary apps, dashboards, trackers, plans, and checklists when the spec can use app-specific summary/content, metrics, sections, rows/items, views/tabs, checklist items, refresh actions, source/fetch bindings, and visual direction to produce a useful first screen. Use custom JavaScript only for custom rendering, parsing, simulation, or app behavior that the declarative shell cannot express.
 - `markdown/index.js`: renders default orbit introduction content.
 - `iframe-html/index.js`: renders a self-contained HTML fragment.
 - `chart/index.js`: exports `barChart(el, values, options)`.
@@ -27,6 +27,6 @@ Available firmware modules:
 - Public HTTPS data can be fetched from widgets through the render context: `ctx.fetchText(url)`, `ctx.fetchJson(url)`, or `ctx.fetchPublic(url)`. Prefer these helpers over direct browser `fetch()` for news, RSS, pricing, market data, or other public feeds because the Orbit host routes them through AgentArk and avoids common CORS failures. Do not use them for private hosts, authenticated APIs, or secrets.
 - For general latest-news widgets, do not default to Reddit, X/Twitter, forum posts, or social-media search unless the user explicitly asks for that source. Prefer public news/RSS/search feeds from news providers or aggregators, label the source in the UI, and show a clear error if a public source is unavailable. Do not use JSONP or script-tag injection for news data.
 
-For ordinary widget requests, do not rewrite `index.html`. Apply only the JavaScript module write or surgical edit needed for the widget unless the user explicitly asks for supporting assets or data files.
+For ordinary widget requests, do not rewrite `index.html`. Prefer a compact `data/widgets.json` app-shell registry spec when it fits. Apply JavaScript module writes only for custom behavior, and use surgical edits for existing modules unless the user explicitly asks for supporting assets or data files.
 
 If the user asks to add back a widget, reuse `mod/<name>/index.js` by restoring its `data/widgets.json` registry entry when that module still exists. If the module was deleted, recreate it from the user's request and conversation context.

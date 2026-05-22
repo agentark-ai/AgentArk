@@ -5,7 +5,7 @@
 //! Provider selection is driven by environment variables or encrypted config.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;

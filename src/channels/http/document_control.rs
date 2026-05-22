@@ -165,25 +165,121 @@ pub(super) fn extract_document_text(
     }
 
     Err(format!(
-        "Unsupported file type '{}'. Supported: txt/md/json/csv/xml/yaml, PDF, DOCX.",
+        "No text extractor is available for content type '{}'.",
         content_type
     ))
 }
 
-pub(super) async fn insert_document_from_text(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DocumentIngestionSource {
+    InlineContent,
+    ManualUpload,
+}
+
+impl DocumentIngestionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InlineContent => "inline_content",
+            Self::ManualUpload => "manual_upload",
+        }
+    }
+}
+
+pub(super) fn document_content_fingerprint(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn document_metadata_value(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.chars().take(300).collect()
+}
+
+pub(super) fn document_text_chunks(content: &str, chunk_size: usize) -> Vec<String> {
+    content
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(chunk_size.max(1))
+        .map(|chunk| chunk.iter().collect::<String>())
+        .filter(|chunk| !chunk.trim().is_empty())
+        .collect()
+}
+
+pub(super) fn document_metadata_chunk(
+    filename: &str,
+    content_type: &str,
+    file_size: usize,
+    content_fingerprint: &str,
+    text_content_indexed: bool,
+    source: DocumentIngestionSource,
+    extraction_status: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        "artifact_kind: document".to_string(),
+        format!("filename: {}", document_metadata_value(filename)),
+        format!("content_type: {}", document_metadata_value(content_type)),
+        format!("file_size_bytes: {}", file_size),
+        format!("sha256: {}", content_fingerprint),
+        format!("text_content_indexed: {}", text_content_indexed),
+        format!("ingestion_source: {}", source.as_str()),
+    ];
+    if let Some(status) = extraction_status
+        .map(document_metadata_value)
+        .filter(|status| !status.trim().is_empty())
+    {
+        lines.push(format!("text_extraction_status: {}", status));
+    }
+    lines.join("\n")
+}
+
+fn document_chunks_with_metadata(
+    filename: &str,
+    content_type: &str,
+    file_size: usize,
+    content_fingerprint: &str,
+    text_content: Option<&str>,
+    source: DocumentIngestionSource,
+    extraction_status: Option<&str>,
+) -> (Vec<String>, bool) {
+    let normalized_text = text_content
+        .map(str::trim)
+        .filter(|content| !content.is_empty());
+    let text_content_indexed = normalized_text.is_some();
+    let mut chunks = vec![document_metadata_chunk(
+        filename,
+        content_type,
+        file_size,
+        content_fingerprint,
+        text_content_indexed,
+        source,
+        extraction_status,
+    )];
+    if let Some(content) = normalized_text {
+        chunks.extend(document_text_chunks(content, 1000));
+    }
+    (chunks, text_content_indexed)
+}
+
+pub(super) async fn insert_document_artifact(
     agent: &Agent,
     filename: String,
     content_type: String,
-    content: String,
-) -> Result<(String, usize), String> {
-    // Chunk the content (simple fixed-size chunking)
-    let chunk_size = 1000; // chars per chunk
-    let chunks: Vec<String> = content
-        .chars()
-        .collect::<Vec<_>>()
-        .chunks(chunk_size)
-        .map(|c| c.iter().collect())
-        .collect();
+    file_size: usize,
+    content_fingerprint: String,
+    text_content: Option<String>,
+    source: DocumentIngestionSource,
+    extraction_status: Option<String>,
+) -> Result<(String, usize, bool), String> {
+    let (chunks, text_content_indexed) = document_chunks_with_metadata(
+        &filename,
+        &content_type,
+        file_size,
+        &content_fingerprint,
+        text_content.as_deref(),
+        source,
+        extraction_status.as_deref(),
+    );
 
     let doc_id = uuid::Uuid::new_v4().to_string();
     let doc = crate::storage::entities::document::Model {
@@ -192,7 +288,7 @@ pub(super) async fn insert_document_from_text(
         content_type,
         project_id: None,
         chunk_count: chunks.len() as i32,
-        file_size: content.len().min(i64::MAX as usize) as i64,
+        file_size: file_size.min(i64::MAX as usize) as i64,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -227,17 +323,43 @@ pub(super) async fn insert_document_from_text(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Emit notification
+    let notification_detail = if text_content_indexed {
+        format!("{} chunks indexed", chunks.len())
+    } else {
+        "Metadata indexed".to_string()
+    };
     agent
         .emit_notification(
             &format!("Document uploaded: {}", filename),
-            &format!("{} chunks indexed", chunks.len()),
+            &notification_detail,
             "info",
             "documents",
         )
         .await;
 
-    Ok((doc_id, chunks.len()))
+    Ok((doc_id, chunks.len(), text_content_indexed))
+}
+
+pub(super) async fn insert_document_from_text(
+    agent: &Agent,
+    filename: String,
+    content_type: String,
+    content: String,
+) -> Result<(String, usize), String> {
+    let fingerprint = document_content_fingerprint(content.as_bytes());
+    let file_size = content.len();
+    insert_document_artifact(
+        agent,
+        filename,
+        content_type,
+        file_size,
+        fingerprint,
+        Some(content),
+        DocumentIngestionSource::InlineContent,
+        Some("provided_text".to_string()),
+    )
+    .await
+    .map(|(doc_id, chunks, _)| (doc_id, chunks))
 }
 
 /// Upload a document (JSON body with already-extracted text content)
@@ -285,13 +407,15 @@ pub(super) async fn upload_document_endpoint(
         .to_string();
 
     let agent = state.agent.read().await;
-    match insert_document_from_text(&agent, filename.clone(), content_type, content).await {
+    match insert_document_from_text(&agent, filename.clone(), content_type.clone(), content).await {
         Ok((doc_id, chunks)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "id": doc_id,
                 "filename": filename,
+                "content_type": content_type,
                 "chunks": chunks,
+                "index_mode": "metadata_and_content",
                 "status": "ok"
             })),
         )
@@ -416,32 +540,53 @@ pub(super) async fn upload_document_file_endpoint(
         .unwrap_or("document.txt".to_string());
     let filename = sanitize_document_filename(&raw_filename);
     let content_type = content_type_override.unwrap_or(uploaded_content_type);
-    let extracted = match extract_document_text(&filename, &content_type, &bytes) {
-        Ok(text) if !text.trim().is_empty() => text,
-        Ok(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Parsed document content is empty".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
-        }
-    };
+    let (text_content, extraction_status) =
+        match extract_document_text(&filename, &content_type, &bytes) {
+            Ok(text) if !text.trim().is_empty() => (Some(text), Some("text_extracted".to_string())),
+            Ok(_) => (None, Some("empty_text_extraction".to_string())),
+            Err(error) => {
+                tracing::info!(
+                    filename = %filename,
+                    content_type = %content_type,
+                    error = %error,
+                    "Document text extraction unavailable; indexing metadata only"
+                );
+                (
+                    None,
+                    Some(format!(
+                        "metadata_only: {}",
+                        document_metadata_value(&error)
+                    )),
+                )
+            }
+        };
+    let fingerprint = document_content_fingerprint(&bytes);
 
     let agent = state.agent.read().await;
-    match insert_document_from_text(&agent, filename.clone(), content_type.clone(), extracted).await
+    match insert_document_artifact(
+        &agent,
+        filename.clone(),
+        content_type.clone(),
+        bytes.len(),
+        fingerprint,
+        text_content,
+        DocumentIngestionSource::ManualUpload,
+        extraction_status,
+    )
+    .await
     {
-        Ok((doc_id, chunks)) => (
+        Ok((doc_id, chunks, text_content_indexed)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "id": doc_id,
                 "filename": filename,
                 "content_type": content_type,
                 "chunks": chunks,
+                "index_mode": if text_content_indexed {
+                    "metadata_and_content"
+                } else {
+                    "metadata"
+                },
                 "status": "ok"
             })),
         )
@@ -500,5 +645,76 @@ pub(super) async fn search_document_endpoint(
             }),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_chunks_with_metadata_include_text_metadata_first() {
+        let fingerprint = document_content_fingerprint(b"hello searchable world");
+        let (chunks, text_indexed) = document_chunks_with_metadata(
+            "notes.md",
+            "text/markdown",
+            22,
+            &fingerprint,
+            Some("hello searchable world"),
+            DocumentIngestionSource::InlineContent,
+            Some("provided_text"),
+        );
+
+        assert!(text_indexed);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].contains("artifact_kind: document"));
+        assert!(chunks[0].contains("filename: notes.md"));
+        assert!(chunks[0].contains("content_type: text/markdown"));
+        assert!(chunks[0].contains("file_size_bytes: 22"));
+        assert!(chunks[0].contains(&format!("sha256: {}", fingerprint)));
+        assert!(chunks[0].contains("text_content_indexed: true"));
+        assert!(chunks[0].contains("ingestion_source: inline_content"));
+        assert!(chunks[1].contains("hello searchable world"));
+    }
+
+    #[test]
+    fn document_chunks_with_metadata_support_binary_metadata_only() {
+        let bytes = [0, 159, 146, 150, 255];
+        let fingerprint = document_content_fingerprint(&bytes);
+        let (chunks, text_indexed) = document_chunks_with_metadata(
+            "image.png",
+            "image/png",
+            bytes.len(),
+            &fingerprint,
+            None,
+            DocumentIngestionSource::ManualUpload,
+            Some("metadata_only"),
+        );
+
+        assert!(!text_indexed);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("filename: image.png"));
+        assert!(chunks[0].contains("content_type: image/png"));
+        assert!(chunks[0].contains("text_content_indexed: false"));
+        assert!(chunks[0].contains("ingestion_source: manual_upload"));
+        assert!(chunks[0].contains("text_extraction_status: metadata_only"));
+    }
+
+    #[test]
+    fn document_metadata_values_are_single_line_and_bounded() {
+        let noisy = format!("{}\n{}", "x".repeat(350), "y".repeat(20));
+        let chunk = document_metadata_chunk(
+            "unsafe\nname.png",
+            &noisy,
+            3,
+            "abc123",
+            false,
+            DocumentIngestionSource::ManualUpload,
+            Some("unsupported\nformat"),
+        );
+
+        assert!(chunk.contains("filename: unsafe name.png"));
+        assert!(chunk.contains("text_extraction_status: unsupported format"));
+        assert!(!chunk.contains("unsafe\nname"));
     }
 }

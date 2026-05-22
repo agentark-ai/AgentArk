@@ -45,7 +45,6 @@ export function preloadWorkspaceSurface(
     case "connections":
     case "channels":
     case "routing":
-    case "browser":
       preloadSettingsTab(settingsTab ?? 20);
       return;
     case "webhooks":

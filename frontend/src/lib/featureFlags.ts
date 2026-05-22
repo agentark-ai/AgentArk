@@ -1,0 +1,4 @@
+export const TASK_RETRY_CONTROLS_ENABLED = false;
+export const TASK_CANCEL_CONTROLS_ENABLED = true;
+export const TASK_PAUSE_CONTROLS_ENABLED = false;
+export const BACKGROUND_WORK_LIFECYCLE_CONTROLS_ENABLED = false;

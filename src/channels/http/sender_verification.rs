@@ -443,8 +443,8 @@ pub(super) async fn revoke_sender(
 mod tests {
     use super::*;
     use crate::core::Agent;
-    use axum::body::{to_bytes, Body};
-    use axum::http::{header, Request};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
     use axum::routing::{get, post};
     use serde_json::Value;
     use std::collections::HashMap;
@@ -524,8 +524,10 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn sender_verification_routes_round_trip() {
         let (state, _config_dir, _data_dir) = build_test_state().await;

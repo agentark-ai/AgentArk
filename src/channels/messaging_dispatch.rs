@@ -22,7 +22,7 @@
 //! (SMTP, WebSocket, native plugins) are out of scope; the registry would
 //! refuse to configure a channel that asked for them.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},

@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::core::embeddings::EmbeddingClient;
-use crate::storage::{document, document_chunk, Storage};
+use crate::storage::{Storage, document, document_chunk};
 
 const MAX_EMBED_BATCH: usize = 64;
 const MAX_FILENAME_MATCH_DOCS: usize = 4;

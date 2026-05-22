@@ -39,6 +39,11 @@ import {
   taskKind,
   taskKindLabel,
 } from "../../lib/backgroundSessions";
+import {
+  TASK_CANCEL_CONTROLS_ENABLED,
+  TASK_PAUSE_CONTROLS_ENABLED,
+  TASK_RETRY_CONTROLS_ENABLED,
+} from "../../lib/featureFlags";
 import type { BackgroundSessionSummary, Task } from "../../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
@@ -936,7 +941,7 @@ export default function TasksPage({ autoRefresh }: TasksPageProps) {
           </div>
         ))}
       </Box>
-      <Box className="list-shell">
+      <Box className="list-shell" data-tour-target="tasks-work-queue">
         <Typography
           variant="h6"
           sx={{
@@ -1027,7 +1032,9 @@ export default function TasksPage({ autoRefresh }: TasksPageProps) {
                         method: "POST",
                       }),
                   },
-                  {
+                ];
+                if (TASK_PAUSE_CONTROLS_ENABLED) {
+                  rowActions.push({
                     label: "Pause",
                     disabled: !["pending", "awaitingapproval"].some((token) =>
                       rawStatusLower.includes(token),
@@ -1037,21 +1044,23 @@ export default function TasksPage({ autoRefresh }: TasksPageProps) {
                         path: `/tasks/${encodeURIComponent(id)}/pause`,
                         method: "POST",
                       }),
-                  },
-                ];
+                  });
+                }
                 if (isChatRequestTask) {
-                  if (rawStatusLower.includes("cancelled")) {
-                    rowActions.push({
-                      label: "Resume in chat",
-                      onClick: () => launchChatResumeForTask(task),
-                    });
-                  } else if (rawStatusLower.includes("failed")) {
-                    rowActions.push({
-                      label: "Retry in chat",
-                      onClick: () => launchChatResumeForTask(task),
-                    });
+                  if (TASK_RETRY_CONTROLS_ENABLED) {
+                    if (rawStatusLower.includes("cancelled")) {
+                      rowActions.push({
+                        label: "Resume in chat",
+                        onClick: () => launchChatResumeForTask(task),
+                      });
+                    } else if (rawStatusLower.includes("failed")) {
+                      rowActions.push({
+                        label: "Retry in chat",
+                        onClick: () => launchChatResumeForTask(task),
+                      });
+                    }
                   }
-                } else {
+                } else if (TASK_RETRY_CONTROLS_ENABLED) {
                   rowActions.push({
                     label: "Resume",
                     disabled: !rawStatusLower.includes("paused"),
@@ -1062,22 +1071,24 @@ export default function TasksPage({ autoRefresh }: TasksPageProps) {
                       }),
                   });
                 }
-                rowActions.push({
-                  label: "Cancel",
-                  tone: "warning",
-                  disabled: ![
-                    "pending",
-                    "awaitingapproval",
-                    "paused",
-                    "inprogress",
-                  ].some((token) => rawStatusLower.includes(token)),
-                  onClick: () =>
-                    opMutation.mutate({
-                      path: `/tasks/${encodeURIComponent(id)}/cancel`,
-                      method: "POST",
-                    }),
-                });
-                if (!isChatRequestTask) {
+                if (TASK_CANCEL_CONTROLS_ENABLED) {
+                  rowActions.push({
+                    label: "Stop",
+                    tone: "warning",
+                    disabled: ![
+                      "pending",
+                      "awaitingapproval",
+                      "paused",
+                      "inprogress",
+                    ].some((token) => rawStatusLower.includes(token)),
+                    onClick: () =>
+                      opMutation.mutate({
+                        path: `/tasks/${encodeURIComponent(id)}/cancel`,
+                        method: "POST",
+                      }),
+                  });
+                }
+                if (TASK_RETRY_CONTROLS_ENABLED && !isChatRequestTask) {
                   rowActions.push({
                     label: "Retry",
                     disabled: !["failed", "cancelled"].some((token) =>

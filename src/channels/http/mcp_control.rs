@@ -133,7 +133,6 @@ pub(super) async fn mcp_handler(
                             caller,
                             crate::actions::ActionExecutionSurface::Api,
                             true,
-                            Vec::new(),
                         ),
                     )
                     .await
@@ -517,18 +516,20 @@ pub(super) async fn delete_mcp_server(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let mut agent = state.agent.write().await;
-    let before = agent.config.mcp.servers.len();
-    agent.config.mcp.servers.retain(|s| s.id != id);
-    if agent.config.mcp.servers.len() == before {
+    let id = id.trim().to_string();
+    if id.is_empty() {
         return (
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "MCP server not found".to_string(),
+                error: "MCP server id is required".to_string(),
             }),
         )
             .into_response();
     }
+    let mut agent = state.agent.write().await;
+    let before = agent.config.mcp.servers.len();
+    agent.config.mcp.servers.retain(|s| s.id != id);
+    let existed = agent.config.mcp.servers.len() != before;
 
     if let Err(e) = clear_mcp_secrets(&mut agent, &id) {
         return (
@@ -540,14 +541,16 @@ pub(super) async fn delete_mcp_server(
             .into_response();
     }
 
-    if let Err(e) = agent.config.save(&agent.config_dir, Some(&agent.data_dir)) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to save config: {}", e),
-            }),
-        )
-            .into_response();
+    if existed {
+        if let Err(e) = agent.config.save(&agent.config_dir, Some(&agent.data_dir)) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to save config: {}", e),
+                }),
+            )
+                .into_response();
+        }
     }
 
     drop(agent);
@@ -555,7 +558,10 @@ pub(super) async fn delete_mcp_server(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "status": "ok", "sync_queued": true })),
+        Json(serde_json::json!({
+            "status": if existed { "deleted" } else { "already_absent" },
+            "sync_queued": true
+        })),
     )
         .into_response()
 }
@@ -924,7 +930,9 @@ pub(super) async fn sync_mcp_registry(agent: &Agent, secrets: &crate::core::conf
     {
         Ok(()) => {
             drop(registry);
-            agent.refresh_action_catalog_index("mcp_registry_sync").await;
+            agent
+                .refresh_action_catalog_index("mcp_registry_sync")
+                .await;
         }
         Err(error) => {
             tracing::warn!("MCP registry sync failed: {}", error);
@@ -1000,7 +1008,9 @@ pub(super) fn schedule_mcp_server_refresh(agent_ref: SharedAgent, id: String) {
         match tokio::time::timeout(timeout, refresh_future).await {
             Ok(Ok(())) => {
                 tracing::info!("MCP server refresh succeeded for {}", id);
-                agent.refresh_action_catalog_index("mcp_server_refresh").await;
+                agent
+                    .refresh_action_catalog_index("mcp_server_refresh")
+                    .await;
             }
             Ok(Err(e)) => tracing::warn!("MCP server refresh failed for {}: {}", id, e),
             Err(_) => tracing::warn!(

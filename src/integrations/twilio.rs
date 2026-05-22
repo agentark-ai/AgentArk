@@ -5,7 +5,7 @@
 //! Authentication uses HTTP Basic Auth with Account SID and Auth Token.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};

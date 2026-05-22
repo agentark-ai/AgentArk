@@ -913,7 +913,7 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
           {restoreDegraded > 0 ? `, ${restoreDegraded} degraded` : ""}.
         </Alert>
       ) : null}
-      <Box className="list-shell">
+      <Box className="list-shell" data-tour-target="apps-registry">
         <TableContainer className="table-shell">
           <Table size="small">
             <TableHead>

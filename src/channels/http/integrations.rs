@@ -367,10 +367,7 @@ pub(super) fn integration_user_disabled_key(id: &str) -> String {
     crate::integrations::integration_user_disabled_key(id)
 }
 
-pub(super) async fn refresh_connected_action_surfaces(
-    state: &AppState,
-    reason: &'static str,
-) {
+pub(super) async fn refresh_connected_action_surfaces(state: &AppState, reason: &'static str) {
     let agent = { state.agent.read().await.clone() };
     agent.refresh_action_catalog_index(reason).await;
 }

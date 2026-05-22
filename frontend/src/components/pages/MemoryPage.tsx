@@ -85,6 +85,12 @@ type DeleteMemoryTarget =
       label: string;
     };
 
+type EditMemoryTarget = {
+  id: string;
+  label: string;
+  value: string;
+};
+
 function isInternalAgentArkHelpUrl(value: unknown): boolean {
   return str(value, "").trim().toLowerCase().startsWith("agentark://help/");
 }
@@ -188,6 +194,36 @@ function knowledgeDisplayTitle(item: JsonRecord | null | undefined): string {
   return str(item?.title, "Knowledge Item");
 }
 
+function memoryFactEditableValue(item: JsonRecord | null | undefined): string {
+  const value = str(item?.value, "").trim();
+  if (value) return value;
+  const factText = str(item?.fact, "").trim();
+  const key = memoryFactKey(item);
+  if (key) {
+    const prefix = `${key}:`;
+    if (factText.startsWith(prefix)) {
+      return factText.slice(prefix.length).trim();
+    }
+    return factText;
+  }
+  const colonIdx = factText.indexOf(":");
+  if (colonIdx > 0 && colonIdx < 80 && !/\s/.test(factText.slice(0, colonIdx))) {
+    return factText.slice(colonIdx + 1).trim();
+  }
+  return factText;
+}
+
+function memoryFactKey(item: JsonRecord | null | undefined): string {
+  return str(item?.key, "").trim();
+}
+
+function memoryFactDisplayText(item: JsonRecord | null | undefined): string {
+  const key = memoryFactKey(item);
+  const value = memoryFactEditableValue(item);
+  if (key && value) return `${key}: ${value}`;
+  return value || str(item?.fact, "-");
+}
+
 type MemoryPageProps = {
   autoRefresh: boolean;
   showHeader?: boolean;
@@ -213,6 +249,8 @@ export default function MemoryPage({
   const [deleteTarget, setDeleteTarget] = useState<DeleteMemoryTarget | null>(
     null,
   );
+  const [editTarget, setEditTarget] = useState<EditMemoryTarget | null>(null);
+  const [editValue, setEditValue] = useState("");
   const [memoryTab, setMemoryTab] = useState(0);
   const [memoryPages, setMemoryPages] = useState<Record<MemoryCategoryKey, number>>({
     facts: 0,
@@ -357,6 +395,19 @@ export default function MemoryPage({
       api.rawDelete(`/memory/facts/${encodeURIComponent(id)}`),
     onSuccess: async () => {
       setSelectedFact(null);
+      await invalidateMemoryQueries();
+    },
+  });
+  const updateLearnedMemoryMutation = useMutation({
+    mutationFn: ({ id, value }: { id: string; value: string }) =>
+      api.rawPost(`/memory/facts/${encodeURIComponent(id)}`, { value }),
+    onSuccess: async (payload, variables) => {
+      const updated = asRecord(asRecord(payload).memory);
+      if (selectedFact && str(selectedFact.id, "") === variables.id) {
+        setSelectedFact(Object.keys(updated).length > 0 ? updated : null);
+      }
+      setEditTarget(null);
+      setEditValue("");
       await invalidateMemoryQueries();
     },
   });
@@ -515,9 +566,40 @@ export default function MemoryPage({
     deletePreferenceMutation.isPending ||
     deleteUserDataMutation.isPending ||
     deleteKnowledgeMutation.isPending;
+  const editBusy = updateLearnedMemoryMutation.isPending;
+  const openMemoryEdit = (item: JsonRecord) => {
+    const id = str(item.id, "").trim();
+    if (!id) return;
+    const label = memoryFactDisplayText(item) || id;
+    setError(null);
+    setSelectedFact(null);
+    setEditTarget({
+      id,
+      label,
+      value: memoryFactEditableValue(item),
+    });
+    setEditValue(memoryFactEditableValue(item));
+  };
   const confirmDeleteTarget = (target: DeleteMemoryTarget) => {
     setError(null);
     setDeleteTarget(target);
+  };
+  const saveMemoryEdit = async () => {
+    if (!editTarget) return;
+    const value = editValue.trim();
+    if (!value) {
+      setError("Memory value is required.");
+      return;
+    }
+    setError(null);
+    try {
+      await updateLearnedMemoryMutation.mutateAsync({
+        id: editTarget.id,
+        value,
+      });
+    } catch (e) {
+      setError(errMessage(e));
+    }
   };
   const runConfirmedDelete = async () => {
     if (!deleteTarget) return;
@@ -580,10 +662,13 @@ export default function MemoryPage({
               </TableHead>
               <TableBody>
                 {items.map((f, idx) => {
+                  const fact = asRecord(f);
                   const id = str(f.id, String(idx));
                   const sources = parseSources(f.sources);
                   const evidenceCount = num(f.evidence_count, sources.length);
-                  const factText = str(f.fact, "-");
+                  const factKey = memoryFactKey(fact);
+                  const factValue = memoryFactEditableValue(fact) || str(f.fact, "-");
+                  const factText = memoryFactDisplayText(fact);
                   const topics = Array.isArray(f.topics)
                     ? f.topics.map((topic) => String(topic)).filter(Boolean)
                     : [];
@@ -594,11 +679,11 @@ export default function MemoryPage({
                       hover
                       tabIndex={0}
                       aria-label={`Open memory: ${factText}`}
-                      onClick={() => setSelectedFact(asRecord(f))}
+                      onClick={() => setSelectedFact(fact)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
-                          setSelectedFact(asRecord(f));
+                          setSelectedFact(fact);
                         }
                       }}
                       sx={{
@@ -606,8 +691,22 @@ export default function MemoryPage({
                       }}
                     >
                       <TableCell sx={{ maxWidth: 560 }}>
+                        {factKey ? (
+                          <Typography
+                            variant="caption"
+                            noWrap
+                            title={factKey}
+                            sx={{
+                              display: "block",
+                              color: "text.secondary",
+                              fontFamily: "var(--font-mono)",
+                            }}
+                          >
+                            {factKey}
+                          </Typography>
+                        ) : null}
                         <Typography variant="body2" noWrap title={factText}>
-                          {factText}
+                          {factValue}
                         </Typography>
                       </TableCell>
                       <TableCell sx={{ maxWidth: 240 }}>
@@ -632,6 +731,10 @@ export default function MemoryPage({
                       >
                         <RowOpsMenu
                           actions={[
+                            {
+                              label: "Edit value",
+                              onClick: () => openMemoryEdit(fact),
+                            },
                             {
                               label: "Delete",
                               tone: "error",
@@ -675,122 +778,44 @@ export default function MemoryPage({
           description="Review remembered facts, preferences, user data, and knowledge."
         />
       ) : null}
-      {/* -- Compact stat row -- */}
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: {
-            xs: "repeat(2, 1fr)",
-            sm: "repeat(3, 1fr)",
-            md: "repeat(auto-fit, minmax(140px, 1fr))",
-          },
-          gap: 1.5,
-        }}
-      >
-        {[
-          {
-            label: "Profile",
-            value: num(stats.profile_facts, num(stats.facts)),
-            color: "#14f195",
-          },
-          {
-            label: "Assistant",
-            value: num(stats.assistant_preferences),
-            color: "#a78bfa",
-          },
-          {
-            label: "Work Prefs",
-            value: num(stats.work_preferences),
-            color: "#38bdf8",
-          },
-          {
-            label: "Domain",
-            value: num(stats.project_domain_memory),
-            color: "#22c55e",
-          },
-          ...(num(stats.other_memory) > 0
-            ? [
-                {
-                  label: "Other",
-                  value: num(stats.other_memory),
-                  color: "#94a3b8",
-                },
-              ]
-            : []),
-          {
-            label: "Preferences",
-            value: num(stats.preferences),
-            color: "#c084fc",
-          },
-          { label: "User Data", value: num(stats.user_data), color: "#f59e0b" },
-          { label: "Knowledge", value: num(stats.knowledge), color: "#f472b6" },
-        ].map((s) => (
-          <Box
-            key={s.label}
-            sx={{
-              p: 1.5,
-              borderRadius: 2,
-              border: "1px solid var(--ui-rgba-255-255-255-060)",
-              background: "var(--ui-rgba-255-255-255-020)",
-              display: "flex",
-              alignItems: "center",
-              gap: 1.5,
+      {/* Removed the colored counter-pills grid — it duplicated the
+          per-category counts that are now shown inline on each filter
+          chip below. The category dimension only needs to be conveyed
+          once, in the place where you act on it (the filter strip). */}
+      <Box className="list-shell workspace-page-subnav-shell">
+        <Stack
+          direction="row"
+          sx={{
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <Tabs
+            value={memoryTab}
+            onChange={(_event, next) => {
+              if (typeof next === "number") setMemoryTab(next);
             }}
+            variant="scrollable"
+            allowScrollButtonsMobile
+            className="workspace-page-subnav-tabs"
+            sx={{ flex: 1 }}
           >
-            <Typography
-              variant="h5"
-              sx={{
-                fontWeight: 600,
-                color: s.color,
-                lineHeight: 1,
-                minWidth: 28,
-              }}
-            >
-              {s.value}
-            </Typography>
-            <Typography
-              variant="caption"
-              sx={{
-                color: "var(--ui-rgba-180-200-225-550)",
-                fontSize: "0.72rem",
-                lineHeight: 1.2,
-              }}
-            >
-              {s.label}
-            </Typography>
-          </Box>
-        ))}
+            <Tab value={0} label={`Profile Facts (${factsTotal})`} />
+            <Tab value={1} label={`Assistant (${assistantPreferencesTotal})`} />
+            <Tab value={2} label={`Work Prefs (${workPreferencesTotal})`} />
+            <Tab value={3} label={`Domain (${domainMemoryTotal})`} />
+            <Tab value={4} label={`Other (${otherMemoryTotal})`} />
+            <Tab value={5} label={`Preferences (${preferencesTotal})`} />
+            <Tab value={6} label={`User Data (${userDataTotal})`} />
+            <Tab value={7} label={`Knowledge (${knowledgeTotal})`} />
+          </Tabs>
+        </Stack>
       </Box>
-      {/* -- Memory tabs -- */}
-      <Tabs
-        value={memoryTab}
-        onChange={(_e, next) => setMemoryTab(next)}
-        variant="scrollable"
-        allowScrollButtonsMobile
-        sx={{
-          minHeight: 0,
-          "& .MuiTab-root": { minHeight: 0, py: 0.5, fontSize: "0.8rem" },
-        }}
-      >
-        <Tab label={`Profile Facts (${factsTotal})`} />
-        <Tab label={`Assistant (${assistantPreferencesTotal})`} />
-        <Tab label={`Work Prefs (${workPreferencesTotal})`} />
-        <Tab label={`Domain (${domainMemoryTotal})`} />
-        <Tab label={`Other (${otherMemoryTotal})`} />
-        <Tab label={`Preferences (${preferencesTotal})`} />
-        <Tab label={`User Data (${userDataTotal})`} />
-        <Tab label={`Knowledge (${knowledgeTotal})`} />
-      </Tabs>
       {memoryTab === 0 ? (
         <Box className="list-shell">
-          <Typography
-            variant="h6"
-            sx={{
-              mb: 1,
-            }}
-          >
-            Profile Facts
-          </Typography>
+          {/* "Profile Facts" h6 header removed — the active filter chip
+              above already says "Profile Facts (N)". Same applies to the
+              other category panels (Preferences, User Data, Knowledge). */}
           {factsQ.error ? (
             <Alert severity="error">{errMessage(factsQ.error)}</Alert>
           ) : null}
@@ -818,21 +843,24 @@ export default function MemoryPage({
                   </TableHead>
                   <TableBody>
                     {facts.map((f, idx) => {
+                      const fact = asRecord(f);
                       const id = str(f.id, String(idx));
                       const sources = parseSources(f.sources);
                       const evidenceCount = num(f.evidence_count, sources.length);
-                      const factText = str(f.fact, "-");
+                      const factKey = memoryFactKey(fact);
+                      const factValue = memoryFactEditableValue(fact) || str(f.fact, "-");
+                      const factText = memoryFactDisplayText(fact);
                       return (
                         <TableRow
                           key={id}
                           hover
                           tabIndex={0}
                           aria-label={`Open memory fact: ${factText}`}
-                          onClick={() => setSelectedFact(asRecord(f))}
+                          onClick={() => setSelectedFact(fact)}
                           onKeyDown={(e) => {
                             if (e.key === "Enter" || e.key === " ") {
                               e.preventDefault();
-                              setSelectedFact(asRecord(f));
+                              setSelectedFact(fact);
                             }
                           }}
                           sx={{
@@ -840,12 +868,26 @@ export default function MemoryPage({
                           }}
                         >
                           <TableCell sx={{ maxWidth: 640 }}>
+                            {factKey ? (
+                              <Typography
+                                variant="caption"
+                                noWrap
+                                title={factKey}
+                                sx={{
+                                  display: "block",
+                                  color: "text.secondary",
+                                  fontFamily: "var(--font-mono)",
+                                }}
+                              >
+                                {factKey}
+                              </Typography>
+                            ) : null}
                             <Typography
                               variant="body2"
                               noWrap
                               title={factText}
                             >
-                              {factText}
+                              {factValue}
                             </Typography>
                           </TableCell>
                           <TableCell>{num(f.confidence, 0).toFixed(2)}</TableCell>
@@ -863,6 +905,10 @@ export default function MemoryPage({
                           >
                             <RowOpsMenu
                               actions={[
+                                {
+                                  label: "Edit value",
+                                  onClick: () => openMemoryEdit(fact),
+                                },
                                 {
                                   label: "Delete",
                                   tone: "error",
@@ -1029,14 +1075,7 @@ export default function MemoryPage({
           </Box>
 
           <Box className="list-shell">
-            <Typography
-              variant="h6"
-              sx={{
-                mb: 1,
-              }}
-            >
-              Preferences
-            </Typography>
+            {/* "Preferences" h6 header removed — chip says it. */}
             {preferencesQ.error ? (
               <Alert severity="error">{errMessage(preferencesQ.error)}</Alert>
             ) : null}
@@ -1221,14 +1260,7 @@ export default function MemoryPage({
           </Box>
 
           <Box className="list-shell">
-            <Typography
-              variant="h6"
-              sx={{
-                mb: 1,
-              }}
-            >
-              User Data
-            </Typography>
+            {/* "User Data" h6 header removed — chip says it. */}
             {userDataQ.error ? (
               <Alert severity="error">{errMessage(userDataQ.error)}</Alert>
             ) : null}
@@ -1458,14 +1490,7 @@ export default function MemoryPage({
           </Box>
 
           <Box className="list-shell">
-            <Typography
-              variant="h6"
-              sx={{
-                mb: 1,
-              }}
-            >
-              Knowledge Base
-            </Typography>
+            {/* "Knowledge Base" h6 header removed — chip says it. */}
             {knowledgeQ.error ? (
               <Alert severity="error">{errMessage(knowledgeQ.error)}</Alert>
             ) : null}
@@ -1637,6 +1662,7 @@ export default function MemoryPage({
       userDataQ.error ||
       knowledgeQ.error ||
       deleteLearnedMemoryMutation.error ||
+      updateLearnedMemoryMutation.error ||
       error ? (
         <Alert severity="error">
           {error ||
@@ -1650,93 +1676,344 @@ export default function MemoryPage({
                 preferencesQ.error ||
                 userDataQ.error ||
                 knowledgeQ.error ||
-                deleteLearnedMemoryMutation.error,
+                deleteLearnedMemoryMutation.error ||
+                updateLearnedMemoryMutation.error,
             )}
         </Alert>
       ) : null}
       <Dialog
         open={selectedFact != null}
         onClose={() => setSelectedFact(null)}
-        maxWidth="md"
+        maxWidth="sm"
         fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              background: "rgba(14, 14, 16, 0.96)",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              borderRadius: 2,
+              backdropFilter: "blur(8px)",
+              backgroundImage: "none",
+            },
+          },
+        }}
       >
-        <DialogTitle>Fact</DialogTitle>
-        <DialogContent>
-          <Stack spacing={1}>
-            <Typography
-              variant="caption"
-              sx={{
-                color: "text.secondary",
-              }}
-            >
-              Confidence: {num(selectedFact?.confidence, 0)} | Created:{" "}
-              <span title={humanTs(str(selectedFact?.created_at, "-")).tip}>
-                {humanTs(str(selectedFact?.created_at, "-")).label}
-              </span>
-            </Typography>
-            <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-              {str(selectedFact?.fact, "-")}
-            </Typography>
-            <Divider />
-            <Typography variant="subtitle2">Evidence references</Typography>
-            {parseSources(selectedFact?.sources).length ? (
-              <Stack spacing={0.5}>
-                {parseSources(selectedFact?.sources)
-                  .slice(0, 50)
-                  .map((s, i) => (
-                    <Box key={`src-${i}`} className="console-line">
-                      <Typography
-                        variant="body2"
-                        sx={{ fontFamily: "JetBrains Mono, monospace" }}
-                      >
-                        {String(s)}
-                      </Typography>
-                    </Box>
-                  ))}
-              </Stack>
-            ) : (
-              <Typography
-                variant="body2"
+        {(() => {
+          const fact = selectedFact;
+          if (!fact) return null;
+          const factText = memoryFactDisplayText(fact);
+          const factKey = memoryFactKey(fact);
+          const factValue = memoryFactEditableValue(fact);
+          const confidence = num(fact.confidence, 0);
+          const confidenceColor =
+            confidence >= 0.85
+              ? {
+                  color: "#7be3a1",
+                  borderColor: "rgba(123, 227, 161, 0.34)",
+                  background: "rgba(123, 227, 161, 0.08)",
+                }
+              : confidence >= 0.6
+                ? {
+                    color: "#e3c47b",
+                    borderColor: "rgba(227, 196, 123, 0.34)",
+                    background: "rgba(227, 196, 123, 0.08)",
+                  }
+                : {
+                    color: "#e37b8a",
+                    borderColor: "rgba(227, 123, 138, 0.34)",
+                    background: "rgba(227, 123, 138, 0.08)",
+                  };
+          const created = humanTs(str(fact.created_at, "-"));
+          const updated = humanTs(str(fact.updated_at, ""));
+          const factId = str(fact.id, "").trim();
+          const factKind = str(fact.kind, "").trim() || "profile_fact";
+          const factScope = str(fact.scope, "").trim();
+          const sources = parseSources(fact.sources);
+          const metaRows: Array<{ label: string; value: string; mono?: boolean }> = [];
+          if (factId) metaRows.push({ label: "ID", value: factId, mono: true });
+          metaRows.push({ label: "Kind", value: factKind, mono: true });
+          if (factScope) metaRows.push({ label: "Scope", value: factScope });
+          metaRows.push({
+            label: "Confidence",
+            value: confidence.toFixed(2),
+            mono: true,
+          });
+          metaRows.push({ label: "Created", value: created.tip });
+          if (updated.label && updated.label !== "-") {
+            metaRows.push({ label: "Updated", value: updated.tip });
+          }
+          metaRows.push({
+            label: "Evidence",
+            value: sources.length > 0 ? `${sources.length} reference${sources.length === 1 ? "" : "s"}` : "—",
+          });
+          return (
+            <>
+              <DialogTitle
                 sx={{
-                  color: "text.secondary",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 1,
+                  pb: 1.5,
+                  pt: 2,
+                  px: 2.5,
+                  borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
                 }}
               >
-                No evidence references recorded.
-              </Typography>
-            )}
-          </Stack>
-        </DialogContent>
-        <DialogActions>
-          <Button
-            color="error"
-            onClick={() => {
-              const id = str(selectedFact?.id, "").trim();
-              if (!id) return;
-              confirmDeleteTarget({
-                kind: "learnedMemory",
-                id,
-                label: str(selectedFact?.fact, id),
-              });
-            }}
-            disabled={!str(selectedFact?.id, "").trim()}
-          >
-            Delete
-          </Button>
-          {onViewMemoryEvidence ? (
-            <Button
-              onClick={() => {
-                const id = str(selectedFact?.id, "").trim();
-                if (!id) return;
-                setSelectedFact(null);
-                onViewMemoryEvidence(id);
-              }}
-              disabled={!str(selectedFact?.id, "").trim()}
-            >
-              View evidence
-            </Button>
-          ) : null}
-          <Button onClick={() => setSelectedFact(null)}>Close</Button>
-        </DialogActions>
+                <Stack
+                  direction="row"
+                  spacing={0.75}
+                  sx={{ alignItems: "center", flexWrap: "wrap" }}
+                >
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label="Profile Fact"
+                    sx={{
+                      height: 22,
+                      fontSize: "0.66rem",
+                      fontWeight: 600,
+                      letterSpacing: "0.06em",
+                      textTransform: "uppercase",
+                      color: "rgba(216, 173, 120, 0.85)",
+                      borderColor: "rgba(216, 173, 120, 0.3)",
+                      background: "rgba(216, 173, 120, 0.06)",
+                      "& .MuiChip-label": { px: 1 },
+                    }}
+                  />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={confidence.toFixed(2)}
+                    sx={{
+                      height: 22,
+                      fontSize: "0.66rem",
+                      fontWeight: 600,
+                      letterSpacing: "0.06em",
+                      fontFamily: "var(--font-mono)",
+                      ...confidenceColor,
+                      "& .MuiChip-label": { px: 1 },
+                    }}
+                  />
+                  <Box sx={{ flex: 1 }} />
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "rgba(220, 220, 220, 0.55)",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.68rem",
+                      letterSpacing: "0.02em",
+                    }}
+                    title={created.tip}
+                  >
+                    {created.label}
+                  </Typography>
+                </Stack>
+                {factKey ? (
+                  <Typography
+                    sx={{
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.7rem",
+                      letterSpacing: "0.04em",
+                      color: "rgba(220, 220, 220, 0.55)",
+                    }}
+                  >
+                    {factKey}
+                  </Typography>
+                ) : null}
+                <Typography
+                  sx={{
+                    fontSize: "1rem",
+                    fontWeight: 600,
+                    color: "var(--text-primary)",
+                    lineHeight: 1.4,
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  {factValue || "—"}
+                </Typography>
+              </DialogTitle>
+              <DialogContent sx={{ px: 2.5, py: 2 }}>
+                <Stack spacing={2}>
+                  <Box
+                    sx={{
+                      borderRadius: 1.5,
+                      border: "1px solid rgba(255, 255, 255, 0.06)",
+                      background: "rgba(255, 255, 255, 0.012)",
+                    }}
+                  >
+                    <Stack>
+                      {metaRows.map((row, mIdx) => (
+                        <Stack
+                          key={row.label}
+                          direction="row"
+                          sx={{
+                            px: 1.5,
+                            py: 0.85,
+                            gap: 1.5,
+                            alignItems: "baseline",
+                            borderTop:
+                              mIdx === 0
+                                ? "none"
+                                : "1px solid rgba(255, 255, 255, 0.04)",
+                          }}
+                        >
+                          <Typography
+                            sx={{
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "0.68rem",
+                              letterSpacing: "0.04em",
+                              color: "rgba(220, 220, 220, 0.52)",
+                              textTransform: "uppercase",
+                              flex: "0 0 110px",
+                              lineHeight: 1.4,
+                            }}
+                          >
+                            {row.label}
+                          </Typography>
+                          <Typography
+                            sx={{
+                              flex: 1,
+                              minWidth: 0,
+                              fontFamily: row.mono
+                                ? "var(--font-mono)"
+                                : undefined,
+                              fontSize: row.mono ? "0.78rem" : "0.84rem",
+                              color: "var(--text-primary)",
+                              wordBreak: "break-all",
+                              lineHeight: 1.4,
+                            }}
+                          >
+                            {row.value}
+                          </Typography>
+                        </Stack>
+                      ))}
+                    </Stack>
+                  </Box>
+                  {sources.length > 0 ? (
+                    <Box>
+                      <Typography
+                        sx={{
+                          fontFamily: "var(--font-mono)",
+                          fontSize: "0.68rem",
+                          letterSpacing: "0.04em",
+                          color: "rgba(220, 220, 220, 0.52)",
+                          textTransform: "uppercase",
+                          mb: 0.75,
+                        }}
+                      >
+                        Evidence references
+                      </Typography>
+                      <Box
+                        sx={{
+                          borderRadius: 1.5,
+                          border: "1px solid rgba(255, 255, 255, 0.06)",
+                          background: "rgba(255, 255, 255, 0.012)",
+                        }}
+                      >
+                        <Stack>
+                          {sources.slice(0, 50).map((s, i) => (
+                            <Box
+                              key={`src-${i}`}
+                              sx={{
+                                px: 1.5,
+                                py: 0.7,
+                                borderTop:
+                                  i === 0
+                                    ? "none"
+                                    : "1px solid rgba(255, 255, 255, 0.04)",
+                                fontFamily: "var(--font-mono)",
+                                fontSize: "0.76rem",
+                                color: "var(--text-primary)",
+                                wordBreak: "break-all",
+                                lineHeight: 1.45,
+                              }}
+                            >
+                              {String(s)}
+                            </Box>
+                          ))}
+                        </Stack>
+                      </Box>
+                    </Box>
+                  ) : null}
+                </Stack>
+              </DialogContent>
+              <DialogActions
+                sx={{
+                  px: 2.5,
+                  py: 1.5,
+                  borderTop: "1px solid rgba(255, 255, 255, 0.06)",
+                  gap: 1,
+                }}
+              >
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={() => openMemoryEdit(fact)}
+                  disabled={!factId}
+                  sx={{
+                    textTransform: "none",
+                    fontSize: "0.78rem",
+                    fontWeight: 500,
+                  }}
+                >
+                  Edit value
+                </Button>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="error"
+                  onClick={() => {
+                    const id = factId;
+                    if (!id) return;
+                    confirmDeleteTarget({
+                      kind: "learnedMemory",
+                      id,
+                      label: factText || id,
+                    });
+                  }}
+                  disabled={!factId}
+                  sx={{
+                    textTransform: "none",
+                    fontSize: "0.78rem",
+                    fontWeight: 500,
+                  }}
+                >
+                  Delete
+                </Button>
+                <Box sx={{ flex: 1 }} />
+                {onViewMemoryEvidence ? (
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      if (!factId) return;
+                      setSelectedFact(null);
+                      onViewMemoryEvidence(factId);
+                    }}
+                    disabled={!factId}
+                    sx={{
+                      textTransform: "none",
+                      fontSize: "0.78rem",
+                      color: "rgba(220, 220, 220, 0.75)",
+                    }}
+                  >
+                    View evidence
+                  </Button>
+                ) : null}
+                <Button
+                  size="small"
+                  onClick={() => setSelectedFact(null)}
+                  sx={{
+                    textTransform: "none",
+                    fontSize: "0.78rem",
+                    color: "rgba(220, 220, 220, 0.75)",
+                  }}
+                >
+                  Close
+                </Button>
+              </DialogActions>
+            </>
+          );
+        })()}
       </Dialog>
       <Dialog
         open={selectedKnowledge != null}
@@ -1917,6 +2194,59 @@ export default function MemoryPage({
             Delete
           </Button>
           <Button onClick={() => setSelectedKnowledge(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={editTarget != null}
+        onClose={() => {
+          if (!editBusy) {
+            setEditTarget(null);
+            setEditValue("");
+          }
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Edit Memory Value</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.25}>
+            <Box className="metadata-box">
+              <Typography
+                variant="body2"
+                sx={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}
+              >
+                {editTarget?.label || editTarget?.id || "Selected memory"}
+              </Typography>
+            </Box>
+            <TextField
+              autoFocus
+              fullWidth
+              multiline
+              minRows={5}
+              label="Value"
+              value={editValue}
+              onChange={(event) => setEditValue(event.target.value)}
+              disabled={editBusy}
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            disabled={editBusy}
+            onClick={() => {
+              setEditTarget(null);
+              setEditValue("");
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            disabled={editBusy || !editTarget || !editValue.trim()}
+            onClick={() => void saveMemoryEdit()}
+          >
+            Save
+          </Button>
         </DialogActions>
       </Dialog>
       <Dialog

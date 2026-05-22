@@ -1679,15 +1679,64 @@ pub async fn execute_search_response(
     Ok(response)
 }
 
-/// Format search results into a human-readable string
+fn markdown_inline_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('*', "\\*")
+        .replace('_', "\\_")
+        .replace('`', "\\`")
+}
+
+fn markdown_link_target(value: &str) -> String {
+    value.trim().replace(' ', "%20").replace(')', "%29")
+}
+
+fn search_result_display_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Format search results into a human-readable markdown list.
 pub fn format_search_results(response: &SearchResponse) -> String {
-    let mut output = format!("Search results for: {}\n\n", response.query);
-    for (i, result) in response.results.iter().enumerate() {
-        output.push_str(&format!("{}. {}\n   {}\n", i + 1, result.title, result.url));
-        if let Some(date) = result.published_date.as_deref() {
-            output.push_str(&format!("   Date: {}\n", date));
+    let mut output = format!(
+        "Search results for: **{}**\n\n",
+        markdown_inline_text(&search_result_display_text(&response.query))
+    );
+    for result in &response.results {
+        let title = search_result_display_text(&result.title);
+        let url = markdown_link_target(&result.url);
+        let source = search_result_display_text(&result.source);
+        let date = result
+            .published_date
+            .as_deref()
+            .map(search_result_display_text)
+            .filter(|value| !value.is_empty());
+        let snippet = search_result_display_text(&result.snippet);
+        let mut meta = Vec::new();
+        if !source.is_empty() {
+            meta.push(markdown_inline_text(&source));
         }
-        output.push_str(&format!("   {}\n\n", result.snippet));
+        if let Some(date) = date {
+            meta.push(format!("Published: {}", markdown_inline_text(&date)));
+        }
+
+        if url.is_empty() {
+            output.push_str(&format!("- **{}**", markdown_inline_text(&title)));
+        } else {
+            output.push_str(&format!(
+                "- **[{}]({})**",
+                markdown_inline_text(&title),
+                url
+            ));
+        }
+        if !meta.is_empty() {
+            output.push_str(&format!("  \n  {}", meta.join(" . ")));
+        }
+        if !snippet.is_empty() {
+            output.push_str(&format!("  \n  {}", markdown_inline_text(&snippet)));
+        }
+        output.push_str("\n");
     }
     output
 }
@@ -2329,7 +2378,9 @@ mod tests {
             backend: "duckduckgo".to_string(),
         });
 
-        assert!(rendered.contains("Date: 2026-04-06"));
+        assert!(rendered.contains("Published: 2026-04-06"));
         assert!(rendered.contains("Summary"));
+        assert!(!rendered.contains("\n   Date:"));
+        assert!(!rendered.contains("\n1."));
     }
 }

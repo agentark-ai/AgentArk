@@ -1269,7 +1269,7 @@ impl Agent {
             + security_snapshot.unauthorized_channel_attempts;
         let arkcore_items = vec![
             format!(
-                "ArkCore: {} open task(s), {} active background session(s), and {} active browser session(s).",
+                "Ark Core: {} open task(s), {} active background session(s), and {} active browser session(s).",
                 counts.open(),
                 background_sessions
                     .iter()
@@ -1278,7 +1278,7 @@ impl Agent {
                 active_browser_sessions.len()
             ),
             format!(
-                "ArkMemory: {} fact(s), {} preference(s), {} document(s), {} chunk(s), {} user-data item(s), and {} knowledge item(s).",
+                "Memory: {} fact(s), {} preference(s), {} document(s), {} chunk(s), {} user-data item(s), and {} knowledge item(s).",
                 fact_count,
                 preference_count,
                 document_count,
@@ -1287,14 +1287,14 @@ impl Agent {
                 knowledge_count
             ),
             format!(
-                "ArkSentinel: {} watcher(s), {} watcher attention item(s), {} security event(s), and {} startup issue(s).",
+                "Sentinel: {} watcher(s), {} watcher attention item(s), {} security event(s), and {} startup issue(s).",
                 watchers.len(),
                 watcher_attention.len(),
                 security_event_count,
                 startup_issue_count
             ),
             format!(
-                "ArkEvolve: {}, {} draft candidate(s), {} pending consolidation item(s), {} pending reflection item(s), {} active pattern(s), and {} active canary run(s).",
+                "Evolve: {}, {} draft candidate(s), {} pending consolidation item(s), {} pending reflection item(s), {} active pattern(s), and {} active canary run(s).",
                 if self_evolve_enabled {
                     "enabled"
                 } else {
@@ -1307,12 +1307,12 @@ impl Agent {
                 active_canary_count
             ),
             format!(
-                "ArkReflect: {} semantic work unit(s) and {} source message(s) indexed from the last 24 hours.",
+                "Reflect: {} semantic work unit(s) and {} source message(s) indexed from the last 24 hours.",
                 reflect_units.len(),
                 reflect_message_count
             ),
             format!(
-                "ArkPulse: {} stored run(s); latest status is {}.",
+                "Pulse: {} stored run(s); latest status is {}.",
                 arkpulse_total, arkpulse_summary
             ),
         ];
@@ -1528,7 +1528,7 @@ impl Agent {
             .join("\n");
 
         let prompt = format!(
-            "Create the top summary for a daily command brief.\n{}\n\nBrief requirements:\n- This run was generated at the user's local time shown below; the deterministic wrapper will handle the greeting, so do not write a greeting, title, sign-off, or section heading.\n- Return 2-4 compact bullet points only.\n- Summarize the highest-impact facts across tasks, approvals, failures, alerts, meetings, mail, monitoring, ArkCore modules, and recent execution.\n- Make the summary useful even when queues are quiet by naming what was checked and what was not connected or unavailable.\n- Use only the facts below. Do not invent external news, events, counts, services, or statuses.\n\nGenerated at:\n{}\nLocal time:\n{}\nLocal daypart:\n{}\nExpected wrapper greeting:\n{}\n\nTask snapshot:\n{}\n\nImportant events:\n{}\n\nArkCore status facts:\n{}\n\nModule attention signals:\n{}\n\nRecent execution:\n{}\n\nCalendar:\n{}\n\nMail:\n{}",
+            "Create the top summary for a daily command brief.\n{}\n\nBrief requirements:\n- This run was generated at the user's local time shown below; the deterministic wrapper will handle the greeting, so do not write a greeting, title, sign-off, or section heading.\n- Return 2-4 compact bullet points only.\n- Summarize the highest-impact facts across tasks, approvals, failures, alerts, meetings, mail, monitoring, Ark Core modules, and recent execution.\n- Make the summary useful even when queues are quiet by naming what was checked and what was not connected or unavailable.\n- Use only the facts below. Do not invent external news, events, counts, services, or statuses.\n\nGenerated at:\n{}\nLocal time:\n{}\nLocal daypart:\n{}\nExpected wrapper greeting:\n{}\n\nTask snapshot:\n{}\n\nImportant events:\n{}\n\nArk Core status facts:\n{}\n\nModule attention signals:\n{}\n\nRecent execution:\n{}\n\nCalendar:\n{}\n\nMail:\n{}",
             style_block,
             generated_at,
             local_time_label,

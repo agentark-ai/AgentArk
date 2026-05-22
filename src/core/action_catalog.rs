@@ -303,73 +303,6 @@ pub(crate) fn action_catalog_entry_needs_embedding(
         .unwrap_or(true)
 }
 
-fn lexical_tokens(text: &str) -> HashSet<String> {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .map(str::trim)
-        .filter(|token| token.len() >= 2)
-        .map(|token| token.to_ascii_lowercase())
-        .collect()
-}
-
-fn lexical_overlap_score(tokens: &HashSet<String>, text: &str, weight: i64) -> i64 {
-    lexical_tokens(text)
-        .into_iter()
-        .filter(|token| tokens.contains(token))
-        .count() as i64
-        * weight
-}
-
-pub(crate) fn rank_action_names_lexically(
-    actions: &[ActionDef],
-    probes: &[String],
-) -> Vec<String> {
-    if actions.is_empty() {
-        return Vec::new();
-    }
-    let probe_text = probes.join("\n").to_ascii_lowercase();
-    let probe_tokens = lexical_tokens(&probe_text);
-    if probe_tokens.is_empty() {
-        return actions.iter().map(|action| action.name.clone()).collect();
-    }
-
-    let mut scored = actions
-        .iter()
-        .enumerate()
-        .map(|(index, action)| {
-            let mut score = 0_i64;
-            score += lexical_overlap_score(&probe_tokens, &action.name, 45);
-            score += lexical_overlap_score(&probe_tokens, &action.description, 18);
-            score += lexical_overlap_score(&probe_tokens, &action.capabilities.join(" "), 30);
-            let metadata = action.action_metadata();
-            score += lexical_overlap_score(&probe_tokens, &format!("{:?}", metadata.role), 18);
-            score += lexical_overlap_score(
-                &probe_tokens,
-                &format!("{:?}", metadata.integration_class),
-                18,
-            );
-            for field in action_schema_field_descriptions(&action.input_schema, 24) {
-                score += lexical_overlap_score(&probe_tokens, &field, 12);
-            }
-            (index, score, action.name.clone())
-        })
-        .collect::<Vec<_>>();
-
-    if scored.iter().all(|(_, score, _)| *score <= 0) {
-        return actions.iter().map(|action| action.name.clone()).collect();
-    }
-
-    scored.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    scored
-        .into_iter()
-        .map(|(_, _, action_name)| action_name)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,9 +343,11 @@ mod tests {
     fn descriptor_includes_schema_field_descriptions() {
         let descriptor = build_action_catalog_descriptor(&action("research", "Gather evidence"));
 
-        assert!(descriptor
-            .descriptor_text
-            .contains("query: string required"));
+        assert!(
+            descriptor
+                .descriptor_text
+                .contains("query: string required")
+        );
         assert!(descriptor.descriptor_text.contains("Topic or objective"));
         assert!(descriptor.descriptor_text.contains("options.depth"));
     }

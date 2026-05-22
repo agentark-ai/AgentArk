@@ -3,7 +3,7 @@
 //! to control a headless browser for web automation tasks.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 pub struct BrowserIntegration {
     client: reqwest::Client,
     bridge_url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BrowserSessionCreateOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +45,10 @@ pub struct BrowserSidecarSessionState {
     pub live_view_port: Option<u16>,
     #[serde(default)]
     pub live_view_path: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub profile_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,11 +219,26 @@ impl BrowserIntegration {
 
     /// Create a new browser session, returns session_id
     pub async fn create_session(&self) -> Result<String> {
+        self.create_session_with_options(&BrowserSessionCreateOptions::default())
+            .await
+    }
+
+    pub async fn create_session_with_options(
+        &self,
+        options: &BrowserSessionCreateOptions,
+    ) -> Result<String> {
         tracing::info!("Creating browser session via sidecar");
+        let mut body = serde_json::json!({ "mode": "interactive" });
+        if options.profile_id.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            body["profile"] = serde_json::json!({
+                "id": options.profile_id.as_deref().unwrap_or_default(),
+                "name": options.profile_name.as_deref().unwrap_or_default(),
+            });
+        }
         let resp: SessionResponse = self
             .client
             .post(format!("{}/session", self.bridge_url))
-            .json(&serde_json::json!({ "mode": "interactive" }))
+            .json(&body)
             .send()
             .await?
             .error_for_status()?
@@ -268,7 +295,7 @@ impl BrowserIntegration {
         let validated_url = validate_browser_url(url)?;
         tracing::debug!(
             "Browser navigate: session={}, url_len={}",
-            &session_id[..8],
+            &session_id[..session_id.len().min(8)],
             validated_url.as_str().len()
         );
         let resp: NavigateResponse = self
@@ -289,9 +316,25 @@ impl BrowserIntegration {
         Ok((final_url, title))
     }
 
+    /// Navigate back in history
+    pub async fn back(&self, session_id: &str) -> Result<(String, String)> {
+        let resp: NavigateResponse = self
+            .client
+            .post(format!("{}/session/{}/back", self.bridge_url, session_id))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok((resp.url.unwrap_or_default(), resp.title.unwrap_or_default()))
+    }
+
     /// Take a screenshot, returns PNG bytes
     pub async fn screenshot(&self, session_id: &str) -> Result<Vec<u8>> {
-        tracing::debug!("Browser screenshot: session={}", &session_id[..8]);
+        tracing::debug!(
+            "Browser screenshot: session={}",
+            &session_id[..session_id.len().min(8)]
+        );
         let bytes = self
             .client
             .get(format!(
@@ -591,6 +634,26 @@ impl Integration for BrowserIntegration {
                     .map(|v| v as i32);
                 self.scroll(sid, direction, amount).await?;
                 Ok(serde_json::json!({ "status": "scrolled" }))
+            }
+            "back" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("session_id required"))?;
+                let (url, title) = self.back(sid).await?;
+                Ok(serde_json::json!({ "url": url, "title": title }))
+            }
+            "press_key" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("session_id required"))?;
+                let key = params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("key required"))?;
+                self.press_key(sid, key).await?;
+                Ok(serde_json::json!({ "status": "pressed" }))
             }
             "get_content" => {
                 let sid = params

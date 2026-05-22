@@ -1,14 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use anyhow::Result;
+use sea_orm::entity::prelude::PgVector;
 
-use crate::core::document_search::normalized_embedding_similarity;
 use crate::core::EmbeddingClient;
+use crate::core::document_search::normalized_embedding_similarity;
 
 use super::intent_classifier::{
-    InboundAdvisorySignal, InboundClassificationDecision, InboundMemoryCaptureSignal,
-    IntentVerdict,
+    InboundAdvisorySignal, InboundClassificationDecision, InboundMemoryCaptureSignal, IntentVerdict,
 };
 
 const FAST_BLOCK_MIN_SCORE: f32 = 0.82;
@@ -31,8 +32,13 @@ const SCHEDULED_TASK_CONCEPT: &str = "scheduled_task";
 const WATCHER_MONITOR_CONCEPT: &str = "watcher_monitor";
 const INTEGRATION_SETUP_CONCEPT: &str = "integration_setup";
 const PERSISTENT_ARTIFACT_CONCEPT: &str = "persistent_artifact";
+const CANONICAL_EMBEDDING_CACHE_MAX_ENTRIES: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+static SECURITY_CANONICAL_EMBEDDING_CACHE: once_cell::sync::Lazy<
+    tokio::sync::Mutex<HashMap<String, CachedSecurityCanonicalEmbeddings>>,
+> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SecurityCategory {
     Conversational,
     ToolUse,
@@ -46,6 +52,7 @@ pub struct SecurityCanonical {
     pub category: SecurityCategory,
     pub concept: String,
     pub text: String,
+    pub advisory: InboundAdvisorySignal,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +60,7 @@ struct ScoredCanonical {
     category: SecurityCategory,
     concept: String,
     score: f32,
+    advisory: InboundAdvisorySignal,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +75,12 @@ struct ScoredMemoryCaptureCanonical {
     should_capture: bool,
     concept: &'static str,
     score: f32,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSecurityCanonicalEmbeddings {
+    canonical_embeddings: Vec<PgVector>,
+    memory_embeddings: Vec<PgVector>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,11 +133,53 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
         concept: &'static str,
         text: &'static str,
     ) -> SecurityCanonical {
+        canonical_with_advisory(
+            category,
+            concept,
+            text,
+            default_advisory_for_category(category, concept),
+        )
+    }
+
+    fn canonical_with_advisory(
+        category: SecurityCategory,
+        concept: &'static str,
+        text: &'static str,
+        advisory: InboundAdvisorySignal,
+    ) -> SecurityCanonical {
         SecurityCanonical {
             category,
             concept: concept.to_string(),
             text: text.to_string(),
+            advisory,
         }
+    }
+
+    fn default_advisory_for_category(
+        category: SecurityCategory,
+        concept: &'static str,
+    ) -> InboundAdvisorySignal {
+        let mut advisory = InboundAdvisorySignal::default();
+        advisory
+            .semantic_queries
+            .push(format!("semantic_concept:{concept}"));
+        advisory.rationale = Some("high-confidence embedding route".to_string());
+        match category {
+            SecurityCategory::Conversational => {
+                advisory.current_answer_expected = true;
+            }
+            SecurityCategory::ToolUse => {
+                advisory.should_execute = true;
+                advisory.tool_use_expected = true;
+            }
+            SecurityCategory::DurableWork | SecurityCategory::ManagedAppDelivery => {
+                advisory.should_execute = true;
+                advisory.tool_use_expected = true;
+                advisory.durable_work_expected = true;
+            }
+            SecurityCategory::SecurityBlock => {}
+        }
+        advisory
     }
 
     vec![
@@ -137,10 +193,22 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
             PRODUCT_IDENTITY_ANSWER_CONCEPT,
             "The user asks for the assistant or running product identity, name, who it is, or what it should call itself, and the answer should come from the trusted product identity already supplied by the system.",
         ),
-        canonical(
+        canonical_with_advisory(
             SecurityCategory::Conversational,
             AGENTARK_CAPABILITIES_ANSWER_CONCEPT,
             "The user asks what AgentArk can do, how an AgentArk capability works, or where an AgentArk feature is configured; the answer should be grounded in the live AgentArk capability registry with curated manual context only as supplemental explanation, not in the assistant's trusted product identity and not in live logs or external web.",
+            InboundAdvisorySignal {
+                current_answer_expected: true,
+                agentark_capabilities_expected: true,
+                semantic_queries: vec![format!(
+                    "semantic_concept:{AGENTARK_CAPABILITIES_ANSWER_CONCEPT}"
+                )],
+                required_capabilities: vec![
+                    "agentark capability registry and manual context".to_string(),
+                ],
+                rationale: Some("high-confidence embedding route".to_string()),
+                ..Default::default()
+            },
         ),
         canonical(
             SecurityCategory::Conversational,
@@ -252,6 +320,28 @@ async fn load_overlay_canonicals(data_dir: Option<&Path>) -> Vec<SecurityCanonic
                 category,
                 concept: concept.to_string(),
                 text: text.to_string(),
+                advisory: InboundAdvisorySignal {
+                    current_answer_expected: matches!(category, SecurityCategory::Conversational),
+                    should_execute: matches!(
+                        category,
+                        SecurityCategory::ToolUse
+                            | SecurityCategory::DurableWork
+                            | SecurityCategory::ManagedAppDelivery
+                    ),
+                    tool_use_expected: matches!(
+                        category,
+                        SecurityCategory::ToolUse
+                            | SecurityCategory::DurableWork
+                            | SecurityCategory::ManagedAppDelivery
+                    ),
+                    durable_work_expected: matches!(
+                        category,
+                        SecurityCategory::DurableWork | SecurityCategory::ManagedAppDelivery
+                    ),
+                    semantic_queries: vec![format!("overlay_semantic_concept:{concept}")],
+                    rationale: Some("overlay embedding route".to_string()),
+                    ..Default::default()
+                },
             })
         })
         .take(64)
@@ -298,15 +388,19 @@ fn block_decision(concept: &str) -> InboundClassificationDecision {
     }
 }
 
-fn allow_decision(category: SecurityCategory, concept: &str) -> InboundClassificationDecision {
+fn allow_decision(
+    category: SecurityCategory,
+    concept: &str,
+    advisory: &InboundAdvisorySignal,
+) -> InboundClassificationDecision {
     let _ = (category, concept);
-    // Embedding classifier no longer projects tool intent. Its job is only
-    // to issue a security verdict (Allow / AllowWithUncheckedTag / Block).
-    // The main model sees the full authorized catalog and picks tools.
+    // Embedding classifier does not choose concrete tools. It only forwards
+    // typed advisory so later planning can skip redundant review when the
+    // semantic route is already high-confidence.
     InboundClassificationDecision {
         verdict: IntentVerdict::Allow,
         memory_capture: InboundMemoryCaptureSignal::default(),
-        advisory: InboundAdvisorySignal::default(),
+        advisory: advisory.clone(),
         model_response: None,
     }
 }
@@ -379,6 +473,82 @@ fn embedding_security_quick_accepts(category: SecurityCategory, score: f32, marg
     }
 }
 
+fn canonical_embedding_cache_key(
+    embedding_client: &EmbeddingClient,
+    canonicals: &[SecurityCanonical],
+    memory_canonicals: &[MemoryCaptureCanonical],
+) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    embedding_client.describe_backend().hash(&mut hasher);
+    for canonical in canonicals {
+        canonical.category.hash(&mut hasher);
+        canonical.concept.hash(&mut hasher);
+        canonical.text.hash(&mut hasher);
+    }
+    for canonical in memory_canonicals {
+        canonical.should_capture.hash(&mut hasher);
+        canonical.concept.hash(&mut hasher);
+        canonical.text.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+async fn load_or_embed_canonical_embeddings(
+    embedding_client: &EmbeddingClient,
+    canonicals: &[SecurityCanonical],
+    memory_canonicals: &[MemoryCaptureCanonical],
+) -> Result<CachedSecurityCanonicalEmbeddings> {
+    let key = canonical_embedding_cache_key(embedding_client, canonicals, memory_canonicals);
+    if let Some(cached) = SECURITY_CANONICAL_EMBEDDING_CACHE
+        .lock()
+        .await
+        .get(&key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let mut texts = Vec::with_capacity(canonicals.len() + memory_canonicals.len());
+    texts.extend(
+        canonicals
+            .iter()
+            .map(|canonical| canonical.text.to_string()),
+    );
+    texts.extend(
+        memory_canonicals
+            .iter()
+            .map(|canonical| canonical.text.to_string()),
+    );
+    let embeddings = embedding_client.embed_texts(&texts).await?;
+    let cached = CachedSecurityCanonicalEmbeddings {
+        canonical_embeddings: embeddings
+            .iter()
+            .take(canonicals.len())
+            .cloned()
+            .collect::<Vec<_>>(),
+        memory_embeddings: embeddings
+            .iter()
+            .skip(canonicals.len())
+            .take(memory_canonicals.len())
+            .cloned()
+            .collect::<Vec<_>>(),
+    };
+    if cached.canonical_embeddings.len() != canonicals.len()
+        || cached.memory_embeddings.len() != memory_canonicals.len()
+    {
+        return Ok(cached);
+    }
+
+    let mut cache = SECURITY_CANONICAL_EMBEDDING_CACHE.lock().await;
+    if cache.len() >= CANONICAL_EMBEDDING_CACHE_MAX_ENTRIES {
+        if let Some(evict_key) = cache.keys().next().cloned() {
+            cache.remove(&evict_key);
+        }
+    }
+    cache.insert(key, cached.clone());
+    Ok(cached)
+}
+
 pub async fn classify_inbound_embedding_fast(
     embedding_client: &EmbeddingClient,
     normalized_message: &str,
@@ -396,29 +566,23 @@ pub async fn classify_inbound_embedding_fast(
     let mut canonicals = default_canonicals();
     canonicals.extend(load_overlay_canonicals(data_dir).await);
     let memory_canonicals = memory_capture_canonicals();
-    let mut texts = Vec::with_capacity(canonicals.len() + memory_canonicals.len() + 2);
-    texts.push(classification_text_for_embedding);
-    texts.push(memory_text_for_embedding);
-    texts.extend(
-        canonicals
-            .iter()
-            .map(|canonical| canonical.text.to_string()),
-    );
-    texts.extend(
-        memory_canonicals
-            .iter()
-            .map(|canonical| canonical.text.to_string()),
-    );
-    let embeddings = embedding_client.embed_texts(&texts).await?;
-    let Some(message_embedding) = embeddings.first() else {
+    let turn_texts = vec![classification_text_for_embedding, memory_text_for_embedding];
+    let (turn_embeddings, cached_embeddings) = tokio::try_join!(
+        embedding_client.embed_texts(&turn_texts),
+        load_or_embed_canonical_embeddings(embedding_client, &canonicals, &memory_canonicals),
+    )?;
+    let Some(message_embedding) = turn_embeddings.first() else {
         return Ok(None);
     };
-    let Some(memory_message_embedding) = embeddings.get(1) else {
+    let Some(memory_message_embedding) = turn_embeddings.get(1) else {
         return Ok(None);
     };
 
     let mut scored = Vec::new();
-    for (canonical, embedding) in canonicals.iter().zip(embeddings.iter().skip(2)) {
+    for (canonical, embedding) in canonicals
+        .iter()
+        .zip(cached_embeddings.canonical_embeddings.iter())
+    {
         let score =
             normalized_embedding_similarity(message_embedding.as_slice(), embedding.as_slice())
                 .unwrap_or(0.0);
@@ -426,12 +590,13 @@ pub async fn classify_inbound_embedding_fast(
             category: canonical.category,
             concept: canonical.concept.clone(),
             score,
+            advisory: canonical.advisory.clone(),
         });
     }
     let mut scored_memory = Vec::new();
     for (canonical, embedding) in memory_canonicals
         .iter()
-        .zip(embeddings.iter().skip(2 + canonicals.len()))
+        .zip(cached_embeddings.memory_embeddings.iter())
     {
         let score = normalized_embedding_similarity(
             memory_message_embedding.as_slice(),
@@ -482,7 +647,7 @@ pub async fn classify_inbound_embedding_fast(
     let mut decision = if top.category == SecurityCategory::SecurityBlock {
         block_decision(&top.concept)
     } else {
-        allow_decision(top.category, &top.concept)
+        allow_decision(top.category, &top.concept, &top.advisory)
     };
     if matches!(decision.verdict, IntentVerdict::Allow) {
         decision.memory_capture = memory_capture;

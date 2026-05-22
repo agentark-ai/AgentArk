@@ -49,7 +49,7 @@ export function OrbitSwitcher({
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
   const [icon, setIcon] = useState("");
-  const [color, setColor] = useState("#58e0ff");
+  const [color, setColor] = useState("#78f2b0");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
@@ -63,7 +63,7 @@ export function OrbitSwitcher({
   const reset = useCallback(() => {
     setName("");
     setIcon("");
-    setColor("#58e0ff");
+    setColor("#78f2b0");
     setError(null);
   }, []);
 

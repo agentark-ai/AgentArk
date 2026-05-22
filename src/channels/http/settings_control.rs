@@ -21,49 +21,50 @@ fn schedule_process_restart_after_chat_idle(state: AppState, reason: &'static st
         return false;
     }
 
-    crate::spawn_logged!("src/channels/http/settings_control.rs:deferred_restart", async move {
-        let started = std::time::Instant::now();
-        let max_defer =
-            std::time::Duration::from_secs(SETTINGS_PROCESS_RESTART_MAX_DEFER_SECS);
-        let poll_interval =
-            std::time::Duration::from_millis(SETTINGS_PROCESS_RESTART_POLL_MS);
-        let idle_grace =
-            std::time::Duration::from_secs(SETTINGS_PROCESS_RESTART_IDLE_GRACE_SECS);
-        let mut logged_wait = false;
+    crate::spawn_logged!(
+        "src/channels/http/settings_control.rs:deferred_restart",
+        async move {
+            let started = std::time::Instant::now();
+            let max_defer = std::time::Duration::from_secs(SETTINGS_PROCESS_RESTART_MAX_DEFER_SECS);
+            let poll_interval = std::time::Duration::from_millis(SETTINGS_PROCESS_RESTART_POLL_MS);
+            let idle_grace =
+                std::time::Duration::from_secs(SETTINGS_PROCESS_RESTART_IDLE_GRACE_SECS);
+            let mut logged_wait = false;
 
-        loop {
-            let active = active_chat_stream_count_for_restart(&state).await;
-            if active == 0 {
-                tokio::time::sleep(idle_grace).await;
-                if active_chat_stream_count_for_restart(&state).await == 0 {
+            loop {
+                let active = active_chat_stream_count_for_restart(&state).await;
+                if active == 0 {
+                    tokio::time::sleep(idle_grace).await;
+                    if active_chat_stream_count_for_restart(&state).await == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                if !logged_wait {
+                    tracing::info!(
+                        active_chat_streams = active,
+                        reason,
+                        "Process restart is waiting for active chat streams to finish"
+                    );
+                    logged_wait = true;
+                }
+                if started.elapsed() >= max_defer {
+                    tracing::warn!(
+                        active_chat_streams = active,
+                        reason,
+                        "Process restart defer window elapsed; restarting with active stream(s)"
+                    );
                     break;
                 }
-                continue;
+                tokio::time::sleep(poll_interval).await;
             }
-            if !logged_wait {
-                tracing::info!(
-                    active_chat_streams = active,
-                    reason,
-                    "Process restart is waiting for active chat streams to finish"
-                );
-                logged_wait = true;
-            }
-            if started.elapsed() >= max_defer {
-                tracing::warn!(
-                    active_chat_streams = active,
-                    reason,
-                    "Process restart defer window elapsed; restarting with active stream(s)"
-                );
-                break;
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
 
-        tracing::info!(reason, "Restarting process to apply settings changes");
-        std::process::exit(0);
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    });
+            tracing::info!(reason, "Restarting process to apply settings changes");
+            std::process::exit(0);
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        }
+    );
     true
 }
 
@@ -4059,7 +4060,7 @@ pub(super) async fn update_settings(
             .set(ARKREFLECT_DAILY_DIGEST_ENABLED_KEY, stored_value.as_bytes())
             .await
         {
-            tracing::warn!("Failed to persist ArkReflect daily digest setting: {}", e);
+            tracing::warn!("Failed to persist Reflect daily digest setting: {}", e);
         }
     }
 
@@ -4928,6 +4929,18 @@ pub struct IntegrationConfigField {
 
 // ==================== SSH API ====================
 
+#[cfg(not(feature = "ssh"))]
+fn ssh_feature_unavailable_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse {
+            error: "SSH support is disabled in this build".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "ssh")]
 pub(super) async fn ssh_list_connections(State(state): State<AppState>) -> Response {
     let config_dir = { state.agent.read().await.config_dir.clone() };
     match crate::actions::ssh::ssh_list_connections(&config_dir).await {
@@ -4946,6 +4959,12 @@ pub(super) async fn ssh_list_connections(State(state): State<AppState>) -> Respo
     }
 }
 
+#[cfg(not(feature = "ssh"))]
+pub(super) async fn ssh_list_connections(State(_state): State<AppState>) -> Response {
+    ssh_feature_unavailable_response()
+}
+
+#[cfg(feature = "ssh")]
 pub(super) async fn ssh_add_connection(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
@@ -5026,6 +5045,15 @@ pub(super) async fn ssh_add_connection(
     }
 }
 
+#[cfg(not(feature = "ssh"))]
+pub(super) async fn ssh_add_connection(
+    State(_state): State<AppState>,
+    Json(_request): Json<serde_json::Value>,
+) -> Response {
+    ssh_feature_unavailable_response()
+}
+
+#[cfg(feature = "ssh")]
 pub(super) async fn ssh_remove_connection(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -5054,6 +5082,15 @@ pub(super) async fn ssh_remove_connection(
     }
 }
 
+#[cfg(not(feature = "ssh"))]
+pub(super) async fn ssh_remove_connection(
+    State(_state): State<AppState>,
+    axum::extract::Path(_name): axum::extract::Path<String>,
+) -> Response {
+    ssh_feature_unavailable_response()
+}
+
+#[cfg(feature = "ssh")]
 pub(super) async fn ssh_list_keys(State(state): State<AppState>) -> Response {
     let config_dir = { state.agent.read().await.config_dir.clone() };
     match crate::actions::ssh::list_key_names(&config_dir) {
@@ -5068,6 +5105,12 @@ pub(super) async fn ssh_list_keys(State(state): State<AppState>) -> Response {
     }
 }
 
+#[cfg(not(feature = "ssh"))]
+pub(super) async fn ssh_list_keys(State(_state): State<AppState>) -> Response {
+    ssh_feature_unavailable_response()
+}
+
+#[cfg(feature = "ssh")]
 pub(super) async fn ssh_upload_key(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
@@ -5125,6 +5168,15 @@ pub(super) async fn ssh_upload_key(
     }
 }
 
+#[cfg(not(feature = "ssh"))]
+pub(super) async fn ssh_upload_key(
+    State(_state): State<AppState>,
+    Json(_request): Json<serde_json::Value>,
+) -> Response {
+    ssh_feature_unavailable_response()
+}
+
+#[cfg(feature = "ssh")]
 pub(super) async fn ssh_remove_key(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -5153,6 +5205,15 @@ pub(super) async fn ssh_remove_key(
     }
 }
 
+#[cfg(not(feature = "ssh"))]
+pub(super) async fn ssh_remove_key(
+    State(_state): State<AppState>,
+    axum::extract::Path(_name): axum::extract::Path<String>,
+) -> Response {
+    ssh_feature_unavailable_response()
+}
+
+#[cfg(feature = "ssh")]
 pub(super) async fn ssh_test_connection(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
@@ -5176,6 +5237,14 @@ pub(super) async fn ssh_test_connection(
         )
             .into_response(),
     }
+}
+
+#[cfg(not(feature = "ssh"))]
+pub(super) async fn ssh_test_connection(
+    State(_state): State<AppState>,
+    Json(_request): Json<serde_json::Value>,
+) -> Response {
+    ssh_feature_unavailable_response()
 }
 
 // ==================== Model Pool API ====================

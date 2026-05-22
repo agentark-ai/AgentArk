@@ -2,19 +2,19 @@
 
 use anyhow::Result;
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, MatchedPath, Multipart, Path,
         Query, Request, State,
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{
-        sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{any, delete, get, post, put},
-    Json, Router,
 };
 use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
@@ -26,15 +26,15 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage};
+use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-mod actions;
+pub(crate) mod actions;
 mod analytics_control;
 mod api_docs_control;
 mod api_types;
@@ -95,8 +95,8 @@ pub use locked_control::serve_locked;
 pub(crate) use memory_control::run_arkmemory_learned_review_pass;
 
 pub(crate) use self::sentinel_panel::{
-    load_background_learning_feed, record_background_learning_job_result,
-    BackgroundLearningJobUpdate,
+    BackgroundLearningJobUpdate, load_background_learning_feed,
+    record_background_learning_job_result,
 };
 use analytics_control::*;
 use api_docs_control::*;
@@ -143,23 +143,20 @@ use crate::core::config::{
     TunnelTailscaleConfig,
 };
 use crate::core::data_lifecycle::{
-    load_data_lifecycle_settings, save_data_lifecycle_settings, DataLifecycleSettings,
+    DataLifecycleSettings, load_data_lifecycle_settings, save_data_lifecycle_settings,
 };
 use crate::core::llm_provider::{
-    canonical_provider_id, display_openai_base_url, force_refresh_codex_cli_api_key,
-    is_openrouter_base_url, normalize_openai_base_url, openai_provider_label,
-    persist_codex_cli_oauth_tokens, provider_allows_model_discovery, resolve_codex_cli_api_key,
-    resolve_openai_request_config, HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID,
-    OPENAI_DEVICE_REDIRECT_URI, OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL,
-    OPENAI_DEVICE_VERIFY_URL, OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL,
-};
-use crate::core::self_evolve::skill_evolution::{
-    self, SkillImpactAssessment, SkillMetricsSnapshot, SkillWindowDirection,
+    HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID, OPENAI_DEVICE_REDIRECT_URI,
+    OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL, OPENAI_DEVICE_VERIFY_URL,
+    OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL, canonical_provider_id,
+    display_openai_base_url, force_refresh_codex_cli_api_key, is_openrouter_base_url,
+    normalize_openai_base_url, openai_provider_label, persist_codex_cli_oauth_tokens,
+    provider_allows_model_discovery, resolve_codex_cli_api_key, resolve_openai_request_config,
 };
 use crate::core::{
-    score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
-    LlmProvider, ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task,
-    TaskApproval, TaskQueue, TaskStatus, TrustPolicy, UserProfile,
+    Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace, LlmProvider,
+    ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task, TaskApproval,
+    TaskQueue, TaskStatus, TrustPolicy, UserProfile, score_action_risk,
 };
 use crate::hooks;
 
@@ -1595,7 +1592,10 @@ pub async fn serve(
             "/chat/tool-approvals/{id}/decision",
             post(decide_chat_tool_approval),
         )
-        .route("/chat/credential-prompt", get(get_chat_credential_prompt))
+        .route(
+            "/chat/credential-prompt",
+            get(get_chat_credential_prompt).delete(dismiss_chat_credential_prompt),
+        )
         .route(
             "/chat/credential-prompt/submit",
             post(submit_chat_credential_prompt),
@@ -2338,7 +2338,7 @@ pub async fn serve(
         .route("/memory/facts", get(list_facts))
         .route(
             "/memory/facts/{id}",
-            axum::routing::delete(delete_memory_fact),
+            post(update_memory_fact_value).delete(delete_memory_fact),
         )
         .route("/channels/available", get(list_available_channels))
         .route("/memory/preferences", get(list_user_preferences))
@@ -2363,11 +2363,11 @@ pub async fn serve(
             "/memory/knowledge/{id}",
             axum::routing::delete(delete_knowledge_item),
         )
-        // ArkMemory operations
+        // Memory operations
         .route("/arkmemory/summary", get(arkmemory_summary))
         .route(
             "/arkmemory/memories/{id}",
-            axum::routing::delete(delete_memory_fact),
+            post(update_memory_fact_value).delete(delete_memory_fact),
         )
         .route("/arkmemory/queue", get(arkmemory_queue))
         .route(
@@ -2394,7 +2394,7 @@ pub async fn serve(
         .route("/arkrecall/summary", get(arkmemory_summary))
         .route(
             "/arkrecall/memories/{id}",
-            axum::routing::delete(delete_memory_fact),
+            post(update_memory_fact_value).delete(delete_memory_fact),
         )
         .route("/arkrecall/queue", get(arkmemory_queue))
         .route(
@@ -2489,6 +2489,7 @@ pub async fn serve(
         .route("/api/uploads/{upload_id}", get(serve_upload_file))
         // Approval audit log
         .route("/approvals/log", get(get_approval_log))
+        .route("/approvals/{id}/dismiss", post(dismiss_approval))
         // Security event log
         .route("/security/logs", get(get_security_logs))
         // Security / Master Password
@@ -2520,7 +2521,7 @@ pub async fn serve(
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/resume", post(resume_run))
         // Greetings (LLM-generated, cached in DB)
-        // ArkPulse log
+        // Pulse log
         .route("/arkpulse", get(get_pulse_log))
         .route("/arkpulse/trigger", post(trigger_pulse))
         .route("/arkpulse/fix", post(run_arkpulse_fix))
@@ -2606,7 +2607,7 @@ pub async fn serve(
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .allow_credentials(true);
 
-    // Keep handles for auto-start and ArkSentinel
+    // Keep handles for auto-start and Sentinel
     let tunnel_handle = state.tunnel.clone();
     let wa_bridge_handle = state.whatsapp_bridge.clone();
 
@@ -2814,7 +2815,7 @@ pub async fn serve(
 
     schedule_enabled_mcp_server_resumes(state.agent.clone());
 
-    // ArkSentinel: monitor tunnel + WhatsApp bridge processes, auto-restart if they die
+    // Sentinel: monitor tunnel + WhatsApp bridge processes, auto-restart if they die
     {
         let t = tunnel_handle.clone();
         let state_for_tunnel = state.clone();
@@ -2853,10 +2854,10 @@ pub async fn serve(
                 if needs_restart {
                     // Wait a bit before restart to avoid tight loops
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    tracing::info!("ArkSentinel: restarting tunnel...");
+                    tracing::info!("Sentinel: restarting tunnel...");
                     match tunnel::spawn_tunnel(&state_for_tunnel, None).await {
-                        Ok(()) => tracing::info!("ArkSentinel: tunnel restarted successfully"),
-                        Err(e) => tracing::error!("ArkSentinel: failed to restart tunnel: {}", e),
+                        Ok(()) => tracing::info!("Sentinel: tunnel restarted successfully"),
+                        Err(e) => tracing::error!("Sentinel: failed to restart tunnel: {}", e),
                     }
                 }
 
@@ -2868,7 +2869,7 @@ pub async fn serve(
                             match child.try_wait() {
                                 Ok(Some(_status)) => {
                                     tracing::warn!(
-                                        "ArkSentinel: WhatsApp bridge exited unexpectedly, will restart..."
+                                        "Sentinel: WhatsApp bridge exited unexpectedly, will restart..."
                                     );
                                     bridge.process = None;
                                     bridge.active = false;
@@ -2889,13 +2890,13 @@ pub async fn serve(
 
                 if wa_needs_restart {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    tracing::info!("ArkSentinel: restarting WhatsApp bridge...");
+                    tracing::info!("Sentinel: restarting WhatsApp bridge...");
                     match spawn_whatsapp_bridge(state_for_bridge.clone()).await {
                         Ok(()) => {
-                            tracing::info!("ArkSentinel: WhatsApp bridge restarted successfully")
+                            tracing::info!("Sentinel: WhatsApp bridge restarted successfully")
                         }
                         Err(e) => {
-                            tracing::error!("ArkSentinel: failed to restart WhatsApp bridge: {}", e)
+                            tracing::error!("Sentinel: failed to restart WhatsApp bridge: {}", e)
                         }
                     }
                 }

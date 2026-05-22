@@ -4,8 +4,8 @@
 //! sync polling. The module stores sync state and room context in the existing
 //! encrypted KV store so it can be wired into the broader channel system later
 //! without schema churn.
-use anyhow::{anyhow, bail, Context, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;

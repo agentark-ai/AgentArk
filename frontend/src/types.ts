@@ -118,8 +118,11 @@ export type BackgroundSessionLinkedWatcher = {
   status: string;
   created_at: string;
   last_poll_at?: string | null;
+  poll_count?: number;
   notify_channel?: string | null;
   last_error?: string | null;
+  last_poll_outcome?: string | null;
+  notification_attempts?: Array<Record<string, unknown>>;
   trigger_result?: string | null;
 };
 
@@ -174,9 +177,22 @@ export type Notification = {
   metadata?: Record<string, unknown>;
 };
 
+export type ApprovalLogEntry = {
+  id: string;
+  action_name: string;
+  arguments: string;
+  rule_name: string;
+  status: string;
+  requested_at: string;
+  resolved_at?: string | null;
+  resolved_by?: string | null;
+};
+
 export type BrowserHandoffStatus = {
   id: string;
   task_description: string;
+  profile_id?: string | null;
+  profile_name?: string | null;
   status: string;
   question?: string | null;
   summary?: string | null;
@@ -200,7 +216,7 @@ export type BrowserSessionsResponse = {
   total: number;
 };
 
-export type ArkPulseRemediationSpec =
+export type PulseRemediationSpec =
   | { kind: "tunnel_start_verify" }
   | { kind: "tunnel_restart_verify" }
   | { kind: "app_restart"; app_id: string }
@@ -215,7 +231,7 @@ export type ArkPulseRemediationSpec =
     }
   | { kind: "shell_command"; command: string };
 
-export type ArkPulseDoctorFinding = {
+export type PulseDoctorFinding = {
   severity: string;
   category: string;
   target: string;
@@ -223,20 +239,20 @@ export type ArkPulseDoctorFinding = {
   evidence: string;
   root_cause: string;
   fix_command: string;
-  remediation?: ArkPulseRemediationSpec | null;
+  remediation?: PulseRemediationSpec | null;
   user_actionable?: boolean;
 };
 
-export type ArkPulseRunFixRequest = {
+export type PulseRunFixRequest = {
   fix_command?: string;
-  remediation?: ArkPulseRemediationSpec;
+  remediation?: PulseRemediationSpec;
   issue_title?: string;
   target?: string;
   event_timestamp?: string;
   finding_index?: number;
 };
 
-export type ArkPulseCleanupCandidate = {
+export type PulseCleanupCandidate = {
   id: string;
   category: string;
   category_label: string;
@@ -251,18 +267,18 @@ export type ArkPulseCleanupCandidate = {
   requires_app_stop?: boolean;
 };
 
-export type ArkPulseCleanupPreviewResponse = {
+export type PulseCleanupPreviewResponse = {
   status: string;
   archive_root: string;
   legacy_archive_root: string;
   archive_retention_days: number;
-  candidates: ArkPulseCleanupCandidate[];
+  candidates: PulseCleanupCandidate[];
   category_counts: Array<{ category: string; count: number; size_bytes: number }>;
   total_size_bytes: number;
   active_job?: unknown;
 };
 
-export type ArkPulseCleanupRequest = {
+export type PulseCleanupRequest = {
   candidate_ids: string[];
   confirm_archive: boolean;
   event_timestamp?: string;
@@ -470,6 +486,8 @@ export type LlmAnalyticsTotals = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cached_prompt_tokens: number;
+  cache_creation_prompt_tokens: number;
   request_count: number;
   estimated_count: number;
   cost_usd?: number | null;
@@ -480,14 +498,20 @@ export type LlmAnalyticsPoint = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cached_prompt_tokens: number;
+  cache_creation_prompt_tokens: number;
   request_count: number;
   primary_prompt_tokens: number;
   primary_completion_tokens: number;
   primary_total_tokens: number;
+  primary_cached_prompt_tokens: number;
+  primary_cache_creation_prompt_tokens: number;
   primary_request_count: number;
   helper_prompt_tokens: number;
   helper_completion_tokens: number;
   helper_total_tokens: number;
+  helper_cached_prompt_tokens: number;
+  helper_cache_creation_prompt_tokens: number;
   helper_request_count: number;
   cost_usd?: number | null;
 };
@@ -500,6 +524,8 @@ export type LlmAnalyticsBreakdownRow = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cached_prompt_tokens: number;
+  cache_creation_prompt_tokens: number;
   request_count: number;
   cost_usd?: number | null;
 };

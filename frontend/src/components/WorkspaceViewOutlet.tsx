@@ -170,9 +170,14 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
   routing: settingsRoute("Loading routing...", 2),
   webhooks: settingsRoute("Loading webhooks...", 22),
   devices: settingsRoute("Loading devices...", 26),
-  // Keep the legacy browser route alive, but redirect it to Integrations
-  // while the browser-profile UI is hidden.
-  browser: settingsRoute("Loading browser integrations...", 2),
+  browser: {
+    componentKey: "sessions",
+    message: "Loading browser...",
+    load: loadBrowserSessionsPage,
+    render: (BrowserSessionsPage, { autoRefresh }) => (
+      <BrowserSessionsPage autoRefresh={autoRefresh} />
+    ),
+  },
   gatewayops: {
     componentKey: "arkpulse",
     message: "Loading gateway ops...",
@@ -293,7 +298,7 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
   },
   arkpulse: {
     componentKey: "arkpulse",
-    message: "Loading ArkPulse...",
+    message: "Loading Pulse...",
     load: loadArkPulsePage,
     render: (ArkPulsePage, { autoRefresh }) => (
       <ArkPulsePage autoRefresh={autoRefresh} />
@@ -327,7 +332,7 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
   },
   arkreflect: {
     componentKey: "arkreflect",
-    message: "Loading ArkReflect...",
+    message: "Loading Reflect...",
     load: loadArkReflectPage,
     render: (ArkReflectPage, { autoRefresh, onNavigateToView }) => (
       <ArkReflectPage

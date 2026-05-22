@@ -96,6 +96,98 @@ function labelize(value) {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
+function firstText(...values) {
+  for (const value of values) {
+    const resolved = text(value);
+    if (resolved) return resolved;
+  }
+  return "";
+}
+
+function appViews(spec) {
+  return asArray(spec.views || spec.tabs).filter((view) => view && typeof view === "object");
+}
+
+function viewKey(view, index) {
+  return firstText(view.id, view.key, view.value, view.label, view.title) || `view-${index}`;
+}
+
+function selectedView(spec, state) {
+  const views = appViews(spec);
+  if (!views.length) return null;
+  const requested = firstText(state.activeView, spec.activeView, spec.defaultView, spec.initialView);
+  const index = requested
+    ? views.findIndex((view, idx) => viewKey(view, idx) === requested)
+    : 0;
+  const selectedIndex = index >= 0 ? index : 0;
+  const selected = views[selectedIndex];
+  state.activeView = viewKey(selected, selectedIndex);
+  return selected;
+}
+
+function viewSpec(base, view) {
+  return {
+    ...base,
+    ...view,
+    title: firstText(view.title, view.label, base.title),
+    subtitle: firstText(view.subtitle, view.summary, view.description, base.subtitle, base.summary),
+    content: view.content ?? view.body ?? view.description ?? base.content ?? base.body,
+    metrics: view.metrics ?? base.metrics,
+    sections: view.sections ?? base.sections,
+    items: view.items ?? base.items,
+    rows: view.rows ?? base.rows,
+    actions: view.actions ?? base.actions,
+    accent: view.accent ?? asObject(view.visual).accent ?? base.accent,
+  };
+}
+
+function renderViewTabs(views, state) {
+  if (views.length <= 1) return "";
+  const active = text(state.activeView);
+  return `<div class="app-shell-tabs" role="tablist">${views
+    .map((view, index) => {
+      const key = viewKey(view, index);
+      const label = firstText(view.label, view.title, key);
+      const selected = key === active;
+      return `<button type="button" class="app-shell-tab${selected ? " is-active" : ""}" role="tab" aria-selected="${selected ? "true" : "false"}" data-app-view="${escapeHtml(key)}">${escapeHtml(label)}</button>`;
+    })
+    .join("")}</div>`;
+}
+
+function checklistKey(namespace, item, index) {
+  const value = asObject(item);
+  return `${namespace}:${firstText(value.id, value.key, value.label, value.name, value.title) || index}`;
+}
+
+function checklistChecked(state, key, fallback) {
+  if (!state.checked || typeof state.checked !== "object") state.checked = {};
+  if (Object.prototype.hasOwnProperty.call(state.checked, key)) return Boolean(state.checked[key]);
+  return Boolean(fallback);
+}
+
+function renderChecklist(items, data, state, namespace) {
+  const rows = asArray(items);
+  if (!rows.length) return "";
+  return `<ul class="app-shell-checklist">${rows
+    .map((row, index) => {
+      const item = asObject(row);
+      const key = checklistKey(namespace, item, index);
+      const checked = checklistChecked(state, key, item.done || item.checked || item.complete);
+      const label = formatBoundValue(firstText(item.label, item.name, item.title) || row, data);
+      const detail = item.detail || item.value || item.summary || item.reps || item.duration || "";
+      return `<li>
+        <button type="button" class="app-shell-check${checked ? " is-checked" : ""}" data-app-check="${escapeHtml(key)}" aria-pressed="${checked ? "true" : "false"}">
+          <span class="app-shell-check-box">${checked ? "&#10003;" : ""}</span>
+          <span class="app-shell-check-copy">
+            <span>${escapeHtml(label)}</span>
+            ${detail ? `<strong>${escapeHtml(formatBoundValue(detail, data))}</strong>` : ""}
+          </span>
+        </button>
+      </li>`;
+    })
+    .join("")}</ul>`;
+}
+
 function renderContentBlock(content, data) {
   const raw = formatBoundValue(content, data).trim();
   if (!raw || raw === "--") return "";
@@ -211,36 +303,38 @@ function renderObjectRows(value, data) {
     });
 }
 
-function renderSection(section, data) {
+function renderSection(section, data, state = {}, namespace = "section") {
   const item = asObject(section);
   const title = item.title || item.label || item.name;
   const body = item.body || item.summary || item.description || item.content;
   const rows = asArray(item.items || item.rows);
   const metrics = asArray(item.metrics);
+  const checklist = asArray(item.checklist || item.checks || item.tasks);
   const objectRows = rows.length ? rows : renderObjectRows(item.fields || item.values, data);
-  if (!title && !body && objectRows.length === 0 && metrics.length === 0) return "";
+  if (!title && !body && objectRows.length === 0 && metrics.length === 0 && checklist.length === 0) return "";
   return `<section class="app-shell-section">
     ${title ? `<h3>${escapeHtml(formatBoundValue(title, data))}</h3>` : ""}
     ${body ? `<p>${escapeHtml(formatBoundValue(body, data))}</p>` : ""}
     ${metrics.length ? `<div class="app-shell-section-metrics">${metrics.map((metric) => renderMetric(metric, data)).join("")}</div>` : ""}
     ${objectRows.length ? `<ul>${renderRows(objectRows, data)}</ul>` : ""}
+    ${checklist.length ? renderChecklist(checklist, data, state, namespace) : ""}
   </section>`;
 }
 
-function renderDataField(key, value, data) {
+function renderDataField(key, value, data, state) {
   if (value == null || value === "") return "";
   if (Array.isArray(value)) {
     if (!value.length) return "";
-    return renderSection({ title: labelize(key), rows: value.slice(0, 12) }, data);
+    return renderSection({ title: labelize(key), rows: value.slice(0, 12) }, data, state, key);
   }
   if (typeof value === "object") {
     const rows = renderObjectRows(value, data);
-    return rows.length ? renderSection({ title: labelize(key), rows }, data) : "";
+    return rows.length ? renderSection({ title: labelize(key), rows }, data, state, key) : "";
   }
-  return renderSection({ title: labelize(key), body: value }, data);
+  return renderSection({ title: labelize(key), body: value }, data, state, key);
 }
 
-function renderLooseData(spec, data) {
+function renderLooseData(spec, data, state) {
   const reserved = new Set([
     "id",
     "module",
@@ -270,10 +364,15 @@ function renderLooseData(spec, data) {
     "fetchedStatus",
     "content",
     "body",
+    "tabs",
+    "views",
+    "activeView",
+    "defaultView",
+    "initialView",
   ]);
   return Object.entries(spec)
     .filter(([key]) => !reserved.has(key))
-    .map(([key, value]) => renderDataField(key, value, data))
+    .map(([key, value]) => renderDataField(key, value, data, state))
     .filter(Boolean);
 }
 
@@ -325,6 +424,10 @@ function fetchSpecFrom(spec) {
 }
 
 function renderApp(el, spec, fetched, state) {
+  const baseSpec = spec;
+  const views = appViews(baseSpec);
+  const activeView = selectedView(baseSpec, state);
+  spec = activeView ? viewSpec(baseSpec, activeView) : baseSpec;
   const data = appData(spec, fetched);
   const visual = asObject(spec.visual);
   const metrics = asArray(spec.metrics);
@@ -335,16 +438,18 @@ function renderApp(el, spec, fetched, state) {
   const title = text(spec.title, text(state.title, "Orbit App"));
   const subtitle = spec.subtitle || spec.summary || "";
   const status = state.error || state.status || spec.status || "";
-  const renderedSections = sections.map((section) => renderSection(section, data)).filter(Boolean);
+  const renderedSections = sections
+    .map((section, index) => renderSection(section, data, state, `${state.activeView || "root"}:section-${index}`))
+    .filter(Boolean);
   const topRows = asArray(spec.items || spec.rows);
   const renderedTopRows = topRows.length
-    ? renderSection({ title: spec.itemsTitle || spec.rowsTitle || "Details", rows: topRows }, data)
+    ? renderSection({ title: spec.itemsTitle || spec.rowsTitle || "Details", rows: topRows }, data, state, `${state.activeView || "root"}:rows`)
     : "";
   const renderedContent = renderContentBlock(spec.content || spec.body || spec.description, data);
-  const looseSections = renderLooseData(spec, data);
+  const looseSections = renderLooseData(spec, data, state);
   const renderedFallbackData =
     !renderedContent && !metrics.length && !renderedSections.length && !renderedTopRows
-      ? renderDataField(spec.dataTitle || "Data", spec.data || spec.defaults || spec.dataBindings, data)
+      ? renderDataField(spec.dataTitle || "Data", spec.data || spec.defaults || spec.dataBindings, data, state)
       : "";
   const hasBody =
     subtitle ||
@@ -408,6 +513,30 @@ function renderApp(el, spec, fetched, state) {
         color: rgba(230, 242, 250, 0.78);
         font-size: 13px;
         line-height: 1.5;
+      }
+      .app-shell-tabs {
+        display: flex;
+        gap: 7px;
+        margin-top: 14px;
+        overflow-x: auto;
+        scrollbar-width: thin;
+      }
+      .app-shell-tab {
+        flex: 0 0 auto;
+        min-height: 32px;
+        padding: 7px 10px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        color: rgba(235, 244, 252, 0.78);
+        background: rgba(255, 255, 255, 0.06);
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .app-shell-tab.is-active {
+        color: #071019;
+        background: ${accent};
+        border-color: color-mix(in srgb, ${accent} 70%, white);
       }
       .app-shell-content {
         margin-top: 14px;
@@ -490,6 +619,54 @@ function renderApp(el, spec, fetched, state) {
         text-align: right;
         overflow-wrap: anywhere;
       }
+      .app-shell-checklist {
+        display: grid;
+        gap: 7px;
+        margin: 10px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+      .app-shell-check {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-height: 42px;
+        padding: 9px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        color: inherit;
+        background: rgba(255, 255, 255, 0.055);
+        text-align: left;
+        cursor: pointer;
+      }
+      .app-shell-check.is-checked {
+        background: color-mix(in srgb, ${accent} 18%, rgba(255, 255, 255, 0.06));
+      }
+      .app-shell-check-box {
+        width: 20px;
+        height: 20px;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: #071019;
+        background: ${accent};
+        font-size: 12px;
+        font-weight: 900;
+        flex: 0 0 auto;
+      }
+      .app-shell-check-copy {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+      .app-shell-check-copy strong {
+        color: rgba(224, 239, 250, 0.65);
+        font-size: 11px;
+        font-weight: 650;
+      }
       .app-shell-actions {
         display: flex;
         flex-wrap: wrap;
@@ -529,6 +706,7 @@ function renderApp(el, spec, fetched, state) {
         ${status ? `<div class="app-shell-status">${escapeHtml(formatBoundValue(status, data))}</div>` : ""}
       </div>
       ${subtitle ? `<p class="app-shell-summary">${escapeHtml(formatBoundValue(subtitle, data))}</p>` : ""}
+      ${renderViewTabs(views, state)}
       ${renderedContent}
       ${metrics.length ? `<div class="app-shell-metrics">${metrics.map((metric) => renderMetric(metric, data)).join("")}</div>` : ""}
       ${renderedSections.join("")}
@@ -575,6 +753,21 @@ export function render(el, ctx = {}) {
     renderApp(el, spec, data, state);
     el.querySelectorAll("[data-app-action='refresh']").forEach((button) => {
       button.addEventListener("click", () => void update(), { once: true });
+    });
+    el.querySelectorAll("[data-app-view]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.activeView = button.getAttribute("data-app-view") || "";
+        draw(currentData);
+      });
+    });
+    el.querySelectorAll("[data-app-check]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const key = button.getAttribute("data-app-check") || "";
+        if (!key) return;
+        if (!state.checked || typeof state.checked !== "object") state.checked = {};
+        state.checked[key] = !state.checked[key];
+        draw(currentData);
+      });
     });
   };
 

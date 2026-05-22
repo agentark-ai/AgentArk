@@ -1,4 +1,4 @@
-//! Generated ArkMemory verification check.
+//! Generated Memory verification check.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

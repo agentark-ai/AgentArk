@@ -702,9 +702,11 @@ mod tests {
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
         assert!(result.sanitized_text.contains("You are AgentArk."));
-        assert!(!result
-            .sanitized_text
-            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
     }
 
     #[test]
@@ -717,9 +719,11 @@ mod tests {
         );
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
-        assert!(result
-            .sanitized_text
-            .contains("rtsp://192.168.29.61:554/live.sdp"));
+        assert!(
+            result
+                .sanitized_text
+                .contains("rtsp://192.168.29.61:554/live.sdp")
+        );
         assert!(result.sanitized_text.contains("bare host [IP]"));
     }
 
@@ -758,9 +762,11 @@ mod tests {
         );
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
         assert!(result.sanitized_text.contains("Example User"));
-        assert!(!result
-            .sanitized_text
-            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
     }
 
     #[test]
@@ -788,9 +794,11 @@ mod tests {
         );
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
-        assert!(!result
-            .sanitized_text
-            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
     }
 
     #[test]
@@ -807,9 +815,11 @@ mod tests {
         assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
         assert!(result.sanitized_text.contains("Example User"));
         assert!(result.sanitized_text.contains("[REDACTED_SECRET]"));
-        assert!(!result
-            .sanitized_text
-            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
+        assert!(
+            !result
+                .sanitized_text
+                .contains("[SENSITIVE_CONTEXT_WITHHELD")
+        );
     }
 
     #[test]

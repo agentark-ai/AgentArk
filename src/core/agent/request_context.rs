@@ -573,31 +573,21 @@ impl Agent {
     pub(super) async fn recent_messages_for_intent_gating(
         &self,
         conversation_id: &str,
-        current_message: &str,
+        _current_message: &str,
     ) -> Vec<ConversationMessage> {
-        let mut history = {
+        let history = {
             let guard = self.conversation_history.read().await;
             guard.get(conversation_id).cloned().unwrap_or_default()
         };
-        if let Some(last) = history.last() {
-            if last.role == "user" && last.content.trim() == current_message.trim() {
-                history.pop();
-            }
-        }
         if !history.is_empty() {
             return history;
         }
 
-        let mut stored = self
+        let stored = self
             .encrypted_storage
             .get_recent_messages_decrypted(conversation_id, 8)
             .await
             .unwrap_or_default();
-        if let Some(last) = stored.last() {
-            if last.role == "user" && last.content.trim() == current_message.trim() {
-                stored.pop();
-            }
-        }
         stored
             .into_iter()
             .map(|msg| ConversationMessage {

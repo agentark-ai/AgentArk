@@ -282,7 +282,9 @@ pub(super) fn clarification_choices_from_operational_payload(
     .unwrap_or_default()
 }
 
-fn direct_chat_approval_id_from_choice(choice: &crate::core::ClarificationChoice) -> Option<String> {
+fn direct_chat_approval_id_from_choice(
+    choice: &crate::core::ClarificationChoice,
+) -> Option<String> {
     choice
         .approval
         .as_ref()
@@ -438,6 +440,11 @@ pub(super) async fn get_conversation_messages(
                     let input_tokens = metrics.map(|row| row.input_tokens).unwrap_or(0);
                     let output_tokens = metrics.map(|row| row.output_tokens).unwrap_or(0);
                     let total_tokens = metrics.map(|row| row.total_tokens).unwrap_or(0);
+                    let cached_prompt_tokens =
+                        metrics.map(|row| row.cached_prompt_tokens).unwrap_or(0);
+                    let cache_creation_prompt_tokens = metrics
+                        .map(|row| row.cache_creation_prompt_tokens)
+                        .unwrap_or(0);
                     let duration_ms = metrics.and_then(|row| row.duration_ms);
                     let time_to_first_token_ms =
                         metrics.and_then(|row| row.time_to_first_token_ms);
@@ -447,6 +454,8 @@ pub(super) async fn get_conversation_messages(
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "total_tokens": total_tokens,
+                        "cached_prompt_tokens": cached_prompt_tokens,
+                        "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
                         "duration_ms": duration_ms,
                         "time_to_first_token_ms": time_to_first_token_ms,
                     });

@@ -30,7 +30,7 @@ import {
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
 import { formatUiTime } from "../../lib/dateFormat";
 import { formatChannelSource } from "../channelLabels";
@@ -51,13 +51,52 @@ import { humanTs } from "./workspaceUiBits";
 import type { TraceOperationalEvent, TraceSummary } from "../../types";
 
 const REFRESH_MS = 8000;
+type TraceSection = "history" | "agentark" | "sync" | "exports" | "security";
+
+const TRACE_SECTIONS = new Set<TraceSection>([
+  "history",
+  "agentark",
+  "sync",
+  "exports",
+  "security",
+]);
+
+function traceSectionFromLocationSearch(): TraceSection {
+  if (typeof window === "undefined") return "history";
+  const raw = new URLSearchParams(window.location.search).get("section") || "";
+  const normalized = raw.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  const compact = normalized.replace(/-/g, "");
+  if (TRACE_SECTIONS.has(normalized as TraceSection)) {
+    return normalized as TraceSection;
+  }
+  if (TRACE_SECTIONS.has(compact as TraceSection)) {
+    return compact as TraceSection;
+  }
+  return "history";
+}
+
+function setTraceSectionLocationSearch(section: TraceSection) {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (section === "history") {
+    url.searchParams.delete("section");
+  } else {
+    url.searchParams.set("section", section);
+  }
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextUrl !== currentUrl) {
+    window.history.replaceState(null, "", nextUrl);
+  }
+}
+
 const TRACE_EVENT_TYPE_PALETTE = [
   "#ff9b9b",
   "#ffbf82",
-  "#7ab8ff",
-  "#5dd4c5",
+  "#78f2b0",
+  "#d8ad78",
   "#89d7ab",
-  "#8fa3c9",
+  "#c8d8c9",
   "#f2c14e",
 ];
 
@@ -166,6 +205,26 @@ type TraceEvidenceItem = {
   type: string;
 };
 
+type TraceReceiptLine = {
+  label: string;
+  value: string;
+};
+
+type TraceReceiptItem = {
+  label: string;
+  detail: string;
+  status?: string;
+};
+
+type TraceRunReceipt = {
+  summary: string;
+  rows: TraceReceiptLine[];
+  actions: TraceReceiptItem[];
+  outputs: TraceReceiptItem[];
+  evidence: TraceReceiptItem[];
+  failures: TraceReceiptItem[];
+};
+
 type TraceStepConsoleView = {
   detail: string;
   dataText: string;
@@ -246,6 +305,205 @@ function buildTraceArtifactBlocks(artifacts: JsonRecord[]): string {
     })
     .filter(Boolean)
     .join("\n\n");
+}
+
+function firstReceiptString(record: JsonRecord, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+  }
+  return "";
+}
+
+function traceReceiptStatus(record: JsonRecord, fallback = ""): string {
+  return firstReceiptString(record, [
+    "status",
+    "state",
+    "outcome",
+    "result",
+    "type",
+    "step_type",
+  ]) || fallback;
+}
+
+function traceReceiptStatusColor(
+  status: string,
+): "default" | "success" | "warning" | "error" {
+  const normalized = status.trim().toLowerCase();
+  if (
+    normalized === "completed" ||
+    normalized === "success" ||
+    normalized === "succeeded" ||
+    normalized === "ok"
+  ) {
+    return "success";
+  }
+  if (
+    normalized === "failed" ||
+    normalized === "failure" ||
+    normalized === "error" ||
+    normalized === "cancelled" ||
+    normalized === "canceled"
+  ) {
+    return "error";
+  }
+  if (
+    normalized === "warning" ||
+    normalized === "blocked" ||
+    normalized === "timeout" ||
+    normalized === "timed_out"
+  ) {
+    return "warning";
+  }
+  return "default";
+}
+
+function traceReceiptIsFailure(record: JsonRecord): boolean {
+  if (record.success === false || record.ok === false) return true;
+  return traceReceiptStatusColor(traceReceiptStatus(record)) === "error";
+}
+
+function traceReceiptItemDetail(record: JsonRecord): string {
+  const direct = firstReceiptString(record, [
+    "failure_class",
+    "last_error",
+    "error",
+    "error_text",
+    "result_summary",
+    "summary",
+    "detail",
+    "message",
+    "outcome",
+  ]);
+  if (direct) return truncateTraceEvidence(direct, 180);
+  const latency = firstReceiptString(record, ["latency_ms", "duration_ms"]);
+  return latency ? `${latency} ms` : "";
+}
+
+function traceReceiptActionLabel(record: JsonRecord, fallback: string): string {
+  return (
+    firstReceiptString(record, [
+      "tool_name",
+      "action_name",
+      "event_type",
+      "kind",
+      "title",
+      "name",
+    ]) || fallback
+  );
+}
+
+function buildTraceRunReceipt(
+  trace: JsonRecord,
+  steps: JsonRecord[],
+): TraceRunReceipt {
+  const executionRun = asRecord(trace.execution_run);
+  const toolAttempts = pickRecords(trace, "tool_attempts");
+  const operationalLogs = pickRecords(trace, "operational_logs");
+  const checkpoints = pickRecords(trace, "checkpoints");
+  const artifacts = steps.flatMap(pickTraceStepArtifacts);
+  const status = traceReceiptStatus(trace, str(trace.status, "running"));
+  const duration = formatTraceDuration(trace.duration_ms);
+  const resultSummary =
+    firstReceiptString(executionRun, ["result_summary", "summary"]) ||
+    firstReceiptString(trace, ["result_summary", "response"]);
+  const summary =
+    resultSummary ||
+    (status.trim().toLowerCase() === "completed"
+      ? `Completed in ${duration}`
+      : `Current status: ${status || "running"}`);
+
+  const rows = [
+    { label: "Outcome", value: status || "-" },
+    { label: "Duration", value: duration },
+    {
+      label: "Steps",
+      value: String(num(trace.step_count, steps.length)),
+    },
+    { label: "Source", value: formatChannelSource(str(trace.channel, "chat"), "Chat") },
+    str(trace.model) ? { label: "Model", value: str(trace.model) } : null,
+    num(trace.total_tokens, 0) > 0
+      ? { label: "Tokens", value: String(num(trace.total_tokens, 0)) }
+      : null,
+  ].filter((row): row is TraceReceiptLine => Boolean(row));
+
+  const actions: TraceReceiptItem[] = [
+    ...toolAttempts.map((attempt, index) => ({
+      label: traceReceiptActionLabel(attempt, `Tool attempt ${index + 1}`),
+      status: traceReceiptStatus(attempt, "recorded"),
+      detail: traceReceiptItemDetail(attempt),
+    })),
+    ...operationalLogs.slice(0, Math.max(0, 8 - toolAttempts.length)).map(
+      (event, index) => ({
+        label: traceReceiptActionLabel(event, `Operational event ${index + 1}`),
+        status:
+          typeof event.success === "boolean"
+            ? event.success
+              ? "success"
+              : "failed"
+            : traceReceiptStatus(event, "recorded"),
+        detail: traceReceiptItemDetail(event),
+      }),
+    ),
+  ].filter((item) => item.label || item.detail);
+
+  const fallbackActions =
+    actions.length > 0
+      ? actions
+      : steps.slice(0, 6).map((step, index) => ({
+          label: firstReceiptString(step, ["title", "source"]) || `Step ${index + 1}`,
+          status: traceReceiptStatus(step, "recorded"),
+          detail: traceReceiptItemDetail(step),
+        }));
+
+  const outputs = uniqueNonEmptyStrings(
+    artifacts.map((artifact) => traceArtifactChipLabel(artifact)),
+  )
+    .slice(0, 6)
+    .map((label) => ({ label, detail: "Artifact" }));
+  if (outputs.length === 0 && str(trace.response).trim()) {
+    outputs.push({
+      label: "Final output",
+      detail: truncateTraceEvidence(str(trace.response), 180),
+    });
+  }
+
+  const evidence = uniqueNonEmptyStrings([
+    ...artifacts.map((artifact) => traceArtifactSummary(artifact)),
+    ...steps.map((step) => firstReceiptString(step, ["ref_id", "source"])),
+    ...checkpoints.map((checkpoint) =>
+      firstReceiptString(checkpoint, ["label", "kind", "id"]),
+    ),
+  ])
+    .slice(0, 6)
+    .map((value) => ({
+      label: truncateTraceEvidence(value, 120),
+      detail: "Evidence",
+    }));
+
+  const failures = [
+    ...toolAttempts.filter(traceReceiptIsFailure),
+    ...operationalLogs.filter(traceReceiptIsFailure),
+    ...steps.filter(traceReceiptIsFailure),
+  ]
+    .slice(0, 4)
+    .map((item, index) => ({
+      label: traceReceiptActionLabel(item, `Failure ${index + 1}`),
+      status: traceReceiptStatus(item, "failed"),
+      detail: traceReceiptItemDetail(item) || "No failure detail recorded.",
+    }));
+
+  return {
+    summary: truncateTraceEvidence(summary, 320),
+    rows,
+    actions: fallbackActions.slice(0, 8),
+    outputs,
+    evidence,
+    failures,
+  };
 }
 
 function truncateTraceEvidence(value: string, max = 240): string {
@@ -642,7 +900,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
     if (!traceKind.startsWith("self_evolve.")) return;
 
     const status = str(step.type, str(step.step_type, "info")).trim() || "info";
-    const title = str(step.title, "ArkEvolve").trim();
+    const title = str(step.title, "Evolve").trim();
     const detail = str(step.detail, "").trim();
     const chips: string[] = [];
     const evidence: string[] = [];
@@ -653,7 +911,6 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       const request = str(data.request, "").trim();
       chips.push(`Mode ${mode}`);
       if (toBool(data.apply_promotion)) chips.push("Promotion enabled");
-      if (toBool(data.allow_code_writes)) chips.push("Code writes allowed");
       const canaryRollout = num(data.canary_rollout_percent, -1);
       if (canaryRollout > 0) chips.push(`Canary ${canaryRollout}%`);
       rationale = request;
@@ -888,26 +1145,6 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       const successGain = num(replay.success_gain, Number.NaN);
       if (Number.isFinite(successGain))
         evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
-    } else if (traceKind === "self_evolve.code.blocked") {
-      chips.push("Code evolution");
-      chips.push("Blocked");
-      rationale = str(data.request, "").trim();
-    } else if (traceKind === "self_evolve.code.result") {
-      const filesChanged = stringList(data.files_changed);
-      const securityWarnings = stringList(data.security_warnings);
-      const iterations = num(data.iterations_used, 0);
-      chips.push(
-        `${filesChanged.length} file${filesChanged.length === 1 ? "" : "s"}`,
-      );
-      chips.push(`${iterations} iteration${iterations === 1 ? "" : "s"}`);
-      if (toBool(data.push_recommended)) chips.push("Push suggested");
-      rationale = str(data.diff_summary, "").trim();
-      if (filesChanged.length)
-        evidence.push(`Files changed: ${filesChanged.join(", ")}`);
-      if (securityWarnings.length)
-        evidence.push(`Security warnings: ${securityWarnings.join(" | ")}`);
-      const error = str(data.error, "").trim();
-      if (error) evidence.push(`Error: ${error}`);
     } else if (
       traceKind === "self_evolve.manual_action.result" ||
       traceKind === "self_evolve.manual_action.request"
@@ -1003,9 +1240,9 @@ type TracePageProps = {
 };
 
 export default function TracePage({ autoRefresh }: TracePageProps) {
-  const [traceSection, setTraceSection] = useState<
-    "history" | "agentark" | "sync" | "exports" | "security"
-  >("history");
+  const [traceSection, setTraceSection] = useState<TraceSection>(() =>
+    traceSectionFromLocationSearch(),
+  );
   const [traceRange, setTraceRange] = useState<TraceRange>("7d");
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
   const [selectedOperationalEvent, setSelectedOperationalEvent] =
@@ -1021,6 +1258,19 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
   const historyPageSize = 20;
   const activityPageSize = 20;
   const syncRunPageSize = 12;
+
+  useEffect(() => {
+    const syncSectionFromLocation = () => {
+      setTraceSection(traceSectionFromLocationSearch());
+    };
+    window.addEventListener("popstate", syncSectionFromLocation);
+    window.addEventListener("agentark:navigation", syncSectionFromLocation);
+    syncSectionFromLocation();
+    return () => {
+      window.removeEventListener("popstate", syncSectionFromLocation);
+      window.removeEventListener("agentark:navigation", syncSectionFromLocation);
+    };
+  }, []);
 
   const traceSince = traceRangeSinceISO(traceRange);
   const traceQ = useQuery({
@@ -1130,6 +1380,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
       : selectedTraceStatus === "failed"
         ? `Failed after ${formatTraceDuration(selectedTrace.duration_ms)}`
         : `Status: ${selectedTraceStatus}`;
+  const traceRunReceipt = buildTraceRunReceipt(selectedTrace, steps);
   const renderDiagnosticsSectionHeader = ({
     eyebrow,
     title,
@@ -1197,7 +1448,10 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
           </TextField>
         }
       />
-      <Box className="list-shell workspace-page-subnav-shell">
+      <Box
+        className="list-shell workspace-page-subnav-shell"
+        data-tour-target="trace-tabs"
+      >
         <Stack
           direction="row"
           sx={{
@@ -1208,8 +1462,12 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
           <Tabs
             value={traceSection}
             onChange={(_, value) => {
-              setTraceSection(value);
-              if (value !== "agentark") setActivityPage(0);
+              const nextSection = TRACE_SECTIONS.has(value as TraceSection)
+                ? (value as TraceSection)
+                : "history";
+              setTraceSection(nextSection);
+              setTraceSectionLocationSearch(nextSection);
+              if (nextSection !== "agentark") setActivityPage(0);
             }}
             variant="scrollable"
             allowScrollButtonsMobile
@@ -2186,6 +2444,147 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                 ) : null}
               </Stack>
 
+              <Box className="diagnostics-content-card diagnostics-content-card--receipt">
+                <Stack spacing={1.1}>
+                  <Stack
+                    direction={{ xs: "column", md: "row" }}
+                    spacing={1}
+                    sx={{
+                      justifyContent: "space-between",
+                      alignItems: { xs: "flex-start", md: "center" },
+                    }}
+                  >
+                    <Box>
+                      <Typography variant="subtitle2">Run receipt</Typography>
+                      <Typography
+                        variant="body2"
+                        sx={{ color: "text.secondary", mt: 0.25 }}
+                      >
+                        {traceRunReceipt.summary}
+                      </Typography>
+                    </Box>
+                    <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap" }}>
+                      {traceRunReceipt.rows.map((row) => (
+                        <Chip
+                          key={`${row.label}-${row.value}`}
+                          size="small"
+                          variant="outlined"
+                          label={`${row.label}: ${row.value}`}
+                        />
+                      ))}
+                    </Stack>
+                  </Stack>
+
+                  <Grid2 container spacing={1}>
+                    <Grid2 size={{ xs: 12, md: 6 }}>
+                      <Box className="diagnostics-subcard">
+                        <Typography variant="caption" className="diagnostics-card-label">
+                          Actions
+                        </Typography>
+                        <Stack spacing={0.75} sx={{ mt: 0.75 }}>
+                          {traceRunReceipt.actions.length === 0 ? (
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              No action records.
+                            </Typography>
+                          ) : (
+                            traceRunReceipt.actions.map((item, index) => (
+                              <Stack
+                                key={`${item.label}-${index}`}
+                                direction="row"
+                                spacing={0.75}
+                                sx={{ alignItems: "flex-start" }}
+                              >
+                                {item.status ? (
+                                  <Chip
+                                    size="small"
+                                    color={traceReceiptStatusColor(item.status)}
+                                    variant="outlined"
+                                    label={item.status}
+                                  />
+                                ) : null}
+                                <Box sx={{ minWidth: 0 }}>
+                                  <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                                    {item.label}
+                                  </Typography>
+                                  {item.detail ? (
+                                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                      {item.detail}
+                                    </Typography>
+                                  ) : null}
+                                </Box>
+                              </Stack>
+                            ))
+                          )}
+                        </Stack>
+                      </Box>
+                    </Grid2>
+                    <Grid2 size={{ xs: 12, md: 6 }}>
+                      <Box className="diagnostics-subcard">
+                        <Typography variant="caption" className="diagnostics-card-label">
+                          Evidence and output
+                        </Typography>
+                        <Stack spacing={0.75} sx={{ mt: 0.75 }}>
+                          {[...traceRunReceipt.outputs, ...traceRunReceipt.evidence]
+                            .slice(0, 8)
+                            .map((item, index) => (
+                              <Box key={`${item.label}-${index}`}>
+                                <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                                  {item.label}
+                                </Typography>
+                                {item.detail ? (
+                                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                    {item.detail}
+                                  </Typography>
+                                ) : null}
+                              </Box>
+                            ))}
+                          {traceRunReceipt.outputs.length === 0 &&
+                          traceRunReceipt.evidence.length === 0 ? (
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              No evidence records.
+                            </Typography>
+                          ) : null}
+                        </Stack>
+                      </Box>
+                    </Grid2>
+                    {traceRunReceipt.failures.length > 0 ? (
+                      <Grid2 size={{ xs: 12 }}>
+                        <Box className="diagnostics-subcard">
+                          <Typography variant="caption" className="diagnostics-card-label">
+                            Needs attention
+                          </Typography>
+                          <Stack spacing={0.75} sx={{ mt: 0.75 }}>
+                            {traceRunReceipt.failures.map((item, index) => (
+                              <Stack
+                                key={`${item.label}-${index}`}
+                                direction="row"
+                                spacing={0.75}
+                                sx={{ alignItems: "flex-start" }}
+                              >
+                                <Chip
+                                  size="small"
+                                  color={traceReceiptStatusColor(item.status || "failed")}
+                                  variant="outlined"
+                                  label={item.status || "failed"}
+                                />
+                                <Box>
+                                  <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                                    {item.label}
+                                  </Typography>
+                                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                    {item.detail}
+                                  </Typography>
+                                </Box>
+                              </Stack>
+                            ))}
+                          </Stack>
+                        </Box>
+                      </Grid2>
+                    ) : null}
+                  </Grid2>
+                </Stack>
+              </Box>
+
               {/* Input / Output side by side on wide screens */}
               <Stack direction={{ xs: "column", md: "row" }} spacing={1.25}>
                 <Box
@@ -2226,7 +2625,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
               {evolutionReviewCards.length > 0 ? (
                 <Box className="diagnostics-content-card diagnostics-content-card--review">
                   <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                    ArkEvolve Review
+                    Evolve Review
                   </Typography>
                   <Stack spacing={0.75}>
                     {evolutionReviewCards.map((card) => (

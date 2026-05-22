@@ -9,7 +9,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     AgentDocTocEntry {
         label: "AgentArk manual",
         location: "src/docs/agentark_manual.rs",
-        use_for: "user-facing setup, navigation, feature, Docker, memory, ArkReflect, built-in connector, and custom integration guidance",
+        use_for: "user-facing setup, navigation, feature, Docker, memory, Reflect, built-in connector, and custom integration guidance",
     },
     AgentDocTocEntry {
         label: "AgentArk knowledge retrieval",
@@ -42,8 +42,8 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
         use_for: "API routes, settings endpoints, local web UI behavior, and browser-visible workflows",
     },
     AgentDocTocEntry {
-        label: "ArkReflect",
-        location: "src/channels/http/reflect_control.rs; src/storage/entities/semantic_work_unit.rs; frontend/src/components/pages/ArkReflectPage.tsx; src/docs/agentark_manual.rs",
+        label: "Reflect",
+        location: "src/channels/http/reflect_control.rs; src/storage/entities/semantic_work_unit.rs; frontend/src/components/pages/ReflectPage.tsx; src/docs/agentark_manual.rs",
         use_for: "cached day/week/month retrospectives, /reflect API queries, derived semantic work units, source coverage, related-history lookup, Daily Digest delivery, and Panorama UI behavior",
     },
     AgentDocTocEntry {
@@ -69,7 +69,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     AgentDocTocEntry {
         label: "Prompt telemetry and canary safety",
         location: "src/core/llm.rs; src/core/agent.rs; src/core/learning.rs; src/core/observability.rs; src/channels/http.rs; frontend/src/components/NativeWorkspace.tsx",
-        use_for: "final prompt and tool-schema telemetry, Trace prompt-telemetry steps, ArkEvolve review signals, observability export, and prompt-profile canary safety review flows",
+        use_for: "final prompt and tool-schema telemetry, Trace prompt-telemetry steps, Evolve review signals, observability export, and prompt-profile canary safety review flows",
     },
     AgentDocTocEntry {
         label: "Security and secrets",
@@ -88,8 +88,8 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     },
     AgentDocTocEntry {
         label: "Skill management",
-        location: "src/docs/agentark_manual.rs; src/security/skill_review.rs; src/security/capabilities.rs; src/channels/http/actions.rs; src/runtime/mod.rs",
-        use_for: "user-added skill import, editing, semantic capability review, deterministic skill policy, and reviewed skill runtime loading",
+        location: "src/docs/agentark_manual.rs; src/core/agent/spine.rs; src/core/agent/tool_execution.rs; src/core/skill_marketplaces.rs; src/security/skill_review.rs; src/security/capabilities.rs; src/channels/http/actions.rs; src/channels/http/skill_marketplaces.rs; src/runtime/mod.rs",
+        use_for: "chat and UI skill import, editing, semantic capability review, deterministic skill policy, confirmation gates, marketplace management, and reviewed skill runtime loading",
     },
 ];
 

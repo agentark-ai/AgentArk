@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use sea_orm::entity::prelude::PgVector;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use super::config::{AgentConfig, EmbeddingsProviderKind};

@@ -3,35 +3,35 @@ import type { JsonRecord } from "./pageHelpers";
 export const ADVANCED_SENTINEL_SIGNAL_OPTIONS = [
   {
     key: "enabled",
-    label: "Keep ArkSentinel available",
+    label: "Keep Sentinel available",
     description: "Lets it stay ready in the background.",
-    enabledMessage: "ArkSentinel stays available in the background.",
-    disabledMessage: "ArkSentinel follow-up scanning is turned off.",
+    enabledMessage: "Sentinel stays available in the background.",
+    disabledMessage: "Sentinel follow-up scanning is turned off.",
   },
   {
     key: "watch_in_app",
     label: "Watch chats and runs",
     description:
       "Uses AgentArk chats and execution runs to spot failed, blocked, stalled, or needs-input follow-ups.",
-    enabledMessage: "ArkSentinel will watch AgentArk chats and runs for follow-ups.",
-    disabledMessage: "ArkSentinel will ignore AgentArk chats and runs.",
+    enabledMessage: "Sentinel will watch AgentArk chats and runs for follow-ups.",
+    disabledMessage: "Sentinel will ignore AgentArk chats and runs.",
   },
   {
     key: "watch_connected_services",
     label: "Pay attention to connected apps",
     description:
       "Uses signals from Gmail, Calendar, Slack, and other services once you connect them.",
-    enabledMessage: "ArkSentinel will watch connected apps for follow-ups.",
-    disabledMessage: "ArkSentinel will ignore connected-app signals.",
+    enabledMessage: "Sentinel will watch connected apps for follow-ups.",
+    disabledMessage: "Sentinel will ignore connected-app signals.",
   },
   {
     key: "infer_new_automations",
     label: "Look for routines worth automating",
     description:
       "Uses recent activity to surface one daily automation review plus concrete reminder, watcher, or workflow opportunities.",
-    enabledMessage: "ArkSentinel will keep reviewing recent activity for automation opportunities.",
+    enabledMessage: "Sentinel will keep reviewing recent activity for automation opportunities.",
     disabledMessage:
-      "ArkSentinel will stop sending daily automation reviews or proposing new routines from recent work.",
+      "Sentinel will stop sending daily automation reviews or proposing new routines from recent work.",
   },
 ] as const;
 

@@ -10,7 +10,8 @@
 
 use anyhow::{Context, Result};
 use scraper::{Html, Selector};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -5871,7 +5872,7 @@ fn join_text_lines_after_patch(lines: &[String], trailing_newline: bool) -> Stri
     out
 }
 
-fn apply_unified_diff_to_text(original: &str, patch: &str) -> Result<String> {
+pub(crate) fn apply_unified_diff_to_text(original: &str, patch: &str) -> Result<String> {
     let (original_lines, had_trailing_newline) = split_text_lines_for_patch(original);
     let patch_lines = patch.lines().collect::<Vec<_>>();
     let mut out = Vec::<String>::new();
@@ -6089,6 +6090,529 @@ async fn effective_app_files_for_validation(
         );
     }
     Ok(files)
+}
+
+fn app_deploy_allows_duplicate(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("allow_duplicate")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || arguments
+            .get("duplicate_policy")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| value == "create_new")
+}
+
+fn update_hasher_with_json_value(hasher: &mut Sha256, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => hasher.update(b"null"),
+        serde_json::Value::Bool(flag) => hasher.update(if *flag {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        }),
+        serde_json::Value::Number(number) => hasher.update(number.to_string().as_bytes()),
+        serde_json::Value::String(text) => {
+            hasher.update(b"\"");
+            hasher.update(text.as_bytes());
+            hasher.update(b"\"");
+        }
+        serde_json::Value::Array(items) => {
+            hasher.update(b"[");
+            for item in items {
+                update_hasher_with_json_value(hasher, item);
+                hasher.update(b",");
+            }
+            hasher.update(b"]");
+        }
+        serde_json::Value::Object(object) => {
+            hasher.update(b"{");
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                hasher.update(key.as_bytes());
+                hasher.update(b":");
+                if let Some(value) = object.get(key) {
+                    update_hasher_with_json_value(hasher, value);
+                }
+                hasher.update(b",");
+            }
+            hasher.update(b"}");
+        }
+    }
+}
+
+fn app_deploy_content_fingerprint(
+    effective_files: &serde_json::Map<String, serde_json::Value>,
+    title: &str,
+    entry_command: Option<&str>,
+    install_command: Option<&str>,
+    stop_command: Option<&str>,
+    runtime_required: bool,
+    runtime_preference: RuntimePreference,
+    runtime_image: Option<&str>,
+    required_inputs: &[AppRequiredInput],
+    config_values: &HashMap<String, String>,
+    runtime_actions: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentark-app-content-v1\n");
+    hasher.update(b"title\0");
+    hasher.update(title.trim().as_bytes());
+    hasher.update(b"\nentry\0");
+    hasher.update(entry_command.unwrap_or("").trim().as_bytes());
+    hasher.update(b"\ninstall\0");
+    hasher.update(install_command.unwrap_or("").trim().as_bytes());
+    hasher.update(b"\nstop\0");
+    hasher.update(stop_command.unwrap_or("").trim().as_bytes());
+    hasher.update(b"\nruntime_required\0");
+    hasher.update(if runtime_required {
+        b"true".as_slice()
+    } else {
+        b"false".as_slice()
+    });
+    hasher.update(b"\nruntime_preference\0");
+    hasher.update(runtime_preference.as_str().as_bytes());
+    hasher.update(b"\nruntime_image\0");
+    hasher.update(runtime_image.unwrap_or("").trim().as_bytes());
+
+    let required_inputs_json =
+        serde_json::to_value(required_inputs).unwrap_or_else(|_| serde_json::json!([]));
+    hasher.update(b"\nrequired_inputs\0");
+    update_hasher_with_json_value(&mut hasher, &required_inputs_json);
+
+    let config_values_json =
+        serde_json::to_value(config_values).unwrap_or_else(|_| serde_json::json!({}));
+    hasher.update(b"\nconfig_values\0");
+    update_hasher_with_json_value(&mut hasher, &config_values_json);
+
+    let runtime_actions_json =
+        serde_json::to_value(runtime_actions).unwrap_or_else(|_| serde_json::json!([]));
+    hasher.update(b"\nruntime_actions\0");
+    update_hasher_with_json_value(&mut hasher, &runtime_actions_json);
+
+    let mut file_paths = effective_files.keys().collect::<Vec<_>>();
+    file_paths.sort();
+    for path in file_paths {
+        hasher.update(b"\nfile\0");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        if let Some(body) = effective_files.get(path).and_then(|value| value.as_str()) {
+            hasher.update(body.as_bytes());
+        } else if let Some(value) = effective_files.get(path) {
+            update_hasher_with_json_value(&mut hasher, value);
+        }
+    }
+
+    hex::encode(hasher.finalize())
+}
+
+fn normalize_artifact_identity_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn push_identity_text(parts: &mut Vec<String>, label: &str, value: &str) {
+    let normalized = normalize_artifact_identity_text(value);
+    if !normalized.is_empty() {
+        parts.push(format!("{}={}", label, normalized));
+    }
+}
+
+fn collect_identity_urls_from_value(value: &serde_json::Value, out: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.starts_with("http://") || text.starts_with("https://") {
+                out.insert(text.trim().to_ascii_lowercase());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_identity_urls_from_value(item, out);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values() {
+                collect_identity_urls_from_value(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_identity_urls_from_text(text: &str, out: &mut BTreeSet<String>) {
+    static URL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let regex = URL_RE.get_or_init(|| {
+        regex::Regex::new(r#"https?://[^\s"'<>)]+"#).expect("valid URL extraction regex")
+    });
+    for capture in regex.find_iter(text).take(32) {
+        let url = capture
+            .as_str()
+            .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ')' | ']'))
+            .to_ascii_lowercase();
+        if !url.is_empty() {
+            out.insert(url);
+        }
+    }
+}
+
+fn app_bundle_textual_data_signature(
+    effective_files: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    static HTML_STYLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static HTML_SCRIPT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    for (path, value) in effective_files {
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.ends_with(".css")
+            || path_lower.ends_with(".svg")
+            || path_lower.ends_with(".png")
+            || path_lower.ends_with(".jpg")
+            || path_lower.ends_with(".jpeg")
+            || path_lower.ends_with(".webp")
+            || path_lower.ends_with(".gif")
+        {
+            continue;
+        }
+        let body = if path_lower.ends_with(".html") || path_lower.ends_with(".htm") {
+            let style_re = HTML_STYLE_RE.get_or_init(|| {
+                regex::Regex::new(r"(?is)<style\b[^>]*>.*?</style>")
+                    .expect("valid style block regex")
+            });
+            let script_re = HTML_SCRIPT_RE.get_or_init(|| {
+                regex::Regex::new(r"(?is)<script\b[^>]*>.*?</script>")
+                    .expect("valid script block regex")
+            });
+            let without_style = style_re.replace_all(text, " ");
+            let without_script = script_re.replace_all(&without_style, " ");
+            let html = Html::parse_document(&without_script);
+            html.root_element().text().collect::<Vec<_>>().join(" ")
+        } else {
+            text.to_string()
+        };
+        let normalized = normalize_artifact_identity_text(&body);
+        if !normalized.is_empty() {
+            parts.push(format!("{}:{}", path_lower, normalized));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentark-app-data-v1\n");
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\n");
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn app_deploy_artifact_identity_value(arguments: &serde_json::Value) -> Option<serde_json::Value> {
+    let value = arguments
+        .get("artifact_identity")
+        .or_else(|| {
+            arguments
+                .get("metadata")
+                .and_then(|metadata| metadata.get("artifact_identity"))
+        })?
+        .clone();
+    match &value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) if text.trim().is_empty() => None,
+        serde_json::Value::Array(items) if items.is_empty() => None,
+        serde_json::Value::Object(object) if object.is_empty() => None,
+        _ => Some(value),
+    }
+}
+
+fn app_deploy_artifact_identity_signature(arguments: &serde_json::Value) -> Option<String> {
+    let identity = app_deploy_artifact_identity_value(arguments)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentark-app-artifact-identity-v1\n");
+    update_hasher_with_json_value(&mut hasher, &identity);
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn app_deploy_identity_fingerprint(
+    arguments: &serde_json::Value,
+    effective_files: &serde_json::Map<String, serde_json::Value>,
+    title: &str,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    let structured_identity_signature = app_deploy_artifact_identity_signature(arguments);
+    if structured_identity_signature.is_none() {
+        push_identity_text(&mut parts, "title", title);
+    }
+    for key in [
+        "repo_url",
+        "repo_ref",
+        "repo_subdir",
+        "source_url",
+        "data_url",
+        "canonical_url",
+        "artifact_key",
+        "workflow_key",
+    ] {
+        if let Some(value) = arguments.get(key).and_then(|value| value.as_str()) {
+            push_identity_text(&mut parts, key, value);
+        }
+    }
+    let mut urls = BTreeSet::new();
+    if let Some(identity) = app_deploy_artifact_identity_value(arguments) {
+        collect_identity_urls_from_value(&identity, &mut urls);
+    }
+    if let Some(metadata) = arguments.get("metadata") {
+        collect_identity_urls_from_value(metadata, &mut urls);
+    }
+    for value in effective_files.values() {
+        if let Some(text) = value.as_str() {
+            collect_identity_urls_from_text(text, &mut urls);
+        }
+    }
+    for url in urls.iter().take(16) {
+        push_identity_text(&mut parts, "url", url);
+    }
+    let has_source_identity = parts
+        .iter()
+        .any(|part| part.starts_with("url=") || part.starts_with("repo_url="));
+    if !has_source_identity {
+        return None;
+    }
+    if let Some(signature) = structured_identity_signature {
+        parts.push(format!("artifact_identity={}", signature));
+    } else {
+        let data_signature = app_bundle_textual_data_signature(effective_files)?;
+        parts.push(format!("data={}", data_signature));
+    }
+    parts.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentark-app-identity-v1\n");
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\n");
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+async fn app_deploy_existing_fingerprint(
+    app_dir: &Path,
+    meta: &serde_json::Value,
+) -> Option<String> {
+    if let Some(fingerprint) = meta
+        .get("content_fingerprint")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(fingerprint.to_string());
+    }
+
+    let meta_opt = Some(meta.clone());
+    let files = load_existing_managed_app_text_files(app_dir, &meta_opt)
+        .await
+        .ok()?;
+    if files.is_empty() {
+        return None;
+    }
+    let title = meta
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("App");
+    let entry_command = app_meta_lifecycle_command(meta, "entry_command");
+    let install_command = app_meta_lifecycle_command(meta, "install_command");
+    let stop_command = app_meta_lifecycle_command(meta, "stop_command");
+    let runtime_required = meta
+        .get("runtime_required")
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| entry_command.is_some());
+    let runtime_preference = runtime_preference_from_opt(
+        meta.get("runtime_preference")
+            .and_then(|value| value.as_str()),
+    );
+    let runtime_image = meta.get("runtime_image").and_then(|value| value.as_str());
+    let required_inputs = parse_required_inputs(meta);
+    let config_values = meta
+        .get("config_values")
+        .and_then(|value| value.as_object())
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| match value {
+                    serde_json::Value::String(text) => Some((key.clone(), text.clone())),
+                    serde_json::Value::Bool(flag) => Some((key.clone(), flag.to_string())),
+                    serde_json::Value::Number(number) => Some((key.clone(), number.to_string())),
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let runtime_actions = parse_runtime_actions(meta);
+    Some(app_deploy_content_fingerprint(
+        &files,
+        title,
+        entry_command.as_deref(),
+        install_command.as_deref(),
+        stop_command.as_deref(),
+        runtime_required,
+        runtime_preference,
+        runtime_image,
+        &required_inputs,
+        &config_values,
+        &runtime_actions,
+    ))
+}
+
+async fn app_deploy_existing_identity_fingerprint(
+    app_dir: &Path,
+    meta: &serde_json::Value,
+) -> Option<String> {
+    if let Some(fingerprint) = meta
+        .get("artifact_identity_fingerprint")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(fingerprint.to_string());
+    }
+    let meta_opt = Some(meta.clone());
+    let files = load_existing_managed_app_text_files(app_dir, &meta_opt)
+        .await
+        .ok()?;
+    let title = meta
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("App");
+    app_deploy_identity_fingerprint(meta, &files, title)
+}
+
+async fn find_duplicate_deployed_app(
+    registry: &AppRegistry,
+    fingerprint: &str,
+    identity_fingerprint: Option<&str>,
+    exclude_app_id: Option<&str>,
+) -> Option<AppDuplicateMatch> {
+    let apps = registry.list().await;
+    for app in apps {
+        let Some(app_id) = app
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if exclude_app_id.is_some_and(|exclude| exclude == app_id) {
+            continue;
+        }
+        let Some(app_dir) = registry.get_dir(app_id).await else {
+            continue;
+        };
+        let meta = load_app_meta_json(&app_dir).await;
+        let content_matches = app_deploy_existing_fingerprint(&app_dir, &meta)
+            .await
+            .is_some_and(|existing| existing == fingerprint);
+        let identity_matches = if let Some(identity) = identity_fingerprint {
+            app_deploy_existing_identity_fingerprint(&app_dir, &meta)
+                .await
+                .is_some_and(|existing| existing == identity)
+        } else {
+            false
+        };
+        if !content_matches && !identity_matches {
+            continue;
+        }
+        let title = app
+            .get("title")
+            .and_then(|value| value.as_str())
+            .or_else(|| meta.get("title").and_then(|value| value.as_str()))
+            .unwrap_or("App")
+            .to_string();
+        let url = app
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("/apps/{}/", app_id));
+        let access_url = app
+            .get("access_url")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| url.clone());
+        let app_type = if app
+            .get("is_static")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            "static"
+        } else {
+            "dynamic"
+        }
+        .to_string();
+        return Some(AppDuplicateMatch {
+            app_id: app_id.to_string(),
+            title,
+            url,
+            access_url,
+            app_type,
+            updated_existing: false,
+            duplicate_match: if content_matches {
+                "content"
+            } else {
+                "artifact_identity"
+            }
+            .to_string(),
+        });
+    }
+    None
+}
+
+async fn app_deploy_duplicate_response(
+    duplicate: AppDuplicateMatch,
+    fingerprint: &str,
+    deploy_started: std::time::Instant,
+) -> Result<String> {
+    tracing::info!(
+        app_id = %duplicate.app_id,
+        title = %duplicate.title,
+        "Skipped duplicate app deployment because a matching app already exists"
+    );
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_total",
+        app_id = %duplicate.app_id,
+        app_type = %duplicate.app_type,
+        duration_ms = deploy_started.elapsed().as_millis() as u64,
+        updated_existing = duplicate.updated_existing,
+        duplicate_skipped = true,
+        "app deploy timing total"
+    );
+    Ok(serde_json::json!({
+        "status": "duplicate_skipped",
+        "type": duplicate.app_type,
+        "app_id": duplicate.app_id,
+        "url": duplicate.url,
+        "access_url": duplicate.access_url,
+        "title": duplicate.title,
+        "updated_existing": duplicate.updated_existing,
+        "duplicate_skipped": true,
+        "duplicate_match": duplicate.duplicate_match,
+        "content_fingerprint": fingerprint,
+        "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
+        "message": "A matching app already exists, so AgentArk skipped creating another duplicate deployment. Set allow_duplicate=true or duplicate_policy=create_new to create another copy."
+    })
+    .to_string())
 }
 
 async fn delete_empty_parent_dirs(app_dir: &Path, path: &str) {
@@ -6544,7 +7068,7 @@ fn parse_app_meta_datetime(
         .map(|value| value.with_timezone(&chrono::Utc))
 }
 
-/// Snapshot of an app's health for ArkPulse reporting
+/// Snapshot of an app's health for Pulse reporting
 pub struct AppHealthSnapshot {
     pub id: String,
     pub title: String,
@@ -6597,6 +7121,17 @@ struct ExistingAppDeployTarget {
     access_guard_enabled: bool,
     access_key: Option<String>,
     expose_public: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AppDuplicateMatch {
+    app_id: String,
+    title: String,
+    url: String,
+    access_url: String,
+    app_type: String,
+    updated_existing: bool,
+    duplicate_match: String,
 }
 
 #[derive(Debug, Clone)]
@@ -7477,7 +8012,7 @@ impl AppRegistry {
         }
     }
 
-    /// Get a health snapshot of all apps for ArkPulse, resetting request counters
+    /// Get a health snapshot of all apps for Pulse, resetting request counters
     pub async fn pulse_snapshot(&self) -> Vec<AppHealthSnapshot> {
         let app_entries: Vec<(String, Arc<RwLock<RunningApp>>)> = {
             let apps = self.apps.read().await;
@@ -8398,6 +8933,7 @@ pub async fn app_deploy(
             "app_deploy requires at least one file write, file patch, or delete_paths entry"
         );
     }
+    let allow_duplicate = app_deploy_allows_duplicate(arguments);
 
     let requested_app_id = arguments
         .get("app_id")
@@ -8741,6 +9277,76 @@ pub async fn app_deploy(
             "app deploy timing stage"
         );
     }
+    let content_fingerprint = app_deploy_content_fingerprint(
+        &effective_files,
+        title,
+        entry_command.as_deref(),
+        install_command.as_deref(),
+        stop_command.as_deref(),
+        runtime_required,
+        runtime_preference,
+        runtime_image.as_deref(),
+        &required_inputs,
+        &config_values,
+        &runtime_actions,
+    );
+    let artifact_identity_fingerprint =
+        app_deploy_identity_fingerprint(arguments, &effective_files, title);
+    if !allow_duplicate {
+        if let Some(target) = existing_target.as_ref() {
+            if let Some(meta) = target.meta.as_ref() {
+                let content_matches = app_deploy_existing_fingerprint(&target.app_dir, meta)
+                    .await
+                    .as_deref()
+                    == Some(content_fingerprint.as_str());
+                let identity_matches =
+                    if let Some(identity_fingerprint) = artifact_identity_fingerprint.as_deref() {
+                        app_deploy_existing_identity_fingerprint(&target.app_dir, meta)
+                            .await
+                            .as_deref()
+                            == Some(identity_fingerprint)
+                    } else {
+                        false
+                    };
+                if content_matches || identity_matches {
+                    let url = format!("/apps/{}/", target.app_id);
+                    let access_url = registry
+                        .issue_access_url(&target.app_id)
+                        .await
+                        .unwrap_or_else(|| url.clone());
+                    return app_deploy_duplicate_response(
+                        AppDuplicateMatch {
+                            app_id: target.app_id.clone(),
+                            title: target.title.clone(),
+                            url,
+                            access_url,
+                            app_type: if is_static { "static" } else { "dynamic" }.to_string(),
+                            updated_existing: true,
+                            duplicate_match: if content_matches {
+                                "content"
+                            } else {
+                                "artifact_identity"
+                            }
+                            .to_string(),
+                        },
+                        &content_fingerprint,
+                        deploy_started,
+                    )
+                    .await;
+                }
+            }
+        } else if let Some(duplicate) = find_duplicate_deployed_app(
+            registry,
+            &content_fingerprint,
+            artifact_identity_fingerprint.as_deref(),
+            None,
+        )
+        .await
+        {
+            return app_deploy_duplicate_response(duplicate, &content_fingerprint, deploy_started)
+                .await;
+        }
+    }
     if updating_existing {
         let stage_started = std::time::Instant::now();
         registry.stop_runtime(&app_id).await?;
@@ -8907,6 +9513,7 @@ pub async fn app_deploy(
         });
     let mut managed_files = effective_files.keys().cloned().collect::<Vec<_>>();
     managed_files.sort_unstable();
+    let artifact_identity = app_deploy_artifact_identity_value(arguments);
     let meta = serde_json::json!({
         "title": title,
         "deploy_mode": plan.mode.as_str(),
@@ -8941,6 +9548,9 @@ pub async fn app_deploy(
         "public_access_guard_enabled": public_access_guard_enabled,
         "enabled": true,
         "conversation_id": conversation_id,
+        "content_fingerprint": content_fingerprint,
+        "artifact_identity_fingerprint": artifact_identity_fingerprint,
+        "artifact_identity": artifact_identity,
         "created_at": created_at,
         "updated_at": chrono::Utc::now().to_rfc3339(),
         "last_accessed": chrono::Utc::now().to_rfc3339(),
@@ -10706,6 +11316,256 @@ edition = "2021"
                 .is_some(),
             "updated deployments should stamp updated_at"
         );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_skips_identical_static_app_unless_duplicate_allowed() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+        let args = serde_json::json!({
+            "title": "Duplicate-aware app",
+            "files": {
+                "index.html": "<!doctype html><html><body>same</body></html>"
+            }
+        });
+
+        let initial_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &args,
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("initial deploy should succeed");
+        let initial_json: serde_json::Value =
+            serde_json::from_str(&initial_result).expect("initial deploy json");
+        let initial_app_id = initial_json
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .expect("initial app id")
+            .to_string();
+
+        let duplicate_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &args,
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("duplicate deploy should reuse existing app");
+        let duplicate_json: serde_json::Value =
+            serde_json::from_str(&duplicate_result).expect("duplicate deploy json");
+        assert_eq!(
+            duplicate_json
+                .get("status")
+                .and_then(|value| value.as_str()),
+            Some("duplicate_skipped")
+        );
+        assert_eq!(
+            duplicate_json
+                .get("app_id")
+                .and_then(|value| value.as_str()),
+            Some(initial_app_id.as_str())
+        );
+        assert_eq!(registry.list().await.len(), 1);
+
+        let allowed_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Duplicate-aware app",
+                "allow_duplicate": true,
+                "files": {
+                    "index.html": "<!doctype html><html><body>same</body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("explicit duplicate deploy should succeed");
+        let allowed_json: serde_json::Value =
+            serde_json::from_str(&allowed_result).expect("allowed deploy json");
+        assert_eq!(
+            allowed_json.get("status").and_then(|value| value.as_str()),
+            Some("deployed")
+        );
+        assert_ne!(
+            allowed_json.get("app_id").and_then(|value| value.as_str()),
+            Some(initial_app_id.as_str())
+        );
+        assert_eq!(registry.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn app_deploy_skips_same_source_identity_even_when_markup_differs() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+
+        let initial_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Source-backed dashboard",
+                "files": {
+                    "index.html": "<!doctype html><html><body><a href=\"https://example.com/data\">Data</a><section>same data</section></body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("initial deploy should succeed");
+        let initial_json: serde_json::Value =
+            serde_json::from_str(&initial_result).expect("initial deploy json");
+        let initial_app_id = initial_json
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .expect("initial app id")
+            .to_string();
+
+        let duplicate_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Source-backed dashboard",
+                "files": {
+                    "index.html": "<!doctype html><html><head><style>body{color:blue}</style></head><body><a href=\"https://example.com/data\">Data</a><section>same data</section></body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("same-source deploy should reuse existing app");
+        let duplicate_json: serde_json::Value =
+            serde_json::from_str(&duplicate_result).expect("duplicate deploy json");
+        assert_eq!(
+            duplicate_json
+                .get("status")
+                .and_then(|value| value.as_str()),
+            Some("duplicate_skipped")
+        );
+        assert_eq!(
+            duplicate_json
+                .get("app_id")
+                .and_then(|value| value.as_str()),
+            Some(initial_app_id.as_str())
+        );
+        assert_eq!(
+            duplicate_json
+                .get("duplicate_match")
+                .and_then(|value| value.as_str()),
+            Some("artifact_identity")
+        );
+        assert_eq!(registry.list().await.len(), 1);
+
+        let changed_data_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Source-backed dashboard",
+                "files": {
+                    "index.html": "<!doctype html><html><body><a href=\"https://example.com/data\">Data</a><section>changed data</section></body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("changed source data should create a new app");
+        let changed_json: serde_json::Value =
+            serde_json::from_str(&changed_data_result).expect("changed deploy json");
+        assert_eq!(
+            changed_json.get("status").and_then(|value| value.as_str()),
+            Some("deployed")
+        );
+        assert_eq!(registry.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn app_deploy_skips_same_structured_artifact_identity_across_titles() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+        let artifact_identity = serde_json::json!({
+            "source_urls": ["https://example.com/pricing"],
+            "source_fingerprint": "same-source-data"
+        });
+
+        let initial_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "First title",
+                "artifact_identity": artifact_identity,
+                "files": {
+                    "index.html": "<!doctype html><html><body><a href=\"https://example.com/pricing\">source</a><table><tr><td>A</td><td>$1</td></tr></table></body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("initial deploy should succeed");
+        let initial_json: serde_json::Value =
+            serde_json::from_str(&initial_result).expect("initial deploy json");
+        let initial_app_id = initial_json
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .expect("initial app id")
+            .to_string();
+
+        let duplicate_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Second title",
+                "metadata": {
+                    "artifact_identity": {
+                        "source_urls": ["https://example.com/pricing"],
+                        "source_fingerprint": "same-source-data"
+                    }
+                },
+                "files": {
+                    "index.html": "<!doctype html><html><body><a href=\"https://example.com/pricing\">source</a><table><tr><td>A</td><td>$1</td></tr></table><p>Different generated prose.</p></body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("same artifact identity should reuse existing app");
+        let duplicate_json: serde_json::Value =
+            serde_json::from_str(&duplicate_result).expect("duplicate deploy json");
+        assert_eq!(
+            duplicate_json
+                .get("status")
+                .and_then(|value| value.as_str()),
+            Some("duplicate_skipped")
+        );
+        assert_eq!(
+            duplicate_json
+                .get("app_id")
+                .and_then(|value| value.as_str()),
+            Some(initial_app_id.as_str())
+        );
+        assert_eq!(registry.list().await.len(), 1);
     }
 
     #[test]

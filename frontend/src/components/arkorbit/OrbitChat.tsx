@@ -12,9 +12,12 @@ import AddCommentRoundedIcon from "@mui/icons-material/AddCommentRounded";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
+import CodeRoundedIcon from "@mui/icons-material/CodeRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
+import FolderOpenRoundedIcon from "@mui/icons-material/FolderOpenRounded";
 import HistoryRoundedIcon from "@mui/icons-material/HistoryRounded";
 import PersonRoundedIcon from "@mui/icons-material/PersonRounded";
+import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import SendRoundedIcon from "@mui/icons-material/SendRounded";
 import StopCircleRoundedIcon from "@mui/icons-material/StopCircleRounded";
 import AgentLogo from "../../assets/logo.svg";
@@ -25,6 +28,7 @@ import type {
   OrbitChatMessageStatus,
   OrbitChatTranscript,
   OrbitChatUsage,
+  OrbitFileEntry,
   OrbitId,
 } from "./types";
 
@@ -43,6 +47,7 @@ type ChatMessage = {
 };
 
 type OrbitChatPanelState = "idle" | "loading" | "running" | "failed" | "stopped" | "archived";
+type OrbitChatTab = "chat" | "files";
 
 type Props = {
   orbitId: OrbitId;
@@ -119,6 +124,10 @@ function normalizeUsage(value: Partial<OrbitChatUsage>): OrbitChatUsage | undefi
   const model = typeof value.model === "string" ? value.model.trim() : "";
   const inputTokens = positiveMetric(value.input_tokens);
   const outputTokens = positiveMetric(value.output_tokens);
+  const cachedPromptTokens = positiveMetric(value.cached_prompt_tokens);
+  const cacheCreationPromptTokens = positiveMetric(
+    value.cache_creation_prompt_tokens,
+  );
   const totalTokens =
     positiveMetric(value.total_tokens) ??
     (inputTokens || outputTokens
@@ -131,6 +140,10 @@ function normalizeUsage(value: Partial<OrbitChatUsage>): OrbitChatUsage | undefi
   if (inputTokens) usage.input_tokens = inputTokens;
   if (outputTokens) usage.output_tokens = outputTokens;
   if (totalTokens) usage.total_tokens = totalTokens;
+  if (cachedPromptTokens) usage.cached_prompt_tokens = cachedPromptTokens;
+  if (cacheCreationPromptTokens) {
+    usage.cache_creation_prompt_tokens = cacheCreationPromptTokens;
+  }
   if (costUsd) usage.cost_usd = costUsd;
   if (typeof value.estimated === "boolean") usage.estimated = value.estimated;
   if (durationMs) usage.duration_ms = durationMs;
@@ -155,13 +168,28 @@ function orbitUsageMetricItems(usage?: OrbitChatUsage): Array<{
   if (!normalized) return [];
   const inputTokens = normalized.input_tokens ?? 0;
   const outputTokens = normalized.output_tokens ?? 0;
+  const cachedPromptTokens = normalized.cached_prompt_tokens ?? 0;
+  const cacheCreationPromptTokens = normalized.cache_creation_prompt_tokens ?? 0;
   const totalTokens = normalized.total_tokens ?? inputTokens + outputTokens;
   if (totalTokens <= 0) return [];
-  return [
+  const items = [
     { label: "Total tokens", value: Math.round(totalTokens).toLocaleString() },
     { label: "Input tokens", value: Math.round(inputTokens).toLocaleString() },
     { label: "Output tokens", value: Math.round(outputTokens).toLocaleString() },
   ];
+  if (cachedPromptTokens > 0) {
+    items.push({
+      label: "Cached prompt",
+      value: Math.round(cachedPromptTokens).toLocaleString(),
+    });
+  }
+  if (cacheCreationPromptTokens > 0) {
+    items.push({
+      label: "Cache write",
+      value: Math.round(cacheCreationPromptTokens).toLocaleString(),
+    });
+  }
+  return items;
 }
 
 function orbitUsageTitle(usage?: OrbitChatUsage): string | undefined {
@@ -368,6 +396,127 @@ function extractFetchError(text: string): string {
   }
 }
 
+function orbitFileName(path: string): string {
+  const normalized = path.replace(/\\/g, "/").trim();
+  return normalized.split("/").filter(Boolean).pop() || normalized || "file";
+}
+
+async function readOrbitChatFileText(
+  orbitId: OrbitId,
+  path: string,
+): Promise<string> {
+  const response = await fetch(arkorbitApi.orbitFileUrl(orbitId, path), {
+    credentials: "include",
+    cache: "no-store",
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(text || `File request failed (${response.status}).`);
+  return text;
+}
+
+function OrbitChatFilesView({
+  files,
+  selectedPath,
+  content,
+  loadingFiles,
+  loadingContent,
+  error,
+  onSelect,
+  onRefresh,
+}: {
+  files: OrbitFileEntry[];
+  selectedPath: string | null;
+  content: string;
+  loadingFiles: boolean;
+  loadingContent: boolean;
+  error: string | null;
+  onSelect: (path: string) => void;
+  onRefresh: () => void;
+}) {
+  const selectedFile =
+    files.find((file) => file.path === selectedPath) ?? files[0] ?? null;
+  const selectedMeta = selectedFile
+    ? formatBytes(selectedFile.bytes) || "0 bytes"
+    : "";
+
+  return (
+    <Box className="orbit-chat-files-view">
+      <Box className="orbit-chat-files-toolbar">
+        <Stack direction="row" spacing={0.6} sx={{ alignItems: "center", minWidth: 0 }}>
+          <FolderOpenRoundedIcon fontSize="small" />
+          <Typography variant="caption" className="orbit-chat-files-title">
+            Files
+          </Typography>
+          <span className="orbit-chat-files-count">{files.length}</span>
+        </Stack>
+        <Tooltip title="Refresh files">
+          <span>
+            <IconButton
+              size="small"
+              className="orbit-chat-tool"
+              onClick={onRefresh}
+              disabled={loadingFiles}
+              aria-label="Refresh Orbit files"
+            >
+              <RefreshRoundedIcon fontSize="small" />
+            </IconButton>
+          </span>
+        </Tooltip>
+      </Box>
+      {error ? <Box className="orbit-chat-files-error">{error}</Box> : null}
+      {loadingFiles && files.length === 0 ? (
+        <Box className="orbit-chat-files-empty">Loading files...</Box>
+      ) : files.length === 0 ? (
+        <Box className="orbit-chat-files-empty">No Orbit files yet.</Box>
+      ) : (
+        <Box className="orbit-chat-files-layout">
+          <Box className="orbit-chat-files-list" role="listbox" aria-label="Orbit files">
+            {files.map((file) => {
+              const active = file.path === selectedFile?.path;
+              return (
+                <button
+                  key={file.path}
+                  type="button"
+                  className={`orbit-chat-file-row${active ? " is-active" : ""}`}
+                  onClick={() => onSelect(file.path)}
+                  aria-selected={active}
+                  role="option"
+                >
+                  <span className="orbit-chat-file-name">{orbitFileName(file.path)}</span>
+                  <span className="orbit-chat-file-path">{file.path}</span>
+                  <span className="orbit-chat-file-size">
+                    {formatBytes(file.bytes) || "0 bytes"}
+                  </span>
+                </button>
+              );
+            })}
+          </Box>
+          <Box className="orbit-chat-file-preview">
+            <Box className="orbit-chat-file-preview-head">
+              <Stack direction="row" spacing={0.55} sx={{ alignItems: "center", minWidth: 0 }}>
+                <CodeRoundedIcon fontSize="small" />
+                <span className="orbit-chat-file-preview-path">
+                  {selectedFile?.path ?? "No file selected"}
+                </span>
+              </Stack>
+              {selectedMeta ? (
+                <span className="orbit-chat-file-preview-meta">{selectedMeta}</span>
+              ) : null}
+            </Box>
+            {loadingContent ? (
+              <Box className="orbit-chat-files-empty">Loading file...</Box>
+            ) : (
+              <pre className="orbit-chat-file-code">
+                <code>{content || "Select a file to preview it."}</code>
+              </pre>
+            )}
+          </Box>
+        </Box>
+      )}
+    </Box>
+  );
+}
+
 function parseEventBlock(block: string): { event: string; data: string } | null {
   let event = "message";
   const data: string[] = [];
@@ -572,6 +721,14 @@ export function OrbitChat({
   const [streaming, setStreaming] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [composerResetSignal, setComposerResetSignal] = useState(0);
+  const [activeTab, setActiveTab] = useState<OrbitChatTab>("chat");
+  const [files, setFiles] = useState<OrbitFileEntry[]>([]);
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const [fileContent, setFileContent] = useState("");
+  const [loadingFiles, setLoadingFiles] = useState(false);
+  const [loadingFileContent, setLoadingFileContent] = useState(false);
+  const [filesError, setFilesError] = useState<string | null>(null);
+  const [filesReloadSignal, setFilesReloadSignal] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const activeAssistantRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -658,6 +815,11 @@ export function OrbitChat({
     setHistoryPage(0);
     setActiveTranscriptId("current");
     setMessages([]);
+    setActiveTab("chat");
+    setFiles([]);
+    setSelectedFilePath(null);
+    setFileContent("");
+    setFilesError(null);
     setComposerResetSignal((value) => value + 1);
     const isCancelled = () => cancelled;
     void loadTranscript("current", isCancelled);
@@ -670,15 +832,17 @@ export function OrbitChat({
 
   useEffect(() => {
     const node = scrollRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, [messages]);
+    if (activeTab === "chat" && node) node.scrollTop = node.scrollHeight;
+  }, [activeTab, messages]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
   useEffect(() => {
     if (activeTranscriptId !== "current" || streaming) return undefined;
     let cancelled = false;
+    let timer: number | null = null;
     const refreshCurrentMessages = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const history = await arkorbitApi.listMessages(orbitId);
         if (cancelled) return;
@@ -690,15 +854,90 @@ export function OrbitChat({
         // The visible chat should not flicker on a transient polling failure.
       }
     };
-    const timer = window.setInterval(() => {
-      void refreshCurrentMessages();
-    }, 2500);
-    void refreshCurrentMessages();
+    const scheduleRefresh = () => {
+      timer = window.setTimeout(() => {
+        void refreshCurrentMessages().finally(() => {
+          if (!cancelled) scheduleRefresh();
+        });
+      }, 10_000);
+    };
+    const handleVisibilityChange = () => {
+      if (typeof document !== "undefined" && !document.hidden) {
+        void refreshCurrentMessages();
+      }
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+    }
+    void refreshCurrentMessages().finally(() => {
+      if (!cancelled) scheduleRefresh();
+    });
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      }
     };
   }, [activeTranscriptId, orbitId, streaming]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingFiles(true);
+    void arkorbitApi
+      .listFiles(orbitId)
+      .then((next) => {
+        if (cancelled) return;
+        setFiles(next);
+        setFilesError(null);
+        setSelectedFilePath((current) =>
+          current && next.some((file) => file.path === current)
+            ? current
+            : next[0]?.path ?? null,
+        );
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setFiles([]);
+        setSelectedFilePath(null);
+        setFileContent("");
+        setFilesError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingFiles(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [filesReloadSignal, orbitId]);
+
+  useEffect(() => {
+    if (activeTab !== "files") return undefined;
+    if (!selectedFilePath) {
+      setFileContent("");
+      return undefined;
+    }
+    let cancelled = false;
+    setLoadingFileContent(true);
+    void readOrbitChatFileText(orbitId, selectedFilePath)
+      .then((text) => {
+        if (!cancelled) {
+          setFileContent(text);
+          setFilesError(null);
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setFileContent("");
+        setFilesError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingFileContent(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, filesReloadSignal, orbitId, selectedFilePath]);
 
   const updateAssistant = useCallback(
     (id: string, mutate: (message: ChatMessage) => ChatMessage) => {
@@ -814,6 +1053,7 @@ export function OrbitChat({
               activity: fileActivityLabel(operation, path, bytes),
               active: true,
             }));
+            setFilesReloadSignal((value) => value + 1);
             onFileWritten?.(path);
           },
           onRead: (_path) =>
@@ -912,6 +1152,7 @@ export function OrbitChat({
                 size="small"
                 className="orbit-chat-tool"
                 onClick={() => {
+                  setActiveTab("chat");
                   setHistoryOpen(false);
                   setHistoryPage(0);
                   void loadTranscript("current");
@@ -927,6 +1168,7 @@ export function OrbitChat({
               size="small"
               className="orbit-chat-tool"
               onClick={() => {
+                setActiveTab("chat");
                 setHistoryOpen((open) => {
                   const next = !open;
                   if (next) setHistoryPage(0);
@@ -943,7 +1185,10 @@ export function OrbitChat({
             <IconButton
               size="small"
               className="orbit-chat-tool"
-              onClick={() => void newChat()}
+              onClick={() => {
+                setActiveTab("chat");
+                void newChat();
+              }}
               aria-label="New chat"
             >
               <AddCommentRoundedIcon fontSize="small" />
@@ -963,6 +1208,29 @@ export function OrbitChat({
           ) : null}
         </Stack>
       </Box>
+      <Box className="orbit-chat-tabs" role="tablist" aria-label="Orbit chat panels">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "chat"}
+          className={`orbit-chat-tab${activeTab === "chat" ? " is-active" : ""}`}
+          onClick={() => setActiveTab("chat")}
+        >
+          Chat
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "files"}
+          className={`orbit-chat-tab${activeTab === "files" ? " is-active" : ""}`}
+          onClick={() => setActiveTab("files")}
+        >
+          Files
+          <span>{files.length}</span>
+        </button>
+      </Box>
+      {activeTab === "chat" ? (
+        <>
       {historyOpen ? (
         <Box className="orbit-chat-history">
           {transcripts.length === 0 ? (
@@ -1138,6 +1406,19 @@ export function OrbitChat({
         onSend={send}
         onStop={stop}
       />
+        </>
+      ) : (
+        <OrbitChatFilesView
+          files={files}
+          selectedPath={selectedFilePath}
+          content={fileContent}
+          loadingFiles={loadingFiles}
+          loadingContent={loadingFileContent}
+          error={filesError}
+          onSelect={setSelectedFilePath}
+          onRefresh={() => setFilesReloadSignal((value) => value + 1)}
+        />
+      )}
     </Box>
   );
 }

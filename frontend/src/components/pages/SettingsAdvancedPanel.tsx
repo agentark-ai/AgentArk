@@ -148,7 +148,7 @@ export function SettingsAdvancedPanel({
                         </Alert>
                       ) : settingsAutonomyPaused ? (
                         <Alert severity="warning" sx={{ mt: 0.75 }}>
-                          Autonomy is paused. ArkPulse, watchers, background
+                          Autonomy is paused. Pulse, watchers, background
                           learning, suggestion scans, and proactive
                           optimizations stay paused until you resume it.
                         </Alert>
@@ -299,9 +299,9 @@ export function SettingsAdvancedPanel({
                       />
                     </div>
                     <div>
-                      <div className="adv-group-header-title">ArkSentinel</div>
+                      <div className="adv-group-header-title">Sentinel</div>
                       <div className="adv-group-header-sub">
-                        These switches decide where ArkSentinel learns from and
+                        These switches decide where Sentinel learns from and
                         what kinds of follow-up it can suggest.
                       </div>
                     </div>
@@ -313,7 +313,7 @@ export function SettingsAdvancedPanel({
                   ) : null}
                   {settingsAutonomyPaused ? (
                     <Alert severity="warning" sx={{ mb: 1.5 }}>
-                      ArkSentinel preferences stay saved here, but follow-up
+                      Sentinel preferences stay saved here, but follow-up
                       scanning is paused until autonomy is active again.
                     </Alert>
                   ) : null}
@@ -382,7 +382,7 @@ export function SettingsAdvancedPanel({
                                 void updateSettingsSentinel(
                                   payload,
                                   item.key === "enabled" && nextChecked
-                                    ? "ArkSentinel and all signal switches are on."
+                                    ? "Sentinel and all signal switches are on."
                                     : nextChecked
                                       ? item.enabledMessage
                                       : item.disabledMessage,
@@ -413,7 +413,7 @@ export function SettingsAdvancedPanel({
                       />
                     </div>
                     <div>
-                      <div className="adv-group-header-title">ArkEvolve</div>
+                      <div className="adv-group-header-title">Evolve</div>
                       <div className="adv-group-header-sub">
                         Controls whether AgentArk learns from completed work and
                         tests reviewed improvements in the background.
@@ -485,7 +485,7 @@ export function SettingsAdvancedPanel({
                     <AccordionDetails>
                       <Alert severity="info" sx={{ borderRadius: 1, mb: 1.25 }}>
                         For normal use, leave these defaults alone. Lower values
-                        make ArkEvolve suggest changes sooner; higher values make
+                        make Evolve suggest changes sooner; higher values make
                         it wait for more proof.
                       </Alert>
                       <Grid2 container spacing={1.25}>
@@ -575,7 +575,7 @@ export function SettingsAdvancedPanel({
                       </div>
                       <div className="adv-group-header-sub">
                         Deployment defaults that should stay separate from
-                        ArkSentinel and ArkEvolve.
+                        Sentinel and Evolve.
                       </div>
                     </div>
                   </div>

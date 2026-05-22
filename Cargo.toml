@@ -17,7 +17,7 @@ gui = ["eframe", "egui", "egui_extras", "image"]
 telegram = ["teloxide"]
 docker = ["bollard"]
 ssh = ["russh"]
-local-llm = ["llama-cpp-2"]
+local-llm = []
 tls = ["axum-server", "rcgen"]
 live-smoke-tests = []
 db-tests = []
@@ -55,9 +55,6 @@ teloxide = { version = "0.13", optional = true, features = ["macros"] }
 # LLM clients
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 fastembed = "5"
-
-# Local LLM (optional)
-llama-cpp-2 = { version = "0.1", optional = true }
 
 # WASM sandbox runtime
 # 43.0.2 is the first patched release for GHSA-p8xm-42r7-89xg / CVE-2026-44216
@@ -120,6 +117,7 @@ dotenvy = "0.15"
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
+mime_guess = "2"
 pdf-extract = "0.7"
 zip = "8.5.1"
 base64 = "0.22"

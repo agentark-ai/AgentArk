@@ -18,6 +18,9 @@ import Typography from "@mui/material/Typography";
 import IconButton from "@mui/material/IconButton";
 import Tooltip from "@mui/material/Tooltip";
 import Collapse from "@mui/material/Collapse";
+import Dialog from "@mui/material/Dialog";
+import DialogContent from "@mui/material/DialogContent";
+import DialogTitle from "@mui/material/DialogTitle";
 import CloseIcon from "@mui/icons-material/Close";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
@@ -28,14 +31,26 @@ import TerminalRoundedIcon from "@mui/icons-material/TerminalRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 
 import type { ChatStepCard, ComputerPaneFile, ComputerPaneTab, SurfaceStatus } from "./types";
-import { extractFilePath, pickComputerView, prepareChipCards } from "./dispatch";
+import { extractFilePath, pickComputerView } from "./dispatch";
 import {
   AGENTARK_RENDERERS,
   rendererIdForCard,
   surfaceDisplayTitle,
   surfaceFromCard,
+  surfacePayloads,
   surfaceStatus,
 } from "./surface";
+import {
+  delegationRecordFromValue,
+  humanizePayloadStatus,
+  isReadableRecord as isRecord,
+  readableFieldsFromRecord,
+  readableNumber,
+  readablePayloadFromValue,
+  readableString,
+  formatReadableDurationMs,
+  type ReadablePayloadTone,
+} from "./readablePayload";
 import {
   FileView,
   SurfaceRenderer,
@@ -59,6 +74,7 @@ export interface ComputerPaneProps {
   isStreaming?: boolean;
   startedAt?: string | number | null;
   tokenPreview?: string;
+  runMetrics?: Array<{ label: string; value: string }>;
   /** Live planner/classifier reasoning text. Surfaced by `WorkingView` as
    * a fallback while the assistant content stream has not started yet. */
   reasoningPreview?: string;
@@ -241,6 +257,29 @@ type ActivityDisplayField = {
   value: string;
 };
 
+type JsonRecord = Record<string, unknown>;
+
+const COMPUTER_ACTIVITY_INTERNAL_FIELDS = new Set([
+  "__omitted_keys",
+  "__streamKey",
+  "agent_id",
+  "chat_visible",
+  "conversation_id",
+  "delegation_id",
+  "id",
+  "plan_id",
+  "plan_revision",
+  "plan_step_id",
+  "run_id",
+  "task_id",
+  "trace_id",
+  "ts",
+]);
+
+function isComputerActivityInternalField(key: string): boolean {
+  return key.startsWith("__") || COMPUTER_ACTIVITY_INTERNAL_FIELDS.has(key);
+}
+
 function formatActivityFieldLabel(value: string): string {
   const normalized = (value || "")
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
@@ -291,6 +330,7 @@ function collectActivityFields(
   const fields: ActivityDisplayField[] = [];
   for (const [key, fieldValue] of Object.entries(record)) {
     if (fields.length >= limit) break;
+    if (isComputerActivityInternalField(key)) continue;
     const fieldLabel = prefix
       ? `${prefix} ${formatActivityFieldLabel(key)}`
       : formatActivityFieldLabel(key);
@@ -320,7 +360,9 @@ function collectActivityFields(
 function buildActivityDetails(card: ChatStepCard) {
   const record = tryParseRecord(card.traceJson || "") || {};
   const data = asPaneRecord(record.data);
-  const overview =
+  const readable = readablePayloadFromValue(data) || readablePayloadFromValue(record);
+  const rawOverview =
+    readable?.detail ||
     str(data.content_snapshot, "") ||
     str(data.content, "") ||
     str(record.detail, "") ||
@@ -329,13 +371,23 @@ function buildActivityDetails(card: ChatStepCard) {
     card.summary ||
     card.detail ||
     "Activity update.";
+  const overview =
+    readablePayloadFromValue(rawOverview)?.detail ||
+    (looksLikeStructuredPanePayload(rawOverview)
+      ? readablePayloadFromValue(rawOverview)?.title || "Received structured activity details."
+      : rawOverview);
   const statusFields: ActivityDisplayField[] = [
     { label: "Status", value: card.kind || "Update" },
     { label: "Title", value: card.label || card.rawTitle || "Activity update" },
     { label: "Step Type", value: card.stepType },
     { label: "Time", value: card.time },
   ].filter((field) => field.value.trim());
-  const traceFields = collectActivityFields(record, { limit: 20 });
+  const traceFields =
+    readable?.fields && readable.fields.length > 0
+      ? readable.fields
+      : collectActivityFields(Object.keys(data).length > 0 ? data : record, {
+          limit: 20,
+        });
   const displayFields = [
     ...statusFields,
     ...traceFields.filter(
@@ -346,17 +398,15 @@ function buildActivityDetails(card: ChatStepCard) {
         ),
     ),
   ];
-  const traceJson = (card.traceJson || "").trim();
   const copyText = [
     `Overview:\n${overview}`,
     displayFields
       .map((field) => `${field.label}:\n${field.value}`)
       .join("\n\n"),
-    traceJson ? `Raw Trace JSON:\n${traceJson}` : "",
   ]
     .filter(Boolean)
     .join("\n\n");
-  return { overview, displayFields, traceJson, copyText };
+  return { overview, displayFields, traceJson: "", copyText };
 }
 
 function ActivityExpandedDetails({
@@ -501,9 +551,41 @@ function reasoningCardPhase(card: ChatStepCard): string {
   return str(record?.phase, str(data.phase, str(record?.step_type, ""))).trim();
 }
 
+function reasoningCardMetadataContent(card: ChatStepCard): string {
+  const record = structuredCardRecord(card) || {};
+  const data = paneRecordFromMaybeJson(record.data);
+  const merged: Record<string, unknown> = { ...record, ...data };
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  const push = (label: string, value: unknown) => {
+    const text = activityDisplayText(value);
+    if (!text) return;
+    const key = `${label}:${text}`.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    lines.push(`${label}: ${text}`);
+  };
+
+  push("Step", card.label || card.rawTitle || card.stepType);
+  push("Kind", card.kind);
+  push("Time", card.time);
+  for (const field of collectActivityFields(merged, { limit: 32 })) {
+    push(field.label, field.value);
+  }
+
+  const detail = str(record.detail, str(data.detail, card.detail || card.summary)).trim();
+  push("Detail", detail);
+  return lines.join("\n");
+}
+
 function reasoningCardContent(card: ChatStepCard): string {
   const record = structuredCardRecord(card);
   const data = paneRecordFromMaybeJson(record?.data);
+  const directDetail =
+    [card.rawDetailFull, card.detailFull].find(
+      (value) => value.trim() && !looksLikeStructuredPanePayload(value),
+    ) || "";
+  if (directDetail) return directDetail;
   return (
     str(record?.content_snapshot, "") ||
     str(data.content_snapshot, "") ||
@@ -513,6 +595,7 @@ function reasoningCardContent(card: ChatStepCard): string {
     str(data.content_delta, "") ||
     card.rawDetailFull ||
     card.detailFull ||
+    reasoningCardMetadataContent(card) ||
     str(record?.detail, "") ||
     str(data.detail, "") ||
     str(record?.text, "") ||
@@ -730,6 +813,875 @@ function statusTone(status: SurfaceStatus | null): "working" | "waiting" | "erro
   return "idle";
 }
 
+type DelegationPaneAgent = {
+  id: string;
+  name: string;
+  role: string;
+  model: string;
+  task: string;
+  status: string;
+  update: string;
+  elapsed: string;
+  specialist: boolean;
+  sequence: number;
+  dependencyCount: number;
+  resolvedDependencyCount: number;
+  memoryCount: number;
+  actionCount: number;
+  contextMode: string;
+  restored: boolean;
+  outputPreview: string;
+};
+
+type DelegationPaneRun = {
+  id: string;
+  request: string;
+  status: string;
+  summary: string;
+  agentCount: number;
+  agents: DelegationPaneAgent[];
+  updatedAtIndex: number;
+};
+
+function readableBool(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  const text = readableString(value).trim().toLowerCase();
+  return text === "true" || text === "1" || text === "yes";
+}
+
+function normalizeDelegationStatus(value: unknown, fallback = "running"): string {
+  const status = readableString(value, String(value ?? "")).trim().toLowerCase();
+  if (!status) return fallback;
+  if (status === "cancelled" || status === "canceled") return "interrupted";
+  if (status === "timeout" || status === "timed out") return "timed_out";
+  return status;
+}
+
+function delegationStatusTone(status: string): ReadablePayloadTone {
+  const normalized = normalizeDelegationStatus(status, "running");
+  if (["completed", "success", "done"].includes(normalized)) return "success";
+  if (["failed", "timed_out", "panicked", "interrupted", "error"].includes(normalized)) {
+    return "error";
+  }
+  if (["partial", "degraded"].includes(normalized)) return "warning";
+  if (["assigned", "running", "synthesizing"].includes(normalized)) return "running";
+  return "idle";
+}
+
+function delegationStatusLabel(status: string): string {
+  const normalized = normalizeDelegationStatus(status, "running");
+  switch (normalized) {
+    case "assigned":
+      return "Assigned";
+    case "running":
+      return "Running";
+    case "synthesizing":
+      return "Synthesizing";
+    case "completed":
+    case "success":
+    case "done":
+      return "Completed";
+    case "partial":
+      return "Partial";
+    case "timed_out":
+      return "Timed out";
+    case "panicked":
+      return "Panicked";
+    case "failed":
+    case "error":
+      return "Failed";
+    case "interrupted":
+      return "Stopped";
+    default:
+      return humanizePayloadStatus(normalized || "queued", "Queued");
+  }
+}
+
+function delegationRunStatus(agents: DelegationPaneAgent[], fallback = "running"): string {
+  if (agents.some((agent) => ["assigned", "running", "synthesizing"].includes(normalizeDelegationStatus(agent.status)))) {
+    return "running";
+  }
+  if (
+    agents.length > 0 &&
+    agents.every((agent) =>
+      ["completed", "success", "done"].includes(normalizeDelegationStatus(agent.status)),
+    )
+  ) {
+    return "completed";
+  }
+  if (
+    agents.some((agent) =>
+      ["completed", "success", "done"].includes(normalizeDelegationStatus(agent.status)),
+    )
+  ) {
+    return "partial";
+  }
+  if (agents.some((agent) => normalizeDelegationStatus(agent.status) === "timed_out")) {
+    return "timed_out";
+  }
+  if (agents.some((agent) => normalizeDelegationStatus(agent.status) === "failed")) {
+    return "failed";
+  }
+  return normalizeDelegationStatus(fallback);
+}
+
+function cleanDelegationUpdate(value: string): string {
+  const text = (value || "").replace(/\s+/g, " ").trim();
+  if (!text || /^\[omitted\s+\d+\s+chars?\]$/i.test(text)) return "";
+  if (looksLikeStructuredPanePayload(text)) {
+    return readablePayloadFromValue(text)?.detail || "Received structured update.";
+  }
+  return text.length > 260 ? `${text.slice(0, 257).trimEnd()}...` : text;
+}
+
+function compactDelegationText(value: string, maxLen = 180): string {
+  const text = (value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > maxLen ? `${text.slice(0, Math.max(0, maxLen - 3)).trimEnd()}...` : text;
+}
+
+function fullDelegationText(value: string): string {
+  return (value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+type DelegationStructuredGoal = {
+  title: string;
+  detail: string;
+  criteria: string[];
+};
+
+type DelegationStructuredContext = {
+  requirements: string[];
+  goals: DelegationStructuredGoal[];
+};
+
+type ExtractedJsonBlock = {
+  start: number;
+  end: number;
+  value: unknown;
+};
+
+function extractJsonBlocks(text: string): ExtractedJsonBlock[] {
+  const blocks: ExtractedJsonBlock[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+    if (ch !== "}" || depth === 0) continue;
+    depth -= 1;
+    if (depth === 0 && start >= 0) {
+      const raw = text.slice(start, index + 1);
+      try {
+        blocks.push({ start, end: index + 1, value: JSON.parse(raw) });
+      } catch {
+        // Ignore malformed embedded JSON and keep it in the prose fallback.
+      }
+      start = -1;
+    }
+  }
+
+  return blocks;
+}
+
+function stringsFromUnknown(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === "string") return fullDelegationText(item);
+        const record = isRecord(item) ? item : {};
+        return fullDelegationText(
+          readableString(record.text) ||
+            readableString(record.outcome) ||
+            readableString(record.title) ||
+            readableString(record.summary),
+        );
+      })
+      .filter(Boolean);
+  }
+  if (typeof value === "string") {
+    const text = fullDelegationText(value);
+    return text ? [text] : [];
+  }
+  return [];
+}
+
+function structuredContextFromRecord(record: Record<string, unknown>): DelegationStructuredContext {
+  const requirements = stringsFromUnknown(record.requirements);
+  const goals = Array.isArray(record.goals)
+    ? record.goals
+        .map((item): DelegationStructuredGoal | null => {
+          if (!isRecord(item)) return null;
+          const title = fullDelegationText(
+            readableString(item.outcome) ||
+              readableString(item.title) ||
+              readableString(item.summary),
+          );
+          const detail = fullDelegationText(
+            readableString(item.capability_need) ||
+              readableString(item.detail) ||
+              readableString(item.description),
+          );
+          const criteria = stringsFromUnknown(item.success_criteria);
+          if (!title && !detail && criteria.length === 0) return null;
+          return {
+            title: title || detail || "Delegated goal",
+            detail: detail && detail !== title ? detail : "",
+            criteria,
+          };
+        })
+        .filter((item): item is DelegationStructuredGoal => Boolean(item))
+    : [];
+  return { requirements, goals };
+}
+
+function mergeStructuredContexts(
+  left: DelegationStructuredContext,
+  right: DelegationStructuredContext,
+): DelegationStructuredContext {
+  const requirementSet = new Set(left.requirements);
+  const requirements = [...left.requirements];
+  for (const item of right.requirements) {
+    if (!requirementSet.has(item)) {
+      requirementSet.add(item);
+      requirements.push(item);
+    }
+  }
+
+  const goalSet = new Set(left.goals.map((goal) => `${goal.title}\n${goal.detail}`));
+  const goals = [...left.goals];
+  for (const goal of right.goals) {
+    const key = `${goal.title}\n${goal.detail}`;
+    if (!goalSet.has(key)) {
+      goalSet.add(key);
+      goals.push(goal);
+    }
+  }
+  return { requirements, goals };
+}
+
+function extractedStructuredContext(blocks: ExtractedJsonBlock[]): DelegationStructuredContext {
+  return blocks.reduce<DelegationStructuredContext>(
+    (acc, block) =>
+      isRecord(block.value)
+        ? mergeStructuredContexts(acc, structuredContextFromRecord(block.value))
+        : acc,
+    { requirements: [], goals: [] },
+  );
+}
+
+function textWithoutJsonBlocks(text: string, blocks: ExtractedJsonBlock[]): string {
+  if (blocks.length === 0) return text;
+  let out = "";
+  let cursor = 0;
+  for (const block of blocks) {
+    out += text.slice(cursor, block.start);
+    cursor = block.end;
+  }
+  out += text.slice(cursor);
+  return out
+    .replace(/\b[A-Z][A-Za-z _-]{0,40}:\s*$/gm, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function displayLinesFromDelegationText(text: string): string[] {
+  const expanded = fullDelegationText(text)
+    .replace(/\\n/g, "\n")
+    .replace(/\s+(#{1,6}\s+)/g, "\n\n$1")
+    .replace(/\s+(\*\*[^*\n]{1,90}\*\*:)/g, "\n$1")
+    .replace(/\s+(\*\*[^*\n]{1,90}\*\*)/g, "\n$1")
+    .replace(/\s+([-*]\s+)/g, "\n$1")
+    .replace(/\s+(\d+\.\s+)/g, "\n$1");
+
+  return expanded
+    .split(/\n+/)
+    .map((line) =>
+      line
+        .replace(/^#{1,6}\s*/, "")
+        .replace(/\*\*/g, "")
+        .replace(/\s+/g, " ")
+        .trim(),
+    )
+    .filter(Boolean);
+}
+
+function DelegationReadableText({
+  text,
+  empty,
+}: {
+  text: string;
+  empty: string;
+}) {
+  const prepared = useMemo(() => {
+    const normalized = fullDelegationText(text);
+    const blocks = extractJsonBlocks(normalized);
+    const structured = extractedStructuredContext(blocks);
+    const prose = textWithoutJsonBlocks(normalized, blocks);
+    const lines = displayLinesFromDelegationText(prose);
+    return { structured, lines };
+  }, [text]);
+
+  if (
+    prepared.lines.length === 0 &&
+    prepared.structured.requirements.length === 0 &&
+    prepared.structured.goals.length === 0
+  ) {
+    return <p className="delegation-readable-empty">{empty}</p>;
+  }
+
+  return (
+    <Box className="delegation-readable-text">
+      {prepared.lines.length > 0 ? (
+        <Box className="delegation-readable-section">
+          {prepared.lines.map((line, index) => {
+            const isBullet = /^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line);
+            return (
+              <p
+                className={isBullet ? "delegation-readable-bullet" : "delegation-readable-line"}
+                key={`delegation-line-${index}`}
+              >
+                {line.replace(/^[-*]\s+/, "").replace(/^\d+\.\s+/, "")}
+              </p>
+            );
+          })}
+        </Box>
+      ) : null}
+      {prepared.structured.requirements.length > 0 ? (
+        <Box className="delegation-readable-section">
+          <span className="delegation-readable-heading">Requirements</span>
+          {prepared.structured.requirements.map((item, index) => (
+            <p className="delegation-readable-line" key={`delegation-req-${index}`}>
+              {item}
+            </p>
+          ))}
+        </Box>
+      ) : null}
+      {prepared.structured.goals.length > 0 ? (
+        <Box className="delegation-readable-goals">
+          {prepared.structured.goals.map((goal, index) => (
+            <Box className="delegation-readable-goal" key={`delegation-goal-${index}`}>
+              <span className="delegation-readable-goal-index">{index + 1}</span>
+              <Box className="delegation-readable-goal-copy">
+                <span className="delegation-readable-goal-title">{goal.title}</span>
+                {goal.detail ? (
+                  <span className="delegation-readable-goal-detail">{goal.detail}</span>
+                ) : null}
+                {goal.criteria.length > 0 ? (
+                  <ul className="delegation-readable-criteria">
+                    {goal.criteria.map((criterion, criterionIndex) => (
+                      <li key={`delegation-goal-${index}-criterion-${criterionIndex}`}>
+                        {criterion}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </Box>
+            </Box>
+          ))}
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function delegationRecordRunId(record: JsonRecord): string {
+  return (
+    readableString(record.delegation_id).trim() ||
+    readableString(record.run_id).trim() ||
+    "delegation"
+  );
+}
+
+function delegationRecordsFromCard(card: ChatStepCard): JsonRecord[] {
+  const candidates: unknown[] = [
+    structuredCardRecord(card),
+    tryParseRecord(card.traceJson || ""),
+    card.payloadView?.body,
+    card.rawDetailFull,
+    card.detailFull,
+  ];
+  for (const item of surfacePayloads(card)) {
+    candidates.push(item.json, item.text, item.preview);
+  }
+  const records: JsonRecord[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const record = delegationRecordFromValue(candidate);
+    if (!record) continue;
+    const key = [
+      readableString(record.kind),
+      readableString(record.delegation_id),
+      readableString(record.agent_id),
+      readableString(record.agent_name),
+      readableString(record.status),
+      readableString(record.reason),
+      readableString(record.task),
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    records.push(record);
+  }
+  return records;
+}
+
+function cardHasDelegationPayload(card: ChatStepCard | null): boolean {
+  return Boolean(card && delegationRecordsFromCard(card).length > 0);
+}
+
+function delegationRunIdFromCard(card: ChatStepCard | null): string {
+  if (!card) return "";
+  const record = delegationRecordsFromCard(card)[0];
+  return record ? delegationRecordRunId(record) : "";
+}
+
+function buildDelegationRunsFromCards(cards: ChatStepCard[]): DelegationPaneRun[] {
+  const runs = new Map<
+    string,
+    {
+      id: string;
+      request: string;
+      status: string;
+      summary: string;
+      agentCount: number;
+      agents: Map<string, DelegationPaneAgent>;
+      order: string[];
+      updatedAtIndex: number;
+    }
+  >();
+
+  cards.forEach((card, index) => {
+    for (const payload of delegationRecordsFromCard(card)) {
+      const kind = readableString(payload.kind).trim().toLowerCase();
+      const runId = delegationRecordRunId(payload);
+      let run = runs.get(runId);
+      if (!run) {
+        run = {
+          id: runId,
+          request: "",
+          status: "running",
+          summary: "",
+          agentCount: 0,
+          agents: new Map<string, DelegationPaneAgent>(),
+          order: [],
+          updatedAtIndex: index,
+        };
+        runs.set(runId, run);
+      }
+
+      const readable = readablePayloadFromValue(payload);
+      run.updatedAtIndex = index;
+      run.request = readableString(payload.request, run.request).trim() || run.request;
+      run.summary =
+        cleanDelegationUpdate(readableString(payload.summary)) ||
+        readable?.detail ||
+        run.summary;
+      run.agentCount = Math.max(run.agentCount, readableNumber(payload.agent_count, 0));
+
+      if (kind === "delegation_started") {
+        run.status = normalizeDelegationStatus(payload.status, "running");
+      } else if (kind === "delegation_synthesis_started") {
+        run.status = normalizeDelegationStatus(payload.status, "synthesizing");
+      } else if (kind === "delegation_completed") {
+        run.status = normalizeDelegationStatus(payload.status, "completed");
+      }
+
+      const agentName = readableString(payload.agent_name).trim();
+      const agentRole = readableString(payload.agent_role).trim();
+      const agentId =
+        readableString(payload.agent_id).trim() ||
+        [agentName, agentRole, readableString(payload.sequence)].filter(Boolean).join(":");
+      if (!agentId) continue;
+
+      let agent = run.agents.get(agentId);
+      if (!agent) {
+        agent = {
+          id: agentId,
+          name: agentName || "Agent",
+          role: agentRole,
+          model: readableString(payload.model_name).trim(),
+          task: readableString(payload.task).trim(),
+          status: "assigned",
+          update: "",
+          elapsed: "",
+          specialist: readableBool(payload.is_specialist),
+          sequence: Math.max(1, readableNumber(payload.sequence, run.order.length + 1)),
+          dependencyCount: 0,
+          resolvedDependencyCount: 0,
+          memoryCount: 0,
+          actionCount: 0,
+          contextMode: "",
+          restored: false,
+          outputPreview: "",
+        };
+        run.agents.set(agentId, agent);
+        run.order.push(agentId);
+      }
+
+      agent.name = agentName || agent.name;
+      agent.role = agentRole || agent.role;
+      agent.model = readableString(payload.model_name, agent.model).trim() || agent.model;
+      agent.task = readableString(payload.task, agent.task).trim() || agent.task;
+      agent.specialist = readableBool(payload.is_specialist) || agent.specialist;
+      agent.elapsed = formatReadableDurationMs(payload.elapsed_ms) || agent.elapsed;
+      agent.dependencyCount = Math.max(
+        agent.dependencyCount,
+        readableNumber(payload.dependency_count, 0),
+      );
+      agent.resolvedDependencyCount = Math.max(
+        agent.resolvedDependencyCount,
+        readableNumber(payload.resolved_dependency_count, 0),
+      );
+      agent.memoryCount = Math.max(agent.memoryCount, readableNumber(payload.memory_count, 0));
+      agent.actionCount = Math.max(agent.actionCount, readableNumber(payload.action_count, 0));
+      agent.contextMode = readableString(payload.context_mode, agent.contextMode).trim() || agent.contextMode;
+      agent.restored = readableBool(payload.restored) || agent.restored;
+      agent.outputPreview =
+        fullDelegationText(readableString(payload.output_preview)) ||
+        agent.outputPreview;
+      agent.update =
+        cleanDelegationUpdate(readableString(payload.content)) ||
+        cleanDelegationUpdate(readableString(payload.summary)) ||
+        readable?.detail ||
+        agent.update;
+
+      if (kind === "delegation_assignment") {
+        agent.status = "assigned";
+      } else if (kind === "delegation_agent_started" || kind === "delegation_agent_progress") {
+        agent.status = normalizeDelegationStatus(payload.status, "running");
+      } else if (kind === "delegation_agent_completed") {
+        agent.status = normalizeDelegationStatus(payload.status, "completed");
+      } else if (kind === "delegation_agent_failed") {
+        agent.status = normalizeDelegationStatus(
+          payload.status,
+          /timeout/i.test(readableString(payload.reason)) ? "timed_out" : "failed",
+        );
+        agent.update =
+          cleanDelegationUpdate(readableString(payload.reason)) ||
+          agent.update ||
+          "This delegated agent did not finish.";
+      }
+    }
+  });
+
+  return Array.from(runs.values())
+    .map((run) => {
+      const agents = run.order
+        .map((agentId) => run.agents.get(agentId))
+        .filter((agent): agent is DelegationPaneAgent => Boolean(agent))
+        .sort((left, right) => left.sequence - right.sequence);
+      return {
+        id: run.id,
+        request: run.request,
+        status: delegationRunStatus(agents, run.status),
+        summary: run.summary,
+        agentCount: Math.max(run.agentCount, agents.length),
+        agents,
+        updatedAtIndex: run.updatedAtIndex,
+      };
+    })
+    .sort((left, right) => right.updatedAtIndex - left.updatedAtIndex);
+}
+
+function delegationAgentKey(runId: string, agentId: string): string {
+  return `${runId}::${agentId}`;
+}
+
+function agentContextLine(agent: DelegationPaneAgent): string {
+  const contextMode = agent.contextMode.trim();
+  const parts = [
+    contextMode || "Own delegated context",
+    agent.dependencyCount > 0
+      ? `${agent.resolvedDependencyCount}/${agent.dependencyCount} dependencies`
+      : "",
+    agent.memoryCount > 0 ? `${agent.memoryCount} memories` : "",
+    agent.actionCount > 0 ? `${agent.actionCount} tools` : "",
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function delegationAgentTypeLabel(agent: DelegationPaneAgent): string {
+  const role = agent.role.trim();
+  if (role) return agent.specialist ? `${role} specialist` : role;
+  return agent.specialist ? "Specialist agent" : "Delegated agent";
+}
+
+function DelegationRunView({
+  cards,
+  activeRunId,
+}: {
+  cards: ChatStepCard[];
+  activeRunId?: string;
+}) {
+  const runs = useMemo(() => buildDelegationRunsFromCards(cards), [cards]);
+  const visibleRuns = useMemo(() => {
+    if (!activeRunId) return runs.slice(0, 1);
+    const selected = runs.find((run) => run.id === activeRunId);
+    return selected ? [selected] : runs.slice(0, 1);
+  }, [activeRunId, runs]);
+  const [selectedAgentKey, setSelectedAgentKey] = useState<string | null>(null);
+  const selectedAgent = useMemo(() => {
+    if (!selectedAgentKey) return null;
+    for (const run of visibleRuns) {
+      const agent = run.agents.find(
+        (candidate) => delegationAgentKey(run.id, candidate.id) === selectedAgentKey,
+      );
+      if (agent) return { run, agent };
+    }
+    return null;
+  }, [selectedAgentKey, visibleRuns]);
+
+  useEffect(() => {
+    if (selectedAgentKey && !selectedAgent) setSelectedAgentKey(null);
+  }, [selectedAgent, selectedAgentKey]);
+
+  if (runs.length === 0) {
+    return (
+      <StatusView
+        title="Agent swarm"
+        detail="Delegated agent activity will appear here."
+      />
+    );
+  }
+
+  const totalAgents = visibleRuns.reduce(
+    (sum, run) => sum + Math.max(run.agentCount, run.agents.length),
+    0,
+  );
+  const allAgents = visibleRuns.flatMap((run) => run.agents);
+  const completedAgents = allAgents.filter((agent) =>
+    ["completed", "success", "done"].includes(normalizeDelegationStatus(agent.status)),
+  ).length;
+  const runningAgents = allAgents.filter((agent) =>
+    ["assigned", "running", "synthesizing"].includes(normalizeDelegationStatus(agent.status)),
+  ).length;
+  const issueAgents = allAgents.filter((agent) =>
+    ["failed", "timed_out", "panicked", "interrupted", "error"].includes(
+      normalizeDelegationStatus(agent.status),
+    ),
+  ).length;
+
+  return (
+    <Box className="delegation-console-view">
+      <Box className="delegation-console-head">
+        <Box>
+          <Typography variant="subtitle2" className="delegation-console-title">
+            Agent swarm
+          </Typography>
+          <Typography variant="body2" className="delegation-console-detail">
+            {visibleRuns.length} active run{visibleRuns.length === 1 ? "" : "s"} with {totalAgents} delegated agent{totalAgents === 1 ? "" : "s"}.
+          </Typography>
+        </Box>
+        <Box className="delegation-run-metrics" aria-label="Agent swarm summary">
+          <span className="delegation-run-metric">
+            <span className="delegation-run-metric-label">Done</span>
+            <span className="delegation-run-metric-value">{completedAgents}</span>
+          </span>
+          <span className="delegation-run-metric">
+            <span className="delegation-run-metric-label">Running</span>
+            <span className="delegation-run-metric-value">{runningAgents}</span>
+          </span>
+          <span className="delegation-run-metric">
+            <span className="delegation-run-metric-label">Needs attention</span>
+            <span className="delegation-run-metric-value">{issueAgents}</span>
+          </span>
+        </Box>
+      </Box>
+      <Stack spacing={1.1}>
+        {visibleRuns.map((run) => (
+          <Box className="delegation-run" key={run.id}>
+            <Box className="delegation-run-head">
+              <Box className="delegation-run-copy">
+                <Typography variant="body2" className="delegation-run-title">
+                  {compactDelegationText(run.request || "Delegated run", 180)}
+                </Typography>
+                <Typography variant="caption" className="delegation-run-summary">
+                  {compactDelegationText(run.summary || `${run.agents.length} delegated agents tracked.`, 180)}
+                </Typography>
+              </Box>
+              <span className={`delegation-status-pill tone-${delegationStatusTone(run.status)}`}>
+                {delegationStatusLabel(run.status)}
+              </span>
+            </Box>
+            <Box className="delegation-run-progress" aria-hidden="true">
+              {Array.from({ length: Math.max(run.agentCount, run.agents.length, 1) }).map(
+                (_, index) => {
+                  const agent = run.agents[index];
+                  const tone = delegationStatusTone(agent?.status || run.status);
+                  return (
+                    <span
+                      className={`delegation-run-progress-segment tone-${tone}`}
+                      key={`${run.id}-progress-${index}`}
+                    />
+                  );
+                },
+              )}
+            </Box>
+            <Typography variant="caption" className="delegation-section-label">
+              Agents launched
+            </Typography>
+            <Box className="delegation-agent-list">
+              {run.agents.map((agent) => {
+                const agentTitle = agent.role
+                  ? `${agent.name} / ${agent.role}`
+                  : agent.name;
+                const contextLine = agentContextLine(agent);
+                return (
+                  <button
+                    type="button"
+                    className="delegation-agent-row"
+                    key={agent.id}
+                    onClick={() => setSelectedAgentKey(delegationAgentKey(run.id, agent.id))}
+                    aria-label={`Open details for ${agentTitle}`}
+                  >
+                    <span className="delegation-agent-row-main">
+                      <span
+                        className={`delegation-agent-dot tone-${delegationStatusTone(agent.status)}`}
+                        aria-hidden="true"
+                      />
+                      <span className="delegation-agent-row-copy">
+                        <span className="delegation-agent-name">{agentTitle}</span>
+                        <span className="delegation-agent-subtitle">
+                          {delegationAgentTypeLabel(agent)}
+                        </span>
+                        <span className="delegation-agent-task">
+                          {compactDelegationText(agent.task || agent.update || "Waiting for task details.", 150)}
+                        </span>
+                      </span>
+                    </span>
+                    <span className="delegation-agent-row-meta">
+                      {agent.elapsed ? (
+                        <span className="delegation-agent-mini">{agent.elapsed}</span>
+                      ) : null}
+                      {contextLine ? (
+                        <span className="delegation-agent-context">
+                          {compactDelegationText(contextLine, 90)}
+                        </span>
+                      ) : null}
+                      <span className={`delegation-status-pill tone-${delegationStatusTone(agent.status)}`}>
+                        {delegationStatusLabel(agent.status)}
+                      </span>
+                      <ChevronRightRoundedIcon fontSize="small" aria-hidden="true" />
+                    </span>
+                  </button>
+                );
+              })}
+            </Box>
+          </Box>
+        ))}
+      </Stack>
+      <Dialog
+        open={Boolean(selectedAgent)}
+        onClose={() => setSelectedAgentKey(null)}
+        maxWidth="md"
+        fullWidth
+        slotProps={{ paper: { className: "delegation-agent-dialog-paper" } }}
+      >
+        <DialogTitle className="delegation-agent-dialog-title">
+          <Box className="delegation-agent-dialog-heading">
+            <Typography variant="subtitle2" className="delegation-console-title">
+              {selectedAgent
+                ? selectedAgent.agent.role
+                  ? `${selectedAgent.agent.name} / ${selectedAgent.agent.role}`
+                  : selectedAgent.agent.name
+                : "Agent details"}
+            </Typography>
+            <Typography variant="caption" className="delegation-console-detail">
+              {selectedAgent ? delegationAgentTypeLabel(selectedAgent.agent) : "Delegated agent"}
+            </Typography>
+          </Box>
+          <IconButton
+            size="small"
+            className="delegation-agent-dialog-close"
+            onClick={() => setSelectedAgentKey(null)}
+            aria-label="Close agent details"
+          >
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers className="delegation-agent-dialog-content">
+          {selectedAgent ? (
+            <Stack spacing={1.4}>
+              <Box className="delegation-agent-dialog-fields">
+                {readableFieldsFromRecord(
+                  {
+                    status: delegationStatusLabel(selectedAgent.agent.status),
+                    elapsed: selectedAgent.agent.elapsed,
+                    agent_type: selectedAgent.agent.specialist ? "Specialist" : "Generalist",
+                    context_mode: selectedAgent.agent.contextMode || "Delegated context",
+                    dependencies:
+                      selectedAgent.agent.dependencyCount > 0
+                        ? `${selectedAgent.agent.resolvedDependencyCount}/${selectedAgent.agent.dependencyCount}`
+                        : "",
+                    memory_count: selectedAgent.agent.memoryCount || "",
+                    action_count: selectedAgent.agent.actionCount || "",
+                    restored: selectedAgent.agent.restored ? "Restored checkpoint" : "",
+                  },
+                  12,
+                ).map((field, index) => (
+                  <Box
+                    className="delegation-agent-dialog-field"
+                    key={`${selectedAgent.agent.id}-dialog-field-${index}`}
+                  >
+                    <span className="delegation-agent-dialog-field-label">
+                      {field.label}
+                    </span>
+                    <span className="delegation-agent-dialog-field-value">
+                      {field.value}
+                    </span>
+                  </Box>
+                ))}
+              </Box>
+              <Box className="delegation-agent-dialog-section">
+                <span className="delegation-section-label">Agent output</span>
+                <DelegationReadableText
+                  text={selectedAgent.agent.outputPreview || selectedAgent.agent.update}
+                  empty="Waiting for an output update."
+                />
+              </Box>
+              <Box className="delegation-agent-dialog-section">
+                <span className="delegation-section-label">Assigned task</span>
+                <DelegationReadableText
+                  text={selectedAgent.agent.task}
+                  empty="No task text was provided."
+                />
+              </Box>
+            </Stack>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </Box>
+  );
+}
+
 const COMPUTER_PANE_TAB_LABEL: Record<ComputerPaneTab, string> = {
   computer: "Console",
   files: "Files",
@@ -749,6 +1701,7 @@ function ComputerPaneInner({
   isStreaming,
   startedAt,
   tokenPreview,
+  runMetrics = [],
   reasoningPreview,
   reasoningPhase,
   taskProgress = null,
@@ -828,26 +1781,7 @@ function ComputerPaneInner({
     () => activityCards.filter((card) => !reasoningCardIds.has(card.id)),
     [activityCards, reasoningCardIds],
   );
-  const navPool = useMemo(
-    () => {
-      const workspaceSurfaceCards = prepareChipCards(cardsForRun).filter(
-        (card) => {
-          const rendererId = rendererIdForCard(card);
-          return (
-            rendererId !== AGENTARK_RENDERERS.WORKING &&
-            rendererId !== AGENTARK_RENDERERS.FILE
-          );
-        },
-      );
-      const reasoningCards = activityCards.filter((card) =>
-        reasoningCardIds.has(card.id),
-      );
-      return [...reasoningCards, ...workspaceSurfaceCards].sort(
-        (left, right) => left.index - right.index,
-      );
-    },
-    [activityCards, cardsForRun, reasoningCardIds],
-  );
+  const navPool = useMemo(() => activityCards, [activityCards]);
   const headerFilePath =
     followedLiveWritePath ||
     deployFilePath ||
@@ -894,6 +1828,22 @@ function ComputerPaneInner({
   const activeCardIsReasoning = activeCard
     ? reasoningCardIds.has(activeCard.id) || isReasoningOnlyCard(activeCard)
     : false;
+  const delegationCardsForRun = useMemo(
+    () => cardsForRun.filter(cardHasDelegationPayload),
+    [cardsForRun],
+  );
+  const activeCardHasDelegation = activeCard ? cardHasDelegationPayload(activeCard) : false;
+  const activeDelegationRunId = useMemo(
+    () => delegationRunIdFromCard(activeCard),
+    [activeCard],
+  );
+  const delegationCardsForActiveRun = useMemo(() => {
+    if (!activeDelegationRunId) return delegationCardsForRun;
+    const filtered = delegationCardsForRun.filter(
+      (card) => delegationRunIdFromCard(card) === activeDelegationRunId,
+    );
+    return filtered.length > 0 ? filtered : delegationCardsForRun;
+  }, [activeDelegationRunId, delegationCardsForRun]);
   const activeSurfaceStatus = activeCard ? surfaceStatus(activeCard, Boolean(isStreaming)) : null;
   const fileHeaderText =
     liveWriteActive && headerFilePath
@@ -908,8 +1858,8 @@ function ComputerPaneInner({
     tab === "files" && hasFileTab ? fileHeaderText : consoleHeaderText,
     "Working",
   );
-  const completedCount = navPool.filter((card) =>
-    /done|complete|success/i.test(card.kind || ""),
+  const completedCount = navPool.filter(
+    (card) => surfaceStatus(card, false) === "done",
   ).length;
   const fileCount = hasWorkspaceFiles ? workspaceFiles.length : hasFileTab ? 1 : 0;
   const fileProgressText =
@@ -1096,6 +2046,15 @@ function ComputerPaneInner({
           snippetPath || "Code",
         )
       : null;
+  const snippetShadowsSelectedWorkspaceFile =
+    !!snippetCard &&
+    !!snippetPath &&
+    ((!!focusedFilePath &&
+      !!focusedFileContent.trim() &&
+      filePathsMatch(snippetPath, focusedFilePath)) ||
+      (!!fallbackFilePath &&
+        !!fallbackFileContent.trim() &&
+        filePathsMatch(snippetPath, fallbackFilePath)));
   const visibleTabs: ComputerPaneTab[] = hasFileTab
     ? ["computer", "files", "activity"]
     : ["computer", "activity"];
@@ -1293,6 +2252,15 @@ function ComputerPaneInner({
                 reasoningPhase={reasoningCardPhase(activeCard)}
                 persisted
               />
+            ) : activeCardHasDelegation ? (
+              <DelegationRunView
+                cards={
+                  delegationCardsForActiveRun.length > 0
+                    ? delegationCardsForActiveRun
+                    : [activeCard]
+                }
+                activeRunId={activeDelegationRunId}
+              />
             ) : (
               <SurfaceRenderer
                 card={activeCard}
@@ -1396,7 +2364,7 @@ function ComputerPaneInner({
             className="computer-pane-stage"
             sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
           >
-            {snippetCard ? (
+            {snippetCard && !snippetShadowsSelectedWorkspaceFile ? (
               <FileView
                 card={snippetCard}
                 snippetPath={snippetPath}
@@ -1415,6 +2383,12 @@ function ComputerPaneInner({
                 snippetPath={fallbackFilePath}
                 snippetContent={fallbackFileContent}
                 live={fallbackFileIsLiveWrite && liveWriteActive}
+              />
+            ) : snippetCard ? (
+              <FileView
+                card={snippetCard}
+                snippetPath={snippetPath}
+                snippetContent={snippetContent}
               />
             ) : (
               <StatusView
@@ -1458,6 +2432,7 @@ function areComputerPanePropsEqual(
     prev.isStreaming === next.isStreaming &&
     prev.startedAt === next.startedAt &&
     prev.tokenPreview === next.tokenPreview &&
+    prev.runMetrics === next.runMetrics &&
     prev.reasoningPreview === next.reasoningPreview &&
     prev.reasoningPhase === next.reasoningPhase &&
     prev.taskProgress === next.taskProgress &&

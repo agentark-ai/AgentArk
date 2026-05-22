@@ -16,70 +16,75 @@ type TourStepDef = {
 
 const TOUR_STEPS: TourStepDef[] = [
   {
-    id: "welcome-models",
-    view: "settings",
-    targetSelector: "[data-tour-target='settings-models']",
-    title: "Welcome. Add your first AI model",
-    body: "Connect an OpenAI, Anthropic, Ollama, or OpenRouter model here. Once one model is set, AgentArk can run the core AI OS surfaces: chat, memory, tasks, integrations, and reviewable actions.",
-    placement: "left",
-    spotlightPadding: 10,
-    settingsInitialTab: 1,
-  },
-  {
-    id: "chat",
-    view: "chat",
-    targetSelector: "[data-tour-target='nav-chat']",
-    title: "Command the system from chat",
-    body: "Chat is where you ask for summaries, reminders, drafts, research, app work, or action. If something becomes long-running or needs approval, it can turn into a task without leaving the thread.",
-    placement: "right",
-    spotlightPadding: 6,
-  },
-  {
-    id: "tasks",
-    view: "tasks",
-    targetSelector: "[data-tour-target='nav-tasks']",
-    title: "Tasks keep work durable",
-    body: "Use Tasks for long-running, scheduled, or approval-gated work. Routines, reminders, and deeper automations land here when they need follow-up.",
-    placement: "right",
-    spotlightPadding: 6,
-  },
-  {
-    id: "apps",
-    view: "apps",
-    targetSelector: "[data-tour-target='nav-apps']",
-    title: "Apps extend the workspace",
-    body: "Generated tools and managed launchers live here with links, restore state, and guard settings.",
-    placement: "right",
-    spotlightPadding: 6,
-  },
-  {
-    id: "attention",
+    id: "mission-control",
     view: "overview",
     targetSelector:
-      "[data-tour-target='overview-attention'], [data-tour-target='overview-dashboard']",
-    title: "Mission Control shows what needs you",
-    body: "Approvals, pauses, failures, and urgent alerts surface here so AgentArk can keep working without acting past your comfort level.",
+      "[data-tour-target='overview-dashboard'], [data-tour-target='welcome-hero']",
+    title: "Mission Control",
+    body: "Start here for live work, attention items, suggestions, and recent activity. It is the main status surface before you jump into a specific tool.",
     placement: "bottom",
     spotlightPadding: 12,
   },
   {
-    id: "overview",
-    view: "overview",
-    targetSelector: "[data-tour-target='overview-dashboard']",
-    title: "Mission Control is the OS dashboard",
-    body: "Use Mission Control for live work, attention items, suggestions, highlights, and recent activity. Chat remains the main command surface.",
-    placement: "bottom",
-    spotlightPadding: 12,
-  },
-  {
-    id: "done",
+    id: "chat-workspace",
     view: "chat",
     targetSelector:
       "[data-tour-target='chat-workspace'], [data-tour-target='nav-chat']",
-    title: "You're ready",
-    body: "Start in chat, turn on the daily brief when you want it, and open deeper OS panels when you need memory, tasks, apps, integrations, traces, or health checks. You can re-run this tour anytime from Settings > Advanced.",
+    title: "Chat",
+    body: "Ask for summaries, reminders, drafts, research, app work, or direct action here. Longer work can become a task when it needs scheduling, approval, or retry.",
     placement: "bottom",
     spotlightPadding: 10,
+  },
+  {
+    id: "tasks-work-queue",
+    view: "tasks",
+    targetSelector:
+      "[data-tour-target='tasks-work-queue'], [data-tour-target='nav-tasks']",
+    title: "Tasks",
+    body: "Long-running jobs, approvals, paused work, and scheduled automations land in this queue so the system can resume work without losing state.",
+    placement: "top",
+    spotlightPadding: 10,
+  },
+  {
+    id: "arkmemory",
+    view: "arkmemory",
+    targetSelector:
+      "[data-tour-target='arkmemory-tabs'], [data-tour-target='nav-arkmemory']",
+    title: "Memory",
+    body: "Saved facts, preferences, and memory review queues live here. Use these tabs to see what AgentArk currently remembers and what changed.",
+    placement: "bottom",
+    spotlightPadding: 10,
+  },
+  {
+    id: "trace-runs",
+    view: "trace",
+    targetSelector:
+      "[data-tour-target='trace-tabs'], [data-tour-target='nav-trace']",
+    title: "Trace",
+    body: "Recent runs, runtime activity, sync work, exports, and security events are split into these tabs for inspection and debugging.",
+    placement: "bottom",
+    spotlightPadding: 10,
+  },
+  {
+    id: "apps-registry",
+    view: "apps",
+    targetSelector:
+      "[data-tour-target='apps-registry'], [data-tour-target='nav-apps']",
+    title: "Apps",
+    body: "Generated apps and managed launchers show up here with health, links, restore status, and runtime controls.",
+    placement: "top",
+    spotlightPadding: 10,
+  },
+  {
+    id: "settings-models",
+    view: "settings",
+    targetSelector:
+      "[data-tour-target='settings-models'], [data-tour-target='settings-trigger']",
+    title: "Models and settings",
+    body: "Model routing, integrations, security, and advanced controls live in Settings. The Model Pool is where you connect providers before AgentArk runs real work.",
+    placement: "left",
+    spotlightPadding: 10,
+    settingsInitialTab: 1,
   },
 ];
 
@@ -349,9 +354,9 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
             width: targetRect.width + pad * 2,
             height: targetRect.height + pad * 2,
             borderRadius: 2,
-            border: "2px solid var(--ui-rgba-47-212-255-950)",
+            border: "2px solid var(--green)",
             boxShadow:
-              "0 0 0 1px var(--ui-rgba-47-212-255-200), 0 0 34px var(--ui-rgba-47-212-255-200), inset 0 0 24px var(--ui-rgba-47-212-255-060)",
+              "0 0 0 1px var(--ui-rgba-130-247-193-220), 0 0 34px var(--ui-rgba-130-247-193-220), inset 0 0 24px var(--ui-rgba-0-255-170-060)",
             animation: "tour-ring-pulse 2s ease-in-out infinite",
           }}
         />
@@ -368,12 +373,13 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           minHeight: 220,
           zIndex: 10000,
           borderRadius: 2,
-          border: "1px solid var(--ui-rgba-47-212-255-220)",
+          border: "1px solid var(--ui-rgba-130-247-193-320)",
           background:
-            "linear-gradient(160deg, var(--ui-rgba-10-18-34-970), var(--ui-rgba-7-14-28-950))",
+            "radial-gradient(circle at 12% 0%, var(--ui-rgba-0-255-170-080), transparent 34%), linear-gradient(160deg, var(--cyber-panel-raised), var(--cyber-panel))",
           backdropFilter: "blur(18px)",
           WebkitBackdropFilter: "blur(18px)",
-          boxShadow: "0 18px 48px var(--ui-rgba-0-0-0-400)",
+          boxShadow:
+            "0 18px 48px var(--ui-rgba-0-0-0-400), 0 0 0 1px var(--ui-rgba-0-255-170-040)",
           p: 2,
           display: "flex",
           flexDirection: "column",
@@ -391,7 +397,7 @@ export function GuidedTour({ openTourStep, currentView }: Props) {
           <Box>
             <Typography
               variant="overline"
-              sx={{ color: "var(--ui-rgba-47-212-255-860)", letterSpacing: 0 }}
+              sx={{ color: "var(--green)", letterSpacing: 0 }}
             >
               Guided Tour
             </Typography>

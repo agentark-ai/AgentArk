@@ -340,14 +340,14 @@ function displayPackName(pack: ExtensionPackView): string {
 
 function packIconColor(id: string): string {
   const palette = [
-    "#5E6AD2",
-    "#4285F4",
-    "#0DBD8B",
-    "#26A5E4",
+    "#78F2B0",
+    "#D8AD78",
+    "#C8D8C9",
+    "#B7A7FF",
     "#FFB020",
     "#E57373",
     "#81C784",
-    "#90CAF9",
+    "#E6D6C0",
   ];
   const seed = Array.from(id).reduce((sum, ch) => sum + ch.charCodeAt(0), 0);
   return palette[seed % palette.length];

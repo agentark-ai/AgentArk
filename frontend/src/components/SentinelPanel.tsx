@@ -10,9 +10,7 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
-  FormControlLabel,
   Stack,
-  Switch,
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -106,13 +104,15 @@ function proposalDotColor(status: string): string {
 }
 
 function proposalActionLabel(proposal: SentinelProposal): string {
-  return proposal.proposal_kind === "chat_suggestion_accept" ? "Launch" : "Run";
+  const actionKind = str(proposal.action?.action_kind, "").trim();
+  if (actionKind === "chat_prompt") return "Open in Chat";
+  return "Review";
 }
 
 function modeLabel(mode: "off" | "assist" | "auto"): string {
   if (mode === "off") return "Off";
   if (mode === "auto") return "Auto";
-  return "Suggest first";
+  return "Review first";
 }
 
 function proposalStatusLabel(status: string): string {
@@ -130,7 +130,7 @@ function sourceKindLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return "AgentArk";
   if (normalized === "in_app_activity") return "Inside AgentArk";
-  if (normalized === "connected_service" || normalized === "service_event") return "Connected apps";
+  if (normalized === "integration" || normalized === "connected_service" || normalized === "service_event") return "Connected source";
   if (normalized === "chat") return "Chat";
   if (normalized === "observation") return "System signal";
   return humanizeBackgroundKey(normalized);
@@ -213,14 +213,21 @@ function proposalLooksLikeRouterNoise(proposal: SentinelProposal): boolean {
 function proposalIsUserActionable(proposal: SentinelProposal): boolean {
   const status = str(proposal.status, "").toLowerCase();
   if (status !== "open" && status !== "queued_for_approval") return false;
-  if (proposal.proposal_kind === "chat_suggestion_accept") return true;
+  if (
+    proposal.proposal_kind === "chat_suggestion_accept" ||
+    proposal.source_kind === "chat_suggestion" ||
+    proposalChatSuggestionId(proposal)
+  ) {
+    return false;
+  }
   if (proposal.source_kind === "execution_run" && proposalLooksLikeRouterNoise(proposal)) return false;
+  const metadata = proposalMetadata(proposal);
+  if (proposal.source_kind === "execution_run" && metadata.background_signal !== true) return false;
   const choices = proposalClarificationChoices(proposal);
   if (choices.length > 0) return true;
   if (!proposalHasRunnableAction(proposal)) return false;
   if (proposal.source_kind !== "execution_run") return true;
 
-  const metadata = proposalMetadata(proposal);
   if (typeof metadata.user_actionable === "boolean") return metadata.user_actionable;
 
   const runStatus = str(proposal.run_status, str(metadata.status, "")).toLowerCase();
@@ -301,7 +308,6 @@ export function SentinelPanel({
   const [runMinimized, setRunMinimized] = useState(false);
   const [selectedProposalId, setSelectedProposalId] = useState("");
   const [proposalPage, setProposalPage] = useState(0);
-  const [showSentinelInternals, setShowSentinelInternals] = useState(false);
 
   const settingsQ = useQuery({
     queryKey: ["sentinel-settings"],
@@ -447,35 +453,31 @@ export function SentinelPanel({
   const currentModeLabel = settingsQ.data?.agent_paused ? "Paused" : modeLabel(currentAutonomyMode);
   const connectedServicesCount = num(stats?.connected_services, 0);
   const inAppEventCount = num(stats?.in_app_events, 0);
-  // When there are open proposals, the cards below show the actual
-  // follow-ups with content + actions; a headline saying "1 follow-up
-  // waiting for you" + a generic "review or leave them for later" line
-  // adds no signal. Fall through to the steady-state copy so the hero
-  // describes ArkSentinel itself, not just re-state the proposal count
-  // that the hero stat strip already shows.
   const sentinelHeroHeadline =
     settingsQ.data?.agent_paused
-      ? "ArkSentinel is paused."
+      ? "Sentinel is paused."
       : currentAutonomyMode === "off"
-        ? "ArkSentinel is turned off."
-        : "ArkSentinel is watching quietly.";
+        ? "Sentinel is turned off."
+        : openProposals.length > 0
+          ? "Background signals need review."
+          : "No background signals need review.";
   const sentinelHeroDetail =
     settingsQ.data?.agent_paused
-      ? "Turn autonomy back on to resume background checks, suggestions, and learning."
+      ? "Turn autonomy back on to resume connected-source and background-run checks."
       : currentAutonomyMode === "off"
-        ? "ArkSentinel is not scanning for follow-ups while this mode is off."
+        ? "Sentinel is not scanning connected sources or detached background work while this mode is off."
         : connectedServicesCount === 0 && inAppEventCount === 0
-          ? "ArkSentinel is watching and learning quietly in the background. Anything worth your attention will show up here."
+          ? "Connect services or start background work; Sentinel will show only signals that are not already attached to an active chat."
           : connectedServicesCount === 0
-            ? `ArkSentinel has noticed ${inAppEventCount} thing${inAppEventCount === 1 ? "" : "s"} so far. Connect an account or app and it will start watching that too.`
+            ? `Sentinel found ${inAppEventCount} detached background signal${inAppEventCount === 1 ? "" : "s"}. Connected sources will appear here after setup.`
           : currentAutonomyMode === "auto"
-            ? `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and can handle lightweight routine work for you.`
-            : `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and will ask before it acts.`;
+            ? `Sentinel is checking ${connectedServicesCount} connected source${connectedServicesCount === 1 ? "" : "s"} plus detached background work.`
+            : `Sentinel is checking ${connectedServicesCount} connected source${connectedServicesCount === 1 ? "" : "s"} and will ask before acting.`;
   const heroStats = [
     {
-      label: "Waiting for you",
+      label: "Signals",
       value: String(openProposals.length),
-      helper: openProposals.length === 0 ? "Nothing needs approval" : "Suggested next step" + (openProposals.length === 1 ? "" : "s")
+      helper: openProposals.length === 0 ? "No action needed" : "Needs review"
     },
     {
       label: "Last check",
@@ -483,36 +485,35 @@ export function SentinelPanel({
       helper: str(scan?.last_status, "idle") || "idle"
     },
     {
-      label: "Connected apps",
+      label: "Connected sources",
       value: String(stats?.connected_services ?? 0),
-      helper: `${stats?.connected_services ?? 0} connected service${(stats?.connected_services ?? 0) === 1 ? "" : "s"}`
+      helper: `${stats?.connected_services ?? 0} source${(stats?.connected_services ?? 0) === 1 ? "" : "s"} active`
     },
     {
-      label: "In-app signals",
+      label: "Background runs",
       value: String(stats?.in_app_events ?? 0),
       helper: `${stats?.recent_runs ?? 0} recent run${(stats?.recent_runs ?? 0) === 1 ? "" : "s"} checked`
     }
   ];
   async function runProposal(proposal: SentinelProposal) {
     const linkedSuggestionId = proposalChatSuggestionId(proposal);
-    if (proposal.proposal_kind === "chat_suggestion_accept") {
-      if (!linkedSuggestionId) {
-        setError("This Sentinel item is missing its linked chat suggestion.");
-        return;
-      }
+    const actionKind = str(proposal.action?.action_kind, "").trim();
+    const actionPayload = asRecord(proposal.action?.payload);
+    const actionPrompt = str(actionPayload.prompt, "").trim();
+    if (actionKind === "chat_prompt" && actionPrompt) {
       setError(null);
       setSuccess(null);
       storeChatPendingLaunch({
         createdAt: Date.now(),
         launchMode: "message",
-        message: `Launch Sentinel suggestion: ${proposal.title}`,
-        conversationId: proposalConversationId(proposal) || undefined,
+        message: actionPrompt,
+        conversationId: str(actionPayload.conversation_id, proposalConversationId(proposal)).trim() || undefined,
         source: "sentinel",
-        acceptedSuggestionId: linkedSuggestionId,
         sentinelProposalId: proposal.id,
       });
+      void dismissMutation.mutateAsync(proposal.id).catch(() => undefined);
       setSelectedProposalId((current) => current === proposal.id ? "" : current);
-      setSuccess("Opening Chat to launch this Sentinel suggestion.");
+      setSuccess("Opening this Sentinel signal in Chat.");
       navigateToView("chat");
       return;
     }
@@ -521,7 +522,7 @@ export function SentinelPanel({
     setRun({
       title: proposal.title,
       status: "running",
-      summary: "Launching ArkSentinel proposal...",
+      summary: "Opening Sentinel signal in Chat...",
       startedAt: new Date().toISOString(),
       suggestionId: linkedSuggestionId || undefined,
     });
@@ -544,14 +545,14 @@ export function SentinelPanel({
             : traceId && runStatus !== "queued_for_approval"
               ? "running"
               : "completed",
-        summary: str(response.message, "ArkSentinel proposal accepted."),
+        summary: str(response.message, "Sentinel proposal accepted."),
         traceId: traceId || undefined,
         startedAt: new Date().toISOString(),
         completedAt: runStatus === "queued_for_approval" || !traceId ? new Date().toISOString() : undefined,
         suggestionId: responseSuggestionId || undefined,
       });
       setSelectedProposalId((current) => current === proposal.id ? "" : current);
-      setSuccess("ArkSentinel proposal accepted.");
+      setSuccess("Sentinel signal opened.");
     } catch (runError) {
       const message = errMessage(runError);
       setRun((current) =>
@@ -574,7 +575,7 @@ export function SentinelPanel({
     try {
       await dismissMutation.mutateAsync(id);
       setSelectedProposalId((current) => current === id ? "" : current);
-      setSuccess("ArkSentinel proposal dismissed.");
+      setSuccess("Sentinel proposal dismissed.");
     } catch (dismissError) {
       setError(errMessage(dismissError));
     }
@@ -586,7 +587,7 @@ export function SentinelPanel({
     try {
       await snoozeMutation.mutateAsync(id);
       setSelectedProposalId((current) => current === id ? "" : current);
-      setSuccess("ArkSentinel proposal snoozed for 6 hours.");
+      setSuccess("Sentinel proposal snoozed for 6 hours.");
     } catch (snoozeError) {
       setError(errMessage(snoozeError));
     }
@@ -594,22 +595,20 @@ export function SentinelPanel({
 
   function launchClarificationChoice(proposal: SentinelProposal, choice: SentinelClarificationChoice) {
     const conversationId = proposalConversationId(proposal);
-    if (!conversationId) {
-      setError("This item is missing its source chat. Open the technical details and continue from the linked run.");
-      return;
-    }
     setError(null);
     setSuccess(null);
     storeChatPendingLaunch({
       createdAt: Date.now(),
       launchMode: "message",
-      message: choice.submitText,
-      conversationId,
+      message: conversationId
+        ? choice.submitText
+        : `Review Sentinel signal: ${proposal.title}\n\n${choice.submitText}`,
+      conversationId: conversationId || undefined,
       source: "sentinel",
     });
     void dismissMutation.mutateAsync(proposal.id).catch(() => undefined);
     setSelectedProposalId((current) => current === proposal.id ? "" : current);
-    setSuccess(`Sending "${choice.label}" to the source chat.`);
+    setSuccess(`Opening "${choice.label}" in Chat.`);
     navigateToView("chat");
   }
 
@@ -618,16 +617,8 @@ export function SentinelPanel({
       <WorkspacePageShell spacing={1.5}>
         <WorkspacePageHeader
           eyebrow="ARK CORE"
-          title="ArkSentinel"
-          description={
-            <>
-              ArkSentinel shows decisions and safety checks that need you.
-              <br />
-              ArkSentinel keeps an eye on activity in the background and learns from what worked before.
-              <br />
-              When something needs you, it shows up here as a suggestion you can approve or skip.
-            </>
-          }
+          title="Sentinel"
+          description="Spots follow-ups, routine work, and unattended issues, then suggests or handles the next step when policy allows it."
           actions={
             <Stack
               direction="row"
@@ -641,26 +632,8 @@ export function SentinelPanel({
                 color={autonomyDisabled ? "warning" : currentAutonomyMode === "auto" ? "success" : "info"}
                 label={currentModeLabel}
               />
-              <Chip label={openProposals.length > 0 ? `${openProposals.length} waiting` : "Nothing waiting"} />
+              <Chip label={openProposals.length > 0 ? `${openProposals.length} signals` : "No signals"} />
               <Chip label={`Checked ${lastScanLabel}`} />
-              <FormControlLabel
-                control={
-                  <Switch
-                    size="small"
-                    checked={showSentinelInternals}
-                    onChange={(event) => {
-                      const next = event.target.checked;
-                      setShowSentinelInternals(next);
-                    }}
-                  />
-                }
-                label={
-                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                    Show Sentinel internals
-                  </Typography>
-                }
-                sx={{ ml: 0.5, mr: 0 }}
-              />
             </Stack>
           }
         />
@@ -698,7 +671,7 @@ export function SentinelPanel({
             <Stack spacing={1}>
               <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
                 <Stack direction="row" spacing={1} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
-                  <Typography variant="h6">Needs your attention</Typography>
+                  <Typography variant="h6">Background signals</Typography>
                   <Chip
                     size="small"
                     variant="outlined"
@@ -722,7 +695,7 @@ export function SentinelPanel({
                   <Typography variant="body2" sx={{
                     color: "text.secondary"
                   }}>
-                    Nothing waiting. Sentinel will flag anything new right here.
+                    No connected-source or detached background signals need review.
                   </Typography>
                 ) : (
                   <Stack spacing={1}>
@@ -869,7 +842,7 @@ export function SentinelPanel({
                   ) : null}
                   {selectedProposalGroup && selectedProposalGroup.proposals.length > 1 ? (
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      Grouped {selectedProposalGroup.proposals.length} matching follow-ups from the same run context.
+                      Grouped {selectedProposalGroup.proposals.length} matching signals from the same source context.
                     </Typography>
                   ) : null}
                 </Stack>
@@ -922,27 +895,6 @@ export function SentinelPanel({
                       </>
                     ) : null}
                   </Box>
-                  {showSentinelInternals ? (
-                    <Box className="metadata-box micro-surface" sx={{ maxHeight: 260, p: 1.25, overflow: "auto" }}>
-                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                        Fingerprint: {selectedProposal.fingerprint || "-"}
-                      </Typography>
-                      {Object.keys(proposalMetadata(selectedProposal)).length > 0 ? (
-                        <Box
-                          component="pre"
-                          sx={{
-                            m: 0,
-                            mt: 1,
-                            whiteSpace: "pre-wrap",
-                            overflowWrap: "anywhere",
-                            fontSize: "0.75rem",
-                          }}
-                        >
-                          {JSON.stringify(proposalMetadata(selectedProposal), null, 2)}
-                        </Box>
-                      ) : null}
-                    </Box>
-                  ) : null}
                 </Stack>
               </Stack>
             </DialogContent>

@@ -30,11 +30,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
 import type {
-  ArkPulseCleanupCandidate,
-  ArkPulseCleanupPreviewResponse,
-  ArkPulseCleanupRequest,
-  ArkPulseRemediationSpec,
-  ArkPulseRunFixRequest,
+  PulseCleanupCandidate,
+  PulseCleanupPreviewResponse,
+  PulseCleanupRequest,
+  PulseRemediationSpec,
+  PulseRunFixRequest,
 } from "../../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { asRecord, errMessage, num, pickRecords, str, toBool, type JsonRecord } from "./pageHelpers";
@@ -64,11 +64,11 @@ import { humanTs } from "./workspaceUiBits";
 
 const REFRESH_MS = 8000;
 
-type ArkPulsePageProps = {
+type PulsePageProps = {
   autoRefresh: boolean;
 };
 
-type ArkPulseInlineResult = {
+type PulseInlineResult = {
   severity: "success" | "info" | "warning" | "error";
   message: string;
   output?: string;
@@ -151,7 +151,7 @@ function manualHandlingText(finding: JsonRecord): string {
   return arkPulseManualFollowupText();
 }
 
-function remediationModeLabel(remediation: ArkPulseRemediationSpec | null): string {
+function remediationModeLabel(remediation: PulseRemediationSpec | null): string {
   if (!remediation) return "Manual";
   if (remediation.kind === "readonly_investigation") return "Diagnostic";
   if (remediation.kind === "app_restart") return "Auto restart";
@@ -162,7 +162,7 @@ function remediationModeLabel(remediation: ArkPulseRemediationSpec | null): stri
   return "Manual command";
 }
 
-function remediationActionLabel(remediation: ArkPulseRemediationSpec | null): string {
+function remediationActionLabel(remediation: PulseRemediationSpec | null): string {
   if (!remediation) return "Run remediation";
   if (remediation.kind === "app_restart") return "Restart app";
   if (remediation.kind === "tunnel_start_verify") return "Start tunnel";
@@ -196,11 +196,11 @@ async function copyClipboardText(value: string): Promise<void> {
   if (!ok) throw new Error("Copy failed.");
 }
 
-export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
+export default function PulsePage({ autoRefresh }: PulsePageProps) {
   const queryClient = useQueryClient();
   const [selectedPulseEvent, setSelectedPulseEvent] = useState<JsonRecord | null>(null);
   const [activeFixId, setActiveFixId] = useState<string | null>(null);
-  const [inlineResults, setInlineResults] = useState<Record<string, ArkPulseInlineResult>>({});
+  const [inlineResults, setInlineResults] = useState<Record<string, PulseInlineResult>>({});
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [pulsePollState, setPulsePollState] = useState<{
@@ -208,7 +208,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
     deadlineAt: number;
   } | null>(null);
   const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
-  const [cleanupPreview, setCleanupPreview] = useState<ArkPulseCleanupPreviewResponse | null>(null);
+  const [cleanupPreview, setCleanupPreview] = useState<PulseCleanupPreviewResponse | null>(null);
   const [selectedCleanupIds, setSelectedCleanupIds] = useState<Record<string, boolean>>({});
   const [cleanupConfirmed, setCleanupConfirmed] = useState(false);
   const [cleanupJob, setCleanupJob] = useState<JsonRecord | null>(null);
@@ -253,10 +253,10 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
   }, [latestPulseEventKey, pulsePollState, pulseRunning]);
 
   const latestPulseHeadline = pulseRunning
-    ? "ArkPulse is currently running."
+    ? "Pulse is currently running."
     : pulseEvents.length === 0
       ? pulseHistoryUnavailable
-        ? "Earlier ArkPulse history is unavailable."
+        ? "Earlier Pulse history is unavailable."
         : "No health checks yet."
       : latestFindingCount > 0
         ? `${latestFindingCount} issue${latestFindingCount === 1 ? "" : "s"} need attention.`
@@ -268,7 +268,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
     : pulseEvents.length === 0
       ? pulseHistoryUnavailable
         ? pulseHistoryUnavailableReason ||
-          "A previous ArkPulse payload exists, but this runtime could not load it. New runs will appear normally."
+          "A previous Pulse payload exists, but this runtime could not load it. New runs will appear normally."
         : "Click Run now to generate your first diagnostics report."
       : latestFindingCount > 0
         ? "Open the latest report and start with the first priority item."
@@ -300,7 +300,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
         ? {
             severity: "warning" as const,
             title: `${selectedPulseFindings.length} issue${selectedPulseFindings.length === 1 ? "" : "s"} need attention.`,
-            detail: "Run only verified ArkPulse actions; findings without a runnable remediation are manual follow-up.",
+            detail: "Run only verified Pulse actions; findings without a runnable remediation are manual follow-up.",
           }
         : {
             severity: "info" as const,
@@ -354,13 +354,13 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
   const runPulseFixMutation = useMutation({
     mutationFn: async (payload: {
       fixCommand: string;
-      remediation?: ArkPulseRemediationSpec | null;
+      remediation?: PulseRemediationSpec | null;
       issueTitle: string;
       target: string;
       eventTimestamp: string;
       findingIndex: number;
     }) => {
-      const body: ArkPulseRunFixRequest = {
+      const body: PulseRunFixRequest = {
         issue_title: payload.issueTitle,
         target: payload.target,
         event_timestamp: payload.eventTimestamp,
@@ -374,7 +374,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
       const out = asRecord(await api.rawPost("/arkpulse/fix", body));
       const status = str(out.status, "").toLowerCase();
       if (status === "error") {
-        throw new Error(str(out.error, "").trim() || str(out.message, "").trim() || "ArkPulse fix failed.");
+        throw new Error(str(out.error, "").trim() || str(out.message, "").trim() || "Pulse fix failed.");
       }
       return out;
     },
@@ -385,7 +385,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
   });
 
   const cleanupMutation = useMutation({
-    mutationFn: async (body: ArkPulseCleanupRequest) => asRecord(await api.rawPost("/arkpulse/cleanup", body)),
+    mutationFn: async (body: PulseCleanupRequest) => asRecord(await api.rawPost("/arkpulse/cleanup", body)),
   });
 
   async function runArkPulseCheck() {
@@ -396,8 +396,8 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
       const status = str(out.status, "").toLowerCase();
       setSuccess(
         status === "already_running"
-          ? str(out.message, "ArkPulse is already running.")
-          : str(out.message, "ArkPulse check started."),
+          ? str(out.message, "Pulse is already running.")
+          : str(out.message, "Pulse check started."),
       );
       setPulsePollState({
         baselineEventId: latestPulseEventKey,
@@ -417,8 +417,8 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
     setCleanupConfirmed(false);
     setCleanupJob(null);
     try {
-      const out = (await cleanupPreviewMutation.mutateAsync()) as unknown as ArkPulseCleanupPreviewResponse;
-      const candidates = Array.isArray(out.candidates) ? out.candidates : [];
+      const out = (await cleanupPreviewMutation.mutateAsync()) as unknown as PulseCleanupPreviewResponse;
+      const candidates: PulseCleanupCandidate[] = Array.isArray(out.candidates) ? out.candidates : [];
       setCleanupPreview({ ...out, candidates });
       const defaults: Record<string, boolean> = {};
       for (const candidate of candidates) {
@@ -441,7 +441,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
         confirm_archive: true,
       });
       setCleanupJob(out);
-      setSuccess(str(out.message, "ArkPulse cleanup is running on its background worker."));
+      setSuccess(str(out.message, "Pulse cleanup is running on its background worker."));
       await queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEYS.arkPulseLog });
     } catch (e) {
       setError(errMessage(e));
@@ -472,7 +472,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
         eventTimestamp: selectedTimestampRaw,
         findingIndex: finding.findingIndex,
       });
-      const message = str(result.message, "ArkPulse fix completed.").trim() || "ArkPulse fix completed.";
+      const message = str(result.message, "Pulse fix completed.").trim() || "Pulse fix completed.";
       const output = str(result.output, "").trim();
       setSuccess(output ? `${message}\n\n${output}` : message);
       setInlineResults((prev) => ({
@@ -508,14 +508,8 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
     <WorkspacePageShell spacing={1.5} className="arkpulse-page-shell">
       <WorkspacePageHeader
         eyebrow="ARK CORE"
-        title="ArkPulse"
-        description={
-          <>
-            ArkPulse shows whether AgentArk and connected systems are working normally.
-            <br />
-            ArkPulse runs checks and offers a one-click fix when it can safely resolve an issue.
-          </>
-        }
+        title="Pulse"
+        description="Pulse runs checks and offers a one-click fix when it can safely resolve an issue."
         actions={
           <Stack direction="row" spacing={0.75}>
             <Button
@@ -580,8 +574,8 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
           <Stack spacing={1} sx={{ flex: 1 }}>
             <Typography variant="body2" sx={{ color: "text.secondary" }}>
               {pulseHistoryUnavailable
-                ? "Stored ArkPulse history could not be loaded in this runtime."
-                : "No ArkPulse events yet."}
+                ? "Stored Pulse history could not be loaded in this runtime."
+                : "No Pulse events yet."}
             </Typography>
             <Box sx={{ flex: 1 }} />
           </Stack>
@@ -672,7 +666,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
           >
             <Box>
               <Typography variant="h6" sx={{ fontWeight: 650 }}>
-                ArkPulse Run
+                Pulse Run
               </Typography>
               <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.35, maxWidth: 720 }}>
                 {str(selectedPulseEvent?.summary, "Health check details, findings, and scan ledger.")}
@@ -996,7 +990,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
                 Run ledger
               </Typography>
               <Typography variant="body2" sx={{ color: "var(--ui-rgba-188-198-212-720)" }}>
-                This shows exactly what ArkPulse scanned, how long each phase took, and what happened with notifications. Sections stay collapsed until you open them.
+                This shows exactly what Pulse scanned, how long each phase took, and what happened with notifications. Sections stay collapsed until you open them.
               </Typography>
             </Stack>
             <Box sx={{ borderRadius: "8px", border: "1px solid var(--ui-rgba-255-255-255-080)", overflow: "hidden" }}>
@@ -1064,7 +1058,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
               <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
                 <CircularProgress size={16} />
                 <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  Loading cleanup preview on the ArkPulse worker.
+                  Loading cleanup preview on the Pulse worker.
                 </Typography>
               </Stack>
             ) : cleanupPreview ? (
@@ -1075,7 +1069,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
                     : "No managed cleanup candidates were found."}
                 </Alert>
                 <Stack spacing={0.75}>
-                  {cleanupCandidates.map((candidate: ArkPulseCleanupCandidate) => {
+                  {cleanupCandidates.map((candidate: PulseCleanupCandidate) => {
                     const checked = Boolean(selectedCleanupIds[candidate.id]);
                     return (
                       <Box

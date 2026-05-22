@@ -1,5 +1,5 @@
 import { formatUiDateTimeMeta } from "../../lib/dateFormat";
-import type { ArkPulseRemediationSpec } from "../../types";
+import type { PulseRemediationSpec } from "../../types";
 import { asRecord, num, str, toBool } from "./pageHelpers";
 
 export const AUTO_APPROVE_ACTION_OPTIONS = [
@@ -149,7 +149,7 @@ export function isUserActionableDoctorFinding(value: unknown): boolean {
 
 export function parseArkPulseRemediationSpec(
   value: unknown,
-): ArkPulseRemediationSpec | null {
+): PulseRemediationSpec | null {
   const row = asRecord(value);
   const kind = str(row.kind, "").trim().toLowerCase();
   if (!kind) return null;
@@ -189,7 +189,7 @@ export function parseArkPulseRemediationSpec(
 }
 
 export function describeArkPulseRemediation(
-  remediation: ArkPulseRemediationSpec | null,
+  remediation: PulseRemediationSpec | null,
 ): string {
   if (!remediation) return "-";
   if (remediation.kind === "tunnel_start_verify") {
@@ -217,13 +217,13 @@ export function describeArkPulseRemediation(
 }
 
 function isArkPulseReadonlyInvestigation(
-  remediation: ArkPulseRemediationSpec | null,
+  remediation: PulseRemediationSpec | null,
 ): boolean {
   return remediation?.kind === "readonly_investigation";
 }
 
 export function arkPulseRunActionLabel(
-  remediation: ArkPulseRemediationSpec | null,
+  remediation: PulseRemediationSpec | null,
 ): string {
   if (isArkPulseReadonlyInvestigation(remediation)) return "Run diagnostic";
   if (remediation?.kind === "managed_app_operation") return "Run app fix";
@@ -231,38 +231,38 @@ export function arkPulseRunActionLabel(
 }
 
 export function arkPulseRemediationFootnote(
-  remediation: ArkPulseRemediationSpec | null,
+  remediation: PulseRemediationSpec | null,
   canRunFix: boolean,
 ): string {
   if (!canRunFix) {
-    return "ArkPulse has no verified executable action for this finding; the recommendation is display-only.";
+    return "Pulse has no verified executable action for this finding; the recommendation is display-only.";
   }
   if (!remediation) {
     return "This next step is advisory only.";
   }
   if (remediation.kind === "readonly_investigation") {
-    return "Runs a read-only diagnostic from ArkPulse and returns a summary here.";
+    return "Runs a read-only diagnostic from Pulse and returns a summary here.";
   }
   if (remediation.kind === "managed_app_operation") {
-    return "Runs a structured app remediation from the stored ArkPulse finding.";
+    return "Runs a structured app remediation from the stored Pulse finding.";
   }
-  return "Runs directly from ArkPulse using the finding's typed remediation.";
+  return "Runs directly from Pulse using the finding's typed remediation.";
 }
 
 export function isRunnableArkPulseRemediation(
-  remediation: ArkPulseRemediationSpec | null,
+  remediation: PulseRemediationSpec | null,
 ): boolean {
   if (!remediation) return false;
   return remediation.kind !== "shell_command";
 }
 
 export function arkPulseManualFollowupText(): string {
-  return "Manual follow-up: this finding has no verified executable ArkPulse action. Review the evidence and apply the relevant configuration or code change outside the auto-fix flow.";
+  return "Manual follow-up: this finding has no verified executable Pulse action. Review the evidence and apply the relevant configuration or code change outside the auto-fix flow.";
 }
 
 export function getRunnableArkPulseRemediation(
   value: unknown,
-): ArkPulseRemediationSpec | null {
+): PulseRemediationSpec | null {
   const row = asRecord(value);
   const remediation = parseArkPulseRemediationSpec(row.remediation);
   return isRunnableArkPulseRemediation(remediation) ? remediation : null;

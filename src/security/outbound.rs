@@ -313,10 +313,12 @@ mod tests {
             OutboundPrivacyDecision::RedactedAllow
         ));
         assert!(result.sanitized_text.contains("[EMAIL]"));
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("PII-like")));
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("PII-like"))
+        );
     }
 
     #[test]
@@ -353,9 +355,11 @@ mod tests {
             },
         );
         assert!(matches!(result.decision, OutboundPrivacyDecision::Block));
-        assert!(result
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("auto-redaction is disabled")));
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("auto-redaction is disabled"))
+        );
     }
 }

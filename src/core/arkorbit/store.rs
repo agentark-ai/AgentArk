@@ -5,7 +5,7 @@
 //! firmware files under `src/core/arkorbit/l0` during source-tree runs, which
 //! win over the embedded L0 fallback compiled into the binary.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
@@ -514,7 +514,9 @@ fn validate_widget_registry_json(source: &str) -> Result<()> {
         .as_array()
         .or_else(|| parsed.get("widgets").and_then(|value| value.as_array()))
         .ok_or_else(|| {
-            anyhow!("arkorbit: data/widgets.json must be an array or an object with a widgets array")
+            anyhow!(
+                "arkorbit: data/widgets.json must be an array or an object with a widgets array"
+            )
         })?;
     for (index, widget) in widgets.iter().enumerate() {
         let object = widget.as_object().ok_or_else(|| {
@@ -1045,12 +1047,14 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("invalid browser JavaScript"));
-        assert!(!store
-            .orbit_dir(&orbit_id)
-            .join("mod")
-            .join("broken")
-            .join("index.js")
-            .exists());
+        assert!(
+            !store
+                .orbit_dir(&orbit_id)
+                .join("mod")
+                .join("broken")
+                .join("index.js")
+                .exists()
+        );
     }
 
     #[test]
@@ -1068,12 +1072,14 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("must export a named render"));
-        assert!(!store
-            .orbit_dir(&orbit_id)
-            .join("mod")
-            .join("broken")
-            .join("index.js")
-            .exists());
+        assert!(
+            !store
+                .orbit_dir(&orbit_id)
+                .join("mod")
+                .join("broken")
+                .join("index.js")
+                .exists()
+        );
     }
 
     #[test]
@@ -1134,11 +1140,13 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("must be valid JSON"));
-        assert!(!store
-            .orbit_dir(&orbit_id)
-            .join("data")
-            .join("widgets.json")
-            .exists());
+        assert!(
+            !store
+                .orbit_dir(&orbit_id)
+                .join("data")
+                .join("widgets.json")
+                .exists()
+        );
     }
 
     #[test]

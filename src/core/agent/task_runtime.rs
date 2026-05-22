@@ -1,24 +1,57 @@
 #![allow(dead_code)]
 
-use super::action_selection::action_is_read_only;
 use super::*;
+
+fn action_is_read_only(action: &crate::actions::ActionDef) -> bool {
+    matches!(
+        action.action_metadata().side_effect_level,
+        ActionSideEffectLevel::None
+    )
+}
+
+fn required_argument_present(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Null) | None => false,
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(serde_json::Value::Object(map)) => !map.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn missing_required_fields(
+    action: &crate::actions::ActionDef,
+    payload: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let required = action
+        .input_schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    required
+        .into_iter()
+        .filter(|field| !required_argument_present(payload.get(field.as_str())))
+        .collect()
+}
 
 fn action_is_scheduler_default_candidate(action: &crate::actions::ActionDef) -> bool {
     let metadata = action.action_metadata();
     let read_only_source = matches!(metadata.side_effect_level, ActionSideEffectLevel::None)
         && matches!(
             metadata.role,
-            ActionRole::DataSource
-                | ActionRole::Inspection
-                | ActionRole::Trigger
+            ActionRole::DataSource | ActionRole::Inspection | ActionRole::Trigger
         );
-    let internal_notification =
-        matches!(metadata.side_effect_level, ActionSideEffectLevel::Notify)
-            && matches!(metadata.role, ActionRole::Delivery)
-            && matches!(
-                metadata.integration_class,
-                ActionIntegrationClass::Internal
-            );
+    let internal_notification = matches!(metadata.side_effect_level, ActionSideEffectLevel::Notify)
+        && matches!(metadata.role, ActionRole::Delivery)
+        && matches!(metadata.integration_class, ActionIntegrationClass::Internal);
     read_only_source || internal_notification
 }
 
@@ -81,6 +114,25 @@ fn watcher_delivery_sentence_fragment(notify_channel: &str) -> String {
     }
 }
 
+fn watcher_repeat_on_match_from_arguments(
+    arguments: &serde_json::Value,
+    existing_watcher: Option<&super::watcher::Watcher>,
+    until_stopped: bool,
+) -> bool {
+    if let Some(value) = arguments
+        .get("repeat_on_match")
+        .and_then(|value| value.as_bool())
+    {
+        return value;
+    }
+
+    if let Some(watcher) = existing_watcher {
+        return watcher.repeat_on_match;
+    }
+
+    until_stopped
+}
+
 fn schedule_task_batch_item_arguments(
     arguments: &serde_json::Value,
 ) -> Option<Result<Vec<serde_json::Value>>> {
@@ -95,6 +147,11 @@ fn schedule_task_batch_item_arguments(
         "report_to",
         "action",
         "action_arguments",
+        "script",
+        "script_language",
+        "context_from",
+        "workdir",
+        "network_access",
         "allow_duplicate",
         "validation",
         "max_attempts",
@@ -165,6 +222,11 @@ fn watch_batch_item_arguments(
         "description",
         "poll_action",
         "poll_arguments",
+        "script",
+        "script_language",
+        "context_from",
+        "workdir",
+        "network_access",
         "condition",
         "on_trigger",
         "interval_secs",
@@ -173,6 +235,7 @@ fn watch_batch_item_arguments(
         "timeout_days",
         "until_stopped",
         "notify_channel",
+        "repeat_on_match",
         "allow_duplicate",
         "validation",
         "max_attempts",
@@ -204,16 +267,22 @@ fn watch_batch_item_arguments(
             .and_then(|value| value.as_str())
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
+        let has_poll_action = merged
+            .get("poll_action")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let has_script = merged
+            .get("script")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
         let can_create = merged
             .get("description")
             .and_then(|value| value.as_str())
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
-            && merged
-                .get("poll_action")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty())
+            && (has_poll_action || has_script)
             && merged.get("condition").is_some()
             && merged
                 .get("on_trigger")
@@ -222,7 +291,7 @@ fn watch_batch_item_arguments(
                 .is_some_and(|value| !value.is_empty());
         if !updates_existing && !can_create {
             return Some(Err(anyhow::anyhow!(
-                "watch.items[{}] must either identify a watcher_id or include description, poll_action, condition, and on_trigger",
+                "watch.items[{}] must either identify a watcher_id or include description, poll_action/script, condition, and on_trigger",
                 index
             )));
         }
@@ -245,6 +314,37 @@ fn schedule_task_completion_data(result: &str) -> Option<serde_json::Value> {
         .cloned()
 }
 
+fn schedule_task_schedule_from_arguments(
+    arguments: &serde_json::Value,
+) -> Result<(Option<String>, Option<chrono::DateTime<chrono::Utc>>), String> {
+    if let Some(cron) = arguments
+        .get("cron")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let cron_6field = if cron.split_whitespace().count() == 5 {
+            format!("0 {}", cron)
+        } else {
+            cron.to_string()
+        };
+        return Ok((Some(cron_6field), None));
+    }
+
+    if let Some(at_time) = arguments
+        .get("at")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let dt = chrono::DateTime::parse_from_rfc3339(at_time).map_err(|error| {
+            format!("Invalid schedule `at` timestamp `{}`: {}.", at_time, error)
+        })?;
+        return Ok((None, Some(dt.with_timezone(&chrono::Utc))));
+    }
+
+    Err("schedule_task requires `cron` or `at`; use `cron` for recurring work or `at` for one-time work; refusing to infer the current time.".to_string())
+}
 fn strip_tool_completion_marker_line(result: &str) -> String {
     let trimmed = result.trim_start();
     if trimmed
@@ -259,10 +359,31 @@ fn strip_tool_completion_marker_line(result: &str) -> String {
     .to_string()
 }
 
+fn task_action_is_settings_authorized_without_approval(action: &str) -> bool {
+    action == "daily_brief"
+}
+
+fn remove_task_approval_envelope(arguments: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = arguments {
+        map.remove("_approval");
+    }
+}
+
 impl Agent {
     /// Add a task to the autonomous queue
     pub async fn add_task(&self, mut task: super::task::Task) -> Result<()> {
         task.approval = super::task::normalized_task_approval(&task.approval);
+        if task_action_is_settings_authorized_without_approval(&task.action)
+            && matches!(
+                task.status,
+                super::task::TaskStatus::AwaitingApproval
+                    | super::task::TaskStatus::ExpiredNeedsReapproval
+            )
+        {
+            task.status = super::task::TaskStatus::Pending;
+            task.result = None;
+            remove_task_approval_envelope(&mut task.arguments);
+        }
         if super::task::task_requires_explicit_approval(&task.approval)
             && matches!(
                 task.status,
@@ -403,6 +524,78 @@ impl Agent {
                 "Repaired {} unrecoverable approval task(s) with unavailable details",
                 repaired.len()
             );
+        }
+
+        Ok(repaired.len())
+    }
+
+    pub async fn repair_settings_authorized_approval_tasks(&self) -> Result<usize> {
+        let repaired: Vec<(uuid::Uuid, super::task::Task)> = {
+            let mut tasks = self.tasks.write().await;
+            let ids = tasks
+                .all()
+                .iter()
+                .filter(|task| {
+                    task_action_is_settings_authorized_without_approval(&task.action)
+                        && matches!(
+                            task.status,
+                            super::task::TaskStatus::AwaitingApproval
+                                | super::task::TaskStatus::ExpiredNeedsReapproval
+                        )
+                })
+                .map(|task| task.id)
+                .collect::<Vec<_>>();
+
+            let mut repaired = Vec::new();
+            for id in ids {
+                if let Some(task) = tasks.get_mut(id) {
+                    task.approval = super::task::TaskApproval::Auto;
+                    task.status = super::task::TaskStatus::Pending;
+                    task.result = None;
+                    remove_task_approval_envelope(&mut task.arguments);
+                    repaired.push((id, task.clone()));
+                }
+            }
+            repaired
+        };
+
+        for (id, task) in &repaired {
+            let arguments_json = serde_json::to_string(&task.arguments)?;
+            let status_json =
+                serde_json::to_string(&task.status).unwrap_or_else(|_| "\"Pending\"".to_string());
+            if let Err(error) = self
+                .storage
+                .update_task(&id.to_string(), None, Some(arguments_json), None, None)
+                .await
+            {
+                tracing::warn!(
+                    task_id = %id,
+                    error = %error,
+                    "Failed to persist settings-authorized task approval cleanup"
+                );
+            }
+            if let Err(error) = self
+                .storage
+                .update_task_status(&id.to_string(), &status_json)
+                .await
+            {
+                tracing::warn!(
+                    task_id = %id,
+                    error = %error,
+                    "Failed to persist settings-authorized task status cleanup"
+                );
+            }
+            if let Err(error) = self
+                .storage
+                .resolve_approval_request(&id.to_string(), "stale", "settings_authorized_cleanup")
+                .await
+            {
+                tracing::warn!(
+                    task_id = %id,
+                    error = %error,
+                    "Failed to resolve settings-authorized task approval row"
+                );
+            }
         }
 
         Ok(repaired.len())
@@ -1631,321 +1824,12 @@ impl Agent {
         }
     }
 
-    /// Execute a task (plan or single action) and return output
+    /// Execute a task through the model-routed spine.
     pub async fn execute_task(&self, task: &super::task::Task) -> Result<String> {
-        let automation_authorization = automation_runtime_authorization_context(
-            &task.arguments,
-            ActionExecutionSurface::Automation,
-        );
-
-        if task.action == "daily_brief" {
-            let preferred_channel = task
-                .arguments
-                .get("report_to")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty());
-            let result = self
-                .run_daily_brief_reported_with_hint(preferred_channel)
-                .await?;
-            return Ok(result.brief);
-        }
-
-        // Goal anchor task: metadata-only record, no executable action required.
-        if task.action == "goal" {
-            let goal_desc = task
-                .arguments
-                .get("goal")
-                .and_then(|v| v.as_str())
-                .unwrap_or("goal");
-            return Ok(format!("Goal '{}' registered.", goal_desc));
-        }
-
-        // Goal reminder - notify user about approaching deadline
-        if task.action == "goal_reminder" {
-            let goal_desc = task
-                .arguments
-                .get("goal")
-                .and_then(|v| v.as_str())
-                .unwrap_or("a goal");
-            let days_left = task
-                .arguments
-                .get("days_left")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let msg = if days_left <= 1 {
-                format!(
-                    "Your goal \"{}\" is due tomorrow. Time to wrap it up!",
-                    goal_desc
-                )
-            } else {
-                format!(
-                    "Heads up: your goal \"{}\" is due in {} days.",
-                    goal_desc, days_left
-                )
-            };
-            let msg = Self::prepend_delayed_reminder_notice(task, &msg, chrono::Utc::now());
-            self.emit_notification("Goal Reminder", &msg, "warning", "goals")
-                .await;
-            let _ = self
-                .notify_preferred_channel_with_hint(&msg, None, false)
-                .await;
-            return Ok(msg);
-        }
-
-        if task.action == "goal_progress_report" {
-            let goal_id = task.arguments.get("goal_id").and_then(|v| v.as_str());
-            let report = self.build_goal_progress_report(goal_id).await?;
-            self.emit_notification("Goal Progress Report", &report, "info", "goals")
-                .await;
-            self.notify_preferred_channel(&report).await;
-            return Ok(report);
-        }
-
-        if task.action == "delegate" {
-            let payload = serde_json::json!({
-                "task": task.arguments.get("task").cloned().unwrap_or_default(),
-                "context": task.arguments.get("context").cloned().unwrap_or_default(),
-            });
-            let mut settings = self.load_autonomy_settings().await;
-            let result = self
-                .execute_autonomy_action_payload(&mut settings, "delegate", &payload)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = self.save_autonomy_settings(&settings).await;
-            return Ok(result.to_string());
-        }
-
-        if task.action == "autonomy_action" {
-            let action_kind = task
-                .arguments
-                .get("autonomy_action_kind")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Autonomy task missing action kind"))?;
-            let payload = task
-                .arguments
-                .get("autonomy_action_payload")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let mut settings = self.load_autonomy_settings().await;
-            let result = self
-                .execute_autonomy_action_payload(&mut settings, action_kind, &payload)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = self.save_autonomy_settings(&settings).await;
-            if !super::task::task_requires_explicit_approval(&task.approval) {
-                self.record_self_tune_autonomous_success().await;
-            }
-            return Ok(result.to_string());
-        }
-
-        if task.action == "plan" {
-            let steps = task
-                .arguments
-                .get("steps")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("Plan task missing steps"))?;
-
-            let mut outputs = Vec::new();
-            for step in steps {
-                let action_name = step
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Plan step missing action"))?;
-                let args = step
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let policy_args =
-                    if super::background_session::background_session_id_from_automation(&args)
-                        .is_some()
-                    {
-                        &args
-                    } else {
-                        &task.arguments
-                    };
-                if let Err(error) = self
-                    .enforce_background_session_policy_for_action(action_name, policy_args)
-                    .await
-                {
-                    outputs.push(error);
-                    continue;
-                }
-
-                let allowed = self.safety.is_allowed(action_name, &args).await?;
-                if !allowed {
-                    outputs.push(format!("Tool '{}' blocked by safety policy", action_name));
-                    continue;
-                }
-
-                let result = self
-                    .execute_action_with_hooks(
-                        action_name,
-                        &args,
-                        "scheduler",
-                        Some(&task.description),
-                        Some(&automation_authorization),
-                        None,
-                        None,
-                    )
-                    .await?;
-                let handled = if let Some(payload) = parse_workflow_missing_inputs_marker(&result) {
-                    return self
-                        .run_scheduled_fallback_for_missing_inputs(&payload)
-                        .await;
-                } else if let Some((wf_action_name, user_query)) =
-                    parse_workflow_action_marker(&result)
-                {
-                    self.execute_workflow_marker_action(&wf_action_name, &user_query)
-                        .await?
-                } else {
-                    result
-                };
-                outputs.push(handled);
-            }
-            return Ok(outputs.join("\n\n"));
-        }
-
-        if task.action == "sensitive_context_followup" {
-            let message = task
-                .arguments
-                .get("message")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Sensitive context follow-up task missing message")
-                })?;
-            let channel = task
-                .arguments
-                .get("channel")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("web");
-            let conversation_id = task
-                .arguments
-                .get("conversation_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let project_id = task
-                .arguments
-                .get("project_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let processed = self
-                .process_turn_request(
-                    message,
-                    channel,
-                    conversation_id,
-                    project_id,
-                    RequestExecutionHints::default(),
-                    true,
-                    false,
-                    None,
-                )
-                .await?;
-            return Ok(processed.response);
-        }
-
-        if task.action == "capability_approval_followup" {
-            let message = task
-                .arguments
-                .get("message")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("Capability approval task missing message"))?;
-            let channel = task
-                .arguments
-                .get("channel")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("web");
-            let conversation_id = task
-                .arguments
-                .get("conversation_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let project_id = task
-                .arguments
-                .get("project_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let operator_comment = task
-                .arguments
-                .get("_approval_response")
-                .and_then(|value| value.get("comment"))
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let mut resume_message = format!(
-                "The user approved the previously blocked capability acquisition. Continue the original request now.\n\nOriginal request:\n{}",
-                message
-            );
-            if let Some(comment) = operator_comment {
-                resume_message.push_str(&format!("\n\nUser approval comment:\n{}", comment));
-            }
-            let processed = self
-                .process_turn_request(
-                    &resume_message,
-                    channel,
-                    conversation_id,
-                    project_id,
-                    RequestExecutionHints {
-                        caller_principal: Some(ActionCallerPrincipal::local_admin("approval_task")),
-                        execution_surface: ActionExecutionSurface::Chat,
-                        direct_user_intent: true,
-                        ..RequestExecutionHints::default()
-                    },
-                    true,
-                    true,
-                    None,
-                )
-                .await?;
-            return Ok(processed.response);
-        }
-
-        self.enforce_background_session_policy_for_action(&task.action, &task.arguments)
-            .await
-            .map_err(anyhow::Error::msg)?;
-
-        let execution_arguments = if task.action.eq_ignore_ascii_case("notify_user") {
-            Self::notify_user_arguments_with_delay_notice(task, chrono::Utc::now())
-                .unwrap_or_else(|| task.arguments.clone())
-        } else {
-            task.arguments.clone()
-        };
-
-        let result = self
-            .execute_action_with_hooks(
-                &task.action,
-                &execution_arguments,
-                "scheduler",
-                Some(&task.description),
-                Some(&automation_authorization),
-                None,
-                None,
-            )
-            .await?;
-        if let Some(payload) = parse_workflow_missing_inputs_marker(&result) {
-            return self
-                .run_scheduled_fallback_for_missing_inputs(&payload)
-                .await;
-        }
-        if let Some((wf_action_name, user_query)) = parse_workflow_action_marker(&result) {
-            return self
-                .execute_workflow_marker_action(&wf_action_name, &user_query)
-                .await;
-        }
-        Ok(result)
+        self.run_model_routed_spine_for_task(task).await
     }
 
-    /// Update task result and status
+    /// Update task result and status.
     pub async fn finalize_task(
         &self,
         id: uuid::Uuid,
@@ -2598,11 +2482,19 @@ impl Agent {
         }
 
         let task_agent = Agent::snapshot(agent).await;
-        let execution = tokio::time::timeout(
-            std::time::Duration::from_secs(policy.stall_timeout_secs),
-            task_agent.execute_task(&task),
-        )
-        .await;
+        let execution = if policy.stall_timeout_secs > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(policy.stall_timeout_secs),
+                task_agent.execute_task(&task),
+            )
+            .await
+            {
+                Ok(result) => Some(result),
+                Err(_) => None,
+            }
+        } else {
+            Some(task_agent.execute_task(&task).await)
+        };
         let finished_at = chrono::Utc::now();
         tracing::info!(
             "Automation supervisor: task '{}' attempt {}/{} finished",
@@ -2612,7 +2504,7 @@ impl Agent {
         );
 
         let (run_status, mut task_status, output, error_text) = match execution {
-            Ok(Ok(output)) => {
+            Some(Ok(output)) => {
                 let critique = critique_automation_result(&policy.validation, Some(&output), None);
                 if !critique.validation_passed {
                     (
@@ -2632,7 +2524,7 @@ impl Agent {
                     )
                 }
             }
-            Ok(Err(error)) => {
+            Some(Err(error)) => {
                 let error_text = error.to_string();
                 (
                     AutomationRunStatus::Failed,
@@ -2643,7 +2535,7 @@ impl Agent {
                     Some(error_text),
                 )
             }
-            Err(_) => {
+            None => {
                 let error_text = format!(
                     "Background execution timed out after {} seconds",
                     policy.stall_timeout_secs
@@ -3132,6 +3024,8 @@ impl Agent {
             action: watcher.poll_action.clone(),
             status: if error_text.is_some() {
                 "failed".to_string()
+            } else if watcher.repeat_on_match {
+                "active".to_string()
             } else {
                 "triggered".to_string()
             },
@@ -3630,8 +3524,8 @@ Return: 1 short status paragraph + 3 bullet next steps.",
 
         let mut payload = arguments.as_object().cloned().unwrap_or_default();
 
-        // Action-specific static repair stays colocated with its helper here;
-        // the shared `argument_repair` module is action-agnostic by contract.
+        // Code execution can derive language from structured code content when
+        // the schema needs it and the caller omitted the field.
         if action_name == "code_execute"
             && !Self::required_action_argument_present(payload.get("language"))
         {
@@ -3650,8 +3544,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         // Action-agnostic structural fallback: any required field literally
         // named `query` may be filled from the original fallback_text. This is
         // a schema-shape rule, not phrasing logic.
-        let post_inference_missing =
-            super::argument_repair::missing_required_fields(&action, &payload);
+        let post_inference_missing = missing_required_fields(&action, &payload);
         if post_inference_missing.iter().any(|field| field == "query") {
             let fallback_query = fallback_text.trim();
             if !fallback_query.is_empty() {
@@ -3662,7 +3555,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             }
         }
 
-        let final_missing = super::argument_repair::missing_required_fields(&action, &payload);
+        let final_missing = missing_required_fields(&action, &payload);
         if !final_missing.is_empty() {
             return Err(format!(
                 "Action `{}` is missing required field(s): {}. Retry the tool call with those fields.",
@@ -3681,17 +3574,38 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         if trimmed.is_empty() {
             return None;
         }
+        if let Some(payload) = trimmed
+            .trim_start()
+            .strip_prefix(crate::runtime::TOOL_COMPLETION_MARKER)
+        {
+            let payload = payload.lines().next().unwrap_or(payload).trim();
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                if let Some(data) = value.get("data") {
+                    return Some(data.clone());
+                }
+                if value.is_object() {
+                    return Some(value);
+                }
+            }
+        }
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if let Some(output) = value.get("output").and_then(|value| value.as_str()) {
                 if let Some(inner) = extract_json_object_from_text(output) {
+                    if let Some(data) = inner.get("data") {
+                        return Some(data.clone());
+                    }
                     return Some(inner);
                 }
+            }
+            if let Some(data) = value.get("data") {
+                return Some(data.clone());
             }
             if value.is_object() {
                 return Some(value);
             }
         }
         extract_json_object_from_text(trimmed)
+            .map(|value| value.get("data").cloned().unwrap_or(value))
     }
 
     pub(super) fn compare_structured_condition_number(
@@ -3794,9 +3708,39 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             (serde_json::Value::String(left), serde_json::Value::String(right)) => left
                 .to_ascii_lowercase()
                 .contains(&right.to_ascii_lowercase()),
-            (serde_json::Value::Array(items), _) => items
-                .iter()
-                .any(|item| Self::json_values_equal_relaxed(item, expected)),
+            (serde_json::Value::Array(items), serde_json::Value::Array(expected_items)) => {
+                expected_items.iter().all(|expected_item| {
+                    items.iter().any(|item| {
+                        Self::json_values_equal_relaxed(item, expected_item)
+                            || Self::json_value_contains_expected(item, expected_item)
+                    })
+                })
+            }
+            (serde_json::Value::Array(items), _) => items.iter().any(|item| {
+                Self::json_values_equal_relaxed(item, expected)
+                    || Self::json_value_contains_expected(item, expected)
+            }),
+            (serde_json::Value::Object(fields), serde_json::Value::String(_)) => fields
+                .values()
+                .any(|value| Self::json_value_contains_expected(value, expected)),
+            (serde_json::Value::Object(fields), serde_json::Value::Array(expected_items)) => {
+                expected_items.iter().all(|expected_item| {
+                    fields
+                        .values()
+                        .any(|value| Self::json_value_contains_expected(value, expected_item))
+                })
+            }
+            (serde_json::Value::Object(fields), _) => fields.values().any(|value| {
+                Self::json_values_equal_relaxed(value, expected)
+                    || Self::json_value_contains_expected(value, expected)
+            }),
+            (
+                serde_json::Value::Number(_) | serde_json::Value::Bool(_),
+                serde_json::Value::String(right),
+            ) => actual
+                .to_string()
+                .to_ascii_lowercase()
+                .contains(&right.to_ascii_lowercase()),
             _ => false,
         }
     }
@@ -4500,32 +4444,17 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             );
         };
 
-        // Parse cron or at time
-        let (cron_expr, scheduled_for) =
-            if let Some(cron) = arguments.get("cron").and_then(|v| v.as_str()) {
-                // Convert 5-field cron to 6-field (with seconds)
-                let cron_6field = if cron.split_whitespace().count() == 5 {
-                    format!("0 {}", cron)
-                } else {
-                    cron.to_string()
-                };
-                (Some(cron_6field), None)
-            } else if let Some(at_time) = arguments.get("at").and_then(|v| v.as_str()) {
-                let dt = chrono::DateTime::parse_from_rfc3339(at_time).ok()?;
-                (None, Some(dt.with_timezone(&chrono::Utc)))
-            } else {
-                let now = chrono::Utc::now();
-                (
-                    Some(format!("0 {} {} * * *", now.format("%M"), now.format("%H"))),
-                    None,
-                )
-            };
+        // Parse cron or at time.
+        let (cron_expr, scheduled_for) = match schedule_task_schedule_from_arguments(arguments) {
+            Ok(schedule) => schedule,
+            Err(error) => return Some(error),
+        };
         if let Some(cron) = cron_expr.as_deref() {
             let fields = cron.split_whitespace().collect::<Vec<_>>();
             let requests_subminute = fields.len() == 6 && fields.first().copied() != Some("0");
             if requests_subminute {
                 return Some(
-                    "Sub-minute recurring schedules are only supported for watcher-style monitoring. Use `watch` with `interval_secs` for cadences below 60 seconds."
+                    "Sub-minute recurring schedules are not supported by schedule_task. Use a managed service or background command loop when the workflow genuinely needs sub-minute polling."
                         .to_string(),
                 );
             }
@@ -4544,6 +4473,31 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                 }),
         );
 
+        let script_action_arguments = arguments
+            .get("script")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|script| {
+                let language = arguments
+                    .get("script_language")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("python");
+                serde_json::json!({
+                    "language": language,
+                    "code": script,
+                    "network_access": arguments.get("network_access").and_then(|value| value.as_bool()).unwrap_or(false),
+                    "execution_contract": {
+                        "phase": "poll",
+                        "target_validated_when_successful": true
+                    },
+                    "context_from": arguments.get("context_from").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "workdir": arguments.get("workdir").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            });
+
         let explicit_action = arguments
             .get("action")
             .and_then(|v| v.as_str())
@@ -4552,12 +4506,18 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                 existing_task_target
                     .as_ref()
                     .map(|task| task.action.clone())
+                    .or_else(|| {
+                        script_action_arguments
+                            .as_ref()
+                            .map(|_| "code_execute".to_string())
+                    })
             });
 
         // Build task arguments: start with explicit action_arguments if provided.
         let mut task_args = arguments
             .get("action_arguments")
             .cloned()
+            .or_else(|| script_action_arguments.clone())
             .or_else(|| {
                 existing_task_target
                     .as_ref()
@@ -4601,7 +4561,9 @@ Return: 1 short status paragraph + 3 bullet next steps.",
 
         let mut action_name = if explicit_valid {
             explicit_action.unwrap_or_default()
-        } else if all_actions.iter().any(|action| action.name == "notify_user")
+        } else if all_actions
+            .iter()
+            .any(|action| action.name == "notify_user")
         {
             "notify_user".to_string()
         } else {
@@ -4747,10 +4709,11 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             }
         };
 
-        let schedule_desc = if cron_expr.is_some() {
-            "recurring schedule".to_string()
-        } else if let Some(at) = scheduled_for {
-            format!("one-time at {}", at.format("%Y-%m-%d %H:%M"))
+        let scheduled_for_text = scheduled_for.map(|value| value.to_rfc3339());
+        let schedule_desc = if let Some(cron) = cron_expr.as_deref() {
+            format!("cron {}", cron)
+        } else if let Some(at) = scheduled_for_text.as_deref() {
+            format!("one-time at {}", at)
         } else {
             "unknown".to_string()
         };
@@ -4820,6 +4783,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                     "schedule": schedule_desc.clone(),
                     "notification": report_label.clone(),
                     "cron": cron_expr.clone(),
+                    "scheduled_for": scheduled_for_text.clone(),
                 }),
             ),
             action_sentence,
@@ -5099,6 +5063,32 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                     .map(|watcher| watcher.description.clone())
             })
             .unwrap_or_else(|| "Background watcher".to_string());
+        let script_poll_arguments = arguments
+            .get("script")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|script| {
+                let language = arguments
+                    .get("script_language")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("python");
+                serde_json::json!({
+                    "language": language,
+                    "code": script,
+                    "network_access": arguments.get("network_access").and_then(|value| value.as_bool()).unwrap_or(false),
+                    "execution_contract": {
+                        "phase": "poll",
+                        "target_validated_when_successful": true,
+                        "ready_for_watch_when_successful": true
+                    },
+                    "context_from": arguments.get("context_from").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "workdir": arguments.get("workdir").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            });
+
         let Some(poll_action_value) = arguments
             .get("poll_action")
             .and_then(|v| v.as_str())
@@ -5109,10 +5099,15 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                 existing_watcher_target
                     .as_ref()
                     .map(|watcher| watcher.poll_action.clone())
+                    .or_else(|| {
+                        script_poll_arguments
+                            .as_ref()
+                            .map(|_| "code_execute".to_string())
+                    })
             })
         else {
             return Some(
-                    "Watcher requires `poll_action` and `poll_arguments` so it knows what to poll. If the polling source is unclear, ask the user before retrying."
+                    "Watcher requires `poll_action`/`poll_arguments` or a `script` so it knows what to poll. If the polling source is unclear, ask the user before retrying."
                         .to_string(),
                 );
         };
@@ -5120,6 +5115,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         let mut poll_arguments = arguments
             .get("poll_arguments")
             .cloned()
+            .or_else(|| script_poll_arguments.clone())
             .or_else(|| {
                 existing_watcher_target
                     .as_ref()
@@ -5170,6 +5166,11 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             .get("until_stopped")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let repeat_on_match = watcher_repeat_on_match_from_arguments(
+            arguments,
+            existing_watcher_target.as_ref(),
+            until_stopped,
+        );
         let timeout_hours = arguments.get("timeout_hours").and_then(|v| v.as_u64());
         let timeout_days = arguments.get("timeout_days").and_then(|v| v.as_u64());
         let requested_timeout_secs = arguments.get("timeout_secs").and_then(|v| v.as_u64());
@@ -5375,6 +5376,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             interval_secs,
             timeout_secs,
             notify_channel: notify_channel.clone(),
+            repeat_on_match,
             status: super::watcher::WatcherStatus::Active,
             created_at,
             last_poll_at: baseline_last_poll_at,
@@ -5500,6 +5502,11 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         let cadence_desc = watcher_cadence_label(interval_secs);
         let delivery_desc = watcher_delivery_label(&display_notify_channel);
         let delivery_fragment = watcher_delivery_sentence_fragment(&display_notify_channel);
+        let trigger_behavior_desc = if repeat_on_match {
+            "keep polling and notify again on each match"
+        } else {
+            "stop after the first match"
+        };
         let trigger_desc = on_trigger
             .trim()
             .trim_end_matches(|ch| matches!(ch, '.' | '!' | '?'));
@@ -5517,7 +5524,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             format!("\n\nTarget: {}", watch_target)
         };
         let completion_detail = format!(
-            "{} It will check {} and notify {} when: {}.{}",
+            "{} It will check {} and notify {} when: {}. It will {}.{}",
             action_sentence,
             cadence_desc,
             delivery_fragment,
@@ -5526,6 +5533,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             } else {
                 trigger_desc
             },
+            trigger_behavior_desc,
             target_sentence
         );
 
@@ -5534,6 +5542,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
              It will check {} and notify {} when: {}.{}\n\n\
              - Cadence: {}\n\
              - Notifications: {}\n\
+             - Trigger behavior: {}\n\
              - Duration: {}\n\n\
              You can stop or edit it from Background Work.{}{}{}{}",
             render_tool_completion_marker_with_data(
@@ -5548,6 +5557,8 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                     "cadence": cadence_desc.clone(),
                     "duration": duration_desc.clone(),
                     "notification": delivery_desc.clone(),
+                    "repeat_on_match": repeat_on_match,
+                    "trigger_behavior": trigger_behavior_desc,
                 }),
             ),
             action_sentence,
@@ -5561,6 +5572,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             target_block,
             cadence_desc,
             delivery_desc,
+            trigger_behavior_desc,
             duration_desc,
             duration_note,
             delivery_note,
@@ -5650,6 +5662,40 @@ mod tests {
     }
 
     #[test]
+    fn schedule_task_requires_explicit_schedule() {
+        let error = schedule_task_schedule_from_arguments(&serde_json::json!({
+            "task": "Send reminder"
+        }))
+        .expect_err("missing schedule should not default to now");
+
+        assert!(error.contains("requires `cron` or `at`"));
+        assert!(error.contains("refusing to infer the current time"));
+    }
+
+    #[test]
+    fn schedule_task_parses_requested_absolute_time() {
+        let (cron, at) = schedule_task_schedule_from_arguments(&serde_json::json!({
+            "task": "Send reminder",
+            "at": "2026-05-22T13:06:00+05:30"
+        }))
+        .expect("valid absolute timestamp");
+
+        assert!(cron.is_none());
+        assert_eq!(at.unwrap().to_rfc3339(), "2026-05-22T07:36:00+00:00");
+    }
+
+    #[test]
+    fn schedule_task_five_field_cron_is_expanded_without_current_time() {
+        let (cron, at) = schedule_task_schedule_from_arguments(&serde_json::json!({
+            "task": "Recurring reminder",
+            "cron": "6 13 * * *"
+        }))
+        .expect("valid cron");
+
+        assert_eq!(cron.as_deref(), Some("0 6 13 * * *"));
+        assert!(at.is_none());
+    }
+    #[test]
     fn watcher_batch_items_inherit_and_override_notification_route() {
         let args = serde_json::json!({
             "poll_action": "web_search",
@@ -5661,6 +5707,7 @@ mod tests {
             "on_trigger": "Notify with the changed pricing details.",
             "interval_secs": 43200,
             "notify_channel": "preferred",
+            "repeat_on_match": true,
             "items": [
                 {
                     "description": "Monitor provider pricing"
@@ -5690,9 +5737,45 @@ mod tests {
             Some(43200)
         );
         assert_eq!(
+            items[1].get("repeat_on_match").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
             items[1].get("poll_action").and_then(|v| v.as_str()),
             Some("web_search")
         );
+    }
+
+    #[test]
+    fn watcher_repeat_mode_uses_structured_contract() {
+        let descriptive_args = serde_json::json!({
+            "description": "monitor a source continuously and alert on later matches"
+        });
+        assert!(!watcher_repeat_on_match_from_arguments(
+            &descriptive_args,
+            None,
+            false
+        ));
+
+        let explicit_args = serde_json::json!({ "repeat_on_match": true });
+        assert!(watcher_repeat_on_match_from_arguments(
+            &explicit_args,
+            None,
+            false
+        ));
+
+        let explicit_false_args = serde_json::json!({ "repeat_on_match": false });
+        assert!(!watcher_repeat_on_match_from_arguments(
+            &explicit_false_args,
+            None,
+            true
+        ));
+
+        assert!(watcher_repeat_on_match_from_arguments(
+            &serde_json::json!({}),
+            None,
+            true
+        ));
     }
 
     #[test]

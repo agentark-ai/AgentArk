@@ -132,7 +132,7 @@ function OrbitHomeDashboard({
   );
   const [name, setName] = useState("");
   const [icon, setIcon] = useState("");
-  const [color, setColor] = useState("#58e0ff");
+  const [color, setColor] = useState("#78f2b0");
   const [nameError, setNameError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [orbitPage, setOrbitPage] = useState(0);
@@ -241,7 +241,7 @@ function OrbitHomeDashboard({
     }
     setName("");
     setIcon("");
-    setColor("#58e0ff");
+    setColor("#78f2b0");
     setNameError(null);
     setCreating(false);
   }, [color, icon, name, onCreateSubmit, orbits]);
@@ -255,14 +255,14 @@ function OrbitHomeDashboard({
     setCreating(false);
     setName("");
     setIcon("");
-    setColor("#58e0ff");
+    setColor("#78f2b0");
     setNameError(null);
   };
 
   const monoFont = "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace";
   const serifDisplay = "'Playfair Display', Georgia, serif";
   const serifBody = "'EB Garamond', Georgia, serif";
-  const accent = "#58e0ff";
+  const accent = "#78f2b0";
   const warm = "#e8b46d";
   const ink = "#e8eef5";
   const inkSoft = "rgba(232,238,245,0.7)";
@@ -289,7 +289,7 @@ function OrbitHomeDashboard({
 
   const accentForOrbit = (orbit: Orbit, idx: number): string => {
     if (orbit.color) return orbit.color;
-    const palette = ["#58e0ff", "#b08aff", "#6dc497", "#e8b46d", "#d96d83", "#93b4c2", "#7dd3fc", "#fda4af"];
+    const palette = ["#78f2b0", "#b7a7ff", "#6dc497", "#e8b46d", "#d96d83", "#c8d8c9", "#e6d6c0", "#fda4af"];
     return palette[idx % palette.length];
   };
 
@@ -304,7 +304,7 @@ function OrbitHomeDashboard({
         minHeight: "100%",
         color: ink,
         background:
-          "radial-gradient(ellipse 60% 50% at 20% 10%, rgba(88,224,255,0.05), transparent 60%)," +
+          "radial-gradient(ellipse 60% 50% at 20% 10%, rgba(120,242,176,0.05), transparent 60%)," +
           "radial-gradient(ellipse 50% 50% at 90% 90%, rgba(232,180,109,0.03), transparent 65%)," +
           "linear-gradient(180deg, rgba(6,8,11,1), rgba(5,6,8,1))",
         pb: 6,
@@ -343,14 +343,14 @@ function OrbitHomeDashboard({
           onClick={startCreating}
           sx={{
             px: 2.4, py: 1.2,
-            background: "rgba(88,224,255,0.1)",
-            border: "1px solid rgba(88,224,255,0.45)",
+            background: "rgba(120,242,176,0.1)",
+            border: "1px solid rgba(120,242,176,0.45)",
             borderRadius: 1,
             color: accent,
             fontFamily: monoFont, fontSize: 11.5, letterSpacing: "0.16em", textTransform: "uppercase", fontWeight: 700,
             cursor: "pointer", flexShrink: 0,
             transition: "all 160ms ease",
-            "&:hover": { background: "rgba(88,224,255,0.18)" },
+            "&:hover": { background: "rgba(120,242,176,0.18)" },
           }}
         >
           + New Canvas
@@ -366,7 +366,7 @@ function OrbitHomeDashboard({
           paper: {
             sx: {
               borderRadius: 2,
-              border: "1px solid rgba(88,224,255,0.24)",
+              border: "1px solid rgba(120,242,176,0.24)",
               background: "linear-gradient(180deg, rgba(10,14,20,0.98), rgba(6,8,12,0.98))",
               color: ink,
               boxShadow: "0 28px 90px rgba(0,0,0,0.62)",
@@ -415,8 +415,8 @@ function OrbitHomeDashboard({
                 cursor: "text", userSelect: "text",
                 "&::placeholder": { color: inkDim },
                 "&:focus": {
-                  borderColor: "rgba(88,224,255,0.7)",
-                  boxShadow: "0 0 0 2px rgba(88,224,255,0.14)",
+                  borderColor: "rgba(120,242,176,0.7)",
+                  boxShadow: "0 0 0 2px rgba(120,242,176,0.14)",
                   background: "rgba(255,255,255,0.075)",
                 },
               }}
@@ -447,8 +447,8 @@ function OrbitHomeDashboard({
                 cursor: "text", userSelect: "text",
                 "&::placeholder": { color: inkDim },
                 "&:focus": {
-                  borderColor: "rgba(88,224,255,0.7)",
-                  boxShadow: "0 0 0 2px rgba(88,224,255,0.14)",
+                  borderColor: "rgba(120,242,176,0.7)",
+                  boxShadow: "0 0 0 2px rgba(120,242,176,0.14)",
                   background: "rgba(255,255,255,0.075)",
                 },
               }}
@@ -502,13 +502,13 @@ function OrbitHomeDashboard({
                 disabled={!canSubmit}
                 sx={{
                   px: 1.8, py: 0.9,
-                  background: "rgba(88,224,255,0.14)",
-                  border: "1px solid rgba(88,224,255,0.45)",
+                  background: "rgba(120,242,176,0.14)",
+                  border: "1px solid rgba(120,242,176,0.45)",
                   borderRadius: 0.8,
                   color: accent,
                   fontFamily: monoFont, fontSize: 10.5, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 700,
                   cursor: "pointer", flexShrink: 0,
-                  "&:hover:not(:disabled)": { background: "rgba(88,224,255,0.24)" },
+                  "&:hover:not(:disabled)": { background: "rgba(120,242,176,0.24)" },
                   "&:disabled": { opacity: 0.35, cursor: "not-allowed" },
                 }}
               >
@@ -562,9 +562,9 @@ function OrbitHomeDashboard({
                     borderRadius: 1,
                     color: inkSoft,
                     "&:hover": {
-                      borderColor: "rgba(88,224,255,0.4)",
+                      borderColor: "rgba(120,242,176,0.4)",
                       color: accent,
-                      background: "rgba(88,224,255,0.08)",
+                      background: "rgba(120,242,176,0.08)",
                     },
                     "&.Mui-disabled": { opacity: 0.34, color: inkDim },
                   }}
@@ -601,9 +601,9 @@ function OrbitHomeDashboard({
                     borderRadius: 1,
                     color: inkSoft,
                     "&:hover": {
-                      borderColor: "rgba(88,224,255,0.4)",
+                      borderColor: "rgba(120,242,176,0.4)",
                       color: accent,
-                      background: "rgba(88,224,255,0.08)",
+                      background: "rgba(120,242,176,0.08)",
                     },
                     "&.Mui-disabled": { opacity: 0.34, color: inkDim },
                   }}
@@ -748,8 +748,8 @@ function OrbitHomeDashboard({
           type="button"
           onClick={startCreating}
           sx={{
-            background: "repeating-linear-gradient(45deg, transparent 0 6px, rgba(88,224,255,0.05) 6px 7px), rgba(13,17,23,0.4)",
-            border: "1px dashed rgba(88,224,255,0.32)",
+            background: "repeating-linear-gradient(45deg, transparent 0 6px, rgba(120,242,176,0.05) 6px 7px), rgba(13,17,23,0.4)",
+            border: "1px dashed rgba(120,242,176,0.32)",
             borderRadius: 2,
             cursor: "pointer", color: "inherit",
             minHeight: 200,
@@ -757,14 +757,14 @@ function OrbitHomeDashboard({
             gap: 1.2, padding: 3,
             transition: "all 200ms ease",
             "&:hover": {
-              background: "repeating-linear-gradient(45deg, transparent 0 6px, rgba(88,224,255,0.10) 6px 7px), rgba(88,224,255,0.04)",
-              borderColor: "rgba(88,224,255,0.6)",
+              background: "repeating-linear-gradient(45deg, transparent 0 6px, rgba(120,242,176,0.10) 6px 7px), rgba(120,242,176,0.04)",
+              borderColor: "rgba(120,242,176,0.6)",
             },
           }}
         >
           <Box sx={{
             width: 44, height: 44, borderRadius: "50%",
-            border: "1px solid rgba(88,224,255,0.55)",
+            border: "1px solid rgba(120,242,176,0.55)",
             display: "grid", placeItems: "center",
             color: accent, fontSize: 24, fontWeight: 300,
           }}>+</Box>

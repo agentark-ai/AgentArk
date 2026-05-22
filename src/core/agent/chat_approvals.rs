@@ -227,10 +227,7 @@ fn direct_chat_structured_completion_value(result: &str) -> Option<serde_json::V
     Some(value)
 }
 
-fn completion_text_field<'a>(
-    value: &'a serde_json::Value,
-    key: &str,
-) -> Option<&'a str> {
+fn completion_text_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value
         .get(key)
         .and_then(|item| item.as_str())
@@ -267,25 +264,17 @@ fn direct_chat_completion_reference_lines(data: &serde_json::Value) -> Vec<Strin
 
 fn format_watch_approval_result(value: &serde_json::Value) -> Option<String> {
     let status = completion_text_field(value, "status")
-        .unwrap_or("completed")
-        .to_ascii_lowercase();
-    if !matches!(
-        status.as_str(),
-        "completed" | "complete" | "succeeded" | "success" | "ok" | "executed"
-    ) {
-        return None;
-    }
-    let detail = completion_text_field(value, "detail").unwrap_or("");
+        .map(|value| safe_truncate(value, 80))
+        .unwrap_or_else(|| "completed".to_string());
     let data = completion_data(value);
-    let updated = detail.to_ascii_lowercase().contains("updated");
-    let mut lines = Vec::new();
-    lines.push(if updated {
-        "I updated the background watcher.".to_string()
-    } else {
-        "I created the background watcher.".to_string()
-    });
-
-    let mut facts = Vec::new();
+    let detail = completion_text_field(value, "detail")
+        .map(|value| safe_truncate(value, 260))
+        .unwrap_or_else(|| "The background watcher operation returned no detail.".to_string());
+    let mut lines = vec!["Background watcher result.".to_string(), String::new()];
+    let mut facts = vec![
+        format!("- Status: {}", status),
+        format!("- Result: {}", detail),
+    ];
     if let Some(description) = data.and_then(|data| completion_text_field(data, "description")) {
         facts.push(format!("- Purpose: {}", safe_truncate(description, 220)));
     }
@@ -298,12 +287,12 @@ fn format_watch_approval_result(value: &serde_json::Value) -> Option<String> {
     if let Some(duration) = data.and_then(|data| completion_text_field(data, "duration")) {
         facts.push(format!("- Duration: {}", duration));
     }
-    if !facts.is_empty() {
-        lines.push(String::new());
-        lines.extend(facts);
-    }
+    lines.extend(facts);
     lines.push(String::new());
-    lines.push("You can view, pause, edit, or stop it from Background Work.".to_string());
+    lines.push(
+        "Open Background Work to inspect linked runs, poll history, and watcher details."
+            .to_string(),
+    );
 
     let refs = data
         .map(direct_chat_completion_reference_lines)
@@ -317,24 +306,52 @@ fn format_watch_approval_result(value: &serde_json::Value) -> Option<String> {
 
 fn format_schedule_approval_result(value: &serde_json::Value) -> Option<String> {
     let status = completion_text_field(value, "status")
-        .unwrap_or("completed")
-        .to_ascii_lowercase();
-    if !matches!(
-        status.as_str(),
-        "completed" | "complete" | "succeeded" | "success" | "ok" | "executed"
-    ) {
-        return None;
-    }
+        .map(|value| safe_truncate(value, 80))
+        .unwrap_or_else(|| "completed".to_string());
     let data = completion_data(value);
     let detail = completion_text_field(value, "detail")
         .map(|value| safe_truncate(value, 260))
-        .unwrap_or_else(|| "The scheduled work was created.".to_string());
+        .unwrap_or_else(|| "The scheduled work operation returned no detail.".to_string());
     let mut lines = vec![
-        "I scheduled the requested work.".to_string(),
+        "Scheduled work result.".to_string(),
         String::new(),
-        format!("- Summary: {}", detail),
+        format!("- Status: {}", status),
+        format!("- Result: {}", detail),
         "You can view or manage it from Tasks and Background Work.".to_string(),
     ];
+    let refs = data
+        .map(direct_chat_completion_reference_lines)
+        .unwrap_or_default();
+    if !refs.is_empty() {
+        lines.push(String::new());
+        lines.extend(refs);
+    }
+    Some(lines.join("\n"))
+}
+
+fn format_background_session_approval_result(value: &serde_json::Value) -> Option<String> {
+    let status = completion_text_field(value, "status")
+        .map(|value| safe_truncate(value, 80))
+        .unwrap_or_else(|| "completed".to_string());
+    let data = completion_data(value);
+    let operation = data
+        .and_then(|data| completion_text_field(data, "operation"))
+        .map(|value| value.replace('_', " "))
+        .unwrap_or_else(|| "background work".to_string());
+    let detail = completion_text_field(value, "detail")
+        .map(|value| safe_truncate(value, 260))
+        .unwrap_or_else(|| "The background work operation returned no detail.".to_string());
+
+    let mut lines = vec![
+        "Background work result.".to_string(),
+        String::new(),
+        format!("- Status: {}", status),
+        format!("- Operation: {}", operation),
+        format!("- Result: {}", detail),
+        "- Open Background Work to inspect linked runs, poll history, and watcher details."
+            .to_string(),
+    ];
+
     let refs = data
         .map(direct_chat_completion_reference_lines)
         .unwrap_or_default();
@@ -355,6 +372,11 @@ fn format_direct_chat_approval_action_result(action_name: &str, result: &str) ->
         }
         if tool.eq_ignore_ascii_case("schedule_task") {
             if let Some(formatted) = format_schedule_approval_result(&value) {
+                return formatted;
+            }
+        }
+        if tool.eq_ignore_ascii_case("background_session_manage") {
+            if let Some(formatted) = format_background_session_approval_result(&value) {
                 return formatted;
             }
         }
@@ -442,78 +464,26 @@ impl Agent {
         let Some((row, request)) = self.load_direct_chat_chain_approval(approval_id).await? else {
             anyhow::bail!("Approval request not found or already handled");
         };
-        if row.status != "pending" {
+        if row.status != "pending" && row.status != "expired" {
             anyhow::bail!("Approval request not found or already handled");
         }
         let view = direct_chat_chain_approval_view(approval_id, &request);
         self.storage
             .resolve_approval_request(approval_id, "denied", "user")
             .await?;
-        let response =
-            self.filter_direct_chat_approval_response(&format!("Rejected `{}`.", view.action_name));
+        let response = if row.status == "expired" || direct_chat_chain_approval_is_expired(&request)
+        {
+            format!("Dismissed expired approval for `{}`.", view.action_name)
+        } else {
+            format!("Rejected `{}`.", view.action_name)
+        };
+        let response = self.filter_direct_chat_approval_response(&response);
         self.persist_direct_chat_approval_assistant_message(
             request.conversation_id.as_deref(),
             &response,
         )
         .await?;
         Ok((view, response))
-    }
-
-    pub(super) async fn retire_pending_direct_chat_approvals_for_new_intent(
-        &self,
-        conversation_id: &str,
-        current_message: &str,
-    ) {
-        if conversation_id.trim().is_empty()
-            || parse_direct_chat_approval_submit_text(current_message).is_some()
-        {
-            return;
-        }
-        let rows = match self.storage.get_approval_log(64, 0).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::debug!(
-                    error = %error,
-                    "failed to load approval log for pending approval cleanup"
-                );
-                return;
-            }
-        };
-        for row in rows {
-            if row.status != "pending" || row.action_name != DIRECT_CHAT_CHAIN_APPROVAL_ACTION {
-                continue;
-            }
-            let Ok(request) =
-                serde_json::from_str::<PersistedDirectChatChainApproval>(&row.arguments)
-            else {
-                continue;
-            };
-            if request
-                .conversation_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                != Some(conversation_id.trim())
-            {
-                continue;
-            }
-            let status = if direct_chat_chain_approval_is_expired(&request) {
-                "expired"
-            } else {
-                "superseded"
-            };
-            if let Err(error) = self
-                .storage
-                .resolve_approval_request(&row.id, status, "new_turn")
-                .await
-            {
-                tracing::debug!(
-                    approval_id = %row.id,
-                    error = %error,
-                    "failed to retire stale direct chat approval"
-                );
-            }
-        }
     }
 
     fn filter_direct_chat_approval_response(&self, response: &str) -> String {
@@ -537,6 +507,9 @@ impl Agent {
             conversation_id: conversation_id.to_string(),
             role: "assistant".to_string(),
             content: response.clone(),
+            tool_calls_json: None,
+            tool_call_id: None,
+            provider_message_json: None,
             timestamp: chrono::Utc::now().to_rfc3339(),
             model_used: Some("approval".to_string()),
             trace_id: None,
@@ -641,6 +614,7 @@ impl Agent {
                     Some(&authorization),
                     request.conversation_id.as_deref(),
                     None,
+                    None,
                 )
                 .await
             {
@@ -673,7 +647,11 @@ impl Agent {
                 .map(|(index, output)| format!("{}. {}", index + 1, output.trim()))
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            format!("Approved. I completed {} actions.\n\n{}", outputs.len(), numbered)
+            format!(
+                "Approved. I completed {} actions.\n\n{}",
+                outputs.len(),
+                numbered
+            )
         };
         let response = self.filter_direct_chat_approval_response(&response);
         self.persist_direct_chat_approval_assistant_message(

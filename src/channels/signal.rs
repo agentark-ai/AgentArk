@@ -1,12 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
 use crate::core::Agent;
+use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
 
 type SharedAgent = Arc<RwLock<Agent>>;
 

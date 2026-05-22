@@ -1,8 +1,7 @@
 use crate::actions::app::{
-    generate_access_key, launch_dynamic_runtime, parse_required_inputs,
-    read_local_runtime_log_tail, resolve_required_env_values, runtime_preference_from_opt,
     AppRegistry, DynamicAppRegistration, DynamicRuntimeHandle, DynamicRuntimeLaunch,
-    RuntimePreference,
+    RuntimePreference, generate_access_key, launch_dynamic_runtime, parse_required_inputs,
+    read_local_runtime_log_tail, resolve_required_env_values, runtime_preference_from_opt,
 };
 use crate::executor::protocol::{
     AppActionResponse, AppDeployRequest, AppDeployResponse, AppLifecycleRequest,
@@ -12,26 +11,26 @@ use crate::executor::protocol::{
 use crate::runtime::ActionRuntime;
 use anyhow::{Context, Result};
 use axum::{
-    body::{to_bytes, Body},
+    Json, Router,
+    body::{Body, to_bytes},
     extract::{
-        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
         FromRequestParts, Path, Request, State,
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, delete, get, post},
-    Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage},
+    tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
 
 const CONTROL_CONTAINER_NAME: &str = "agentark-control";

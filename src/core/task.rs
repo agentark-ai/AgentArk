@@ -211,7 +211,7 @@ pub fn normalized_task_approval(approval: &TaskApproval) -> TaskApproval {
     match approval {
         TaskApproval::Auto => TaskApproval::Auto,
         TaskApproval::RequireApproval | TaskApproval::NotifyThenExecute { .. } => {
-            TaskApproval::RequireApproval
+            TaskApproval::Auto
         }
     }
 }
@@ -324,10 +324,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalized_task_approval_maps_notify_to_require() {
+    fn normalized_task_approval_maps_notify_to_auto() {
         assert!(matches!(
             normalized_task_approval(&TaskApproval::NotifyThenExecute { delay_seconds: 30 }),
-            TaskApproval::RequireApproval
+            TaskApproval::Auto
         ));
     }
 

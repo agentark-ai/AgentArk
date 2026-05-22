@@ -114,6 +114,7 @@ impl Agent {
 
         // Initialize action runtime
         let mut runtime = ActionRuntime::new(config_dir, data_dir).await?;
+        runtime.set_safety_engine(safety.clone());
 
         let config_state = secure_config.load_runtime_state()?;
         if config_state.config_degraded {
@@ -494,6 +495,13 @@ impl Agent {
                 );
                 let mut status =
                     serde_json::from_str(&t.status).unwrap_or(super::task::TaskStatus::Pending);
+                if matches!(
+                    status,
+                    super::task::TaskStatus::AwaitingApproval
+                        | super::task::TaskStatus::ExpiredNeedsReapproval
+                ) {
+                    status = super::task::TaskStatus::Pending;
+                }
                 if super::task::task_requires_explicit_approval(&approval)
                     && matches!(
                         status,
@@ -637,7 +645,7 @@ impl Agent {
                                     .await
                                 {
                                     tracing::warn!(
-                                        "Failed to delete stale ArkPulse app events during startup: {}",
+                                        "Failed to delete stale Pulse app events during startup: {}",
                                         error
                                     );
                                 }
@@ -659,7 +667,7 @@ impl Agent {
                             }
                         }
                         Err(error) => tracing::warn!(
-                            "Failed to reconcile stale ArkPulse app references during startup: {}",
+                            "Failed to reconcile stale Pulse app references during startup: {}",
                             error
                         ),
                     }
@@ -736,16 +744,11 @@ impl Agent {
             notification_events,
             live_runs: Arc::new(crate::core::LiveRunRegistry::new(Some(storage.clone()))),
             startup_issues: Arc::new(RwLock::new(startup_issues)),
-            capability_snapshot: Arc::new(RwLock::new(None)),
-            capability_snapshot_refresh: Arc::new(tokio::sync::Mutex::new(())),
-            capability_snapshot_generation: Arc::new(AtomicUsize::new(0)),
-            capability_health_snapshot: Arc::new(RwLock::new(None)),
-            capability_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
-            capability_health_generation: Arc::new(AtomicUsize::new(0)),
             app_registry,
         };
 
         agent.spawn_gepa_idle_worker();
+        agent.spawn_curator_idle_worker();
         {
             let agent_for_memory_backfill = agent.clone();
             crate::spawn_logged!(
@@ -918,7 +921,7 @@ impl Agent {
     }
 
     pub async fn refresh_action_catalog_index(&self, reason: &'static str) {
-        self.invalidate_capability_snapshot(reason).await;
+        self.invalidate_spine_tool_directory(reason).await;
         match self.load_action_catalog_actions().await {
             Ok(actions) => {
                 self.spawn_action_catalog_index_sync(actions, reason);

@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use once_cell::sync::Lazy;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::Mutex;
 
 use crate::storage::Storage;
@@ -449,8 +449,10 @@ pub async fn revoke_sender(
 mod tests {
     use super::*;
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn pairing_policy_requires_approval_then_allows_sender() {
         let _dir = tempfile::tempdir().unwrap();
@@ -489,8 +491,10 @@ mod tests {
         assert!(matches!(second, SenderTrustDecision::Allowed));
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn repeated_unknown_sender_updates_pending_without_duplication() {
         let _dir = tempfile::tempdir().unwrap();
@@ -532,8 +536,10 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn unreadable_settings_payload_falls_back_to_defaults() {
         let _dir = tempfile::tempdir().unwrap();

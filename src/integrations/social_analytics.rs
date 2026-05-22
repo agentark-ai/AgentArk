@@ -3,7 +3,7 @@
 //! Provides aggregated social/content performance summaries from available sources.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::path::{Path, PathBuf};

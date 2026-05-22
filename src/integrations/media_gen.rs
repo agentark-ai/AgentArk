@@ -10,7 +10,7 @@
 //! - Luma AI (Dream Machine video)
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -1152,11 +1152,11 @@ impl MediaGenConnector {
                 video: Option<String>,
             }
 
-            let gen: GenerationResponse = response.json().await?;
+            let generation: GenerationResponse = response.json().await?;
 
-            match gen.state.as_str() {
+            match generation.state.as_str() {
                 "completed" => {
-                    if let Some(assets) = gen.assets {
+                    if let Some(assets) = generation.assets {
                         if let Some(video) = assets.video {
                             return Ok(video);
                         }
@@ -1166,7 +1166,7 @@ impl MediaGenConnector {
                 "failed" => {
                     return Err(anyhow!(
                         "Generation failed: {}",
-                        gen.failure_reason.unwrap_or_default()
+                        generation.failure_reason.unwrap_or_default()
                     ));
                 }
                 _ => continue,

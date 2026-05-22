@@ -2,13 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::core::self_evolve::skill_evolution::{self, SkillMetricsSnapshot, SkillWindowDirection};
 use crate::storage::{
-    experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
-    KvLeaseGuard, Storage,
+    KvLeaseGuard, Storage, experience_edge, experience_item, experience_run, learning_candidate,
+    procedural_pattern,
 };
 
 pub const LEARNING_ENABLED_KEY: &str = "learning_enabled_v1";
@@ -214,195 +213,6 @@ fn describe_user_preference_memory(
     };
 
     Some((kind, title, content))
-}
-
-fn candidate_action_name(pattern: &procedural_pattern::Model) -> String {
-    let mut slug = pattern
-        .title
-        .to_ascii_lowercase()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect::<String>();
-    while slug.contains("--") {
-        slug = slug.replace("--", "-");
-    }
-    slug = slug.trim_matches('-').to_string();
-    let base = if slug.is_empty() {
-        "learned-workflow".to_string()
-    } else {
-        format!("learned-{}", safe_truncate(&slug, 28))
-    };
-    format!(
-        "{}-{}",
-        base.trim_matches('-'),
-        short_hash(&[pattern.id.as_str()])
-    )
-}
-
-fn workflow_candidate_markdown(
-    pattern: &procedural_pattern::Model,
-    action_name: &str,
-    steps: &[String],
-) -> String {
-    let description = pattern.summary.replace('"', "'").replace(['\n', '\r'], " ");
-    let workflow_steps = if steps.is_empty() {
-        "- Review the request context and follow the learned sequence.".to_string()
-    } else {
-        steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| format!("### Step {}\n{}\n", index + 1, step))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    format!(
-        "---\nname: {action_name}\ndescription: \"{description}\"\nversion: \"1.0.0\"\npermissions: [memory, research]\n---\n\n# {title}\n\n{summary}\n\n## Trigger\n{trigger}\n\n## Workflow\n\n{workflow_steps}\n",
-        title = pattern.title,
-        summary = pattern.summary,
-        trigger = if pattern.trigger_summary.trim().is_empty() {
-            "Use this workflow when the request matches the learned pattern."
-        } else {
-            pattern.trigger_summary.as_str()
-        },
-    )
-}
-
-fn build_skill_patch_candidate_content(
-    action: &str,
-    skill_name: &str,
-    target_source: &str,
-    before_content: &str,
-    after_content: &str,
-    diff_summary: &str,
-    evidence: Value,
-    impact_baseline: SkillMetricsSnapshot,
-    history_versions_read: usize,
-) -> Value {
-    let canonical_skill_name = skill_evolution::canonicalize_skill_name(skill_name);
-    json!({
-        "action": action,
-        "skill_name": canonical_skill_name,
-        "target_source": target_source,
-        "before_content": before_content,
-        "after_content": after_content,
-        "content": after_content,
-        "diff_summary": diff_summary,
-        "diff_preview": skill_evolution::build_skill_diff_preview(before_content, after_content),
-        "evidence": evidence,
-        "impact_baseline": impact_baseline,
-        "impact_status": "pending",
-        "history_versions_read": history_versions_read,
-    })
-}
-
-fn run_request_preview(run: &experience_run::Model) -> String {
-    run.request_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| safe_truncate(value, 120))
-        .or_else(|| {
-            run.failure_reason
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| safe_truncate(value, 120))
-        })
-        .unwrap_or_else(|| run.intent_key.clone())
-}
-
-fn run_failure_summary(run: &experience_run::Model) -> Option<String> {
-    run.failure_reason
-        .as_deref()
-        .or(run.outcome_summary.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| safe_truncate(value, 140))
-}
-
-fn run_failure_label(run: &experience_run::Model) -> String {
-    run.task_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| run_request_preview(run))
-}
-
-fn candidate_exclusion_labels(runs: &[&experience_run::Model]) -> Vec<String> {
-    let mut labels = runs
-        .iter()
-        .map(|run| run_failure_label(run))
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    labels.sort();
-    labels.dedup();
-    labels.truncate(4);
-    labels
-}
-
-fn candidate_failure_checks_section(
-    executed_failures: &[&experience_run::Model],
-    selected_only_failures: &[&experience_run::Model],
-) -> Option<String> {
-    let mut bullets = Vec::new();
-
-    let mut tool_names = executed_failures
-        .iter()
-        .flat_map(|run| {
-            run.tool_sequence_json
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|item| item.get("tool_name").and_then(|value| value.as_str()))
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    tool_names.sort();
-    tool_names.dedup();
-    if !tool_names.is_empty() {
-        bullets.push(format!(
-            "- Recheck the workflow before committing when it depends on {}.",
-            tool_names
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    let mut failure_notes = executed_failures
-        .iter()
-        .filter_map(|run| run_failure_summary(run))
-        .collect::<Vec<_>>();
-    failure_notes.sort();
-    failure_notes.dedup();
-    if !failure_notes.is_empty() {
-        bullets.push(format!(
-            "- Stop and reassess when you see the same failure mode: {}.",
-            failure_notes
-                .iter()
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
-    }
-
-    let mismatch_labels = candidate_exclusion_labels(selected_only_failures);
-    if !mismatch_labels.is_empty() {
-        bullets.push(format!(
-            "- Treat {} as out-of-scope unless the request explicitly matches the trigger.",
-            mismatch_labels.join(", ")
-        ));
-    }
-
-    if bullets.is_empty() {
-        return None;
-    }
-    Some(bullets.join("\n"))
 }
 
 pub async fn load_learning_enabled(storage: &Storage) -> bool {
@@ -1575,6 +1385,10 @@ fn learning_candidate_is_reviewed(status: &str) -> bool {
     status.eq_ignore_ascii_case("approved") || status.eq_ignore_ascii_case("rejected")
 }
 
+fn ark_evolve_candidate_type_allowed(candidate_type: &str) -> bool {
+    candidate_type.trim() != "skill_patch"
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateWriteOutcome {
     Unchanged,
@@ -1627,6 +1441,15 @@ async fn upsert_generated_learning_candidate(
     lease_guard: &KvLeaseGuard,
     mut candidate: learning_candidate::Model,
 ) -> Result<CandidateWriteOutcome> {
+    if !ark_evolve_candidate_type_allowed(&candidate.candidate_type) {
+        tracing::warn!(
+            candidate_type = %candidate.candidate_type,
+            subject_key = %candidate.subject_key,
+            "Rejected Evolve learning candidate because skills are not a learning artifact"
+        );
+        return Ok(CandidateWriteOutcome::Unchanged);
+    }
+
     let existing_candidates = storage
         .list_learning_candidates_for_subject(&candidate.candidate_type, &candidate.subject_key, 64)
         .await?;
@@ -1815,7 +1638,7 @@ fn apply_candidate_write_outcome(
     }
 }
 
-pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Result<usize> {
+pub async fn run_candidate_generation(storage: &Storage, _data_dir: &Path) -> Result<usize> {
     if !load_learning_enabled(storage).await {
         return Ok(0);
     }
@@ -1880,33 +1703,6 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
 
     let result = async {
         let cap = load_learning_queue_cap(storage).await as u64;
-        let skill_catalog = {
-            let data_dir = data_dir.to_path_buf();
-            match tokio::task::spawn_blocking(move || skill_evolution::load_skill_catalog(&data_dir))
-                .await
-            {
-                Ok(Ok(catalog)) => catalog,
-                Ok(Err(error)) => {
-                    tracing::warn!("Failed to load skill catalog during candidate generation: {}", error);
-                    Vec::new()
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Skill catalog loader task failed during candidate generation: {}",
-                        error
-                    );
-                    Vec::new()
-                }
-            }
-        };
-        let known_skill_names = skill_catalog
-            .iter()
-            .map(|entry| entry.name.trim().to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        let recent_runs = storage
-            .list_recent_experience_runs_any_scope(cap.max(192))
-            .await
-            .unwrap_or_default();
         let patterns = storage
             .list_candidate_ready_patterns(3, 0.66, cap)
             .await?
@@ -1926,18 +1722,6 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                 break;
             }
 
-            let steps = pattern
-                .steps_json
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(|value| value.to_string()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let action_name = candidate_action_name(&pattern);
-            let workflow_content = workflow_candidate_markdown(&pattern, &action_name, &steps);
             let tool_names = pattern
                 .tool_sequence_json
                 .as_array()
@@ -1948,77 +1732,6 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if known_skill_names.contains(&action_name.to_ascii_lowercase())
-                || tool_names
-                    .iter()
-                    .any(|name| known_skill_names.contains(&name.trim().to_ascii_lowercase()))
-            {
-                continue;
-            }
-            let workflow_candidate_id = stable_id(
-                "candidate",
-                &[
-                    "skill_patch_create",
-                    pattern.id.as_str(),
-                    short_hash(&[workflow_content.as_str()]).as_str(),
-                ],
-            );
-            let now = chrono::Utc::now().to_rfc3339();
-            if !apply_candidate_write_outcome(
-                upsert_generated_learning_candidate(
-                    storage,
-                    &lease_guard,
-                    learning_candidate::Model {
-                        id: workflow_candidate_id,
-                        candidate_type: "skill_patch".to_string(),
-                        subject_key: action_name.clone(),
-                        title: format!("Teach your agent a new skill: {}", pattern.title),
-                        summary: Some(
-                            "Your agent has handled this kind of request well several times. Save it as a reusable skill so future requests start from what worked."
-                                .to_string(),
-                        ),
-                        project_id: None,
-                        conversation_id: None,
-                        pattern_id: Some(pattern.id.clone()),
-                        evidence_refs: json!([pattern.id]),
-                        proposed_content: build_skill_patch_candidate_content(
-                            "create_skill",
-                            &action_name,
-                            "custom",
-                            "",
-                            &workflow_content,
-                            "Create a new reusable skill from a repeated successful procedure.",
-                            json!({
-                                "pattern_id": pattern.id,
-                                "sample_count": pattern.sample_count,
-                                "success_count": pattern.success_count,
-                                "success_rate": pattern.success_rate,
-                                "task_type": pattern
-                                    .metadata
-                                    .get("task_type")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("general"),
-                                "tool_sequence": tool_names,
-                                "trigger_summary": pattern.trigger_summary,
-                            }),
-                            SkillMetricsSnapshot::default(),
-                            0,
-                        ),
-                        confidence: pattern.success_rate,
-                        approval_status: "draft".to_string(),
-                        review_notes: None,
-                        reviewed_at: None,
-                        approved_ref: None,
-                        created_at: now.clone(),
-                        updated_at: now.clone(),
-                    },
-                )
-                .await?,
-                &mut generated,
-                &lease_alive,
-            ) {
-                break;
-            }
 
             let metadata = pattern.metadata.as_object().cloned().unwrap_or_default();
             let task_type = metadata
@@ -2028,6 +1741,7 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
             let strategy_profile =
                 build_strategy_candidate_profile(&pattern, task_type, &tool_names);
             let strategy_candidate_id = stable_id("candidate", &["strategy", pattern.id.as_str()]);
+            let now = chrono::Utc::now().to_rfc3339();
             if !apply_candidate_write_outcome(
                 upsert_generated_learning_candidate(
                     storage,
@@ -2143,200 +1857,6 @@ pub async fn run_candidate_generation(storage: &Storage, data_dir: &Path) -> Res
                         proposed_content: serde_json::to_value(strategy_profile)
                             .unwrap_or(Value::Null),
                         confidence: avg_confidence.clamp(0.45, 0.98),
-                        approval_status: "draft".to_string(),
-                        review_notes: None,
-                        reviewed_at: None,
-                        approved_ref: None,
-                        created_at: now.clone(),
-                        updated_at: now,
-                    },
-                )
-                .await?,
-                &mut generated,
-                &lease_alive,
-            ) {
-                break;
-            }
-        }
-
-        for skill in skill_catalog {
-            if !lease_alive.load(std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    "Stopping learning candidate generation after lease ownership was lost"
-                );
-                break;
-            }
-
-            let matched_runs = recent_runs
-                .iter()
-                .filter(|run| skill_evolution::skill_matches_run(run, &skill.name))
-                .collect::<Vec<_>>();
-            if matched_runs.len() < 3 {
-                continue;
-            }
-
-            let baseline = skill_evolution::compute_skill_metrics(
-                &recent_runs,
-                &skill.name,
-                None,
-                SkillWindowDirection::Baseline,
-                8,
-                64,
-            );
-            let selected_only_failures = recent_runs
-                .iter()
-                .filter(|run| {
-                    skill_evolution::skill_selected_by_run(run, &skill.name)
-                        && !skill_evolution::skill_executed_by_run(run, &skill.name)
-                        && (run.correction_state == "corrected" || run.success_state == "failed")
-                })
-                .collect::<Vec<_>>();
-            let executed_failures = recent_runs
-                .iter()
-                .filter(|run| {
-                    skill_evolution::skill_executed_by_run(run, &skill.name)
-                        && (run.correction_state == "corrected" || run.success_state == "failed")
-                })
-                .collect::<Vec<_>>();
-
-            let mut action = None::<&str>;
-            let mut diff_summary = None::<String>;
-            let mut updated_content = None::<String>;
-            let history = skill_evolution::load_skill_history(&skill.history_dir).unwrap_or_default();
-
-            if selected_only_failures.len() >= 2 {
-                let description = skill_evolution::extract_frontmatter_value(&skill.content, "description")
-                    .unwrap_or_else(|| skill.description.clone());
-                if let Some(next_description) = skill_evolution::append_not_for_clause(
-                    &description,
-                    &candidate_exclusion_labels(&selected_only_failures),
-                ) {
-                    let content = skill_evolution::replace_frontmatter_value(
-                        &skill.content,
-                        "description",
-                        &next_description,
-                    );
-                    if content != skill.content {
-                        action = Some("optimize_description");
-                        diff_summary = Some(
-                            "Stop this skill from running on requests it isn't good at, based on recent failures."
-                                .to_string(),
-                        );
-                        updated_content = Some(content);
-                    }
-                }
-            }
-
-            if action.is_none()
-                && (executed_failures.len() >= 2
-                    || baseline.failure_rate >= 0.34
-                    || baseline.tool_error_rate >= 0.25)
-            {
-                if let Some(section_body) =
-                    candidate_failure_checks_section(&executed_failures, &selected_only_failures)
-                {
-                    let content = skill_evolution::upsert_markdown_section(
-                        &skill.content,
-                        "## Common failure checks",
-                        &section_body,
-                    );
-                    if content != skill.content {
-                        action = Some("improve_skill");
-                        diff_summary = Some(
-                            "Add guidance to help this skill handle what's been going wrong recently."
-                                .to_string(),
-                        );
-                        updated_content = Some(content);
-                    }
-                }
-            }
-
-            let (Some(action), Some(diff_summary), Some(after_content)) =
-                (action, diff_summary, updated_content)
-            else {
-                continue;
-            };
-
-            let evidence_refs = recent_runs
-                .iter()
-                .filter(|run| {
-                    skill_evolution::skill_matches_run(run, &skill.name)
-                        && (run.correction_state == "corrected" || run.success_state == "failed")
-                })
-                .take(6)
-                .map(|run| Value::String(run.id.clone()))
-                .collect::<Vec<_>>();
-            let candidate_id = stable_id(
-                "candidate",
-                &[
-                    "skill_patch",
-                    skill.name.as_str(),
-                    action,
-                    short_hash(&[after_content.as_str()]).as_str(),
-                ],
-            );
-            let now = chrono::Utc::now().to_rfc3339();
-            if !apply_candidate_write_outcome(
-                upsert_generated_learning_candidate(
-                    storage,
-                    &lease_guard,
-                    learning_candidate::Model {
-                        id: candidate_id,
-                        candidate_type: "skill_patch".to_string(),
-                        subject_key: skill.name.clone(),
-                        title: format!("Improve the '{}' skill", skill.name),
-                        summary: Some(diff_summary.clone()),
-                        project_id: None,
-                        conversation_id: None,
-                        pattern_id: None,
-                        evidence_refs: Value::Array(evidence_refs),
-                        proposed_content: build_skill_patch_candidate_content(
-                            action,
-                            &skill.name,
-                            &skill.source,
-                            &skill.content,
-                            &after_content,
-                            &diff_summary,
-                            json!({
-                                "selected_only_failures": selected_only_failures.len(),
-                                "executed_failures": executed_failures.len(),
-                                "matched_runs": matched_runs.len(),
-                                "baseline": baseline,
-                                "recent_failure_reasons": executed_failures
-                                    .iter()
-                                    .filter_map(|run| run_failure_summary(run))
-                                    .take(4)
-                                    .collect::<Vec<_>>(),
-                                "recent_tool_errors": executed_failures
-                                    .iter()
-                                    .flat_map(|run| {
-                                        run.tool_sequence_json
-                                            .as_array()
-                                            .into_iter()
-                                            .flatten()
-                                            .filter(|item| {
-                                                item.get("status")
-                                                    .and_then(|value| value.as_str())
-                                                    .map(|status| status != "success")
-                                                    .unwrap_or(false)
-                                            })
-                                            .filter_map(|item| item.get("tool_name").and_then(|value| value.as_str()))
-                                            .map(|value| value.to_string())
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .take(6)
-                                    .collect::<Vec<_>>(),
-                                "selected_failure_examples": selected_only_failures
-                                    .iter()
-                                    .take(3)
-                                    .map(|run| run_request_preview(run))
-                                    .collect::<Vec<_>>(),
-                                "history_versions_read": history.len(),
-                            }),
-                            baseline,
-                            history.len(),
-                        ),
-                        confidence: ((matched_runs.len().min(8) as f64) / 8.0).clamp(0.35, 0.95),
                         approval_status: "draft".to_string(),
                         review_notes: None,
                         reviewed_at: None,
@@ -2630,42 +2150,18 @@ mod tests {
     }
 
     #[test]
-    fn candidate_action_name_is_slugged() {
-        let pattern = procedural_pattern::Model {
-            id: "pattern-123".to_string(),
-            intent_key: "coding::fix-tool-bug".to_string(),
-            scope: "project".to_string(),
-            project_id: None,
-            conversation_id: None,
-            title: "Fix Tool Bug / Flow".to_string(),
-            trigger_summary: String::new(),
-            summary: String::new(),
-            tool_sequence_digest: None,
-            steps_json: Value::Array(Vec::new()),
-            tool_sequence_json: Value::Array(Vec::new()),
-            sample_count: 3,
-            success_count: 3,
-            correction_count: 0,
-            success_rate: 1.0,
-            last_validated_at: None,
-            status: "active".to_string(),
-            metadata: Value::Null,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let action_name = candidate_action_name(&pattern);
-        assert!(action_name.starts_with("learned-fix-tool-bug-flow"));
-        assert!(action_name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
-    }
-
-    #[test]
     fn describe_user_preference_memory_maps_name_to_personal_fact() {
         let mapped = describe_user_preference_memory("user_name", "Ava")
             .expect("user_name should map to a personal fact");
         assert_eq!(mapped.0, "personal_fact");
         assert!(mapped.2.contains("Ava"));
+    }
+
+    #[test]
+    fn ark_evolve_rejects_skill_patch_candidate_type() {
+        assert!(!ark_evolve_candidate_type_allowed("skill_patch"));
+        assert!(ark_evolve_candidate_type_allowed("strategy"));
+        assert!(ark_evolve_candidate_type_allowed("memory_merge"));
     }
 
     #[test]

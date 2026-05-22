@@ -108,6 +108,95 @@ function readinessRecord(value: unknown): JsonRecord | null {
   return Object.keys(record).length > 0 ? record : null;
 }
 
+function promptProposalLifecycle(row: JsonRecord): JsonRecord {
+  return asRecord(row.lifecycle);
+}
+
+function promptProposalLifecycleStatus(row: JsonRecord): string {
+  const lifecycle = promptProposalLifecycle(row);
+  const status = str(lifecycle.status, "").trim();
+  if (status) return status;
+  const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
+  if (reviewStatus === "approved") return "approved_waiting_for_more_examples";
+  if (reviewStatus === "rejected") return "dismissed";
+  return "suggested";
+}
+
+function promptProposalLifecycleLabel(status: string): string {
+  switch (status) {
+    case "suggested":
+      return "Needs decision";
+    case "approved_waiting_for_more_examples":
+      return "Collecting samples";
+    case "queued_for_background_test":
+      return "Queued";
+    case "running_background_test":
+      return "Running";
+    case "background_test_completed":
+      return "Candidate ready";
+    case "testing":
+      return "Testing";
+    case "test_regression":
+      return "Stop suggested";
+    case "deployed":
+      return "Deployed";
+    case "rollback_suggested":
+      return "Rollback suggested";
+    case "rolled_back":
+      return "Rolled back";
+    case "test_stopped":
+      return "Stopped";
+    case "blocked":
+      return "Blocked";
+    case "dismissed":
+      return "Dismissed";
+    default:
+      return humanizeStatusLabel(status || "suggested");
+  }
+}
+
+function promptProposalLifecycleStep(status: string): number {
+  switch (status) {
+    case "suggested":
+      return 0;
+    case "approved_waiting_for_more_examples":
+    case "queued_for_background_test":
+    case "running_background_test":
+    case "blocked":
+      return 1;
+    case "background_test_completed":
+      return 2;
+    case "testing":
+    case "test_regression":
+    case "test_stopped":
+      return 3;
+    case "deployed":
+    case "rollback_suggested":
+    case "rolled_back":
+      return 4;
+    default:
+      return 1;
+  }
+}
+
+function promptProposalLifecycleColor(status: string) {
+  if (status === "deployed") return "success" as const;
+  if (status === "testing" || status === "queued_for_background_test" || status === "running_background_test") {
+    return "warning" as const;
+  }
+  if (status === "blocked" || status === "rolled_back" || status === "dismissed" || status === "test_regression" || status === "rollback_suggested") {
+    return "error" as const;
+  }
+  return "default" as const;
+}
+
+function promptProposalSampleLabel(lifecycle: JsonRecord): string {
+  const samples = num(lifecycle.sample_count, 0);
+  const required = num(lifecycle.required_samples, 0);
+  if (required > 0) return `${samples.toLocaleString()} / ${required.toLocaleString()} samples`;
+  return `${samples.toLocaleString()} samples`;
+}
+
 function readinessChipColor(stage: string) {
   if (stage === "auto_ready") return "success" as const;
   if (stage === "review_ready") return "info" as const;
@@ -137,7 +226,7 @@ function recordList(value: unknown): JsonRecord[] {
 function backgroundImprovementReason(reason: string) {
   switch (reason) {
     case "learning_paused":
-      return "ArkEvolve is paused.";
+      return "Evolve is paused.";
     case "gepa_disabled":
       return "GEPA background optimizer is disabled.";
     case "model_or_runtime_not_ready":
@@ -206,97 +295,88 @@ function EvolutionLifecycle({
   steps: string[];
   activeIndex: number;
 }) {
-  // Connected-dot progress strip. Past steps and the current step are
-  // filled in AgentArk green; future steps are hollow. Connecting lines
-  // between dots are tinted green up to the active step, then muted —
-  // makes the "where we are in the lifecycle" reading instant. Replaces
-  // the previous 5-chip grid that looked like clickable buttons.
-  const ACTIVE_COLOR = "#78f2b0";
-  const MUTED_COLOR = "var(--ui-rgba-145-170-205-380)";
+  // Compact breadcrumb-style lifecycle. Current stage renders as a
+  // small filled pill in AgentArk green; past stages are dim primary
+  // mono text; future stages are dim secondary mono text; chevrons
+  // separate them. Reads as a single progression line instead of five
+  // evenly-spaced labels with a faint dot strip above.
+  const ACTIVE_FG = "#78f2b0";
+  const ACTIVE_BG = "rgba(120, 242, 176, 0.10)";
+  const ACTIVE_BORDER = "rgba(120, 242, 176, 0.35)";
+  const PAST_FG = "rgba(220, 224, 232, 0.78)";
+  const FUTURE_FG = "rgba(184, 191, 201, 0.45)";
+  const CHEVRON_FG = "rgba(184, 191, 201, 0.32)";
   return (
     <Box
       sx={{
         display: "flex",
-        alignItems: "flex-start",
-        gap: 0,
-        py: 0.5,
-        px: 0.5,
-        // Responsive horizontal scroll on narrow widths so the dots stay
-        // on one line; the user can still scan left-to-right.
-        overflowX: "auto",
-        scrollbarWidth: "none",
-        "&::-webkit-scrollbar": { display: "none" },
+        alignItems: "center",
+        gap: 0.85,
+        py: 0.35,
+        flexWrap: "wrap",
+        rowGap: 0.6,
       }}
     >
+      <Box
+        component="span"
+        sx={{
+          color: "rgba(184, 191, 201, 0.5)",
+          fontFamily: "var(--font-mono)",
+          fontSize: "0.62rem",
+          letterSpacing: "0.08em",
+          textTransform: "uppercase",
+          mr: 0.25,
+        }}
+      >
+        Stage
+      </Box>
       {steps.map((step, idx) => {
         const isActive = idx === activeIndex;
         const isPast = idx < activeIndex;
-        const isReached = isActive || isPast;
-        const isLast = idx === steps.length - 1;
+        const color = isActive ? ACTIVE_FG : isPast ? PAST_FG : FUTURE_FG;
         return (
           <Box
             key={`${step}-${idx}`}
-            sx={{
-              flex: isLast ? "0 0 auto" : 1,
-              minWidth: 88,
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "flex-start",
-              gap: 0.6,
-            }}
+            component="span"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 0.85 }}
           >
             <Box
+              component="span"
               sx={{
-                position: "relative",
-                width: "100%",
-                height: 14,
-                display: "flex",
+                display: "inline-flex",
                 alignItems: "center",
-              }}
-            >
-              <Box
-                sx={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: "50%",
-                  background: isReached ? ACTIVE_COLOR : "transparent",
-                  border: `2px solid ${isReached ? ACTIVE_COLOR : MUTED_COLOR}`,
-                  boxShadow: isActive
-                    ? "0 0 12px rgba(120, 242, 176, 0.5)"
-                    : "none",
-                  flex: "0 0 auto",
-                  zIndex: 1,
-                }}
-              />
-              {!isLast ? (
-                <Box
-                  sx={{
-                    flex: 1,
-                    height: 2,
-                    ml: 0.5,
-                    background: isPast ? ACTIVE_COLOR : MUTED_COLOR,
-                    opacity: isPast ? 0.85 : 0.45,
-                  }}
-                />
-              ) : null}
-            </Box>
-            <Typography
-              variant="caption"
-              sx={{
-                color: isActive
-                  ? ACTIVE_COLOR
-                  : isPast
-                    ? "var(--text-primary)"
-                    : "var(--text-secondary)",
+                gap: 0.5,
+                px: isActive ? 0.85 : 0,
+                py: isActive ? 0.2 : 0,
+                borderRadius: 999,
+                border: isActive ? `1px solid ${ACTIVE_BORDER}` : "none",
+                background: isActive ? ACTIVE_BG : "transparent",
+                color,
+                fontFamily: "var(--font-mono)",
+                fontSize: "0.68rem",
                 fontWeight: isActive ? 600 : 500,
-                lineHeight: 1.3,
+                letterSpacing: "0.04em",
+                textTransform: "lowercase",
                 whiteSpace: "nowrap",
-                fontSize: "0.72rem",
-                letterSpacing: 0.2,
+                lineHeight: 1.5,
               }}
             >
               {step}
-            </Typography>
+            </Box>
+            {idx < steps.length - 1 ? (
+              <Box
+                component="span"
+                aria-hidden="true"
+                sx={{
+                  color: CHEVRON_FG,
+                  fontSize: "0.78rem",
+                  lineHeight: 1,
+                  userSelect: "none",
+                }}
+              >
+                ›
+              </Box>
+            ) : null}
           </Box>
         );
       })}
@@ -362,8 +442,8 @@ function ResultSummaryCard({
       : tone === "warn"
         ? "#fbbf24"
         : tone === "info"
-          ? "#54c6ff"
-          : "#9fb3c8";
+          ? "#78f2b0"
+          : "#c8d8c9";
   return (
     <Box
       sx={{
@@ -629,7 +709,7 @@ function experimentLastActivityText(
 
 export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<EvolutionPageTab>("what");
+  const [tab, setTab] = useState<EvolutionPageTab>("review");
   const [showSuperseded, setShowSuperseded] = useState(false);
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(
     getDeveloperModeEnabled,
@@ -646,6 +726,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   // Default-closed so novice users see the narrative hero first. The
   // existing tabs and analytics stay one click away for power users.
   const [showDetails, setShowDetails] = useState(false);
+  const [optimizationOpen, setOptimizationOpen] = useState(false);
 
   useEffect(() => {
     const refreshDeveloperMode = () =>
@@ -771,7 +852,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const backgroundImprovementPaused =
     !selfEvolveEnabled || !gepaOptimizerEnabled;
   const backgroundImprovementPauseText = !selfEvolveEnabled
-    ? "ArkEvolve is paused."
+    ? "Evolve is paused."
     : "GEPA background optimizer is disabled.";
   const backgroundImprovementNeedsAttention = [
     latestGepaStatus,
@@ -843,7 +924,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const learningCandidates = pickRecords(evolutionDev, "learning_candidates");
   const learningPatterns = pickRecords(evolutionDev, "learning_patterns");
   const learningItems = pickRecords(evolutionDev, "learning_items");
-  const skillEvolutions = pickRecords(evolutionDev, "skill_evolutions");
+  const skillEvolutions: JsonRecord[] = [];
   const experienceGraph = asRecord(evolutionDev.experience_graph);
   const experienceGraphNodes = pickRecords(experienceGraph, "nodes");
   const experienceGraphEdges = pickRecords(experienceGraph, "edges");
@@ -1135,11 +1216,11 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     return {
       backgroundColor: "transparent",
       animationDurationUpdate: 260,
-      color: ["#5b7cfa", "#84cc6a", "#f4c35d", "#f87171", "#5fbad3"],
+      color: ["#78f2b0", "#d8ad78", "#ffbe63", "#ff9b9b", "#b7a7ff"],
       tooltip: {
-        backgroundColor: "var(--ui-rgba-6-14-28-950)",
-        borderColor: "var(--ui-rgba-84-198-255-250)",
-        textStyle: { color: "#d8edff", fontSize: 12 },
+        backgroundColor: "rgba(14, 18, 14, 0.96)",
+        borderColor: "rgba(120, 242, 176, 0.24)",
+        textStyle: { color: "#fff8ed", fontSize: 12 },
         formatter: (params: { data?: JsonRecord; value?: unknown }) => {
           const data = asRecord(params.data);
           return [str(data.name, "Node"), str(data.value, "")]
@@ -1155,7 +1236,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           itemHeight: 7,
           itemGap: 10,
           data: categories.map((category) => category.name),
-          textStyle: { color: "#9fb3c8", fontSize: 10 },
+          textStyle: { color: "#c8d8c9", fontSize: 10 },
         },
       ],
       series: [
@@ -1174,7 +1255,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           label: {
             show: false,
             position: "right",
-            color: "#eef6ff",
+            color: "#fff8ed",
             fontSize: 10,
             distance: 5,
             formatter: (params: { data?: JsonRecord }) =>
@@ -1194,7 +1275,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           emphasis: {
             focus: "adjacency",
             label: { show: true },
-            itemStyle: { borderColor: "#e8f4ff", borderWidth: 1.4 },
+            itemStyle: { borderColor: "#fff8ed", borderWidth: 1.4 },
             lineStyle: { opacity: 0.78, width: 1.25 },
           },
           blur: {
@@ -1239,10 +1320,17 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       .toLowerCase();
     return reviewStatus === "open" || reviewStatus === "review_recommended";
   });
-  const openPromptOptimizationOpportunities = promptOptimizationOpportunities.filter(
+  const promptOptimizationDecisionItems = promptOptimizationOpportunities.filter(
     (row) => {
       const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
       return reviewStatus !== "approved" && reviewStatus !== "rejected";
+    },
+  );
+  const activePromptOptimizationOpportunities = promptOptimizationOpportunities.filter(
+    (row) => {
+      const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
+      const lifecycleStatus = promptProposalLifecycleStatus(row);
+      return reviewStatus !== "rejected" && lifecycleStatus !== "rolled_back";
     },
   );
   const visiblePromptCanarySafetyEvents = showSuperseded
@@ -1250,7 +1338,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     : openPromptCanarySafetyEvents;
   const visiblePromptOptimizationOpportunities = showSuperseded
     ? promptOptimizationOpportunities
-    : openPromptOptimizationOpportunities;
+    : activePromptOptimizationOpportunities;
   const openNonSkillLearningCandidates = nonSkillLearningCandidates.filter((row) => {
     const status = str(row.approval_status, "draft").trim().toLowerCase();
     return !status || status === "draft" || status === "open";
@@ -1262,7 +1350,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     skillReviewItems.length +
     openNonSkillLearningCandidates.length +
     openPromptCanarySafetyEvents.length +
-    openPromptOptimizationOpportunities.length;
+    promptOptimizationDecisionItems.length;
   const promotedChangeCount =
     lineageRows.filter((row) => toBool(row.promoted)).length +
     skillHelpedItems.length;
@@ -1296,19 +1384,19 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     backgroundColor: "transparent",
     animationDuration: 350,
     grid: { left: 42, right: 14, top: 40, bottom: 34, containLabel: true },
-    legend: { top: 0, textStyle: { color: "#9fc3e6", fontSize: 11 } },
+    legend: { top: 0, textStyle: { color: "#d8d0c4", fontSize: 11 } },
     tooltip: {
       trigger: "axis",
-      backgroundColor: "var(--ui-rgba-6-14-28-950)",
-      borderColor: "var(--ui-rgba-84-198-255-250)",
-      textStyle: { color: "#d8edff" },
+      backgroundColor: "rgba(14, 18, 14, 0.96)",
+      borderColor: "rgba(120, 242, 176, 0.24)",
+      textStyle: { color: "#fff8ed" },
     },
     xAxis: {
       type: "category",
       data: metricChartLabels,
       axisTick: { alignWithLabel: true },
       axisLabel: {
-        color: "#8fb2d1",
+        color: "#c8d8c9",
         fontSize: 10,
         interval: 0,
         rotate: metricChartRows.length > 4 ? 22 : 0,
@@ -1321,8 +1409,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     yAxis: {
       type: "value",
       max: 100,
-      axisLabel: { color: "#8fb2d1", formatter: "{value}%" },
-      splitLine: { lineStyle: { color: "var(--ui-rgba-108-156-212-100)" } },
+      axisLabel: { color: "#c8d8c9", formatter: "{value}%" },
+      splitLine: { lineStyle: { color: "rgba(130, 170, 160, 0.14)" } },
     },
     series: [
       {
@@ -1397,20 +1485,20 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 ? "Checking candidate safety"
                 : "Nothing needs you now";
   const primaryStatusDetail = needsApprovalCount > 0
-    ? `Nothing has changed yet. Open the review queue to decide whether ArkEvolve should keep going with ${reviewDecisionSubject}.`
+    ? `Nothing has changed yet. Open the review queue to decide whether Evolve should keep going with ${reviewDecisionSubject}.`
     : activeTests > 0
       ? "A small live test is active. You can view it, stop it, or make it stable from Live tests."
       : anyRollbackAvailable
         ? `${rollbackAvailableCount} stable change${rollbackAvailableCount === 1 ? "" : "s"} can be rolled back from Live tests.`
         : gepaRunningJobs > 0
-          ? "ArkEvolve is reviewing completed work. If it finds something useful, it will move into safety checks or review."
+          ? "Evolve is reviewing completed work. If it finds something useful, it will move into safety checks or review."
           : gepaPendingJobs > 0
             ? "A background check is waiting until AgentArk is quiet."
             : !gepaReady
               ? "Background improvement needs a working primary model before it can run."
               : latestGepaCandidateCount > 0
                 ? "Candidate improvements were created and are going through safety checks."
-                : "ArkEvolve is watching completed work and will ask before it changes behavior.";
+                : "Evolve is watching completed work and will ask before it changes behavior.";
   const reviewLifecycleSteps = [
     "Suggested",
     "Saved for follow-up",
@@ -1464,7 +1552,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const activeError = error || statusError;
   const hasMeasuredHelp =
     confirmedRecentChangeCount > 0 ||
-    skillHelpedItems.length > 0 ||
     helpedLines.length > 0;
   const resultSummarySeverity = detailError
     ? ("warning" as const)
@@ -1479,12 +1566,12 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         ? `${confirmedRecentChangeCount || helpedLines.length} confirmed improvement${(confirmedRecentChangeCount || helpedLines.length) === 1 ? "" : "s"}`
         : "No proven improvement yet";
   const resultSummaryDetail = detailLoading
-    ? "ArkEvolve is loading the recent evidence behind prompt, routing, specialist, and skill changes."
+    ? "Evolve is loading the recent evidence behind prompt, routing, specialist, memory, and strategy changes."
     : detailError
-      ? "The detail endpoint did not return enough data to explain recent ArkEvolve results."
+      ? "The detail endpoint did not return enough data to explain recent Evolve results."
       : hasMeasuredHelp
         ? "These are changes with measured evidence from recent runs. Live tests and review items are shown separately before anything risky becomes stable."
-        : "ArkEvolve has not found enough measured evidence to call a recent change useful. This page now shows that plainly instead of stretching empty panels or drawing weak charts.";
+        : "Evolve has not found enough measured evidence to call a recent change useful. This page now shows that plainly instead of stretching empty panels or drawing weak charts.";
   const resultSummaryCards = [
     {
       label: "Confirmed wins",
@@ -1501,7 +1588,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       helper:
         skillObservedItems.length > 0
           ? "Approved changes need more traffic."
-          : "No approved skill change is waiting.",
+          : "No approved change is waiting.",
       tone: skillObservedItems.length > 0 ? ("warn" as const) : ("default" as const),
     },
     {
@@ -1577,144 +1664,49 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     <WorkspacePageShell className="evolution-page" spacing={1.5}>
       <WorkspacePageHeader
         eyebrow="ARK CORE"
-        title="ArkEvolve"
-        description={
-          <>
-            How AgentArk is learning to work better for you. ArkEvolve watches
-            completed work, proposes improvements, and asks before anything
-            lasting changes.
-          </>
-        }
+        title="Evolve"
+        description="Watches completed work, proposes improvements, and asks before anything lasting changes."
       />
       {success ? <Alert severity="success">{success}</Alert> : null}
       {activeError ? <Alert severity="error">{activeError}</Alert> : null}
 
-      {/* Narrative hero. Headline number prioritizes what's actually on
-          the user: pending reviews > live tests > steady > paused. The
-          existing dense analytics view is hidden behind "Show details"
-          so non-technical users see the gist first. */}
-      <EvolveHero
-        loading={statusLoading}
-        title={primaryStatusTitle}
-        detail={primaryStatusDetail}
-        needsApprovalCount={needsApprovalCount}
-        activeTests={activeTests}
-        rollbackAvailableCount={rollbackAvailableCount}
-        selfEvolveEnabled={toBool(evolution.self_evolve_enabled)}
-        showDetails={showDetails}
-        onToggleDetails={() => setShowDetails((value) => !value)}
-        onOpenReviewQueue={openReviewQueue}
-        onOpenLiveTests={() => setTab("tests")}
-        onOpenRollback={
-          anyRollbackAvailable ? () => setTab("tests") : undefined
-        }
-      />
+      {/* EvolveHero removed entirely. The filter chip strip below
+          ("Needs review (2)" / "Live tests (1)" / "Stable" / "Overview")
+          carries the same headline number + state with far less screen
+          real estate. The page no longer has a giant counter floating
+          at the top — counts live inline on the action they belong to. */}
 
-      <Collapse in={showDetails} mountOnEnter timeout={240}>
-      <Box className="list-shell" sx={{ p: 1.5 }}>
-        <Stack spacing={1.15}>
-          <Stack
-            direction={{ xs: "column", md: "row" }}
-            spacing={1}
-            sx={{
-              alignItems: { xs: "flex-start", md: "center" },
-              justifyContent: "space-between",
-            }}
-          >
-            <Box sx={{ minWidth: 0 }}>
-              <Typography
-                variant="h6"
-                sx={{ color: "#e8f4ff", fontWeight: 800 }}
-              >
-                {primaryStatusTitle}
-              </Typography>
-              <Typography
-                variant="body2"
-                sx={{ color: "text.secondary", mt: 0.4, lineHeight: 1.6 }}
-              >
-                {primaryStatusDetail}
-              </Typography>
-            </Box>
-            {needsApprovalCount > 0 ||
-            activeTests > 0 ||
-            anyRollbackAvailable ? (
-              <Stack
-                direction="row"
-                spacing={0.75}
-                useFlexGap
-                sx={{ flexWrap: "wrap", flexShrink: 0 }}
-              >
-                {needsApprovalCount > 0 ? (
-                  <Button
-                    size="small"
-                    variant="contained"
-                    onClick={openReviewQueue}
-                  >
-                    Open review queue
-                  </Button>
-                ) : null}
-                {activeTests > 0 ? (
-                  <Button
-                    size="small"
-                    variant="contained"
-                    onClick={() => setTab("tests")}
-                  >
-                    View live tests
-                  </Button>
-                ) : null}
-                {routingRollbackAvailable ? (
-                  <Button
-                    size="small"
-                    color="inherit"
-                    disabled={runEvolutionActionMutation.isPending}
-                    onClick={() =>
-                      void runEvolutionAction(
-                        { action: "rollback_baseline" },
-                        "Rolled back to the previous stable routing behavior.",
-                        "Roll back the stable routing change now?",
-                      )
-                    }
-                  >
-                    Roll back stable change
-                  </Button>
-                ) : anyRollbackAvailable ? (
-                  <Button
-                    size="small"
-                    color="inherit"
-                    onClick={() => setTab("tests")}
-                  >
-                    Rollback options
-                  </Button>
-                ) : null}
-              </Stack>
-            ) : null}
-          </Stack>
-        </Stack>
-      </Box>
-      {/* The status strip and the background-learning section were
-          retired here — the EvolveHero above already presents the same
-          mode / live-test / needs-you state in one place. Only the
-          startup-readiness Alert stays, because it surfaces an actionable
-          blocker (no primary model configured) the hero can't convey. */}
+      {/* Previous "show details" Collapse + duplicate primaryStatusTitle
+          header was removed. The EvolveHero above already surfaces the
+          headline + action moments; repeating it below was the source
+          of the "2 suggestions need your review" / "2 suggestions are
+          waiting" duplication. Tabs are now always visible. */}
       {!gepaReady && !backgroundImprovementPaused ? (
         <Alert severity="info" sx={{ borderRadius: 1 }}>
           Background improvement starts automatically after Models has a working
           primary model{gepaIssues[0] ? `: ${gepaIssues[0]}` : "."}
         </Alert>
       ) : null}
-      <Box className="list-shell" sx={{ p: 0.75 }}>
-        <Tabs
-          value={tab}
-          onChange={(_, next) => setTab(next as EvolutionPageTab)}
-          variant="scrollable"
-          scrollButtons="auto"
-          aria-label="ArkEvolve page sections"
-          className="workspace-page-subnav-tabs"
+      <Box className="list-shell workspace-page-subnav-shell">
+        <Stack
+          direction="row"
+          sx={{
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
         >
-          {EVOLUTION_PAGE_TABS.map((item) => (
-            <Tab key={item.value} value={item.value} label={item.label} />
-          ))}
-        </Tabs>
+          <Tabs
+            value={tab}
+            onChange={(_event, next) => setTab(next as EvolutionPageTab)}
+            variant="scrollable"
+            allowScrollButtonsMobile
+            className="workspace-page-subnav-tabs"
+            sx={{ flex: 1 }}
+          >
+            <Tab value="review" label={`Needs Review (${needsApprovalCount})`} />
+            <Tab value="helped" label={`Deployed (${promotedChangeCount})`} />
+          </Tabs>
+        </Stack>
       </Box>
       {statusLoading ? (
         <Box className="list-shell" sx={{ p: 1.5 }}>
@@ -1732,7 +1724,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 color: "text.secondary",
               }}
             >
-              Loading ArkEvolve status...
+              Loading Evolve status...
             </Typography>
           </Stack>
         </Box>
@@ -1760,7 +1752,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               </Stack>
             ) : detailError ? (
               <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                Detailed ArkEvolve history is unavailable: {detailError}
+                Detailed Evolve history is unavailable: {detailError}
               </Alert>
             ) : confirmedRecentChangeCount === 0 ? (
               <Typography
@@ -1769,7 +1761,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   color: "text.secondary",
                 }}
               >
-                No confirmed improvements yet. ArkEvolve will list changes here
+                No confirmed improvements yet. Evolve will list changes here
                 only after they have proven measurable impact. In the meantime,
                 the Review queue tab shows changes that are waiting on you.
               </Typography>
@@ -1790,7 +1782,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                         mb: 0.75,
                       }}
                     >
-                      Skill improvements
+                      Capability improvements
                     </Typography>
                     <Stack spacing={0.85}>
                       {skillHelpedItems.slice(0, 4).map((row, idx) => {
@@ -1857,7 +1849,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                             <Typography variant="body2">
                               {str(
                                 row.diff_summary,
-                                str(row.summary, "Reviewable skill change"),
+                                str(row.summary, "Reviewable capability change"),
                               )}
                             </Typography>
                           </Alert>
@@ -1955,7 +1947,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 }}
               >
                 Select a row to inspect the grouped runs, observed tools, and
-                why ArkEvolve is still only watching the pattern.
+                why Evolve is still only watching the pattern.
               </Typography>
               {detailLoading ? (
                 <Stack
@@ -2080,7 +2072,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           ) : null}
         </Stack>
       ) : null}
-      </Collapse>
       <Dialog
         open={selectedPatternCard != null}
         onClose={() => setSelectedPatternCard(null)}
@@ -2356,7 +2347,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     Results in plain English
                   </Typography>
                   <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                    What ArkEvolve can prove, what it is still measuring, and
+                    What Evolve can prove, what it is still measuring, and
                     whether anything needs your decision.
                   </Typography>
                 </Box>
@@ -2372,7 +2363,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   label={resultSummaryTitle}
                 />
               </Stack>
-              {/* Long "ArkEvolve has not found enough measured evidence…"
+              {/* Long "Evolve has not found enough measured evidence…"
                   Alert removed. The four stat cards already say "Confirmed
                   wins: 0", "Still measuring: 0", etc. — adding a paragraph
                   saying the same in prose was double-billing. Stat helpers
@@ -2601,8 +2592,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           <Grid2 size={{ xs: 12, lg: 5 }}>
             <Stack spacing={1.5}>
               {/* "Still observing" section is hidden entirely when no
-                  approved skill change is waiting on more evidence — the
-                  long info banner saying "No approved skill changes are
+                  approved change is waiting on more evidence — the
+                  long info banner saying "No approved changes are
                   waiting" was an empty state pretending to be content. */}
               {!detailLoading && !detailError && skillObservedItems.length === 0 ? null : (
               <Box className="list-shell" sx={{ p: 1.6 }}>
@@ -2619,7 +2610,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     mb: 1,
                   }}
                 >
-                  Approved skill changes that have traffic, but have not cleared
+                  Approved changes that have traffic, but have not cleared
                   the improvement threshold yet.
                 </Typography>
                 {detailLoading ? (
@@ -2773,90 +2764,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                       The graph is still forming. There are not enough connected
                       runs and learned items to draw a useful network yet.
                     </Alert>
-                    {(() => {
-                      // Try to pull actual node content from common field
-                      // names so the row says WHAT this experience item
-                      // contains, not just "Learned user memory" repeated
-                      // five times. Rows without any meaningful preview
-                      // are dropped — they were the source of the user's
-                      // "I don't know for what" complaint.
-                      const previewFor = (node: JsonRecord): string => {
-                        const candidates = [
-                          str(node.text, ""),
-                          str(node.body, ""),
-                          str(node.summary, ""),
-                          str(node.description, ""),
-                          str(node.content, ""),
-                          str(node.detail, ""),
-                          str(node.value, ""),
-                        ];
-                        for (const candidate of candidates) {
-                          const trimmed = candidate.trim();
-                          if (trimmed && trimmed.length > 6) return trimmed;
-                        }
-                        // Fallback: only return label if it differs from
-                        // the generic kind label — otherwise we'd show
-                        // "Learned user memory" over and over.
-                        const rawLabel = str(node.label, "").trim();
-                        const kindLabel = titleCaseLabel(
-                          str(node.kind, "").replace(/_/g, " "),
-                        );
-                        if (rawLabel && rawLabel.toLowerCase() !== kindLabel.toLowerCase()) {
-                          return rawLabel;
-                        }
-                        return "";
-                      };
-                      const useful = experienceNodePreview
-                        .map((node) => ({ node, preview: previewFor(node) }))
-                        .filter((item) => item.preview.length > 0);
-                      if (useful.length === 0) return null;
-                      return (
-                        <Stack spacing={0.7}>
-                          {useful.map(({ node, preview }, idx) => (
-                            <Box
-                              key={`experience-node-preview-${str(node.id, String(idx))}`}
-                              sx={{
-                                p: 0.9,
-                                border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                borderRadius: 1,
-                                bgcolor: "rgba(8, 14, 24, 0.28)",
-                              }}
-                            >
-                              <Typography
-                                variant="body2"
-                                sx={{
-                                  color: "#e8f4ff",
-                                  fontWeight: 600,
-                                  display: "-webkit-box",
-                                  WebkitLineClamp: 2,
-                                  WebkitBoxOrient: "vertical",
-                                  overflow: "hidden",
-                                }}
-                                title={preview}
-                              >
-                                {preview}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "block",
-                                  fontFamily: "var(--font-mono)",
-                                  fontSize: "0.66rem",
-                                  letterSpacing: 0.4,
-                                  textTransform: "uppercase",
-                                  mt: 0.3,
-                                }}
-                              >
-                                {titleCaseLabel(
-                                  str(node.kind, "item").replace(/_/g, " "),
-                                )}
-                              </Typography>
-                            </Box>
-                          ))}
-                        </Stack>
-                      );
-                    })()}
                   </Stack>
                 ) : (
                   <Stack spacing={1}>
@@ -2884,21 +2791,42 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 )}
               </Box>
               <Box className="list-shell" sx={{ p: 1.6 }}>
-                <Typography
-                  variant="h6"
-                  sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                >
-                  Optimization graph
-                </Typography>
-                <Typography
-                  variant="body2"
+                <Stack
+                  direction="row"
+                  spacing={1}
                   sx={{
-                    color: "text.secondary",
-                    mb: 1,
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    cursor: "pointer",
                   }}
+                  onClick={() => setOptimizationOpen((value) => !value)}
                 >
-                  Success and error rates for the versions with recent traffic.
-                </Typography>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography
+                      variant="h6"
+                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                    >
+                      Optimization graph
+                    </Typography>
+                    <Typography
+                      variant="body2"
+                      sx={{
+                        color: "text.secondary",
+                      }}
+                    >
+                      Success and error rates for the versions with recent traffic.
+                    </Typography>
+                  </Box>
+                  <Button
+                    size="small"
+                    variant="text"
+                    sx={{ flexShrink: 0, color: "text.secondary" }}
+                  >
+                    {optimizationOpen ? "Hide" : "Show"}
+                  </Button>
+                </Stack>
+                <Collapse in={optimizationOpen} mountOnEnter timeout={220}>
+                <Box sx={{ mt: 1 }}>
                 {detailLoading ? (
                   <Stack
                     direction="row"
@@ -2978,6 +2906,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     style={{ height: 260, width: "100%" }}
                   />
                 )}
+                </Box>
+                </Collapse>
               </Box>
             </Stack>
           </Grid2>
@@ -3005,7 +2935,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                       No active experiments
                     </Typography>
                     <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                      ArkEvolve is using the current stable behavior across reply
+                      Evolve is using the current stable behavior across reply
                       routing, main replies, adaptive prompt guidance, request
                       understanding, and specialist helpers.
                     </Typography>
@@ -3013,7 +2943,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   <Chip size="small" label="Stable" />
                 </Stack>
                 <Alert severity="info" sx={{ borderRadius: 1 }}>
-                  When ArkEvolve starts testing a new improvement, this page will
+                  When Evolve starts testing a new improvement, this page will
                   explain what is changing, why it could help, how much traffic
                   is included, and what decision is still pending.
                 </Alert>
@@ -3337,46 +3267,63 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             }}
           >
             <Stack
-              direction={{ xs: "column", md: "row" }}
+              direction="row"
               spacing={1}
               sx={{
                 justifyContent: "space-between",
-                alignItems: { xs: "flex-start", md: "center" },
-                mb: 1,
+                alignItems: "flex-start",
+                mb: 1.25,
+                gap: 1.5,
               }}
             >
-              <Box>
+              <Box sx={{ minWidth: 0, flex: 1 }}>
                 <Typography
-                  variant="h6"
-                  sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                  variant="subtitle1"
+                  sx={{
+                    color: "var(--text-primary)",
+                    fontWeight: 600,
+                    fontSize: "0.95rem",
+                    lineHeight: 1.3,
+                  }}
                 >
                   Review queue
                 </Typography>
                 <Typography
                   variant="body2"
                   sx={{
-                    color: "text.secondary",
+                    color: "var(--text-secondary)",
+                    fontSize: "0.78rem",
+                    lineHeight: 1.4,
+                    mt: 0.25,
                   }}
                 >
-                  Nothing here changes AgentArk until a card says it is in a
-                  live test or stable change.
+                  Improvements Evolve drafted from recent runs. Each one
+                  waits on your decision before AgentArk behavior changes.
                 </Typography>
               </Box>
               <FormControlLabel
                 control={
                   <Switch
+                    size="small"
                     checked={showSuperseded}
                     onChange={(event) => setShowSuperseded(event.target.checked)}
                   />
                 }
                 label="Show past decisions"
+                sx={{
+                  m: 0,
+                  flex: "0 0 auto",
+                  alignSelf: "center",
+                  "& .MuiTypography-root": {
+                    fontFamily: "var(--font-mono)",
+                    fontSize: "0.7rem",
+                    textTransform: "uppercase",
+                    color: "var(--text-secondary)",
+                    letterSpacing: 0.04,
+                  },
+                }}
               />
             </Stack>
-            <Alert severity="info" sx={{ borderRadius: 1, mb: 1.25 }}>
-              Review items are suggestions until ArkEvolve marks them as a
-              live test or stable change. Suggested-only items do not change
-              AgentArk behavior and do not need rollback.
-            </Alert>
             {detailLoading ? (
               <Stack
                 direction="row"
@@ -3638,20 +3585,63 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 ) : null}
                 {visiblePromptOptimizationOpportunities.length > 0 ? (
                   <Box>
-                    <Typography
-                      variant="subtitle2"
-                      sx={{ color: "#e8f4ff", mb: 1 }}
-                    >
-                      Suggestions before behavior changes
-                    </Typography>
+                    {/* Removed "Suggestions before behavior changes" header.
+                        The chip strip already says "Needs review (N)" — a
+                        section sub-header below it was redundant. */}
                     <Stack spacing={1}>
                       {visiblePromptOptimizationOpportunities.map((row, idx) => {
                         const proposalId = str(row.id, "");
                         const reviewStatus = str(row.review_status, "open");
+                        const lifecycle = promptProposalLifecycle(row);
+                        const lifecycleStatus = promptProposalLifecycleStatus(row);
+                        const lifecycleLabel = promptProposalLifecycleLabel(lifecycleStatus);
+                        const lifecycleReason = str(lifecycle.reason, "");
+                        const lifecycleSamples = num(lifecycle.sample_count, 0);
+                        const lifecycleRequiredSamples = num(lifecycle.required_samples, 0);
+                        const monitoringSummary = stringList(lifecycle.monitoring_summary);
+                        const monitoringRegressions = stringList(lifecycle.monitoring_regressions);
+                        const rollbackRecommended = toBool(lifecycle.rollback_recommended);
+                        const lifecycleSamplePct =
+                          lifecycleRequiredSamples > 0
+                            ? Math.min(100, (lifecycleSamples / lifecycleRequiredSamples) * 100)
+                            : 0;
+                        const lifecycleChartOption = {
+                          backgroundColor: "transparent",
+                          grid: { left: 28, right: 16, top: 18, bottom: 26 },
+                          xAxis: {
+                            type: "category",
+                            data: ["Collected", "Required"],
+                            axisLabel: { color: "#c8d8c9" },
+                            axisLine: { lineStyle: { color: "rgba(130,170,160,0.22)" } },
+                          },
+                          yAxis: {
+                            type: "value",
+                            axisLabel: { color: "#c8d8c9" },
+                            splitLine: { lineStyle: { color: "rgba(130,170,160,0.12)" } },
+                          },
+                          series: [
+                            {
+                              type: "bar",
+                              data: [
+                                lifecycleSamples,
+                                lifecycleRequiredSamples || lifecycleSamples,
+                              ],
+                              itemStyle: { color: "#78f2b0", borderRadius: [4, 4, 0, 0] },
+                            },
+                          ],
+                        };
                         const riskLevel = str(row.risk_level, "default");
                         const evidence = stringList(row.evidence);
                         const expectedBenefit = stringList(row.expected_benefit);
                         const caveats = stringList(row.caveats);
+                        const targetScope = promptProposalScopeLabel(
+                          str(row.target_scope, "prompt_profile"),
+                        );
+                        const collapsedExplanation =
+                          str(row.summary, "").trim() ||
+                          expectedBenefit[0] ||
+                          evidence[0] ||
+                          "Evolve found a possible improvement from recent completed work. Nothing changes unless you approve it.";
                         const reviewedAt = str(row.reviewed_at, "");
                         const reviewEvidence =
                           promptOptimizationReviewEvidence(row);
@@ -3659,9 +3649,13 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                           !!proposalId &&
                           reviewStatus !== "approved" &&
                           reviewStatus !== "rejected";
-                        const proposalStateLabel = canApprove
-                          ? "Suggested only"
-                          : "Review recorded";
+                        const canManagePromptCanary =
+                          !!proposalId &&
+                          str(lifecycle.live_surface, "") === "prompt" &&
+                          (lifecycleStatus === "testing" ||
+                            lifecycleStatus === "test_regression" ||
+                            lifecycleStatus === "deployed" ||
+                            lifecycleStatus === "rollback_suggested");
                         return (
                           <Accordion
                             disableGutters
@@ -3678,36 +3672,103 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                             <AccordionSummary
                               expandIcon={<ExpandMoreIcon sx={{ color: "text.secondary" }} />}
                               sx={{
-                                px: 1.5,
-                                minHeight: 48,
+                                px: 1.75,
+                                py: 0.25,
                                 "& .MuiAccordionSummary-content": {
-                                  alignItems: "center",
-                                  gap: 1,
-                                  my: 0.75,
+                                  alignItems: "flex-start",
+                                  gap: 1.25,
+                                  my: 1,
                                   minWidth: 0,
+                                },
+                                "& .MuiAccordionSummary-expandIconWrapper": {
+                                  alignSelf: "center",
                                 },
                               }}
                             >
-                              <Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0.2 }}>
+                              <Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0.35 }}>
+                                <Stack
+                                  direction="row"
+                                  spacing={1}
+                                  sx={{ alignItems: "baseline", minWidth: 0 }}
+                                >
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "var(--text-faint)",
+                                      fontFamily: "var(--font-mono)",
+                                      fontSize: "0.62rem",
+                                      textTransform: "uppercase",
+                                      letterSpacing: 0.08,
+                                      flex: "0 0 auto",
+                                      lineHeight: 1.2,
+                                    }}
+                                  >
+                                    {lifecycleLabel}
+                                  </Typography>
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "var(--text-secondary)",
+                                      fontFamily: "var(--font-mono)",
+                                      fontSize: "0.62rem",
+                                      textTransform: "uppercase",
+                                      letterSpacing: 0.08,
+                                      flex: "0 0 auto",
+                                      lineHeight: 1.2,
+                                    }}
+                                  >
+                                    {targetScope} | {promptProposalSampleLabel(lifecycle)}
+                                  </Typography>
+                                </Stack>
                                 <Typography
                                   variant="subtitle2"
                                   sx={{
                                     color: "#e8f4ff",
                                     fontWeight: 600,
+                                    fontSize: "0.92rem",
                                     overflow: "hidden",
                                     textOverflow: "ellipsis",
                                     whiteSpace: "nowrap",
+                                    lineHeight: 1.3,
                                   }}
                                 >
                                   {str(row.title, "Suggested improvement")}
                                 </Typography>
                                 <Typography
-                                  variant="caption"
-                                  sx={{ color: "var(--text-secondary)" }}
+                                  variant="body2"
+                                  sx={{
+                                    color: "var(--text-secondary)",
+                                    fontSize: "0.78rem",
+                                    lineHeight: 1.4,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                  }}
                                 >
-                                  Suggested change to how AgentArk writes its instructions to itself
+                                  Why it is here: {collapsedExplanation}
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  sx={{
+                                    color: "var(--text-dim)",
+                                    fontSize: "0.72rem",
+                                  }}
+                                >
+                                  {lifecycleReason ||
+                                    (rollbackRecommended
+                                      ? "Monitoring found a regression; rollback is recommended."
+                                      : "") ||
+                                    (canApprove
+                                      ? "Nothing changes until you approve this."
+                                      : "Approved work stays attached here while it is sampled, tested, deployed, or rolled back.")}
                                 </Typography>
                               </Box>
+                              <Chip
+                                size="small"
+                                color={promptProposalLifecycleColor(lifecycleStatus)}
+                                label={lifecycleLabel}
+                                sx={{ flex: "0 0 auto", alignSelf: "center" }}
+                              />
                               {/* Inline risk indicator — coloured dot + label,
                                   no chip background. Reads as part of the row,
                                   not as a clickable element. */}
@@ -3756,10 +3817,45 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     isn't relevant until a live test exists. */}
                                 <EvolutionLifecycle
                                   steps={reviewLifecycleSteps}
-                                  activeIndex={canApprove ? 0 : 1}
+                                  activeIndex={promptProposalLifecycleStep(lifecycleStatus)}
                                 />
+                                {!canApprove ? (
+                                  <Box>
+                                    <Typography
+                                      variant="caption"
+                                      sx={{ color: "text.secondary", display: "block", mb: 0.35 }}
+                                    >
+                                      Sampling progress
+                                    </Typography>
+                                    <Box
+                                      sx={{
+                                        height: 7,
+                                        borderRadius: 999,
+                                        overflow: "hidden",
+                                        bgcolor: "rgba(130,170,160,0.16)",
+                                      }}
+                                    >
+                                      <Box
+                                        sx={{
+                                          width: `${lifecycleSamplePct}%`,
+                                          height: "100%",
+                                          bgcolor:
+                                            lifecycleStatus === "blocked"
+                                              ? "#fb7185"
+                                              : "#78f2b0",
+                                        }}
+                                      />
+                                    </Box>
+                                    <Typography
+                                      variant="caption"
+                                      sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+                                    >
+                                      {promptProposalSampleLabel(lifecycle)}
+                                    </Typography>
+                                  </Box>
+                                ) : null}
                                 <Typography variant="body2">
-                                  {str(row.summary, "ArkEvolve found a reviewable prompt improvement.")}
+                                  {str(row.summary, "Evolve found a reviewable prompt improvement.")}
                                 </Typography>
                                 {expectedBenefit[0] ? (
                                   <Typography variant="body2" sx={{ color: "text.secondary" }}>
@@ -3788,7 +3884,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     variant="text"
                                     onClick={() => setTechnicalDialogProposalId(proposalId)}
                                   >
-                                    See technical details
+                                    Review details
                                   </Button>
                                   <Button
                                     size="small"
@@ -3816,12 +3912,26 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                           action: "approve_prompt_optimization_proposal",
                                           candidate_id: proposalId,
                                         },
-                                        "Saved for follow-up. AgentArk behavior has not changed, so no rollback is needed.",
+                                        "Saved for follow-up. Background optimization is now attached to this row.",
                                       )
                                     }
                                   >
                                     Save for follow-up
                                   </Button>
+                                  {!canApprove && canManagePromptCanary ? (
+                                    <Button
+                                      size="small"
+                                      variant="contained"
+                                      color={lifecycleStatus === "deployed" ? "inherit" : "primary"}
+                                      onClick={() => setTechnicalDialogProposalId(proposalId)}
+                                    >
+                                      {lifecycleStatus === "deployed"
+                                        ? "Manage deployed"
+                                        : lifecycleStatus === "rollback_suggested"
+                                          ? "Review rollback"
+                                        : "Open test"}
+                                    </Button>
+                                  ) : null}
                                 </Stack>
                               </Stack>
                             </AccordionDetails>
@@ -3831,16 +3941,209 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                               maxWidth="md"
                               fullWidth
                             >
-                              <DialogTitle>Technical details</DialogTitle>
+                              <DialogTitle>{str(row.title, "Evolve change")}</DialogTitle>
                               <DialogContent>
                                 <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
                                 <Stack spacing={1.25} sx={{ mt: 2 }}>
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                      gap: 1,
+                                    }}
+                                  >
+                                    <Box
+                                      sx={{
+                                        p: 1,
+                                        border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                        borderRadius: 1,
+                                      }}
+                                    >
+                                      <Typography
+                                        variant="caption"
+                                        sx={{ color: "text.secondary", display: "block" }}
+                                      >
+                                        Lifecycle
+                                      </Typography>
+                                      <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                                        {lifecycleLabel}
+                                      </Typography>
+                                      <Typography
+                                        variant="caption"
+                                        sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+                                      >
+                                        {lifecycleReason || "No blocker recorded."}
+                                      </Typography>
+                                    </Box>
+                                    <Box
+                                      sx={{
+                                        p: 1,
+                                        border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                        borderRadius: 1,
+                                      }}
+                                    >
+                                      <Typography
+                                        variant="caption"
+                                        sx={{ color: "text.secondary", display: "block" }}
+                                      >
+                                        Evidence samples
+                                      </Typography>
+                                      <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                                        {promptProposalSampleLabel(lifecycle)}
+                                      </Typography>
+                                      <Typography
+                                        variant="caption"
+                                        sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+                                      >
+                                        Job: {str(lifecycle.job_status, "not queued")}
+                                      </Typography>
+                                    </Box>
+                                  </Box>
+                                  {monitoringRegressions.length > 0 ? (
+                                    <Alert
+                                      severity={rollbackRecommended ? "error" : "warning"}
+                                      sx={{ borderRadius: 1 }}
+                                    >
+                                      <Stack spacing={0.4}>
+                                        {monitoringRegressions.map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${proposalId}-monitoring-regression-${lineIdx}`}
+                                            variant="body2"
+                                          >
+                                            {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    </Alert>
+                                  ) : null}
+                                  {monitoringSummary.length > 0 ? (
+                                    <Alert severity="info" sx={{ borderRadius: 1 }}>
+                                      <Stack spacing={0.4}>
+                                        {monitoringSummary.map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${proposalId}-monitoring-summary-${lineIdx}`}
+                                            variant="body2"
+                                          >
+                                            {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    </Alert>
+                                  ) : null}
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: {
+                                        xs: "1fr 1fr",
+                                        md: "repeat(4, minmax(0, 1fr))",
+                                      },
+                                      gap: 0.75,
+                                    }}
+                                  >
+                                    {[
+                                      {
+                                        label: "Baseline success",
+                                        value: formatPercentRatio(
+                                          finiteNumber(lifecycle.baseline_success_rate),
+                                        ),
+                                        helper: `${num(lifecycle.baseline_samples, 0).toLocaleString()} samples`,
+                                      },
+                                      {
+                                        label: "Candidate success",
+                                        value: formatPercentRatio(
+                                          finiteNumber(lifecycle.candidate_success_rate),
+                                        ),
+                                        helper: `${num(lifecycle.candidate_samples, 0).toLocaleString()} samples`,
+                                      },
+                                      {
+                                        label: "Tool success",
+                                        value: formatPercentRatio(
+                                          finiteNumber(lifecycle.candidate_tool_success_rate),
+                                        ),
+                                        helper: `Stable ${formatPercentRatio(finiteNumber(lifecycle.baseline_tool_success_rate))}`,
+                                      },
+                                      {
+                                        label: "p95 latency",
+                                        value: finiteNumber(lifecycle.candidate_p95_latency_ms) == null
+                                          ? "-"
+                                          : `${Math.round(num(lifecycle.candidate_p95_latency_ms, 0)).toLocaleString()} ms`,
+                                        helper: finiteNumber(lifecycle.baseline_p95_latency_ms) == null
+                                          ? "Stable -"
+                                          : `Stable ${Math.round(num(lifecycle.baseline_p95_latency_ms, 0)).toLocaleString()} ms`,
+                                      },
+                                    ].map((metric) => (
+                                      <Box
+                                        key={`${proposalId}-monitoring-${metric.label}`}
+                                        sx={{
+                                          minWidth: 0,
+                                          p: 1,
+                                          border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                          borderRadius: 1,
+                                          bgcolor: "rgba(8, 14, 24, 0.38)",
+                                        }}
+                                      >
+                                        <Typography
+                                          variant="caption"
+                                          sx={{
+                                            color: "text.secondary",
+                                            display: "block",
+                                            lineHeight: 1.35,
+                                          }}
+                                        >
+                                          {metric.label}
+                                        </Typography>
+                                        <Typography
+                                          variant="body2"
+                                          sx={{
+                                            color: "#e8f4ff",
+                                            fontWeight: 700,
+                                            mt: 0.2,
+                                            wordBreak: "break-word",
+                                          }}
+                                        >
+                                          {metric.value}
+                                        </Typography>
+                                        <Typography
+                                          variant="caption"
+                                          sx={{
+                                            color: "text.secondary",
+                                            display: "block",
+                                            mt: 0.25,
+                                            lineHeight: 1.4,
+                                          }}
+                                        >
+                                          {metric.helper}
+                                        </Typography>
+                                      </Box>
+                                    ))}
+                                  </Box>
+                                  <ReactECharts
+                                    option={lifecycleChartOption}
+                                    style={{ height: 180, width: "100%" }}
+                                  />
                                   <Typography
                                     variant="body2"
                                     sx={{ color: "text.secondary" }}
                                   >
-                                    Target area: {promptProposalScopeLabel(str(row.target_scope, "prompt_profile"))}
+                                    Target area: {targetScope}
                                   </Typography>
+                                  {str(lifecycle.baseline_version, "") ||
+                                  str(lifecycle.candidate_version, "") ? (
+                                    <Box
+                                      sx={{
+                                        display: "grid",
+                                        gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                        gap: 1,
+                                      }}
+                                    >
+                                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                        Stable: {str(lifecycle.baseline_version, "-")}
+                                      </Typography>
+                                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                        Candidate: {str(lifecycle.candidate_version, "-")}
+                                      </Typography>
+                                    </Box>
+                                  ) : null}
                                   {evidence.length > 0 ? (
                                     <Box>
                                       <Typography
@@ -3909,6 +4212,70 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                 </Stack>
                               </DialogContent>
                               <DialogActions>
+                                {canManagePromptCanary &&
+                                (lifecycleStatus === "testing" ||
+                                  lifecycleStatus === "test_regression") ? (
+                                  <Button
+                                    color="inherit"
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "disable_prompt_canary",
+                                          candidate_id: "prompt",
+                                          proposal_id: proposalId,
+                                        },
+                                        "Live test stopped.",
+                                        "Stop this live prompt test now?",
+                                      )
+                                    }
+                                  >
+                                    Stop test
+                                  </Button>
+                                ) : null}
+                                {canManagePromptCanary &&
+                                lifecycleStatus === "testing" ? (
+                                  <Button
+                                    variant="contained"
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "promote_prompt_canary_candidate",
+                                          candidate_id: "prompt",
+                                          proposal_id: proposalId,
+                                        },
+                                        "Accepted as stable. Monitoring continues on this row.",
+                                        "Deploy this prompt candidate to AgentArk?",
+                                      )
+                                    }
+                                  >
+                                    Deploy to AgentArk
+                                  </Button>
+                                ) : null}
+                                {canManagePromptCanary &&
+                                (lifecycleStatus === "deployed" ||
+                                  lifecycleStatus === "rollback_suggested") &&
+                                toBool(lifecycle.rollback_available) ? (
+                                  <Button
+                                    color="error"
+                                    variant={rollbackRecommended ? "contained" : "outlined"}
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "rollback_prompt_baseline",
+                                          candidate_id: "prompt",
+                                          proposal_id: proposalId,
+                                        },
+                                        "Rolled back and recorded as a bad optimization outcome.",
+                                        "Roll back this deployed prompt change?",
+                                      )
+                                    }
+                                  >
+                                    Roll back
+                                  </Button>
+                                ) : null}
                                 <Button
                                   onClick={() =>
                                     setTechnicalDialogProposalId(null)
@@ -4061,7 +4428,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                 <Typography variant="body1">
                                   {str(
                                     row.diff_summary,
-                                    str(row.summary, "Reviewable skill change"),
+                                    str(row.summary, "Reviewable capability change"),
                                   )}
                                 </Typography>
                                 <Typography
@@ -4266,7 +4633,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                             key={`${candidateId}-added-${lineIdx}`}
                                             variant="body2"
                                             sx={{
-                                              color: "#d8edff",
+                                              color: "#fff8ed",
                                               display: "block",
                                             }}
                                           >
@@ -4678,7 +5045,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               </Stack>
               <Typography variant="body2">
                 {readinessSummary(readinessDialog.readiness) ||
-                  "ArkEvolve is still collecting enough evidence."}
+                  "Evolve is still collecting enough evidence."}
               </Typography>
               {stringList(readinessDialog.readiness.blockers).length > 0 ? (
                 <Alert severity="warning" sx={{ borderRadius: 1 }}>

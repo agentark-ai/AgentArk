@@ -3,7 +3,7 @@
 //! Shells out to the `lightpanda` CLI binary for fast markdown extraction.
 //! Falls back gracefully when the binary is not installed.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

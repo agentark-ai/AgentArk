@@ -812,6 +812,150 @@ pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> Str
     }};
   }}
 
+  const nativeAlert = window.alert ? window.alert.bind(window) : null;
+  const alertQueue = [];
+  let activeAlert = null;
+  const dismissActiveAlert = () => {{
+    if (!activeAlert) return;
+    const current = activeAlert;
+    activeAlert = null;
+    try {{
+      if (current.onKeyDown) {{
+        document.removeEventListener("keydown", current.onKeyDown, true);
+      }}
+    }} catch (_) {{}}
+    try {{
+      current.root.remove();
+    }} catch (_) {{}}
+    try {{
+      if (current.previousFocus && typeof current.previousFocus.focus === "function") {{
+        current.previousFocus.focus();
+      }}
+    }} catch (_) {{}}
+    if (alertQueue.length) {{
+      const nextMessage = alertQueue.shift();
+      window.setTimeout(() => showAgentArkAlert(nextMessage), 0);
+    }}
+  }};
+  const showAgentArkAlert = (message) => {{
+    if (!document || !document.createElement) {{
+      if (nativeAlert) nativeAlert(message);
+      return;
+    }}
+    if (activeAlert) {{
+      alertQueue.push(message);
+      return;
+    }}
+    const root = document.createElement("div");
+    root.setAttribute("role", "presentation");
+    root.style.cssText = [
+      "position:fixed",
+      "inset:0",
+      "z-index:2147483647",
+      "display:flex",
+      "align-items:center",
+      "justify-content:center",
+      "padding:24px",
+      "background:rgba(0,0,0,.58)"
+    ].join(";");
+
+    const panel = document.createElement("div");
+    panel.setAttribute("role", "alertdialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-labelledby", "__agentarkAlertTitle");
+    panel.setAttribute("aria-describedby", "__agentarkAlertMessage");
+    panel.style.cssText = [
+      "width:min(420px,calc(100vw - 48px))",
+      "max-height:calc(100vh - 48px)",
+      "overflow:auto",
+      "box-sizing:border-box",
+      "border:1px solid rgba(0,255,170,.20)",
+      "border-radius:8px",
+      "background:#111611",
+      "color:#eef6ef",
+      "box-shadow:0 22px 70px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.05)",
+      "font:14px/1.5 Inter,Segoe UI,system-ui,sans-serif",
+      "padding:20px"
+    ].join(";");
+
+    const title = document.createElement("div");
+    title.id = "__agentarkAlertTitle";
+    title.textContent = "AgentArk";
+    title.style.cssText = [
+      "margin:0 0 12px",
+      "color:#f5fff8",
+      "font:700 15px/1.3 JetBrains Mono,Consolas,monospace"
+    ].join(";");
+
+    const body = document.createElement("div");
+    body.id = "__agentarkAlertMessage";
+    body.textContent = String(message ?? "");
+    body.style.cssText = [
+      "white-space:pre-wrap",
+      "overflow-wrap:anywhere",
+      "color:rgba(238,246,239,.86)",
+      "margin:0 0 18px"
+    ].join(";");
+
+    const actions = document.createElement("div");
+    actions.style.cssText = "display:flex;justify-content:flex-end";
+    const ok = document.createElement("button");
+    ok.type = "button";
+    ok.textContent = "OK";
+    ok.style.cssText = [
+      "min-width:72px",
+      "min-height:36px",
+      "border:1px solid rgba(0,255,170,.24)",
+      "border-radius:8px",
+      "background:#16d6d8",
+      "color:#031112",
+      "font:700 13px/1 Inter,Segoe UI,system-ui,sans-serif",
+      "cursor:pointer",
+      "padding:0 16px"
+    ].join(";");
+    actions.appendChild(ok);
+    panel.appendChild(title);
+    panel.appendChild(body);
+    panel.appendChild(actions);
+    root.appendChild(panel);
+
+    const previousFocus = document.activeElement;
+    const onKeyDown = (event) => {{
+      if (!activeAlert || activeAlert.root !== root) {{
+        document.removeEventListener("keydown", onKeyDown, true);
+        return;
+      }}
+      if (event.key === "Escape" || event.key === "Enter") {{
+        event.preventDefault();
+        dismissActiveAlert();
+        document.removeEventListener("keydown", onKeyDown, true);
+      }}
+    }};
+    activeAlert = {{ root, previousFocus, onKeyDown }};
+    ok.addEventListener("click", dismissActiveAlert);
+    root.addEventListener("click", (event) => {{
+      if (event.target === root) dismissActiveAlert();
+    }});
+    document.addEventListener("keydown", onKeyDown, true);
+    const mount = document.body || document.documentElement;
+    if (!mount) {{
+      activeAlert = null;
+      if (nativeAlert) nativeAlert(message);
+      return;
+    }}
+    mount.appendChild(root);
+    try {{
+      ok.focus({{ preventScroll: true }});
+    }} catch (_) {{
+      ok.focus();
+    }}
+  }};
+  if (nativeAlert) {{
+    window.alert = function(message) {{
+      showAgentArkAlert(message);
+    }};
+  }}
+
   const nativePrompt = window.prompt ? window.prompt.bind(window) : null;
   if (nativePrompt) {{
     window.prompt = function(message, defaultValue) {{
@@ -951,8 +1095,7 @@ pub(super) fn app_runtime_action_is_bridge_safe(action: &crate::actions::ActionD
     let metadata = action.action_metadata();
     matches!(
         metadata.role,
-        crate::actions::ActionRole::DataSource
-            | crate::actions::ActionRole::Inspection
+        crate::actions::ActionRole::DataSource | crate::actions::ActionRole::Inspection
     ) && matches!(
         metadata.side_effect_level,
         crate::actions::ActionSideEffectLevel::None
@@ -2535,13 +2678,8 @@ pub(super) async fn public_proxy_raw(
 
 pub(super) fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
     query.and_then(|q| {
-        url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| {
-            if k == key {
-                Some(v.into_owned())
-            } else {
-                None
-            }
-        })
+        url::form_urlencoded::parse(q.as_bytes())
+            .find_map(|(k, v)| if k == key { Some(v.into_owned()) } else { None })
     })
 }
 
@@ -3214,7 +3352,12 @@ pub(super) async fn serve_app_file_inner(
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
         return app_scoped_runtime_action_proxy(
-            state, app_id, &app_dir, action_name, &headers, body,
+            state,
+            app_id,
+            &app_dir,
+            action_name,
+            &headers,
+            body,
         )
         .await;
     }
@@ -3870,8 +4013,10 @@ mod tests {
         assert!(rewritten.contains(r#"href="/apps/demo-app/""#));
         assert!(rewritten.contains(r#"src="/apps/demo-app/app.js""#));
         assert!(rewritten.contains(r#"action="/apps/demo-app/api/save""#));
-        assert!(rewritten
-            .contains(r#"srcset="/apps/demo-app/small.png 1x, /apps/demo-app/large.png 2x""#));
+        assert!(
+            rewritten
+                .contains(r#"srcset="/apps/demo-app/small.png 1x, /apps/demo-app/large.png 2x""#)
+        );
         assert!(rewritten.contains(r#"href="/apps/other/style.css""#));
     }
 
@@ -3906,6 +4051,19 @@ mod tests {
         assert!(rewritten.contains("APP_BASE_PATH"));
         assert!(rewritten.contains("rebaseSameOriginAppUrl"));
         assert!(rewritten.contains("fetch('/api/papers')"));
+    }
+
+    #[test]
+    fn html_transform_injects_agentark_alert_modal_shim() {
+        let rewritten = inject_app_runtime_fetch_shims(
+            "<!DOCTYPE html><html><head></head><body></body></html>",
+            "demo-app",
+        );
+
+        assert!(rewritten.contains("window.alert = function"));
+        assert!(rewritten.contains("showAgentArkAlert"));
+        assert!(rewritten.contains(r#"title.textContent = "AgentArk""#));
+        assert!(rewritten.contains(r#"panel.setAttribute("role", "alertdialog")"#));
     }
 
     #[test]
@@ -4821,7 +4979,7 @@ pub(super) async fn delete_app(
     }
 
     // Step 4: prune in-memory/persisted registry rows, free the reserved port,
-    // delete app-scoped notifications and ArkPulse events. `purge_deleted_app_state`
+    // delete app-scoped notifications and Pulse events. `purge_deleted_app_state`
     // (invoked inside `cleanup_deleted_app_references`) handles port release and
     // access-token cleanup; failures inside it are already logged as warnings.
     tracing::info!(

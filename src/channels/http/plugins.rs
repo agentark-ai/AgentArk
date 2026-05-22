@@ -143,8 +143,8 @@ pub(super) async fn list_plugin_logs(
 mod tests {
     use super::*;
     use crate::core::Agent;
-    use axum::body::{to_bytes, Body};
-    use axum::http::{header, HeaderMap, Request};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{HeaderMap, Request, header};
     use axum::routing::{get, post};
     use serde_json::Value;
     use std::collections::HashMap;
@@ -340,8 +340,10 @@ mod tests {
         (format!("http://{}", addr), state, handle)
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn plugin_sdk_routes_work_end_to_end() {
         let (state, config_dir, data_dir) = build_test_state().await;
@@ -487,18 +489,22 @@ mod tests {
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
-        assert!(logs
-            .iter()
-            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("manifest")));
-        assert!(logs
-            .iter()
-            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("action")));
-        assert!(logs
-            .iter()
-            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("event")));
-        assert!(logs
-            .iter()
-            .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("ping")));
+        assert!(
+            logs.iter()
+                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("manifest"))
+        );
+        assert!(
+            logs.iter()
+                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("action"))
+        );
+        assert!(
+            logs.iter()
+                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("event"))
+        );
+        assert!(
+            logs.iter()
+                .any(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("ping"))
+        );
 
         let action_payloads = mock_plugin.action_payloads.lock().await.clone();
         assert_eq!(action_payloads.len(), 1);
@@ -548,8 +554,10 @@ mod tests {
         server_handle.abort();
     }
 
-
-    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
     #[tokio::test]
     async fn plugin_sdk_missing_plugin_routes_return_not_found() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
