@@ -40,7 +40,6 @@ import {
 import Grid2 from "@mui/material/Grid";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ArrowDropDownRoundedIcon from "@mui/icons-material/ArrowDropDownRounded";
-import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import AttachFileRoundedIcon from "@mui/icons-material/AttachFileRounded";
 import TravelExploreRoundedIcon from "@mui/icons-material/TravelExploreRounded";
 import AutorenewRoundedIcon from "@mui/icons-material/AutorenewRounded";
@@ -86,7 +85,12 @@ import {
 } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, apiUrl } from "../../api/client";
+import {
+  api,
+  apiOutputPathFromHref,
+  apiUrl,
+  downloadApiFile,
+} from "../../api/client";
 import AgentLogo from "../../assets/logo.svg";
 import { MetricBarCard } from "../analytics/MetricBarCard";
 import { CompanionDevicesPanel } from "../CompanionDevicesPanel";
@@ -132,6 +136,11 @@ import {
   TASK_CANCEL_CONTROLS_ENABLED,
   TASK_RETRY_CONTROLS_ENABLED,
 } from "../../lib/featureFlags";
+import {
+  buildRunPayloadViewFromSources,
+  type RunPayloadItem,
+  type RunPayloadView,
+} from "../chat/runPayloadView";
 import type {
   PulseRemediationSpec,
   PulseRunFixRequest,
@@ -143,7 +152,7 @@ import type {
 } from "../../types";
 import { ComputerPane } from "../chat";
 import type { SurfaceDescriptor } from "../chat/types";
-import { surfaceFromValue } from "../chat/surface";
+import { surfaceFromCard, surfaceFromValue } from "../chat/surface";
 import { readablePayloadFromValue } from "../chat/readablePayload";
 import {
   InlineAgentArkChart,
@@ -177,6 +186,9 @@ const CHAT_PENDING_RUN_TTL_MS = 45 * 60 * 1000;
 const CHAT_WORKING_CHATS_MAX = 3;
 const CHAT_BACKGROUND_RUN_SNAPSHOTS_MAX = 12;
 const CHAT_WORKSPACE_SNAPSHOT_TTL_MS = 12 * 60 * 60 * 1000;
+const CHAT_EARLY_ACCESS_NOTICE_STORAGE_KEY =
+  "agentark.chat.earlyAccessNoticeDismissedUntil";
+const CHAT_EARLY_ACCESS_NOTICE_DISMISS_MS = 7 * 24 * 60 * 60 * 1000;
 const CHAT_WORKSPACE_SNAPSHOT_MAX_CONVERSATIONS = 10;
 const CHAT_WORKSPACE_SNAPSHOT_MAX_FILES = 24;
 const CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS = 60_000;
@@ -283,6 +295,35 @@ function writeChatDraftMode(active: boolean): void {
     }
   } catch {
     // Ignore storage failures.
+  }
+}
+
+function readEarlyAccessNoticeDismissed(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const raw = window.localStorage.getItem(
+      CHAT_EARLY_ACCESS_NOTICE_STORAGE_KEY,
+    );
+    const dismissedUntil = raw ? Number(raw) : 0;
+    if (Number.isFinite(dismissedUntil) && dismissedUntil > Date.now()) {
+      return true;
+    }
+    window.localStorage.removeItem(CHAT_EARLY_ACCESS_NOTICE_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures and show the notice.
+  }
+  return false;
+}
+
+function dismissEarlyAccessNoticeForSevenDays(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      CHAT_EARLY_ACCESS_NOTICE_STORAGE_KEY,
+      String(Date.now() + CHAT_EARLY_ACCESS_NOTICE_DISMISS_MS),
+    );
+  } catch {
+    // Ignore storage failures; the current render still dismisses locally.
   }
 }
 
@@ -2955,20 +2996,9 @@ function tunnelCheckLabel(status: unknown): string {
   return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
-type ActivityPayloadView = {
-  kind: "json" | "text";
-  badgeLabel: string;
-  headerLabel: string;
-  preview: string;
-  body: string;
-  lineCount: number;
-  items?: ActivityPayloadItem[];
-};
+type ActivityPayloadView = RunPayloadView;
 
-type ActivityPayloadItem = {
-  label: string;
-  value: string;
-};
+type ActivityPayloadItem = RunPayloadItem;
 
 type ActivityTimelineCard = {
   id: string;
@@ -3263,6 +3293,65 @@ function transcriptCommandAuditFromCard(card: ActivityTimelineCard): ChatTranscr
     outputLabel,
     output: cleanedOutput,
   };
+}
+
+function inlineToolActivityTitle(toolName: string, card: ActivityTimelineCard): string {
+  const records = transcriptCardPayloadRecords(card);
+  const surface = surfaceFromCard(card);
+  const structuredTitle = firstTranscriptString(records, [
+    "activity_label",
+    "display_label",
+    "activity_title",
+    "display_title",
+    "label",
+  ]);
+  if (structuredTitle) return structuredTitle;
+
+  const surfaceTitle = str(surface?.title, "").trim();
+  if (surfaceTitle) return surfaceTitle;
+
+  const displayName =
+    str(surface?.tool?.displayName, "").trim() ||
+    firstTranscriptString(records, ["display_name", "displayName"]) ||
+    humanizeToolIdentifier(toolName || "tool");
+  return displayName ? `Using ${displayName}` : "Using tool";
+}
+
+function humanizeToolIdentifier(value: string): string {
+  const cleaned = (value || "")
+    .trim()
+    .split(/[_\-.]+/)
+    .filter((part) => part.trim())
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+  return cleaned || "Tool";
+}
+
+function inlineToolActivityDetail(
+  toolName: string,
+  card: ActivityTimelineCard,
+  fallbackDetail: string,
+): string {
+  void toolName;
+  const records = transcriptCardPayloadRecords(card);
+  const firstValue = (keys: string[]) => firstTranscriptString(records, keys);
+  const structuredDetail = firstValue([
+    "activity_detail",
+    "display_detail",
+    "summary",
+    "preview",
+  ]);
+  if (structuredDetail) return compactTranscriptDetail(structuredDetail);
+
+  const detail = compactTranscriptDetail(fallbackDetail || card.detail || card.summary);
+  if (!detail) return "";
+  return detail;
+}
+
+function transcriptStatusLabel(status: ChatTranscriptActionStatus): string {
+  if (status === "done") return "success";
+  if (status === "issue") return "issue";
+  return "running";
 }
 
 const ACTIVITY_PAYLOAD_PREVIEW_PRIORITY = [
@@ -3680,6 +3769,7 @@ function buildActivityPayloadView(value: unknown): ActivityPayloadView | null {
       preview: summarizeActivityPayloadPreview(trimmed),
       body: trimmed,
       lineCount: trimmed.split(/\r?\n/).length,
+      items: [],
     };
   }
 
@@ -3723,11 +3813,7 @@ function buildActivityPayloadView(value: unknown): ActivityPayloadView | null {
 function buildActivityPayloadViewFromSources(
   ...values: unknown[]
 ): ActivityPayloadView | null {
-  for (const value of values) {
-    const payloadView = buildActivityPayloadView(value);
-    if (payloadView) return payloadView;
-  }
-  return null;
+  return buildRunPayloadViewFromSources(...values);
 }
 
 function compactUnknown(value: unknown, maxLen = 2200): string {
@@ -4260,7 +4346,7 @@ function agentLoopProgressActionNamesFromStep(step: JsonRecord): string[] {
   const add = (value: unknown) => {
     const normalized = str(value, "")
       .trim()
-      .replace(/[.。]+$/g, "")
+      .replace(/[.ã€‚]+$/g, "")
       .replace(/^["'`]+|["'`]+$/g, "");
     if (!normalized || out.includes(normalized)) return;
     out.push(normalized);
@@ -4724,40 +4810,39 @@ function ActivityPayloadDisclosure({
               />
             }
           >
-            {expanded ? "Hide details" : "Show details"}
+            {expanded ? "Hide raw payload" : "Raw payload"}
           </Button>
         </Stack>
       </Stack>
+      {payload.items.length > 0 ? (
+        <Box className="activity-payload-fields activity-payload-readable-fields">
+          {payload.items.map((item, index) => (
+            <Box
+              key={`${controlsId}-field-${index}`}
+              className="activity-payload-field"
+            >
+              <span className="activity-payload-field-label">
+                {item.label}
+              </span>
+              <span className="activity-payload-field-value">
+                {item.value}
+              </span>
+            </Box>
+          ))}
+        </Box>
+      ) : payload.preview ? (
+        <Typography variant="body2" className="activity-detail-copy activity-payload-readable-copy">
+          {payload.preview}
+        </Typography>
+      ) : null}
       <Collapse in={expanded} mountOnEnter unmountOnExit>
-        <Box id={controlsId} className="activity-payload-body">
+        <Box id={controlsId} className="activity-payload-body activity-payload-raw-body">
           <Typography variant="caption" className="activity-payload-body-label">
-            {payload.headerLabel}
+            {payload.kind === "json" ? "Raw JSON payload" : "Raw text payload"}
           </Typography>
-          {payload.items?.length ? (
-            <Box className="activity-payload-fields">
-              {payload.items.map((item, index) => (
-                <Box
-                  key={`${controlsId}-field-${index}`}
-                  className="activity-payload-field"
-                >
-                  <span className="activity-payload-field-label">
-                    {item.label}
-                  </span>
-                  <span className="activity-payload-field-value">
-                    {item.value}
-                  </span>
-                </Box>
-              ))}
-            </Box>
-          ) : payload.kind === "json" ? (
-            <Typography variant="body2" className="activity-detail-copy">
-              {payload.preview || "Structured details captured."}
-            </Typography>
-          ) : (
-            <Box component="pre" className="activity-payload-pre">
-              {payload.body}
-            </Box>
-          )}
+          <Box component="pre" className="activity-payload-pre">
+            {payload.body}
+          </Box>
         </Box>
       </Collapse>
     </Box>
@@ -5932,7 +6017,9 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
 
     if (kind === "tool_start") {
       const name = str(payload.name, "");
-      const inner = asRecord(payload.payload);
+      const nestedPayload = asRecord(payload.payload);
+      const inner =
+        Object.keys(nestedPayload).length > 0 ? nestedPayload : payload;
       const intentText = toolStartIntentText(inner);
       steps.push({
         step_type: "tool_start",
@@ -7285,6 +7372,22 @@ function looksLikeUrl(value: string): boolean {
   return v.startsWith("http://") || v.startsWith("https://");
 }
 
+function localAgentArkHref(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (parsed.hostname !== "app.agentark.ai") return null;
+    if (
+      parsed.pathname.startsWith("/apps/") ||
+      parsed.pathname.startsWith("/api/outputs/")
+    ) {
+      return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function normalizeOutboundHref(value?: string): string | null {
   const trimmed = (value || "").trim();
   if (!trimmed) return null;
@@ -7296,11 +7399,16 @@ function normalizeOutboundHref(value?: string): string | null {
   ) {
     return null;
   }
+  const localHref = localAgentArkHref(trimmed);
+  if (localHref) return localHref;
   if (
     trimmed === "/apps" ||
     trimmed.startsWith("/apps/") ||
     trimmed === "/ui/documents" ||
-    trimmed.startsWith("/ui/documents?")
+    trimmed.startsWith("/ui/documents?") ||
+    (trimmed.startsWith("/api/outputs/") &&
+      !trimmed.includes("..") &&
+      !trimmed.includes("\\"))
   ) {
     return trimmed;
   }
@@ -7601,14 +7709,19 @@ function splitUrlTrailingPunctuation(
 }
 
 function handleChatLinkClick(event: React.MouseEvent<HTMLElement>): void {
-  // Keep the click from bubbling to any parent bubble/list-row handler, but
-  // let the native anchor (`target="_blank"` with `rel="noopener noreferrer"`)
-  // handle the actual navigation. An earlier implementation called
-  // preventDefault + window.open here, which broke clicks in contexts where
-  // window.open was blocked (PWA shells, strict popup policies, some feature
-  // string parsing quirks) - the native fallback was suppressed and nothing
-  // happened on click.
   event.stopPropagation();
+  const anchor = event.currentTarget as HTMLAnchorElement;
+  const outputPath = apiOutputPathFromHref(
+    anchor.getAttribute("href") || anchor.href,
+  );
+  if (!outputPath) return;
+  event.preventDefault();
+  void downloadApiFile(outputPath).catch((error) => {
+    console.error("Failed to download AgentArk output", error);
+    const message =
+      error instanceof Error ? error.message : "Could not download this file.";
+    window.alert(`Download failed: ${message}`);
+  });
 }
 
 function MarkdownBody({
@@ -8368,7 +8481,7 @@ function convertAgentArkChartFencesForExport(content: string): string {
 
 function cleanResearchReportMarkdownForExport(
   report: ResearchReportPreview,
-  options: { preserveChartFences?: boolean } = {},
+  options: { preserveChartFences?: boolean; includeEvidenceBrief?: boolean } = {},
 ): string {
   let body = (report.mainContent || report.content || "").trim();
   body = body.replace(
@@ -8382,7 +8495,13 @@ function cleanResearchReportMarkdownForExport(
   if (!options.preserveChartFences) {
     body = convertAgentArkChartFencesForExport(body);
   }
-  const sources = extractMarkdownSection(report.evidenceBrief, "Sources");
+  const evidenceBrief = (report.evidenceBrief || "").trim();
+  if (options.includeEvidenceBrief && evidenceBrief) {
+    body = `${body.trim()}\n\n---\n\n${evidenceBrief}`;
+  }
+  const sources = options.includeEvidenceBrief
+    ? ""
+    : extractMarkdownSection(report.evidenceBrief, "Sources");
   if (sources && !/^##\s+Sources\b/im.test(body)) {
     body = `${body.trim()}\n\n## Sources\n\n${sources.trim()}`;
   }
@@ -8514,6 +8633,84 @@ function reportChartValueLabel(value: number): string {
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
+function reportChartStableId(value: string): string {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash).toString(36) || "0";
+}
+
+function reportChartBarSvg({
+  label,
+  value,
+  percent,
+  gradientId,
+}: {
+  label: string;
+  value: number;
+  percent: number;
+  gradientId: string;
+}): string {
+  const safeLabel = escapeDocumentHtml(label);
+  const safeValue = escapeDocumentHtml(reportChartValueLabel(value));
+  const chartWidth = 300;
+  const chartHeight = 16;
+  const fillWidth =
+    (Math.min(100, Math.max(0, percent)) / 100) * chartWidth;
+  return `<div class="report-chart-row"><span>${safeLabel}</span><svg class="report-chart-bar" viewBox="0 0 ${chartWidth} ${chartHeight}" preserveAspectRatio="none" role="img" aria-label="${safeLabel}: ${safeValue}"><defs><linearGradient id="${gradientId}" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#78f2b0"/><stop offset="100%" stop-color="#d8ad78"/></linearGradient></defs><rect x="0" y="1" width="${chartWidth}" height="14" rx="7" fill="#e5edf3"/><rect x="0" y="1" width="${Math.max(2, fillWidth).toFixed(1)}" height="14" rx="7" fill="url(#${gradientId})"/></svg><em>${safeValue}</em></div>`;
+}
+
+function reportChartPolarPoint(
+  cx: number,
+  cy: number,
+  radius: number,
+  angleDegrees: number,
+): { x: number; y: number } {
+  const angleRadians = ((angleDegrees - 90) * Math.PI) / 180;
+  return {
+    x: cx + radius * Math.cos(angleRadians),
+    y: cy + radius * Math.sin(angleRadians),
+  };
+}
+
+function reportChartPieSlicePath({
+  cx,
+  cy,
+  outerRadius,
+  innerRadius,
+  startAngle,
+  endAngle,
+}: {
+  cx: number;
+  cy: number;
+  outerRadius: number;
+  innerRadius: number;
+  startAngle: number;
+  endAngle: number;
+}): string {
+  const startOuter = reportChartPolarPoint(cx, cy, outerRadius, endAngle);
+  const endOuter = reportChartPolarPoint(cx, cy, outerRadius, startAngle);
+  const largeArcFlag = endAngle - startAngle <= 180 ? "0" : "1";
+  if (innerRadius <= 0) {
+    return [
+      `M ${cx} ${cy}`,
+      `L ${startOuter.x.toFixed(1)} ${startOuter.y.toFixed(1)}`,
+      `A ${outerRadius} ${outerRadius} 0 ${largeArcFlag} 0 ${endOuter.x.toFixed(1)} ${endOuter.y.toFixed(1)}`,
+      "Z",
+    ].join(" ");
+  }
+  const startInner = reportChartPolarPoint(cx, cy, innerRadius, endAngle);
+  const endInner = reportChartPolarPoint(cx, cy, innerRadius, startAngle);
+  return [
+    `M ${startOuter.x.toFixed(1)} ${startOuter.y.toFixed(1)}`,
+    `A ${outerRadius} ${outerRadius} 0 ${largeArcFlag} 0 ${endOuter.x.toFixed(1)} ${endOuter.y.toFixed(1)}`,
+    `L ${endInner.x.toFixed(1)} ${endInner.y.toFixed(1)}`,
+    `A ${innerRadius} ${innerRadius} 0 ${largeArcFlag} 1 ${startInner.x.toFixed(1)} ${startInner.y.toFixed(1)}`,
+    "Z",
+  ].join(" ");
+}
+
 function agentArkChartToReportHtml(rawJson: string): string {
   try {
     const spec = asRecord(JSON.parse(rawJson));
@@ -8535,6 +8732,7 @@ function agentArkChartToReportHtml(rawJson: string): string {
     const safeSubtitle = subtitle
       ? `<div class="report-chart-subtitle">${escapeDocumentHtml(subtitle)}</div>`
       : "";
+    const chartId = reportChartStableId(rawJson);
 
     if (kind === "line" || kind === "area" || kind === "scatter") {
       const width = 760;
@@ -8580,7 +8778,7 @@ function agentArkChartToReportHtml(rawJson: string): string {
       const legend = seriesKeys
         .map(
           (key, index) =>
-            `<span><i style="background:${reportChartColor(index)}"></i>${escapeDocumentHtml(key)}</span>`,
+            `<span><svg viewBox="0 0 10 10" aria-hidden="true"><circle cx="5" cy="5" r="5" fill="${reportChartColor(index)}"/></svg>${escapeDocumentHtml(key)}</span>`,
         )
         .join("");
       const labelStep = Math.max(1, Math.ceil(rows.length / 6));
@@ -8593,6 +8791,49 @@ function agentArkChartToReportHtml(rawJson: string): string {
       return `<figure class="report-chart"><figcaption>${safeTitle}${safeSubtitle}</figcaption><div class="report-chart-legend">${legend}</div><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${safeTitle}"><rect x="0" y="0" width="${width}" height="${height}" rx="12" fill="#f8fbfd"/><line x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}" stroke="#b6c4cf"/><line x1="${left}" y1="${top}" x2="${left}" y2="${top + plotHeight}" stroke="#b6c4cf"/><text x="${left - 8}" y="${top + 6}" text-anchor="end">${escapeDocumentHtml(reportChartValueLabel(max))}</text><text x="${left - 8}" y="${top + plotHeight}" text-anchor="end">${escapeDocumentHtml(reportChartValueLabel(min))}</text>${seriesSvg}${labels}</svg></figure>`;
     }
 
+    if (kind === "pie" || kind === "doughnut") {
+      const valueKey = seriesKeys[0] || "";
+      if (!valueKey) return "";
+      const slices = rows
+        .map((row, index) => ({
+          label: reportChartText(row[categoryKey], String(index + 1)),
+          value: Math.max(0, reportChartNumber(row[valueKey]) ?? 0),
+          color: reportChartColor(index),
+        }))
+        .filter((slice) => slice.value > 0)
+        .slice(0, 12);
+      const total = slices.reduce((sum, slice) => sum + slice.value, 0);
+      if (total <= 0) return "";
+      const width = 760;
+      const height = 300;
+      const cx = 238;
+      const cy = 154;
+      const outerRadius = 92;
+      const innerRadius = kind === "doughnut" ? 52 : 0;
+      let cursor = 0;
+      const paths = slices
+        .map((slice) => {
+          const startAngle = cursor;
+          const endAngle = cursor + (slice.value / total) * 360;
+          cursor = endAngle;
+          return `<path d="${reportChartPieSlicePath({ cx, cy, outerRadius, innerRadius, startAngle, endAngle })}" fill="${slice.color}" stroke="#ffffff" stroke-width="2"/>`;
+        })
+        .join("");
+      const centerLabel =
+        kind === "doughnut"
+          ? `<text x="${cx}" y="${cy - 4}" text-anchor="middle" font-size="22" font-weight="700" fill="#214636">${escapeDocumentHtml(reportChartValueLabel(total))}</text><text x="${cx}" y="${cy + 18}" text-anchor="middle" font-size="11" fill="#456273">total</text>`
+          : "";
+      const legendRows = slices
+        .map((slice, index) => {
+          const y = 66 + index * 18;
+          const label = escapeDocumentHtml(slice.label.replace(/\s+/g, " ").slice(0, 30));
+          const value = escapeDocumentHtml(reportChartValueLabel(slice.value));
+          return `<g transform="translate(456 ${y})"><rect x="0" y="-9" width="11" height="11" rx="3" fill="${slice.color}"/><text x="18" y="0">${label}</text><text x="260" y="0" text-anchor="end">${value}</text></g>`;
+        })
+        .join("");
+      return `<figure class="report-chart"><figcaption>${safeTitle}${safeSubtitle}</figcaption><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${safeTitle}"><rect x="0" y="0" width="${width}" height="${height}" rx="12" fill="#f8fbfd"/>${paths}${centerLabel}${legendRows}</svg></figure>`;
+    }
+
     const firstSeries = seriesKeys[0];
     const chartRows = rows
       .map((row, index) => ({
@@ -8602,9 +8843,14 @@ function agentArkChartToReportHtml(rawJson: string): string {
       .filter((row): row is { label: string; value: number } => row.value != null);
     const max = Math.max(...chartRows.map((row) => Math.abs(row.value)), 1);
     const bars = chartRows
-      .map((row) => {
+      .map((row, index) => {
         const width = Math.max(2, Math.abs(row.value / max) * 100);
-        return `<div class="report-chart-row"><span>${escapeDocumentHtml(row.label)}</span><b><i style="width:${width.toFixed(1)}%"></i></b><em>${escapeDocumentHtml(reportChartValueLabel(row.value))}</em></div>`;
+        return reportChartBarSvg({
+          label: row.label,
+          value: row.value,
+          percent: width,
+          gradientId: `report-chart-bar-${chartId}-${index}`,
+        });
       })
       .join("");
     return `<figure class="report-chart"><figcaption>${safeTitle}${safeSubtitle}</figcaption><div class="report-chart-bars">${bars}</div></figure>`;
@@ -8749,15 +8995,15 @@ function reportPrintHtml(title: string, markdown: string): string {
     .report-chart text { fill: #456273; font-family: Aptos, Calibri, Arial, sans-serif; font-size: 10px; }
     .report-chart-legend { display: flex; flex-wrap: wrap; gap: 8pt; margin: 4pt 0 6pt; color: #385064; font-size: 9pt; }
     .report-chart-legend span { display: inline-flex; align-items: center; gap: 4pt; }
-    .report-chart-legend i { display: inline-block; width: 8pt; height: 8pt; border-radius: 999px; }
+    .report-chart-legend svg { width: 8pt; height: 8pt; flex: 0 0 auto; }
     .report-chart-bars { display: grid; gap: 6pt; }
     .report-chart-row { display: grid; grid-template-columns: minmax(88pt, 1fr) minmax(120pt, 2fr) auto; align-items: center; gap: 8pt; font-size: 9pt; }
     .report-chart-row span { color: #2c465a; }
-    .report-chart-row b { display: block; height: 10pt; border-radius: 999px; background: #e5edf3; overflow: hidden; }
-    .report-chart-row i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #78f2b0, #d8ad78); }
+    .report-chart-bar { display: block; width: 100%; height: 12pt; }
     .report-chart-row em { color: #214636; font-style: normal; font-weight: 700; }
     .report-page { box-sizing: border-box; max-width: 184mm; min-height: 260mm; margin: 24px auto; padding: 22mm 18mm; background: #fffefb; box-shadow: 0 16px 54px rgba(21, 31, 44, 0.18); }
     @media print {
+      * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
       html { background: #fff; }
       body { margin: 0; }
       .report-page { max-width: none; min-height: 0; margin: 0; padding: 0; box-shadow: none; }
@@ -9536,6 +9782,8 @@ type ChatStarterCategoryId =
   | "security"
   | "advanced";
 
+type ChatStarterTabId = "all" | Exclude<ChatStarterCategoryId, "advanced">;
+
 type ChatStarterExample = {
   id: string;
   title: string;
@@ -9549,7 +9797,46 @@ type ChatStarterExample = {
 type ChatComposerPrefillRequest = {
   text: string;
   seq: number;
+  browserProfileContext?: JsonRecord | null;
 };
+
+type ChatComposerPrefillPayload = {
+  text: string;
+  browser_profile_context?: JsonRecord | null;
+};
+
+function normalizeChatComposerPrefillPayload(
+  stored: string,
+): ChatComposerPrefillPayload | null {
+  const raw = stored.trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const record = asRecord(parsed);
+    const text = str(record.text, "").trimEnd();
+    if (text) {
+      const context = asRecord(record.browser_profile_context);
+      return {
+        text,
+        browser_profile_context:
+          Object.keys(context).length > 0 ? context : null,
+      };
+    }
+  } catch {
+    // Legacy prefill values were plain strings.
+  }
+
+  const legacyProfile = raw.match(/Use the saved browser login profile "([^"]+)"/);
+  if (legacyProfile?.[1]) {
+    const taskMatch = raw.match(/\nTask:\s*([\s\S]*)$/);
+    const task = taskMatch?.[1]?.trimStart() || "";
+    return {
+      text: `Browser profile: ${legacyProfile[1]}\n\nTask: ${task}`,
+      browser_profile_context: null,
+    };
+  }
+  return { text: stored, browser_profile_context: null };
+}
 
 const CHAT_STARTER_CATEGORY_META: Record<
   ChatStarterCategoryId,
@@ -9606,6 +9893,28 @@ const CHAT_STARTER_CATEGORY_ORDER: ChatStarterCategoryId[] = [
   "browser",
   "security",
 ];
+
+const CHAT_STARTER_TAB_ORDER: ChatStarterTabId[] = [
+  "all",
+  "build",
+  "watch",
+  "background",
+  "research",
+  "swarm",
+  "browser",
+  "security",
+];
+
+const CHAT_STARTER_TAB_LABELS: Record<ChatStarterTabId, string> = {
+  all: "suggested",
+  build: "buildDeploy",
+  watch: "watchersDashboards",
+  background: "backgroundSessions",
+  research: "deepResearch",
+  swarm: "swarm",
+  browser: "browserAutomation",
+  security: "accessPermissions",
+};
 
 const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
   {
@@ -9895,10 +10204,6 @@ const CHAT_STARTER_DEFAULT_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
   (example) => example.defaultVisible,
 );
 
-const CHAT_STARTER_LIBRARY_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
-  (example) => !example.defaultVisible && example.category !== "advanced",
-);
-
 const CHAT_STARTER_ADVANCED_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
   (example) => example.category === "advanced",
 );
@@ -9933,10 +10238,8 @@ const ChatComposerInput = memo(function ChatComposerInput({
   prefillRequest: ChatComposerPrefillRequest | null;
 }) {
   const [draft, setDraft] = useState("");
-  const [optionsAnchor, setOptionsAnchor] = useState<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const lastAppliedPrefillSeqRef = useRef<number | null>(null);
-  const optionsOpen = Boolean(optionsAnchor);
 
   const resizeComposerTextarea = (el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -9984,17 +10287,6 @@ const ChatComposerInput = memo(function ChatComposerInput({
       el.style.height = "auto";
     }
   };
-  const closeComposerOptions = () => setOptionsAnchor(null);
-  const attachFilesFromMenu = () => {
-    closeComposerOptions();
-    onAttachFiles();
-  };
-  const toggleDeepResearchFromMenu = () => {
-    if (isStreaming || composerLocked || deepResearchDisabled) return;
-    onToggleDeepResearch();
-    closeComposerOptions();
-  };
-
   return (
     <>
       <textarea
@@ -10021,72 +10313,48 @@ const ChatComposerInput = memo(function ChatComposerInput({
         disabled={composerLocked}
       />
       <div className="chat-composer-actions">
-        <Tooltip title="Options">
-          <IconButton
-            size="small"
-            className={`chat-composer-action-btn chat-composer-options-btn${optionsOpen || (deepResearchEnabled && !deepResearchDisabled) ? " active" : ""}`}
-            aria-label="Composer options"
-            aria-controls={optionsOpen ? "chat-composer-options-menu" : undefined}
-            aria-haspopup="menu"
-            aria-expanded={optionsOpen ? "true" : undefined}
-            onClick={(event) => setOptionsAnchor(event.currentTarget)}
-            disabled={isStreaming || composerLocked}
-          >
-            <AddRoundedIcon fontSize="small" />
-          </IconButton>
-        </Tooltip>
-        <Menu
-          id="chat-composer-options-menu"
-          className="chat-composer-options-menu"
-          anchorEl={optionsAnchor}
-          open={optionsOpen}
-          onClose={closeComposerOptions}
-          anchorOrigin={{ vertical: "top", horizontal: "left" }}
-          transformOrigin={{ vertical: "bottom", horizontal: "left" }}
-        >
-          <MenuItem
-            className="chat-composer-menu-item"
-            onClick={attachFilesFromMenu}
-            disabled={isStreaming || composerLocked}
-          >
-            <span className="chat-composer-menu-icon">
-              <AttachFileRoundedIcon fontSize="small" />
-            </span>
-            <span className="chat-composer-menu-body">
-              <span className="chat-composer-menu-title">Upload files</span>
-              <span className="chat-composer-menu-caption">
-                PDFs, images, or text — up to 25 MB
-              </span>
-            </span>
-          </MenuItem>
-          <MenuItem
-            className={`chat-composer-menu-item is-toggle${
-              deepResearchEnabled && !deepResearchDisabled ? " is-active" : ""
-            }`}
-            onClick={toggleDeepResearchFromMenu}
-            disabled={isStreaming || composerLocked || deepResearchDisabled}
-            role="menuitemcheckbox"
-            aria-checked={deepResearchEnabled && !deepResearchDisabled}
-          >
-            <span className="chat-composer-menu-icon">
-              <TravelExploreRoundedIcon fontSize="small" />
-            </span>
-            <span className="chat-composer-menu-body">
-              <span className="chat-composer-menu-title">Deep research</span>
-              <span className="chat-composer-menu-caption">
-                Cited multi-source report with plan review
-              </span>
-            </span>
-            <span
-              className={`chat-composer-menu-switch${
-                deepResearchEnabled && !deepResearchDisabled ? " is-on" : ""
-              }`}
-              aria-hidden="true"
+        <div className="chat-composer-inline-tools" aria-label="Composer tools">
+          <Tooltip title="Upload files">
+            <Button
+              type="button"
+              size="small"
+              variant="outlined"
+              className={`chat-composer-tool-btn${attachedFilesCount > 0 ? " is-active" : ""}`}
+              startIcon={<AttachFileRoundedIcon fontSize="small" />}
+              onClick={onAttachFiles}
+              disabled={isStreaming || composerLocked}
             >
-              <span className="chat-composer-menu-switch-thumb" />
+              {attachedFilesCount > 0 ? `Files ${attachedFilesCount}` : "Upload"}
+            </Button>
+          </Tooltip>
+          <Tooltip
+            title={
+              deepResearchDisabled
+                ? "Deep research is unavailable for this state"
+                : "Toggle cited multi-source research"
+            }
+          >
+            <span>
+              <Button
+                type="button"
+                size="small"
+                variant="outlined"
+                className={`chat-composer-tool-btn chat-composer-research-btn${
+                  deepResearchEnabled && !deepResearchDisabled ? " is-active" : ""
+                }`}
+                startIcon={<TravelExploreRoundedIcon fontSize="small" />}
+                onClick={() => {
+                  if (isStreaming || composerLocked || deepResearchDisabled) return;
+                  onToggleDeepResearch();
+                }}
+                disabled={isStreaming || composerLocked || deepResearchDisabled}
+                aria-pressed={deepResearchEnabled && !deepResearchDisabled}
+              >
+                Deep research
+              </Button>
             </span>
-          </MenuItem>
-        </Menu>
+          </Tooltip>
+        </div>
         {isStreaming && TASK_CANCEL_CONTROLS_ENABLED ? (
           <IconButton
             size="small"
@@ -10171,6 +10439,18 @@ function ChatPageInner({
   );
   const [planConfirmation, setPlanConfirmation] =
     useState<PlanConfirmationState | null>(null);
+  const [expandedPlanSteps, setExpandedPlanSteps] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const togglePlanStepExpansion = (key: string) => {
+    if (!key) return;
+    setExpandedPlanSteps((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
   const [executionPlanFailure, setExecutionPlanFailure] = useState("");
   const [executionPlanExpanded, setExecutionPlanExpanded] = useState(false);
   const [streamingProgressMessages, setStreamingProgressMessages] = useState<
@@ -10198,8 +10478,11 @@ function ChatPageInner({
     setWorkspaceOpen(false);
   }, []);
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
-  const [starterLibraryExpanded, setStarterLibraryExpanded] = useState(false);
+  const [starterActiveTab, setStarterActiveTab] =
+    useState<ChatStarterTabId>("all");
   const [starterAdvancedExpanded, setStarterAdvancedExpanded] = useState(false);
+  const [emptyEarlyAccessNoticeDismissed, setEmptyEarlyAccessNoticeDismissed] =
+    useState(() => readEarlyAccessNoticeDismissed());
   const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
   const [activityDetailRow, setActivityDetailRow] =
@@ -10270,6 +10553,8 @@ function ChatPageInner({
     useState<ChatPendingRunSnapshotMap>(() => loadChatBackgroundRunSnapshots());
   const [composerPrefillRequest, setComposerPrefillRequest] =
     useState<ChatComposerPrefillRequest | null>(null);
+  const [composerBrowserProfileContext, setComposerBrowserProfileContext] =
+    useState<JsonRecord | null>(null);
   const activeRunUsesLiveStream =
     liveRunStreamOpen && (isStreaming || pendingRunSnapshot !== null);
   const chatBackgroundRefresh =
@@ -10328,9 +10613,12 @@ function ChatPageInner({
   const lastWorkspaceActivityRestoreSeedRef = useRef("");
   const reattachedRunIdRef = useRef("");
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
-  const queueComposerPrefill = useCallback((text: string) => {
+  const queueComposerPrefill = useCallback((prefill: ChatComposerPrefillPayload) => {
+    const browserProfileContext = prefill.browser_profile_context ?? null;
+    setComposerBrowserProfileContext(browserProfileContext);
     setComposerPrefillRequest((prev) => ({
-      text,
+      text: prefill.text,
+      browserProfileContext,
       seq: (prev?.seq ?? 0) + 1,
     }));
   }, []);
@@ -10352,9 +10640,9 @@ function ChatPageInner({
     try {
       window.sessionStorage.removeItem(ARKREFLECT_COMPOSER_PREFILL_STORAGE_KEY);
     } catch {
-      // ignore — best-effort cleanup
+      // ignore â€” best-effort cleanup
     }
-    queueComposerPrefill(stored);
+    queueComposerPrefill({ text: stored, browser_profile_context: null });
     // queueComposerPrefill is stable (uses setState updater); intentional one-shot mount effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -10373,7 +10661,9 @@ function ChatPageInner({
       } catch {
         // Best-effort cleanup.
       }
-      queueComposerPrefill(stored);
+      const prefill = normalizeChatComposerPrefillPayload(stored);
+      if (!prefill) return;
+      queueComposerPrefill(prefill);
     };
     consumeComposerPrefill();
     window.addEventListener(CHAT_COMPOSER_PREFILL_EVENT, consumeComposerPrefill);
@@ -13340,9 +13630,7 @@ function ChatPageInner({
     };
 
     const actionTitle = (toolName: string, card: ActivityTimelineCard) =>
-      toolName
-        ? formatActivityToolName(toolName)
-        : card.label || card.rawTitle || "Action";
+      inlineToolActivityTitle(toolName, card);
 
     const detailLabel = (type: string, card: ActivityTimelineCard) => {
       if (type === "tool_start") return "Input";
@@ -13551,7 +13839,9 @@ function ChatPageInner({
             ? `${actionNames.length} Actions`
             : actionTitle(toolName, card);
         const audit = transcriptCommandAuditFromCard(card);
-        const detail = compactTranscriptDetail(
+        const detail = inlineToolActivityDetail(
+          toolName,
+          card,
           audit?.command || card.summary || card.detail || str(step.detail, ""),
         );
         const childDetail = buildActionDetail(
@@ -13582,7 +13872,9 @@ function ChatPageInner({
           (toolName ? toolName.trim().toLowerCase() : "agent-loop-actions");
         const status = transcriptStatusFromCard(card);
         const audit = transcriptCommandAuditFromCard(card);
-        const detail = compactTranscriptDetail(
+        const detail = inlineToolActivityDetail(
+          toolName,
+          card,
           audit?.output || card.summary || card.detail || str(step.detail, ""),
         );
         const matchIndex = latestMatchingAction(syntheticKey);
@@ -13636,7 +13928,9 @@ function ChatPageInner({
         const toolName = activityToolNameFromStep(step);
         const title = actionTitle(toolName, card);
         const audit = transcriptCommandAuditFromCard(card);
-        const detail = compactTranscriptDetail(
+        const detail = inlineToolActivityDetail(
+          toolName,
+          card,
           audit?.command ||
             toolStartIntentText(data) ||
             card.summary ||
@@ -13666,7 +13960,9 @@ function ChatPageInner({
       if (stepType === "tool_progress") {
         const toolName = activityToolNameFromStep(step);
         const key = toolKey(toolName, card);
-        const detail = compactTranscriptDetail(
+        const detail = inlineToolActivityDetail(
+          toolName,
+          card,
           card.summary || card.detail || str(step.detail, ""),
         );
         const matchIndex = latestMatchingAction(key);
@@ -13709,7 +14005,9 @@ function ChatPageInner({
         const key = toolKey(toolName, card);
         const status = transcriptStatusFromCard(card);
         const audit = transcriptCommandAuditFromCard(card);
-        const detail = compactTranscriptDetail(
+        const detail = inlineToolActivityDetail(
+          toolName,
+          card,
           audit?.output || card.summary || card.detail || str(step.detail, ""),
         );
         const matchIndex = latestMatchingAction(key);
@@ -13986,7 +14284,7 @@ function ChatPageInner({
     setIsDragOverChat(false);
     setConversationId(null);
     setConversationPage(0);
-    queueComposerPrefill("");
+    queueComposerPrefill({ text: "", browser_profile_context: null });
     setDeepResearchEnabled(false);
     setAttachedFiles([]);
     setChatError(null);
@@ -14559,7 +14857,13 @@ function ChatPageInner({
         conversationTitle,
       );
       if (report) {
-        const cleanReportBody = cleanResearchReportMarkdownForExport(report);
+        const cleanReportBody = researchReportExportMarkdown({
+          report,
+          previousUserPrompt: prompt,
+          timestamp,
+          traceId,
+          preserveChartFences: true,
+        });
         const safe =
           heading
             .replace(/[^\w.-]+/g, "_")
@@ -14640,6 +14944,38 @@ function ChatPageInner({
     }
   };
 
+  const researchReportExportMarkdown = ({
+    report,
+    previousUserPrompt,
+    timestamp,
+    traceId,
+    preserveChartFences,
+  }: {
+    report: ResearchReportPreview;
+    previousUserPrompt?: string;
+    timestamp?: string;
+    traceId?: string;
+    preserveChartFences: boolean;
+  }): string => {
+    const body = cleanResearchReportMarkdownForExport(report, {
+      preserveChartFences,
+      includeEvidenceBrief: true,
+    });
+    const prompt = str(previousUserPrompt, "").trim();
+    const details: string[] = [];
+    if (prompt) {
+      details.push("## Request", "", prompt, "");
+    }
+    details.push("## Report Details", "");
+    details.push("| Field | Value |");
+    details.push("| --- | --- |");
+    details.push(`| Conversation | ${conversationId || "Not available"} |`);
+    details.push(`| Assistant time | ${str(timestamp, "").trim() || "Not available"} |`);
+    details.push(`| Trace id | ${str(traceId, "").trim() || "Not available"} |`);
+    details.push(`| Exported at | ${new Date().toISOString()} |`);
+    return [body, details.join("\n")].filter(Boolean).join("\n\n");
+  };
+
   const researchReportExportHtml = ({
     report,
     headingHint,
@@ -14657,28 +14993,17 @@ function ChatPageInner({
       str(headingHint, "").trim() ||
       report.title ||
       "Research report";
-    const lines = [
-      cleanResearchReportMarkdownForExport(report, {
-        preserveChartFences: true,
-      }),
-    ];
-    const prompt = str(previousUserPrompt, "").trim();
-    const details: string[] = [];
-    if (prompt) {
-      details.push("## Request", "", prompt, "");
-    }
-    details.push("## Report Details", "");
-    details.push("| Field | Value |");
-    details.push("| --- | --- |");
-    details.push(`| Conversation | ${conversationId || "Not available"} |`);
-    details.push(`| Assistant time | ${str(timestamp, "").trim() || "Not available"} |`);
-    details.push(`| Trace id | ${str(traceId, "").trim() || "Not available"} |`);
-    details.push(`| Exported at | ${new Date().toISOString()} |`);
-    lines.push(details.join("\n"));
+    const markdown = researchReportExportMarkdown({
+      report,
+      previousUserPrompt,
+      timestamp,
+      traceId,
+      preserveChartFences: true,
+    });
     return {
       filenameStem: documentFileStem(heading),
       heading,
-      html: reportPrintHtml(heading, lines.filter(Boolean).join("\n\n")),
+      html: reportPrintHtml(heading, markdown),
     };
   };
 
@@ -15163,7 +15488,7 @@ function ChatPageInner({
               return (
                 <Box
                   key={step.draft_id}
-                  className={`chat-plan-confirmation-step${step.enabled ? "" : " disabled"}${planConfirmation?.editing ? " editing" : ""}`}
+                  className={`chat-plan-confirmation-step${step.enabled ? "" : " disabled"}${planConfirmation?.editing ? " editing" : ""}${expandedPlanSteps.has(step.draft_id) ? " expanded" : ""}`}
                 >
                   <Box
                     className={`chat-plan-confirmation-step-marker pending${step.enabled ? "" : " disabled"}${planConfirmation?.editing ? " editing" : ""}`}
@@ -15300,12 +15625,29 @@ function ChatPageInner({
                           {stepCopy.title}
                         </Typography>
                         {stepCopy.description ? (
-                          <Typography
-                            variant="caption"
-                            className="chat-plan-confirmation-step-detail"
-                          >
-                            {stepCopy.description}
-                          </Typography>
+                          <>
+                            <button
+                              type="button"
+                              className="chat-plan-confirmation-step-toggle"
+                              aria-expanded={expandedPlanSteps.has(
+                                step.draft_id,
+                              )}
+                              onClick={() =>
+                                togglePlanStepExpansion(step.draft_id)
+                              }
+                            >
+                              <span className="chat-plan-confirmation-step-toggle-icon" />
+                              {expandedPlanSteps.has(step.draft_id)
+                                ? "Hide details"
+                                : "Show details"}
+                            </button>
+                            <Typography
+                              variant="caption"
+                              className="chat-plan-confirmation-step-detail"
+                            >
+                              {stepCopy.description}
+                            </Typography>
+                          </>
                         ) : null}
                       </>
                     )}
@@ -15476,14 +15818,21 @@ function ChatPageInner({
                   {badgeLabel}
                 </Typography>
               </Stack>
+              {runningCount > 0 ? (
+                <Box
+                  className="chat-plan-confirmation-progress"
+                  aria-hidden="true"
+                >
+                  <Box className="chat-plan-confirmation-progress-fill" />
+                </Box>
+              ) : null}
               <Typography
                 variant="caption"
                 className="chat-plan-confirmation-inline-note"
               >
-                {completedCount} done
-                {runningCount > 0 ? `, ${runningCount} running` : ""}
-                {pendingCount > 0 ? `, ${pendingCount} pending` : ""}
-                {failedCount > 0 ? `, ${failedCount} failed` : ""}
+                {runningCount > 0
+                  ? `${completedCount} of ${liveSteps.length} complete · working…`
+                  : `${completedCount} of ${liveSteps.length} complete${failedCount > 0 ? `, ${failedCount} failed` : ""}`}
               </Typography>
               {failureDetail ? (
                 <Stack spacing={0.75}>
@@ -15536,7 +15885,7 @@ function ChatPageInner({
                   return (
                     <Box
                       key={`${step.id}-${step.title}`}
-                      className={`chat-plan-confirmation-step live ${stepStatus}`}
+                      className={`chat-plan-confirmation-step live ${stepStatus}${expandedPlanSteps.has(step.title) ? " expanded" : ""}`}
                     >
                       <Box
                         className={`chat-plan-confirmation-step-marker live ${stepStatus}`}
@@ -15554,12 +15903,27 @@ function ChatPageInner({
                           {stepCopy.title}
                         </Typography>
                         {stepCopy.description ? (
-                          <Typography
-                            variant="caption"
-                            className="chat-plan-confirmation-step-detail"
-                          >
-                            {stepCopy.description}
-                          </Typography>
+                          <>
+                            <button
+                              type="button"
+                              className="chat-plan-confirmation-step-toggle"
+                              aria-expanded={expandedPlanSteps.has(step.title)}
+                              onClick={() =>
+                                togglePlanStepExpansion(step.title)
+                              }
+                            >
+                              <span className="chat-plan-confirmation-step-toggle-icon" />
+                              {expandedPlanSteps.has(step.title)
+                                ? "Hide details"
+                                : "Show details"}
+                            </button>
+                            <Typography
+                              variant="caption"
+                              className="chat-plan-confirmation-step-detail"
+                            >
+                              {stepCopy.description}
+                            </Typography>
+                          </>
                         ) : null}
                         {displayedSubsteps.length > 0 ? (
                           <Stack
@@ -16813,6 +17177,7 @@ function ChatPageInner({
       planOverride?: ExecutionPlanState | null;
       acceptedSuggestionId?: string;
       sentinelProposalId?: string;
+      browserProfileContext?: JsonRecord | null;
     },
   ): Promise<boolean> => {
     const resumeTaskId = (opts?.resumeTaskId || "").trim();
@@ -16883,9 +17248,30 @@ function ChatPageInner({
     }
     const now = Date.now();
     const deepResearch = Boolean(opts?.deepResearch);
+    const executionProfile = deepResearch
+      ? {
+          work_type: "research",
+          depth: "deep",
+          deliverables: ["answer", "markdown", "document"],
+          plan_first: true,
+          confidence: 1,
+          source: "ui_override",
+        }
+      : undefined;
     const planOverride = opts?.planOverride ?? null;
     const acceptedSuggestionId = str(opts?.acceptedSuggestionId, "").trim();
     const sentinelProposalId = str(opts?.sentinelProposalId, "").trim();
+    const browserProfileContext =
+      opts?.browserProfileContext &&
+      Object.keys(opts.browserProfileContext).length > 0
+        ? opts.browserProfileContext
+        : null;
+    const browserProfileFingerprint = browserProfileContext
+      ? `${str(browserProfileContext.profile_id, "")}::${str(
+          browserProfileContext.profile_name,
+          "",
+        )}`
+      : "__no_browser_profile__";
     const executionMode: ChatExecutionMode = "auto";
     if (!isResumeMode && workingChatCount >= CHAT_WORKING_CHATS_MAX) {
       setChatError(
@@ -16934,7 +17320,7 @@ function ChatPageInner({
       : `${targetConversationId || "__new__"}::${activeMessagePreview
           .toLowerCase()
           .replace(/\s+/g, " ")
-          .trim()}::${attachmentFingerprint}::${deepResearch ? "research" : "chat"}::${executionMode}::${acceptedSuggestionId || "__no_suggestion__"}::${sentinelProposalId || "__no_sentinel__"}`;
+          .trim()}::${attachmentFingerprint}::${deepResearch ? "research" : "chat"}::${executionMode}::${acceptedSuggestionId || "__no_suggestion__"}::${sentinelProposalId || "__no_sentinel__"}::${browserProfileFingerprint}`;
     const lastSend = recentSendRef.current;
     if (
       lastSend &&
@@ -17285,7 +17671,6 @@ function ChatPageInner({
               onTaskStarted: (payload) => {
                 if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
-                const description = str(payload.description, "Task");
                 if (!taskId) return;
                 activeChatTaskIdRef.current = taskId;
                 setPendingRunSnapshot((prev) => {
@@ -17303,7 +17688,6 @@ function ChatPageInner({
                   storeChatPendingRunSnapshotNow(next);
                   return next;
                 });
-                setChatNotice(`Task started: ${description}`);
                 void queryClient.invalidateQueries({ queryKey: ["tasks"] });
                 void queryClient.invalidateQueries({
                   queryKey: ["tasks-manager"],
@@ -17321,7 +17705,6 @@ function ChatPageInner({
               onTaskStatus: (payload) => {
                 if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
-                const description = str(payload.description, "Task");
                 const status = str(payload.status, "");
                 if (isTerminalChatTaskStatus(status)) {
                   refreshConversationMessagesFromStreamPayload(
@@ -17332,20 +17715,16 @@ function ChatPageInner({
                   );
                 }
                 if (!taskId || !status) return;
-                const statusLabel =
-                  status === "completed"
-                    ? "completed"
-                    : status === "failed"
-                      ? "failed"
-                      : status === "paused"
-                        ? "paused"
-                        : status === "awaiting_approval"
-                          ? "awaiting approval"
-                          : status.replace(/_/g, " ");
-                setChatNotice(`Task ${statusLabel}: ${description}`);
+                const pauseKind = str(
+                  payload.pause_kind,
+                  str(payload._pause_kind, ""),
+                )
+                  .trim()
+                  .toLowerCase();
                 if (
                   (status === "paused" || status === "awaiting_approval") &&
-                  (deepResearch ||
+                  (pauseKind === "plan_confirmation" ||
+                    deepResearch ||
                     Boolean(planOverride) ||
                     !!str(planConfirmation?.source, "").trim())
                 ) {
@@ -17404,7 +17783,7 @@ function ChatPageInner({
               message: payloadMessage,
               channel: "web",
               conversation_id: targetConversationId || undefined,
-              deep_research: deepResearch,
+              execution_profile: executionProfile,
               plan_confirmation_mode: deepResearch
                 ? "before_execution"
                 : undefined,
@@ -17413,6 +17792,7 @@ function ChatPageInner({
               attachments: attachmentPayloads,
               accepted_suggestion_id: acceptedSuggestionId || undefined,
               sentinel_proposal_id: sentinelProposalId || undefined,
+              browser_profile_context: browserProfileContext || undefined,
             },
             {
               signal: abortController.signal,
@@ -17450,7 +17830,6 @@ function ChatPageInner({
               onTaskStarted: (payload) => {
                 if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
-                const description = str(payload.description, "Task");
                 if (!taskId) return;
                 activeChatTaskIdRef.current = taskId;
                 setPendingRunSnapshot((prev) => {
@@ -17466,7 +17845,6 @@ function ChatPageInner({
                   storeChatPendingRunSnapshotNow(next);
                   return next;
                 });
-                setChatNotice(`Task started: ${description}`);
                 void queryClient.invalidateQueries({ queryKey: ["tasks"] });
                 void queryClient.invalidateQueries({
                   queryKey: ["tasks-manager"],
@@ -17484,7 +17862,6 @@ function ChatPageInner({
               onTaskStatus: (payload) => {
                 if (streamDetachedToBackground()) return;
                 const taskId = str(payload.task_id, "");
-                const description = str(payload.description, "Task");
                 const status = str(payload.status, "");
                 if (isTerminalChatTaskStatus(status)) {
                   refreshConversationMessagesFromStreamPayload(
@@ -17495,20 +17872,16 @@ function ChatPageInner({
                   );
                 }
                 if (!taskId || !status) return;
-                const statusLabel =
-                  status === "completed"
-                    ? "completed"
-                    : status === "failed"
-                      ? "failed"
-                      : status === "paused"
-                        ? "paused"
-                        : status === "awaiting_approval"
-                          ? "awaiting approval"
-                          : status.replace(/_/g, " ");
-                setChatNotice(`Task ${statusLabel}: ${description}`);
+                const pauseKind = str(
+                  payload.pause_kind,
+                  str(payload._pause_kind, ""),
+                )
+                  .trim()
+                  .toLowerCase();
                 if (
                   (status === "paused" || status === "awaiting_approval") &&
-                  (deepResearch ||
+                  (pauseKind === "plan_confirmation" ||
+                    deepResearch ||
                     Boolean(planOverride) ||
                     !!str(planConfirmation?.source, "").trim())
                 ) {
@@ -18471,6 +18844,7 @@ function ChatPageInner({
   const submitComposerMessage = async (
     messageText: string,
     files: File[] = [],
+    browserProfileContext: JsonRecord | null = composerBrowserProfileContext,
   ): Promise<boolean> => {
     const trimmed = messageText.trim();
     const useDeepResearchForSubmit =
@@ -18504,6 +18878,11 @@ function ChatPageInner({
     setChatError(null);
     void runStreamingChat(trimmed, files, {
       deepResearch: useDeepResearchForSubmit,
+      browserProfileContext,
+    }).then((accepted) => {
+      if (accepted && browserProfileContext === composerBrowserProfileContext) {
+        setComposerBrowserProfileContext(null);
+      }
     });
     return true;
   };
@@ -19194,6 +19573,11 @@ function ChatPageInner({
     !showStreamingAssistant &&
     !visiblePendingUserMessage &&
     !visibleFailedUserMessage;
+
+  useEffect(() => {
+    setEmptyEarlyAccessNoticeDismissed(readEarlyAccessNoticeDismissed());
+  }, [showEmptyHero]);
+
   const shouldInlineCompletedProgressBeforeAssistant =
     !showStreamingAssistant &&
     visibleStreamingProgressMessages.length > 0 &&
@@ -19512,16 +19896,49 @@ function ChatPageInner({
             : "Preparing a structured execution outline.";
 
   const applyStarterExample = (example: ChatStarterExample) => {
-    queueComposerPrefill(example.prompt);
+    queueComposerPrefill({
+      text: example.prompt,
+      browser_profile_context: null,
+    });
     setDeepResearchEnabled(Boolean(example.deepResearch) && !deepResearchDisabled);
     setChatError(null);
     setChatNotice(null);
   };
 
-  useEffect(() => {
-    if (starterLibraryExpanded) return;
-    setStarterAdvancedExpanded(false);
-  }, [starterLibraryExpanded]);
+  const starterVisibleExamples =
+    starterActiveTab === "all"
+      ? CHAT_STARTER_DEFAULT_EXAMPLES
+      : CHAT_STARTER_EXAMPLES.filter(
+          (example) => example.category === starterActiveTab,
+        );
+
+  const renderStarterExampleCard = (item: ChatStarterExample) => {
+    const categoryMeta = CHAT_STARTER_CATEGORY_META[item.category];
+    return (
+      <Button
+        key={item.id}
+        variant="outlined"
+        className="chat-starter-card"
+        data-category={item.category}
+        onClick={() => applyStarterExample(item)}
+      >
+        <Box className="chat-starter-card-body">
+          <Box className="chat-starter-card-meta">
+            <span className="chat-starter-tag">{categoryMeta.label}</span>
+            {item.deepResearch && item.category !== "research" ? (
+              <span className="chat-starter-tag research">Deep research</span>
+            ) : null}
+          </Box>
+          <Typography component="span" className="chat-starter-card-title">
+            {item.title}
+          </Typography>
+          <Typography component="span" className="chat-starter-card-copy">
+            {item.summary}
+          </Typography>
+        </Box>
+      </Button>
+    );
+  };
 
   useEffect(() => {
     if (!planConfirmation || planConfirmation.stage === "planning") return;
@@ -19767,17 +20184,18 @@ function ChatPageInner({
     [completedLastRunSteps, completedPersistedTraceSteps],
   );
 
+  const workspaceStepsUseActiveRun =
+    (showStreamingAssistant || hasPendingSnapshotForConversation) &&
+    streamingSteps.length > 0;
   const workspaceStepsSource = useMemo(
     () =>
-      (showStreamingAssistant || hasPendingSnapshotForConversation) &&
-      streamingSteps.length > 0
+      workspaceStepsUseActiveRun
         ? trimTrailingHeartbeatSteps(streamingSteps)
         : completedWorkspaceSteps,
     [
       completedWorkspaceSteps,
-      hasPendingSnapshotForConversation,
-      showStreamingAssistant,
       streamingSteps,
+      workspaceStepsUseActiveRun,
     ],
   );
   const workspaceActivityRestoreState = useMemo(
@@ -19800,6 +20218,17 @@ function ChatPageInner({
       restoredFiles.length === 0 &&
       Object.keys(restoredLiveWrites).length === 0
     ) {
+      if (workspaceStepsUseActiveRun) {
+        lastWorkspaceActivityRestoreSeedRef.current = JSON.stringify({
+          conversationId,
+          active: true,
+          emptyWorkspace: true,
+        });
+        streamedWorkspaceAppRef.current = null;
+        setStreamedWorkspaceApp(null);
+        setDeployedFiles((prev) => (prev.length > 0 ? [] : prev));
+        setLiveFileWrites((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+      }
       return;
     }
     const restoreSeed = JSON.stringify({
@@ -19836,10 +20265,18 @@ function ChatPageInner({
         mergeLiveFileWriteStates(prev, restoredLiveWrites, appDir),
       );
     }
-  }, [conversationId, workspaceActivityRestoreState]);
-  const liveChatTranscriptItems = useMemo(() => {
-    return [] as ChatTranscriptItem[];
-  }, []);
+  }, [conversationId, workspaceActivityRestoreState, workspaceStepsUseActiveRun]);
+  const liveChatTranscriptItems = useMemo(
+    () =>
+      buildChatTranscriptItemsFromSteps(
+        trimTrailingHeartbeatSteps(
+          streamingSteps.length > 0 ? streamingSteps : workspaceStepsSource,
+        ),
+        "live-transcript",
+        8,
+      ).filter((item) => item.kind === "action"),
+    [buildChatTranscriptItemsFromSteps, streamingSteps, workspaceStepsSource],
+  );
   const livePlanPhaseStatuses = useMemo(() => {
     const plan =
       activePlanConfirmationState ??
@@ -20012,6 +20449,16 @@ function ChatPageInner({
     }
     return byMessageId;
   }, [buildChatTranscriptItemsFromSteps, messageRenderBundle, traceStepsById]);
+  const completedRunTranscriptItems = useMemo(
+    () =>
+      buildChatTranscriptItemsFromSteps(
+        completedLastRunSteps,
+        "completed-run-transcript",
+        8,
+        { complete: true },
+      ).filter((item) => item.kind === "action"),
+    [buildChatTranscriptItemsFromSteps, completedLastRunSteps],
+  );
   const latestWorkspaceCard = pickPrimaryActivityCard(workspaceCards);
   const progressRows = useMemo(() => {
     const seen = new Set<string>();
@@ -20112,8 +20559,7 @@ function ChatPageInner({
   const streamingRunMetricItems =
     !currentRunStillActiveForMetrics ? computerRunMetricItems : [];
   const hasVisibleStreamingReply = Boolean(visibleStreamingResponse.trim());
-  const hasLiveWorkActivity = false;
-  const showLiveExecutionPanel = false;
+  const showLiveExecutionPanel = liveChatTranscriptItems.length > 0;
   const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
     activeCodeFile ? liveFileWrites[activeCodeFile.name]?.content || "" : "",
     activeCodeFile?.content || "",
@@ -20497,7 +20943,7 @@ function ChatPageInner({
     // Build the union of files the agent has fully deployed AND files it is
     // currently streaming. The first deploy of a turn has empty deployedFiles
     // until the action returns, so without folding live-writes in here the
-    // Computer pane would render "Files: 0" while the model is mid-draft —
+    // Computer pane would render "Files: 0" while the model is mid-draft â€”
     // exactly the Lovable/Bolt hole the user flagged. Live-write content takes
     // precedence over any captured snapshot for the same path.
     const merged = new Map<string, { path: string; content: string }>();
@@ -21613,8 +22059,8 @@ function ChatPageInner({
                     ) : null}
                   </span>
                   {stepCount > 0 ? (
-                    <span className="chat-transcript-action-count">
-                      {stepCount}
+                    <span className="chat-transcript-action-status">
+                      {transcriptStatusLabel(item.status)}
                     </span>
                   ) : null}
                   <ExpandMoreIcon
@@ -21673,8 +22119,8 @@ function ChatPageInner({
                   ) : null}
                 </span>
                 {stepCount > 0 ? (
-                  <span className="chat-transcript-action-count">
-                    {stepCount}
+                  <span className="chat-transcript-action-status">
+                    {transcriptStatusLabel(item.status)}
                   </span>
                 ) : null}
                 <ExpandMoreIcon
@@ -21708,7 +22154,9 @@ function ChatPageInner({
       onStopStreaming={() => {
         void handleStopStreaming();
       }}
-      onSubmit={(draft) => submitComposerMessage(draft, attachedFiles)}
+      onSubmit={(draft) =>
+        submitComposerMessage(draft, attachedFiles, composerBrowserProfileContext)
+      }
       onToggleDeepResearch={() => setDeepResearchEnabled((prev) => !prev)}
       placeholder={placeholder}
       prefillRequest={composerPrefillRequest}
@@ -21904,6 +22352,38 @@ function ChatPageInner({
                       {conversationId ? "Conversation" : "AgentArk"}
                     </Typography>
                   </Box>
+                  {!emptyEarlyAccessNoticeDismissed ? (
+                    <Box
+                      className="chat-empty-early-access"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      <InfoOutlinedIcon
+                        className="chat-empty-early-access-icon"
+                        fontSize="small"
+                        aria-hidden="true"
+                      />
+                      <Typography
+                        component="p"
+                        className="chat-empty-early-access-copy"
+                      >
+                        <strong>AgentArk is in beta and can make mistakes.</strong>{" "}
+                        Review browser actions, connected-tool results, and
+                        long-running work before relying on them.
+                      </Typography>
+                      <IconButton
+                        size="small"
+                        className="chat-empty-early-access-close"
+                        aria-label="Dismiss early access notice"
+                        onClick={() => {
+                          dismissEarlyAccessNoticeForSevenDays();
+                          setEmptyEarlyAccessNoticeDismissed(true);
+                        }}
+                      >
+                        <CloseIcon fontSize="small" />
+                      </IconButton>
+                    </Box>
+                  ) : null}
                   <Box className="chat-empty-composer-wrap">
                     {renderAttachedFilePills("chat-empty-attachments")}
                     <Box
@@ -21913,188 +22393,81 @@ function ChatPageInner({
                     </Box>
                   </Box>
                   <Box className="chat-starter-shell">
-                    <Typography
-                      variant="caption"
-                      className="chat-starter-caption"
-                    >
-                      Common starts
-                    </Typography>
-                    <Box className="chat-starter-grid">
-                      {CHAT_STARTER_DEFAULT_EXAMPLES.map((item) => {
-                        const categoryMeta =
-                          CHAT_STARTER_CATEGORY_META[item.category];
-                        return (
-                          <Button
-                            key={item.id}
-                            variant="outlined"
-                            className="chat-starter-card"
-                            onClick={() => applyStarterExample(item)}
-                          >
-                            <Box className="chat-starter-card-body">
-                              <Box className="chat-starter-card-meta">
-                                <span className="chat-starter-tag">
-                                  {categoryMeta.label}
-                                </span>
-                                {item.deepResearch &&
-                                item.category !== "research" ? (
-                                  <span className="chat-starter-tag research">
-                                    Deep research
-                                  </span>
-                                ) : null}
-                              </Box>
-                              <Typography
-                                component="span"
-                                className="chat-starter-card-title"
-                              >
-                                {item.title}
-                              </Typography>
-                              <Typography
-                                component="span"
-                                className="chat-starter-card-copy"
-                              >
-                                {item.summary}
-                              </Typography>
-                            </Box>
-                          </Button>
-                        );
-                      })}
-                    </Box>
-                    <Box className="chat-starter-actions">
-                      <Button
-                        size="small"
-                        variant="text"
-                        className="chat-starter-toggle"
-                        endIcon={
-                          <ExpandMoreIcon
-                            sx={{
-                              transform: starterLibraryExpanded
-                                ? "rotate(180deg)"
-                                : "rotate(0deg)",
-                              transition: "transform 0.16s ease",
-                            }}
-                          />
-                        }
-                        onClick={() =>
-                          setStarterLibraryExpanded((prev) => !prev)
-                        }
+                    <Box className="chat-starter-tabs-head">
+                      <Typography
+                        variant="caption"
+                        className="chat-starter-caption"
                       >
-                        {starterLibraryExpanded
-                          ? "Show fewer"
-                          : "More examples"}
-                      </Button>
+                        Common starts
+                      </Typography>
+                      <Tabs
+                        value={starterActiveTab}
+                        onChange={(_, value) =>
+                          setStarterActiveTab(value as ChatStarterTabId)
+                        }
+                        variant="scrollable"
+                        scrollButtons="auto"
+                        className="chat-starter-tabs"
+                      >
+                        {CHAT_STARTER_TAB_ORDER.map((categoryId) => (
+                          <Tab
+                            key={categoryId}
+                            value={categoryId}
+                            label={CHAT_STARTER_TAB_LABELS[categoryId]}
+                          />
+                        ))}
+                      </Tabs>
                     </Box>
-                    {starterLibraryExpanded ? (
-                      <Box className="chat-starter-library">
-                        <Box className="chat-starter-grid chat-starter-grid-expanded">
-                          {CHAT_STARTER_LIBRARY_EXAMPLES.map((item) => {
-                            const categoryMeta =
-                              CHAT_STARTER_CATEGORY_META[item.category];
-                            return (
-                              <Button
-                                key={item.id}
-                                variant="outlined"
-                                className="chat-starter-card"
-                                onClick={() => applyStarterExample(item)}
-                              >
-                                <Box className="chat-starter-card-body">
-                                  <Box className="chat-starter-card-meta">
-                                    <span className="chat-starter-tag">
-                                      {categoryMeta.label}
-                                    </span>
-                                    {item.deepResearch &&
-                                    item.category !== "research" ? (
-                                      <span className="chat-starter-tag research">
-                                        Deep research
-                                      </span>
-                                    ) : null}
-                                  </Box>
-                                  <Typography
-                                    component="span"
-                                    className="chat-starter-card-title"
-                                  >
-                                    {item.title}
-                                  </Typography>
-                                  <Typography
-                                    component="span"
-                                    className="chat-starter-card-copy"
-                                  >
-                                    {item.summary}
-                                  </Typography>
-                                </Box>
-                              </Button>
-                            );
-                          })}
+                    <Box
+                      className={`chat-starter-grid${starterActiveTab === "all" ? "" : " chat-starter-grid-expanded"}`}
+                    >
+                      {starterVisibleExamples.map(renderStarterExampleCard)}
+                    </Box>
+                    {CHAT_STARTER_ADVANCED_EXAMPLES.length > 0 ? (
+                      <Box className="chat-starter-advanced">
+                        <Box className="chat-starter-section-head">
+                          <Typography
+                            variant="overline"
+                            className="chat-starter-section-title"
+                          >
+                            {CHAT_STARTER_CATEGORY_META.advanced.label}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            className="chat-starter-section-copy"
+                          >
+                            {CHAT_STARTER_CATEGORY_META.advanced.description}
+                          </Typography>
                         </Box>
-                        {CHAT_STARTER_ADVANCED_EXAMPLES.length > 0 ? (
-                          <Box className="chat-starter-advanced">
-                            <Box className="chat-starter-section-head">
-                              <Typography
-                                variant="overline"
-                                className="chat-starter-section-title"
-                              >
-                                {CHAT_STARTER_CATEGORY_META.advanced.label}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                className="chat-starter-section-copy"
-                              >
-                                {
-                                  CHAT_STARTER_CATEGORY_META.advanced
-                                    .description
-                                }
-                              </Typography>
-                            </Box>
-                            <Box className="chat-starter-advanced-actions">
-                              <Button
-                                size="small"
-                                variant="text"
-                                className="chat-starter-toggle"
-                                endIcon={
-                                  <ExpandMoreIcon
-                                    sx={{
-                                      transform: starterAdvancedExpanded
-                                        ? "rotate(180deg)"
-                                        : "rotate(0deg)",
-                                      transition: "transform 0.16s ease",
-                                    }}
-                                  />
-                                }
-                                onClick={() =>
-                                  setStarterAdvancedExpanded((prev) => !prev)
-                                }
-                              >
-                                {starterAdvancedExpanded
-                                  ? "Hide advanced"
-                                  : "Show advanced"}
-                              </Button>
-                            </Box>
-                            {starterAdvancedExpanded ? (
-                              <Box className="chat-starter-grid chat-starter-grid-expanded">
-                                {CHAT_STARTER_ADVANCED_EXAMPLES.map((item) => (
-                                  <Button
-                                    key={item.id}
-                                    variant="outlined"
-                                    className="chat-starter-card"
-                                    onClick={() => applyStarterExample(item)}
-                                  >
-                                    <Box className="chat-starter-card-body">
-                                      <Typography
-                                        component="span"
-                                        className="chat-starter-card-title"
-                                      >
-                                        {item.title}
-                                      </Typography>
-                                      <Typography
-                                        component="span"
-                                        className="chat-starter-card-copy"
-                                      >
-                                        {item.summary}
-                                      </Typography>
-                                    </Box>
-                                  </Button>
-                                ))}
-                              </Box>
-                            ) : null}
+                        <Box className="chat-starter-advanced-actions">
+                          <Button
+                            size="small"
+                            variant="text"
+                            className="chat-starter-toggle"
+                            endIcon={
+                              <ExpandMoreIcon
+                                sx={{
+                                  transform: starterAdvancedExpanded
+                                    ? "rotate(180deg)"
+                                    : "rotate(0deg)",
+                                  transition: "transform 0.16s ease",
+                                }}
+                              />
+                            }
+                            onClick={() =>
+                              setStarterAdvancedExpanded((prev) => !prev)
+                            }
+                          >
+                            {starterAdvancedExpanded
+                              ? "Hide advanced"
+                              : "Show advanced"}
+                          </Button>
+                        </Box>
+                        {starterAdvancedExpanded ? (
+                          <Box className="chat-starter-grid chat-starter-grid-expanded">
+                            {CHAT_STARTER_ADVANCED_EXAMPLES.map(
+                              renderStarterExampleCard,
+                            )}
                           </Box>
                         ) : null}
                       </Box>
@@ -22122,9 +22495,16 @@ function ChatPageInner({
                       markdownNode,
                       runMetricItems,
                     } = bundle;
-                    const messageTranscriptItems = isAssistant
+                    const traceTranscriptItems = isAssistant
                       ? perMessageTraceTranscriptById[messageId] || []
                       : [];
+                    const messageTranscriptItems =
+                      isAssistant &&
+                      traceTranscriptItems.length === 0 &&
+                      !showStreamingAssistant &&
+                      idx === messages.length - 1
+                        ? completedRunTranscriptItems
+                        : traceTranscriptItems;
                     const isPlanConfirmationMessage =
                       isAssistant &&
                       showPlanConfirmationCard &&
@@ -23571,34 +23951,18 @@ function ChatPageInner({
           {researchReportDialog ? (
             <Box className="chat-research-report-paper">
               {renderChatMarkdown(
-                researchReportDialog.report.mainContent ||
-                  researchReportDialog.report.content,
+                researchReportExportMarkdown({
+                  report: researchReportDialog.report,
+                  previousUserPrompt: researchReportDialog.previousUserPrompt,
+                  timestamp: researchReportDialog.timestamp,
+                  traceId: researchReportDialog.traceId,
+                  preserveChartFences: true,
+                }),
                 {
-                  snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-main`,
+                  snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-full`,
                   onOpenSnippet: openCodePreviewInWorkspace,
                 },
               )}
-              {researchReportDialog.report.evidenceBrief ? (
-                <Box className="chat-research-report-evidence-inline">
-                  <Typography
-                    variant="subtitle2"
-                    className="chat-research-report-evidence-title"
-                  >
-                    Evidence brief and source checks
-                  </Typography>
-                  <Typography
-                    variant="caption"
-                    className="chat-research-report-evidence-meta"
-                  >
-                    Raw evidence used for the synthesis, including source
-                    reliability charts when available.
-                  </Typography>
-                  {renderChatMarkdown(researchReportDialog.report.evidenceBrief, {
-                    snippetNamespace: `research-report-${researchReportDialog.messageId || "dialog"}-evidence`,
-                    onOpenSnippet: openCodePreviewInWorkspace,
-                  })}
-                </Box>
-              ) : null}
             </Box>
           ) : null}
         </DialogContent>

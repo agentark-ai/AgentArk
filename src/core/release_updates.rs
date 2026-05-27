@@ -41,9 +41,7 @@ pub fn release_repo_slug() -> String {
 }
 
 pub fn strip_release_tag_prefix(tag: &str) -> String {
-    tag.trim()
-        .trim_start_matches(|c| c == 'v' || c == 'V')
-        .to_string()
+    tag.trim().trim_start_matches(['v', 'V']).to_string()
 }
 
 pub fn image_repository(image_ref: &str) -> String {

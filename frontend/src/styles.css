@@ -1923,6 +1923,50 @@ body {
   gap: 10px;
 }
 
+.chat-empty-early-access {
+  width: min(100%, 780px);
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(244, 198, 138, 0.22);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(244, 198, 138, 0.07), rgba(255, 255, 255, 0.012)),
+    rgba(10, 10, 10, 0.68);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  padding: 9px 10px 9px 12px;
+  text-align: left;
+}
+
+.chat-empty-early-access-icon {
+  color: rgba(244, 198, 138, 0.9);
+}
+
+.chat-empty-early-access-copy.MuiTypography-root {
+  min-width: 0;
+  margin: 0;
+  color: rgba(246, 240, 232, 0.78);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.chat-empty-early-access-copy strong {
+  color: rgba(255, 248, 237, 0.95);
+  font-weight: 720;
+}
+
+.chat-empty-early-access-close.MuiIconButton-root {
+  width: 26px;
+  height: 26px;
+  color: rgba(226, 218, 208, 0.5);
+}
+
+.chat-empty-early-access-close.MuiIconButton-root:hover {
+  color: rgba(255, 248, 237, 0.88);
+  background: rgba(255, 255, 255, 0.055);
+}
+
 .chat-empty-logo {
   width: 34px;
   height: 34px;
@@ -2066,47 +2110,84 @@ body {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 16px;
+  gap: 12px;
+}
+
+.chat-starter-tabs-head {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(13, 19, 16, 0.78), rgba(7, 11, 9, 0.76));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
 }
 
 .chat-starter-caption {
-  align-self: center;
+  align-self: flex-start;
   position: relative;
   margin: 0 !important;
-  padding: 0 18px !important;
+  padding: 0 !important;
   font-family: var(--font-mono) !important;
   font-size: 0.66rem !important;
   font-weight: 600 !important;
-  letter-spacing: 0.22em !important;
+  letter-spacing: 0 !important;
   text-transform: uppercase;
-  color: rgba(220, 226, 232, 0.5) !important;
+  color: var(--ui-rgba-213-216-223-720) !important;
   line-height: 1.4 !important;
 }
 
 .chat-starter-caption::before,
 .chat-starter-caption::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  width: 36px;
-  height: 1px;
-  transform: translateY(-50%);
+  display: none;
 }
 
-.chat-starter-caption::before {
-  right: 100%;
-  background: linear-gradient(90deg, rgba(220, 226, 232, 0), rgba(220, 226, 232, 0.18));
+.chat-starter-tabs.MuiTabs-root {
+  min-height: 34px;
+  width: 100%;
 }
 
-.chat-starter-caption::after {
-  left: 100%;
-  background: linear-gradient(90deg, rgba(220, 226, 232, 0.18), rgba(220, 226, 232, 0));
+.chat-starter-tabs .MuiTabs-flexContainer {
+  gap: 6px;
+}
+
+.chat-starter-tabs .MuiTabs-indicator {
+  display: none;
+}
+
+.chat-starter-tabs .MuiTab-root {
+  min-height: 30px;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.chat-starter-tabs .MuiTab-root.Mui-selected {
+  border-color: rgba(120, 242, 176, 0.34);
+  background: rgba(120, 242, 176, 0.1);
+  color: var(--text-primary);
+}
+
+.chat-starter-tabs .MuiTab-root:hover {
+  border-color: rgba(120, 242, 176, 0.24);
+  background: rgba(120, 242, 176, 0.07);
+  color: var(--text-primary);
 }
 
 .chat-starter-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+  gap: 10px;
 }
 
 .chat-starter-grid-expanded {
@@ -2119,25 +2200,53 @@ body {
 
 .MuiButton-root.chat-starter-card,
 .chat-starter-card {
+  --starter-accent: 120, 242, 176;
   position: relative;
-  min-height: 144px;
+  min-height: 132px;
   padding: 0 !important;
   justify-content: stretch !important;
   align-items: stretch !important;
-  border-radius: 4px !important;
-  border: 1px solid rgba(255, 255, 255, 0.07) !important;
-  background: rgba(7, 11, 9, 0.78) !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--surface-border) !important;
+  background:
+    linear-gradient(180deg, rgba(13, 19, 16, 0.88), rgba(7, 11, 9, 0.86)) !important;
   text-transform: none !important;
   box-shadow: none !important;
   overflow: hidden;
-  transition: border-color 180ms ease, background 180ms ease, box-shadow 220ms ease;
+  transition: border-color 180ms ease, background 200ms ease, box-shadow 220ms ease, transform 180ms ease;
+}
+
+.chat-starter-card[data-category] { --starter-accent: 120, 242, 176; }
+
+.MuiButton-root.chat-starter-card::before,
+.chat-starter-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: linear-gradient(180deg,
+    rgba(120, 242, 176, 0.34) 0%,
+    rgba(120, 242, 176, 0.08) 100%);
+  opacity: 0.55;
+  transition: opacity 180ms ease, width 180ms ease;
+  pointer-events: none;
 }
 
 .MuiButton-root.chat-starter-card:hover,
 .chat-starter-card:hover {
-  border-color: rgba(255, 255, 255, 0.18) !important;
-  background: rgba(11, 15, 13, 0.86) !important;
-  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.45) !important;
+  border-color: rgba(120, 242, 176, 0.26) !important;
+  background:
+    linear-gradient(180deg, rgba(15, 24, 19, 0.94), rgba(8, 13, 11, 0.9)) !important;
+  box-shadow:
+    0 10px 22px rgba(0, 0, 0, 0.34),
+    0 0 0 1px rgba(120, 242, 176, 0.06) inset !important;
+  transform: translateY(-1px);
+}
+
+.MuiButton-root.chat-starter-card:hover::before,
+.chat-starter-card:hover::before {
+  opacity: 1;
+  width: 3px;
 }
 
 .chat-starter-card-body {
@@ -2148,8 +2257,8 @@ body {
   flex-direction: column;
   align-items: flex-start;
   justify-content: flex-start;
-  gap: 10px;
-  padding: 16px 18px;
+  gap: 9px;
+  padding: 15px 16px 15px 18px;
   text-align: left;
 }
 
@@ -2164,7 +2273,7 @@ body {
   font-size: 1rem !important;
   font-weight: 600 !important;
   line-height: 1.3 !important;
-  letter-spacing: -0.005em !important;
+  letter-spacing: 0 !important;
 }
 
 .chat-starter-card-copy {
@@ -2177,23 +2286,30 @@ body {
   display: inline-flex;
   align-items: center;
   min-height: 18px;
-  padding: 3px 8px;
-  border-radius: 0;
-  border: 1px solid rgba(255, 255, 255, 0.12) !important;
-  background: rgba(255, 255, 255, 0.025) !important;
-  color: rgba(220, 226, 232, 0.65) !important;
+  padding: 3px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 242, 176, 0.16) !important;
+  background: rgba(120, 242, 176, 0.055) !important;
+  color: rgba(220, 234, 226, 0.8) !important;
   font-family: var(--font-mono);
   font-size: 0.6rem;
   font-weight: 600;
-  letter-spacing: 0.14em;
+  letter-spacing: 0;
   line-height: 1;
   text-transform: uppercase;
   white-space: nowrap;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+.chat-starter-card:hover .chat-starter-tag {
+  border-color: rgba(120, 242, 176, 0.28) !important;
+  background: rgba(120, 242, 176, 0.09) !important;
 }
 
 .chat-starter-tag.research {
-  color: rgba(220, 226, 232, 0.88) !important;
-  border-color: rgba(255, 255, 255, 0.2) !important;
+  color: rgba(120, 242, 176, 0.9) !important;
+  border-color: rgba(120, 242, 176, 0.3) !important;
+  background: rgba(120, 242, 176, 0.08) !important;
 }
 
 .chat-starter-actions {
@@ -2208,11 +2324,11 @@ body {
   font-family: var(--font-mono) !important;
   font-size: 0.66rem !important;
   font-weight: 600 !important;
-  letter-spacing: 0.18em !important;
+  letter-spacing: 0 !important;
   color: rgba(220, 226, 232, 0.7) !important;
   background: rgba(255, 255, 255, 0.025) !important;
   border: 1px solid rgba(255, 255, 255, 0.1) !important;
-  border-radius: 0 !important;
+  border-radius: 8px !important;
   padding: 6px 14px !important;
   min-height: 28px !important;
   transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
@@ -2238,7 +2354,7 @@ body {
   flex-direction: column;
   gap: 12px;
   padding-top: 14px;
-  border-top: 1px dashed rgba(255, 255, 255, 0.07);
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
 }
 
 .chat-starter-advanced-actions {
@@ -2259,7 +2375,7 @@ body {
   font-family: var(--font-mono) !important;
   font-size: 0.66rem !important;
   font-weight: 600 !important;
-  letter-spacing: 0.18em !important;
+  letter-spacing: 0 !important;
   text-transform: uppercase;
   line-height: 1.2 !important;
 }
@@ -4709,6 +4825,10 @@ body {
   border-top: 1px solid var(--ui-rgba-255-255-255-060);
 }
 
+.activity-payload-raw-body {
+  margin-top: 8px;
+}
+
 .activity-payload-body-label {
   display: block;
   margin: 8px 0 6px;
@@ -4721,6 +4841,17 @@ body {
   display: grid;
   gap: 6px;
   padding: 2px 0 4px;
+}
+
+.activity-payload-readable-fields {
+  margin-top: 6px;
+  padding-top: 7px;
+  border-top: 1px solid var(--ui-rgba-255-255-255-050);
+}
+
+.activity-payload-readable-copy {
+  margin: 7px 0 0 !important;
+  color: var(--text-secondary) !important;
 }
 
 .activity-payload-field {
@@ -6219,22 +6350,98 @@ body {
   -webkit-backdrop-filter: blur(18px) saturate(135%);
 }
 
+@keyframes planCardGlow {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px rgba(54, 245, 184, 0.10),
+      0 0 24px -4px rgba(54, 245, 184, 0.06),
+      inset 0 1px 0 var(--ui-rgba-255-255-255-040);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px rgba(54, 245, 184, 0.22),
+      0 0 28px -2px rgba(54, 245, 184, 0.16),
+      inset 0 1px 0 var(--ui-rgba-255-255-255-060);
+  }
+}
+
+@keyframes planScanLine {
+  0% { transform: translateX(-100%); opacity: 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { transform: translateX(380%); opacity: 0; }
+}
+
+@keyframes planStepRise {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes planOrbBreathe {
+  0%, 100% {
+    box-shadow:
+      0 0 0 0 rgba(54, 245, 184, 0.32),
+      0 0 8px rgba(54, 245, 184, 0.20);
+  }
+  50% {
+    box-shadow:
+      0 0 0 4px rgba(54, 245, 184, 0.10),
+      0 0 14px rgba(54, 245, 184, 0.34);
+  }
+}
+
+@keyframes planRunningRing {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes planConnectorFlow {
+  0% { background-position: 0% -100%; }
+  100% { background-position: 0% 100%; }
+}
+
+@keyframes planMeterShimmer {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(310%); }
+}
+
 .chat-plan-confirmation-card {
+  position: relative;
   margin-top: 4px;
-  padding: 14px 14px 12px;
-  border: 1px solid var(--ui-rgba-255-255-255-120);
-  border-radius: 8px;
-  background: var(--ui-rgba-24-24-24-980);
-  box-shadow: inset 0 1px 0 var(--ui-rgba-255-255-255-030);
+  padding: 16px 16px 14px;
+  border: 1px solid rgba(54, 245, 184, 0.10);
+  border-radius: 12px;
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(54, 245, 184, 0.045) 0%, transparent 55%),
+    linear-gradient(180deg, rgba(20, 26, 24, 0.96), rgba(13, 17, 16, 0.98));
+  box-shadow:
+    0 0 0 1px rgba(54, 245, 184, 0.10),
+    0 0 24px -4px rgba(54, 245, 184, 0.06),
+    inset 0 1px 0 var(--ui-rgba-255-255-255-040);
+  overflow: hidden;
+  animation: planCardGlow 4.2s ease-in-out infinite;
+}
+
+.chat-plan-confirmation-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 1px;
+  width: 28%;
+  background: linear-gradient(90deg, transparent, rgba(54, 245, 184, 0.85), transparent);
+  animation: planScanLine 3.6s ease-in-out infinite;
+  pointer-events: none;
+  z-index: 2;
 }
 
 .chat-plan-confirmation-card.thread {
   margin-top: 0;
-  width: min(100%, 500px);
+  width: min(100%, 540px);
 }
 
 .chat-plan-confirmation-card.editing {
-  border-color: var(--ui-rgba-255-255-255-180);
+  border-color: rgba(54, 245, 184, 0.28);
 }
 
 .chat-plan-confirmation-card .MuiInputBase-root {
@@ -6355,32 +6562,55 @@ body {
 }
 
 .chat-plan-confirmation-step-list {
-  margin-top: 2px;
+  position: relative;
+  margin-top: 4px;
+}
+
+.chat-plan-confirmation-step-list::before {
+  content: "";
+  position: absolute;
+  left: 8.5px;
+  top: 16px;
+  bottom: 16px;
+  width: 1px;
+  background:
+    linear-gradient(180deg,
+      rgba(54, 245, 184, 0.38) 0%,
+      rgba(54, 245, 184, 0.10) 40%,
+      rgba(54, 245, 184, 0.10) 100%);
+  background-size: 1px 220%;
+  animation: planConnectorFlow 5.5s linear infinite;
+  pointer-events: none;
+  opacity: 0.55;
+}
+
+.chat-plan-confirmation-step-list:not(.live)::before {
+  opacity: 0.32;
+  animation: none;
 }
 
 .chat-plan-confirmation-step {
+  position: relative;
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  padding: 0;
+  padding: 4px 0;
   border: none;
   border-radius: 0;
   background: transparent;
+  animation: planStepRise 0.42s ease-out backwards;
 }
+
+.chat-plan-confirmation-step:nth-child(1) { animation-delay: 0.00s; }
+.chat-plan-confirmation-step:nth-child(2) { animation-delay: 0.05s; }
+.chat-plan-confirmation-step:nth-child(3) { animation-delay: 0.10s; }
+.chat-plan-confirmation-step:nth-child(4) { animation-delay: 0.15s; }
+.chat-plan-confirmation-step:nth-child(5) { animation-delay: 0.20s; }
+.chat-plan-confirmation-step:nth-child(6) { animation-delay: 0.25s; }
+.chat-plan-confirmation-step:nth-child(7) { animation-delay: 0.30s; }
+.chat-plan-confirmation-step:nth-child(8) { animation-delay: 0.35s; }
 
 .chat-plan-confirmation-step.live {
-  background: transparent;
-}
-
-.chat-plan-confirmation-step.live.running {
-  background: transparent;
-}
-
-.chat-plan-confirmation-step.live.completed {
-  background: transparent;
-}
-
-.chat-plan-confirmation-step.live.failed {
   background: transparent;
 }
 
@@ -6389,85 +6619,176 @@ body {
 }
 
 .chat-plan-confirmation-step.disabled {
-  opacity: 0.56;
+  opacity: 0.48;
 }
 
 .chat-plan-confirmation-step-marker {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   width: 18px;
   height: 18px;
   border-radius: 999px;
-  background: transparent;
-  border: 1px solid var(--ui-rgba-255-255-255-160);
-  color: var(--ui-rgba-205-205-212-840);
-  font-size: 0.64rem;
+  background: radial-gradient(circle at 32% 30%, rgba(255, 255, 255, 0.16), rgba(54, 245, 184, 0.08) 60%, rgba(13, 17, 16, 1));
+  border: 1px solid rgba(54, 245, 184, 0.28);
+  color: rgba(220, 240, 232, 0.88);
+  font-size: 0.66rem;
   font-weight: 500;
   flex: 0 0 auto;
-  margin-top: 2px;
+  margin-top: 3px;
+  z-index: 1;
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
 }
 
 .chat-plan-confirmation-step-marker.pending {
-  border-color: var(--ui-rgba-255-255-255-180);
+  border-color: rgba(54, 245, 184, 0.22);
+  box-shadow: 0 0 8px -3px rgba(54, 245, 184, 0.16);
 }
 
 .chat-plan-confirmation-step-marker.editing {
   width: 20px;
   height: 20px;
-  margin-top: 1px;
+  margin-top: 2px;
 }
 
 .chat-plan-confirmation-step-dot {
   width: 4px;
   height: 4px;
   border-radius: 999px;
-  background: var(--ui-rgba-208-208-214-720);
+  background: rgba(54, 245, 184, 0.78);
+  box-shadow: 0 0 6px rgba(54, 245, 184, 0.55);
 }
 
 .chat-plan-confirmation-step-marker.live {
-  background: transparent;
+  background: radial-gradient(circle at 32% 30%, rgba(255, 255, 255, 0.18), rgba(54, 245, 184, 0.10) 60%, rgba(13, 17, 16, 1));
 }
 
 .chat-plan-confirmation-step-marker.live.running {
-  border-color: var(--ui-rgba-255-255-255-240);
-  color: var(--ui-rgba-237-237-242-940);
-  box-shadow: 0 0 0 3px var(--ui-rgba-104-196-255-080);
+  border-color: rgba(54, 245, 184, 0.72);
+  color: rgba(232, 255, 245, 0.98);
+  background: radial-gradient(circle at 32% 30%, rgba(255, 255, 255, 0.32), rgba(54, 245, 184, 0.32) 60%, rgba(13, 17, 16, 1));
+  animation: planOrbBreathe 1.8s ease-in-out infinite;
+}
+
+.chat-plan-confirmation-step-marker.live.running::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  border-top-color: rgba(54, 245, 184, 0.92);
+  border-right-color: rgba(54, 245, 184, 0.36);
+  animation: planRunningRing 1.4s linear infinite;
+  pointer-events: none;
 }
 
 .chat-plan-confirmation-step-marker.live.completed {
-  border-color: var(--ui-rgba-154-211-173-340);
-  color: var(--ui-rgba-205-235-215-940);
+  border-color: rgba(54, 245, 184, 0.6);
+  color: rgba(214, 252, 234, 0.96);
+  background: radial-gradient(circle at 32% 30%, rgba(255, 255, 255, 0.20), rgba(54, 245, 184, 0.22) 70%, rgba(13, 17, 16, 1));
+  box-shadow: 0 0 12px -2px rgba(54, 245, 184, 0.42);
 }
 
 .chat-plan-confirmation-step-marker.live.failed {
-  border-color: var(--ui-rgba-221-143-143-340);
-  color: var(--ui-rgba-244-210-210-960);
+  border-color: rgba(252, 134, 134, 0.6);
+  color: rgba(252, 220, 220, 0.96);
+  background: radial-gradient(circle at 32% 30%, rgba(255, 255, 255, 0.16), rgba(252, 80, 80, 0.20) 70%, rgba(13, 17, 16, 1));
 }
 
 .chat-plan-confirmation-step-marker.disabled {
-  border-color: var(--ui-rgba-255-255-255-100);
-  color: var(--ui-rgba-170-170-178-700);
+  border-color: rgba(255, 255, 255, 0.08);
+  color: rgba(170, 170, 178, 0.6);
+  box-shadow: none;
+  opacity: 0.6;
 }
 
 .chat-plan-confirmation-step-title {
-  color: var(--ui-rgba-241-241-243-950) !important;
-  font-weight: 400 !important;
-  font-size: 0.97rem !important;
+  color: rgba(244, 248, 246, 0.96) !important;
+  font-weight: 500 !important;
+  font-size: 0.94rem !important;
   line-height: 1.4 !important;
+  letter-spacing: -0.005em;
 }
 
 .chat-plan-confirmation-step.disabled .chat-plan-confirmation-step-title {
-  color: var(--ui-rgba-184-184-192-700) !important;
+  color: rgba(184, 184, 192, 0.66) !important;
   text-decoration: line-through;
 }
 
 .chat-plan-confirmation-step-detail {
   display: block;
+  color: rgba(180, 195, 188, 0.78) !important;
+  font-size: 0.76rem !important;
+  line-height: 1.42 !important;
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  margin-top: 0;
+  transition: max-height 0.32s ease, opacity 0.24s ease, margin-top 0.24s ease;
+}
+
+.chat-plan-confirmation-step.expanded .chat-plan-confirmation-step-detail {
+  max-height: 320px;
+  opacity: 1;
   margin-top: 6px;
-  color: var(--ui-rgba-173-173-180-720) !important;
-  font-size: 0.73rem !important;
-  line-height: 1.38 !important;
+}
+
+.chat-plan-confirmation-step-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 2px 8px 2px 4px;
+  border: none;
+  background: transparent;
+  color: rgba(180, 195, 188, 0.62);
+  font-family: inherit;
+  font-size: 0.72rem;
+  line-height: 1.2;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: color 0.2s ease, background 0.2s ease;
+}
+
+.chat-plan-confirmation-step-toggle:hover {
+  color: rgba(54, 245, 184, 0.96);
+  background: rgba(54, 245, 184, 0.06);
+}
+
+.chat-plan-confirmation-step-toggle-icon {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.24s ease;
+  margin-top: -2px;
+}
+
+.chat-plan-confirmation-step.expanded .chat-plan-confirmation-step-toggle-icon {
+  transform: rotate(45deg);
+  margin-top: -4px;
+}
+
+.chat-plan-confirmation-progress {
+  position: relative;
+  height: 2px;
+  margin-top: 2px;
+  border-radius: 999px;
+  background: rgba(54, 245, 184, 0.08);
+  overflow: hidden;
+}
+
+.chat-plan-confirmation-progress-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 38%;
+  background: linear-gradient(90deg, rgba(54, 245, 184, 0), rgba(54, 245, 184, 0.82), rgba(54, 245, 184, 0));
+  animation: planMeterShimmer 2.0s ease-in-out infinite;
 }
 
 .chat-plan-confirmation-step-status {
@@ -6545,41 +6866,70 @@ body {
 
 .chat-plan-confirmation-action {
   min-width: 0 !important;
-  padding: 6px 14px !important;
+  padding: 6px 16px !important;
   border-radius: 999px !important;
   text-transform: none !important;
   font-size: 0.84rem !important;
   font-weight: 500 !important;
   line-height: 1.1 !important;
   box-shadow: none !important;
+  transition: all 0.2s ease !important;
 }
 
 .chat-plan-confirmation-action.ghost {
-  border-color: var(--ui-rgba-255-255-255-140) !important;
-  color: var(--ui-rgba-236-236-239-920) !important;
-  background: var(--ui-rgba-255-255-255-010) !important;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+  color: rgba(220, 230, 226, 0.72) !important;
+  background: transparent !important;
 }
 
 .chat-plan-confirmation-action.ghost:hover {
-  border-color: var(--ui-rgba-255-255-255-220) !important;
-  background: var(--ui-rgba-255-255-255-040) !important;
+  border-color: rgba(54, 245, 184, 0.34) !important;
+  color: rgba(54, 245, 184, 0.96) !important;
+  background: rgba(54, 245, 184, 0.06) !important;
 }
 
 .chat-plan-confirmation-action.primary {
-  color: var(--button-text-strong) !important;
-  background: var(--button-bg-primary) !important;
-  border-color: var(--ui-rgba-158-185-212-240) !important;
-  box-shadow: var(--button-shadow-primary) !important;
+  color: rgba(232, 255, 245, 0.98) !important;
+  background: linear-gradient(180deg, rgba(54, 245, 184, 0.22), rgba(34, 195, 144, 0.32)) !important;
+  border: 1px solid rgba(54, 245, 184, 0.42) !important;
+  box-shadow:
+    0 0 16px -4px rgba(54, 245, 184, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10) !important;
 }
 
 .chat-plan-confirmation-action.primary:hover {
-  background: var(--button-bg-primary-hover) !important;
-  border-color: var(--ui-rgba-173-199-224-300) !important;
-  box-shadow: var(--button-shadow-hover) !important;
+  background: linear-gradient(180deg, rgba(54, 245, 184, 0.32), rgba(34, 195, 144, 0.42)) !important;
+  border-color: rgba(54, 245, 184, 0.70) !important;
+  box-shadow:
+    0 0 22px -2px rgba(54, 245, 184, 0.56),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14) !important;
+  transform: translateY(-0.5px);
+}
+
+.chat-plan-confirmation-action.primary:disabled {
+  opacity: 0.5;
+  box-shadow: none !important;
+  transform: none;
 }
 
 .chat-plan-confirmation-action.text {
-  color: var(--ui-rgba-178-178-186-880) !important;
+  color: rgba(178, 192, 186, 0.85) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-plan-confirmation-card,
+  .chat-plan-confirmation-card::before,
+  .chat-plan-confirmation-step-list::before,
+  .chat-plan-confirmation-step,
+  .chat-plan-confirmation-step-marker.live.running,
+  .chat-plan-confirmation-step-marker.live.running::after,
+  .chat-plan-confirmation-progress-fill {
+    animation: none !important;
+  }
+  .chat-plan-confirmation-step {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .chat-bubble-plan-confirmation {
@@ -6650,6 +7000,10 @@ body {
   padding-top: 2px;
 }
 
+.chat-composer-shell.chat-composer-shell-centered .chat-composer-inline-tools {
+  flex-wrap: wrap;
+}
+
 .chat-composer-textarea {
   width: 100%;
   align-self: center;
@@ -6707,6 +7061,75 @@ body {
   align-items: center;
   gap: 4px;
   white-space: nowrap;
+}
+
+.chat-composer-inline-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.chat-composer-tool-btn.MuiButton-root {
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: 8px !important;
+  border-color: rgba(120, 242, 176, 0.18) !important;
+  background:
+    linear-gradient(180deg, rgba(120, 242, 176, 0.052), rgba(18, 22, 20, 0.32)),
+    rgba(8, 10, 10, 0.72) !important;
+  color: rgba(246, 240, 232, 0.82) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 0.72rem !important;
+  font-weight: 650 !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+
+.chat-composer-tool-btn.MuiButton-root:hover {
+  border-color: rgba(120, 242, 176, 0.32) !important;
+  background:
+    linear-gradient(180deg, rgba(120, 242, 176, 0.092), rgba(18, 22, 20, 0.44)),
+    rgba(10, 13, 12, 0.82) !important;
+  color: rgba(255, 248, 237, 0.95) !important;
+}
+
+.chat-composer-tool-btn.MuiButton-root.is-active {
+  border-color: rgba(54, 245, 184, 0.42) !important;
+  background:
+    linear-gradient(180deg, rgba(120, 242, 176, 0.16), rgba(16, 30, 24, 0.64)),
+    rgba(7, 14, 11, 0.86) !important;
+  color: rgba(255, 248, 237, 0.96) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 0 16px rgba(54, 245, 184, 0.12) !important;
+}
+
+.chat-composer-tool-btn .MuiButton-startIcon {
+  margin-right: 5px;
+}
+
+@media (max-width: 720px) {
+  .chat-composer-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chat-composer-actions {
+    grid-column: 1 / -1;
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .chat-composer-inline-tools {
+    flex: 1 1 auto;
+  }
+
+  .chat-composer-tool-btn.MuiButton-root {
+    flex: 1 1 0;
+    padding: 0 7px;
+  }
 }
 
 .chat-composer-action-btn {
@@ -7313,6 +7736,50 @@ body {
   display: block;
 }
 
+.companion-status-summary {
+  display: block;
+}
+
+.companion-mobile-access {
+  display: block;
+}
+
+.companion-access-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.companion-access-card {
+  min-width: 0;
+  min-height: 118px;
+  padding: 11px 12px;
+  border: 1px solid var(--ui-rgba-255-255-255-075);
+  border-radius: 8px;
+  background: var(--ui-rgba-255-255-255-025);
+}
+
+.companion-access-card svg {
+  color: var(--ui-rgba-57-208-255-900);
+  flex: 0 0 auto;
+}
+
+.companion-access-meta,
+.companion-access-channel {
+  margin-top: 7px !important;
+  font-size: 0.72rem !important;
+  line-height: 1.35 !important;
+  color: var(--ui-rgba-244-245-247-900) !important;
+  overflow-wrap: anywhere;
+}
+
+.companion-access-channel {
+  margin-top: 0 !important;
+  min-width: 0;
+  font-weight: 650 !important;
+}
+
 .companion-pairing-start-icon {
   display: grid;
   place-items: center;
@@ -7427,11 +7894,10 @@ body {
 
 .companion-devices-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(320px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   grid-template-areas:
-    "devices command"
-    "approvals history"
-    "audit audit";
+    "devices"
+    "advanced";
   gap: 12px;
   align-items: start;
   min-width: 0;
@@ -7464,6 +7930,39 @@ body {
 
 .companion-panel-audit {
   grid-area: audit;
+}
+
+.companion-advanced {
+  grid-area: advanced;
+  min-width: 0;
+  color: inherit !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.companion-advanced::before {
+  display: none;
+}
+
+.companion-advanced .MuiAccordionSummary-root {
+  min-height: 48px;
+  padding: 0 12px;
+  border: 1px solid var(--ui-rgba-255-255-255-075);
+  border-radius: 8px;
+  background: linear-gradient(180deg, var(--ui-rgba-255-255-255-025), var(--ui-rgba-255-255-255-012));
+}
+
+.companion-advanced .MuiAccordionSummary-root.Mui-expanded {
+  min-height: 48px;
+}
+
+.companion-advanced .MuiAccordionSummary-content,
+.companion-advanced .MuiAccordionSummary-content.Mui-expanded {
+  margin: 8px 0;
+}
+
+.companion-advanced .MuiAccordionDetails-root {
+  padding: 10px 0 0;
 }
 
 .companion-panel .MuiTypography-h6 {
@@ -7510,10 +8009,7 @@ body {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
       "devices"
-      "command"
-      "approvals"
-      "history"
-      "audit";
+      "advanced";
   }
 
   .companion-metric-strip {
@@ -7522,6 +8018,10 @@ body {
 
   .companion-guide-steps {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .companion-access-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .companion-connect-card {
@@ -8255,6 +8755,193 @@ body {
   border-radius: 8px;
   padding: 11px 12px;
   background: linear-gradient(180deg, var(--ui-rgba-24-24-28-920), var(--ui-rgba-15-15-18-880));
+}
+
+.browser-profile-panel-shell {
+  overflow: hidden;
+  border: 1px solid var(--arkcore-panel-border, rgba(255, 255, 255, 0.06));
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.024), rgba(255, 255, 255, 0.006)),
+    rgba(9, 10, 11, 0.64);
+}
+
+.browser-profile-panel-head {
+  padding: 13px 16px 12px;
+  border-bottom: 1px solid var(--arkcore-panel-border, rgba(255, 255, 255, 0.06));
+}
+
+.browser-profile-empty-state {
+  padding: 30px 16px;
+}
+
+.browser-profile-row-list {
+  display: grid;
+  min-width: 0;
+}
+
+.browser-profile-row {
+  display: grid;
+  grid-template-columns: 4px minmax(230px, 1fr) minmax(136px, 0.34fr) max-content;
+  gap: 14px;
+  align-items: center;
+  min-width: 0;
+  min-height: 78px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.055);
+  background: rgba(255, 255, 255, 0.012);
+  cursor: pointer;
+  transition: background 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.browser-profile-row:last-child {
+  border-bottom: 0;
+}
+
+.browser-profile-row:hover,
+.browser-profile-row:focus-visible {
+  background: rgba(120, 242, 176, 0.045);
+  outline: none;
+}
+
+.browser-profile-row.is-selected {
+  background: rgba(120, 242, 176, 0.055);
+  box-shadow: inset 0 0 0 1px rgba(120, 242, 176, 0.12);
+}
+
+.browser-profile-row-rail {
+  width: 4px;
+  height: 46px;
+  border-radius: 999px;
+  background: rgba(174, 180, 190, 0.38);
+}
+
+.browser-profile-row-rail--available {
+  background: rgba(120, 242, 176, 0.82);
+}
+
+.browser-profile-row-rail--running {
+  background: rgba(124, 231, 255, 0.88);
+}
+
+.browser-profile-row-rail--locked,
+.browser-profile-row-rail--manual_login {
+  background: rgba(255, 205, 116, 0.84);
+}
+
+.browser-profile-row-rail--error {
+  background: rgba(255, 112, 112, 0.9);
+}
+
+.browser-profile-row-main {
+  min-width: 0;
+}
+
+.browser-profile-row-name {
+  max-width: min(340px, 100%);
+  font-weight: 700 !important;
+  letter-spacing: 0 !important;
+  color: rgba(248, 250, 252, 0.96);
+}
+
+.browser-profile-row-target {
+  display: block;
+  max-width: 100%;
+  margin-top: 2px !important;
+  color: rgba(226, 218, 208, 0.5);
+}
+
+.browser-profile-row-detail {
+  display: -webkit-box;
+  max-width: 100%;
+  margin-top: 5px !important;
+  overflow: hidden;
+  color: rgba(226, 218, 208, 0.68);
+  line-height: 1.38 !important;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.browser-profile-row .MuiChip-root {
+  height: 22px;
+  border-radius: 999px;
+  font-size: 0.64rem;
+  font-weight: 650;
+}
+
+.browser-profile-row-meta {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 10px;
+  row-gap: 4px;
+  align-items: center;
+  min-width: 0;
+  color: rgba(226, 218, 208, 0.68);
+  font-family: var(--font-mono);
+  font-size: 0.67rem;
+}
+
+.browser-profile-row-meta-label {
+  color: rgba(226, 218, 208, 0.42);
+  text-transform: uppercase;
+}
+
+.browser-profile-row-meta-value {
+  min-width: 0;
+  color: rgba(248, 250, 252, 0.84);
+  white-space: nowrap;
+}
+
+.browser-profile-row-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  max-width: 520px;
+}
+
+.browser-profile-row-actions .MuiButton-root {
+  min-height: 28px;
+  border-radius: 7px;
+  padding: 3px 8px;
+  font-size: 0.72rem;
+  line-height: 1.2;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.browser-profile-row-actions .MuiButton-startIcon {
+  margin-right: 4px;
+}
+
+@media (max-width: 1180px) {
+  .browser-profile-row {
+    grid-template-columns: 4px minmax(0, 1fr) minmax(120px, 0.4fr);
+  }
+
+  .browser-profile-row-actions {
+    grid-column: 2 / -1;
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 720px) {
+  .browser-profile-row {
+    grid-template-columns: 4px minmax(0, 1fr);
+    gap: 9px 12px;
+    padding: 12px;
+  }
+
+  .browser-profile-row-meta,
+  .browser-profile-row-actions {
+    grid-column: 2 / -1;
+  }
+
+  .browser-profile-row-meta {
+    grid-template-columns: max-content minmax(0, 1fr);
+  }
+
+  .browser-profile-row-actions .MuiButton-root {
+    flex: 1 1 126px;
+  }
 }
 
 .skill-test-error {
@@ -9518,6 +10205,13 @@ body {
   .chat-empty-brand {
     justify-content: center;
   }
+  .chat-empty-early-access {
+    grid-template-columns: 20px minmax(0, 1fr) 28px;
+  }
+  .chat-empty-early-access-close.MuiIconButton-root {
+    grid-column: 3 / 4;
+    grid-row: 1 / 2;
+  }
   .chat-starter-grid,
   .chat-starter-grid-expanded {
     grid-template-columns: minmax(0, 1fr);
@@ -10320,6 +11014,7 @@ body {
 .MuiChip-root,
 .chat-mode-toggle-btn,
 .chat-composer-action-btn,
+.chat-composer-tool-btn,
 .chat-composer-send-btn,
 .chat-composer-stop-btn,
 .workspace-scope-menu-trigger,
@@ -10343,10 +11038,34 @@ body {
   box-shadow: var(--button-shadow-hover) !important;
 }
 
+.MuiButton-root.Mui-disabled,
+.MuiButton-contained.Mui-disabled,
+.MuiButton-outlined.Mui-disabled,
+.MuiButton-text.Mui-disabled {
+  opacity: 0.42 !important;
+  cursor: not-allowed !important;
+  color: rgba(190, 198, 208, 0.42) !important;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+  background: rgba(255, 255, 255, 0.025) !important;
+  box-shadow: none !important;
+  filter: grayscale(0.65) saturate(0.45) !important;
+}
+
+.MuiButton-root.Mui-disabled:hover,
+.MuiButton-contained.Mui-disabled:hover,
+.MuiButton-outlined.Mui-disabled:hover,
+.MuiButton-text.Mui-disabled:hover {
+  color: rgba(190, 198, 208, 0.42) !important;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+  background: rgba(255, 255, 255, 0.025) !important;
+  box-shadow: none !important;
+}
+
 .MuiButton-outlined,
 .MuiButton-text,
 .chat-mode-toggle-btn,
 .chat-composer-action-btn,
+.chat-composer-tool-btn,
 .settings-nav-btn {
   border-color: rgba(255, 255, 255, 0.11) !important;
   background: rgba(255, 255, 255, 0.025) !important;
@@ -10357,6 +11076,7 @@ body {
 .MuiButton-text:hover,
 .chat-mode-toggle-btn:hover,
 .chat-composer-action-btn:hover,
+.chat-composer-tool-btn:hover,
 .settings-nav-btn:hover:not(.active) {
   border-color: rgba(120, 242, 176, 0.22) !important;
   background: rgba(255, 255, 255, 0.055) !important;
@@ -11558,7 +12278,7 @@ select,
 .chat-agent-transcript {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 5px;
   width: min(100%, 72ch);
 }
 
@@ -11595,27 +12315,22 @@ select,
 .chat-transcript-action-row {
   appearance: none;
   width: 100%;
-  min-height: 42px;
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto 16px;
+  min-height: 28px;
+  display: flex;
   align-items: center;
-  gap: 8px;
-  border-radius: 8px;
-  border: 1px solid rgba(120, 242, 176, 0.16);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.006)),
-    rgba(10, 10, 10, 0.5);
-  color: rgba(246, 240, 232, 0.92);
-  padding: 8px 9px;
+  gap: 7px;
+  border-radius: 6px;
+  border: 0;
+  background: transparent;
+  color: rgba(235, 238, 244, 0.84);
+  padding: 3px 0;
   text-align: left;
   cursor: pointer;
 }
 
 .chat-transcript-action-row:hover {
-  border-color: rgba(120, 242, 176, 0.3);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
-    rgba(18, 18, 18, 0.62);
+  background: transparent;
+  color: rgba(248, 250, 252, 0.94);
 }
 
 .chat-transcript-reasoning-row {
@@ -11646,7 +12361,7 @@ select,
   align-items: center;
   justify-content: center;
   color: rgba(120, 242, 176, 0.76);
-  font-size: 16px;
+  font-size: 15px;
 }
 
 .chat-transcript-running-indicator {
@@ -11684,15 +12399,16 @@ select,
   display: flex;
   align-items: baseline;
   gap: 7px;
+  flex: 0 1 auto;
   color: inherit;
   font-family: var(--font-sans);
-  font-size: 0.76rem;
+  font-size: 0.77rem;
   line-height: 1.35;
 }
 
 .chat-transcript-action-title {
   flex: 0 0 auto;
-  max-width: min(44%, 180px);
+  max-width: min(58%, 260px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -11714,11 +12430,13 @@ select,
   font-weight: 500;
 }
 
-.chat-transcript-action-count {
+.chat-transcript-action-count,
+.chat-transcript-action-status {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 20px;
+  flex: 0 0 auto;
+  min-width: 0;
   height: 18px;
   border-radius: 999px;
   border: 1px solid rgba(120, 242, 176, 0.16);
@@ -11727,10 +12445,12 @@ select,
   font-family: var(--font-mono);
   font-size: 10px;
   line-height: 1;
+  padding: 0 7px;
+  text-transform: lowercase;
 }
 
 .chat-transcript-action-chevron {
-  justify-self: end;
+  flex: 0 0 auto;
   color: rgba(226, 218, 208, 0.46);
   font-size: 16px !important;
   transition: transform 180ms ease, color 180ms ease;
@@ -15709,7 +16429,7 @@ select,
   top: 18px;
   right: 18px;
   bottom: 18px;
-  width: min(430px, calc(100vw - 44px));
+  width: min(520px, calc(100vw - 44px));
   border: 1px solid rgba(54, 245, 184, 0.2);
   border-radius: 12px;
   overflow: hidden;
@@ -16720,8 +17440,9 @@ select,
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(92px, 34%) minmax(0, 1fr);
-  gap: 0.55rem;
+  grid-template-columns: minmax(180px, 236px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0.65rem;
 }
 .orbit-chat-files-list {
   min-height: 0;
@@ -16814,13 +17535,19 @@ select,
   flex: 1 1 auto;
   min-height: 0;
   margin: 0;
-  padding: 0.65rem;
+  padding: 0.85rem 0.95rem 1rem;
   overflow: auto;
   color: rgba(237, 247, 244, 0.88);
   font-family: var(--font-mono);
-  font-size: 0.68rem;
-  line-height: 1.5;
+  font-size: 0.72rem;
+  line-height: 1.58;
   white-space: pre;
+}
+@media (max-width: 760px) {
+  .orbit-chat-files-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(88px, 26%) minmax(0, 1fr);
+  }
 }
 .orbit-chat-messages {
   flex: 1 1 auto;
@@ -17555,6 +18282,11 @@ select,
    a stable measure in both plain chat and Run Details split view. */
 .chat-shell {
   --chat-response-max-width: min(100%, clamp(640px, 56vw, 860px));
+  --chat-response-font-size: 0.86rem;
+  --chat-response-heading-1-size: 1.08rem;
+  --chat-response-heading-2-size: 0.98rem;
+  --chat-response-heading-3-size: 0.93rem;
+  --chat-response-heading-small-size: 0.89rem;
 }
 
 .chat-shell.chat-shell-console-open {
@@ -17583,7 +18315,13 @@ select,
 }
 
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown {
+  font-size: var(--chat-response-font-size) !important;
   line-height: 1.58 !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown p,
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown li {
+  font-size: var(--chat-response-font-size) !important;
 }
 
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown > * + * {
@@ -17602,6 +18340,24 @@ select,
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h5,
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h6 {
   margin: 0.78rem 0 0.28rem !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h1 {
+  font-size: var(--chat-response-heading-1-size) !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h2 {
+  font-size: var(--chat-response-heading-2-size) !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h3 {
+  font-size: var(--chat-response-heading-3-size) !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h4,
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h5,
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h6 {
+  font-size: var(--chat-response-heading-small-size) !important;
 }
 
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown ul,
@@ -18033,6 +18789,278 @@ select,
   }
 }
 
+/* ============================================================
+   ArkCore unified page skin
+   Visual-only normalization across ArkCore pages. Keep page
+   behavior local; make shared surfaces, tabs, chips, and panels
+   read as one product system.
+   ============================================================ */
+
+:root {
+  --arkcore-page-bg: rgba(10, 10, 10, 0.54);
+  --arkcore-panel-bg:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.008)),
+    rgba(10, 10, 10, 0.58);
+  --arkcore-panel-bg-strong:
+    radial-gradient(ellipse at 18% 0%, rgba(120, 242, 176, 0.035), transparent 40%),
+    linear-gradient(180deg, rgba(22, 22, 24, 0.72), rgba(9, 9, 10, 0.66));
+  --arkcore-panel-border: rgba(255, 255, 255, 0.055);
+  --arkcore-panel-border-hover: rgba(120, 242, 176, 0.14);
+  --arkcore-panel-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
+  --arkcore-muted-text: rgba(226, 218, 208, 0.68);
+  --arkcore-faint-text: rgba(226, 218, 208, 0.46);
+  --arkcore-accent: rgba(120, 242, 176, 0.86);
+}
+
+.workspace-page-shell {
+  gap: 10px !important;
+}
+
+.workspace-page-hero-shell,
+.settings-page-header.workspace-page-hero-shell,
+.list-shell,
+.metadata-box,
+.micro-surface,
+.action-row,
+.accordion-shell,
+.diagnostics-stat-card,
+.diagnostics-chart-card,
+.diagnostics-content-card,
+.settings-inline-card,
+.mission-panel,
+.mission-side-panel,
+.mission-metric-card,
+.attention-card,
+.welcome-hero-card,
+.arkreflect-status,
+.arkreflect-panorama,
+.arkreflect-grid-pane,
+.arkreflect-motion-panel,
+.arkreflect-tab-strip,
+.arkpulse-page-shell .list-shell,
+.arkorbit-canvas-wrap,
+.arkorbit-frame-pane,
+.arkorbit-chat-flyout,
+.orbit-home-panel,
+.orbit-files-panel {
+  border: 1px solid var(--arkcore-panel-border) !important;
+  border-radius: 10px !important;
+  background: var(--arkcore-panel-bg) !important;
+  box-shadow: var(--arkcore-panel-shadow) !important;
+  backdrop-filter: blur(12px) saturate(1.03) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(1.03) !important;
+}
+
+.workspace-page-hero-shell,
+.settings-page-header.workspace-page-hero-shell,
+.arkreflect-tab-strip,
+.arkorbit-header {
+  background: var(--arkcore-panel-bg-strong) !important;
+}
+
+.list-shell:hover,
+.metadata-box[role="button"]:hover,
+.metadata-box.is-interactive:hover,
+.action-row:hover,
+.accordion-shell:hover,
+.settings-inline-card:hover,
+.mission-panel:hover,
+.attention-card:hover,
+.arkreflect-motion-panel:hover,
+.arkorbit-canvas-wrap:hover,
+.arkorbit-frame-pane:hover {
+  border-color: var(--arkcore-panel-border-hover) !important;
+}
+
+.workspace-page-kicker,
+.micro-surface-kicker,
+.settings-inline-card-kicker,
+.mission-metric-card__label,
+.stat-strip-label,
+.arkreflect-pill.MuiChip-root,
+.arkorbit-subtitle,
+.arkpulse-page-shell .MuiTypography-caption {
+  color: var(--arkcore-faint-text) !important;
+  font-family: var(--font-mono) !important;
+  letter-spacing: 0 !important;
+  text-transform: uppercase;
+}
+
+.workspace-page-title,
+.micro-surface-title,
+.settings-inline-card-title,
+.mission-metric-card__value,
+.stat-strip-value,
+.arkorbit-title {
+  color: var(--text-primary) !important;
+  letter-spacing: 0 !important;
+}
+
+.workspace-page-copy,
+.micro-surface-copy,
+.settings-inline-card-description,
+.mission-metric-card__detail,
+.mission-card-copy,
+.mission-detail-clamp,
+.stat-strip-helper,
+.arkorbit-subtitle {
+  color: var(--arkcore-muted-text) !important;
+}
+
+.stat-strip {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)) !important;
+  gap: 1px !important;
+  padding: 0 !important;
+  overflow: hidden;
+}
+
+.stat-strip-item {
+  min-height: 78px;
+  border: 0 !important;
+  border-right: 1px solid var(--arkcore-panel-border) !important;
+  border-top: 0 !important;
+  background: rgba(255, 255, 255, 0.018) !important;
+}
+
+.stat-strip-item:last-child {
+  border-right: 0 !important;
+}
+
+.workspace-page-subnav-shell,
+.arkreflect-tab-strip {
+  padding: 5px !important;
+}
+
+.workspace-page-subnav-tabs .MuiTab-root,
+.MuiTab-root,
+.arkreflect-tab-strip .MuiButton-root {
+  min-height: 34px !important;
+  border-radius: 7px !important;
+  text-transform: none !important;
+  font-size: 0.82rem !important;
+  font-weight: 600 !important;
+}
+
+.workspace-page-subnav-tabs .Mui-selected,
+.MuiTab-root.Mui-selected,
+.arkreflect-tab-strip .MuiButton-contained,
+.arkreflect-motion-panel > .MuiButton-contained {
+  background: rgba(120, 242, 176, 0.11) !important;
+  color: var(--text-primary) !important;
+  border-color: rgba(120, 242, 176, 0.18) !important;
+  box-shadow: none !important;
+}
+
+.arkreflect-status::before,
+.arkreflect-status::after,
+.arkreflect-narrative::before,
+.arkreflect-narrative::after,
+.arkreflect-panorama::before,
+.arkreflect-panorama::after,
+.arkreflect-grid-pane::before,
+.arkreflect-grid-pane::after,
+.arkreflect-motion-panel::before,
+.arkreflect-motion-panel::after,
+.arkreflect-pill.MuiChip-root::before,
+.arkreflect-pill.MuiChip-root::after,
+.arkorbit-shell::before,
+.arkorbit-canvas-wrap::before,
+.arkorbit-canvas-wrap::after,
+.arkorbit-chat-flyout::before,
+.arkorbit-chat-flyout::after,
+.arkorbit-toolbar-icon.MuiIconButton-root::before,
+.arkorbit-toolbar-icon.MuiIconButton-root::after,
+.arkorbit-new-button.MuiButton-root::before,
+.arkorbit-new-button.MuiButton-root::after,
+.arkorbit-orbit-menu-button.MuiButton-root::before,
+.arkorbit-orbit-menu-button.MuiButton-root::after {
+  content: none !important;
+  display: none !important;
+}
+
+.arkreflect-motion-panel,
+.arkreflect-tab-strip,
+.arkreflect-panorama-backdrop {
+  animation: none !important;
+}
+
+.arkreflect-panorama {
+  min-height: 430px !important;
+  overflow: hidden !important;
+}
+
+.arkreflect-pill.MuiChip-root {
+  height: 26px !important;
+  border-radius: 999px !important;
+  background: rgba(255, 255, 255, 0.035) !important;
+  border-color: var(--arkcore-panel-border) !important;
+  color: var(--arkcore-muted-text) !important;
+  box-shadow: none !important;
+}
+
+.arkorbit-shell {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
+.arkorbit-header {
+  border: 1px solid var(--arkcore-panel-border) !important;
+  border-radius: 10px !important;
+  padding: 8px 10px !important;
+  box-shadow: var(--arkcore-panel-shadow) !important;
+}
+
+.arkorbit-canvas-wrap {
+  background: var(--arkcore-page-bg) !important;
+}
+
+.arkorbit-toolbar-icon.MuiIconButton-root,
+.arkorbit-new-button.MuiButton-root,
+.arkorbit-orbit-menu-button.MuiButton-root,
+.arkorbit-switcher-chip,
+.arkorbit-chat-bubble.MuiIconButton-root,
+.arkorbit-chat-drag-handle.MuiIconButton-root {
+  border-radius: 8px !important;
+  border-color: var(--arkcore-panel-border) !important;
+  background: rgba(255, 255, 255, 0.03) !important;
+  box-shadow: none !important;
+}
+
+.arkorbit-switcher-chip-active,
+.arkorbit-toolbar-icon.MuiIconButton-root:hover,
+.arkorbit-new-button.MuiButton-root:hover,
+.arkorbit-orbit-menu-button.MuiButton-root:hover,
+.arkorbit-chat-bubble.MuiIconButton-root:hover,
+.arkorbit-chat-drag-handle.MuiIconButton-root:hover {
+  border-color: var(--arkcore-panel-border-hover) !important;
+  background: rgba(120, 242, 176, 0.075) !important;
+}
+
+.arkpulse-inline-result.MuiAlert-root {
+  border-radius: 10px !important;
+  border-color: var(--arkcore-panel-border) !important;
+  background: var(--arkcore-panel-bg) !important;
+}
+
+.mission-panel--hero,
+.welcome-hero-card {
+  min-height: auto;
+}
+
+.welcome-hero-typewriter-stage,
+.welcome-hero-command-deck,
+.mission-sparkline-shell {
+  border-color: var(--arkcore-panel-border) !important;
+  background: rgba(255, 255, 255, 0.024) !important;
+  box-shadow: none !important;
+}
+
+.MuiAlert-root {
+  border-radius: 10px !important;
+}
+
 .notification-popover-paper.MuiPaper-root {
   background: #111317 !important;
   background-image: none !important;
@@ -18051,6 +19079,59 @@ select,
 .notification-popover-paper .MuiListItemButton-root {
   background-image: none !important;
   box-shadow: none !important;
+}
+
+/* Orbit canvas must read as space even when no widgets are mounted. This
+   sits after the shared ArkCore panel overrides so the full canvas is not
+   flattened into a blank black/panel surface. */
+.arkorbit-canvas-wrap {
+  background-color: #02040a !important;
+  background-image:
+    radial-gradient(circle at 14% 18%, rgba(95, 215, 255, 0.16) 0 1px, transparent 2px),
+    radial-gradient(circle at 32% 68%, rgba(120, 242, 176, 0.14) 0 1px, transparent 2px),
+    radial-gradient(circle at 76% 24%, rgba(177, 132, 255, 0.16) 0 1px, transparent 2px),
+    radial-gradient(circle at 86% 72%, rgba(255, 214, 132, 0.12) 0 1px, transparent 2px),
+    radial-gradient(circle at 18% 30%, rgba(54, 245, 184, 0.11), transparent 30%),
+    radial-gradient(circle at 74% 18%, rgba(77, 151, 255, 0.12), transparent 28%),
+    radial-gradient(ellipse at 52% 92%, rgba(120, 242, 176, 0.08), transparent 42%),
+    linear-gradient(135deg, rgba(8, 14, 24, 0.98), rgba(3, 5, 11, 0.99) 48%, rgba(2, 4, 10, 1)) !important;
+  background-size:
+    180px 180px,
+    240px 240px,
+    300px 300px,
+    220px 220px,
+    auto,
+    auto,
+    auto,
+    auto !important;
+  background-position:
+    0 0,
+    42px 76px,
+    128px 20px,
+    18px 132px,
+    center,
+    center,
+    center,
+    center !important;
+}
+
+.arkorbit-frame-pane,
+.orbit-frame-shell,
+.orbit-frame-canvas {
+  background: transparent !important;
+}
+
+.orbit-frame-canvas::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(rgba(54, 245, 184, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(54, 245, 184, 0.026) 1px, transparent 1px);
+  background-size: 56px 56px, 56px 56px;
+  mask-image: radial-gradient(circle at 50% 44%, black 0, black 38%, transparent 75%);
+  opacity: 0.55;
 }
 
 /* Settings uses the AgentArk green control language; do not inherit the
@@ -18360,4 +19441,238 @@ select,
   font-size: 0.7rem;
   letter-spacing: 0.04em;
   color: rgba(120, 242, 176, 0.78);
+}
+
+/* Compact Orbit sidecar pass. Keep the panel useful for files, but make it
+   read like a slim HUD rail instead of a full-width console. */
+.arkorbit-chat-flyout {
+  width: min(520px, calc(100vw - 44px)) !important;
+  border-radius: 10px !important;
+  background: rgba(4, 6, 9, 0.94) !important;
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.42) !important;
+}
+
+.arkorbit-chat-drag-handle.MuiIconButton-root {
+  top: 7px !important;
+  width: 26px !important;
+  height: 26px !important;
+  border-radius: 7px !important;
+}
+
+.arkorbit-chat-drag-handle.MuiIconButton-root .MuiSvgIcon-root,
+.orbit-chat-tool.MuiIconButton-root .MuiSvgIcon-root,
+.orbit-chat-send-icon.MuiIconButton-root .MuiSvgIcon-root {
+  width: 16px;
+  height: 16px;
+}
+
+.orbit-chat-header {
+  min-height: 42px;
+  padding: 0.38rem 0.62rem !important;
+  gap: 0.5rem;
+}
+
+.orbit-chat-title {
+  font-size: 0.64rem !important;
+  letter-spacing: 0.07em !important;
+}
+
+.orbit-chat-subtitle {
+  font-size: 0.64rem !important;
+  gap: 0.32rem !important;
+  letter-spacing: 0.02em !important;
+}
+
+.orbit-chat-tool.MuiIconButton-root {
+  width: 28px !important;
+  height: 28px !important;
+  border-radius: 6px !important;
+}
+
+.orbit-chat-tabs {
+  gap: 0.25rem !important;
+  padding: 0.28rem 0.5rem 0 !important;
+}
+
+.orbit-chat-tab {
+  min-height: 25px !important;
+  padding: 0 0.5rem !important;
+  border-radius: 5px 5px 0 0 !important;
+  font-size: 0.67rem !important;
+}
+
+.orbit-chat-tab span {
+  min-width: 16px !important;
+  padding: 0 5px !important;
+  font-size: 0.58rem !important;
+}
+
+.orbit-chat-messages {
+  gap: 0.4rem !important;
+  padding: 0.48rem 0.58rem !important;
+}
+
+.orbit-chat-msg.orbit-chat-msg-user,
+.orbit-chat-msg.orbit-chat-msg-assistant {
+  padding: 0.42rem 0.56rem 0.42rem 0.72rem !important;
+  border-radius: 5px !important;
+  border-color: rgba(130, 170, 160, 0.08) !important;
+  background: linear-gradient(180deg, rgba(8, 15, 20, 0.5), rgba(4, 9, 13, 0.32)) !important;
+}
+
+.orbit-chat-msg-glyph-row {
+  gap: 0.4rem !important;
+  margin-bottom: 0.22rem !important;
+}
+
+.orbit-chat-msg-glyph {
+  width: 17px !important;
+  height: 17px !important;
+  border-radius: 4px !important;
+}
+
+.orbit-chat-msg-glyph-user .orbit-chat-role-user-icon {
+  width: 10px !important;
+  height: 10px !important;
+}
+
+.orbit-chat-msg-glyph-assistant .orbit-chat-role-agent-logo {
+  width: 11px !important;
+  height: 11px !important;
+}
+
+.orbit-chat-msg-text {
+  font-size: 0.78rem !important;
+  line-height: 1.46 !important;
+}
+
+.orbit-chat-msg .orbit-file-chip-row {
+  margin-top: 0.28rem !important;
+}
+
+.orbit-chat-msg .orbit-file-chip {
+  padding: 0.1rem 0.38rem !important;
+  font-size: 0.64rem !important;
+}
+
+.orbit-chat-composer {
+  gap: 0.38rem !important;
+  padding: 0.42rem 0.52rem !important;
+}
+
+.orbit-chat-input {
+  min-height: 34px;
+  max-height: 72px;
+  border-radius: 7px !important;
+  padding: 0.38rem 0.52rem !important;
+  font-size: 0.78rem !important;
+  line-height: 1.35;
+}
+
+.orbit-chat-send-icon.MuiIconButton-root {
+  width: 32px !important;
+  height: 32px !important;
+  border-radius: 7px !important;
+}
+
+.orbit-chat-files-view {
+  gap: 0.4rem !important;
+  padding: 0.42rem !important;
+  background:
+    linear-gradient(180deg, rgba(7, 13, 18, 0.72), rgba(2, 5, 8, 0.76)),
+    rgba(2, 5, 8, 0.78) !important;
+}
+
+.orbit-chat-files-toolbar {
+  min-height: 28px;
+}
+
+.orbit-chat-files-title {
+  font-size: 0.66rem !important;
+  letter-spacing: 0.04em !important;
+}
+
+.orbit-chat-files-count {
+  min-width: 17px !important;
+  padding: 0 5px !important;
+  font-size: 0.58rem !important;
+}
+
+.orbit-chat-files-layout {
+  grid-template-columns: minmax(160px, 210px) minmax(0, 1fr) !important;
+  grid-template-rows: minmax(0, 1fr) !important;
+  gap: 0.45rem !important;
+}
+
+.orbit-chat-files-list {
+  min-height: 0 !important;
+  overflow: auto !important;
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 0.22rem !important;
+  padding-right: 0.12rem !important;
+}
+
+.orbit-chat-file-row {
+  grid-template-columns: minmax(0, 1fr) auto !important;
+  gap: 0.06rem 0.45rem !important;
+  min-height: 32px !important;
+  padding: 0.28rem 0.38rem !important;
+  border-radius: 5px !important;
+  border-color: rgba(120, 242, 176, 0.1) !important;
+  background: rgba(237, 247, 244, 0.018) !important;
+}
+
+.orbit-chat-file-name {
+  font-size: 0.68rem !important;
+}
+
+.orbit-chat-file-path,
+.orbit-chat-file-size {
+  font-size: 0.55rem !important;
+}
+
+.orbit-chat-file-row:hover,
+.orbit-chat-file-row.is-active {
+  border-color: rgba(54, 245, 184, 0.34) !important;
+  background: rgba(54, 245, 184, 0.07) !important;
+}
+
+.orbit-chat-file-row.is-active {
+  box-shadow: inset 2px 0 0 rgba(54, 245, 184, 0.72) !important;
+}
+
+.orbit-chat-file-preview {
+  border-radius: 5px !important;
+  min-height: 0 !important;
+}
+
+.orbit-chat-file-preview-head {
+  min-height: 30px !important;
+  padding: 0 0.48rem !important;
+}
+
+.orbit-chat-file-preview-path {
+  font-size: 0.62rem !important;
+}
+
+.orbit-chat-file-preview-meta {
+  font-size: 0.57rem !important;
+}
+
+.orbit-chat-file-code {
+  padding: 0.58rem 0.66rem 0.75rem !important;
+  font-size: 0.66rem !important;
+  line-height: 1.48 !important;
+}
+
+@media (max-width: 820px) {
+  .arkorbit-chat-flyout {
+    width: auto !important;
+  }
+
+  .orbit-chat-files-layout {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: minmax(112px, 30%) minmax(0, 1fr) !important;
+  }
 }

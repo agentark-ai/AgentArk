@@ -19,6 +19,64 @@ pub struct BrowserSessionCreateOptions {
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_profile_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_login: Option<bool>,
+}
+
+impl BrowserSessionCreateOptions {
+    pub fn from_browser_profile(profile: &crate::core::BrowserProfileRecord) -> Self {
+        let metadata = profile.metadata.as_ref();
+        Self {
+            profile_id: Some(profile.id.clone()),
+            profile_name: Some(profile.name.clone()),
+            browser: metadata_string(metadata, "browser").or_else(|| Some("chrome".to_string())),
+            target_kind: Some(browser_profile_target_kind(profile.target_kind).to_string()),
+            target_endpoint: profile.target_endpoint.clone(),
+            target_profile_path: profile.target_profile_path.clone(),
+            target_workspace: profile.target_workspace.clone(),
+            managed: metadata_bool(metadata, "managed")
+                .or(Some(!matches!(
+                    profile.target_kind,
+                    crate::core::BrowserProfileTargetKind::Host
+                ))),
+            manual_login: None,
+        }
+    }
+}
+
+fn browser_profile_target_kind(kind: crate::core::BrowserProfileTargetKind) -> &'static str {
+    match kind {
+        crate::core::BrowserProfileTargetKind::Sandbox => "sandbox",
+        crate::core::BrowserProfileTargetKind::Host => "host",
+        crate::core::BrowserProfileTargetKind::RemoteCdp => "remote_cdp",
+    }
+}
+
+fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    metadata
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn metadata_bool(metadata: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+    metadata
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_bool())
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +275,24 @@ impl BrowserIntegration {
         }
     }
 
+    async fn require_success(response: reqwest::Response, operation: &str) -> Result<()> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "{} failed with HTTP {}{}",
+            operation,
+            status,
+            if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", body.trim())
+            }
+        )
+    }
+
     /// Create a new browser session, returns session_id
     pub async fn create_session(&self) -> Result<String> {
         self.create_session_with_options(&BrowserSessionCreateOptions::default())
@@ -233,6 +309,13 @@ impl BrowserIntegration {
             body["profile"] = serde_json::json!({
                 "id": options.profile_id.as_deref().unwrap_or_default(),
                 "name": options.profile_name.as_deref().unwrap_or_default(),
+                "browser": options.browser.as_deref().unwrap_or("chrome"),
+                "target_kind": options.target_kind.as_deref().unwrap_or("sandbox"),
+                "target_endpoint": options.target_endpoint.as_deref().unwrap_or_default(),
+                "target_profile_path": options.target_profile_path.as_deref().unwrap_or_default(),
+                "target_workspace": options.target_workspace.as_deref().unwrap_or_default(),
+                "managed": options.managed,
+                "manual_login": options.manual_login,
             });
         }
         let resp: SessionResponse = self
@@ -350,7 +433,7 @@ impl BrowserIntegration {
         Ok(bytes.to_vec())
     }
 
-    /// Click an element by selector, text, or coordinates
+    /// Click an element by snapshot index, selector, text, or coordinates
     pub async fn click(
         &self,
         session_id: &str,
@@ -358,8 +441,12 @@ impl BrowserIntegration {
         text: Option<&str>,
         x: Option<i32>,
         y: Option<i32>,
+        element_index: Option<usize>,
     ) -> Result<()> {
         let mut body = serde_json::Map::new();
+        if let Some(index) = element_index {
+            body.insert("element_index".into(), serde_json::json!(index));
+        }
         if let Some(s) = selector {
             body.insert("selector".into(), serde_json::Value::String(s.to_string()));
         }
@@ -372,13 +459,13 @@ impl BrowserIntegration {
         if let Some(yv) = y {
             body.insert("y".into(), serde_json::json!(yv));
         }
-        self.client
+        let response = self
+            .client
             .post(format!("{}/session/{}/click", self.bridge_url, session_id))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+            .await?;
+        Self::require_success(response, "browser click").await
     }
 
     /// Type text into an element or the focused element
@@ -393,13 +480,13 @@ impl BrowserIntegration {
         if let Some(s) = selector {
             body["selector"] = serde_json::Value::String(s.to_string());
         }
-        self.client
+        let response = self
+            .client
             .post(format!("{}/session/{}/type", self.bridge_url, session_id))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+            .await?;
+        Self::require_success(response, "browser type").await
     }
 
     /// Scroll the page
@@ -425,13 +512,13 @@ impl BrowserIntegration {
     /// Press a keyboard key
     #[allow(dead_code)]
     pub async fn press_key(&self, session_id: &str, key: &str) -> Result<()> {
-        self.client
+        let response = self
+            .client
             .post(format!("{}/session/{}/press", self.bridge_url, session_id))
             .json(&serde_json::json!({ "key": key }))
             .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+            .await?;
+        Self::require_success(response, "browser key press").await
     }
 
     /// Get page content and interactive elements
@@ -466,6 +553,24 @@ impl BrowserIntegration {
             &session_id[..session_id.len().min(8)]
         );
         Ok(())
+    }
+
+    /// Delete persisted browser state for a saved profile.
+    pub async fn delete_profile_storage(&self, profile_id: &str) -> Result<()> {
+        let profile_id = profile_id.trim();
+        if profile_id.is_empty() {
+            anyhow::bail!("profile_id required");
+        }
+        let response = self
+            .client
+            .delete(format!(
+                "{}/profile/{}",
+                self.bridge_url,
+                urlencoding::encode(profile_id)
+            ))
+            .send()
+            .await?;
+        Self::require_success(response, "browser profile storage delete").await
     }
 
     /// Check if the sidecar is reachable
@@ -598,11 +703,16 @@ impl Integration for BrowserIntegration {
                     .get("session_id")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("session_id required"))?;
+                let element_index = params
+                    .get("element_index")
+                    .or_else(|| params.get("index"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
                 let selector = params.get("selector").and_then(|v| v.as_str());
                 let text = params.get("text").and_then(|v| v.as_str());
                 let x = params.get("x").and_then(|v| v.as_i64()).map(|v| v as i32);
                 let y = params.get("y").and_then(|v| v.as_i64()).map(|v| v as i32);
-                self.click(sid, selector, text, x, y).await?;
+                self.click(sid, selector, text, x, y, element_index).await?;
                 Ok(serde_json::json!({ "status": "clicked" }))
             }
             "type_text" => {

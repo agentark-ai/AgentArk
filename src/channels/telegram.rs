@@ -266,7 +266,7 @@ fn markdown_inline_to_telegram_html(text: &str) -> String {
         } else if c == '`' {
             let mut inner = String::new();
             let mut closed = false;
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if next == '`' {
                     closed = true;
                     break;
@@ -284,7 +284,7 @@ fn markdown_inline_to_telegram_html(text: &str) -> String {
         } else if c == '*' {
             let mut inner = String::new();
             let mut closed = false;
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if next == '*' {
                     closed = true;
                     break;
@@ -306,7 +306,7 @@ fn markdown_inline_to_telegram_html(text: &str) -> String {
             while let Some(next) = chars.next() {
                 if next == ']' && chars.peek() == Some(&'(') {
                     chars.next();
-                    while let Some(url_ch) = chars.next() {
+                    for url_ch in chars.by_ref() {
                         if url_ch == ')' {
                             found = true;
                             break;

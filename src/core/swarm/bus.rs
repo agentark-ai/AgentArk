@@ -3,7 +3,7 @@
 use super::agent_trait::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// System-wide events broadcast to all agents
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

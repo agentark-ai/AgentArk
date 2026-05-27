@@ -12,6 +12,7 @@
         "hello",
         "pairing_claim",
         "pairing_claim_result",
+        "browser_auth",
         "auth",
         "auth_ok",
         "auth_error",
@@ -56,6 +57,14 @@
       },
       "uniqueItems": true
     },
+    "commands": {
+      "type": "array",
+      "description": "Concrete command declarations supported by this companion. These must fit the granted capability set and should use action ids such as notifications.show instead of broad labels.",
+      "items": {
+        "$ref": "#/$defs/commandDescriptor"
+      },
+      "uniqueItems": true
+    },
     "metadata": {
       "type": "object",
       "additionalProperties": {
@@ -81,6 +90,37 @@
     }
   },
   "$defs": {
+    "commandDescriptor": {
+      "type": "object",
+      "required": ["id", "label", "capability", "action", "risk"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,96}$"
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "capability": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,96}$"
+        },
+        "action": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,96}$"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "risk": {
+          "type": "string",
+          "enum": ["low", "high"]
+        }
+      }
+    },
     "command": {
       "type": "object",
       "required": ["id", "device_id", "capability", "action", "requested_scopes", "risk", "status"],

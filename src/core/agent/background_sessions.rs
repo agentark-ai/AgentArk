@@ -22,7 +22,7 @@ pub(super) fn background_session_policy_for_action(
     background_session::BackgroundSessionPolicy {
         allowed_action_roles: vec![action_role_name(&meta.role).to_string()],
         allowed_integration_classes: vec![
-            action_integration_class_name(&meta.integration_class).to_string(),
+            action_integration_class_name(&meta.integration_class).to_string()
         ],
     }
     .normalized()
@@ -132,7 +132,7 @@ impl Agent {
         let required_coverage = if query_tokens.len() <= 3 {
             query_tokens.len()
         } else {
-            (query_tokens.len() + 1) / 2
+            query_tokens.len().div_ceil(2)
         };
         if overlap < required_overlap || overlap < required_coverage {
             return 0;

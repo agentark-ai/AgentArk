@@ -193,6 +193,7 @@ RUN --mount=type=cache,id=agentark-node-npm,target=/root/.npm \
         rm -rf /tmp/*; \
     fi
 COPY bridges/playwright-bridge/index.js ./
+COPY bridges/playwright-bridge/manual-login.js ./
 
 # -- Stage 4: Minimal runtime --
 # Keep runtime on the same Debian family so the final binary sees the same
@@ -220,6 +221,11 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends ${apt_packages}; \
+    if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ] && [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/google-chrome-stable.deb; \
+        apt-get install -y --no-install-recommends /tmp/google-chrome-stable.deb; \
+        rm -f /tmp/google-chrome-stable.deb; \
+    fi; \
     rm -rf /var/lib/apt/lists/*
 
 RUN if [ "${INSTALL_TAILSCALE}" = "true" ]; then \
@@ -354,7 +360,7 @@ ENV TS_USERSPACE=true
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
 ENV PLAYWRIGHT_HEADLESS=false
 ENV PLAYWRIGHT_LIVE_VIEW_PORT=6080
-ENV PLAYWRIGHT_LIVE_VIEW_PATH=/vnc.html?autoconnect=1&resize=remote&path=websockify
+ENV PLAYWRIGHT_LIVE_VIEW_PATH=/vnc.html?autoconnect=1&resize=scale&path=websockify
 # Default bridge URL for in-container Playwright service
 ENV PLAYWRIGHT_BRIDGE_URL=http://127.0.0.1:3100
 # Secure logging: suppress SQLx queries to prevent sensitive data exposure

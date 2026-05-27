@@ -1493,7 +1493,7 @@ pub(super) async fn update_settings(
             let bundled_check: fn(&str) -> bool = |_| false;
             let ctx = crate::channels::messaging_registry::ChannelQueryContext {
                 bundled_configured: &bundled_check,
-                extension_packs: &*packs_guard,
+                extension_packs: &packs_guard,
                 storage: &agent.storage,
                 config_dir: &agent.config_dir,
                 data_dir: &agent.data_dir,

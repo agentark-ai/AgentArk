@@ -28,12 +28,9 @@ export const SETTINGS_NAV_GROUPS: SettingsNavGroup[] = [
     id: "integrations",
     label: "Integrations",
     items: [
-      { value: 20, label: "Messaging Channels" },
-      { value: 21, label: "Integrations" },
+      { value: 20, label: "Integrations" },
       { value: 8, label: "MCP Servers" },
       { value: 26, label: "Companion Devices" },
-      { value: 22, label: "Webhooks & APIs" },
-      { value: 23, label: "Plugins" },
     ],
   },
   {

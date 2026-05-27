@@ -10,6 +10,7 @@ Minimum SDK: 26.
 
 ## Security
 
+- The bundled app advertises only `approval_prompt` and `notifications`; SMS needs a separate SMS-capable Android build or bridge.
 - Stores scoped companion identity in encrypted shared preferences.
 - Sends stored tokens in WebSocket headers, not JSON messages.
 - Sends a stable device identity with each pairing claim.

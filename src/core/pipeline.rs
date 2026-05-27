@@ -1,7 +1,7 @@
 //! First-class pipeline primitives: DAG specs, retry/idempotency policies,
 //! and typed signal ranking/consensus.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 

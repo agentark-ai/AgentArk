@@ -435,8 +435,15 @@ function OrbitChatFilesView({
 }) {
   const selectedFile =
     files.find((file) => file.path === selectedPath) ?? files[0] ?? null;
+  const selectedIndex = selectedFile
+    ? Math.max(0, files.findIndex((file) => file.path === selectedFile.path))
+    : -1;
+  const selectedPosition =
+    selectedIndex >= 0 && files.length > 1 ? `${selectedIndex + 1} / ${files.length}` : "";
   const selectedMeta = selectedFile
-    ? formatBytes(selectedFile.bytes) || "0 bytes"
+    ? [formatBytes(selectedFile.bytes) || "0 bytes", selectedPosition]
+        .filter(Boolean)
+        .join(" | ")
     : "";
 
   return (
@@ -715,6 +722,7 @@ export function OrbitChat({
 }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [transcripts, setTranscripts] = useState<OrbitChatTranscript[]>([]);
+  const [transcriptTotal, setTranscriptTotal] = useState(0);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyPage, setHistoryPage] = useState(0);
   const [activeTranscriptId, setActiveTranscriptId] = useState("current");
@@ -733,16 +741,11 @@ export function OrbitChat({
   const activeAssistantRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const readOnly = activeTranscriptId !== "current";
-  const historyPageCount = Math.max(1, Math.ceil(transcripts.length / HISTORY_PAGE_SIZE));
+  const historyPageCount = Math.max(1, Math.ceil(transcriptTotal / HISTORY_PAGE_SIZE));
   const normalizedHistoryPage = Math.min(historyPage, historyPageCount - 1);
-  const visibleTranscripts = useMemo(
-    () =>
-      transcripts.slice(
-        normalizedHistoryPage * HISTORY_PAGE_SIZE,
-        normalizedHistoryPage * HISTORY_PAGE_SIZE + HISTORY_PAGE_SIZE,
-      ),
-    [normalizedHistoryPage, transcripts],
-  );
+  const historyStart = normalizedHistoryPage * HISTORY_PAGE_SIZE;
+  const historyStartLabel = transcriptTotal === 0 ? 0 : historyStart + 1;
+  const historyEnd = Math.min(historyStart + transcripts.length, transcriptTotal);
   const visibleTurnState = useMemo<OrbitChatPanelState>(() => {
     if (readOnly) return "archived";
     if (loadingHistory) return "loading";
@@ -764,12 +767,23 @@ export function OrbitChat({
   }, [historyPage, normalizedHistoryPage]);
 
   const refreshTranscripts = useCallback(
-    async (cancelled?: () => boolean) => {
+    async (page = 0, cancelled?: () => boolean) => {
       try {
-        const next = await arkorbitApi.listTranscripts(orbitId);
-        if (!cancelled?.()) setTranscripts(next);
+        const offset = Math.max(0, page) * HISTORY_PAGE_SIZE;
+        const next = await arkorbitApi.listTranscripts(orbitId, {
+          limit: HISTORY_PAGE_SIZE,
+          offset,
+        });
+        if (cancelled?.()) return;
+        setTranscripts(next.transcripts);
+        setTranscriptTotal(next.total);
+        const maxPage = Math.max(0, Math.ceil(next.total / HISTORY_PAGE_SIZE) - 1);
+        if (page > maxPage) setHistoryPage(maxPage);
       } catch {
-        if (!cancelled?.()) setTranscripts([]);
+        if (!cancelled?.()) {
+          setTranscripts([]);
+          setTranscriptTotal(0);
+        }
       }
     },
     [orbitId],
@@ -815,6 +829,8 @@ export function OrbitChat({
     setHistoryPage(0);
     setActiveTranscriptId("current");
     setMessages([]);
+    setTranscripts([]);
+    setTranscriptTotal(0);
     setActiveTab("chat");
     setFiles([]);
     setSelectedFilePath(null);
@@ -823,12 +839,21 @@ export function OrbitChat({
     setComposerResetSignal((value) => value + 1);
     const isCancelled = () => cancelled;
     void loadTranscript("current", isCancelled);
-    void refreshTranscripts(isCancelled);
+    void refreshTranscripts(0, isCancelled);
 
     return () => {
       cancelled = true;
     };
   }, [orbitId, loadTranscript, refreshTranscripts]);
+
+  useEffect(() => {
+    if (!historyOpen) return undefined;
+    let cancelled = false;
+    void refreshTranscripts(normalizedHistoryPage, () => cancelled);
+    return () => {
+      cancelled = true;
+    };
+  }, [historyOpen, normalizedHistoryPage, refreshTranscripts]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -971,7 +996,7 @@ export function OrbitChat({
       setHistoryOpen(false);
       setHistoryPage(0);
       setActiveTranscriptId("current");
-      void refreshTranscripts();
+      void refreshTranscripts(0);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       setMessages((prev) => [
@@ -1096,7 +1121,7 @@ export function OrbitChat({
               activity: undefined,
             })),
         });
-        void refreshTranscripts();
+        void refreshTranscripts(0);
       } catch (err) {
         if ((err as { name?: string })?.name !== "AbortError") {
           const detail = err instanceof Error ? err.message : String(err);
@@ -1130,7 +1155,7 @@ export function OrbitChat({
     <Box
       className={`orbit-chat-shell orbit-chat-panel-${visibleTurnState}${
         streaming ? " is-streaming" : ""
-      }`}
+      } orbit-chat-tab-${activeTab}`}
     >
       <Box className="orbit-chat-header">
         <Stack sx={{ minWidth: 0 }}>
@@ -1174,7 +1199,7 @@ export function OrbitChat({
                   if (next) setHistoryPage(0);
                   return next;
                 });
-                void refreshTranscripts();
+                void refreshTranscripts(0);
               }}
               aria-label="Conversation history"
             >
@@ -1233,12 +1258,12 @@ export function OrbitChat({
         <>
       {historyOpen ? (
         <Box className="orbit-chat-history">
-          {transcripts.length === 0 ? (
+          {transcriptTotal === 0 ? (
             <Typography variant="caption" className="orbit-chat-history-empty">
               No previous conversations.
             </Typography>
           ) : (
-            visibleTranscripts.map((transcript) => (
+            transcripts.map((transcript) => (
               <button
                 key={transcript.id}
                 type="button"
@@ -1258,7 +1283,7 @@ export function OrbitChat({
               </button>
             ))
           )}
-          {transcripts.length > HISTORY_PAGE_SIZE ? (
+          {transcriptTotal > HISTORY_PAGE_SIZE ? (
             <Box className="orbit-chat-history-pager">
               <Tooltip title="Previous conversations">
                 <span>
@@ -1274,7 +1299,7 @@ export function OrbitChat({
                 </span>
               </Tooltip>
               <span className="orbit-chat-history-page-label">
-                {normalizedHistoryPage + 1} / {historyPageCount}
+                {historyStartLabel}-{historyEnd} / {transcriptTotal}
               </span>
               <Tooltip title="More conversations">
                 <span>

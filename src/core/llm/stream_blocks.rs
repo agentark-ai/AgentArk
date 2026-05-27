@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 #[cfg(test)]
 use std::collections::BTreeMap;
 

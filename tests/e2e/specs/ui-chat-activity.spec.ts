@@ -17,7 +17,22 @@ test.describe("Chat Activity UI @smoke", () => {
       pageErrors.push(String(error));
     });
 
-    await page.route("**/conversations?**", async (route) => {
+    await page.route("**/conversations*", async (route) => {
+      if (route.request().method().toUpperCase() === "POST") {
+        createdConversationId = "conv-pref-ui";
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({
+            id: createdConversationId,
+            title: "Preference capture chat",
+            channel: "web",
+            created_at: "2026-03-08T13:00:00.000Z",
+            updated_at: "2026-03-08T13:00:00.000Z",
+            message_count: 0
+          })
+        });
+        return;
+      }
       const conversations = createdConversationId
         ? [
             {
@@ -139,6 +154,164 @@ test.describe("Chat Activity UI @smoke", () => {
     });
     await expect(input).toBeVisible();
     expect(pageErrors).toEqual([]);
+  });
+
+  test("renders streamed tool access as compact inline chat activity", async ({ page }) => {
+    let createdConversationId = "";
+    let userMessage = "";
+    const assistantMessage = "I found three fresh messages in your inbox.";
+    const rawToolName = "vendor_mail_connector_v2";
+
+    await page.addInitScript(() => {
+      window.sessionStorage.removeItem("agentark.chat.lastConversationId");
+      window.sessionStorage.removeItem("agentark.chat.pendingRun");
+      window.sessionStorage.removeItem("agentark.chat.draftMode");
+    });
+
+    await page.route("**/conversations?**", async (route) => {
+      const conversations = createdConversationId
+        ? [
+            {
+              id: createdConversationId,
+              title: "Inbox check",
+              channel: "web",
+              created_at: "2026-05-24T09:00:00.000Z",
+              updated_at: "2026-05-24T09:00:08.000Z",
+              message_count: 2,
+              archived: false
+            }
+          ]
+        : [];
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations,
+          total: conversations.length,
+          limit: 30,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route("**/conversations/*/messages?**", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages:
+            conversationId && conversationId === createdConversationId
+              ? [
+                  {
+                    id: "msg-user-inbox-check",
+                    role: "user",
+                    content: userMessage,
+                    timestamp: "2026-05-24T09:00:01.000Z",
+                    model_used: null,
+                    trace_id: null
+                  },
+                  {
+                    id: "msg-assistant-inbox-check",
+                    role: "assistant",
+                    content: assistantMessage,
+                    timestamp: "2026-05-24T09:00:08.000Z",
+                    model_used: "test-model",
+                    trace_id: null
+                  }
+                ]
+              : []
+        })
+      });
+    });
+
+    await page.route("**/conversations/*", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      if (!conversationId || conversationId !== createdConversationId) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "not found" })
+        });
+        return;
+      }
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: createdConversationId,
+          title: "Inbox check",
+          channel: "web",
+          created_at: "2026-05-24T09:00:00.000Z",
+          updated_at: "2026-05-24T09:00:08.000Z",
+          message_count: 2
+        })
+      });
+    });
+
+    await page.route("**/chat/stream", async (route) => {
+      const payload = route.request().postDataJSON() as {
+        conversation_id?: string;
+        message?: string;
+      };
+      createdConversationId = payload.conversation_id || "conv-inbox-access";
+      userMessage = payload.message || "check my new emails";
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: [
+          `event: tool_start\ndata: {"name":"${rawToolName}","label":"Accessing Gmail account","activity_detail":"Checking messages","account":"primary"}\n\n`,
+          `event: tool_result\ndata: {"name":"${rawToolName}","label":"Accessing Gmail account","activity_detail":"Inbox checked","content":"3 messages returned","status":"ok","count":3}\n\n`,
+          `event: content\ndata: {"conversation_id":"${createdConversationId}","content":"${assistantMessage}"}\n\n`,
+          "event: done\ndata: {}\n\n"
+        ].join("")
+      });
+    });
+
+    await page.route("**/conversations", async (route) => {
+      if (route.request().method().toUpperCase() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      createdConversationId = "conv-inbox-access";
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: createdConversationId,
+          title: "Inbox check",
+          channel: "web",
+          created_at: "2026-05-24T09:00:00.000Z",
+          updated_at: "2026-05-24T09:00:00.000Z",
+          message_count: 0
+        })
+      });
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    const input = page.locator("textarea[aria-label='Message']").first();
+    await expect(input).toBeVisible({ timeout: 10_000 });
+
+    await input.fill("check my new emails");
+    await input.press("Enter");
+
+    const activityRow = page
+      .locator(".chat-transcript-action-row")
+      .filter({ hasText: "Accessing Gmail account" })
+      .first();
+    await expect(activityRow).toBeVisible({ timeout: 10_000 });
+    await expect(activityRow.locator(".chat-transcript-action-status")).toContainText(
+      "success"
+    );
+    await expect(page.locator(`text=${assistantMessage}`)).toBeVisible({
+      timeout: 10_000
+    });
+    await expect(page.locator(".chat-thread")).not.toContainText(rawToolName);
   });
 
   test("renders summarized trace activity without raw dumps", async ({ page }) => {

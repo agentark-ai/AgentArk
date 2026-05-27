@@ -7,7 +7,7 @@ use super::registry::AgentRegistry;
 use super::specialist::{SpecialistAgent, SpecialistConfig};
 use crate::actions::ActionDef;
 use crate::core::llm::LlmClient;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

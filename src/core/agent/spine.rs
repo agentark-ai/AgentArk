@@ -5,19 +5,48 @@ use super::spine_request::*;
 use super::*;
 use crate::actions::ActionAuthorization;
 use async_trait::async_trait;
+use chrono::{TimeZone, Timelike};
 use futures::future::join_all;
+use std::sync::LazyLock;
 
-const PRIMITIVE_NAMES: [&str; 7] = [
+const PRIMITIVE_NAMES: [&str; 8] = [
     "search",
     "fetch",
     "browse",
     "code_exec",
+    "pdf_generate",
     "resource_rw",
     "memory_rw",
     "delegate",
 ];
+
+const RESOURCE_RW_VALID_KINDS: [&str; 17] = [
+    "file",
+    "app_service",
+    "watcher",
+    "scheduled_task",
+    "notification",
+    "background_session",
+    "goal",
+    "dashboard",
+    "conversation",
+    "activity",
+    "integration",
+    "custom_api",
+    "custom_messaging_channel",
+    "extension_pack",
+    "mcp_server",
+    "skill",
+    "skill_marketplace",
+];
 const LLM_NATIVE_IMAGE_ATTACHMENT_LIMIT: usize = 4;
 const LLM_NATIVE_IMAGE_ATTACHMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+static NOTIFICATION_CLOCK_TIME_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(?:^|[^[:alnum:]_])(?:(?P<hour12>0?[1-9]|1[0-2])(?:[:.](?P<minute12>[0-5]\d))?\s*(?P<meridiem>a\.?m\.?|p\.?m\.?)|(?P<hour24>[01]?\d|2[0-3]):(?P<minute24>[0-5]\d)(?::(?P<second24>[0-5]\d))?)(?:[^[:alnum:]_]|$)",
+    )
+    .expect("valid notification clock time regex")
+});
 
 #[derive(Debug, Clone)]
 pub struct SpineChatResponse {
@@ -71,6 +100,9 @@ impl ToolRegistry {
         };
         let mut approval_calls = Vec::new();
         for invocation in invocations {
+            let invocation = self
+                .repair_invocation_for_request_context(&invocation, call, cx)
+                .await;
             let action_def = cx
                 .agent
                 .runtime
@@ -159,6 +191,9 @@ impl ToolRegistry {
         call: &SpineToolCall,
         cx: &SpineContext,
     ) -> Result<serde_json::Value, serde_json::Value> {
+        let invocation = self
+            .repair_invocation_for_request_context(invocation, call, cx)
+            .await;
         let action_def = cx
             .agent
             .runtime
@@ -209,7 +244,7 @@ impl ToolRegistry {
                 &invocation.action_name,
                 &invocation.arguments,
                 &cx.request.channel,
-                Some(&format!("spine primitive `{}`", call.name)),
+                None,
                 Some(&cx.request.authorization),
                 cx.request.conversation_id.as_deref(),
                 cx.request.project_id.as_deref(),
@@ -229,6 +264,35 @@ impl ToolRegistry {
             spine_tool_result_value_for_model(call.name.as_str(), &invocation.action_name, content);
         remember_pending_credential_prompt_from_tool_result(cx, &mut result).await;
         Ok(result)
+    }
+
+    async fn repair_invocation_for_request_context(
+        &self,
+        invocation: &PrimitiveActionInvocation,
+        call: &SpineToolCall,
+        cx: &SpineContext,
+    ) -> PrimitiveActionInvocation {
+        if call.name == "resource_rw" && invocation.action_name.eq_ignore_ascii_case("notify_user")
+        {
+            if let Some(request_text) = latest_user_message_text(&cx.request.messages) {
+                let default_timezone = {
+                    let profile = cx.agent.user_profile.read().await;
+                    profile
+                        .timezone
+                        .as_deref()
+                        .and_then(|timezone| timezone.parse::<chrono_tz::Tz>().ok())
+                };
+                if let Some(repaired) = scheduled_notification_invocation_from_direct_notification(
+                    invocation,
+                    request_text,
+                    chrono::Utc::now(),
+                    default_timezone,
+                ) {
+                    return repaired;
+                }
+            }
+        }
+        invocation.clone()
     }
 
     async fn dispatch_memory(
@@ -387,6 +451,7 @@ impl ToolRegistry {
             "fetch" => plan_fetch(&call.arguments),
             "browse" => plan_browse(&call.arguments),
             "code_exec" => plan_code_exec(&call.arguments),
+            "pdf_generate" => plan_pdf_generate(&call.arguments),
             "resource_rw" => plan_resource_rw(&call.arguments),
             "memory_rw" => plan_memory_rw(&call.arguments),
             "delegate" => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
@@ -700,6 +765,15 @@ struct PrimitiveActionInvocation {
 }
 
 #[derive(Debug, Clone)]
+struct NotificationScheduleHint {
+    local_date: String,
+    local_time: String,
+    timezone_name: String,
+    timezone_abbrev: String,
+    date_label: String,
+}
+
+#[derive(Debug, Clone)]
 enum PrimitivePlan {
     Actions(Vec<PrimitiveActionInvocation>),
     Memory(MemoryPrimitiveOp),
@@ -765,6 +839,216 @@ impl ToolResult {
     fn summary(&self) -> String {
         let raw = self.to_json();
         safe_truncate(&raw, 240)
+    }
+}
+
+const SPINE_TOOL_STREAM_MAX_STRING_CHARS: usize = 900;
+const SPINE_TOOL_STREAM_MAX_ARRAY_ITEMS: usize = 12;
+const SPINE_TOOL_STREAM_MAX_OBJECT_KEYS: usize = 24;
+const SPINE_TOOL_STREAM_MAX_DEPTH: usize = 5;
+const SPINE_TOOL_STREAM_PREVIEW_ITEMS: usize = 5;
+
+fn spine_tool_start_stream_payload(call: &SpineToolCall) -> serde_json::Value {
+    let arguments = sanitize_spine_tool_stream_value(&call.arguments, 0);
+    let intent_summary = spine_tool_start_intent_summary(&call.name, &arguments);
+    serde_json::json!({
+        "kind": "model_tool_call",
+        "tool_call_id": call.id,
+        "tool_name": call.name,
+        "arguments": arguments,
+        "intent_summary": intent_summary,
+    })
+}
+
+fn spine_tool_result_stream_content(call: &SpineToolCall, result: &ToolResult) -> String {
+    let result_preview = sanitize_spine_tool_stream_value(&result.value, 0);
+    let summary =
+        spine_tool_result_visible_summary(&result_preview).unwrap_or_else(|| result.summary());
+    serde_json::json!({
+        "kind": "model_tool_result",
+        "tool_call_id": call.id,
+        "tool_name": call.name,
+        "ok": result.ok,
+        "summary": summary,
+        "result_preview": result_preview,
+    })
+    .to_string()
+}
+
+fn sanitize_spine_tool_stream_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth >= SPINE_TOOL_STREAM_MAX_DEPTH {
+        return match value {
+            serde_json::Value::Null => serde_json::Value::Null,
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.clone(),
+            serde_json::Value::String(text) => {
+                serde_json::Value::String(safe_truncate(text.trim(), 160))
+            }
+            serde_json::Value::Array(items) => serde_json::json!({
+                "truncated": true,
+                "items": items.len(),
+            }),
+            serde_json::Value::Object(map) => serde_json::json!({
+                "truncated": true,
+                "fields": map.len(),
+            }),
+        };
+    }
+
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            value.clone()
+        }
+        serde_json::Value::String(text) => serde_json::Value::String(safe_truncate(
+            text.trim(),
+            SPINE_TOOL_STREAM_MAX_STRING_CHARS,
+        )),
+        serde_json::Value::Array(items) => {
+            let mut sanitized = items
+                .iter()
+                .take(SPINE_TOOL_STREAM_MAX_ARRAY_ITEMS)
+                .map(|item| sanitize_spine_tool_stream_value(item, depth + 1))
+                .collect::<Vec<_>>();
+            if items.len() > SPINE_TOOL_STREAM_MAX_ARRAY_ITEMS {
+                sanitized.push(serde_json::json!({
+                    "truncated_items": items.len() - SPINE_TOOL_STREAM_MAX_ARRAY_ITEMS,
+                }));
+            }
+            serde_json::Value::Array(sanitized)
+        }
+        serde_json::Value::Object(map) => {
+            let mut sanitized = serde_json::Map::new();
+            let mut omitted = 0usize;
+            for (key, inner) in map {
+                if key.starts_with('_') {
+                    continue;
+                }
+                if sanitized.len() >= SPINE_TOOL_STREAM_MAX_OBJECT_KEYS {
+                    omitted += 1;
+                    continue;
+                }
+                if is_sensitive_tool_call_argument_key(key) {
+                    sanitized.insert(
+                        key.clone(),
+                        serde_json::Value::String("[redacted]".to_string()),
+                    );
+                    continue;
+                }
+                sanitized.insert(
+                    key.clone(),
+                    sanitize_spine_tool_stream_value(inner, depth + 1),
+                );
+            }
+            if omitted > 0 {
+                sanitized.insert("truncated_keys".to_string(), serde_json::json!(omitted));
+            }
+            serde_json::Value::Object(sanitized)
+        }
+    }
+}
+
+fn spine_tool_start_intent_summary(tool_name: &str, arguments: &serde_json::Value) -> String {
+    let label = readable_spine_tool_name(tool_name);
+    let preview = spine_tool_stream_preview(arguments, SPINE_TOOL_STREAM_PREVIEW_ITEMS);
+    if preview.is_empty() {
+        format!("Starting {label}.")
+    } else {
+        format!("Starting {label} with {preview}.")
+    }
+}
+
+fn spine_tool_result_visible_summary(result_preview: &serde_json::Value) -> Option<String> {
+    let preview = spine_tool_stream_preview(result_preview, SPINE_TOOL_STREAM_PREVIEW_ITEMS);
+    if preview.is_empty() {
+        None
+    } else {
+        Some(format!("Returned {preview}."))
+    }
+}
+
+fn spine_tool_stream_preview(value: &serde_json::Value, max_items: usize) -> String {
+    let mut parts = Vec::new();
+    collect_spine_tool_stream_preview(None, value, max_items, &mut parts);
+    parts.join("; ")
+}
+
+fn collect_spine_tool_stream_preview(
+    label: Option<&str>,
+    value: &serde_json::Value,
+    max_items: usize,
+    out: &mut Vec<String>,
+) {
+    if out.len() >= max_items {
+        return;
+    }
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Bool(value) => {
+            if let Some(label) = label {
+                out.push(format!("{}: {}", readable_json_key(label), value));
+            }
+        }
+        serde_json::Value::Number(value) => {
+            if let Some(label) = label {
+                out.push(format!("{}: {}", readable_json_key(label), value));
+            }
+        }
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() || text == "[redacted]" {
+                return;
+            }
+            let text = safe_truncate(text, 160);
+            if let Some(label) = label {
+                out.push(format!("{}: {}", readable_json_key(label), text));
+            } else {
+                out.push(text);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_spine_tool_stream_preview(label, item, max_items, out);
+                if out.len() >= max_items {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map {
+                if key.starts_with('_') || is_sensitive_tool_call_argument_key(key) {
+                    continue;
+                }
+                collect_spine_tool_stream_preview(Some(key), inner, max_items, out);
+                if out.len() >= max_items {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn readable_spine_tool_name(name: &str) -> String {
+    let readable = name
+        .split(|ch: char| ch == '_' || ch == '-')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if readable.is_empty() {
+        "tool".to_string()
+    } else {
+        readable
+    }
+}
+
+fn readable_json_key(key: &str) -> String {
+    let readable = key
+        .split(|ch: char| ch == '_' || ch == '-')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if readable.is_empty() {
+        "value".to_string()
+    } else {
+        readable
     }
 }
 
@@ -836,6 +1120,55 @@ pub async fn run_spine(
 
         if response.tool_calls.is_empty() {
             let final_text = normalize_final_response_artifact_links(&response.text, &messages);
+            if let Some(blocker) = no_progress_final_response(&messages, &final_text) {
+                messages.push(SpineMessage::Assistant {
+                    content: Some(blocker.clone()),
+                    tool_calls: Vec::new(),
+                });
+                cx.emit(SpineTraceEvent::TurnCompleted {
+                    turn,
+                    terminal_state: SpineTerminalState::Blocked,
+                    final_text_present: true,
+                })
+                .await;
+                return SpineResult::Blocked {
+                    messages,
+                    final_text: blocker,
+                    turns_used: turn + 1,
+                };
+            }
+            if incomplete_no_tool_final_response(&messages, &final_text) {
+                if turn + 1 < max_turns {
+                    messages.push(SpineMessage::User {
+                        content: incomplete_no_tool_final_response_repair_prompt(),
+                    });
+                    continue;
+                }
+                let blocker = incomplete_no_tool_final_response_blocker(&final_text);
+                messages.push(SpineMessage::Assistant {
+                    content: Some(blocker.clone()),
+                    tool_calls: Vec::new(),
+                });
+                cx.emit(SpineTraceEvent::TurnCompleted {
+                    turn,
+                    terminal_state: SpineTerminalState::Blocked,
+                    final_text_present: true,
+                })
+                .await;
+                return SpineResult::Blocked {
+                    messages,
+                    final_text: blocker,
+                    turns_used: turn + 1,
+                };
+            }
+            if final_response_repeats_tool_call_content(&messages, &final_text)
+                && turn + 1 < max_turns
+            {
+                messages.push(SpineMessage::User {
+                    content: stale_final_response_repair_prompt(),
+                });
+                continue;
+            }
             messages.push(SpineMessage::Assistant {
                 content: Some(final_text.clone()),
                 tool_calls: Vec::new(),
@@ -890,14 +1223,30 @@ pub async fn run_spine(
 
         let futures = prepared_calls
             .iter()
-            .cloned()
             .map(|(tool_call, _signature, blocked)| {
+                let tool_call = tool_call.clone();
+                let blocked = *blocked;
                 let tools = tools.clone();
                 let cx = cx.clone();
                 async move {
+                    let start_payload = spine_tool_start_stream_payload(&tool_call);
+                    if let Some(stream_tx) = cx.stream_tx.as_ref() {
+                        queue_stream_event(
+                            stream_tx,
+                            StreamEvent::ToolStart {
+                                name: tool_call.name.clone(),
+                                payload: Some(start_payload.clone()),
+                            },
+                        );
+                    }
                     cx.emit(SpineTraceEvent::ToolStarted {
                         tool_call_id: tool_call.id.clone(),
                         name: tool_call.name.clone(),
+                        arguments: start_payload.get("arguments").cloned(),
+                        intent_summary: start_payload
+                            .get("intent_summary")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
                     })
                     .await;
                     let result = if blocked {
@@ -915,6 +1264,15 @@ pub async fn run_spine(
                     } else {
                         tools.dispatch(tool_call.clone(), cx.clone()).await
                     };
+                    if let Some(stream_tx) = cx.stream_tx.as_ref() {
+                        queue_stream_event(
+                            stream_tx,
+                            StreamEvent::ToolResult {
+                                name: tool_call.name.clone(),
+                                content: spine_tool_result_stream_content(&tool_call, &result),
+                            },
+                        );
+                    }
                     cx.emit(SpineTraceEvent::ToolCompleted {
                         tool_call_id: tool_call.id.clone(),
                         name: tool_call.name.clone(),
@@ -942,6 +1300,23 @@ pub async fn run_spine(
                 tool_call_id: tool_call.id.clone(),
                 content: result.to_json(),
             });
+        }
+        if let Some(final_text) = needs_input_message_from_tool_results(&results) {
+            messages.push(SpineMessage::Assistant {
+                content: Some(final_text.clone()),
+                tool_calls: Vec::new(),
+            });
+            cx.emit(SpineTraceEvent::TurnCompleted {
+                turn,
+                terminal_state: SpineTerminalState::NeedsInput,
+                final_text_present: true,
+            })
+            .await;
+            return SpineResult::NeedsInput {
+                messages,
+                final_text,
+                turns_used: turn + 1,
+            };
         }
     }
 
@@ -1111,6 +1486,7 @@ fn tool_call_progress_signature(call: &SpineToolCall) -> Option<ToolProgressSign
             _ => return None,
         },
         "search" | "fetch" => ToolProgressClass::ReadOnly,
+        "pdf_generate" => ToolProgressClass::Mutation,
         _ => return None,
     };
     let signature_args =
@@ -1122,11 +1498,22 @@ fn tool_call_progress_signature(call: &SpineToolCall) -> Option<ToolProgressSign
 }
 
 fn tool_call_progress_identity(call: &SpineToolCall) -> Option<serde_json::Value> {
+    if call.name == "pdf_generate" {
+        return Some(serde_json::json!({
+            "title": json_text(&call.arguments, "title"),
+            "filename": json_text(&call.arguments, "filename"),
+        }));
+    }
     if call.name != "resource_rw" {
         return None;
     }
     let kind = json_text(&call.arguments, "kind")?.to_ascii_lowercase();
     let op = json_text(&call.arguments, "op")?.to_ascii_lowercase();
+    let payload = call
+        .arguments
+        .get("content")
+        .or_else(|| call.arguments.get("metadata"))
+        .cloned();
     let id = json_text(&call.arguments, "id")
         .or_else(|| json_text_path(&call.arguments, &["content", "path"]))
         .or_else(|| json_text_path(&call.arguments, &["content", "name"]))
@@ -1140,7 +1527,12 @@ fn tool_call_progress_identity(call: &SpineToolCall) -> Option<serde_json::Value
         "kind": kind,
         "op": op,
         "id": id,
-        "query": query
+        "query": query,
+        "payload": if matches!(kind.as_str(), "custom_api" | "integration") && matches!(op.as_str(), "create" | "update" | "install" | "connect") {
+            payload
+        } else {
+            None
+        }
     }))
 }
 
@@ -1625,6 +2017,12 @@ fn structured_chat_request_context_system_message(
             bounded_json_for_spine_context(arkorbit_context, 8_000),
         );
     }
+    if let Some(browser_profile_context) = request_hints.browser_profile_context.as_ref() {
+        context.insert(
+            "browser_profile_context".to_string(),
+            bounded_json_for_spine_context(browser_profile_context, 8_000),
+        );
+    }
     if !request_hints.recent_actionable_artifacts.is_empty() {
         context.insert(
             "recent_actionable_artifacts".to_string(),
@@ -1681,6 +2079,57 @@ async fn browser_profiles_context_system_message(
     ))
 }
 
+fn browser_session_status_is_live_context(status: &str) -> bool {
+    matches!(
+        status,
+        "active" | "waiting_for_operator" | "operator_claimed" | "ready"
+    )
+}
+
+async fn live_browser_sessions_context_system_message(
+    browser_sessions: &crate::core::browser_session::BrowserSessionManager,
+    conversation_id: Option<&str>,
+) -> Option<String> {
+    let conversation_id = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let listed = browser_sessions.list_session_views().await;
+    let mut sessions = Vec::new();
+    for session in listed
+        .into_iter()
+        .filter(|session| {
+            session.conversation_id.as_deref() == Some(conversation_id)
+                && browser_session_status_is_live_context(session.status.as_str())
+        })
+        .take(3)
+    {
+        let view = browser_sessions
+            .describe_session(&session.id)
+            .await
+            .unwrap_or(session);
+        sessions.push(serde_json::json!({
+            "id": view.id,
+            "status": view.status,
+            "task_description": view.task_description,
+            "question": view.question,
+            "summary": view.summary,
+            "page_url": view.page_url,
+            "page_title": view.page_title,
+            "can_claim": view.can_claim,
+            "can_release": view.can_release,
+            "can_complete": view.can_complete,
+        }));
+    }
+    if sessions.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Live browser session context for this chat. If the user refers to the current page, screen, browser, handoff, checkpoint, or a pending browser question, use the browse primitive action that matches the meaning: action=snapshot to read the current page, action=resume_handoff to pass the user's reply or handoff note back to the waiting browser loop, and action=start_session only for new or continued browser automation. Do not state current page content without snapshot evidence.\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(sessions))
+            .unwrap_or_else(|_| "[]".to_string())
+    ))
+}
+
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_model_routed_spine_for_chat(
@@ -1716,6 +2165,14 @@ impl Agent {
         {
             spine_messages.push(SpineMessage::System {
                 content: browser_profile_context,
+            });
+        }
+        if let Some(live_browser_context) =
+            live_browser_sessions_context_system_message(&self.browser_sessions, conversation_id)
+                .await
+        {
+            spine_messages.push(SpineMessage::System {
+                content: live_browser_context,
             });
         }
         if let Some(request_context) = structured_chat_request_context_system_message(request_hints)
@@ -1810,6 +2267,24 @@ impl Agent {
                 turn_records,
                 turn_plan: None,
             }),
+            SpineResult::Blocked { final_text, .. } => Ok(spine_blocked_processed_message(
+                conversation_id,
+                &final_text,
+                crate::core::ExecutionRunStatus::Blocked.as_str(),
+                trace_steps,
+                turn_records,
+                cached_prompt_tokens,
+                cache_creation_prompt_tokens,
+            )),
+            SpineResult::NeedsInput { final_text, .. } => Ok(spine_blocked_processed_message(
+                conversation_id,
+                &final_text,
+                crate::core::ExecutionRunStatus::NeedsInput.as_str(),
+                trace_steps,
+                turn_records,
+                cached_prompt_tokens,
+                cache_creation_prompt_tokens,
+            )),
             SpineResult::PausedForApproval { .. } => {
                 let approval = cx.paused_approval().await.unwrap_or_else(|| {
                     tool_result_error(
@@ -1979,6 +2454,26 @@ impl Agent {
         let tools = ToolRegistry::new();
         match run_spine((*request).clone(), &server, &tools, &cx).await {
             SpineResult::Completed { final_text, .. } => Ok(final_text),
+            SpineResult::Blocked {
+                final_text,
+                turns_used,
+                ..
+            } => Ok(serde_json::json!({
+                "status": "blocked",
+                "turns_used": turns_used,
+                "message": final_text,
+            })
+            .to_string()),
+            SpineResult::NeedsInput {
+                final_text,
+                turns_used,
+                ..
+            } => Ok(serde_json::json!({
+                "status": "needs_input",
+                "turns_used": turns_used,
+                "message": final_text,
+            })
+            .to_string()),
             SpineResult::PausedForApproval { pending_call, .. } => {
                 let pending = serde_json::json!({
                     "status": "paused_for_approval",
@@ -2054,6 +2549,14 @@ impl Agent {
         let tools = ToolRegistry::new();
         match run_spine((*request).clone(), &server, &tools, &cx).await {
             SpineResult::Completed { final_text, .. } => Ok(final_text),
+            SpineResult::Blocked { final_text, .. } => Err(anyhow::anyhow!(
+                "watcher spine poll blocked: {}",
+                final_text
+            )),
+            SpineResult::NeedsInput { final_text, .. } => Err(anyhow::anyhow!(
+                "watcher spine poll needs input: {}",
+                final_text
+            )),
             SpineResult::MaxTurnsExceeded { turns_used, .. } => Err(anyhow::anyhow!(
                 "watcher spine poll exceeded turn budget after {} turns",
                 turns_used
@@ -2150,7 +2653,7 @@ fn storage_message_to_spine_message(
             tool_call_id: message
                 .tool_call_id
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| message.id),
+                .unwrap_or(message.id),
             content: message.content,
         },
         _ => SpineMessage::User {
@@ -2377,6 +2880,8 @@ fn spine_trace_steps(events: &[SpineTraceEvent]) -> Vec<ExecutionStep> {
                     "[spine]",
                     match terminal_state {
                         SpineTerminalState::Completed => "Spine Completed",
+                        SpineTerminalState::NeedsInput => "Spine Needs Input",
+                        SpineTerminalState::Blocked => "Spine Blocked",
                         SpineTerminalState::MaxTurnsExceeded => "Spine Max Turns",
                         SpineTerminalState::Cancelled => "Spine Cancelled",
                         SpineTerminalState::PausedForApproval => "Spine Paused",
@@ -2426,6 +2931,8 @@ fn spine_cache_usage_from_events(events: &[SpineTraceEvent]) -> (i64, i64) {
 fn spine_turn_records(result: &SpineResult) -> Vec<AgentTurnRecord> {
     let messages = match result {
         SpineResult::Completed { messages, .. }
+        | SpineResult::NeedsInput { messages, .. }
+        | SpineResult::Blocked { messages, .. }
         | SpineResult::MaxTurnsExceeded { messages, .. }
         | SpineResult::Cancelled { messages, .. }
         | SpineResult::PausedForApproval { messages, .. }
@@ -2507,7 +3014,9 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
                 "properties": {
                     "url": { "type": "string" },
                     "method": { "type": "string", "enum": ["GET", "POST"], "default": "GET" },
-                    "integration": { "type": "string", "enum": ["gmail", "calendar", "google_drive", "connector"], "description": "Canonical integration id for connected reads." },
+                    "integration": { "type": "string", "enum": ["gmail", "calendar", "google_drive", "connector", "custom_api"], "description": "Canonical integration surface for connected reads. Use custom_api with id plus operation/body to call a saved read-only custom API action." },
+                    "id": { "type": "string", "description": "Saved integration/custom API id when integration=custom_api." },
+                    "operation": { "type": "string", "description": "Saved custom API operation id, action name, or operation label when integration=custom_api." },
                     "op": { "type": "string", "description": "Read operation such as read, list, query, today, free_busy." },
                     "query": { "type": "string" },
                     "content": { "type": "object" },
@@ -2522,13 +3031,16 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
             serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "action": { "type": "string", "enum": ["start_session", "snapshot", "resume_handoff"], "default": "start_session", "description": "Use start_session for new or continued browser automation, snapshot to read the current live browser page without changing it, and resume_handoff to pass the user's chat reply or handoff note back to a waiting browser loop." },
                     "url": { "type": "string" },
                     "task": { "type": "string", "description": "Browser task to perform." },
+                    "session_id": { "type": "string", "description": "Optional live browser session id from current browser session context." },
+                    "note": { "type": "string", "description": "User reply, choice, or handoff note to return to a waiting browser loop when action=resume_handoff." },
+                    "resume_in_chat": { "type": "boolean", "description": "When action=resume_handoff, return control to chat instead of continuing the browser loop." },
                     "profile": { "type": "string", "description": "Optional saved browser profile selector by id, name, target, tag, or semantic description when the task should reuse a saved login or browser identity." },
-                    "expectation": { "type": "string" },
+                    "expectation": { "type": "string", "description": "User-facing browser completion expectation, checkpoint, stop condition, requested question, or follow-up choice that must be preserved for the browser loop." },
                     "metadata": { "type": "object" }
                 },
-                "required": ["task"],
                 "additionalProperties": false
             }),
         ),
@@ -2551,16 +3063,32 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
             }),
         ),
         primitive_schema(
+            "pdf_generate",
+            "Create a managed PDF document artifact from complete supplied content. Use this for PDF deliverables so AgentArk returns a Documents-visible managed file directly instead of requiring code execution or filesystem handoff.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Human-readable document title." },
+                    "filename": { "type": "string", "description": "Suggested PDF filename. AgentArk normalizes it safely." },
+                    "style": { "type": "string", "enum": ["plain", "report", "letter", "invoice"], "default": "report" },
+                    "content": { "type": "string", "description": "Complete final document body to render into the PDF." },
+                    "metadata": { "type": "object", "description": "Optional provenance or artifact identity metadata." }
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
             "resource_rw",
-            "Create, read, update, delete, list, pause, resume, connect, install, refresh, test, or inspect backed durable AgentArk resources, user-visible artifacts, and external integration surfaces. Use managed files for saved documents, reports, runbooks, reusable workflow instructions, and source assets; they are surfaced through Documents rather than container paths. Use app_service or dashboard for browser-runnable pages, dashboards, apps, and tools. Use scheduled_task or watcher only when the durable outcome must run independently later, monitor a condition, notify outside the artifact, or follow a concrete cadence. Use integration/custom_api/custom_messaging_channel/extension_pack/mcp_server when setting up or inspecting external capabilities for AgentArk itself. If a requested kind/op is unsupported, the tool result is terminal evidence; do not loop.",
+            "Create, read, update, delete, list, pause, resume, connect, install, refresh, test, or inspect backed durable AgentArk resources, user-visible artifacts, notifications, local activity evidence, and external integration surfaces. Use notification for user-facing notification delivery; include schedule fields when it should happen later. Use activity for recent work, recent conversations, Reflect/Sentinel signals, work patterns, attention, avoidance, recurring themes, and retrospective personal activity questions. Use managed files for saved documents, reports, runbooks, reusable workflow instructions, and source assets; they are surfaced through Documents rather than container paths. Use app_service or dashboard for browser-runnable pages, dashboards, apps, and tools. Use scheduled_task or watcher only when the durable outcome must run independently later, monitor a condition, notify outside the artifact, or follow a concrete cadence. Use integration/custom_api/custom_messaging_channel/extension_pack/mcp_server when setting up or inspecting external capabilities for AgentArk itself. If a requested kind/op is unsupported, the tool result is terminal evidence; do not loop.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "op": { "type": "string", "enum": ["create", "read", "update", "delete", "list", "status", "pause", "resume", "stop", "cancel", "update_delivery", "install", "connect", "enable", "disable", "refresh", "test"] },
                     "kind": {
                         "type": "string",
-                        "enum": ["file", "app_service", "watcher", "scheduled_task", "background_session", "goal", "dashboard", "conversation", "integration", "custom_api", "custom_messaging_channel", "extension_pack", "mcp_server", "skill", "skill_marketplace"],
-                        "description": "Resource substrate selected by meaning: app_service/dashboard for browser-viewable pages, dashboards, apps, games, tools, and HTML UI artifacts; file for raw documents, runbooks, source assets, and reusable instructions; scheduled_task/watcher only for independent future execution or monitoring; integration/custom_api/custom_messaging_channel/extension_pack/mcp_server for external capabilities installed into AgentArk; skill for reusable AgentArk procedures/capabilities; skill_marketplace for sources that list installable skills."
+                        "enum": ["file", "app_service", "watcher", "scheduled_task", "notification", "background_session", "goal", "dashboard", "conversation", "activity", "integration", "custom_api", "custom_messaging_channel", "extension_pack", "mcp_server", "skill", "skill_marketplace"],
+                        "description": "Resource substrate selected by meaning: notification for user-facing notification delivery, immediate or scheduled; activity for recent work, conversations, Reflect/Sentinel evidence, personal activity patterns, attention, avoidance, recurring themes, and retrospective local-state insight; app_service/dashboard for browser-viewable pages, dashboards, apps, games, tools, and HTML UI artifacts; file for raw documents, runbooks, source assets, and reusable instructions; scheduled_task/watcher only for independent future execution or monitoring; integration/custom_api/custom_messaging_channel/extension_pack/mcp_server for external capabilities installed into AgentArk; skill for reusable AgentArk procedures/capabilities; skill_marketplace for sources that list installable skills."
                     },
                     "id": {
                         "type": "string",
@@ -2569,7 +3097,7 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
                     "query": { "type": "string", "description": "Semantic lookup, listing, or matching text for the target resource." },
                     "content": {
                         "type": "object",
-                        "description": "Payload for the resource. For kind=file create/update, include path as a workspace/data-relative string and one body source in the same call: content (complete file body string), content_base64, source_path, or source_resource. Do not create files with only title/description/metadata. Single-file patch updates need path plus patch; batch patch updates need patches entries with path and patch. For kind=app_service/dashboard, provide browser-runnable files with an HTML entrypoint such as index.html, a complete HTML document in content.content, or staged source_dir/source_paths so AgentArk returns a browser-accessible /apps/ URL. For custom_api provide name, description, and base_url/path or openapi_url/openapi_text plus auth fields if known. For custom_messaging_channel provide the channel name and declarative send specification. For extension_pack provide pack_id/source_url/source_path/manifest_text/manifest for installs or pack_id plus connection fields for connect. For mcp_server provide name plus HTTP url or stdio command/args and auth type/credential metadata. For skill provide name plus complete SKILL.md markdown for create/update, url/source_url/install_url for import/install, or arguments for test. For skill_marketplace provide name/url/enabled for create/update and id/name for read/delete/refresh/enable/disable. Durable facts, preferences, and reusable knowledge that are not procedures should use memory_rw rather than skill."
+                        "description": "Payload for the resource. For kind=file create/update, include path as a workspace/data-relative string and one body source in the same call: content (complete file body string), content_base64, source_path, or source_resource. Do not create files with only title/description/metadata. Single-file patch updates need path plus patch; batch patch updates need patches entries with path and patch. For kind=app_service/dashboard, provide browser-runnable files with an HTML entrypoint such as index.html, a complete HTML document in content.content, or staged source_dir/source_paths so AgentArk returns a browser-accessible /apps/ URL. For kind=notification create, include message/title plus optional delivery route as delivery_channel, report_to, or channel; include cron, at, scheduled_for, or local_time/timezone when delivery should happen later. For kind=scheduled_task create/update, include task or task_id plus cron, at, scheduled_for, or local_time/timezone, optional report_to/channel, and optional action/action_arguments; for notification reminders, action_arguments.message is the reminder body. scheduled_for is the persisted one-time timestamp returned by task status/list and is equivalent to at. Use local_time/timezone when the user gave a wall-clock time without a full date. For custom_api create/update/install/connect, provide name, description, and base_url/path or openapi_url/openapi_text plus auth fields if known. For custom_messaging_channel configure a reusable non-bundled outbound channel by providing the channel name and declarative HTTP send specification; do not use it to send a one-off notification. For extension_pack provide pack_id/source_url/source_path/manifest_text/manifest for installs or pack_id plus connection fields for connect. For mcp_server provide name plus HTTP url or stdio command/args and auth type/credential metadata only when the requested substrate is explicitly MCP. For skill provide name plus complete SKILL.md markdown for create/update, url/source_url/install_url for import/install, or arguments for test. For skill_marketplace provide name/url/enabled for create/update and id/name for read/delete/refresh/enable/disable. Durable facts, preferences, and reusable knowledge that are not procedures should use memory_rw rather than skill."
                     },
                     "metadata": {
                         "type": "object",
@@ -2714,18 +3242,51 @@ fn plan_fetch(arguments: &serde_json::Value) -> PrimitivePlan {
             action_name: "connector_request".to_string(),
             arguments: merge_content_metadata(arguments),
         }]),
+        "custom_api" => {
+            let mut payload = merge_content_metadata(arguments);
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("integration");
+            }
+            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+                action_name: "custom_api_request".to_string(),
+                arguments: payload,
+            }])
+        }
         _ => unsupported("fetch requires either `url` or a supported `integration` read target."),
     }
 }
 
 fn plan_browse(arguments: &serde_json::Value) -> PrimitivePlan {
-    let Some(task) = json_text(arguments, "task") else {
+    let action = json_text(arguments, "action").unwrap_or_else(|| "start_session".to_string());
+    let task = json_text(arguments, "task");
+    if action == "start_session" && task.is_none() {
         return unsupported("browse requires `task`.");
-    };
+    }
     let mut payload = serde_json::Map::new();
-    payload.insert("task".to_string(), serde_json::Value::String(task));
+    payload.insert("action".to_string(), serde_json::Value::String(action));
+    if let Some(task) = task {
+        payload.insert("task".to_string(), serde_json::Value::String(task));
+    }
     if let Some(url) = json_text(arguments, "url") {
         payload.insert("url".to_string(), serde_json::Value::String(url));
+    }
+    if let Some(session_id) = json_text(arguments, "session_id") {
+        payload.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id),
+        );
+    }
+    if let Some(note) = json_text(arguments, "note") {
+        payload.insert("note".to_string(), serde_json::Value::String(note));
+    }
+    if let Some(resume_in_chat) = arguments
+        .get("resume_in_chat")
+        .and_then(|value| value.as_bool())
+    {
+        payload.insert(
+            "resume_in_chat".to_string(),
+            serde_json::Value::Bool(resume_in_chat),
+        );
     }
     if let Some(profile) = json_text(arguments, "profile") {
         payload.insert("profile".to_string(), serde_json::Value::String(profile));
@@ -2736,10 +3297,6 @@ fn plan_browse(arguments: &serde_json::Value) -> PrimitivePlan {
             serde_json::Value::String(expectation),
         );
     }
-    payload.insert(
-        "action".to_string(),
-        serde_json::Value::String("start_session".to_string()),
-    );
     PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
         action_name: "browser_auto".to_string(),
         arguments: serde_json::Value::Object(payload),
@@ -2765,11 +3322,11 @@ fn plan_code_exec(arguments: &serde_json::Value) -> PrimitivePlan {
     if !payload.contains_key("code") {
         return unsupported("code_exec requires either `command` or `code`.");
     }
-    if !payload
+    if payload
         .get("language")
         .and_then(|value| value.as_str())
         .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
+        .is_none_or(|value| value.is_empty())
     {
         return unsupported_with_extra(
             "code_exec with inline `code` requires `language`.",
@@ -2781,6 +3338,37 @@ fn plan_code_exec(arguments: &serde_json::Value) -> PrimitivePlan {
     }
     PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
         action_name: "code_execute".to_string(),
+        arguments: serde_json::Value::Object(payload),
+    }])
+}
+
+fn plan_pdf_generate(arguments: &serde_json::Value) -> PrimitivePlan {
+    let Some(content) = json_text(arguments, "content") else {
+        return unsupported("pdf_generate requires complete `content`.");
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert("content".to_string(), serde_json::Value::String(content));
+    if let Some(title) = json_text(arguments, "title") {
+        payload.insert("title".to_string(), serde_json::Value::String(title));
+    }
+    if let Some(filename) = json_text(arguments, "filename") {
+        payload.insert("filename".to_string(), serde_json::Value::String(filename));
+    }
+    payload.insert(
+        "style".to_string(),
+        serde_json::Value::String(
+            json_text(arguments, "style").unwrap_or_else(|| "report".to_string()),
+        ),
+    );
+    payload.insert(
+        "document_visible".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    if let Some(metadata) = arguments.get("metadata").cloned() {
+        payload.insert("metadata".to_string(), metadata);
+    }
+    PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+        action_name: "pdf_generate".to_string(),
         arguments: serde_json::Value::Object(payload),
     }])
 }
@@ -2925,6 +3513,12 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                 Err(plan) => plan,
             }
         }
+        ("notification", "create") | ("notification", "update") => {
+            match notification_payload_from_resource(arguments, op.as_str()) {
+                Ok(action) => PrimitivePlan::Actions(vec![action]),
+                Err(plan) => plan,
+            }
+        }
         ("scheduled_task", "list") | ("scheduled_task", "read") | ("scheduled_task", "status") => {
             match durable_work_manage_payload_from_resource(arguments, kind.as_str(), op.as_str()) {
                 Ok(payload) => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
@@ -2977,14 +3571,51 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                 arguments: payload,
             }])
         }
+        ("integration", "test") => {
+            let mut payload = merge_content_metadata(arguments);
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("run_check".to_string(), serde_json::Value::Bool(true));
+                object.remove("op");
+                object.remove("kind");
+            }
+            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+                action_name: "inspect_integration".to_string(),
+                arguments: payload,
+            }])
+        }
         ("integration", "create")
         | ("integration", "update")
         | ("integration", "install")
         | ("integration", "connect") => plan_integration_mutation(arguments, op.as_str()),
-        ("custom_api", "create") | ("custom_api", "update") => {
+        ("custom_api", "create")
+        | ("custom_api", "update")
+        | ("custom_api", "install")
+        | ("custom_api", "connect") => {
+            let mut payload = merge_content_metadata(arguments);
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("op");
+                object.remove("kind");
+                if op != "update" {
+                    object.remove("id");
+                }
+            }
             PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
                 action_name: "capability_acquire".to_string(),
-                arguments: merge_content_metadata(arguments),
+                arguments: payload,
+            }])
+        }
+        ("custom_api", "test") => {
+            let mut payload = merge_objects(
+                serde_json::json!({ "surface": "custom_apis", "run_check": true }),
+                merge_content_metadata(arguments),
+            );
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("op");
+                object.remove("kind");
+            }
+            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+                action_name: "inspect_integration".to_string(),
+                arguments: payload,
             }])
         }
         ("custom_api", "list") | ("custom_api", "read") | ("custom_api", "status") => {
@@ -3001,16 +3632,37 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                 ),
             }])
         }
+        ("custom_api", "delete") | ("custom_api", "enable") | ("custom_api", "disable") => {
+            let mut payload = merge_content_metadata(arguments);
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "operation".to_string(),
+                    serde_json::Value::String(op.clone()),
+                );
+                object.remove("op");
+                object.remove("kind");
+            }
+            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+                action_name: "custom_api_manage".to_string(),
+                arguments: payload,
+            }])
+        }
         ("custom_api", _) => unsupported_resource_operation(
             "custom_api",
             op.as_str(),
-            &["create", "update", "list", "read", "status"],
+            &[
+                "create", "update", "install", "connect", "list", "read", "status", "test",
+                "delete", "enable", "disable",
+            ],
         ),
         ("custom_messaging_channel", "create") | ("custom_messaging_channel", "update") => {
-            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                action_name: "custom_messaging_channel_upsert".to_string(),
-                arguments: merge_content_metadata(arguments),
-            }])
+            match custom_messaging_channel_payload_from_resource(arguments, op.as_str()) {
+                Ok(payload) => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+                    action_name: "custom_messaging_channel_upsert".to_string(),
+                    arguments: payload,
+                }]),
+                Err(plan) => plan,
+            }
         }
         ("custom_messaging_channel", "list")
         | ("custom_messaging_channel", "read")
@@ -3154,11 +3806,70 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                     .or_else(|| json_usize_path(arguments, &["metadata", "limit"])),
             })
         }
-        _ => unsupported(format!(
+        ("activity", "read")
+        | ("activity", "list")
+        | ("activity", "status")
+        | ("activity", "refresh") => {
+            let mut payload = serde_json::json!({
+                "operation": "surface",
+                "surface": "activity",
+            });
+            if let Some(limit) = json_usize(arguments, "limit")
+                .or_else(|| json_usize_path(arguments, &["metadata", "limit"]))
+            {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("limit".to_string(), serde_json::json!(limit));
+                }
+            }
+            if let Some(query) = json_text(arguments, "query") {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("query".to_string(), serde_json::json!(query));
+                }
+            }
+            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+                action_name: "ark_inspect".to_string(),
+                arguments: payload,
+            }])
+        }
+        _ => unsupported_resource_adapter(arguments, kind.as_str(), op.as_str()),
+    }
+}
+
+fn unsupported_resource_adapter(
+    arguments: &serde_json::Value,
+    kind: &str,
+    op: &str,
+) -> PrimitivePlan {
+    let mut extra = serde_json::json!({
+        "kind": kind,
+        "op": op,
+        "valid_kinds": RESOURCE_RW_VALID_KINDS,
+    });
+    if resource_payload_looks_like_notification(arguments) {
+        if let Some(object) = extra.as_object_mut() {
+            object.insert(
+                "suggested_kind".to_string(),
+                serde_json::Value::String("notification".to_string()),
+            );
+            object.insert(
+                "suggested_op".to_string(),
+                serde_json::Value::String("create".to_string()),
+            );
+            object.insert(
+                "hint".to_string(),
+                serde_json::Value::String(
+                    "This payload has a user-facing notification shape. Retry as resource_rw kind=notification with the message/title and delivery route in content.delivery_channel, content.report_to, or content.channel.".to_string(),
+                ),
+            );
+        }
+    }
+    unsupported_with_extra(
+        format!(
             "resource_rw does not yet have a substrate adapter for kind `{}` and op `{}`.",
             kind, op
-        )),
-    }
+        ),
+        extra,
+    )
 }
 
 fn scheduled_task_payload_from_resource(
@@ -3166,6 +3877,41 @@ fn scheduled_task_payload_from_resource(
     op: &str,
 ) -> Result<serde_json::Value, PrimitivePlan> {
     let mut payload = merge_content_metadata(arguments);
+    merge_top_level_resource_fields(
+        arguments,
+        &mut payload,
+        &[
+            "items",
+            "message",
+            "title",
+            "task",
+            "task_id",
+            "cron",
+            "at",
+            "scheduled_for",
+            "local_date",
+            "local_time",
+            "timezone",
+            "timezone_offset_minutes",
+            "date_policy",
+            "report_to",
+            "delivery_channel",
+            "channel",
+            "action",
+            "action_arguments",
+            "script",
+            "script_language",
+            "context_from",
+            "workdir",
+            "network_access",
+            "validation",
+            "max_attempts",
+            "stall_timeout_secs",
+            "retry_backoff_secs",
+            "automation_policy",
+        ],
+    );
+    normalize_scheduled_notification_payload(&mut payload);
     if op == "update" {
         let task_id = json_text(arguments, "id")
             .or_else(|| json_text(&payload, "task_id"))
@@ -3191,6 +3937,532 @@ fn scheduled_task_payload_from_resource(
         object.remove("id");
     }
     Ok(payload)
+}
+
+fn notification_payload_from_resource(
+    arguments: &serde_json::Value,
+    op: &str,
+) -> Result<PrimitiveActionInvocation, PrimitivePlan> {
+    let mut payload = merge_content_metadata(arguments);
+    merge_top_level_resource_fields(
+        arguments,
+        &mut payload,
+        &[
+            "items",
+            "message",
+            "title",
+            "task",
+            "task_id",
+            "cron",
+            "at",
+            "scheduled_for",
+            "local_date",
+            "local_time",
+            "timezone",
+            "timezone_offset_minutes",
+            "date_policy",
+            "report_to",
+            "delivery_channel",
+            "channel",
+            "action",
+            "action_arguments",
+            "allow_duplicate",
+            "validation",
+            "max_attempts",
+            "stall_timeout_secs",
+            "retry_backoff_secs",
+            "automation_policy",
+        ],
+    );
+
+    if notification_payload_has_schedule(&payload) {
+        normalize_scheduled_notification_payload(&mut payload);
+        if op == "update" {
+            let task_id = json_text(arguments, "id")
+                .or_else(|| json_text(&payload, "task_id"))
+                .or_else(|| json_text_path(arguments, &["content", "task_id"]));
+            let Some(task_id) = task_id else {
+                return Err(unsupported_with_extra(
+                    "resource_rw notification update requires `id` or `content.task_id` when updating a scheduled notification.",
+                    serde_json::json!({
+                        "kind": "notification",
+                        "op": op,
+                        "field": "id",
+                    }),
+                ));
+            };
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("task_id".to_string(), serde_json::Value::String(task_id));
+            }
+        }
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("op");
+            object.remove("kind");
+            object.remove("id");
+            object.remove("delivery_channel");
+            object.remove("channel");
+            object.remove("message");
+            object.remove("title");
+        }
+        return Ok(PrimitiveActionInvocation {
+            action_name: "schedule_task".to_string(),
+            arguments: payload,
+        });
+    }
+
+    normalize_direct_notification_payload(&mut payload)?;
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("op");
+        object.remove("kind");
+        object.remove("id");
+        object.remove("query");
+        object.remove("report_to");
+        object.remove("channel");
+        object.remove("task");
+    }
+    Ok(PrimitiveActionInvocation {
+        action_name: "notify_user".to_string(),
+        arguments: payload,
+    })
+}
+
+fn custom_messaging_channel_payload_from_resource(
+    arguments: &serde_json::Value,
+    op: &str,
+) -> Result<serde_json::Value, PrimitivePlan> {
+    let mut payload = merge_content_metadata(arguments);
+    merge_top_level_resource_fields(
+        arguments,
+        &mut payload,
+        &[
+            "name",
+            "description",
+            "enabled",
+            "docs_url",
+            "send",
+            "auth_manifest",
+            "auth_profile_id",
+            "credential_fields",
+            "clear_secrets",
+        ],
+    );
+    if json_text(&payload, "name").is_none() || !payload.get("send").is_some_and(|v| v.is_object())
+    {
+        let mut extra = serde_json::json!({
+            "kind": "custom_messaging_channel",
+            "op": op,
+            "field": "content.send",
+            "hint": "Use kind=notification for delivering a user-facing notification. Use custom_messaging_channel only to configure a reusable non-bundled outbound channel."
+        });
+        if resource_payload_looks_like_notification(arguments) {
+            if let Some(object) = extra.as_object_mut() {
+                object.insert(
+                    "suggested_kind".to_string(),
+                    serde_json::Value::String("notification".to_string()),
+                );
+                object.insert(
+                    "suggested_op".to_string(),
+                    serde_json::Value::String("create".to_string()),
+                );
+            }
+        }
+        return Err(unsupported_with_extra(
+            "resource_rw custom_messaging_channel create requires a reusable channel name and declarative send specification.",
+            extra,
+        ));
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("op");
+        object.remove("kind");
+    }
+    Ok(payload)
+}
+
+fn resource_payload_looks_like_notification(arguments: &serde_json::Value) -> bool {
+    let payload = merge_content_metadata(arguments);
+    if payload.get("send").is_some_and(|value| value.is_object()) {
+        return false;
+    }
+
+    let has_message_body = ["message", "title", "task"]
+        .iter()
+        .any(|key| json_text(&payload, key).is_some())
+        || json_text_path(&payload, &["action_arguments", "message"]).is_some();
+    let has_delivery_route = ["delivery_channel", "report_to", "channel", "recipient"]
+        .iter()
+        .any(|key| json_text(&payload, key).is_some());
+
+    has_message_body && (has_delivery_route || notification_payload_has_schedule(&payload))
+}
+
+fn notification_payload_has_schedule(payload: &serde_json::Value) -> bool {
+    ["cron", "at", "scheduled_for", "local_time"]
+        .iter()
+        .any(|key| json_text(payload, key).is_some())
+        || payload
+            .get("items")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    ["cron", "at", "scheduled_for", "local_time"]
+                        .iter()
+                        .any(|key| json_text(item, key).is_some())
+                })
+            })
+}
+
+fn normalize_scheduled_notification_payload(payload: &mut serde_json::Value) {
+    if let Some(items) = payload
+        .get_mut("items")
+        .and_then(|value| value.as_array_mut())
+    {
+        for item in items {
+            normalize_single_scheduled_notification_payload(item);
+        }
+    }
+    normalize_single_scheduled_notification_payload(payload);
+}
+
+fn normalize_single_scheduled_notification_payload(payload: &mut serde_json::Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+
+    let delivery_channel = ["delivery_channel", "channel"].iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    if let Some(delivery_channel) = delivery_channel {
+        object
+            .entry("report_to".to_string())
+            .or_insert(serde_json::Value::String(delivery_channel));
+    }
+
+    let message = object
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            object
+                .get("action_arguments")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            object
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+
+    if let Some(message) = message {
+        object
+            .entry("task".to_string())
+            .or_insert_with(|| serde_json::Value::String(message.clone()));
+        object
+            .entry("action".to_string())
+            .or_insert_with(|| serde_json::Value::String("notify_user".to_string()));
+        let action_is_notify_user = object
+            .get("action")
+            .and_then(|value| value.as_str())
+            .is_none_or(|value| value.trim().eq_ignore_ascii_case("notify_user"));
+        if action_is_notify_user {
+            let action_arguments = object
+                .entry("action_arguments".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if !action_arguments.is_object() {
+                *action_arguments = serde_json::json!({});
+            }
+            if let Some(args_object) = action_arguments.as_object_mut() {
+                args_object
+                    .entry("message".to_string())
+                    .or_insert_with(|| serde_json::Value::String(message));
+                args_object
+                    .entry("source".to_string())
+                    .or_insert_with(|| serde_json::Value::String("reminder".to_string()));
+                args_object
+                    .entry("in_app_title".to_string())
+                    .or_insert_with(|| serde_json::Value::String("Reminder".to_string()));
+            }
+        }
+    }
+}
+
+fn normalize_direct_notification_payload(
+    payload: &mut serde_json::Value,
+) -> Result<(), PrimitivePlan> {
+    let Some(object) = payload.as_object_mut() else {
+        return Err(unsupported_with_extra(
+            "resource_rw notification create requires a notification payload object.",
+            serde_json::json!({
+                "kind": "notification",
+                "field": "content",
+            }),
+        ));
+    };
+
+    let delivery_channel = ["report_to", "channel"].iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    if let Some(delivery_channel) = delivery_channel {
+        object
+            .entry("delivery_channel".to_string())
+            .or_insert(serde_json::Value::String(delivery_channel));
+    }
+
+    let message = object
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            object
+                .get("task")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            object
+                .get("query")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            object
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+
+    let Some(message) = message else {
+        return Err(unsupported_with_extra(
+            "resource_rw notification create requires `content.message`.",
+            serde_json::json!({
+                "kind": "notification",
+                "field": "content.message",
+            }),
+        ));
+    };
+    object
+        .entry("message".to_string())
+        .or_insert_with(|| serde_json::Value::String(message));
+    Ok(())
+}
+
+fn scheduled_notification_invocation_from_direct_notification(
+    invocation: &PrimitiveActionInvocation,
+    request_text: &str,
+    now_utc: chrono::DateTime<chrono::Utc>,
+    default_timezone: Option<chrono_tz::Tz>,
+) -> Option<PrimitiveActionInvocation> {
+    if !invocation.action_name.eq_ignore_ascii_case("notify_user")
+        || notification_payload_has_schedule(&invocation.arguments)
+    {
+        return None;
+    }
+
+    let hint = notification_schedule_hint_from_request(request_text, now_utc, default_timezone)?;
+    let message = direct_notification_body_from_arguments(&invocation.arguments)?;
+    let reminder_message = format!(
+        "⏰ Reminder: {} scheduled for {} at {} {}",
+        message, hint.date_label, hint.local_time, hint.timezone_abbrev
+    );
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("task".to_string(), serde_json::Value::String(message));
+    arguments.insert(
+        "local_date".to_string(),
+        serde_json::Value::String(hint.local_date),
+    );
+    arguments.insert(
+        "local_time".to_string(),
+        serde_json::Value::String(hint.local_time),
+    );
+    arguments.insert(
+        "timezone".to_string(),
+        serde_json::Value::String(hint.timezone_name),
+    );
+    if let Some(route) = direct_notification_route_from_arguments(&invocation.arguments) {
+        arguments.insert("report_to".to_string(), serde_json::Value::String(route));
+    }
+    arguments.insert(
+        "action".to_string(),
+        serde_json::Value::String("notify_user".to_string()),
+    );
+    arguments.insert(
+        "action_arguments".to_string(),
+        serde_json::json!({
+            "message": reminder_message,
+            "source": "reminder",
+            "in_app_title": "Reminder"
+        }),
+    );
+    if let Some(allow_duplicate) = invocation.arguments.get("allow_duplicate").cloned() {
+        arguments.insert("allow_duplicate".to_string(), allow_duplicate);
+    }
+
+    Some(PrimitiveActionInvocation {
+        action_name: "schedule_task".to_string(),
+        arguments: serde_json::Value::Object(arguments),
+    })
+}
+
+fn notification_schedule_hint_from_request(
+    request_text: &str,
+    now_utc: chrono::DateTime<chrono::Utc>,
+    default_timezone: Option<chrono_tz::Tz>,
+) -> Option<NotificationScheduleHint> {
+    let local_time = NOTIFICATION_CLOCK_TIME_RE
+        .captures_iter(request_text)
+        .find_map(|captures| notification_clock_time_from_captures(&captures))?;
+    let timezone = default_timezone.unwrap_or(chrono_tz::UTC);
+    let now_local = now_utc.with_timezone(&timezone);
+    let now_local_date = now_local.date_naive();
+    let mut local_date = now_local_date;
+    let mut scheduled_local =
+        notification_resolve_local_datetime(timezone, local_date, local_time)?;
+    if scheduled_local.with_timezone(&chrono::Utc) <= now_utc {
+        local_date = now_local_date.succ_opt()?;
+        scheduled_local = notification_resolve_local_datetime(timezone, local_date, local_time)?;
+    }
+
+    Some(NotificationScheduleHint {
+        local_date: scheduled_local.date_naive().to_string(),
+        local_time: format_notification_local_time(local_time),
+        timezone_name: timezone.to_string(),
+        timezone_abbrev: scheduled_local.format("%Z").to_string(),
+        date_label: notification_schedule_date_label(now_local_date, scheduled_local.date_naive()),
+    })
+}
+
+fn notification_clock_time_from_captures(
+    captures: &regex::Captures<'_>,
+) -> Option<chrono::NaiveTime> {
+    if let (Some(hour), Some(meridiem)) = (captures.name("hour12"), captures.name("meridiem")) {
+        let mut hour = hour.as_str().parse::<u32>().ok()?;
+        let minute = captures
+            .name("minute12")
+            .map(|value| value.as_str().parse::<u32>().ok())
+            .unwrap_or(Some(0))?;
+        let meridiem = meridiem.as_str().to_ascii_lowercase();
+        if meridiem.starts_with('p') && hour != 12 {
+            hour += 12;
+        } else if meridiem.starts_with('a') && hour == 12 {
+            hour = 0;
+        }
+        return chrono::NaiveTime::from_hms_opt(hour, minute, 0);
+    }
+
+    let hour = captures.name("hour24")?.as_str().parse::<u32>().ok()?;
+    let minute = captures.name("minute24")?.as_str().parse::<u32>().ok()?;
+    let second = captures
+        .name("second24")
+        .map(|value| value.as_str().parse::<u32>().ok())
+        .unwrap_or(Some(0))?;
+    chrono::NaiveTime::from_hms_opt(hour, minute, second)
+}
+
+fn notification_resolve_local_datetime(
+    timezone: chrono_tz::Tz,
+    local_date: chrono::NaiveDate,
+    local_time: chrono::NaiveTime,
+) -> Option<chrono::DateTime<chrono_tz::Tz>> {
+    match timezone.from_local_datetime(&local_date.and_time(local_time)) {
+        chrono::LocalResult::Single(value) => Some(value),
+        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        chrono::LocalResult::None => None,
+    }
+}
+
+fn format_notification_local_time(time: chrono::NaiveTime) -> String {
+    let hour24 = time.hour();
+    let hour12 = match hour24 % 12 {
+        0 => 12,
+        value => value,
+    };
+    let meridiem = if hour24 < 12 { "AM" } else { "PM" };
+    format!("{}:{:02} {}", hour12, time.minute(), meridiem)
+}
+
+fn notification_schedule_date_label(
+    now_local_date: chrono::NaiveDate,
+    scheduled_local_date: chrono::NaiveDate,
+) -> String {
+    if scheduled_local_date == now_local_date {
+        "today".to_string()
+    } else if now_local_date
+        .succ_opt()
+        .is_some_and(|tomorrow| scheduled_local_date == tomorrow)
+    {
+        "tomorrow".to_string()
+    } else {
+        scheduled_local_date.to_string()
+    }
+}
+
+fn direct_notification_body_from_arguments(arguments: &serde_json::Value) -> Option<String> {
+    json_text(arguments, "message")
+        .or_else(|| json_text(arguments, "title"))
+        .or_else(|| json_text(arguments, "task"))
+}
+
+fn direct_notification_route_from_arguments(arguments: &serde_json::Value) -> Option<String> {
+    ["delivery_channel", "report_to", "channel", "recipient"]
+        .iter()
+        .find_map(|key| json_text(arguments, key))
+}
+
+fn latest_user_message_text(messages: &[SpineMessage]) -> Option<&str> {
+    messages.iter().rev().find_map(|message| match message {
+        SpineMessage::User { content } => {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        _ => None,
+    })
+}
+
+fn merge_top_level_resource_fields(
+    arguments: &serde_json::Value,
+    payload: &mut serde_json::Value,
+    keys: &[&str],
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    for key in keys {
+        if let Some(value) = arguments.get(*key) {
+            object
+                .entry((*key).to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
 }
 
 fn goal_resource_payload_from_resource(
@@ -3451,34 +4723,6 @@ fn plan_integration_mutation(arguments: &serde_json::Value, op: &str) -> Primiti
         }]);
     }
 
-    if payload.get("transport").is_some()
-        || payload.get("resources_enabled").is_some()
-        || payload.get("tool_allowlist").is_some()
-        || payload.get("tool_blocklist").is_some()
-        || payload.get("resource_allowlist").is_some()
-        || payload.get("command").is_some()
-        || (payload.get("url").is_some()
-            && (payload.get("auth").is_some()
-                || payload.get("auth_type").is_some()
-                || payload.get("timeout_secs").is_some()
-                || payload.get("max_response_bytes").is_some()))
-    {
-        if let Some(object) = payload.as_object_mut() {
-            object.insert(
-                "operation".to_string(),
-                serde_json::Value::String(if matches!(op, "install" | "connect") {
-                    "create".to_string()
-                } else {
-                    op.to_string()
-                }),
-            );
-        }
-        return PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-            action_name: "mcp_server_manage".to_string(),
-            arguments: payload,
-        }]);
-    }
-
     if payload.get("base_url").is_some()
         || payload.get("path").is_some()
         || payload.get("openapi_url").is_some()
@@ -3495,7 +4739,7 @@ fn plan_integration_mutation(arguments: &serde_json::Value, op: &str) -> Primiti
         serde_json::json!({
             "kind": "integration",
             "op": op,
-            "hint": "Use a specific resource kind when known: mcp_server, custom_api, custom_messaging_channel, or extension_pack. Otherwise provide structured fields such as transport/url/auth for MCP, base_url/path/openapi_url for custom APIs, send for messaging channels, or pack_id/source/manifest for extension packs."
+            "hint": "Use a specific resource kind when the substrate is explicit: mcp_server for MCP transports, custom_api for HTTP/API operations, custom_messaging_channel for send specs, or extension_pack for pack manifests/catalog installs. For custom APIs provide base_url/path or openapi_url/openapi_text; do not infer an MCP server from a generic integration request."
         }),
     )
 }
@@ -3546,11 +4790,7 @@ fn validate_file_mutation_payload(
         ));
     }
 
-    let field = if has_patch {
-        "content.path"
-    } else {
-        "content.path"
-    };
+    let field = "content.path";
     let reason = if has_patch {
         "resource_rw file patch updates require `content.path` for the file being patched."
     } else {
@@ -3849,6 +5089,10 @@ fn merge_content_metadata(arguments: &serde_json::Value) -> serde_json::Value {
         "query",
         "url",
         "method",
+        "operation",
+        "operation_id",
+        "action_name",
+        "body",
         "integration",
         "duplicate_policy",
         "allow_duplicate",
@@ -4130,8 +5374,8 @@ fn spine_tool_result_value_for_model(
             let data = value.get("data").unwrap_or(&value);
             return sanitize_service_manage_result_for_model(primitive, data);
         }
-        if action_name == "file_write" {
-            return sanitize_file_write_result_for_model(primitive, &value);
+        if matches!(action_name, "file_write" | "pdf_generate") {
+            return sanitize_managed_file_result_for_model(primitive, action_name, &value);
         }
         return sanitize_structured_tool_result_for_model(primitive, action_name, &value);
     }
@@ -4432,8 +5676,9 @@ fn sanitize_service_manage_service_for_model(service: &serde_json::Value) -> ser
     })
 }
 
-fn sanitize_file_write_result_for_model(
+fn sanitize_managed_file_result_for_model(
     primitive: &str,
+    action_name: &str,
     value: &serde_json::Value,
 ) -> serde_json::Value {
     let data = value.get("data").unwrap_or(value);
@@ -4487,16 +5732,39 @@ fn sanitize_file_write_result_for_model(
     if let Some(bytes) = bytes {
         artifact.insert("bytes".to_string(), serde_json::json!(bytes));
     }
+    if let Some(source_artifact) = data.get("artifact") {
+        for key in ["url", "download_url"] {
+            if let Some(href) = json_value_text(source_artifact, key)
+                .filter(|href| safe_model_visible_artifact_href(href))
+            {
+                artifact.insert(key.to_string(), serde_json::Value::String(href));
+            }
+        }
+    }
+    if !artifact.contains_key("download_url") {
+        if let Some(href) = document
+            .and_then(|doc| json_value_text(doc, "download_url"))
+            .filter(|href| safe_model_visible_artifact_href(href))
+        {
+            artifact.insert("download_url".to_string(), serde_json::Value::String(href));
+        }
+    }
 
     let document_ref = document.and_then(|doc| {
         let id = json_value_text(doc, "id")?;
         let filename = json_value_text(doc, "filename").unwrap_or_else(|| label.clone());
-        Some(serde_json::json!({
+        let mut document_ref = serde_json::json!({
             "id": id,
             "filename": filename,
             "url": json_value_text(doc, "url").unwrap_or_else(|| "/ui/documents".to_string()),
             "duplicate_skipped": doc.get("duplicate_skipped").and_then(|value| value.as_bool()).unwrap_or(false),
-        }))
+        });
+        if let Some(href) = json_value_text(doc, "download_url")
+            .filter(|href| safe_model_visible_artifact_href(href))
+        {
+            document_ref["download_url"] = serde_json::Value::String(href);
+        }
+        Some(document_ref)
     });
     if let Some(document_ref) = document_ref.clone() {
         artifact.insert("document".to_string(), document_ref);
@@ -4523,7 +5791,7 @@ fn sanitize_file_write_result_for_model(
     serde_json::json!({
         "ok": true,
         "primitive": primitive,
-        "tool": "file_write",
+        "tool": action_name,
         "status": value.get("status").and_then(|value| value.as_str()).unwrap_or("completed"),
         "artifact": serde_json::Value::Object(artifact),
         "message": message,
@@ -4537,6 +5805,11 @@ fn json_value_text(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn safe_model_visible_artifact_href(value: &str) -> bool {
+    (value == "/ui/documents" || value.starts_with("/ui/documents?"))
+        || (value.starts_with("/api/outputs/") && !value.contains("..") && !value.contains('\\'))
 }
 
 fn resource_label_from_path_text(path: &str) -> Option<String> {
@@ -4569,6 +5842,201 @@ fn estimate_prompt_tokens(messages: &[SpineMessage]) -> usize {
     chars.div_ceil(4)
 }
 
+fn stale_final_response_repair_prompt() -> String {
+    "The previous assistant message repeated content that was attached to an earlier tool-call turn instead of answering from the latest tool results. Provide the final answer now, grounded in the latest tool results. If the result is inconclusive or failed, state that clearly and include the blocker."
+        .to_string()
+}
+
+fn no_progress_final_response(messages: &[SpineMessage], final_text: &str) -> Option<String> {
+    if final_text.trim().is_empty() {
+        return None;
+    }
+    let last_tool_content = messages.iter().rev().find_map(|message| {
+        if let SpineMessage::Tool { content, .. } = message {
+            Some(content)
+        } else {
+            None
+        }
+    })?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(last_tool_content) else {
+        return None;
+    };
+    let error = value.get("error").and_then(|item| item.as_str());
+    if error != Some("repeated_no_progress_tool_call") {
+        return None;
+    }
+    let message = value
+        .get("message")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or("The last tool call repeated work that already produced no new progress.");
+    Some(format!(
+        "I could not complete this because the latest tool step made no new progress. {} Use the previous tool result, inspect the saved state, or call a different operation with different arguments before retrying.",
+        message
+    ))
+}
+
+fn needs_input_message_from_tool_results(results: &[ToolResult]) -> Option<String> {
+    results.iter().find_map(|result| {
+        let outcome = super::tool_responses::structured_tool_value_outcome(&result.value)?;
+        if outcome.state != super::tool_responses::StructuredToolOutcomeState::NeedsInput {
+            return None;
+        }
+        needs_input_message_from_tool_value(&result.value).or(outcome.message)
+    })
+}
+
+fn needs_input_message_from_tool_value(value: &serde_json::Value) -> Option<String> {
+    json_text_path(value, &["data", "session", "question"])
+        .or_else(|| json_text_path(value, &["data", "question"]))
+        .or_else(|| json_text(value, "question"))
+        .or_else(|| json_text(value, "detail"))
+        .or_else(|| json_text(value, "message"))
+        .or_else(|| Some("I need your input before I can continue this browser task.".to_string()))
+}
+
+fn incomplete_no_tool_final_response_repair_prompt() -> String {
+    "The previous assistant message was an unfinished lead-in and did not call a tool or provide a final answer. Continue from the current state: call the required tool now, or give a concrete blocker grounded in the available evidence."
+        .to_string()
+}
+
+fn incomplete_no_tool_final_response_blocker(final_text: &str) -> String {
+    let lead_in = final_text.trim();
+    if lead_in.is_empty() {
+        return "I could not complete this because the model stopped without calling a tool or giving a final answer."
+            .to_string();
+    }
+    format!(
+        "I could not complete this because the model stopped after an unfinished lead-in without calling a tool or giving a final answer: {}",
+        lead_in
+    )
+}
+
+fn incomplete_no_tool_final_response(messages: &[SpineMessage], final_text: &str) -> bool {
+    let trimmed = final_text.trim();
+    if trimmed.is_empty() || trimmed.lines().count() != 1 {
+        return false;
+    }
+    if trimmed.chars().count() > 240 {
+        return false;
+    }
+    let follows_live_context = messages.iter().rev().any(|message| {
+        matches!(
+            message,
+            SpineMessage::User { .. } | SpineMessage::Tool { .. }
+        )
+    });
+    if !follows_live_context {
+        return false;
+    }
+    if trimmed.ends_with(':') {
+        return true;
+    }
+    substantial_tool_run_before_final(messages) && !final_text_has_delivery_reference(trimmed)
+}
+
+fn substantial_tool_run_before_final(messages: &[SpineMessage]) -> bool {
+    let mut assistant_tool_turns = 0usize;
+    let mut requested_tool_calls = 0usize;
+    let mut completed_tool_results = 0usize;
+
+    for message in messages {
+        match message {
+            SpineMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                assistant_tool_turns += 1;
+                requested_tool_calls += tool_calls.len();
+            }
+            SpineMessage::Tool { .. } => {
+                completed_tool_results += 1;
+            }
+            _ => {}
+        }
+    }
+
+    assistant_tool_turns >= 2 || requested_tool_calls >= 4 || completed_tool_results >= 4
+}
+
+fn final_text_has_delivery_reference(text: &str) -> bool {
+    text.contains("](")
+        || text.contains("://")
+        || text.contains("/apps/")
+        || text.contains("/api/outputs/")
+        || text.contains("/ui/")
+}
+
+fn final_response_repeats_tool_call_content(messages: &[SpineMessage], final_text: &str) -> bool {
+    let final_normalized = normalize_text_for_repetition_check(final_text);
+    if final_normalized.len() < 12 {
+        return false;
+    }
+
+    messages.iter().any(|message| {
+        let SpineMessage::Assistant {
+            content,
+            tool_calls,
+        } = message
+        else {
+            return false;
+        };
+        if tool_calls.is_empty() {
+            return false;
+        }
+        let Some(content) = content.as_deref() else {
+            return false;
+        };
+        let prior_normalized = normalize_text_for_repetition_check(content);
+        texts_are_near_duplicates(&final_normalized, &prior_normalized)
+    })
+}
+
+fn normalize_text_for_repetition_check(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_space = true;
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            normalized.push(ch);
+            last_was_space = false;
+        } else if !last_was_space {
+            normalized.push(' ');
+            last_was_space = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn texts_are_near_duplicates(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let shorter = left_len.min(right_len) as f64;
+    let longer = left_len.max(right_len) as f64;
+    if shorter / longer < 0.8 {
+        return false;
+    }
+
+    let left_tokens = left.split_whitespace().collect::<Vec<_>>();
+    let right_tokens = right.split_whitespace().collect::<Vec<_>>();
+    if left_tokens.len().min(right_tokens.len()) < 4 {
+        return false;
+    }
+
+    let left_set = left_tokens
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let right_set = right_tokens
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let intersection = left_set.intersection(&right_set).count() as f64;
+    let union = left_set.union(&right_set).count() as f64;
+    union > 0.0 && intersection / union >= 0.9
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4597,7 +6065,11 @@ mod tests {
         assert!(prompt.contains("Finish every requested deliverable before the final answer"));
         assert!(prompt.contains("lead with one natural confirmation sentence"));
         assert!(prompt.contains("follow with compact details"));
-        assert!(prompt.contains("do not introduce a formal summary block"));
+        assert!(
+            prompt
+                .to_ascii_lowercase()
+                .contains("do not introduce a formal summary block")
+        );
         assert!(prompt.contains("do not add generic filler follow-up questions"));
         assert!(prompt.contains("accessible /apps/ URL"));
         assert!(prompt.contains("Do not return container paths"));
@@ -4705,6 +6177,198 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_no_tool_final_response_flags_short_multistep_tool_run() {
+        let messages = vec![
+            SpineMessage::User {
+                content: "Create a researched PDF report comparing agent platforms.".to_string(),
+            },
+            SpineMessage::Assistant {
+                content: Some("Gathering source evidence.".to_string()),
+                tool_calls: vec![
+                    test_tool_call("call-search-1", "search"),
+                    test_tool_call("call-search-2", "search"),
+                    test_tool_call("call-search-3", "search"),
+                ],
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-search-1".to_string(),
+                content: serde_json::json!({"ok": true, "results": ["source-a"]}).to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-search-2".to_string(),
+                content: serde_json::json!({"ok": true, "results": ["source-b"]}).to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-search-3".to_string(),
+                content: serde_json::json!({"ok": true, "results": ["source-c"]}).to_string(),
+            },
+            SpineMessage::Assistant {
+                content: Some("Checking the strongest sources.".to_string()),
+                tool_calls: vec![
+                    test_tool_call("call-fetch-1", "fetch"),
+                    test_tool_call("call-fetch-2", "fetch"),
+                    test_tool_call("call-fetch-3", "fetch"),
+                ],
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-fetch-1".to_string(),
+                content: serde_json::json!({"ok": true, "text": "evidence one"}).to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-fetch-2".to_string(),
+                content: serde_json::json!({"ok": true, "text": "evidence two"}).to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-fetch-3".to_string(),
+                content: serde_json::json!({"ok": true, "text": "evidence three"}).to_string(),
+            },
+        ];
+
+        assert!(incomplete_no_tool_final_response(
+            &messages,
+            "I need one more pass before the final synthesis."
+        ));
+    }
+
+    #[test]
+    fn incomplete_no_tool_final_response_allows_short_delivery_reference() {
+        let messages = vec![
+            SpineMessage::Assistant {
+                content: Some("Saving the finished document.".to_string()),
+                tool_calls: vec![
+                    test_tool_call("call-search-1", "search"),
+                    test_tool_call("call-fetch-1", "fetch"),
+                    test_tool_call("call-pdf-1", "pdf_generate"),
+                    test_tool_call("call-fetch-2", "fetch"),
+                ],
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-search-1".to_string(),
+                content: serde_json::json!({"ok": true}).to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-fetch-1".to_string(),
+                content: serde_json::json!({"ok": true}).to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-pdf-1".to_string(),
+                content: serde_json::json!({
+                    "ok": true,
+                    "artifact": {
+                        "download_url": "/api/outputs/report.pdf/download"
+                    }
+                })
+                .to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-fetch-2".to_string(),
+                content: serde_json::json!({"ok": true}).to_string(),
+            },
+        ];
+
+        assert!(!incomplete_no_tool_final_response(
+            &messages,
+            "Saved the PDF: /api/outputs/report.pdf/download"
+        ));
+    }
+
+    fn test_tool_call(id: &str, name: &str) -> SpineToolCall {
+        SpineToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn spine_tool_start_stream_payload_exposes_sanitized_model_tool_inputs() {
+        let call = SpineToolCall {
+            id: "call-research-1".to_string(),
+            name: "research".to_string(),
+            arguments: serde_json::json!({
+                "query": "agent memory systems comparison",
+                "headers": {
+                    "authorization": "Bearer secret"
+                },
+                "nested": {
+                    "password": "secret",
+                    "url": "https://example.com/report"
+                },
+                "_internal": "hidden"
+            }),
+        };
+
+        let payload = spine_tool_start_stream_payload(&call);
+
+        assert_eq!(payload["kind"], "model_tool_call");
+        assert_eq!(payload["tool_call_id"], "call-research-1");
+        assert_eq!(payload["tool_name"], "research");
+        assert_eq!(
+            payload["arguments"]["query"],
+            "agent memory systems comparison"
+        );
+        assert!(payload["arguments"].get("_internal").is_none());
+        assert_eq!(payload["arguments"]["headers"], "[redacted]");
+        assert_eq!(payload["arguments"]["nested"]["password"], "[redacted]");
+        assert_eq!(
+            payload["arguments"]["nested"]["url"],
+            "https://example.com/report"
+        );
+        let intent_summary = payload["intent_summary"]
+            .as_str()
+            .expect("tool start payload should include visible intent summary");
+        assert!(intent_summary.contains("research"));
+        assert!(intent_summary.contains("agent memory systems comparison"));
+    }
+
+    #[test]
+    fn spine_tool_result_stream_content_exposes_sanitized_result_preview() {
+        let call = SpineToolCall {
+            id: "call-fetch-1".to_string(),
+            name: "fetch".to_string(),
+            arguments: serde_json::json!({ "url": "https://example.com" }),
+        };
+        let result = ToolResult::from_value(
+            true,
+            serde_json::json!({
+                "ok": true,
+                "token": "secret",
+                "results": [{
+                    "title": "Agent memory report",
+                    "body": "x".repeat(2_000)
+                }]
+            }),
+        );
+
+        let content = spine_tool_result_stream_content(&call, &result);
+        let payload = serde_json::from_str::<serde_json::Value>(&content)
+            .expect("tool result stream content should be structured JSON");
+
+        assert_eq!(payload["kind"], "model_tool_result");
+        assert_eq!(payload["tool_call_id"], "call-fetch-1");
+        assert_eq!(payload["tool_name"], "fetch");
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["result_preview"]["token"], "[redacted]");
+        assert_eq!(
+            payload["result_preview"]["results"][0]["title"],
+            "Agent memory report"
+        );
+        assert!(
+            payload["result_preview"]["results"][0]["body"]
+                .as_str()
+                .expect("body should remain a string")
+                .len()
+                < 1_200
+        );
+        assert!(
+            payload["summary"]
+                .as_str()
+                .expect("summary should be present")
+                .contains("Agent memory report")
+        );
+    }
+
+    #[test]
     fn structured_chat_request_context_carries_attachments_and_arkorbit() {
         let hints = RequestExecutionHints {
             attachments_present: true,
@@ -4718,6 +6382,11 @@ mod tests {
                 "active_orbit_id": "orbit-1",
                 "widgets": [{"id": "w1", "kind": "note"}]
             })),
+            browser_profile_context: Some(serde_json::json!({
+                "profile_id": "profile-1",
+                "profile_name": "alex",
+                "browser": "chromium"
+            })),
             ..Default::default()
         };
 
@@ -4727,6 +6396,9 @@ mod tests {
         assert!(context.contains("upload-1"));
         assert!(context.contains("active_orbit_id"));
         assert!(context.contains("orbit-1"));
+        assert!(context.contains("browser_profile_context"));
+        assert!(context.contains("profile-1"));
+        assert!(context.contains("alex"));
     }
 
     #[test]
@@ -4896,6 +6568,60 @@ mod tests {
         assert!(rendered.contains("Documents"));
         assert!(!rendered.contains("/app/"));
         assert!(!rendered.contains("gpu-pricing/runbook.md"));
+    }
+
+    #[test]
+    fn pdf_generate_tool_result_is_sanitized_for_model() {
+        let raw = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "pdf_generate",
+                "status": "completed",
+                "detail": "Saved managed file report.pdf.",
+                "data": {
+                    "payload": {
+                        "kind": "resource",
+                        "resource": {
+                            "id": "file:abc",
+                            "path": "/app/data/outputs/report.pdf",
+                            "mime": "application/pdf",
+                            "bytes": 1200,
+                            "created_at": "2026-05-20T00:00:00Z",
+                            "source_action": "pdf_generate"
+                        }
+                    },
+                    "artifact": {
+                        "kind": "managed_file",
+                        "label": "report.pdf",
+                        "bytes": 1200,
+                        "content_type": "application/pdf",
+                        "download_url": "/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/report.pdf/download"
+                    },
+                    "document": {
+                        "id": "generated-file:abc:123",
+                        "filename": "report.pdf",
+                        "content_type": "application/pdf",
+                        "chunk_count": 1,
+                        "file_size": 1200,
+                        "url": "/ui/documents"
+                    }
+                }
+            })
+        );
+        let sanitized = spine_tool_result_value_for_model("pdf_generate", "pdf_generate", raw);
+        let rendered = sanitized.to_string();
+
+        assert_eq!(sanitized["ok"], true);
+        assert_eq!(sanitized["tool"], "pdf_generate");
+        assert_eq!(sanitized["artifact"]["label"], "report.pdf");
+        assert_eq!(
+            sanitized["artifact"]["download_url"],
+            "/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/report.pdf/download"
+        );
+        assert_eq!(sanitized["artifact"]["document"]["url"], "/ui/documents");
+        assert!(rendered.contains("Documents"));
+        assert!(!rendered.contains("/app/data/outputs"));
     }
 
     #[test]
@@ -5115,6 +6841,52 @@ mod tests {
     }
 
     #[test]
+    fn resource_activity_read_routes_to_ark_inspect_activity_surface() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "read",
+            "kind": "activity",
+            "limit": 8
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "ark_inspect");
+                assert_eq!(actions[0].arguments["operation"], "surface");
+                assert_eq!(actions[0].arguments["surface"], "activity");
+                assert_eq!(actions[0].arguments["limit"], 8);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_schema_exposes_activity_as_readable_resource_kind() {
+        let schema = ToolRegistry::new()
+            .schemas()
+            .into_iter()
+            .find(|schema| schema.name == "resource_rw")
+            .expect("resource_rw schema should exist");
+
+        let kinds = schema.input_schema["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("kind enum should be present");
+
+        assert!(kinds.iter().any(|kind| kind.as_str() == Some("activity")));
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| kind.as_str() == Some("notification"))
+        );
+
+        let kind_description = schema.input_schema["properties"]["kind"]["description"]
+            .as_str()
+            .expect("kind description should be present");
+        assert!(kind_description.contains("notification for user-facing notification delivery"));
+        assert!(kind_description.contains("custom_messaging_channel"));
+    }
+
+    #[test]
     fn resource_file_write_requires_content_path() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
@@ -5224,6 +6996,175 @@ mod tests {
     }
 
     #[test]
+    fn final_response_repeats_tool_call_content_detects_stale_intermediate_text() {
+        let messages = vec![
+            SpineMessage::User {
+                content: "Check whether the provider API works.".to_string(),
+            },
+            SpineMessage::Assistant {
+                content: Some("I will check the provider API now.".to_string()),
+                tool_calls: vec![SpineToolCall {
+                    id: "call_1".to_string(),
+                    name: "resource_rw".to_string(),
+                    arguments: serde_json::json!({"kind": "custom_api", "op": "status"}),
+                }],
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: serde_json::json!({"ok": true, "status": "connected"}).to_string(),
+            },
+        ];
+
+        assert!(final_response_repeats_tool_call_content(
+            &messages,
+            "I will check the provider API now."
+        ));
+        assert!(final_response_repeats_tool_call_content(
+            &messages,
+            "  i will check the provider api now  "
+        ));
+    }
+
+    #[test]
+    fn final_response_repeats_tool_call_content_allows_new_terminal_answer() {
+        let messages = vec![
+            SpineMessage::User {
+                content: "Check whether the provider API works.".to_string(),
+            },
+            SpineMessage::Assistant {
+                content: Some("I will check the provider API now.".to_string()),
+                tool_calls: vec![SpineToolCall {
+                    id: "call_1".to_string(),
+                    name: "resource_rw".to_string(),
+                    arguments: serde_json::json!({"kind": "custom_api", "op": "status"}),
+                }],
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: serde_json::json!({"ok": true, "status": "connected"}).to_string(),
+            },
+        ];
+
+        assert!(!final_response_repeats_tool_call_content(
+            &messages,
+            "The provider API status check completed. It is connected."
+        ));
+    }
+
+    #[test]
+    fn incomplete_no_tool_final_response_detects_unfinished_lead_in() {
+        let messages = vec![SpineMessage::User {
+            content: "Check whether the saved integration works.".to_string(),
+        }];
+
+        assert!(incomplete_no_tool_final_response(
+            &messages,
+            "Let me run an actual connectivity test:"
+        ));
+        assert!(!incomplete_no_tool_final_response(
+            &messages,
+            "The saved integration test failed with HTTP 400."
+        ));
+    }
+
+    #[test]
+    fn final_response_after_no_progress_tool_result_is_forced_to_blocker() {
+        let messages = vec![
+            SpineMessage::Assistant {
+                content: Some("I will update the saved API operation.".to_string()),
+                tool_calls: vec![SpineToolCall {
+                    id: "call_1".to_string(),
+                    name: "resource_rw".to_string(),
+                    arguments: serde_json::json!({
+                        "kind": "custom_api",
+                        "op": "update",
+                        "id": "provider-api"
+                    }),
+                }],
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: serde_json::json!({
+                    "ok": false,
+                    "error": "repeated_no_progress_tool_call",
+                    "message": "This exact tool request already completed."
+                })
+                .to_string(),
+            },
+        ];
+
+        let replacement = no_progress_final_response(&messages, "I will try a different approach.");
+
+        assert!(replacement.is_some());
+        assert!(!replacement.unwrap().contains("I will try"));
+    }
+
+    #[test]
+    fn needs_input_tool_result_has_terminal_user_message() {
+        let result = ToolResult::from_value(
+            true,
+            serde_json::json!({
+                "ok": true,
+                "primitive": "browse",
+                "tool": "browser_auto",
+                "status": "needs_input",
+                "detail": "Should I inspect the History section or the Products section?",
+                "data": {
+                    "session": {
+                        "status": "waiting_for_operator",
+                        "question": "Should I inspect the History section or the Products section?"
+                    }
+                }
+            }),
+        );
+
+        let message = needs_input_message_from_tool_results(&[result])
+            .expect("needs-input tool result should stop the spine turn");
+
+        assert_eq!(
+            message,
+            "Should I inspect the History section or the Products section?"
+        );
+    }
+
+    #[test]
+    fn browse_snapshot_maps_to_browser_auto_without_requiring_new_task() {
+        let plan = plan_browse(&serde_json::json!({
+            "action": "snapshot",
+            "session_id": "session-1"
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "browser_auto");
+                assert_eq!(actions[0].arguments["action"], "snapshot");
+                assert_eq!(actions[0].arguments["session_id"], "session-1");
+                assert!(actions[0].arguments.get("task").is_none());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn browse_resume_handoff_maps_user_note_to_browser_auto() {
+        let plan = plan_browse(&serde_json::json!({
+            "action": "resume_handoff",
+            "session_id": "session-1",
+            "note": "Use the History section"
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "browser_auto");
+                assert_eq!(actions[0].arguments["action"], "resume_handoff");
+                assert_eq!(actions[0].arguments["session_id"], "session-1");
+                assert_eq!(actions[0].arguments["note"], "Use the History section");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn code_exec_requires_language_for_inline_code() {
         let plan = plan_code_exec(&serde_json::json!({
             "code": "print('hello')"
@@ -5232,6 +7173,26 @@ mod tests {
             PrimitivePlan::Unsupported { reason, extra } => {
                 assert!(reason.contains("language"));
                 assert_eq!(extra.unwrap()["field"], "language");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pdf_generate_maps_to_managed_pdf_action() {
+        let plan = plan_pdf_generate(&serde_json::json!({
+            "title": "Market research",
+            "filename": "market-research.pdf",
+            "style": "report",
+            "content": "Executive summary\n\nFindings."
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "pdf_generate");
+                assert_eq!(actions[0].arguments["title"], "Market research");
+                assert_eq!(actions[0].arguments["filename"], "market-research.pdf");
+                assert_eq!(actions[0].arguments["style"], "report");
+                assert_eq!(actions[0].arguments["document_visible"], true);
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -5299,6 +7260,155 @@ mod tests {
     }
 
     #[test]
+    fn resource_custom_api_install_and_connect_map_to_capability_acquire() {
+        for op in ["install", "connect"] {
+            let plan = plan_resource_rw(&serde_json::json!({
+                "op": op,
+                "kind": "custom_api",
+                "content": {
+                    "name": "provider work items",
+                    "description": "Read work items from a provider API",
+                    "base_url": "https://api.example.com",
+                    "path": "/graphql",
+                    "auth_type": "bearer"
+                }
+            }));
+            match plan {
+                PrimitivePlan::Actions(actions) => {
+                    assert_eq!(actions[0].action_name, "capability_acquire");
+                    assert_eq!(actions[0].arguments["base_url"], "https://api.example.com");
+                    assert_eq!(actions[0].arguments["path"], "/graphql");
+                    assert_eq!(actions[0].arguments["auth_type"], "bearer");
+                    assert!(actions[0].arguments.get("kind").is_none());
+                }
+                other => panic!("unexpected plan for {op}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resource_custom_api_update_preserves_target_id() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "update",
+            "kind": "custom_api",
+            "id": "provider-api",
+            "content": {
+                "method": "post",
+                "path": "/graphql",
+                "default_headers": {
+                    "content-type": "application/json"
+                }
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "capability_acquire");
+                assert_eq!(actions[0].arguments["id"], "provider-api");
+                assert_eq!(actions[0].arguments["method"], "post");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_api_update_progress_identity_includes_payload_shape() {
+        let get_call = SpineToolCall {
+            id: "call_1".to_string(),
+            name: "resource_rw".to_string(),
+            arguments: serde_json::json!({
+                "kind": "custom_api",
+                "op": "update",
+                "id": "provider-api",
+                "content": {
+                    "method": "get",
+                    "path": "/graphql"
+                }
+            }),
+        };
+        let post_call = SpineToolCall {
+            id: "call_2".to_string(),
+            name: "resource_rw".to_string(),
+            arguments: serde_json::json!({
+                "kind": "custom_api",
+                "op": "update",
+                "id": "provider-api",
+                "content": {
+                    "method": "post",
+                    "path": "/graphql"
+                }
+            }),
+        };
+
+        assert_ne!(
+            tool_call_progress_identity(&get_call),
+            tool_call_progress_identity(&post_call)
+        );
+    }
+
+    #[test]
+    fn fetch_custom_api_maps_to_saved_custom_api_request() {
+        let plan = plan_fetch(&serde_json::json!({
+            "integration": "custom_api",
+            "id": "provider-api",
+            "operation": "post-graphql",
+            "content": {
+                "body": {
+                    "query": "query Probe { __typename }"
+                }
+            }
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "custom_api_request");
+                assert_eq!(actions[0].arguments["id"], "provider-api");
+                assert_eq!(actions[0].arguments["operation"], "post-graphql");
+                assert_eq!(
+                    actions[0].arguments["body"]["query"],
+                    "query Probe { __typename }"
+                );
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_custom_api_test_maps_to_inspect_integration_with_run_check() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "test",
+            "kind": "custom_api",
+            "id": "provider-api"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "inspect_integration");
+                assert_eq!(actions[0].arguments["surface"], "custom_apis");
+                assert_eq!(actions[0].arguments["id"], "provider-api");
+                assert_eq!(actions[0].arguments["run_check"], true);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_generic_integration_test_maps_to_inspect_with_run_check() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "test",
+            "kind": "integration",
+            "query": "provider api"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "inspect_integration");
+                assert_eq!(actions[0].arguments["query"], "provider api");
+                assert_eq!(actions[0].arguments["run_check"], true);
+                assert!(actions[0].arguments.get("surface").is_none());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn resource_mcp_server_create_maps_to_manage_action() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
@@ -5345,7 +7455,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_generic_integration_install_routes_by_structured_mcp_fields() {
+    fn resource_generic_integration_with_mcp_like_fields_requires_explicit_substrate() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "install",
             "kind": "integration",
@@ -5357,10 +7467,19 @@ mod tests {
             }
         }));
         match plan {
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("structured integration content"));
+                let extra = extra.unwrap();
+                assert_eq!(extra["kind"], "integration");
+                assert_eq!(extra["op"], "install");
+                assert!(extra["hint"].as_str().unwrap().contains("mcp_server"));
+                assert!(extra["hint"].as_str().unwrap().contains("custom_api"));
+            }
             PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].action_name, "mcp_server_manage");
-                assert_eq!(actions[0].arguments["operation"], "create");
-                assert_eq!(actions[0].arguments["resources_enabled"], true);
+                panic!(
+                    "generic integration install inferred {}",
+                    actions[0].action_name
+                );
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -5384,6 +7503,53 @@ mod tests {
             PrimitivePlan::Actions(actions) => {
                 assert_eq!(actions[0].action_name, "custom_messaging_channel_upsert");
                 assert_eq!(actions[0].arguments["name"], "Provider alerts");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_custom_messaging_channel_create_requires_channel_definition() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "custom_messaging_channel",
+            "content": {
+                "message": "Meeting with Mark",
+                "channel": "telegram"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("custom_messaging_channel create requires"));
+                assert_eq!(extra.unwrap()["kind"], "custom_messaging_channel");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_unsupported_surface_with_notification_shape_returns_recovery_hint() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "conversation",
+            "content": {
+                "message": "Meeting with Mark",
+                "channel": "slack"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("does not yet have a substrate adapter"));
+                let extra =
+                    extra.expect("notification-shaped unsupported resource should include hint");
+                assert_eq!(extra["suggested_kind"], "notification");
+                assert_eq!(extra["suggested_op"], "create");
+                assert!(
+                    extra["hint"]
+                        .as_str()
+                        .unwrap()
+                        .contains("kind=notification")
+                );
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -5500,6 +7666,266 @@ mod tests {
     }
 
     #[test]
+    fn resource_scheduled_task_preserves_scheduler_fields_from_tool_payload() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "scheduled_task",
+            "task": "Send meeting reminder",
+            "at": "2026-05-26T21:51:00+05:30",
+            "action": "notify_user",
+            "action_arguments": {
+                "message": "Meeting with Mark"
+            },
+            "report_to": "telegram"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "schedule_task");
+                assert_eq!(actions[0].arguments["task"], "Send meeting reminder");
+                assert_eq!(actions[0].arguments["at"], "2026-05-26T21:51:00+05:30");
+                assert_eq!(actions[0].arguments["action"], "notify_user");
+                assert_eq!(
+                    actions[0].arguments["action_arguments"]["message"],
+                    "Meeting with Mark"
+                );
+                assert_eq!(actions[0].arguments["report_to"], "telegram");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_notification_with_schedule_maps_to_notify_user_scheduled_task() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "notification",
+            "content": {
+                "message": "Meeting with Mark",
+                "local_time": "12:10 PM",
+                "timezone": "Asia/Kolkata",
+                "delivery_channel": "telegram"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "schedule_task");
+                assert_eq!(actions[0].arguments["task"], "Meeting with Mark");
+                assert_eq!(actions[0].arguments["local_time"], "12:10 PM");
+                assert_eq!(actions[0].arguments["timezone"], "Asia/Kolkata");
+                assert_eq!(actions[0].arguments["report_to"], "telegram");
+                assert_eq!(actions[0].arguments["action"], "notify_user");
+                assert_eq!(
+                    actions[0].arguments["action_arguments"]["message"],
+                    "Meeting with Mark"
+                );
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_notification_without_schedule_maps_to_direct_notify_user() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "notification",
+            "content": {
+                "title": "Meeting",
+                "message": "Meeting with Mark",
+                "delivery_channel": "telegram"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "notify_user");
+                assert_eq!(actions[0].arguments["title"], "Meeting");
+                assert_eq!(actions[0].arguments["message"], "Meeting with Mark");
+                assert_eq!(actions[0].arguments["delivery_channel"], "telegram");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_notification_schedule_accepts_structured_channel_route_and_title_body() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "notification",
+            "content": {
+                "title": "Meeting with Mark",
+                "local_time": "12:10 PM",
+                "timezone": "Asia/Kolkata",
+                "channel": "slack"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "schedule_task");
+                assert_eq!(actions[0].arguments["task"], "Meeting with Mark");
+                assert_eq!(actions[0].arguments["report_to"], "slack");
+                assert_eq!(actions[0].arguments["action"], "notify_user");
+                assert_eq!(
+                    actions[0].arguments["action_arguments"]["message"],
+                    "Meeting with Mark"
+                );
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_notification_direct_accepts_structured_channel_route_and_title_body() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "notification",
+            "content": {
+                "title": "Meeting with Mark",
+                "channel": "whatsapp"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "notify_user");
+                assert_eq!(actions[0].arguments["message"], "Meeting with Mark");
+                assert_eq!(actions[0].arguments["delivery_channel"], "whatsapp");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_notification_with_clock_time_in_request_is_repaired_to_schedule_task() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-27T13:27:00+05:30")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let invocation = PrimitiveActionInvocation {
+            action_name: "notify_user".to_string(),
+            arguments: serde_json::json!({
+                "title": "Meeting with Mark",
+                "message": "Meeting with Mark",
+                "delivery_channel": "telegram"
+            }),
+        };
+
+        let repaired = scheduled_notification_invocation_from_direct_notification(
+            &invocation,
+            "send me a notificaiton in telegram for meeting with mark at 1:30 PM today",
+            now,
+            Some(chrono_tz::Asia::Kolkata),
+        )
+        .expect("time-bearing notification request should schedule instead of sending now");
+
+        assert_eq!(repaired.action_name, "schedule_task");
+        assert_eq!(repaired.arguments["task"], "Meeting with Mark");
+        assert_eq!(repaired.arguments["local_time"], "1:30 PM");
+        assert_eq!(repaired.arguments["timezone"], "Asia/Kolkata");
+        assert_eq!(repaired.arguments["report_to"], "telegram");
+        assert_eq!(repaired.arguments["action"], "notify_user");
+        assert_eq!(
+            repaired.arguments["action_arguments"]["message"],
+            "⏰ Reminder: Meeting with Mark scheduled for today at 1:30 PM IST"
+        );
+    }
+
+    #[test]
+    fn direct_notification_clock_time_repair_preserves_arbitrary_delivery_route() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-27T13:27:00+05:30")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let invocation = PrimitiveActionInvocation {
+            action_name: "notify_user".to_string(),
+            arguments: serde_json::json!({
+                "message": "Meeting with Mark",
+                "delivery_channel": "whatsapp"
+            }),
+        };
+
+        let repaired = scheduled_notification_invocation_from_direct_notification(
+            &invocation,
+            "remind me on whatsapp about meeting with mark at 1:30 PM",
+            now,
+            Some(chrono_tz::Asia::Kolkata),
+        )
+        .expect("clock-time notification request should preserve any delivery route");
+
+        assert_eq!(repaired.action_name, "schedule_task");
+        assert_eq!(repaired.arguments["report_to"], "whatsapp");
+        assert_eq!(
+            repaired.arguments["action_arguments"]["message"],
+            "⏰ Reminder: Meeting with Mark scheduled for today at 1:30 PM IST"
+        );
+    }
+
+    #[test]
+    fn direct_notification_without_clock_time_is_not_repaired_to_schedule_task() {
+        let invocation = PrimitiveActionInvocation {
+            action_name: "notify_user".to_string(),
+            arguments: serde_json::json!({
+                "message": "Meeting with Mark",
+                "delivery_channel": "telegram"
+            }),
+        };
+
+        let repaired = scheduled_notification_invocation_from_direct_notification(
+            &invocation,
+            "send me a notificaiton in telegram for meeting with mark",
+            chrono::Utc::now(),
+            Some(chrono_tz::Asia::Kolkata),
+        );
+
+        assert!(repaired.is_none());
+    }
+
+    #[test]
+    fn resource_scheduled_task_message_payload_becomes_notify_user_action() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "scheduled_task",
+            "content": {
+                "message": "Meeting with Mark",
+                "local_time": "12:10 PM",
+                "timezone": "Asia/Kolkata",
+                "delivery_channel": "telegram"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "schedule_task");
+                assert_eq!(actions[0].arguments["task"], "Meeting with Mark");
+                assert_eq!(actions[0].arguments["action"], "notify_user");
+                assert_eq!(
+                    actions[0].arguments["action_arguments"]["message"],
+                    "Meeting with Mark"
+                );
+                assert_eq!(actions[0].arguments["report_to"], "telegram");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_scheduled_task_notification_payload_accepts_structured_channel_route() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "scheduled_task",
+            "content": {
+                "message": "Meeting with Mark",
+                "local_time": "12:10 PM",
+                "timezone": "Asia/Kolkata",
+                "channel": "pagerduty"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "schedule_task");
+                assert_eq!(actions[0].arguments["task"], "Meeting with Mark");
+                assert_eq!(actions[0].arguments["action"], "notify_user");
+                assert_eq!(actions[0].arguments["report_to"], "pagerduty");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn resource_scheduled_task_update_maps_id_to_task_id() {
         let task_id = "11111111-1111-4111-8111-111111111111";
         let plan = plan_resource_rw(&serde_json::json!({
@@ -5520,6 +7946,56 @@ mod tests {
                 assert!(actions[0].arguments.get("id").is_none());
                 assert!(actions[0].arguments.get("op").is_none());
                 assert!(actions[0].arguments.get("kind").is_none());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_scheduled_task_update_preserves_persisted_schedule_fields() {
+        let task_id = "11111111-1111-4111-8111-111111111111";
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "update",
+            "kind": "scheduled_task",
+            "id": task_id,
+            "content": {
+                "scheduled_for": "2026-05-22T13:06:00+05:30"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "schedule_task");
+                assert_eq!(actions[0].arguments["task_id"], task_id);
+                assert_eq!(
+                    actions[0].arguments["scheduled_for"],
+                    "2026-05-22T13:06:00+05:30"
+                );
+                assert!(actions[0].arguments.get("id").is_none());
+                assert!(actions[0].arguments.get("op").is_none());
+                assert!(actions[0].arguments.get("kind").is_none());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_scheduled_task_update_preserves_structured_local_time() {
+        let task_id = "11111111-1111-4111-8111-111111111111";
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "update",
+            "kind": "scheduled_task",
+            "id": task_id,
+            "content": {
+                "local_time": "00:22",
+                "timezone": "Asia/Kolkata"
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "schedule_task");
+                assert_eq!(actions[0].arguments["task_id"], task_id);
+                assert_eq!(actions[0].arguments["local_time"], "00:22");
+                assert_eq!(actions[0].arguments["timezone"], "Asia/Kolkata");
             }
             other => panic!("unexpected plan: {other:?}"),
         }

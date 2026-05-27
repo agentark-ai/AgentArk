@@ -3,7 +3,7 @@ use crate::core::AgentConfig;
 use crate::storage::Storage;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -765,6 +765,8 @@ pub async fn export_test_trace(
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("simple".to_string()),
         plan: None,

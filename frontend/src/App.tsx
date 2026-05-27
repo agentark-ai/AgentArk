@@ -869,6 +869,22 @@ function notificationDisplaySummary(notification: {
   return notification.body || notification.source || "Open to view details.";
 }
 
+function notificationSourceLabel(source?: string): string {
+  const raw = String(source || "").trim();
+  if (!raw) return "";
+  const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (compact === "agentark") return "AgentArk";
+  if (compact === "arkpulse") return "ArkPulse";
+  if (compact === "arkreflect") return "ArkReflect";
+  if (compact === "arkmemory") return "ArkMemory";
+  return raw
+    .replace(/[_-]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 type NotificationActionTarget = {
   view: ViewKey;
   label: string;
@@ -1944,6 +1960,7 @@ export default function App() {
         <BrowserHandoffPage
           sessionId={browserHandoffSessionId}
           onBack={() => navigateToView("chat", true)}
+          onBackToBrowser={() => navigateToView("browser", true)}
         />
       </Suspense>
     );
@@ -2492,7 +2509,7 @@ export default function App() {
                             {n.source ? (
                               <Chip
                                 size="small"
-                                label={n.source}
+                                label={notificationSourceLabel(n.source)}
                                 variant="outlined"
                                 sx={{
                                   height: 22,

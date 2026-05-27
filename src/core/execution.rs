@@ -2,7 +2,7 @@ use super::config::{ModelCapabilityTier, ModelCostTier};
 use super::llm::{LlmClient, LlmResponse, LlmStreamFailure, LlmStreamFailureKind};
 use crate::actions::ActionDef;
 use crate::core::PromptMemory;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -929,32 +929,30 @@ pub async fn execute_supervised_transport_chat_stream_with_policy(
                 ));
             }
         }
+    } else if app_delivery_stream {
+        llm.chat_with_history_stream_for_app_delivery(
+            system_prompt,
+            user_message,
+            &history,
+            memories,
+            actions,
+            token_tx,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
     } else {
-        if app_delivery_stream {
-            llm.chat_with_history_stream_for_app_delivery(
-                system_prompt,
-                user_message,
-                &history,
-                memories,
-                actions,
-                token_tx,
-                policy,
-                allow_sensitive_context,
-            )
-            .await
-        } else {
-            llm.chat_with_history_stream_for_helper(
-                system_prompt,
-                user_message,
-                &history,
-                memories,
-                actions,
-                token_tx,
-                policy,
-                allow_sensitive_context,
-            )
-            .await
-        }
+        llm.chat_with_history_stream_for_helper(
+            system_prompt,
+            user_message,
+            &history,
+            memories,
+            actions,
+            token_tx,
+            policy,
+            allow_sensitive_context,
+        )
+        .await
     };
 
     response.map_err(|error| {

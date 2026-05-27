@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use lettre::message::{Mailbox, MultiPart, SinglePart, header};
+use lettre::message::{header, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use reqwest::Url;
@@ -767,11 +767,9 @@ mod tests {
             Some("2026-04-18 09:30 IST"),
             Some("sections"),
         );
-        assert!(
-            rendered
-                .text_body
-                .contains("Generated at: 2026-04-18 09:30 IST")
-        );
+        assert!(rendered
+            .text_body
+            .contains("Generated at: 2026-04-18 09:30 IST"));
         assert!(rendered.html_body.contains("AgentArk"));
         assert!(rendered.html_body.contains("Line one"));
     }
@@ -782,16 +780,14 @@ mod tests {
             normalize_email_backend_selection("auto", &[EMAIL_PROVIDER_GMAIL.to_string()]).unwrap(),
             EMAIL_PROVIDER_GMAIL
         );
-        assert!(
-            normalize_email_backend_selection(
-                "auto",
-                &[
-                    EMAIL_PROVIDER_GMAIL.to_string(),
-                    EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string(),
-                ],
-            )
-            .is_err()
-        );
+        assert!(normalize_email_backend_selection(
+            "auto",
+            &[
+                EMAIL_PROVIDER_GMAIL.to_string(),
+                EMAIL_PROVIDER_GOOGLE_WORKSPACE.to_string(),
+            ],
+        )
+        .is_err());
     }
 
     #[test]

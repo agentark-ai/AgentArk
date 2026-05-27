@@ -220,6 +220,8 @@ pub(super) struct TraceDetailResponse {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    pub cached_prompt_tokens: i64,
+    pub cache_creation_prompt_tokens: i64,
     pub cost_usd: f64,
     pub complexity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -388,6 +390,41 @@ fn parse_jsonish_value(raw: &str) -> Option<serde_json::Value> {
         }
     }
     None
+}
+
+fn trace_json_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|v| v.min(i64::MAX as u64) as i64))
+}
+
+fn trace_prompt_cache_metrics_from_steps(steps: &[crate::core::ExecutionStep]) -> (i64, i64) {
+    let mut cached_prompt_tokens = 0i64;
+    let mut cache_creation_prompt_tokens = 0i64;
+    for step in steps {
+        let Some(data) = step.data.as_deref() else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if payload.get("event").and_then(|value| value.as_str()) != Some("model_completed") {
+            continue;
+        }
+        cached_prompt_tokens = cached_prompt_tokens.saturating_add(
+            payload
+                .get("cache_read_tokens")
+                .and_then(trace_json_i64)
+                .unwrap_or_default(),
+        );
+        cache_creation_prompt_tokens = cache_creation_prompt_tokens.saturating_add(
+            payload
+                .get("cache_creation_tokens")
+                .and_then(trace_json_i64)
+                .unwrap_or_default(),
+        );
+    }
+    (cached_prompt_tokens, cache_creation_prompt_tokens)
 }
 
 fn build_text_artifact(
@@ -672,7 +709,7 @@ fn trace_times_close(left: &str, right: &str) -> bool {
     let Some(right_dt) = chrono::DateTime::parse_from_rfc3339(right).ok() else {
         return false;
     };
-    let delta = (left_dt - right_dt).num_seconds().abs() as u64;
+    let delta = (left_dt - right_dt).num_seconds().unsigned_abs();
     delta <= 120
 }
 
@@ -1568,6 +1605,12 @@ fn format_trace_detail_from_memory(
             .map(|end| (end - start).num_milliseconds() as u64)
     });
     let steps = build_trace_detail_steps(&t.steps, enrichment);
+    let (cached_prompt_tokens, cache_creation_prompt_tokens) =
+        if t.cached_prompt_tokens != 0 || t.cache_creation_prompt_tokens != 0 {
+            (t.cached_prompt_tokens, t.cache_creation_prompt_tokens)
+        } else {
+            trace_prompt_cache_metrics_from_steps(&t.steps)
+        };
 
     TraceDetailResponse {
         id: t.id.clone(),
@@ -1589,6 +1632,8 @@ fn format_trace_detail_from_memory(
         input_tokens: t.input_tokens,
         output_tokens: t.output_tokens,
         total_tokens: t.total_tokens,
+        cached_prompt_tokens,
+        cache_creation_prompt_tokens,
         cost_usd: t.cost_usd,
         complexity: t.complexity.clone(),
         execution_run: enrichment
@@ -1633,6 +1678,8 @@ fn format_trace_detail_from_persisted(
 ) -> TraceDetailResponse {
     let parsed_steps = parse_persisted_trace_steps(t);
     let steps = build_trace_detail_steps(&parsed_steps, enrichment);
+    let (cached_prompt_tokens, cache_creation_prompt_tokens) =
+        trace_prompt_cache_metrics_from_steps(&parsed_steps);
 
     TraceDetailResponse {
         id: t.id.clone(),
@@ -1654,6 +1701,8 @@ fn format_trace_detail_from_persisted(
         input_tokens: t.input_tokens as i64,
         output_tokens: t.output_tokens as i64,
         total_tokens: t.total_tokens as i64,
+        cached_prompt_tokens,
+        cache_creation_prompt_tokens,
         cost_usd: t.cost_usd,
         complexity: t.complexity.clone(),
         execution_run: enrichment
@@ -1888,6 +1937,8 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            cached_prompt_tokens: 0,
+            cache_creation_prompt_tokens: 0,
             cost_usd: 0.0,
             complexity: None,
             plan: None,

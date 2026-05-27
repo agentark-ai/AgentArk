@@ -12,9 +12,9 @@ pub mod store;
 pub use models::{
     Orbit, OrbitChatMessage, OrbitChatTranscriptSummary, OrbitFileEntry, OrbitManifest, OrbitUpdate,
 };
-pub use orbit_agent::{OrbitAgentEvent, OrbitChatUsage, stream_orbit_chat_turn};
+pub use orbit_agent::{stream_orbit_chat_turn, OrbitAgentEvent, OrbitChatUsage};
 pub use service::ArkOrbitService;
 pub use store::{
-    LayeredStore, ModuleLayer, ResolvedModule, content_type_for_name, content_type_for_path,
-    validate_readable_orbit_path, validate_writable_orbit_path,
+    content_type_for_name, content_type_for_path, validate_readable_orbit_path,
+    validate_writable_orbit_path, LayeredStore, ModuleLayer, ResolvedModule,
 };

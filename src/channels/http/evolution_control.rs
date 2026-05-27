@@ -346,7 +346,11 @@ pub(super) async fn load_learning_queue_cap(storage: &crate::storage::Storage) -
 }
 
 pub(super) fn bool_setting_bytes(enabled: bool) -> &'static [u8] {
-    if enabled { b"true" } else { b"false" }
+    if enabled {
+        b"true"
+    } else {
+        b"false"
+    }
 }
 
 pub(super) async fn store_bool_setting(
@@ -3505,7 +3509,7 @@ pub(super) async fn build_evolution_dev_response(
         .collect::<Vec<_>>();
     let learning_items = learning_item_rows
         .iter()
-        .map(|item| build_experience_item_summary(&item))
+        .map(build_experience_item_summary)
         .collect::<Vec<_>>();
     let learning_pattern_rows = storage
         .list_procedural_patterns_any_scope(&["active", "draft"], 48)
@@ -4072,6 +4076,8 @@ pub(super) async fn persist_evolution_action_trace(
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("evolution".to_string()),
         plan: None,
@@ -4378,6 +4384,8 @@ pub(super) async fn persist_autonomy_action_trace(
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("autonomy".to_string()),
         plan: None,

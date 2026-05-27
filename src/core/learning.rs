@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::storage::{
-    KvLeaseGuard, Storage, experience_edge, experience_item, experience_run, learning_candidate,
-    procedural_pattern,
+    experience_edge, experience_item, experience_run, learning_candidate, procedural_pattern,
+    KvLeaseGuard, Storage,
 };
 
 pub const LEARNING_ENABLED_KEY: &str = "learning_enabled_v1";
@@ -826,21 +826,15 @@ pub(crate) fn experience_item_is_reflected_heuristic(item: &experience_item::Mod
         && experience_item_metadata_text(item, "origin") == Some(HEURISTIC_REFLECTION_ORIGIN)
 }
 
-pub(crate) fn reflected_heuristic_task_type<'a>(
-    item: &'a experience_item::Model,
-) -> Option<&'a str> {
+pub(crate) fn reflected_heuristic_task_type(item: &experience_item::Model) -> Option<&str> {
     experience_item_metadata_text(item, "task_type")
 }
 
-pub(crate) fn reflected_heuristic_polarity<'a>(
-    item: &'a experience_item::Model,
-) -> Option<&'a str> {
+pub(crate) fn reflected_heuristic_polarity(item: &experience_item::Model) -> Option<&str> {
     experience_item_metadata_text(item, "polarity")
 }
 
-pub(crate) fn reflected_heuristic_applicability<'a>(
-    item: &'a experience_item::Model,
-) -> Option<&'a str> {
+pub(crate) fn reflected_heuristic_applicability(item: &experience_item::Model) -> Option<&str> {
     experience_item_metadata_text(item, "applicability")
 }
 

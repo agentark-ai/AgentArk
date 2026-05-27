@@ -948,16 +948,12 @@ pub(super) async fn swarm_agent_access_plan(
     State(state): State<AppState>,
     Json(request): Json<SwarmAgentAccessPlanRequest>,
 ) -> Response {
-    let spec_summary = vec![
+    let spec_summary = [
         format!("name: {}", request.name.trim()),
         format!("role: {}", request.agent_type.trim()),
         format!(
             "description: {}",
-            request
-                .description
-                .trim()
-                .replace('\r', " ")
-                .replace('\n', " ")
+            request.description.trim().replace(['\r', '\n'], " ")
         ),
         format!(
             "capabilities: {}",
@@ -971,11 +967,7 @@ pub(super) async fn swarm_agent_access_plan(
         ),
         format!(
             "system_prompt: {}",
-            request
-                .system_prompt
-                .trim()
-                .replace('\r', " ")
-                .replace('\n', " ")
+            request.system_prompt.trim().replace(['\r', '\n'], " ")
         ),
     ]
     .join("\n");

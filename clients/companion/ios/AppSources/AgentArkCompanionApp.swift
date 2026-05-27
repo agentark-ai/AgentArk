@@ -118,11 +118,7 @@ struct CompanionHomeView: View {
         }
         let capabilities = [
             "approval_prompt",
-            "notifications",
-            "camera",
-            "photos",
-            "location",
-            "shortcuts_run"
+            "notifications"
         ]
         let client = CompanionWebSocketClient(
             webSocketURL: url,

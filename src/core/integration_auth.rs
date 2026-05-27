@@ -540,7 +540,7 @@ fn humanise_secret_key(key: &str) -> String {
         return "Secret".to_string();
     }
     let mut out = String::with_capacity(key.len());
-    for part in key.split(|ch: char| ch == '_' || ch == '-' || ch == '.') {
+    for part in key.split(['_', '-', '.']) {
         if part.is_empty() {
             continue;
         }

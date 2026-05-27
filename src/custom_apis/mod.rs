@@ -1444,7 +1444,7 @@ fn graphql_document_operation_kinds(document: &str) -> Vec<String> {
             continue;
         }
         if ch == '#' {
-            while let Some((_, next)) = chars.next() {
+            for (_, next) in chars.by_ref() {
                 if next == '\n' || next == '\r' {
                     break;
                 }
@@ -1458,7 +1458,7 @@ fn graphql_document_operation_kinds(document: &str) -> Vec<String> {
                 chars.next();
                 chars.next();
                 let mut quote_run = 0usize;
-                while let Some((_, next)) = chars.next() {
+                for (_, next) in chars.by_ref() {
                     if next == '"' {
                         quote_run += 1;
                         if quote_run == 3 {
@@ -1470,7 +1470,7 @@ fn graphql_document_operation_kinds(document: &str) -> Vec<String> {
                 }
             } else {
                 let mut escaped = false;
-                while let Some((_, next)) = chars.next() {
+                for (_, next) in chars.by_ref() {
                     if escaped {
                         escaped = false;
                         continue;

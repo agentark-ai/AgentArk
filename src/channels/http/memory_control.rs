@@ -30,7 +30,7 @@ pub(super) async fn list_available_channels(State(state): State<AppState>) -> Re
     let bundled_check = AgentBundledCheck(&agent);
     let ctx = ChannelQueryContext {
         bundled_configured: &bundled_check,
-        extension_packs: &*packs_guard,
+        extension_packs: &packs_guard,
         storage: &agent.storage,
         config_dir: &agent.config_dir,
         data_dir: &agent.data_dir,
@@ -800,17 +800,13 @@ mod memory_control_tests {
             "my OpenAI key is sk-abcdefghijklmnopqrstuvwxyz123456",
         );
 
-        assert!(
-            context
-                .source_redactions
-                .iter()
-                .any(|value| value.contains("openai_key"))
-        );
-        assert!(
-            !context
-                .source_semantic_text
-                .contains("sk-abcdefghijklmnopqrstuvwxyz123456")
-        );
+        assert!(context
+            .source_redactions
+            .iter()
+            .any(|value| value.contains("openai_key")));
+        assert!(!context
+            .source_semantic_text
+            .contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
     }
 
     #[test]
@@ -1347,7 +1343,7 @@ fn arkmemory_capture_event_reviewed_status(
                 .get("previous_status")
                 .and_then(|value| value.as_str())
         })
-        .unwrap_or_else(|| event.status.as_str())
+        .unwrap_or(event.status.as_str())
         .trim();
     if status == "rejected_sensitive_input" {
         "reviewed_sensitive_input"
@@ -1448,19 +1444,19 @@ fn arkmemory_capture_review_context_from_metadata(
         status: review_context
             .get("status")
             .and_then(|value| value.as_str())
-            .unwrap_or_else(|| event.status.as_str())
+            .unwrap_or(event.status.as_str())
             .trim()
             .to_string(),
         capture_kind: review_context
             .get("capture_kind")
             .and_then(|value| value.as_str())
-            .unwrap_or_else(|| event.capture_kind.as_str())
+            .unwrap_or(event.capture_kind.as_str())
             .trim()
             .to_string(),
         channel: review_context
             .get("channel")
             .and_then(|value| value.as_str())
-            .unwrap_or_else(|| event.channel.as_str())
+            .unwrap_or(event.channel.as_str())
             .trim()
             .to_string(),
         last_error_code: review_context
@@ -3806,10 +3802,8 @@ pub(super) async fn arkmemory_apply_health(
                 }
                 None => MemoryEventContext::default(),
             }
-        } else if let Some(context) = operation_context {
-            context
         } else {
-            MemoryEventContext::default()
+            operation_context.unwrap_or_default()
         };
         let capture_resolution = if let Some(capture_event_id) = capture_event_id.as_deref() {
             let mut event = agent

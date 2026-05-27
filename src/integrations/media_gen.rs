@@ -93,8 +93,7 @@ impl MediaProvider {
         let normalized = value
             .trim()
             .to_ascii_lowercase()
-            .replace('-', "_")
-            .replace(' ', "_");
+            .replace(['-', ' '], "_");
         match normalized.as_str() {
             "replicate" => Some(Self::Replicate),
             "stability_ai" | "stability" => Some(Self::StabilityAi),

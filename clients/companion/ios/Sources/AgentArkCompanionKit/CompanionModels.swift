@@ -87,6 +87,15 @@ public struct CompanionCommand: Codable, Identifiable, Equatable {
     }
 }
 
+public struct CompanionCommandDescriptor: Codable, Equatable {
+    public let id: String
+    public let label: String
+    public let capability: String
+    public let action: String
+    public let description: String
+    public let risk: String
+}
+
 public struct CompanionEnvelope: Codable {
     public var type: CompanionMessageType
     public var protocolVersion: String?
@@ -97,6 +106,7 @@ public struct CompanionEnvelope: Codable {
     public var devicePublicKey: String?
     public var state: CompanionState?
     public var capabilities: [String]?
+    public var commands: [CompanionCommandDescriptor]?
     public var metadata: [String: String]?
     public var command: CompanionCommand?
     public var commandId: String?
@@ -118,6 +128,7 @@ public struct CompanionEnvelope: Codable {
         case devicePublicKey = "device_public_key"
         case state
         case capabilities
+        case commands
         case metadata
         case command
         case commandId = "command_id"

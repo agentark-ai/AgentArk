@@ -109,12 +109,6 @@ function proposalActionLabel(proposal: SentinelProposal): string {
   return "Review";
 }
 
-function modeLabel(mode: "off" | "assist" | "auto"): string {
-  if (mode === "off") return "Off";
-  if (mode === "auto") return "Auto";
-  return "Review first";
-}
-
 function proposalStatusLabel(status: string): string {
   const normalized = status.trim().toLowerCase();
   if (normalized === "queued_for_approval") return "Waiting for approval";
@@ -448,9 +442,7 @@ export function SentinelPanel({
   const configuredMode = str(settingsQ.data?.autonomy_mode, "assist").toLowerCase();
   const currentAutonomyMode: "off" | "assist" | "auto" =
     configuredMode === "off" || configuredMode === "auto" ? configuredMode : "assist";
-  const autonomyDisabled = Boolean(settingsQ.data?.agent_paused) || currentAutonomyMode === "off";
   const lastScanLabel = scan?.last_completed_at ? humanTs(scan.last_completed_at).label : "Waiting for the first check";
-  const currentModeLabel = settingsQ.data?.agent_paused ? "Paused" : modeLabel(currentAutonomyMode);
   const connectedServicesCount = num(stats?.connected_services, 0);
   const inAppEventCount = num(stats?.in_app_events, 0);
   const sentinelHeroHeadline =
@@ -619,23 +611,6 @@ export function SentinelPanel({
           eyebrow="ARK CORE"
           title="Sentinel"
           description="Spots follow-ups, routine work, and unattended issues, then suggests or handles the next step when policy allows it."
-          actions={
-            <Stack
-              direction="row"
-              spacing={1}
-              useFlexGap
-              sx={{
-                flexWrap: "wrap",
-                alignItems: "center"
-              }}>
-              <Chip
-                color={autonomyDisabled ? "warning" : currentAutonomyMode === "auto" ? "success" : "info"}
-                label={currentModeLabel}
-              />
-              <Chip label={openProposals.length > 0 ? `${openProposals.length} signals` : "No signals"} />
-              <Chip label={`Checked ${lastScanLabel}`} />
-            </Stack>
-          }
         />
 
         {error ? <Alert severity="error">{error}</Alert> : null}

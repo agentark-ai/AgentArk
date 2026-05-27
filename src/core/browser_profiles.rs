@@ -3,13 +3,13 @@
 //! This module keeps profile state in the existing encrypted KV store so we can
 //! add browser profile management without introducing schema churn.
 
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use anyhow::{bail, Context, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::storage::Storage;
 
 const BROWSER_PROFILES_KEY: &str = "browser:profiles:v1";
-const MAX_RECENT_SESSIONS: usize = 20;
+const MAX_RECENT_SESSIONS: usize = 3;
 const PROFILE_RESOLVE_MIN_SCORE: f64 = 0.34;
 const PROFILE_RESOLVE_AMBIGUITY_MARGIN: f64 = 0.08;
 

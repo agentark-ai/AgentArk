@@ -131,7 +131,7 @@ impl Agent {
         let required_overlap = if query_tokens.len() <= 4 {
             2
         } else {
-            ((query_tokens.len() + 2) / 3).max(2)
+            query_tokens.len().div_ceil(3).max(2)
         };
         if overlap < required_overlap {
             0
@@ -353,7 +353,7 @@ impl Agent {
                         | "unknown"
                 )
             })
-            .unwrap_or_else(|| match surface {
+            .unwrap_or(match surface {
                 AutomationSurface::Schedule => "recurring_schedule",
                 AutomationSurface::Watch => "external_state",
             });
@@ -653,6 +653,7 @@ mod tests {
     #[test]
     fn exact_external_delivery_route_is_preserved_for_later_setup() {
         assert!(automation_delivery_channel_requires_connection("telegram"));
+        assert!(automation_delivery_channel_requires_connection("pagerduty"));
         assert!(!automation_delivery_channel_requires_connection(
             "preferred"
         ));
@@ -663,5 +664,9 @@ mod tests {
         let note = automation_unavailable_delivery_note("telegram");
         assert!(note.contains("Telegram delivery is requested"));
         assert!(note.contains("use Telegram automatically once the channel is connected"));
+
+        let custom_note = automation_unavailable_delivery_note("pagerduty");
+        assert!(custom_note.contains("pagerduty delivery is requested"));
+        assert!(custom_note.contains("use pagerduty automatically once the channel is connected"));
     }
 }

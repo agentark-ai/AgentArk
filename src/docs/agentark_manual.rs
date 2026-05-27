@@ -363,6 +363,8 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 label: "what it is",
                 items: &[
                     "Companion devices are paired execution surfaces with explicit capability grants.",
+                    "Bundled iPhone / iPad and Android companions implement AgentArk notifications and approval prompts only.",
+                    "Phone chat uses configured messaging channels such as Telegram, WhatsApp, iMessage bridge, or SMS bridges; it is separate from companion-device pairing.",
                     "Supported presets include iPhone / iPad, Android phone, macOS / Windows / Linux desktop, home server / mini PC, Raspberry Pi / IoT, and Custom Device.",
                     "Custom devices implement the `agentark-companion-v1` WebSocket protocol and use structured capability ids such as `custom.greenhouse_sensor`.",
                     "Pairing establishes identity; grants define allowed capabilities; approvals allow a specific sensitive action to run now.",
@@ -376,7 +378,8 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Production companion sockets use TLS; plaintext `ws://` is only for local development.",
                     "Paired devices send tokens in WebSocket headers, not JSON message bodies.",
                     "Pairing approval is bound to the claimed device identity before token issue.",
-                    "Bundled iOS and Android devices need verified platform attestation before high-risk grants can be approved.",
+                    "A connected iPhone companion does not expose personal SMS, iMessage, photos, camera, location, or Shortcuts.",
+                    "iMessage and SMS access require a separate bridge or integration, such as a macOS Messages bridge, Twilio, a carrier bridge, or a custom SMS-capable Android companion.",
                     "Custom and desktop devices without platform attestation need an explicit trusted-unattested override before high-risk grants can be approved.",
                     "Requested command scopes must be a subset of both the paired device grant and the caller's current grant.",
                     "Capability reports from a device may show availability but must not expand the approved grant automatically.",
@@ -400,6 +403,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 label: "commands",
                 items: &[
                     "Companion commands are typed JSON actions with capability, action id, arguments, requested scopes, and resource scope.",
+                    "Companions should declare concrete commands such as `notifications.show`; do not infer SMS, photos, camera, or shortcut commands from a broad phone label.",
                     "Do not dispatch raw natural-language strings to a companion device.",
                     "If a user asks in natural language, infer structured intent first, validate it against schemas and grants, and ask for clarification when device or action selection is ambiguous.",
                     "High-risk typed commands should create an approval request instead of dispatching directly.",

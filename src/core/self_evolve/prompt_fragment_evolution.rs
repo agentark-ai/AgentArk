@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
 use crate::core::prompt_fragments::{
-    PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY, PromptFragment, PromptFragmentBundleProfile,
     default_prompt_fragment_bundle, parse_prompt_fragment_bundle_profile,
-    required_prompt_fragment_ids, sanitize_prompt_fragment_bundle,
+    required_prompt_fragment_ids, sanitize_prompt_fragment_bundle, PromptFragment,
+    PromptFragmentBundleProfile, PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
 };
 
 pub(crate) const PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH: &str =
@@ -741,16 +741,14 @@ mod tests {
             evaluation.forbidden_immutable_spine_fragment_ids,
             vec!["spine.non_evolvable_safety".to_string()]
         );
-        assert!(
-            render_prompt_fragment_promotion_gate(
-                false,
-                true,
-                true,
-                true,
-                &evaluation.forbidden_immutable_spine_fragment_ids,
-                0.0,
-            )
-            .contains("immutable spine fragment")
-        );
+        assert!(render_prompt_fragment_promotion_gate(
+            false,
+            true,
+            true,
+            true,
+            &evaluation.forbidden_immutable_spine_fragment_ids,
+            0.0,
+        )
+        .contains("immutable spine fragment"));
     }
 }

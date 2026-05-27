@@ -2,8 +2,8 @@ use super::ChatAttachmentHint;
 use crate::actions::{ActionAuthorizationContext, ActionExecutionSurface};
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,12 +112,14 @@ impl SpineRequest {
         messages: Vec<SpineMessage>,
         channel: impl Into<String>,
     ) -> Self {
-        let mut authorization = ActionAuthorizationContext::default();
-        authorization.surface = caller_kind.execution_surface();
-        authorization.direct_user_intent = matches!(
-            caller_kind,
-            CallerKind::Chat | CallerKind::Gateway | CallerKind::Companion
-        );
+        let authorization = ActionAuthorizationContext {
+            surface: caller_kind.execution_surface(),
+            direct_user_intent: matches!(
+                caller_kind,
+                CallerKind::Chat | CallerKind::Gateway | CallerKind::Companion
+            ),
+            ..ActionAuthorizationContext::default()
+        };
         Self {
             messages,
             caller_kind,
@@ -137,6 +139,16 @@ impl SpineRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SpineResult {
     Completed {
+        messages: Vec<SpineMessage>,
+        final_text: String,
+        turns_used: usize,
+    },
+    Blocked {
+        messages: Vec<SpineMessage>,
+        final_text: String,
+        turns_used: usize,
+    },
+    NeedsInput {
         messages: Vec<SpineMessage>,
         final_text: String,
         turns_used: usize,
@@ -199,6 +211,10 @@ pub enum SpineTraceEvent {
     ToolStarted {
         tool_call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent_summary: Option<String>,
     },
     ToolCompleted {
         tool_call_id: String,
@@ -217,6 +233,8 @@ pub enum SpineTraceEvent {
 #[serde(rename_all = "snake_case")]
 pub enum SpineTerminalState {
     Completed,
+    NeedsInput,
+    Blocked,
     MaxTurnsExceeded,
     Cancelled,
     PausedForApproval,

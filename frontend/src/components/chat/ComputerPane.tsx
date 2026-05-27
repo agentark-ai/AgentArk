@@ -51,6 +51,7 @@ import {
   formatReadableDurationMs,
   type ReadablePayloadTone,
 } from "./readablePayload";
+import { buildRunPayloadViewFromSources } from "./runPayloadView";
 import {
   FileView,
   SurfaceRenderer,
@@ -360,8 +361,15 @@ function collectActivityFields(
 function buildActivityDetails(card: ChatStepCard) {
   const record = tryParseRecord(card.traceJson || "") || {};
   const data = asPaneRecord(record.data);
+  const payloadView = buildRunPayloadViewFromSources(
+    Object.keys(data).length > 0 ? data : null,
+    Object.keys(record).length > 0 ? record : null,
+    card.rawDetailFull,
+    card.detailFull,
+  );
   const readable = readablePayloadFromValue(data) || readablePayloadFromValue(record);
   const rawOverview =
+    payloadView?.preview ||
     readable?.detail ||
     str(data.content_snapshot, "") ||
     str(data.content, "") ||
@@ -383,7 +391,9 @@ function buildActivityDetails(card: ChatStepCard) {
     { label: "Time", value: card.time },
   ].filter((field) => field.value.trim());
   const traceFields =
-    readable?.fields && readable.fields.length > 0
+    payloadView?.items && payloadView.items.length > 0
+      ? payloadView.items
+      : readable?.fields && readable.fields.length > 0
       ? readable.fields
       : collectActivityFields(Object.keys(data).length > 0 ? data : record, {
           limit: 20,
@@ -406,7 +416,14 @@ function buildActivityDetails(card: ChatStepCard) {
   ]
     .filter(Boolean)
     .join("\n\n");
-  return { overview, displayFields, traceJson: "", copyText };
+  const rawPayload =
+    payloadView?.body ||
+    (looksLikeStructuredPanePayload(card.rawDetailFull)
+      ? card.rawDetailFull
+      : looksLikeStructuredPanePayload(card.detailFull)
+        ? card.detailFull
+        : card.traceJson || "");
+  return { overview, displayFields, traceJson: rawPayload, copyText };
 }
 
 function ActivityExpandedDetails({
@@ -490,7 +507,7 @@ function ActivityExpandedDetails({
         ) : null}
         {details.traceJson ? (
           <details className="computer-pane-activity-raw">
-            <summary>Raw trace JSON</summary>
+            <summary>Raw payload</summary>
             <pre className="computer-pane-activity-full">{details.traceJson}</pre>
           </details>
         ) : null}
@@ -1719,8 +1736,17 @@ function ComputerPaneInner({
   const lastLiveWritePathRef = useRef<string | null>(null);
   const hasWorkspaceFiles = workspaceFiles.length > 0;
   const snippetFileAvailable = Boolean(showSnippet && (snippetPath || snippetContent));
+  const deployFilePathAvailable = Boolean(
+    deployFilePath &&
+      ((!!liveWritePath && filePathsMatch(deployFilePath, liveWritePath)) ||
+        workspaceFiles.some((file) => filePathsMatch(file.path, deployFilePath)) ||
+        (!!snippetFileAvailable &&
+          !!snippetPath &&
+          filePathsMatch(snippetPath, deployFilePath))),
+  );
+  const selectedDeployFilePath = deployFilePathAvailable ? deployFilePath : null;
   const hasFileTab =
-    hasWorkspaceFiles || Boolean(liveWritePath || deployFilePath) || snippetFileAvailable;
+    hasWorkspaceFiles || Boolean(liveWritePath || selectedDeployFilePath) || snippetFileAvailable;
   const autoFocusFilePath = liveWritePath || workspaceFiles[0]?.path || null;
   const followedLiveWritePath =
     liveWriteActive && liveWritePath && !userPickedDeployFile
@@ -1735,14 +1761,19 @@ function ComputerPaneInner({
   useEffect(() => {
     if (!autoFocusFilePath) return;
     if (userPickedDeployFile) return;
-    if (!liveWriteActive && deployFilePath) return;
+    if (!liveWriteActive && selectedDeployFilePath) return;
     setDeployFilePath(autoFocusFilePath);
   }, [
     autoFocusFilePath,
-    deployFilePath,
     liveWriteActive,
+    selectedDeployFilePath,
     userPickedDeployFile,
   ]);
+  useEffect(() => {
+    if (!deployFilePath || deployFilePathAvailable) return;
+    setDeployFilePath(null);
+    setUserPickedDeployFile(false);
+  }, [deployFilePath, deployFilePathAvailable]);
   useEffect(() => {
     if (!liveWriteActive) setUserPickedDeployFile(false);
   }, [liveWriteActive]);
@@ -1784,7 +1815,7 @@ function ComputerPaneInner({
   const navPool = useMemo(() => activityCards, [activityCards]);
   const headerFilePath =
     followedLiveWritePath ||
-    deployFilePath ||
+    selectedDeployFilePath ||
     liveWritePath ||
     workspaceFiles[0]?.path ||
     snippetPath ||
@@ -1879,35 +1910,37 @@ function ComputerPaneInner({
   const progressText =
     tab === "files" && hasFileTab ? fileProgressText : consoleProgressText;
   const deployFileIsLiveWrite =
-    !!deployFilePath &&
+    !!selectedDeployFilePath &&
     !!liveWritePath &&
-    filePathsMatch(deployFilePath, liveWritePath);
+    filePathsMatch(selectedDeployFilePath, liveWritePath);
   const deployFileContent = useMemo(() => {
-    if (!deployFilePath) return "";
+    if (!selectedDeployFilePath) return "";
     // While the file is streaming, prefer the live buffer over any captured
     // workspace snapshot so the user sees the just-written line, not stale
     // content from a previous run.
     if (deployFileIsLiveWrite && liveWriteContent) return liveWriteContent;
     return (
-      findWorkspaceFileContent(workspaceFiles, deployFilePath) ||
-      findFileContentForPath(cardsForRun, deployFilePath)
+      findWorkspaceFileContent(workspaceFiles, selectedDeployFilePath) ||
+      findFileContentForPath(cardsForRun, selectedDeployFilePath)
     );
   }, [
     cardsForRun,
-    deployFilePath,
     deployFileIsLiveWrite,
     liveWriteContent,
+    selectedDeployFilePath,
     workspaceFiles,
   ]);
   const focusedFilePath =
-    followedLiveWritePath || deployFilePath || (liveWriteActive ? liveWritePath || "" : "");
+    followedLiveWritePath ||
+    selectedDeployFilePath ||
+    (liveWriteActive ? liveWritePath || "" : "");
   const focusedFileIsLiveWrite =
     !!focusedFilePath &&
     !!liveWritePath &&
     filePathsMatch(focusedFilePath, liveWritePath);
   const focusedFileContent = useMemo(() => {
     if (!focusedFilePath) return "";
-    if (deployFilePath && filePathsMatch(focusedFilePath, deployFilePath)) {
+    if (selectedDeployFilePath && filePathsMatch(focusedFilePath, selectedDeployFilePath)) {
       return deployFileContent;
     }
     if (focusedFileIsLiveWrite && liveWriteContent) return liveWriteContent;
@@ -1918,10 +1951,10 @@ function ComputerPaneInner({
   }, [
     cardsForRun,
     deployFileContent,
-    deployFilePath,
     focusedFileIsLiveWrite,
     focusedFilePath,
     liveWriteContent,
+    selectedDeployFilePath,
     workspaceFiles,
   ]);
   const activeFilePath =
@@ -1951,8 +1984,8 @@ function ComputerPaneInner({
       ? activeFileIsLiveWrite && liveWriteActive
       : Boolean(isStreaming) && activeIndex === navPool.length - 1;
   const fallbackFilePath =
-    !activeCard && (deployFilePath || liveWritePath || workspaceFiles[0]?.path)
-      ? deployFilePath || liveWritePath || workspaceFiles[0]?.path || ""
+    !activeCard && (selectedDeployFilePath || liveWritePath || workspaceFiles[0]?.path)
+      ? selectedDeployFilePath || liveWritePath || workspaceFiles[0]?.path || ""
       : "";
   const fallbackFileIsLiveWrite =
     !!fallbackFilePath &&
@@ -2046,15 +2079,6 @@ function ComputerPaneInner({
           snippetPath || "Code",
         )
       : null;
-  const snippetShadowsSelectedWorkspaceFile =
-    !!snippetCard &&
-    !!snippetPath &&
-    ((!!focusedFilePath &&
-      !!focusedFileContent.trim() &&
-      filePathsMatch(snippetPath, focusedFilePath)) ||
-      (!!fallbackFilePath &&
-        !!fallbackFileContent.trim() &&
-        filePathsMatch(snippetPath, fallbackFilePath)));
   const visibleTabs: ComputerPaneTab[] = hasFileTab
     ? ["computer", "files", "activity"]
     : ["computer", "activity"];
@@ -2364,13 +2388,7 @@ function ComputerPaneInner({
             className="computer-pane-stage"
             sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
           >
-            {snippetCard && !snippetShadowsSelectedWorkspaceFile ? (
-              <FileView
-                card={snippetCard}
-                snippetPath={snippetPath}
-                snippetContent={snippetContent}
-              />
-            ) : focusedFileCard ? (
+            {focusedFileCard ? (
               <FileView
                 card={focusedFileCard}
                 snippetPath={focusedFilePath}

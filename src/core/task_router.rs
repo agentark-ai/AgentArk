@@ -4,7 +4,7 @@
 //! and they are auto-spawned from the model pool. User-configured specialists
 //! act as priority boosters — preferred when they match, but never required.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -23,8 +23,8 @@ use super::swarm::specialist::SpecialistAgent;
 use super::swarm::{AgentAccessScope, SwarmActivityAgent, SwarmActivityTracker};
 use super::{DegradationNote, DelegationStatus, FailureKind, StreamEvent};
 use crate::actions::ActionDef;
-use crate::core::PromptMemory;
 use crate::core::queue_stream_event;
+use crate::core::PromptMemory;
 
 fn compact_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -699,6 +699,49 @@ fn build_fallback_delegation_response(
         provider: "internal".to_string(),
         model: "delegation-fallback".to_string(),
     }
+}
+
+fn classify_ephemeral_worker_response(
+    content: &str,
+    requested_tool_count: usize,
+) -> (
+    DelegationStatus,
+    Option<FailureKind>,
+    Option<String>,
+    String,
+) {
+    let content = content.trim();
+    if requested_tool_count > 0 {
+        return (
+            DelegationStatus::Failed,
+            Some(FailureKind::ToolContractFailure),
+            Some(
+                "Run required tools in the parent loop or retry with a worker path that can execute those tools."
+                    .to_string(),
+            ),
+            if content.is_empty() {
+                format!(
+                    "Delegated path requested {} tool call(s) but returned no final result.",
+                    requested_tool_count
+                )
+            } else {
+                format!(
+                    "Delegated path requested {} tool call(s) and returned text before those tools could run: {}",
+                    requested_tool_count,
+                    compact_text(content, 500)
+                )
+            },
+        );
+    }
+    if content.is_empty() {
+        return (
+            DelegationStatus::Failed,
+            Some(FailureKind::InternalPostProcess),
+            Some("Retry with a clearer scoped task.".to_string()),
+            "Delegated path returned no user-facing result.".to_string(),
+        );
+    }
+    (DelegationStatus::Completed, None, None, content.to_string())
 }
 
 const RESEARCHER_CALLSIGNS: &[&str] = &[
@@ -1654,12 +1697,11 @@ impl TaskRouter {
         let requested_role = if !smart_routing {
             ModelRole::Primary
         } else {
-            spec.resolve_model_role()
-                .unwrap_or_else(|| match agent_type {
-                    SubAgentType::Coder => ModelRole::Code,
-                    SubAgentType::Researcher => ModelRole::Research,
-                    _ => ModelRole::Primary,
-                })
+            spec.resolve_model_role().unwrap_or(match agent_type {
+                SubAgentType::Coder => ModelRole::Code,
+                SubAgentType::Researcher => ModelRole::Research,
+                _ => ModelRole::Primary,
+            })
         };
 
         let mut ordered_slot_ids = Vec::new();
@@ -2647,33 +2689,10 @@ impl TaskRouter {
                                         let content = resp.content.trim().to_string();
                                         let requested_tool_count = resp.tool_calls.len();
                                         let (status, failure_kind, next_action_hint, result_text) =
-                                            if content.is_empty() && requested_tool_count > 0 {
-                                                (
-                                                    DelegationStatus::Failed,
-                                                    Some(FailureKind::ToolContractFailure),
-                                                    Some(
-                                                        "Run required tools in the parent loop or retry with a worker path that can execute those tools."
-                                                            .to_string(),
-                                                    ),
-                                                    format!(
-                                                        "Delegated path requested {} tool call(s) but returned no final result.",
-                                                        requested_tool_count
-                                                    ),
-                                                )
-                                            } else if content.is_empty() {
-                                                (
-                                                    DelegationStatus::Failed,
-                                                    Some(FailureKind::InternalPostProcess),
-                                                    Some(
-                                                        "Retry with a clearer scoped task."
-                                                            .to_string(),
-                                                    ),
-                                                    "Delegated path returned no user-facing result."
-                                                        .to_string(),
-                                                )
-                                            } else {
-                                                (DelegationStatus::Completed, None, None, content)
-                                            };
+                                            classify_ephemeral_worker_response(
+                                                &content,
+                                                requested_tool_count,
+                                            );
                                         Ok(AgentExecResult {
                                             agent_id,
                                             agent_type: agent_type.name(),
@@ -3247,13 +3266,22 @@ mod tests {
 
         assert_eq!(degradation.len(), 1);
         assert_eq!(degradation[0].kind, "delegation");
-        assert!(
-            degradation[0]
-                .detail
-                .as_deref()
-                .unwrap_or_default()
-                .contains("panicked")
-        );
+        assert!(degradation[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("panicked"));
+    }
+
+    #[test]
+    fn ephemeral_worker_tool_calls_are_not_completed_by_text() {
+        let (status, failure_kind, next_action_hint, result_text) =
+            classify_ephemeral_worker_response("I can do that after I inspect the file.", 1);
+
+        assert_eq!(status, DelegationStatus::Failed);
+        assert_eq!(failure_kind, Some(FailureKind::ToolContractFailure));
+        assert!(next_action_hint.is_some());
+        assert!(result_text.contains("requested 1 tool call"));
     }
 
     #[test]
@@ -3292,11 +3320,9 @@ mod tests {
             &[degraded_result(DelegationStatus::TimedOut)],
         );
 
-        assert!(
-            response
-                .content
-                .contains("couldn't complete the delegated execution cleanly")
-        );
+        assert!(response
+            .content
+            .contains("couldn't complete the delegated execution cleanly"));
         assert!(response.content.contains("Still needs follow-up"));
     }
 

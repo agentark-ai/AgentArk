@@ -89,7 +89,7 @@ impl Agent {
     }
 
     async fn curator_idle_window_elapsed(&self) -> bool {
-        let last_activity = self.last_activity.read().await.clone();
+        let last_activity = *self.last_activity.read().await;
         let Some(last_activity) = last_activity else {
             return true;
         };
@@ -136,19 +136,19 @@ impl Agent {
             if record.pinned || record.created_by != "agent" {
                 continue;
             }
-            let last_activity = parse_rfc3339_utc(record.last_activity_at.as_deref())
-                .unwrap_or_else(|| now.clone());
+            let last_activity =
+                parse_rfc3339_utc(record.last_activity_at.as_deref()).unwrap_or(now);
             let age = now.signed_duration_since(last_activity);
             if record.state == "active" && age >= chrono::Duration::days(CURATOR_STALE_AFTER_DAYS) {
                 record.state = "stale".to_string();
                 stale_marked += 1;
             }
-            if record.state == "stale" && age >= chrono::Duration::days(CURATOR_ARCHIVE_AFTER_DAYS)
+            if record.state == "stale"
+                && age >= chrono::Duration::days(CURATOR_ARCHIVE_AFTER_DAYS)
+                && archive_skill_dir(&skills_dir, &archive_dir, name).await?
             {
-                if archive_skill_dir(&skills_dir, &archive_dir, name).await? {
-                    record.state = "archived".to_string();
-                    archived += 1;
-                }
+                record.state = "archived".to_string();
+                archived += 1;
             }
         }
 

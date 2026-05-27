@@ -16,6 +16,7 @@ Minimum target: iOS 16.
 
 ## Security
 
+- Advertises only `approval_prompt` and `notifications`; it does not read SMS, iMessage, photos, location, camera, or Shortcuts.
 - Stores the scoped device token in Keychain.
 - Sends stored tokens in WebSocket headers, not JSON messages.
 - Sends a stable device identity with each pairing claim.

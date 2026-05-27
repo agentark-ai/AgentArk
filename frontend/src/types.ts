@@ -190,6 +190,7 @@ export type ApprovalLogEntry = {
 
 export type BrowserHandoffStatus = {
   id: string;
+  conversation_id?: string | null;
   task_description: string;
   profile_id?: string | null;
   profile_name?: string | null;
@@ -984,6 +985,15 @@ export type CompanionPreset = {
   capability_ids: string[];
 };
 
+export type CompanionCommandDescriptor = {
+  id: string;
+  label: string;
+  capability: string;
+  action: string;
+  description?: string;
+  risk: CompanionRiskLevel;
+};
+
 export type CompanionDeviceRecord = {
   id: string;
   display_name: string;
@@ -995,6 +1005,7 @@ export type CompanionDeviceRecord = {
   available_capabilities?: string[];
   granted_capabilities?: string[];
   token_capabilities?: string[];
+  declared_commands?: CompanionCommandDescriptor[];
   paired_at: string;
   last_seen_at?: string | null;
   owner?: string | null;
@@ -1093,6 +1104,7 @@ export type CompanionProtocolDocument = {
   auth: string;
   pairing: string;
   messages: string[];
+  commands?: CompanionCommandDescriptor[];
   security: string[];
 };
 
@@ -1119,6 +1131,29 @@ export type CompanionCommandsResponse = {
 export type CompanionAuditResponse = {
   status?: string;
   events: CompanionAuditEvent[];
+};
+
+export type CompanionMobileAccessChannel = {
+  id: string;
+  label: string;
+  kind: string;
+  configured: boolean;
+  ready: boolean;
+  detail: string;
+  settings_path: string;
+};
+
+export type CompanionMobileAccessResponse = {
+  phone_companion: {
+    paired: number;
+    online: number;
+    capabilities: string[];
+    can_read_phone_messages: boolean;
+    detail: string;
+  };
+  message_channels: CompanionMobileAccessChannel[];
+  sms: CompanionMobileAccessChannel;
+  truth_notes: string[];
 };
 
 export type BrowserProfileRecord = {

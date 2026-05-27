@@ -85,8 +85,38 @@ public actor CompanionWebSocketClient {
         var envelope = CompanionEnvelope(type: .pulse)
         envelope.state = state
         envelope.capabilities = capabilities
+        envelope.commands = commandDescriptors()
         envelope.metadata = metadata
         try await send(envelope)
+    }
+
+    private func commandDescriptors() -> [CompanionCommandDescriptor] {
+        var descriptors: [CompanionCommandDescriptor] = []
+        if capabilities.contains("approval_prompt") {
+            descriptors.append(
+                CompanionCommandDescriptor(
+                    id: "approval.prompt",
+                    label: "Approval prompt",
+                    capability: "approval_prompt",
+                    action: "approval.prompt",
+                    description: "Ask this iOS companion for an approval decision.",
+                    risk: "low"
+                )
+            )
+        }
+        if capabilities.contains("notifications") {
+            descriptors.append(
+                CompanionCommandDescriptor(
+                    id: "notifications.show",
+                    label: "Show notification",
+                    capability: "notifications",
+                    action: "notifications.show",
+                    description: "Show a local notification on this iOS companion.",
+                    risk: "low"
+                )
+            )
+        }
+        return descriptors
     }
 
     private func receiveLoop() async throws {

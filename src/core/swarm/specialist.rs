@@ -1,12 +1,12 @@
 //! Lightweight specialist agent
 
-use super::AgentAccessScope;
 use super::agent_trait::*;
+use super::AgentAccessScope;
 use crate::actions::ActionDef;
-use crate::core::PromptMemory;
 use crate::core::llm::{LlmClient, LlmProvider};
 use crate::core::orchestra::SubAgentType;
 use crate::core::prompt_policy::delegated_policy_v2_block;
+use crate::core::PromptMemory;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;

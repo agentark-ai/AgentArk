@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::skill_marketplaces::{
-    SkillMarketplaceUpsertRequest, load_marketplaces, refresh_marketplace, remove_marketplace,
-    upsert_marketplace,
+    load_marketplaces, refresh_marketplace, remove_marketplace, upsert_marketplace,
+    SkillMarketplaceUpsertRequest,
 };
 
 fn error_response(status: StatusCode, error: impl ToString) -> Response {

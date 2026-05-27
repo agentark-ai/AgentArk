@@ -2,6 +2,19 @@ use super::*;
 
 // ==================== Document Endpoints ====================
 
+const GENERATED_FILE_DOCUMENT_ID_PREFIX: &str = "generated-file:";
+
+fn document_metadata_download_url(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("download_url:")?.trim();
+        if value.starts_with("/api/outputs/") && !value.contains("..") && !value.contains('\\') {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 pub(super) async fn list_documents_endpoint(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -27,16 +40,35 @@ pub(super) async fn list_documents_endpoint(
         .await
     {
         Ok(docs) => {
-            let list: Vec<serde_json::Value> = docs
-                .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "id": d.id, "filename": d.filename, "content_type": d.content_type,
-                        "chunk_count": d.chunk_count,
-                        "file_size": d.file_size, "created_at": d.created_at,
-                    })
-                })
-                .collect();
+            let mut list: Vec<serde_json::Value> = Vec::with_capacity(docs.len());
+            for d in &docs {
+                let download_url = if d.id.starts_with(GENERATED_FILE_DOCUMENT_ID_PREFIX) {
+                    agent
+                        .storage
+                        .get_document_chunks(&d.id)
+                        .await
+                        .ok()
+                        .and_then(|chunks| {
+                            chunks
+                                .iter()
+                                .find_map(|chunk| document_metadata_download_url(&chunk.content))
+                        })
+                } else {
+                    None
+                };
+                let mut doc = serde_json::json!({
+                    "id": d.id.clone(),
+                    "filename": d.filename.clone(),
+                    "content_type": d.content_type.clone(),
+                    "chunk_count": d.chunk_count,
+                    "file_size": d.file_size,
+                    "created_at": d.created_at.clone(),
+                });
+                if let Some(download_url) = download_url {
+                    doc["download_url"] = serde_json::Value::String(download_url);
+                }
+                list.push(doc);
+            }
             (StatusCode::OK, Json(serde_json::json!({"documents": list, "total": total, "limit": limit, "offset": offset}))).into_response()
         }
         Err(e) => (
@@ -698,6 +730,21 @@ mod tests {
         assert!(chunks[0].contains("text_content_indexed: false"));
         assert!(chunks[0].contains("ingestion_source: manual_upload"));
         assert!(chunks[0].contains("text_extraction_status: metadata_only"));
+    }
+
+    #[test]
+    fn document_metadata_download_url_extracts_safe_managed_output_link() {
+        let value = document_metadata_download_url(
+            "artifact_kind: managed_file\n\
+             filename: report.pdf\n\
+             download_url: /api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/report.pdf/download\n",
+        );
+
+        assert_eq!(
+            value.as_deref(),
+            Some("/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/report.pdf/download")
+        );
+        assert!(document_metadata_download_url("download_url: /api/outputs/../secret").is_none());
     }
 
     #[test]

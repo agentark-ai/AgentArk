@@ -282,7 +282,11 @@ impl WatcherFollowupWorker {
             }
         }
 
-        if ordered.is_empty() { vec![] } else { ordered }
+        if ordered.is_empty() {
+            vec![]
+        } else {
+            ordered
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

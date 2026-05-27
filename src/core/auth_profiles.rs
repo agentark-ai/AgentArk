@@ -3,8 +3,8 @@
 //! Profiles are stored encrypted in the shared storage layer and expose a single
 //! resolution path for runtime HTTP-style auth application.
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::integrations::oauth::{OAuthClient, OAuthConfig, OAuthConfigInput};
@@ -980,7 +980,7 @@ fn overlay_query_value(query: &BTreeMap<String, String>, name: &str) -> Option<S
 }
 
 fn basic_authorization_header(username: &str, password: &str) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     let raw = format!("{}:{}", username, password);
     format!("Basic {}", STANDARD.encode(raw))

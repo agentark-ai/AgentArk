@@ -20,8 +20,8 @@ use crate::core::prompt_policy::{
 };
 
 use super::promotion_gate::{
-    PromotionGateCheck, PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
-    promotion_gate_report, render_legacy_promotion_gate,
+    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
+    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
 };
 use super::prompt_evolution::PromptSurfaceProfile;
 
@@ -319,7 +319,7 @@ impl SpecialistPromptEvolutionEngine {
         let evaluated_candidates = candidates.len();
         let mut evaluated = Vec::new();
         for candidate in candidates {
-            let eval = self.evaluate_bundle(&candidate.bundle, &benchmark).await;
+            let eval = self.evaluate_bundle(&candidate.bundle, benchmark).await;
             let paired = paired_stats(&baseline_eval.case_scores, &eval.case_scores);
             evaluated.push((candidate, eval, paired));
         }

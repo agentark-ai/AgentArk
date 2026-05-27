@@ -497,7 +497,7 @@ mod tests {
         newest_tie.created_at = base + chrono::Duration::minutes(3);
         newest_tie.scheduled_for = Some(base + chrono::Duration::minutes(10));
 
-        let mut tasks = vec![
+        let mut tasks = [
             newest_tie.clone(),
             later_non_reminder.clone(),
             reminder.clone(),

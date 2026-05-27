@@ -145,7 +145,7 @@ enum ConversationControlCommand {
 }
 
 fn parse_conversation_control_command(message: &str) -> Option<ConversationControlCommand> {
-    let mut parts = message.trim().split_whitespace();
+    let mut parts = message.split_whitespace();
     let command = parts.next()?;
     if parts.next().is_some() {
         return None;
@@ -170,6 +170,35 @@ mod tests {
         assert_eq!(normalize_request_project_id(Some("   ")), None);
         assert_eq!(normalize_request_project_id(None), None);
     }
+
+    #[test]
+    fn turn_pipeline_usage_delta_includes_prompt_cache_usage() {
+        let before = TurnPipelineUsageSnapshot {
+            input_tokens: 10,
+            output_tokens: 4,
+            total_tokens: 14,
+            cached_prompt_tokens: 3,
+            cache_creation_prompt_tokens: 2,
+            cost_usd: 0.01,
+        };
+        let after = TurnPipelineUsageSnapshot {
+            input_tokens: 25,
+            output_tokens: 9,
+            total_tokens: 34,
+            cached_prompt_tokens: 11,
+            cache_creation_prompt_tokens: 7,
+            cost_usd: 0.03,
+        };
+
+        let delta = after.delta_since(before);
+
+        assert_eq!(delta.input_tokens, 15);
+        assert_eq!(delta.output_tokens, 5);
+        assert_eq!(delta.total_tokens, 20);
+        assert_eq!(delta.cached_prompt_tokens, 8);
+        assert_eq!(delta.cache_creation_prompt_tokens, 5);
+        assert!((delta.cost_usd - 0.02).abs() < f64::EPSILON);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -177,6 +206,8 @@ struct TurnPipelineUsageSnapshot {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
+    cached_prompt_tokens: i64,
+    cache_creation_prompt_tokens: i64,
     cost_usd: f64,
 }
 
@@ -420,6 +451,12 @@ impl TurnPipelineUsageSnapshot {
             input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
             output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
             total_tokens: self.total_tokens.saturating_sub(previous.total_tokens),
+            cached_prompt_tokens: self
+                .cached_prompt_tokens
+                .saturating_sub(previous.cached_prompt_tokens),
+            cache_creation_prompt_tokens: self
+                .cache_creation_prompt_tokens
+                .saturating_sub(previous.cache_creation_prompt_tokens),
             cost_usd: (self.cost_usd - previous.cost_usd).max(0.0),
         }
     }
@@ -1050,6 +1087,8 @@ impl Agent {
             input_tokens: trace.input_tokens,
             output_tokens: trace.output_tokens,
             total_tokens: trace.total_tokens,
+            cached_prompt_tokens: trace.cached_prompt_tokens,
+            cache_creation_prompt_tokens: trace.cache_creation_prompt_tokens,
             cost_usd: trace.cost_usd,
         }
     }
@@ -1653,6 +1692,8 @@ impl Agent {
             input_tokens: usage_delta.input_tokens,
             output_tokens: usage_delta.output_tokens,
             total_tokens: usage_delta.total_tokens,
+            cached_prompt_tokens: usage_delta.cached_prompt_tokens,
+            cache_creation_prompt_tokens: usage_delta.cache_creation_prompt_tokens,
             cost_usd: usage_delta.cost_usd,
             complexity: Some(complexity.to_string()),
             plan: turn_plan.clone(),
@@ -1746,8 +1787,8 @@ impl Agent {
             input_tokens: usage_delta.input_tokens,
             output_tokens: usage_delta.output_tokens,
             total_tokens: usage_delta.total_tokens,
-            cached_prompt_tokens: 0,
-            cache_creation_prompt_tokens: 0,
+            cached_prompt_tokens: usage_delta.cached_prompt_tokens,
+            cache_creation_prompt_tokens: usage_delta.cache_creation_prompt_tokens,
             choices,
             degradation: Vec::new(),
             attempted_models: Vec::new(),
@@ -1944,10 +1985,12 @@ impl Agent {
         let tool_attempts = self.storage.list_tool_attempts_for_run(run_id).await?;
         let resume_message =
             Self::build_execution_resume_message(&run, &checkpoints, &tool_attempts);
-        let mut hints = RequestExecutionHints::default();
-        hints.execution_surface = ActionExecutionSurface::Chat;
-        hints.direct_user_intent = true;
-        hints.caller_principal = caller.cloned();
+        let hints = RequestExecutionHints {
+            execution_surface: ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            caller_principal: caller.cloned(),
+            ..RequestExecutionHints::default()
+        };
 
         self.process_message_with_meta_and_hints(
             &resume_message,
@@ -2438,6 +2481,8 @@ impl Agent {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            cached_prompt_tokens: 0,
+            cache_creation_prompt_tokens: 0,
             cost_usd: 0.0,
             complexity: Some("immediate".to_string()),
             plan: None,

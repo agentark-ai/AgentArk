@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -549,7 +549,7 @@ async fn publish_app_to_vercel_direct(
             "deployment_id": deployment_id,
             "url": deployment_url,
             "target": if options.production { "production" } else { "preview" },
-            "project_id": payload_deployment_project_id(diagnostic).or_else(|| payload_deployment_project_id(&payload)).or_else(|| project_selection.as_ref().and_then(|selection| selection.id.as_deref())).or_else(|| project_id.as_deref()).unwrap_or_default(),
+            "project_id": payload_deployment_project_id(diagnostic).or_else(|| payload_deployment_project_id(&payload)).or_else(|| project_selection.as_ref().and_then(|selection| selection.id.as_deref())).or(project_id.as_deref()).unwrap_or_default(),
             "project_name": diagnostic.get("name").and_then(|value| value.as_str()).or_else(|| payload.get("name").and_then(|value| value.as_str())).unwrap_or(deployment_name.as_str()),
             "ready_state": ready_state,
             "message": deployment_failure_message(diagnostic).unwrap_or_else(|| format!("Vercel deployment finished with state {}", ready_state)),
@@ -572,7 +572,7 @@ async fn publish_app_to_vercel_direct(
         "deployment_id": deployment_id,
         "url": deployment_url,
         "target": if options.production { "production" } else { "preview" },
-        "project_id": readiness.as_ref().and_then(payload_deployment_project_id).or_else(|| payload_deployment_project_id(&payload)).or_else(|| project_selection.as_ref().and_then(|selection| selection.id.as_deref())).or_else(|| project_id.as_deref()).unwrap_or_default(),
+        "project_id": readiness.as_ref().and_then(payload_deployment_project_id).or_else(|| payload_deployment_project_id(&payload)).or_else(|| project_selection.as_ref().and_then(|selection| selection.id.as_deref())).or(project_id.as_deref()).unwrap_or_default(),
         "project_name": readiness.as_ref().and_then(|value| value.get("name").and_then(|value| value.as_str())).or_else(|| payload.get("name").and_then(|value| value.as_str())).unwrap_or(deployment_name.as_str()),
         "project_created": project_selection.as_ref().is_some_and(|selection| selection.created),
         "ready_state": ready_state,

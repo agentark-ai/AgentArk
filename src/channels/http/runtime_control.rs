@@ -541,7 +541,11 @@ pub(super) async fn build_runtime_health_payload(
         && blocking_startup_issue_count == 0;
     let overall_ok = if readiness_mode { ready } else { true };
     let status_text = if readiness_mode {
-        if ready { "ok" } else { "not_ready" }
+        if ready {
+            "ok"
+        } else {
+            "not_ready"
+        }
     } else if healthy {
         "ok"
     } else {
@@ -2481,6 +2485,8 @@ pub(super) struct BrowserHandoffCompleteRequest {
     note: Option<String>,
     #[serde(default)]
     response: Option<String>,
+    #[serde(default)]
+    resume_in_chat: bool,
 }
 
 pub(super) fn browser_session_action_error_response(error: anyhow::Error) -> Response {
@@ -2509,7 +2515,7 @@ pub(super) async fn browser_respond(
         .to_string();
     match agent
         .browser_sessions
-        .complete_operator_handoff(&id, &note)
+        .complete_operator_handoff(&id, &note, body.resume_in_chat)
         .await
     {
         Ok(view) => (

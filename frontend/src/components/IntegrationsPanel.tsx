@@ -13,6 +13,7 @@ import {
   DialogTitle,
   Divider,
   FormControlLabel,
+  InputAdornment,
   IconButton,
   Menu,
   MenuItem,
@@ -34,6 +35,7 @@ import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import EditRoundedIcon from "@mui/icons-material/EditRounded";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
+import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 import VpnKeyRoundedIcon from "@mui/icons-material/VpnKeyRounded";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -52,6 +54,15 @@ import { ExtensionPacksPanel } from "./ExtensionPacksPanel";
 import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
 import { IntegrationRoutingPanel } from "./IntegrationRoutingPanel";
 import { PluginSdkPanel } from "./PluginSdkPanel";
+import { WebhooksPanel } from "./WebhooksPanel";
+import {
+  asRecord,
+  asRecords,
+  isRecord,
+  str,
+  toBool,
+  type JsonRecord
+} from "./integrationPanelData";
 
 const REFRESH_MS = 8000;
 const OAUTH_SIGNAL_STORAGE_KEY = "agentark:oauth-callback";
@@ -240,7 +251,6 @@ function isEmailExternalProvider(value: string): boolean {
   return EMAIL_EXTERNAL_PROVIDERS.has((value || "").trim().toLowerCase());
 }
 
-type JsonRecord = Record<string, unknown>;
 type OAuthSignalPayload = {
   type?: string;
   service_id?: string;
@@ -600,35 +610,6 @@ function gatewayChannelDetail(channel: GatewayChannelDescriptor | null, fallback
   return parts.join(" | ");
 }
 
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function asRecord(value: unknown): JsonRecord {
-  return isRecord(value) ? value : {};
-}
-
-function asRecords(value: unknown): JsonRecord[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter(isRecord);
-}
-
-function str(value: unknown, fallback = ""): string {
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return fallback;
-}
-
-function toBool(value: unknown): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  if (typeof value === "string") {
-    const v = value.trim().toLowerCase();
-    return v === "true" || v === "1" || v === "yes";
-  }
-  return false;
-}
-
 function customMessagingCredentialFields(channel?: CustomMessagingChannel | null): IntegrationAuthManifestField[] {
   const mode = channel?.auth_manifest?.mode;
   if (!mode || typeof mode !== "object") return [];
@@ -704,6 +685,92 @@ function summarizeInlineNames(names: string[], emptyText: string): string {
   if (cleaned.length === 0) return emptyText;
   const preview = cleaned.slice(0, 3).join(", ");
   return cleaned.length > 3 ? `${preview} +${cleaned.length - 3} more` : preview;
+}
+
+type IntegrationHubCategory = "chat" | "productivity" | "tools" | "social" | "platform";
+type IntegrationHubFilter = "all" | IntegrationHubCategory;
+type IntegrationHubStatus = "connected" | "attention" | "error" | "off" | "info";
+
+const INTEGRATION_HUB_FILTERS: Array<{ value: IntegrationHubFilter; label: string }> = [
+  { value: "all", label: "All" },
+  { value: "chat", label: "Chat" },
+  { value: "productivity", label: "Productivity" },
+  { value: "tools", label: "Tools & Automation" },
+  { value: "social", label: "Social" },
+  { value: "platform", label: "Platform" }
+];
+
+function integrationHubCategory(id: string, name = ""): IntegrationHubCategory {
+  const key = `${id} ${name}`.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (
+    key.includes("telegram") ||
+    key.includes("whatsapp") ||
+    key.includes("slack") ||
+    key.includes("discord") ||
+    key.includes("matrix") ||
+    key.includes("teams") ||
+    key.includes("google_chat") ||
+    key.includes("signal") ||
+    key.includes("imessage") ||
+    key.includes("line") ||
+    key.includes("wechat") ||
+    key.includes("qq")
+  ) {
+    return "chat";
+  }
+  if (
+    key.includes("gmail") ||
+    key.includes("calendar") ||
+    key.includes("drive") ||
+    key.includes("docs") ||
+    key.includes("sheets") ||
+    key.includes("notion") ||
+    key.includes("airtable") ||
+    key.includes("asana") ||
+    key.includes("basecamp") ||
+    key.includes("attio") ||
+    key.includes("moltbook") ||
+    key.includes("ordering") ||
+    key.includes("shopify") ||
+    key.includes("email")
+  ) {
+    return "productivity";
+  }
+  if (
+    key.includes("twitter") ||
+    key.includes("reddit") ||
+    key.includes("instagram") ||
+    key.includes("social")
+  ) {
+    return "social";
+  }
+  if (
+    key.includes("plugin") ||
+    key.includes("webhook") ||
+    key.includes("extension") ||
+    key.includes("pack") ||
+    key.includes("mcp") ||
+    key.includes("companion")
+  ) {
+    return "platform";
+  }
+  return "tools";
+}
+
+function integrationHubStatusLabel(status: IntegrationHubStatus): string {
+  if (status === "connected") return "Enabled";
+  if (status === "attention") return "Needs setup";
+  if (status === "error") return "Error";
+  if (status === "info") return "Available";
+  return "Disabled";
+}
+
+function integrationHubStatusSortRank(status: IntegrationHubStatus): number {
+  if (status === "connected") return 0;
+  if (status === "attention") return 1;
+  if (status === "error") return 2;
+  if (status === "info") return 3;
+  return 4;
 }
 
 function parseWorkspaceBundleCsv(input: string): string[] {
@@ -853,12 +920,13 @@ export function IntegrationsPanel({
 }) {
   const queryClient = useQueryClient();
   const showIntegrations = mode !== "mcp";
-  const showCatalog = mode === "all" || mode === "integrations";
+  const showUnifiedHub = mode === "integrations";
+  const showCatalog = mode === "all";
   const showMessagingOnly = mode === "messaging" || mode === "channels";
   const showMcp = mode === "all" || mode === "mcp";
   const showChannelsPage = mode === "channels";
   const showConnectorsPage = mode === "connectors";
-  const shouldLoadConnectorCatalog = showCatalog || showConnectorsPage;
+  const shouldLoadConnectorCatalog = showCatalog || showConnectorsPage || showUnifiedHub;
   const [active, setActive] = useState<IntegrationItem | null>(null);
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
@@ -892,6 +960,8 @@ export function IntegrationsPanel({
   const [sshTestConnName, setSshTestConnName] = useState("");
   const [sshTestOutput, setSshTestOutput] = useState("");
   const [expandedSection, setExpandedSection] = useState<string | false>("connected");
+  const [hubSearch, setHubSearch] = useState("");
+  const [hubFilter, setHubFilter] = useState<IntegrationHubFilter>("all");
   const [sshKeyError, setSshKeyError] = useState<string | null>(null);
   const [sshConnError, setSshConnError] = useState<string | null>(null);
   const [showDisabledIntegrations, setShowDisabledIntegrations] = useState(false);
@@ -1055,31 +1125,31 @@ export function IntegrationsPanel({
     queryKey: ["integration-sync-status"],
     queryFn: api.getIntegrationSyncStatus,
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-    enabled: showCatalog
+    enabled: shouldLoadConnectorCatalog
   });
   const integrationSyncFeedQ = useQuery({
     queryKey: ["integration-sync-feed"],
     queryFn: () => api.getIntegrationSyncFeed({ limit: 18 }),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-    enabled: showCatalog
+    enabled: shouldLoadConnectorCatalog
   });
   const webhookSourcesQ = useQuery({
     queryKey: ["integrations-quickstart-webhooks"],
     queryFn: () => api.rawGet("/webhooks/sources"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-    enabled: showCatalog
+    enabled: shouldLoadConnectorCatalog
   });
   const customApisQ = useQuery({
     queryKey: ["integrations-quickstart-custom-apis"],
     queryFn: () => api.rawGet("/custom-apis"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-    enabled: showCatalog
+    enabled: shouldLoadConnectorCatalog
   });
   const pluginsSummaryQ = useQuery({
     queryKey: ["settings-plugins"],
     queryFn: () => api.rawGet("/plugins"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-    enabled: showCatalog
+    enabled: shouldLoadConnectorCatalog
   });
   const settingsQ = useQuery({
     queryKey: ["settings"],
@@ -1098,7 +1168,7 @@ export function IntegrationsPanel({
     queryKey: ["custom-messaging-channels"],
     queryFn: api.listCustomMessagingChannels,
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-    enabled: showChannelsPage
+    enabled: showChannelsPage || showUnifiedHub
   });
   const senderVerificationQ = useQuery({
     queryKey: ["settings-sender-verification-inline"],
@@ -1305,7 +1375,7 @@ export function IntegrationsPanel({
   });
 
   const integrations = shouldLoadConnectorCatalog ? integrationsQ.data?.integrations || [] : [];
-  const integrationSyncStatuses = showCatalog ? integrationSyncStatusQ.data?.statuses || [] : [];
+  const integrationSyncStatuses = shouldLoadConnectorCatalog ? integrationSyncStatusQ.data?.statuses || [] : [];
   const integrationSyncStatusById = useMemo(
     () =>
       Object.fromEntries(
@@ -1313,7 +1383,7 @@ export function IntegrationsPanel({
       ) as Record<string, IntegrationSyncStatus>,
     [integrationSyncStatuses]
   );
-  const integrationSyncFeed = showCatalog ? integrationSyncFeedQ.data?.items || [] : [];
+  const integrationSyncFeed = shouldLoadConnectorCatalog ? integrationSyncFeedQ.data?.items || [] : [];
   const settings = asRecord(settingsQ.data);
   const emailSettings = asRecord(settings.email);
   const emailAuthSettings = asRecord(emailSettings.auth);
@@ -1472,12 +1542,21 @@ export function IntegrationsPanel({
   const whatsappBridgeInstalled = waBridge.installed !== false;
   const telegramProbeStatus = str(telegramStatus.status, "").trim().toLowerCase();
   const telegramProbeDetail = str(telegramStatus.detail, "").trim();
-  const emailStatusLabel = emailDeliveryReady ? "Delivery ready" : "Setup needed";
-  const emailStatusColor = emailDeliveryReady
-    ? "success"
-    : emailDraftIssues.length > 0
-      ? "warning"
-      : "info";
+  const emailSetupStarted =
+    emailDeliveryReady ||
+    emailProviderSaved !== "auto" ||
+    emailRecipientConfigured ||
+    emailFromConfigured ||
+    channelForm.email_domain.trim().length > 0 ||
+    channelForm.email_http_base_url.trim().length > 0 ||
+    channelForm.email_http_send_path.trim().length > 0 ||
+    channelForm.email_smtp_host.trim().length > 0 ||
+    hasEmailApiKey ||
+    hasEmailBasicPassword ||
+    hasEmailAwsSecretAccessKey ||
+    hasEmailAwsSessionToken;
+  const emailStatusLabel = emailDeliveryReady ? "Enabled" : "Optional";
+  const emailStatusColor = emailDeliveryReady ? "success" : "info";
   const emailConnectionDetail = (() => {
     if (emailDeliveryReady) {
       const activeProviderLabel =
@@ -1494,13 +1573,13 @@ export function IntegrationsPanel({
         : "";
       return [activeProviderLabel, "is ready.", recipientText, fromText].filter(Boolean).join(" ");
     }
-    if (emailDraftIssues.length > 0) {
+    if (emailSetupStarted && emailDraftIssues.length > 0) {
       return emailDraftIssues[0];
     }
     if (emailAvailableBackendLabels.length > 0) {
-      return `Ready backends: ${summarizeInlineNames(emailAvailableBackendLabels, "No ready backends yet")}. Save to apply your selection.`;
+      return `Optional email delivery can use ${summarizeInlineNames(emailAvailableBackendLabels, "a ready backend")} when you want email notifications.`;
     }
-    return "Connect Gmail or Google Workspace, or configure a provider account you control.";
+    return "Email delivery is optional. Leave it disabled unless you want AgentArk to send email notifications.";
   })();
   const emailProviderHelperText = (() => {
     if (emailSelectedProvider === "auto" && emailAvailableBackends.length === 1) {
@@ -2576,6 +2655,411 @@ export function IntegrationsPanel({
       displayState: messagingDisplayState(setup.status, setup.enabled)
     }))
     .filter((setup) => setup.displayState === "ready");
+
+  type IntegrationHubCard = {
+    id: string;
+    name: string;
+    detail: string;
+    kind: string;
+    category: IntegrationHubCategory;
+    status: IntegrationHubStatus;
+    statusLabel?: string;
+    actionLabel: string;
+    iconName: string;
+    tags?: string[];
+    onClick?: () => void;
+  };
+
+  const customMessagingCards: IntegrationHubCard[] = customMessagingChannels.map((channel) => {
+    const fields = customMessagingCredentialFields(channel);
+    const ready = !!channel.configured;
+    const needsCredentials = !!channel.requires_auth && !ready;
+    return {
+      id: `custom-channel:${channel.id}`,
+      name: channel.name || channel.id,
+      detail: channel.description || channel.runtime_channel_id || "User-added messaging delivery channel.",
+      kind: "Custom channel",
+      category: "chat",
+      status: ready ? "connected" : needsCredentials ? "attention" : "off",
+      statusLabel: ready ? "Enabled" : needsCredentials ? "Needs credentials" : "Disabled",
+      actionLabel: fields.length > 0 ? "Credentials" : "Test",
+      iconName: channel.name || channel.id,
+      tags: ["User-added", channel.runtime_channel_id].filter(Boolean),
+      onClick: fields.length > 0
+        ? () => openCustomMessagingCredentials(channel)
+        : () => {
+            if (ready) testCustomMessagingChannelMutation.mutate(channel.id);
+          }
+    };
+  });
+
+  const channelHubCards: IntegrationHubCard[] = [
+    {
+      id: "channel:email",
+      name: "Email Delivery",
+      detail: emailConnectionDetail,
+      kind: "Channel",
+      category: "productivity",
+      status: emailDeliveryReady ? "connected" : "off",
+      statusLabel: emailDeliveryReady ? "Enabled" : "Disabled",
+      actionLabel: emailDeliveryReady ? "Open wizard" : "Set up",
+      iconName: "Email",
+      tags: ["Email", emailProviderLabel(emailSelectedProvider)],
+      onClick: openEmailSetup
+    },
+    ...messagingSetups.map((setup): IntegrationHubCard => {
+      const displayState = messagingDisplayState(setup.status, setup.enabled);
+      return {
+        id: `channel:${setup.id}`,
+        name: setup.name,
+        detail: setup.detail,
+        kind: "Channel",
+        category: integrationHubCategory(setup.id, setup.name),
+        status:
+          displayState === "ready"
+            ? "connected"
+            : displayState === "error"
+              ? "error"
+              : displayState === "off"
+                ? "off"
+                : "attention",
+        statusLabel:
+          displayState === "ready"
+            ? "Enabled"
+            : displayState === "error"
+              ? "Error"
+              : setup.enabled
+                ? "Needs setup"
+                : "Disabled",
+        actionLabel: setup.actionLabel,
+        iconName: setup.name,
+        tags: ["Messaging"],
+        onClick: setup.open
+      };
+    }),
+    ...customMessagingCards
+  ];
+
+  const integrationHubCards: IntegrationHubCard[] = [
+    ...sorted.map((integration): IntegrationHubCard => {
+      const cardState = integrationCardState(integration);
+      const status =
+        cardState === "enabled"
+          ? "connected"
+          : integration.status === "error"
+            ? "error"
+            : integration.status === "needs_auth" || integration.status === "starting"
+              ? "attention"
+              : "off";
+      return {
+        id: `integration:${integration.id}`,
+        name: integration.name,
+        detail: integrationCardCopy(integration),
+        kind: "Built-in",
+        category: integrationHubCategory(integration.id, integration.name),
+        status,
+        statusLabel:
+          status === "connected"
+            ? "Enabled"
+            : integration.status === "needs_auth"
+              ? "Needs sign-in"
+              : integration.status === "error"
+                ? "Error"
+                : "Disabled",
+        actionLabel:
+          status === "connected"
+            ? "Manage"
+            : integration.status === "needs_auth"
+              ? "Resume"
+              : integration.status === "error"
+                ? "Fix"
+                : "Connect",
+        iconName: integration.name,
+        tags: [integration.id],
+        onClick: () => {
+          if (integration.status === "connected" && !integration.enabled) {
+            enableMutation.mutate(integration.id);
+            return;
+          }
+          openConfig(integration);
+        }
+      };
+    }),
+    ...customApis.map((item): IntegrationHubCard => {
+      const id = str(item.id, str(item.name, "custom-api"));
+      const enabled = item.enabled !== false;
+      const operationCount = Number(item.operation_count ?? item.operations_count ?? item.enabled_operation_count ?? 0);
+      return {
+        id: `custom-api:${id}`,
+        name: str(item.name, id),
+        detail: str(item.description, "Imported external API available as agent actions."),
+        kind: "Custom API",
+        category: "tools",
+        status: enabled ? "connected" : "off",
+        statusLabel: enabled ? "Enabled" : "Disabled",
+        actionLabel: "Manage",
+        iconName: str(item.name, id),
+        tags: [
+          "User-added",
+          operationCount > 0 ? `${operationCount} operation${operationCount === 1 ? "" : "s"}` : "API"
+        ],
+        onClick: () => setExpandedSection("hub_custom_apis")
+      };
+    }),
+    ...webhookSources.map((item): IntegrationHubCard => {
+      const id = str(item.id, str(item.name, "webhook"));
+      const enabled = item.enabled !== false;
+      return {
+        id: `webhook:${id}`,
+        name: str(item.name, id),
+        detail: str(item.description, "Inbound event source that can trigger AgentArk workflows."),
+        kind: "Webhook",
+        category: "platform",
+        status: enabled ? "connected" : "off",
+        statusLabel: enabled ? "Enabled" : "Disabled",
+        actionLabel: "Manage",
+        iconName: "Webhook",
+        tags: ["Events"],
+        onClick: () => setExpandedSection("hub_webhooks")
+      };
+    }),
+    ...pluginSummaries.map((item): IntegrationHubCard => {
+      const id = str(item.id, str(item.name, "plugin"));
+      const enabled = item.enabled !== false;
+      return {
+        id: `plugin:${id}`,
+        name: str(item.name, id),
+        detail: str(item.description, "External plugin endpoint and event subscription."),
+        kind: "Plugin",
+        category: "platform",
+        status: enabled ? "connected" : "off",
+        statusLabel: enabled ? "Enabled" : "Disabled",
+        actionLabel: "Manage",
+        iconName: "Plugin",
+        tags: ["SDK"],
+        onClick: () => setExpandedSection("hub_plugins")
+      };
+    }),
+    {
+      id: "extension-packs",
+      name: "Extension Packs",
+      detail: "Manifest-based integrations and channel packs installed from external sources.",
+      kind: "Pack-based",
+      category: "platform",
+      status: "info",
+      statusLabel: "Available",
+      actionLabel: "Manage",
+      iconName: "Extension",
+      tags: ["Integrations", "Channels"],
+      onClick: () => setExpandedSection("hub_extension_packs")
+    }
+  ];
+
+  const hubSearchNeedle = hubSearch.trim().toLowerCase();
+  const hubMatches = (item: IntegrationHubCard) => {
+    if (hubFilter !== "all" && item.category !== hubFilter) return false;
+    if (!hubSearchNeedle) return true;
+    const haystack = [
+      item.name,
+      item.detail,
+      item.kind,
+      item.category,
+      item.statusLabel || integrationHubStatusLabel(item.status),
+      ...(item.tags || [])
+    ].join(" ").toLowerCase();
+    return haystack.includes(hubSearchNeedle);
+  };
+  const sortHubCards = (items: IntegrationHubCard[]) =>
+    items.sort((a, b) => {
+      const rankDelta =
+        integrationHubStatusSortRank(a.status) -
+        integrationHubStatusSortRank(b.status);
+      if (rankDelta !== 0) return rankDelta;
+      return a.name.localeCompare(b.name);
+    });
+  const visibleChannelHubCards = sortHubCards(channelHubCards.filter(hubMatches));
+  const visibleIntegrationHubCards = sortHubCards(integrationHubCards.filter(hubMatches));
+  const hubConnectedCount = [...channelHubCards, ...integrationHubCards].filter((item) => item.status === "connected").length;
+  const hubAttentionCount = [...channelHubCards, ...integrationHubCards].filter(
+    (item) => item.status === "attention" || item.status === "error"
+  ).length;
+  const hubCardAccent = (status: IntegrationHubStatus) => {
+    if (status === "connected") {
+      return {
+        border: "var(--ui-rgba-74-210-157-350)",
+        background:
+          "linear-gradient(180deg, var(--ui-rgba-74-210-157-080), rgba(8, 17, 13, 0.58))",
+        hoverBorder: "var(--ui-rgba-74-210-157-550)",
+        chipBorder: "var(--ui-rgba-74-210-157-300)",
+        chipColor: "var(--ui-rgba-74-210-157-900)"
+      };
+    }
+    if (status === "error") {
+      return {
+        border: "rgba(248, 113, 113, 0.36)",
+        background: "rgba(127, 29, 29, 0.08)",
+        hoverBorder: "rgba(248, 113, 113, 0.55)",
+        chipBorder: "rgba(248, 113, 113, 0.35)",
+        chipColor: "rgb(252, 165, 165)"
+      };
+    }
+    if (status === "attention") {
+      return {
+        border: "rgba(255, 180, 50, 0.2)",
+        background:
+          "linear-gradient(180deg, rgba(255, 180, 50, 0.045), rgba(8, 8, 7, 0.66))",
+        hoverBorder: "rgba(255, 180, 50, 0.34)",
+        chipBorder: "rgba(255, 180, 50, 0.22)",
+        chipColor: "var(--ui-rgba-255-196-92-920)"
+      };
+    }
+    return {
+      border: "rgba(255, 255, 255, 0.045)",
+      background:
+        "linear-gradient(180deg, rgba(255, 255, 255, 0.014), rgba(0, 0, 0, 0.22)), rgba(3, 5, 7, 0.7)",
+      hoverBorder: "rgba(255, 255, 255, 0.12)",
+      chipBorder: "rgba(255, 255, 255, 0.08)",
+      chipColor: "rgba(203, 213, 225, 0.58)"
+    };
+  };
+
+  const renderIntegrationHubCard = (item: IntegrationHubCard) => {
+    const accent = hubCardAccent(item.status);
+    const statusLabel = item.statusLabel || integrationHubStatusLabel(item.status);
+    const isConnected = item.status === "connected";
+    const isInactive = item.status === "off" || item.status === "info";
+    const statusDotColor =
+      isConnected
+        ? "var(--ui-rgba-74-210-157-920)"
+        : item.status === "error"
+          ? "rgb(248, 113, 113)"
+          : item.status === "attention"
+            ? "var(--ui-rgba-255-180-50-850)"
+            : "var(--ui-rgba-180-200-220-420)";
+    return (
+      <Grid2 key={item.id} size={{ xs: 6, sm: 4, md: 3, lg: 2 }} sx={{ display: "flex" }}>
+        <Box
+          role={item.onClick ? "button" : undefined}
+          tabIndex={item.onClick ? 0 : undefined}
+          title={`${item.name}: ${statusLabel}`}
+          aria-label={`${item.name}: ${statusLabel}`}
+          onClick={item.onClick}
+          onKeyDown={(event) => {
+            if (!item.onClick) return;
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              item.onClick();
+            }
+          }}
+          sx={{
+            width: "100%",
+            minHeight: 128,
+            p: 1.15,
+            position: "relative",
+            borderRadius: "8px",
+            border: `1px solid ${accent.border}`,
+            background: accent.background,
+            cursor: item.onClick ? "pointer" : "default",
+            opacity: isInactive ? 0.66 : 1,
+            transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s, transform 0.15s",
+            "&:hover": item.onClick
+              ? {
+                  borderColor: accent.hoverBorder,
+                  boxShadow: isConnected
+                    ? "0 10px 28px rgba(74, 210, 157, 0.08), 0 10px 26px var(--ui-rgba-0-0-0-220)"
+                    : "0 8px 24px var(--ui-rgba-0-0-0-220)",
+                  opacity: 1,
+                  transform: "translateY(-1px)"
+                }
+              : undefined
+          }}
+        >
+          <Box
+            sx={{
+              position: "absolute",
+              top: 10,
+              right: 10,
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              background: statusDotColor,
+              boxShadow:
+                isConnected
+                  ? "0 0 0 3px var(--ui-rgba-74-210-157-090), 0 0 14px rgba(74, 210, 157, 0.32)"
+                  : "0 0 0 3px var(--ui-rgba-255-255-255-035)"
+            }}
+          />
+          <Stack spacing={0.75} sx={{ height: "100%", alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+            <Box
+              sx={{
+                width: 42,
+                height: 42,
+                borderRadius: "8px",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background:
+                  isConnected
+                    ? "var(--ui-rgba-74-210-157-100)"
+                    : "rgba(255, 255, 255, 0.032)",
+                border:
+                  isConnected
+                    ? "1px solid var(--ui-rgba-74-210-157-260)"
+                    : "1px solid rgba(255, 255, 255, 0.07)",
+                boxShadow: isConnected
+                  ? "0 0 0 1px rgba(74, 210, 157, 0.08), 0 10px 26px rgba(74, 210, 157, 0.08)"
+                  : "none",
+                "& > img": {
+                  opacity: isConnected ? 0.9 : 0.36,
+                  filter: isConnected
+                    ? "brightness(0) invert(1)"
+                    : "brightness(0) invert(0.52)"
+                },
+                "& > span": {
+                  background: isConnected
+                    ? CHANNEL_ICON_FALLBACK_BG
+                    : "rgba(255, 255, 255, 0.08)",
+                  color: isConnected
+                    ? CHANNEL_ICON_FALLBACK_TEXT
+                    : "rgba(217, 226, 236, 0.56)"
+                }
+              }}
+            >
+              <ChannelIcon name={item.iconName || item.name} size={26} />
+            </Box>
+            <Box sx={{ minWidth: 0, width: "100%" }}>
+              <Typography
+                variant="subtitle2"
+                noWrap
+                title={item.name}
+                sx={{
+                  color: isInactive ? "rgba(226, 232, 240, 0.68)" : "text.primary",
+                  fontWeight: 800,
+                  lineHeight: 1.2,
+                  maxWidth: "100%"
+                }}
+              >
+                {item.name}
+              </Typography>
+              <Typography
+                variant="caption"
+                noWrap
+                sx={{
+                  color: isInactive
+                    ? "rgba(148, 163, 184, 0.48)"
+                    : "text.secondary",
+                  display: "block",
+                  textTransform: "none"
+                }}
+              >
+                {item.kind}
+              </Typography>
+            </Box>
+          </Stack>
+        </Box>
+      </Grid2>
+    );
+  };
 
   const persistChannelSettings = async (form: ChannelSettingsForm) => {
       const emailProviderForSave = form.email_provider.trim().toLowerCase() || "auto";
@@ -3793,6 +4277,286 @@ export function IntegrationsPanel({
           Failed to load integrations:{" "}
           {integrationsQ.error instanceof Error ? integrationsQ.error.message : "Unknown error"}
         </Alert>
+      ) : null}
+      {showUnifiedHub ? (
+        <Stack spacing={1.5}>
+          <Box
+            sx={{
+              p: 1.5,
+              borderRadius: "8px",
+              border: "1px solid var(--ui-rgba-112-153-201-140)",
+              background: "var(--ui-rgba-8-18-34-540)"
+            }}
+          >
+            <Stack spacing={1.25}>
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                spacing={1}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", md: "center" }
+                }}
+              >
+                <Box>
+                  <Typography variant="subtitle1" sx={{ fontWeight: 800 }}>
+                    Integration Hub
+                  </Typography>
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    Messaging channels, built-in connectors, custom APIs, webhooks, plugins, and extension packs in one place.
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                  <Chip size="small" label={`${hubConnectedCount} enabled`} sx={sectionCountChipSx} />
+                  {hubAttentionCount > 0 ? (
+                    <Chip size="small" label={`${hubAttentionCount} need attention`} sx={sectionCountChipSx} />
+                  ) : null}
+                  <Chip size="small" label={`${channelHubCards.length} channels`} sx={sectionCountChipSx} />
+                  <Chip size="small" label={`${integrationHubCards.length} integrations`} sx={sectionCountChipSx} />
+                </Stack>
+              </Stack>
+              <TextField
+                fullWidth
+                size="small"
+                value={hubSearch}
+                onChange={(event) => setHubSearch(event.target.value)}
+                placeholder="Search integrations, channels, APIs, webhooks, and plugins..."
+                slotProps={{
+                  input: {
+                    startAdornment: (
+                      <InputAdornment position="start">
+                        <SearchRoundedIcon fontSize="small" />
+                      </InputAdornment>
+                    )
+                  }
+                }}
+              />
+              <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                {INTEGRATION_HUB_FILTERS.map((filter) => {
+                  const activeFilter = hubFilter === filter.value;
+                  return (
+                    <Chip
+                      key={filter.value}
+                      label={filter.label}
+                      clickable
+                      color={activeFilter ? "primary" : "default"}
+                      variant={activeFilter ? "filled" : "outlined"}
+                      onClick={() => setHubFilter(filter.value)}
+                      sx={{
+                        height: 28,
+                        borderRadius: 1.4,
+                        fontWeight: 700,
+                        "& .MuiChip-label": { px: 1.15 }
+                      }}
+                    />
+                  );
+                })}
+              </Stack>
+            </Stack>
+          </Box>
+
+          {channelsQ.error ? (
+            <Alert severity="error">
+              Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
+            </Alert>
+          ) : null}
+          {customMessagingChannelsQ.error ? (
+            <Alert severity="error">
+              Failed to load custom messaging channels: {asErrorMessage(customMessagingChannelsQ.error)}
+            </Alert>
+          ) : null}
+
+          {(hubFilter === "all" || visibleChannelHubCards.length > 0) ? (
+            <Box
+              sx={{
+                p: 1.5,
+                borderRadius: "8px",
+                border: "1px solid var(--ui-rgba-112-153-201-120)",
+                background: "var(--ui-rgba-7-17-32-420)"
+              }}
+            >
+              <Stack spacing={1.2}>
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: { xs: "flex-start", sm: "center" }
+                  }}
+                >
+                  <Box>
+                    <Typography variant="subtitle2">Channels</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      Places AgentArk can receive messages or deliver updates.
+                    </Typography>
+                  </Box>
+                  <Chip size="small" label={`${visibleChannelHubCards.length} shown`} sx={sectionCountChipSx} />
+                </Stack>
+                {visibleChannelHubCards.length > 0 ? (
+                  <Grid2 container spacing={1.1} sx={{ alignItems: "stretch" }}>
+                    {visibleChannelHubCards.map(renderIntegrationHubCard)}
+                  </Grid2>
+                ) : (
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    No channels match the current search.
+                  </Typography>
+                )}
+              </Stack>
+            </Box>
+          ) : null}
+
+          {(hubFilter === "all" || visibleIntegrationHubCards.length > 0) ? (
+            <Box
+              sx={{
+                p: 1.5,
+                borderRadius: "8px",
+                border: "1px solid var(--ui-rgba-112-153-201-120)",
+                background: "var(--ui-rgba-7-17-32-420)"
+              }}
+            >
+              <Stack spacing={1.2}>
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: { xs: "flex-start", sm: "center" }
+                  }}
+                >
+                  <Box>
+                    <Typography variant="subtitle2">Integrations</Typography>
+                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                      Apps, APIs, event sources, plugins, and pack-based connectors the agent can use.
+                    </Typography>
+                  </Box>
+                  <Chip size="small" label={`${visibleIntegrationHubCards.length} shown`} sx={sectionCountChipSx} />
+                </Stack>
+                {visibleIntegrationHubCards.length > 0 ? (
+                  <Grid2 container spacing={1.1} sx={{ alignItems: "stretch" }}>
+                    {visibleIntegrationHubCards.map(renderIntegrationHubCard)}
+                  </Grid2>
+                ) : (
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    No integrations match the current search.
+                  </Typography>
+                )}
+              </Stack>
+            </Box>
+          ) : null}
+
+          {visibleChannelHubCards.length === 0 && visibleIntegrationHubCards.length === 0 ? (
+            <Alert severity="info">No channels, integrations, or APIs match the current filters.</Alert>
+          ) : null}
+
+          <Accordion
+            disableGutters
+            expanded={expandedSection === "hub_custom_apis"}
+            onChange={(_, expanded) => setExpandedSection(expanded ? "hub_custom_apis" : false)}
+            sx={sectionAccordionSx}
+          >
+            <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+              <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", width: "100%" }}>
+                <Box>
+                  <Typography variant="subtitle2">Custom API Builder</Typography>
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    Import OpenAPI specs, cURL examples, or authenticated APIs as agent actions.
+                  </Typography>
+                </Box>
+                <Chip size="small" label={`${customApis.length} APIs`} sx={sectionCountChipSx} />
+              </Stack>
+            </AccordionSummary>
+            <AccordionDetails>
+              <IntegrationQuickstartPanel
+                integrations={[]}
+                autoRefresh={autoRefresh}
+                embedded
+                onConfigureIntegration={() => {}}
+                mode="custom-apis-only"
+              />
+            </AccordionDetails>
+          </Accordion>
+
+          <Accordion
+            disableGutters
+            expanded={expandedSection === "hub_webhooks"}
+            onChange={(_, expanded) => setExpandedSection(expanded ? "hub_webhooks" : false)}
+            sx={sectionAccordionSx}
+          >
+            <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+              <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", width: "100%" }}>
+                <Box>
+                  <Typography variant="subtitle2">Webhooks</Typography>
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    Inbound event sources that can trigger AgentArk work.
+                  </Typography>
+                </Box>
+                <Chip size="small" label={`${webhookSources.length} sources`} sx={sectionCountChipSx} />
+              </Stack>
+            </AccordionSummary>
+            <AccordionDetails>
+              <WebhooksPanel autoRefresh={autoRefresh} />
+            </AccordionDetails>
+          </Accordion>
+
+          <Accordion
+            disableGutters
+            expanded={expandedSection === "hub_extension_packs"}
+            onChange={(_, expanded) => setExpandedSection(expanded ? "hub_extension_packs" : false)}
+            sx={sectionAccordionSx}
+          >
+            <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+              <Box>
+                <Typography variant="subtitle2">Extension Packs</Typography>
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  Pack-based integrations, custom connectors, and messaging channel packs.
+                </Typography>
+              </Box>
+            </AccordionSummary>
+            <AccordionDetails>
+              <ExtensionPacksPanel mode="integrations" autoRefresh={autoRefresh} />
+            </AccordionDetails>
+          </Accordion>
+
+          <Accordion
+            disableGutters
+            expanded={expandedSection === "hub_plugins"}
+            onChange={(_, expanded) => setExpandedSection(expanded ? "hub_plugins" : false)}
+            sx={sectionAccordionSx}
+          >
+            <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+              <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", width: "100%" }}>
+                <Box>
+                  <Typography variant="subtitle2">Plugin SDK</Typography>
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    External plugin endpoints, event subscriptions, and plugin runtime health.
+                  </Typography>
+                </Box>
+                <Chip size="small" label={`${pluginSummaries.length} plugins`} sx={sectionCountChipSx} />
+              </Stack>
+            </AccordionSummary>
+            <AccordionDetails>
+              <PluginSdkPanel autoRefresh={autoRefresh} embedded />
+            </AccordionDetails>
+          </Accordion>
+
+          <Accordion
+            disableGutters
+            expanded={expandedSection === "hub_routing"}
+            onChange={(_, expanded) => setExpandedSection(expanded ? "hub_routing" : false)}
+            sx={sectionAccordionSx}
+          >
+            <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+              <Box>
+                <Typography variant="subtitle2">Conversation Routing</Typography>
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  Route channel-specific traffic only when a dedicated path is needed.
+                </Typography>
+              </Box>
+            </AccordionSummary>
+            <AccordionDetails>
+              <IntegrationRoutingPanel autoRefresh={autoRefresh} />
+            </AccordionDetails>
+          </Accordion>
+        </Stack>
       ) : null}
       {showCatalog ? (
         <Accordion
@@ -5570,7 +6334,7 @@ export function IntegrationsPanel({
           <Stack spacing={1.5}>
             {notice?.kind === "error" ? <Alert severity="error">{notice.text}</Alert> : null}
             <Typography variant="body2" sx={{ color: "text.secondary" }}>
-              Send AgentArk notification emails through a connected Google mailbox or a provider account you control.
+              Optional email notifications can use a connected Google mailbox or a provider account you control.
             </Typography>
             <Stack direction="row" spacing={1} sx={{ alignItems: "center", flexWrap: "wrap" }}>
               <Chip
@@ -5579,26 +6343,26 @@ export function IntegrationsPanel({
                 color={emailStatusColor}
                 variant="outlined"
               />
-              <Chip
-                size="small"
-                label={
-                  emailProviderSaved === "auto" && emailAutoResolvesTo
-                    ? `Auto -> ${emailProviderLabel(emailAutoResolvesTo)}`
-                    : emailProviderLabel(emailProviderSaved)
-                }
-                variant="outlined"
-              />
+              {emailDeliveryReady || emailProviderSaved !== "auto" || emailAutoResolvesTo ? (
+                <Chip
+                  size="small"
+                  label={
+                    emailProviderSaved === "auto" && emailAutoResolvesTo
+                      ? `Auto -> ${emailProviderLabel(emailAutoResolvesTo)}`
+                      : emailProviderLabel(emailProviderSaved)
+                  }
+                  variant="outlined"
+                />
+              ) : null}
             </Stack>
-            <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
-              {emailAvailableBackendLabels.length > 0 ? (
-                emailAvailableBackendLabels.map((label) => (
+            {emailAvailableBackendLabels.length > 0 ? (
+              <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                {emailAvailableBackendLabels.map((label) => (
                   <Chip key={label} size="small" label={label} variant="outlined" sx={sectionCountChipSx} />
-                ))
-              ) : (
-                <Chip size="small" label="No ready backends yet" variant="outlined" sx={sectionCountChipSx} />
-              )}
-            </Stack>
-            <Alert severity={emailDeliveryReady ? "success" : emailDraftIssues.length > 0 ? "warning" : "info"}>
+                ))}
+              </Stack>
+            ) : null}
+            <Alert severity={emailDeliveryReady ? "success" : emailSetupStarted && emailDraftIssues.length > 0 ? "warning" : "info"}>
               {emailConnectionDetail}
             </Alert>
             <TextField

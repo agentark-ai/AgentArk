@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use crate::core::llm::LlmClient;
 
 use super::promotion_gate::{
-    PromotionGateCheck, PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
-    promotion_gate_report, render_legacy_promotion_gate,
+    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
+    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
 };
 
 pub const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";

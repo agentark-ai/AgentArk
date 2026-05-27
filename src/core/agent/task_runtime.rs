@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use super::*;
+use crate::core::automation::AutomationCritique;
+use chrono::TimeZone;
 
 fn action_is_read_only(action: &crate::actions::ActionDef) -> bool {
     matches!(
@@ -152,6 +154,12 @@ fn schedule_task_batch_item_arguments(
         "context_from",
         "workdir",
         "network_access",
+        "scheduled_for",
+        "local_date",
+        "local_time",
+        "timezone",
+        "timezone_offset_minutes",
+        "date_policy",
         "allow_duplicate",
         "validation",
         "max_attempts",
@@ -178,26 +186,8 @@ fn schedule_task_batch_item_arguments(
         }
         merged.remove("items");
         let merged = serde_json::Value::Object(merged);
-        let has_task_ref = merged
-            .get("task")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-            || merged
-                .get("task_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
-        let has_schedule = merged
-            .get("cron")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-            || merged
-                .get("at")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
+        let has_task_ref = schedule_task_has_task_source(&merged);
+        let has_schedule = schedule_task_has_schedule_source(&merged);
         if !has_task_ref || !has_schedule {
             return Some(Err(anyhow::anyhow!(
                 "schedule_task.items[{}] must identify a task and a schedule",
@@ -207,6 +197,53 @@ fn schedule_task_batch_item_arguments(
         out.push(merged);
     }
     Some(Ok(out))
+}
+
+fn schedule_text_field<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .or_else(|| arguments.get("schedule").and_then(|value| value.get(key)))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn schedule_i32_field(arguments: &serde_json::Value, key: &str) -> Option<i32> {
+    arguments
+        .get(key)
+        .or_else(|| arguments.get("schedule").and_then(|value| value.get(key)))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .and_then(|number| i32::try_from(number).ok())
+                .or_else(|| value.as_str()?.trim().parse::<i32>().ok())
+        })
+}
+
+fn schedule_task_has_task_source(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("task")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || arguments
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || arguments
+            .get("action_arguments")
+            .and_then(|value| value.get("message"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn schedule_task_has_schedule_source(arguments: &serde_json::Value) -> bool {
+    schedule_text_field(arguments, "cron").is_some()
+        || schedule_text_field(arguments, "at").is_some()
+        || schedule_text_field(arguments, "scheduled_for").is_some()
+        || schedule_text_field(arguments, "local_time").is_some()
 }
 
 fn watch_batch_item_arguments(
@@ -314,15 +351,170 @@ fn schedule_task_completion_data(result: &str) -> Option<serde_json::Value> {
         .cloned()
 }
 
+#[derive(Clone, Copy)]
+struct ScheduleTaskScheduleContext<'a> {
+    now_utc: chrono::DateTime<chrono::Utc>,
+    existing_task_target: Option<&'a super::task::Task>,
+    default_timezone: Option<chrono_tz::Tz>,
+}
+
+impl Default for ScheduleTaskScheduleContext<'_> {
+    fn default() -> Self {
+        Self {
+            now_utc: chrono::Utc::now(),
+            existing_task_target: None,
+            default_timezone: None,
+        }
+    }
+}
+
+enum ScheduleTaskTimezone {
+    Named(chrono_tz::Tz),
+    Fixed(chrono::FixedOffset),
+}
+
+impl ScheduleTaskTimezone {
+    fn from_arguments(
+        arguments: &serde_json::Value,
+        default_timezone: Option<chrono_tz::Tz>,
+    ) -> Result<Self, String> {
+        if let Some(offset_minutes) = schedule_i32_field(arguments, "timezone_offset_minutes") {
+            let Some(offset) = chrono::FixedOffset::east_opt(offset_minutes.saturating_mul(60))
+            else {
+                return Err(format!(
+                    "Invalid schedule timezone_offset_minutes `{}`.",
+                    offset_minutes
+                ));
+            };
+            return Ok(Self::Fixed(offset));
+        }
+
+        if let Some(timezone) = schedule_text_field(arguments, "timezone") {
+            let parsed = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+                format!(
+                    "Invalid schedule timezone `{}`. Use an IANA timezone such as Asia/Kolkata or provide timezone_offset_minutes.",
+                    timezone
+                )
+            })?;
+            return Ok(Self::Named(parsed));
+        }
+
+        Ok(Self::Named(default_timezone.unwrap_or(chrono_tz::UTC)))
+    }
+
+    fn local_date_for_utc(&self, value: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
+        match self {
+            Self::Named(timezone) => value.with_timezone(timezone).date_naive(),
+            Self::Fixed(offset) => value.with_timezone(offset).date_naive(),
+        }
+    }
+
+    fn resolve_local_datetime(
+        &self,
+        local: chrono::NaiveDateTime,
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        match self {
+            Self::Named(timezone) => match timezone.from_local_datetime(&local) {
+                chrono::LocalResult::Single(value) => Ok(value.with_timezone(&chrono::Utc)),
+                chrono::LocalResult::Ambiguous(earliest, _) => {
+                    Ok(earliest.with_timezone(&chrono::Utc))
+                }
+                chrono::LocalResult::None => Err(format!(
+                    "Local schedule time `{}` does not exist in the selected timezone.",
+                    local
+                )),
+            },
+            Self::Fixed(offset) => match offset.from_local_datetime(&local) {
+                chrono::LocalResult::Single(value) => Ok(value.with_timezone(&chrono::Utc)),
+                chrono::LocalResult::Ambiguous(earliest, _) => {
+                    Ok(earliest.with_timezone(&chrono::Utc))
+                }
+                chrono::LocalResult::None => Err(format!(
+                    "Local schedule time `{}` does not exist in the selected timezone.",
+                    local
+                )),
+            },
+        }
+    }
+}
+
+fn parse_schedule_local_time(value: &str) -> Result<chrono::NaiveTime, String> {
+    let normalized = value.trim().to_ascii_uppercase();
+    for format in [
+        "%H:%M:%S",
+        "%H:%M",
+        "%I:%M:%S %p",
+        "%I:%M %p",
+        "%I:%M%p",
+        "%I %p",
+    ] {
+        if let Ok(time) = chrono::NaiveTime::parse_from_str(&normalized, format) {
+            return Ok(time);
+        }
+    }
+    Err(format!(
+        "Invalid schedule local_time `{}`. Use HH:MM, HH:MM:SS, or a standard AM/PM time.",
+        value
+    ))
+}
+
+fn parse_schedule_local_date(value: &str) -> Result<chrono::NaiveDate, String> {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|error| {
+        format!(
+            "Invalid schedule local_date `{}`: {}. Use YYYY-MM-DD.",
+            value, error
+        )
+    })
+}
+
+fn resolve_schedule_local_time(
+    arguments: &serde_json::Value,
+    context: ScheduleTaskScheduleContext<'_>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let Some(local_time) = schedule_text_field(arguments, "local_time") else {
+        return Ok(None);
+    };
+    let time = parse_schedule_local_time(local_time)?;
+    let timezone = ScheduleTaskTimezone::from_arguments(arguments, context.default_timezone)?;
+    let date_policy = schedule_text_field(arguments, "date_policy")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let explicit_date = match schedule_text_field(arguments, "local_date") {
+        Some(value) => Some(parse_schedule_local_date(value)?),
+        None => None,
+    };
+    let now_local_date = timezone.local_date_for_utc(context.now_utc);
+    let existing_local_date = context
+        .existing_task_target
+        .and_then(|task| task.scheduled_for)
+        .map(|value| timezone.local_date_for_utc(value));
+    let base_date = explicit_date.unwrap_or_else(|| {
+        if date_policy == "next_occurrence" {
+            now_local_date
+        } else if date_policy == "same_local_date" {
+            now_local_date
+        } else {
+            existing_local_date.unwrap_or(now_local_date)
+        }
+    });
+    let mut scheduled_for = timezone.resolve_local_datetime(base_date.and_time(time))?;
+    if explicit_date.is_none()
+        && date_policy != "same_local_date"
+        && scheduled_for <= context.now_utc
+    {
+        let next_date = now_local_date
+            .succ_opt()
+            .ok_or_else(|| "Unable to resolve the next local schedule date.".to_string())?;
+        scheduled_for = timezone.resolve_local_datetime(next_date.and_time(time))?;
+    }
+    Ok(Some(scheduled_for))
+}
+
 fn schedule_task_schedule_from_arguments(
     arguments: &serde_json::Value,
+    context: ScheduleTaskScheduleContext<'_>,
 ) -> Result<(Option<String>, Option<chrono::DateTime<chrono::Utc>>), String> {
-    if let Some(cron) = arguments
-        .get("cron")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(cron) = schedule_text_field(arguments, "cron") {
         let cron_6field = if cron.split_whitespace().count() == 5 {
             format!("0 {}", cron)
         } else {
@@ -331,11 +523,8 @@ fn schedule_task_schedule_from_arguments(
         return Ok((Some(cron_6field), None));
     }
 
-    if let Some(at_time) = arguments
-        .get("at")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if let Some(at_time) = schedule_text_field(arguments, "at")
+        .or_else(|| schedule_text_field(arguments, "scheduled_for"))
     {
         let dt = chrono::DateTime::parse_from_rfc3339(at_time).map_err(|error| {
             format!("Invalid schedule `at` timestamp `{}`: {}.", at_time, error)
@@ -343,8 +532,142 @@ fn schedule_task_schedule_from_arguments(
         return Ok((None, Some(dt.with_timezone(&chrono::Utc))));
     }
 
-    Err("schedule_task requires `cron` or `at`; use `cron` for recurring work or `at` for one-time work; refusing to infer the current time.".to_string())
+    if let Some(scheduled_for) = resolve_schedule_local_time(arguments, context)? {
+        return Ok((None, Some(scheduled_for)));
+    }
+
+    Err("schedule_task requires `cron`, `at`, `scheduled_for`, or `local_time`; use `cron` for recurring work, an ISO timestamp for fully resolved one-time work, or local_time with timezone for wall-clock scheduling; refusing to infer the current time.".to_string())
 }
+
+fn schedule_task_validation_failure_result(detail: &str, reason: &str) -> String {
+    render_tool_completion_marker_with_data(
+        "schedule_task",
+        "failed",
+        detail,
+        serde_json::json!({
+            "success": false,
+            "durable_commit": false,
+            "durable_object": "Scheduled task",
+            "reason": reason,
+            "recoverable_by_model": true,
+            "assistant_instruction": "Repair the schedule_task arguments from the current conversation context when the missing or invalid field is already available. For existing task updates, keep the same task_id and repair the schedule fields; do not cancel, delete, or recreate the task as an argument-repair path unless the user explicitly requested cancellation or deletion. Ask the user only when the required fact is absent."
+        }),
+    )
+}
+
+fn schedule_task_description_from_arguments(
+    arguments: &serde_json::Value,
+    existing_task_target: Option<&super::task::Task>,
+) -> Option<String> {
+    arguments
+        .get("task")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            existing_task_target
+                .as_ref()
+                .map(|task| task.description.clone())
+        })
+        .or_else(|| {
+            arguments
+                .get("action_arguments")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn scheduled_task_uses_direct_notify_user_execution(task: &super::task::Task) -> bool {
+    task.action.eq_ignore_ascii_case("notify_user")
+}
+
+fn scheduled_task_should_deliver_output_after_execution(task: &super::task::Task) -> bool {
+    !scheduled_task_uses_direct_notify_user_execution(task)
+}
+
+fn scheduled_notify_user_execution_arguments(task: &super::task::Task) -> serde_json::Value {
+    let mut payload = task.arguments.as_object().cloned().unwrap_or_default();
+    let has_message = payload
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_message {
+        payload.insert(
+            "message".to_string(),
+            serde_json::Value::String(task.description.clone()),
+        );
+    }
+    let has_delivery_channel = payload
+        .get("delivery_channel")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_delivery_channel {
+        let route = normalize_automation_notification_channel(
+            payload.get("report_to").and_then(|value| value.as_str()),
+        );
+        if !route.is_empty() {
+            payload.insert(
+                "delivery_channel".to_string(),
+                serde_json::Value::String(route),
+            );
+        }
+    }
+    payload
+        .entry("source".to_string())
+        .or_insert_with(|| serde_json::Value::String("reminder".to_string()));
+    payload
+        .entry("in_app_title".to_string())
+        .or_insert_with(|| serde_json::Value::String("Reminder".to_string()));
+    serde_json::Value::Object(payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn task_automation_run_record(
+    task: &super::task::Task,
+    run_id: &str,
+    status: AutomationRunStatus,
+    attempt: u32,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    origin: AutomationOriginContext,
+    policy: AutomationExecutionPolicy,
+    critique: AutomationCritique,
+    output_preview: Option<String>,
+    error: Option<String>,
+    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> AutomationRunRecord {
+    AutomationRunRecord {
+        id: run_id.to_string(),
+        automation_id: task.id.to_string(),
+        automation_kind: "task".to_string(),
+        title: task.description.clone(),
+        action: task.action.clone(),
+        trigger: automation_trigger_label("scheduler", &task.action),
+        status,
+        attempt,
+        started_at: started_at.to_rfc3339(),
+        completed_at: completed_at.map(|value| value.to_rfc3339()),
+        duration_ms: completed_at.map(|finished_at| {
+            finished_at
+                .signed_duration_since(started_at)
+                .num_milliseconds()
+                .max(0) as u64
+        }),
+        origin,
+        policy,
+        critique,
+        output_preview,
+        error,
+        next_retry_at: next_retry_at.map(|value| value.to_rfc3339()),
+    }
+}
+
 fn strip_tool_completion_marker_line(result: &str) -> String {
     let trimmed = result.trim_start();
     if trimmed
@@ -1826,6 +2149,10 @@ impl Agent {
 
     /// Execute a task through the model-routed spine.
     pub async fn execute_task(&self, task: &super::task::Task) -> Result<String> {
+        if scheduled_task_uses_direct_notify_user_execution(task) {
+            let arguments = scheduled_notify_user_execution_arguments(task);
+            return self.execute_direct_notify_user_tool(&arguments).await;
+        }
         self.run_model_routed_spine_for_task(task).await
     }
 
@@ -2425,6 +2752,34 @@ impl Agent {
         let attempt = automation_current_attempt(&task.arguments);
         let started_at = chrono::Utc::now();
         let run_id = uuid::Uuid::new_v4().to_string();
+        let mut run_record_available = false;
+        let running_run_record = task_automation_run_record(
+            &task,
+            &run_id,
+            AutomationRunStatus::Running,
+            attempt,
+            started_at,
+            None,
+            origin.clone(),
+            policy.clone(),
+            AutomationCritique {
+                summary: "Execution started.".to_string(),
+                retryable: false,
+                validation_passed: false,
+            },
+            None,
+            None,
+            None,
+        );
+        if let Err(error) = append_automation_run(&storage, running_run_record).await {
+            tracing::warn!(
+                "Failed to append running automation run record for task '{}': {}",
+                task.id,
+                error
+            );
+        } else {
+            run_record_available = true;
+        }
 
         let mut supervisor_state = load_automation_supervisor_state(&storage, &task.id.to_string())
             .await
@@ -2449,7 +2804,7 @@ impl Agent {
             });
         supervisor_state.status = "running".to_string();
         supervisor_state.attempt_count = attempt;
-        supervisor_state.last_run_id = Some(run_id.clone());
+        supervisor_state.last_run_id = run_record_available.then(|| run_id.clone());
         supervisor_state.last_run_at = Some(started_at.to_rfc3339());
         supervisor_state.next_retry_at = None;
         supervisor_state.origin = origin.clone();
@@ -2465,10 +2820,15 @@ impl Agent {
                 error
             );
         }
+        let running_last_run_id = if run_record_available {
+            Some(run_id.as_str())
+        } else {
+            None
+        };
         if let Err(error) = storage
             .record_task_run_metadata(
                 &task.id.to_string(),
-                Some(&run_id),
+                running_last_run_id,
                 None,
                 Some(supervisor_state.consecutive_failures as i32),
             )
@@ -2483,15 +2843,12 @@ impl Agent {
 
         let task_agent = Agent::snapshot(agent).await;
         let execution = if policy.stall_timeout_secs > 0 {
-            match tokio::time::timeout(
+            tokio::time::timeout(
                 std::time::Duration::from_secs(policy.stall_timeout_secs),
                 task_agent.execute_task(&task),
             )
             .await
-            {
-                Ok(result) => Some(result),
-                Err(_) => None,
-            }
+            .ok()
         } else {
             Some(task_agent.execute_task(&task).await)
         };
@@ -2591,40 +2948,32 @@ impl Agent {
             effective_run_status = AutomationRunStatus::Retrying;
         }
 
-        let run_record = AutomationRunRecord {
-            id: run_id.clone(),
-            automation_id: task.id.to_string(),
-            automation_kind: "task".to_string(),
-            title: task.description.clone(),
-            action: task.action.clone(),
-            trigger: automation_trigger_label("scheduler", &task.action),
-            status: effective_run_status.clone(),
+        let run_record = task_automation_run_record(
+            &task,
+            &run_id,
+            effective_run_status.clone(),
             attempt,
-            started_at: started_at.to_rfc3339(),
-            completed_at: Some(finished_at.to_rfc3339()),
-            duration_ms: Some(
-                finished_at
-                    .signed_duration_since(started_at)
-                    .num_milliseconds()
-                    .max(0) as u64,
-            ),
-            origin: origin.clone(),
-            policy: policy.clone(),
-            critique: critique.clone(),
+            started_at,
+            Some(finished_at),
+            origin.clone(),
+            policy.clone(),
+            critique.clone(),
             output_preview,
-            error: error_text.clone(),
-            next_retry_at: next_retry_at.map(|dt| dt.to_rfc3339()),
-        };
+            error_text.clone(),
+            next_retry_at.clone(),
+        );
         if let Err(error) = append_automation_run(&storage, run_record).await {
             tracing::warn!(
                 "Failed to append automation run record for task '{}': {}",
                 task.id,
                 error
             );
+        } else {
+            run_record_available = true;
         }
 
         supervisor_state.last_run_at = Some(finished_at.to_rfc3339());
-        supervisor_state.last_run_id = Some(run_id);
+        supervisor_state.last_run_id = run_record_available.then(|| run_id.clone());
         supervisor_state.origin = origin;
         match effective_run_status {
             AutomationRunStatus::Succeeded => {
@@ -2663,7 +3012,9 @@ impl Agent {
                             error
                         );
                     }
-                    task_agent.deliver_task_output(&task, value).await;
+                    if scheduled_task_should_deliver_output_after_execution(&task) {
+                        task_agent.deliver_task_output(&task, value).await;
+                    }
                     task_agent
                         .maybe_emit_webhook_task_completion_notification(&task, Some(value), None)
                         .await;
@@ -3971,20 +4322,20 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             crate::core::watcher::WatchConditionMatcher::Llm => None,
         }?;
 
-        Some(current_state_match.and_then(|matched| {
+        Some(current_state_match.map(|matched| {
             if !matched {
-                return Ok(false);
+                return false;
             }
             if condition.evaluation_mode
                 != crate::core::watcher::WatchConditionEvaluationMode::Change
             {
-                return Ok(true);
+                return true;
             }
             let Some(previous_result) = previous_result else {
-                return Ok(false);
+                return false;
             };
-            Ok(Self::normalized_watch_result_for_change_detection(result)
-                != Self::normalized_watch_result_for_change_detection(previous_result))
+            Self::normalized_watch_result_for_change_detection(result)
+                != Self::normalized_watch_result_for_change_detection(previous_result)
         }))
     }
 
@@ -4426,29 +4777,38 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             }
             None => None,
         };
-        let task_desc = arguments
-            .get("task")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .or_else(|| {
-                existing_task_target
-                    .as_ref()
-                    .map(|task| task.description.clone())
-            });
+        let task_desc =
+            schedule_task_description_from_arguments(arguments, existing_task_target.as_ref());
         let Some(task_desc) = task_desc else {
-            return Some(
-                "Task scheduling requires `task` unless `task_id` points at an existing task."
-                    .to_string(),
-            );
+            return Some(schedule_task_validation_failure_result(
+                "Task scheduling requires `task` unless `task_id` points at an existing task.",
+                "missing_task",
+            ));
         };
 
         // Parse cron or at time.
-        let (cron_expr, scheduled_for) = match schedule_task_schedule_from_arguments(arguments) {
-            Ok(schedule) => schedule,
-            Err(error) => return Some(error),
+        let default_timezone = {
+            let profile = self.user_profile.read().await;
+            profile
+                .timezone
+                .as_deref()
+                .and_then(|value| value.parse::<chrono_tz::Tz>().ok())
         };
+        let schedule_context = ScheduleTaskScheduleContext {
+            now_utc: chrono::Utc::now(),
+            existing_task_target: existing_task_target.as_ref(),
+            default_timezone,
+        };
+        let (cron_expr, scheduled_for) =
+            match schedule_task_schedule_from_arguments(arguments, schedule_context) {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    return Some(schedule_task_validation_failure_result(
+                        &error,
+                        "invalid_schedule",
+                    ));
+                }
+            };
         if let Some(cron) = cron_expr.as_deref() {
             let fields = cron.split_whitespace().collect::<Vec<_>>();
             let requests_subminute = fields.len() == 6 && fields.first().copied() != Some("0");
@@ -5365,7 +5725,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
 
         let created_at = chrono::Utc::now();
         let has_initial_baseline = initial_baseline_result.is_some();
-        let baseline_last_poll_at = has_initial_baseline.then(|| created_at.clone());
+        let baseline_last_poll_at = has_initial_baseline.then_some(created_at);
         let watcher = super::watcher::Watcher {
             id: uuid::Uuid::new_v4(),
             description: description.clone(),
@@ -5507,12 +5867,8 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         } else {
             "stop after the first match"
         };
-        let trigger_desc = on_trigger
-            .trim()
-            .trim_end_matches(|ch| matches!(ch, '.' | '!' | '?'));
-        let watch_target = description
-            .trim()
-            .trim_end_matches(|ch| matches!(ch, '.' | '!' | '?'));
+        let trigger_desc = on_trigger.trim().trim_end_matches(['.', '!', '?']);
+        let watch_target = description.trim().trim_end_matches(['.', '!', '?']);
         let target_sentence = if watch_target.is_empty() {
             String::new()
         } else {
@@ -5600,6 +5956,119 @@ mod tests {
         }
     }
 
+    fn test_task(action: &str, arguments: serde_json::Value) -> crate::core::task::Task {
+        crate::core::task::Task {
+            id: uuid::Uuid::new_v4(),
+            description: "Scheduled test task".to_string(),
+            action: action.to_string(),
+            arguments,
+            approval: crate::core::task::TaskApproval::Auto,
+            capabilities: vec![action.to_string()],
+            status: crate::core::task::TaskStatus::Pending,
+            created_at: chrono::Utc::now(),
+            scheduled_for: Some(chrono::Utc::now()),
+            cron: None,
+            result: None,
+            proof_id: None,
+            priority: None,
+            urgency: None,
+            importance: None,
+            eisenhower_quadrant: None,
+        }
+    }
+
+    #[test]
+    fn scheduled_notify_user_tasks_execute_directly_and_self_deliver() {
+        let notify = test_task(
+            "notify_user",
+            serde_json::json!({
+                "message": "Reminder: meeting with Mark",
+                "report_to": "telegram"
+            }),
+        );
+        let web_search = test_task("web_search", serde_json::json!({"query": "status"}));
+
+        assert!(scheduled_task_uses_direct_notify_user_execution(&notify));
+        assert!(!scheduled_task_uses_direct_notify_user_execution(
+            &web_search
+        ));
+        assert!(!scheduled_task_should_deliver_output_after_execution(
+            &notify
+        ));
+        assert!(scheduled_task_should_deliver_output_after_execution(
+            &web_search
+        ));
+    }
+
+    #[test]
+    fn scheduled_notify_user_execution_arguments_promote_report_to_route() {
+        let task = test_task(
+            "notify_user",
+            serde_json::json!({
+                "message": "Reminder: meeting with Mark",
+                "report_to": "telegram"
+            }),
+        );
+
+        let arguments = scheduled_notify_user_execution_arguments(&task);
+
+        assert_eq!(
+            arguments.get("message").and_then(|value| value.as_str()),
+            Some("Reminder: meeting with Mark")
+        );
+        assert_eq!(
+            arguments
+                .get("delivery_channel")
+                .and_then(|value| value.as_str()),
+            Some("telegram")
+        );
+        assert_eq!(
+            arguments.get("source").and_then(|value| value.as_str()),
+            Some("reminder")
+        );
+        assert_eq!(
+            arguments
+                .get("in_app_title")
+                .and_then(|value| value.as_str()),
+            Some("Reminder")
+        );
+    }
+
+    #[test]
+    fn task_automation_run_record_can_exist_before_last_run_references() {
+        let task = test_task("notify_user", serde_json::json!({"message": "Reminder"}));
+        let started_at = chrono::DateTime::parse_from_rfc3339("2026-05-26T17:38:08Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let policy = AutomationExecutionPolicy::default();
+        let critique = AutomationCritique {
+            summary: "Execution started.".to_string(),
+            retryable: false,
+            validation_passed: false,
+        };
+
+        let record = task_automation_run_record(
+            &task,
+            "run-1",
+            AutomationRunStatus::Running,
+            1,
+            started_at,
+            None,
+            AutomationOriginContext::default(),
+            policy,
+            critique,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(record.id, "run-1");
+        assert_eq!(record.automation_id, task.id.to_string());
+        assert_eq!(record.status, AutomationRunStatus::Running);
+        assert_eq!(record.completed_at, None);
+        assert_eq!(record.duration_ms, None);
+    }
+
     #[test]
     fn scheduler_default_selection_never_invents_app_deploy() {
         let app_deploy = action(
@@ -5662,22 +6131,92 @@ mod tests {
     }
 
     #[test]
+    fn schedule_batch_accepts_structured_local_time_and_message_body() {
+        let args = serde_json::json!({
+            "report_to": "telegram",
+            "action": "notify_user",
+            "timezone": "Asia/Kolkata",
+            "items": [
+                {
+                    "local_time": "00:22",
+                    "action_arguments": {"message": "Meeting with Mark"}
+                }
+            ]
+        });
+
+        let items = schedule_task_batch_item_arguments(&args)
+            .expect("batch should be detected")
+            .expect("batch should validate");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("local_time").and_then(|value| value.as_str()),
+            Some("00:22")
+        );
+        assert_eq!(
+            items[0]
+                .get("action_arguments")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.as_str()),
+            Some("Meeting with Mark")
+        );
+    }
+
+    #[test]
     fn schedule_task_requires_explicit_schedule() {
-        let error = schedule_task_schedule_from_arguments(&serde_json::json!({
-            "task": "Send reminder"
-        }))
+        let error = schedule_task_schedule_from_arguments(
+            &serde_json::json!({
+                "task": "Send reminder"
+            }),
+            ScheduleTaskScheduleContext::default(),
+        )
         .expect_err("missing schedule should not default to now");
 
-        assert!(error.contains("requires `cron` or `at`"));
+        assert!(error.contains("requires `cron`, `at`, `scheduled_for`, or `local_time`"));
         assert!(error.contains("refusing to infer the current time"));
     }
 
     #[test]
+    fn schedule_task_validation_failures_are_structured_failed_completions() {
+        let result = schedule_task_validation_failure_result(
+            "Task scheduling requires `task` unless `task_id` points at an existing task.",
+            "missing_task",
+        );
+
+        let completion = crate::runtime::parse_schedule_task_completion(&result)
+            .expect("validation failure should use a structured schedule_task marker");
+        assert_eq!(completion.tool, "schedule_task");
+        assert_eq!(completion.status, "failed");
+        assert!(result.contains("durable_commit"));
+        assert!(result.contains("missing_task"));
+    }
+
+    #[test]
+    fn schedule_task_description_can_use_notify_user_message() {
+        let args = serde_json::json!({
+            "at": "2026-05-22T13:06:00+05:30",
+            "action": "notify_user",
+            "action_arguments": {
+                "message": "Meeting with Mark"
+            },
+            "report_to": "telegram"
+        });
+
+        assert_eq!(
+            schedule_task_description_from_arguments(&args, None).as_deref(),
+            Some("Meeting with Mark")
+        );
+    }
+
+    #[test]
     fn schedule_task_parses_requested_absolute_time() {
-        let (cron, at) = schedule_task_schedule_from_arguments(&serde_json::json!({
-            "task": "Send reminder",
-            "at": "2026-05-22T13:06:00+05:30"
-        }))
+        let (cron, at) = schedule_task_schedule_from_arguments(
+            &serde_json::json!({
+                "task": "Send reminder",
+                "at": "2026-05-22T13:06:00+05:30"
+            }),
+            ScheduleTaskScheduleContext::default(),
+        )
         .expect("valid absolute timestamp");
 
         assert!(cron.is_none());
@@ -5685,11 +6224,83 @@ mod tests {
     }
 
     #[test]
+    fn schedule_task_accepts_persisted_scheduled_for_as_absolute_time() {
+        let (cron, at) = schedule_task_schedule_from_arguments(
+            &serde_json::json!({
+                "task": "Send reminder",
+                "scheduled_for": "2026-05-22T13:06:00+05:30"
+            }),
+            ScheduleTaskScheduleContext::default(),
+        )
+        .expect("valid persisted timestamp");
+
+        assert!(cron.is_none());
+        assert_eq!(at.unwrap().to_rfc3339(), "2026-05-22T07:36:00+00:00");
+    }
+
+    #[test]
+    fn schedule_task_resolves_time_only_update_against_existing_local_date() {
+        let mut existing = test_task("notify_user", serde_json::json!({"message": "Reminder"}));
+        existing.scheduled_for = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-05-27T23:08:00+05:30")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let now_utc = chrono::DateTime::parse_from_rfc3339("2026-05-27T00:18:00+05:30")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let context = ScheduleTaskScheduleContext {
+            now_utc,
+            existing_task_target: Some(&existing),
+            default_timezone: Some(chrono_tz::Asia::Kolkata),
+        };
+
+        let (cron, at) = schedule_task_schedule_from_arguments(
+            &serde_json::json!({
+                "task_id": existing.id.to_string(),
+                "local_time": "12:22AM"
+            }),
+            context,
+        )
+        .expect("time-only update should resolve deterministically");
+
+        assert!(cron.is_none());
+        assert_eq!(at.unwrap().to_rfc3339(), "2026-05-26T18:52:00+00:00");
+    }
+
+    #[test]
+    fn schedule_task_resolves_time_only_create_to_next_local_occurrence() {
+        let now_utc = chrono::DateTime::parse_from_rfc3339("2026-05-27T00:18:00+05:30")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let context = ScheduleTaskScheduleContext {
+            now_utc,
+            existing_task_target: None,
+            default_timezone: Some(chrono_tz::Asia::Kolkata),
+        };
+
+        let (cron, at) = schedule_task_schedule_from_arguments(
+            &serde_json::json!({
+                "task": "Send reminder",
+                "local_time": "00:22"
+            }),
+            context,
+        )
+        .expect("time-only create should resolve to the next occurrence");
+
+        assert!(cron.is_none());
+        assert_eq!(at.unwrap().to_rfc3339(), "2026-05-26T18:52:00+00:00");
+    }
+
+    #[test]
     fn schedule_task_five_field_cron_is_expanded_without_current_time() {
-        let (cron, at) = schedule_task_schedule_from_arguments(&serde_json::json!({
-            "task": "Recurring reminder",
-            "cron": "6 13 * * *"
-        }))
+        let (cron, at) = schedule_task_schedule_from_arguments(
+            &serde_json::json!({
+                "task": "Recurring reminder",
+                "cron": "6 13 * * *"
+            }),
+            ScheduleTaskScheduleContext::default(),
+        )
         .expect("valid cron");
 
         assert_eq!(cron.as_deref(), Some("0 6 13 * * *"));

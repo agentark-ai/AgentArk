@@ -6,12 +6,12 @@
 pub mod master;
 
 use aes_gcm::{
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use argon2::{Argon2, Params};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -284,47 +284,6 @@ pub(crate) fn atomic_write_file_if_absent(path: &Path, contents: &[u8]) -> Resul
         }
         Err(error) => Err(anyhow!("Failed to atomically create {:?}: {}", path, error)),
     }
-}
-
-/// Generate a self-signed TLS certificate for localhost
-/// Returns (cert_pem, key_pem) as strings
-#[cfg(feature = "tls")]
-pub fn generate_self_signed_cert(data_dir: &Path) -> Result<(String, String)> {
-    let cert_path = data_dir.join("tls_cert.pem");
-    let key_path = data_dir.join("tls_key.pem");
-
-    // Reuse existing cert if available
-    if cert_path.exists() && key_path.exists() {
-        let cert_pem = std::fs::read_to_string(&cert_path)?;
-        let key_pem = std::fs::read_to_string(&key_path)?;
-        return Ok((cert_pem, key_pem));
-    }
-
-    // Generate new self-signed certificate
-    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
-    params.subject_alt_names = vec![
-        rcgen::SanType::DnsName("localhost".try_into()?),
-        rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
-    ];
-
-    let key_pair = rcgen::KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-
-    // Save for reuse
-    std::fs::write(&cert_path, &cert_pem)?;
-    std::fs::write(&key_path, &key_pem)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    tracing::info!("Generated self-signed TLS certificate at {:?}", cert_path);
-
-    Ok((cert_pem, key_pem))
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Shared structural validators for ArkOrbit tools.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 pub(super) fn require_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {

@@ -230,7 +230,11 @@ impl Agent {
             let ready = model_pool_map
                 .get(&slot_id)
                 .is_some_and(|(slot, _)| Self::provider_has_runtime_credentials(&slot.provider));
-            if ready { Some(slot_id) } else { None }
+            if ready {
+                Some(slot_id)
+            } else {
+                None
+            }
         });
         if had_persisted_model_override && user_selected_model_slot.is_none() {
             let _ = storage.delete(USER_SELECTED_MODEL_SLOT_KEY).await;

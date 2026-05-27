@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -183,6 +183,8 @@ pub enum PromptCacheCapability {
     OpenAiExplicitKey,
     AnthropicCacheControl,
     OpenRouterAnthropicCacheControl,
+    OpenRouterExplicitCacheControl,
+    OpenRouterGeminiCacheControl,
     OpenRouterProviderSpecific,
 }
 
@@ -201,18 +203,44 @@ pub fn prompt_cache_capability_for_openai_request(
                 .next()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(|value| value.to_ascii_lowercase())
+                .map(|value| value.trim_start_matches('~').to_ascii_lowercase())
                 .unwrap_or_default();
             let route_discovery = provider_descriptor(route_provider.as_str())
                 .map(|descriptor| descriptor.capabilities.discovery);
             if matches!(route_discovery, Some(ProviderDiscoveryKind::Anthropic)) {
                 PromptCacheCapability::OpenRouterAnthropicCacheControl
+            } else if openrouter_route_supports_gemini_prompt_cache_control(
+                route_provider.as_str(),
+                model,
+            ) {
+                PromptCacheCapability::OpenRouterGeminiCacheControl
+            } else if openrouter_route_supports_explicit_prompt_cache_control(
+                route_provider.as_str(),
+            ) {
+                PromptCacheCapability::OpenRouterExplicitCacheControl
             } else {
                 PromptCacheCapability::OpenRouterProviderSpecific
             }
         }
         _ => PromptCacheCapability::None,
     }
+}
+
+fn openrouter_route_supports_explicit_prompt_cache_control(route_provider: &str) -> bool {
+    // OpenRouter documents Anthropic-style content block breakpoints for
+    // Alibaba Qwen routes; other routes use provider-side automatic caching or
+    // provider-specific handling without extra request fields.
+    matches!(route_provider, "qwen" | "alibaba")
+}
+
+fn openrouter_route_supports_gemini_prompt_cache_control(
+    route_provider: &str,
+    model: &str,
+) -> bool {
+    // Gemini also uses explicit content block breakpoints through OpenRouter,
+    // but dynamic system tails must be moved into later user content.
+    let model = model.trim().to_ascii_lowercase();
+    route_provider == "google" && model.contains("gemini")
 }
 
 pub fn display_openai_base_url(base_url: Option<&String>) -> Option<String> {
@@ -537,9 +565,10 @@ pub async fn resolve_openai_request_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        CODEX_CLI_BASE_URL, HUGGINGFACE_API_BASE_URL, OPENAI_PROVIDER_ID, OPENROUTER_API_BASE_URL,
-        OPENROUTER_PROVIDER_ID, PromptCacheCapability, normalize_openai_base_url,
-        openai_provider_label, prompt_cache_capability_for_openai_request,
+        normalize_openai_base_url, openai_provider_label,
+        prompt_cache_capability_for_openai_request, PromptCacheCapability, CODEX_CLI_BASE_URL,
+        HUGGINGFACE_API_BASE_URL, OPENAI_PROVIDER_ID, OPENROUTER_API_BASE_URL,
+        OPENROUTER_PROVIDER_ID,
     };
 
     #[test]
@@ -571,6 +600,30 @@ mod tests {
                 "anthropic/claude-sonnet-4.6"
             ),
             PromptCacheCapability::OpenRouterAnthropicCacheControl
+        );
+        assert_eq!(
+            prompt_cache_capability_for_openai_request(
+                OPENROUTER_PROVIDER_ID,
+                true,
+                "~anthropic/claude-sonnet-4.6"
+            ),
+            PromptCacheCapability::OpenRouterAnthropicCacheControl
+        );
+        assert_eq!(
+            prompt_cache_capability_for_openai_request(
+                OPENROUTER_PROVIDER_ID,
+                true,
+                "qwen/qwen3-max"
+            ),
+            PromptCacheCapability::OpenRouterExplicitCacheControl
+        );
+        assert_eq!(
+            prompt_cache_capability_for_openai_request(
+                OPENROUTER_PROVIDER_ID,
+                true,
+                "google/gemini-2.5-pro"
+            ),
+            PromptCacheCapability::OpenRouterGeminiCacheControl
         );
         assert_eq!(
             prompt_cache_capability_for_openai_request(

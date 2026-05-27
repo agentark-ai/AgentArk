@@ -4,7 +4,7 @@
 //! 2. Fetching and extracting content from URLs
 //! 3. Synthesizing information into a coherent report
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -247,11 +247,7 @@ impl ResearchProgressReporter {
 }
 
 fn summarize_progress_text(value: &str, max_chars: usize) -> String {
-    let normalized = value
-        .trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= max_chars {
         return normalized;
     }
@@ -292,11 +288,15 @@ fn trim_research_list_marker(line: &str) -> Option<&str> {
     }
 
     let rest = after_chars.as_str().trim();
-    if rest.is_empty() { None } else { Some(rest) }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
 }
 
 fn compact_research_query_text(text: &str, max_chars: usize) -> String {
-    let compact = text.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
         return compact;
     }
@@ -1219,7 +1219,7 @@ impl ResearchClient {
                         stream_key,
                     );
                 }
-                return Ok(filtered_results);
+                Ok(filtered_results)
             }
             Err(error) => {
                 if let Some(progress) = progress {
@@ -1235,7 +1235,7 @@ impl ResearchClient {
                         stream_key,
                     );
                 }
-                return Err(error);
+                Err(error)
             }
         }
     }
@@ -1902,12 +1902,7 @@ impl ResearchClient {
         if content.is_empty() {
             return None;
         }
-        if self
-            .best_text_relevance_score(content, relevance_term_sets)
-            .is_none()
-        {
-            return None;
-        }
+        self.best_text_relevance_score(content, relevance_term_sets)?;
         Some(Finding {
             content: content.to_string(),
             confidence,
@@ -2920,9 +2915,7 @@ fn research_inline_chart_blocks(args: &ResearchArgs, result: &ResearchResult) ->
 
 fn format_finding_citations(finding: &Finding) -> String {
     let mut citations = finding.supporting_source_indices.clone();
-    if citations.is_empty() {
-        citations.push(finding.source_index);
-    } else if !citations.contains(&finding.source_index) {
+    if !citations.contains(&finding.source_index) {
         citations.push(finding.source_index);
     }
     citations.sort_unstable();
@@ -2964,26 +2957,18 @@ mod tests {
         let client = test_client();
         let queries = client.generate_research_queries("rust agent framework", true);
 
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("primary sources"))
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("recent coverage"))
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("comparison alternatives"))
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("risks limitations open questions"))
-        );
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("primary sources")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("recent coverage")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("comparison alternatives")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("risks limitations open questions")));
     }
 
     #[test]
@@ -2993,26 +2978,18 @@ mod tests {
         let queries = client.generate_research_queries(request, true);
 
         assert!(queries.len() > 8);
-        assert!(
-            queries
-                .iter()
-                .all(|query| query.text.chars().count() <= 240)
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("compute access"))
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("open-source AI"))
-        );
-        assert!(
-            !queries
-                .iter()
-                .any(|query| query.text.contains("Focus on:\n-"))
-        );
+        assert!(queries
+            .iter()
+            .all(|query| query.text.chars().count() <= 240));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("compute access")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("open-source AI")));
+        assert!(!queries
+            .iter()
+            .any(|query| query.text.contains("Focus on:\n-")));
     }
 
     #[test]
@@ -3057,16 +3034,12 @@ mod tests {
             client.effective_freshness_window_days(&args, &args.query),
             None
         );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("period coverage"))
-        );
-        assert!(
-            !queries
-                .iter()
-                .any(|query| query.text.contains("recent coverage"))
-        );
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("period coverage")));
+        assert!(!queries
+            .iter()
+            .any(|query| query.text.contains("recent coverage")));
     }
 
     #[test]
@@ -3128,22 +3101,18 @@ mod tests {
         let query_terms =
             client.normalized_query_terms("India AI publications startups compute infrastructure");
 
-        assert!(
-            client
-                .text_relevance_score(
-                    "Access 160 million publication pages and gain visibility by uploading work.",
-                    &query_terms,
-                )
-                .is_none()
-        );
-        assert!(
-            client
-                .text_relevance_score(
-                    "India AI compute infrastructure is shaping startup and publication output.",
-                    &query_terms,
-                )
-                .is_some()
-        );
+        assert!(client
+            .text_relevance_score(
+                "Access 160 million publication pages and gain visibility by uploading work.",
+                &query_terms,
+            )
+            .is_none());
+        assert!(client
+            .text_relevance_score(
+                "India AI compute infrastructure is shaping startup and publication output.",
+                &query_terms,
+            )
+            .is_some());
     }
 
     #[test]

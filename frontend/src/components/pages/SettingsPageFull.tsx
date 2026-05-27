@@ -5847,15 +5847,13 @@ export default function SettingsPage({
             ) : null}
 
             {tab === 20 ? (
-              <Box className="list-shell">
-                <WorkspaceLazyPanel message={settingsLoadingMessage}>
-                  <IntegrationsPanel
-                    autoRefresh={autoRefresh}
-                    embedded
-                    mode="channels"
-                  />
-                </WorkspaceLazyPanel>
-              </Box>
+              <WorkspaceLazyPanel message={settingsLoadingMessage}>
+                <IntegrationsPanel
+                  autoRefresh={autoRefresh}
+                  embedded
+                  mode="integrations"
+                />
+              </WorkspaceLazyPanel>
             ) : null}
 
             {tab === 21 ? (

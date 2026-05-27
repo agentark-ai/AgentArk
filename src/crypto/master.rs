@@ -7,12 +7,12 @@
 //!
 //! Persisted file: `config_dir/master.json`
 
-use anyhow::{Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::{KEY_LEN, KeyManager, derive_key, generate_salt};
+use super::{derive_key, generate_salt, KeyManager, KEY_LEN};
 
 pub const INSTALL_MASTER_SECRET_PATH: &str = "/run/secrets/agentark_master_key";
 

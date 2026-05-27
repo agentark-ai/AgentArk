@@ -7,8 +7,8 @@ use crate::{
     identity::IdentityManager,
     proofs::ProofEngine,
     runtime::{
-        ActionRuntime, InstalledCliSkillManifest, WorkflowMissingInputsPayload,
-        parse_workflow_action_marker, parse_workflow_missing_inputs_marker,
+        parse_workflow_action_marker, parse_workflow_missing_inputs_marker, ActionRuntime,
+        InstalledCliSkillManifest, WorkflowMissingInputsPayload,
     },
     safety::SafetyEngine,
     security::SecurityGuard,
@@ -16,27 +16,23 @@ use crate::{
 };
 use anyhow::Result;
 use regex::Regex;
-use sea_orm::{TransactionTrait, entity::prelude::PgVector};
+use sea_orm::{entity::prelude::PgVector, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{broadcast, RwLock};
 
 use super::{
-    AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus,
-    PlanSubstep, PromptMemory, RequestState,
     action_catalog::{
-        ActionCatalogSyncStats, action_catalog_embedding_has_default_dim,
-        action_catalog_entry_needs_embedding, build_action_catalog_descriptor,
+        action_catalog_embedding_has_default_dim, action_catalog_entry_needs_embedding,
+        build_action_catalog_descriptor, ActionCatalogSyncStats,
     },
     arkorbit,
     automation::{
-        self, AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
-        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
-        AutomationValidationMode, append_run as append_automation_run, compute_retry_at,
+        self, append_run as append_automation_run, compute_retry_at,
         critique_result as critique_automation_result,
         current_attempt as automation_current_attempt,
         delete_supervisor_state as delete_automation_supervisor_state,
@@ -52,15 +48,18 @@ use super::{
         truncate_text as automation_truncate_text,
         upsert_supervisor_state as upsert_automation_supervisor_state,
         validation_from_request_argument as automation_validation_from_request_argument,
+        AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
+        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
+        AutomationValidationMode,
     },
     autonomy::{self, ConversationScope},
     background_session, browser_session,
     config::{ModelCapabilityTier, ModelCostTier, ModelRole, ModelSlot},
     document_search::{self, DocumentSearchHit},
     execution::{
-        ExecutionCandidateDescriptor, ExecutionRequest, ExecutionRunStatus, ExecutionSupervisor,
-        RecoveryAction, UserFacingOutcome, UserFacingOutcomeStatus,
-        execute_supervised_transport_chat,
+        execute_supervised_transport_chat, ExecutionCandidateDescriptor, ExecutionRequest,
+        ExecutionRunStatus, ExecutionSupervisor, RecoveryAction, UserFacingOutcome,
+        UserFacingOutcomeStatus,
     },
     llm::{self, LlmClient, LlmProvider},
     model_failover::{
@@ -69,7 +68,8 @@ use super::{
     orchestra::{Orchestra, OrchestraConfig},
     swarm::{AgentId, SwarmManager},
     task::{self, TaskQueue},
-    task_router, watcher,
+    task_router, watcher, AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep,
+    PlanStepStatus, PlanSubstep, PromptMemory, RequestState,
 };
 
 mod automation_helpers;
@@ -101,21 +101,21 @@ mod watcher_followup;
 use automation_helpers::*;
 use background_sessions::*;
 pub(crate) use chat_approvals::{
-    DirectChatApprovalSubmitDecision, parse_direct_chat_approval_submit_text,
+    parse_direct_chat_approval_submit_text, DirectChatApprovalSubmitDecision,
 };
 pub use conversation_context::ConversationMessage;
 use memory::*;
-pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
 use notifications::{
     inbound_security_source_label, is_external_notification_channel,
     notification_channel_display_name, notification_channel_not_connected_outcome,
     notification_push_signature, telegram_notification_target_is_configured,
     whatsapp_notification_target_is_configured,
 };
+pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
 use request_context::*;
 use skill_import::*;
-pub use streaming::StreamEvent;
 pub(crate) use streaming::queue_stream_event;
+pub use streaming::StreamEvent;
 use tool_responses::*;
 pub(crate) use watcher_followup::{WatcherFollowupPreparation, WatcherFollowupWorker};
 
@@ -1592,6 +1592,7 @@ pub struct RequestExecutionHints {
     pub attachments_present: bool,
     pub attachments: Vec<ChatAttachmentHint>,
     pub arkorbit_context: Option<serde_json::Value>,
+    pub browser_profile_context: Option<serde_json::Value>,
     pub recent_actionable_artifacts: Vec<serde_json::Value>,
 }
 
@@ -1798,6 +1799,10 @@ pub struct ExecutionTrace {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    #[serde(default)]
+    pub cached_prompt_tokens: i64,
+    #[serde(default)]
+    pub cache_creation_prompt_tokens: i64,
     /// Estimated cost in USD
     pub cost_usd: f64,
     /// Routing complexity tier (simple/medium/complex)
@@ -1942,6 +1947,12 @@ impl Agent {
             trace.input_tokens += usage.prompt_tokens as i64;
             trace.output_tokens += usage.completion_tokens as i64;
             trace.total_tokens += usage.total_tokens as i64;
+            trace.cached_prompt_tokens = trace
+                .cached_prompt_tokens
+                .saturating_add(usage.cached_prompt_tokens.min(i64::MAX as u64) as i64);
+            trace.cache_creation_prompt_tokens = trace
+                .cache_creation_prompt_tokens
+                .saturating_add(usage.cache_creation_prompt_tokens.min(i64::MAX as u64) as i64);
             trace.cost_usd += usage.cost_usd.unwrap_or_else(|| {
                 estimate_cost_usd(
                     &resp.provider,

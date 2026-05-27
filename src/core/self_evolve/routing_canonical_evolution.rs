@@ -5,7 +5,7 @@
 //! promote them into the existing security canonical overlay without changing
 //! router prompt text.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

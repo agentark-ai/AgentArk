@@ -2277,7 +2277,7 @@ pub(super) async fn create_task(
     State(state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Response {
-    use crate::core::{Task, TaskApproval, status_for_task_approval};
+    use crate::core::{status_for_task_approval, Task, TaskApproval};
 
     // Convert and validate cron expression if provided
     // Standard 5-field cron is converted to 6-field (with seconds) for Rust cron crate
@@ -2978,14 +2978,17 @@ pub(super) async fn resume_chat_task_stream(
             attachments_present: false,
             attachments: Vec::new(),
             arkorbit_context: None,
+            browser_profile_context: None,
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             accepted_suggestion: None,
+            execution_profile: resume_request.execution_profile.clone(),
             task_mode: ChatStreamTaskMode::Existing(Box::new(StreamedChatTask {
                 task_id: resumed_task.id.to_string(),
                 description: resumed_task.description.clone(),
                 work_type: resume_request.work_type,
                 user_message_already_recorded: true,
                 plan_override,
+                execution_profile: resume_request.execution_profile,
             })),
         },
     )

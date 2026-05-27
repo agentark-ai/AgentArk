@@ -43,6 +43,13 @@ import {
 } from "./settingsConstants";
 
 const LOCAL_EMBEDDINGS_MODEL = "BAAI/bge-small-en-v1.5";
+const MODEL_ROLE_OPTIONS = ["primary", "fast", "code", "research", "fallback"];
+
+function modelOptionLabel(value: unknown): string {
+  const normalized = str(value, "").replace(/[_-]+/g, " ").trim();
+  if (!normalized) return "-";
+  return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+}
 
 type SettingsModelsPanelProps = {
   [key: string]: any;
@@ -227,7 +234,7 @@ export function SettingsModelsPanel({
                                           {str(slot.label, "-")}
                                         </TableCell>
                                         <TableCell>
-                                          {str(slot.role, "-")}
+                                          {modelOptionLabel(slot.role)}
                                         </TableCell>
                                         <TableCell>
                                           {str(slot.provider, "-")}
@@ -449,11 +456,11 @@ export function SettingsModelsPanel({
                         }
                         fullWidth
                       >
-                        <MenuItem value="primary">primary</MenuItem>
-                        <MenuItem value="fast">fast</MenuItem>
-                        <MenuItem value="code">code</MenuItem>
-                        <MenuItem value="research">research</MenuItem>
-                        <MenuItem value="fallback">fallback</MenuItem>
+                        {MODEL_ROLE_OPTIONS.map((role) => (
+                          <MenuItem key={role} value={role}>
+                            {modelOptionLabel(role)}
+                          </MenuItem>
+                        ))}
                       </TextField>
                       <TextField
                         label="Provider"

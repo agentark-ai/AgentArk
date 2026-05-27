@@ -20,8 +20,21 @@ import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { errMessage } from "./pageHelpers";
 
 const REFRESH_MS = 8000;
+const SESSION_PAGE_SIZE = 8;
 const CHAT_COMPOSER_PREFILL_STORAGE_KEY = "agentark.chat.composerPrefill";
 const CHAT_COMPOSER_PREFILL_EVENT = "agentark.chat.composer-prefill";
+
+type BrowserProfileChatPrefill = {
+  text: string;
+  browser_profile_context: {
+    profile_id: string;
+    profile_name: string;
+    browser: string;
+    target?: string;
+    target_kind?: string;
+    manual_handoff: boolean;
+  };
+};
 
 type RowMenuAction = {
   label: string;
@@ -35,27 +48,27 @@ function browserSessionHandoffUrl(sessionId: string): string {
   return `/ui/browser-handoff/${encodeURIComponent(sessionId)}`;
 }
 
-function browserProfileChatDraft(profile: BrowserProfile): string {
-  const lines = [
-    `Use the saved browser login profile "${profile.name}" for this browser task.`,
-    `Profile id: ${profile.id}. Browser: ${profile.browser}.`,
-  ];
-  if (profile.target) {
-    lines.push(`Saved target: ${profile.target}.`);
-  }
-  lines.push(
-    "",
-    "If the site asks for login, CAPTCHA, or 2FA, open a manual handoff for me and continue after I finish.",
-    "",
-    "Task: ",
-  );
-  return lines.join("\n");
+function browserProfileChatPrefill(profile: BrowserProfile): BrowserProfileChatPrefill {
+  return {
+    text: `Browser profile: ${profile.name}\n\nTask: `,
+    browser_profile_context: {
+      profile_id: profile.id,
+      profile_name: profile.name,
+      browser: profile.browser,
+      ...(profile.target ? { target: profile.target } : {}),
+      ...(profile.target_kind ? { target_kind: profile.target_kind } : {}),
+      manual_handoff: true,
+    },
+  };
 }
 
-function storeChatComposerPrefill(text: string): void {
+function storeChatComposerPrefill(prefill: BrowserProfileChatPrefill): void {
   if (typeof window === "undefined") return;
   try {
-    window.sessionStorage.setItem(CHAT_COMPOSER_PREFILL_STORAGE_KEY, text);
+    window.sessionStorage.setItem(
+      CHAT_COMPOSER_PREFILL_STORAGE_KEY,
+      JSON.stringify(prefill),
+    );
   } catch {
     // Ignore storage failures; navigation still works.
   }
@@ -172,6 +185,7 @@ function profileDetail(profile: BrowserProfileRecord): string {
   if (profile.lock) {
     return profile.lock.reason || `Locked by ${profile.lock.owner}`;
   }
+  if (profile.target_kind === "host") return profile.description || "Ready for real browser profile work.";
   return profile.description || "Ready for isolated browser work.";
 }
 
@@ -187,6 +201,7 @@ function mapBrowserProfile(profile: BrowserProfileRecord): BrowserProfile {
     browser: profileBrowserName(profile),
     status: profileStatus(profile),
     target: profileTarget(profile),
+    target_kind: profile.target_kind,
     managed,
     session_count: profile.recent_sessions?.length || 0,
     last_launch_at: profile.last_used_at || profile.login_checked_at || undefined,
@@ -257,6 +272,7 @@ export default function BrowserSessionsPage({
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [sessionPage, setSessionPage] = useState(0);
 
   const sessionsQ = useQuery({
     queryKey: ["browser-sessions"],
@@ -273,13 +289,32 @@ export default function BrowserSessionsPage({
     () => sessionsQ.data?.sessions || [],
     [sessionsQ.data],
   );
-  const profiles = useMemo(
-    () => (profilesQ.data?.profiles || []).map(mapBrowserProfile),
-    [profilesQ.data],
-  );
+  const profiles = useMemo(() => {
+    const activeByProfile = new Map<string, number>();
+    for (const session of sessions) {
+      const profileId = String(session.profile_id || "").trim();
+      if (!profileId || isTerminal(session)) continue;
+      activeByProfile.set(profileId, (activeByProfile.get(profileId) || 0) + 1);
+    }
+    return (profilesQ.data?.profiles || []).map((record) => {
+      const mapped = mapBrowserProfile(record);
+      const activeSessions = activeByProfile.get(record.id) || 0;
+      return {
+        ...mapped,
+        status: activeSessions > 0 ? "running" : mapped.status,
+        session_count: activeSessions,
+      };
+    });
+  }, [profilesQ.data, sessions]);
   const activeCount = useMemo(
     () => sessions.filter((session) => !isTerminal(session)).length,
     [sessions],
+  );
+  const totalSessionPages = Math.max(1, Math.ceil(sessions.length / SESSION_PAGE_SIZE));
+  const safeSessionPage = Math.min(sessionPage, totalSessionPages - 1);
+  const visibleSessions = sessions.slice(
+    safeSessionPage * SESSION_PAGE_SIZE,
+    safeSessionPage * SESSION_PAGE_SIZE + SESSION_PAGE_SIZE,
   );
 
   const invalidate = async () => {
@@ -305,9 +340,33 @@ export default function BrowserSessionsPage({
     onError: (err) => setError(errMessage(err)),
   });
   const profileMutation = useMutation({
-    mutationFn: async (payload: { name: string; browser: string; managed: boolean }) =>
+    mutationFn: async (payload: { name: string; browser: string; managed: boolean; target_profile_path?: string }) =>
       api.createBrowserProfile(payload),
     onSuccess: async () => {
+      await invalidate();
+    },
+    onError: (err) => setError(errMessage(err)),
+  });
+  const profileLaunchMutation = useMutation({
+    mutationFn: async (profileId: string) => api.launchBrowserProfile(profileId),
+    onSuccess: async (result) => {
+      await invalidate();
+      const session = result.session as BrowserSessionSummary | undefined;
+      if (session?.id) {
+        window.open(browserSessionHandoffUrl(session.id), "_blank", "noopener,noreferrer");
+      }
+    },
+    onError: (err) => setError(errMessage(err)),
+  });
+  const profileCloseMutation = useMutation({
+    mutationFn: async (profileId: string) => api.closeBrowserProfile(profileId),
+    onSuccess: invalidate,
+    onError: (err) => setError(errMessage(err)),
+  });
+  const profileDeleteMutation = useMutation({
+    mutationFn: async (profileId: string) => api.deleteBrowserProfile(profileId),
+    onSuccess: async (_result, profileId) => {
+      if (selectedProfileId === profileId) setSelectedProfileId(null);
       await invalidate();
     },
     onError: (err) => setError(errMessage(err)),
@@ -341,8 +400,26 @@ export default function BrowserSessionsPage({
   };
 
   const useProfileInChat = (profile: BrowserProfile) => {
-    storeChatComposerPrefill(browserProfileChatDraft(profile));
+    storeChatComposerPrefill(browserProfileChatPrefill(profile));
     navigateToChatComposer();
+  };
+  const openProfileLive = (profileId: string) => {
+    const liveSession = sessions.find(
+      (session) => session.profile_id === profileId && !isTerminal(session),
+    );
+    if (liveSession) {
+      window.open(browserSessionHandoffUrl(liveSession.id), "_blank", "noopener,noreferrer");
+      return;
+    }
+    profileLaunchMutation.mutate(profileId);
+  };
+  const deleteProfile = (profileId: string) => {
+    const profile = profiles.find((item) => item.id === profileId);
+    const confirmed = window.confirm(
+      `Delete browser profile "${profile?.name || profileId}"? This closes live browsers for it and removes saved browser state.`,
+    );
+    if (!confirmed) return;
+    profileDeleteMutation.mutate(profileId);
   };
 
   return (
@@ -392,6 +469,10 @@ export default function BrowserSessionsPage({
             selectedProfileId={selectedProfileId}
             onSelectProfile={setSelectedProfileId}
             onUseProfileInChat={useProfileInChat}
+            onLaunchProfile={(profileId) => profileLaunchMutation.mutate(profileId)}
+            onStopProfile={(profileId) => profileCloseMutation.mutate(profileId)}
+            onOpenManualLogin={openProfileLive}
+            onDeleteProfile={deleteProfile}
             onCreateProfile={(payload) => profileMutation.mutate(payload)}
           />
         )}
@@ -427,7 +508,7 @@ export default function BrowserSessionsPage({
           </Box>
         ) : (
           <Stack spacing={0.25}>
-            {sessions.map((session) => {
+            {visibleSessions.map((session) => {
               const detailLine = sessionDetailLine(session);
               return (
                 <Box
@@ -501,8 +582,7 @@ export default function BrowserSessionsPage({
                       variant="caption"
                       sx={{ color: "text.secondary", display: "block", mt: 0.2 }}
                     >
-                      Created {formatTimestamp(session.created_at)} - Updated{" "}
-                      {formatTimestamp(session.updated_at)}
+                      Updated {formatTimestamp(session.updated_at)}
                     </Typography>
                   </Box>
                   <Box sx={{ flexShrink: 0 }}>
@@ -514,6 +594,35 @@ export default function BrowserSessionsPage({
                 </Box>
               );
             })}
+            {sessions.length > SESSION_PAGE_SIZE ? (
+              <Stack
+                direction="row"
+                spacing={1}
+                sx={{ alignItems: "center", justifyContent: "flex-end", pt: 1 }}
+              >
+                <Typography variant="caption" sx={{ color: "text.secondary", mr: "auto" }}>
+                  Showing {safeSessionPage * SESSION_PAGE_SIZE + 1}-
+                  {Math.min((safeSessionPage + 1) * SESSION_PAGE_SIZE, sessions.length)} of{" "}
+                  {sessions.length}
+                </Typography>
+                <Button
+                  size="small"
+                  disabled={safeSessionPage === 0}
+                  onClick={() => setSessionPage((page) => Math.max(0, page - 1))}
+                >
+                  Previous
+                </Button>
+                <Button
+                  size="small"
+                  disabled={safeSessionPage >= totalSessionPages - 1}
+                  onClick={() =>
+                    setSessionPage((page) => Math.min(totalSessionPages - 1, page + 1))
+                  }
+                >
+                  Next
+                </Button>
+              </Stack>
+            ) : null}
           </Stack>
         )}
       </Box>

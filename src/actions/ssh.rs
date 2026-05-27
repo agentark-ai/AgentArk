@@ -3,7 +3,7 @@
 //! Allows the agent to execute commands on configured remote servers.
 //! Private keys are stored encrypted via SecureConfigManager.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -211,11 +211,7 @@ fn append_ssh_output(
 }
 
 fn truncate_ssh_audit_command(command: &str) -> String {
-    let normalized = command
-        .trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= MAX_SSH_AUDIT_COMMAND_CHARS {
         normalized
     } else {

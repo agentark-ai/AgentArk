@@ -5,7 +5,7 @@
 //! firmware files under `src/core/arkorbit/l0` during source-tree runs, which
 //! win over the embedded L0 fallback compiled into the binary.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
@@ -545,7 +545,7 @@ fn validate_widget_registry_json(source: &str) -> Result<()> {
                         key
                     );
                 };
-                if !number.is_finite() || number < 0.0 || number > 1_000_000.0 {
+                if !number.is_finite() || !(0.0..=1_000_000.0).contains(&number) {
                     bail!(
                         "arkorbit: data/widgets.json widget {} field '{}' must be between 0 and 1000000",
                         index,
@@ -609,8 +609,8 @@ fn contains_phrase_with_identifier_boundary(source: &str, phrase: &str) -> bool 
         let end = start + phrase.len();
         let before = source[..start].chars().next_back();
         let after = source[end..].chars().next();
-        let before_ok = before.map_or(true, |ch| !is_javascript_identifier_continue(ch));
-        let after_ok = after.map_or(true, |ch| !is_javascript_identifier_continue(ch));
+        let before_ok = before.is_none_or(|ch| !is_javascript_identifier_continue(ch));
+        let after_ok = after.is_none_or(|ch| !is_javascript_identifier_continue(ch));
         if before_ok && after_ok {
             return true;
         }
@@ -668,11 +668,7 @@ fn contains_render_in_export_list(source: &str) -> bool {
 
 fn export_specifier_exports_render(specifier: &str) -> bool {
     let parts = specifier.split_whitespace().collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["render"] => true,
-        [_, "as", "render"] => true,
-        _ => false,
-    }
+    matches!(parts.as_slice(), ["render"] | [_, "as", "render"])
 }
 
 fn strip_javascript_comments_and_strings(source: &str) -> String {
@@ -1047,14 +1043,12 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("invalid browser JavaScript"));
-        assert!(
-            !store
-                .orbit_dir(&orbit_id)
-                .join("mod")
-                .join("broken")
-                .join("index.js")
-                .exists()
-        );
+        assert!(!store
+            .orbit_dir(&orbit_id)
+            .join("mod")
+            .join("broken")
+            .join("index.js")
+            .exists());
     }
 
     #[test]
@@ -1072,14 +1066,12 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("must export a named render"));
-        assert!(
-            !store
-                .orbit_dir(&orbit_id)
-                .join("mod")
-                .join("broken")
-                .join("index.js")
-                .exists()
-        );
+        assert!(!store
+            .orbit_dir(&orbit_id)
+            .join("mod")
+            .join("broken")
+            .join("index.js")
+            .exists());
     }
 
     #[test]
@@ -1140,13 +1132,11 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("must be valid JSON"));
-        assert!(
-            !store
-                .orbit_dir(&orbit_id)
-                .join("data")
-                .join("widgets.json")
-                .exists()
-        );
+        assert!(!store
+            .orbit_dir(&orbit_id)
+            .join("data")
+            .join("widgets.json")
+            .exists());
     }
 
     #[test]

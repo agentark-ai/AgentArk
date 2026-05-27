@@ -7,6 +7,7 @@
 //! - Transactional filesystem with rollback capability
 
 mod ark_inspect;
+mod file_tools;
 mod sandbox;
 pub mod toolsets;
 mod transaction;
@@ -99,6 +100,25 @@ impl std::error::Error for MissingSecretPlaceholder {}
 
 const TOOL_PAYLOAD_INLINE_BYTES: usize = 256 * 1024;
 const TOOL_PAYLOAD_RESOURCE_DIR: &str = "tool-payloads";
+const FILE_SEARCH_DEFAULT_MAX_FILES_SCANNED: usize = 2_500;
+const FILE_SEARCH_DEFAULT_MAX_ENTRIES_VISITED: usize = 20_000;
+const FILE_SEARCH_DEFAULT_SKIPPED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".cache",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -408,6 +428,8 @@ struct IndexedDocumentArtifact {
     chunk_count: usize,
     file_size: u64,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_url: Option<String>,
     duplicate_skipped: bool,
     content_fingerprint: String,
     metadata_only: bool,
@@ -1078,1865 +1100,6 @@ struct ActionReviewBuildInput<'a> {
 }
 
 impl ActionRuntime {
-    fn sanitize_upload_filename(raw: &str) -> String {
-        let filename: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if filename.is_empty() {
-            "file".to_string()
-        } else {
-            filename
-        }
-    }
-
-    fn inline_code_execute_payloads(
-        arguments: &serde_json::Value,
-    ) -> Result<Vec<SandboxUploadFile>> {
-        let Some(payloads) = arguments
-            .get("file_payloads")
-            .and_then(|value| value.as_array())
-        else {
-            return Ok(Vec::new());
-        };
-        let mut files = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            let filename = payload
-                .get("filename")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("Each file_payload must include a filename"))?;
-            let bytes_b64 = payload
-                .get("bytes_b64")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Each file_payload must include bytes_b64"))?;
-            let bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, bytes_b64)
-                    .map_err(|e| {
-                        anyhow::anyhow!("Invalid base64 file payload for '{}': {}", filename, e)
-                    })?;
-            files.push(SandboxUploadFile {
-                filename: Self::sanitize_upload_filename(filename),
-                content_type: payload
-                    .get("content_type")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string),
-                bytes,
-            });
-        }
-        Ok(files)
-    }
-
-    async fn collect_code_execute_files(
-        &self,
-        arguments: &serde_json::Value,
-    ) -> Result<Vec<SandboxUploadFile>> {
-        let inline = Self::inline_code_execute_payloads(arguments)?;
-        if !inline.is_empty() {
-            return Ok(inline);
-        }
-        let mut files = Vec::new();
-        if let Some(files_arr) = arguments.get("files").and_then(|v| v.as_array()) {
-            for file_val in files_arr {
-                if let Some(upload_id) = file_val
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    match self.resolve_upload_for_sandbox(upload_id).await {
-                        Ok(file) => {
-                            files.push(file);
-                            continue;
-                        }
-                        Err(upload_error) => {
-                            let resource = Self::runtime_resource_from_argument(file_val)
-                                .ok_or(upload_error)?;
-                            files.push(self.sandbox_upload_from_resource(resource).await?);
-                            continue;
-                        }
-                    }
-                }
-                let resource = Self::runtime_resource_from_argument(file_val).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Each code_execute file reference must be an upload ID, ResourceRef, resource path, or structured resource payload"
-                    )
-                })?;
-                files.push(self.sandbox_upload_from_resource(resource).await?);
-            }
-        }
-        Ok(files)
-    }
-
-    fn upload_signature(
-        filename: &str,
-        content_type: Option<&str>,
-        bytes: &[u8],
-    ) -> serde_json::Value {
-        let lower_name = filename.to_ascii_lowercase();
-        let lower_ct = content_type.unwrap_or("").to_ascii_lowercase();
-        let ext = lower_name
-            .rsplit_once('.')
-            .map(|(_, ext)| ext)
-            .unwrap_or("");
-
-        let mut detected = if bytes.starts_with(b"OggS") {
-            if bytes
-                .windows(b"OpusHead".len())
-                .any(|win| win == b"OpusHead")
-            {
-                serde_json::json!({
-                    "input_type": "audio",
-                    "media_kind": "audio",
-                    "mime": "audio/ogg; codecs=opus",
-                    "extension": "opus",
-                    "confidence": "high",
-                    "source": "magic_bytes",
-                })
-            } else {
-                serde_json::json!({
-                    "input_type": "audio",
-                    "media_kind": "audio",
-                    "mime": "audio/ogg",
-                    "extension": "ogg",
-                    "confidence": "high",
-                    "source": "magic_bytes",
-                })
-            }
-        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
-            serde_json::json!({
-                "input_type": "audio",
-                "media_kind": "audio",
-                "mime": "audio/wav",
-                "extension": "wav",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(b"ID3") || bytes.starts_with(&[0xFF, 0xFB]) {
-            serde_json::json!({
-                "input_type": "audio",
-                "media_kind": "audio",
-                "mime": "audio/mpeg",
-                "extension": "mp3",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(b"fLaC") {
-            serde_json::json!({
-                "input_type": "audio",
-                "media_kind": "audio",
-                "mime": "audio/flac",
-                "extension": "flac",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-            let brand =
-                String::from_utf8_lossy(&bytes[8..bytes.len().min(24)]).to_ascii_lowercase();
-            let audio_brand =
-                brand.contains("m4a") || brand.contains("m4b") || brand.contains("mp42");
-            serde_json::json!({
-                "input_type": if audio_brand { "audio" } else { "audio_video" },
-                "media_kind": if audio_brand { "audio" } else { "audio_or_video" },
-                "mime": if audio_brand { "audio/mp4" } else { "video/mp4" },
-                "extension": if audio_brand { "m4a" } else { "mp4" },
-                "confidence": "medium",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
-            serde_json::json!({
-                "input_type": "audio_video",
-                "media_kind": "audio_or_video",
-                "mime": "video/webm",
-                "extension": "webm",
-                "confidence": "medium",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
-            serde_json::json!({
-                "input_type": "image",
-                "media_kind": "image",
-                "mime": "image/png",
-                "extension": "png",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-            serde_json::json!({
-                "input_type": "image",
-                "media_kind": "image",
-                "mime": "image/jpeg",
-                "extension": "jpg",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-            serde_json::json!({
-                "input_type": "image",
-                "media_kind": "image",
-                "mime": "image/gif",
-                "extension": "gif",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-            serde_json::json!({
-                "input_type": "image",
-                "media_kind": "image",
-                "mime": "image/webp",
-                "extension": "webp",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(b"%PDF-") {
-            serde_json::json!({
-                "input_type": "document",
-                "media_kind": "document",
-                "mime": "application/pdf",
-                "extension": "pdf",
-                "confidence": "high",
-                "source": "magic_bytes",
-            })
-        } else if bytes.starts_with(b"PK\x03\x04") {
-            serde_json::json!({
-                "input_type": "archive",
-                "media_kind": "archive",
-                "mime": "application/zip",
-                "extension": "zip",
-                "confidence": "medium",
-                "source": "magic_bytes",
-            })
-        } else {
-            serde_json::json!({
-                "input_type": "unknown",
-                "media_kind": "unknown",
-                "mime": serde_json::Value::Null,
-                "extension": ext,
-                "confidence": "low",
-                "source": "unresolved",
-                "needs_deeper_inspection": true,
-            })
-        };
-
-        if let Some(obj) = detected.as_object_mut() {
-            obj.insert("filename".to_string(), serde_json::json!(filename));
-            obj.insert("size_bytes".to_string(), serde_json::json!(bytes.len()));
-            if let Some(content_type) = content_type {
-                obj.insert(
-                    "provided_content_type".to_string(),
-                    serde_json::json!(content_type),
-                );
-            }
-            if !lower_ct.is_empty() {
-                obj.insert(
-                    "provided_content_type_hint".to_string(),
-                    serde_json::json!(lower_ct),
-                );
-            }
-        }
-        detected
-    }
-
-    fn sanitize_missing_binary_candidate(raw: &str) -> Option<String> {
-        let candidate = raw
-            .trim()
-            .trim_matches(|ch: char| {
-                !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' && ch != '.' && ch != '+'
-            })
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("")
-            .trim();
-        if candidate.is_empty()
-            || candidate.len() > 80
-            || !candidate
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+'))
-        {
-            return None;
-        }
-        Some(candidate.to_string())
-    }
-
-    fn quoted_missing_binary_candidate(line: &str) -> Option<String> {
-        for quote in ['\'', '"'] {
-            let mut parts = line.split(quote);
-            while let Some(_) = parts.next() {
-                let Some(candidate) = parts.next() else {
-                    break;
-                };
-                if let Some(cleaned) = Self::sanitize_missing_binary_candidate(candidate) {
-                    return Some(cleaned);
-                }
-            }
-        }
-        None
-    }
-
-    fn detect_missing_binary_from_output(output: &str) -> Option<String> {
-        let lower = output.to_ascii_lowercase();
-        if let Some(idx) = lower.find("agentark_missing_binary:") {
-            let raw = output[idx + "AGENTARK_MISSING_BINARY:".len()..]
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim();
-            if let Some(candidate) = Self::sanitize_missing_binary_candidate(
-                raw.split_whitespace().next().unwrap_or(raw),
-            ) {
-                return Some(candidate);
-            }
-        }
-
-        for line in output.lines() {
-            let lower_line = line.to_ascii_lowercase();
-            for pattern in [": command not found", ": not found"] {
-                if let Some(idx) = lower_line.find(pattern) {
-                    let prefix = line[..idx].trim();
-                    let after_shell_prefix = prefix.rsplit(':').next().unwrap_or(prefix);
-                    let candidate = after_shell_prefix
-                        .split_whitespace()
-                        .last()
-                        .unwrap_or(after_shell_prefix);
-                    if let Some(cleaned) = Self::sanitize_missing_binary_candidate(candidate) {
-                        return Some(cleaned);
-                    }
-                }
-            }
-
-            if lower_line.contains("no such file or directory")
-                || lower_line.contains("is not recognized")
-            {
-                if let Some(candidate) = Self::quoted_missing_binary_candidate(line) {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    }
-
-    fn build_sandbox_transcription_code() -> &'static str {
-        r#"import json
-import pathlib
-import shutil
-import sys
-
-data_dir = pathlib.Path("/data")
-files = [p for p in data_dir.iterdir() if p.is_file()]
-if not files:
-    raise SystemExit("No uploaded audio file was injected into /data.")
-
-input_path = files[0]
-if shutil.which("ffmpeg") is None:
-    print("AGENTARK_MISSING_BINARY: ffmpeg")
-    raise SystemExit(127)
-
-import whisper
-
-model = whisper.load_model("base")
-result = model.transcribe(str(input_path))
-print(json.dumps({
-    "input_file": input_path.name,
-    "text": (result.get("text") or "").strip()
-}, ensure_ascii=False))
-"#
-    }
-
-    fn control_plane_executor_client() -> Option<ExecutorClient> {
-        let role = std::env::var("AGENTARK_STACK_ROLE")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase());
-        if !matches!(role.as_deref(), Some("control-plane" | "control")) {
-            return None;
-        }
-        let client = ExecutorClient::new(ExecutorClientConfig::from_env()).ok()?;
-        client.bearer_token()?;
-        Some(client)
-    }
-
-    async fn execute_code_remote(
-        &self,
-        arguments: &serde_json::Value,
-        auth_context: &ActionAuthorizationContext,
-    ) -> Result<String> {
-        let language = arguments["language"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'language' argument"))?
-            .to_string();
-        let code = arguments["code"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'code' argument"))?
-            .to_string();
-        let env = arguments
-            .get("env")
-            .and_then(|value| value.as_object())
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_string()))
-                    })
-                    .collect::<BTreeMap<String, String>>()
-            })
-            .unwrap_or_default();
-        let network_access = arguments
-            .get("network_access")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let execution_contract = arguments.get("execution_contract").cloned();
-        let file_payloads = self
-            .collect_code_execute_files(arguments)
-            .await?
-            .into_iter()
-            .map(|file| CodeExecuteFilePayload {
-                filename: file.filename,
-                bytes_b64: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    file.bytes,
-                ),
-            })
-            .collect::<Vec<_>>();
-        let executor = Self::control_plane_executor_client()
-            .ok_or_else(|| anyhow::anyhow!("Executor service is not configured"))?;
-        let response = executor
-            .execute_code(&crate::clients::CodeExecuteRequest {
-                language,
-                code,
-                files: Vec::new(),
-                file_payloads,
-                env,
-                network_access,
-                execution_contract,
-                auth_context: Some(auth_context.clone()),
-            })
-            .await?;
-        if response.status.eq_ignore_ascii_case("ok") {
-            if response.raw.is_object() {
-                return Ok(serde_json::to_string(&response.raw)?);
-            }
-            return Ok(serde_json::to_string(&serde_json::json!({
-                "output": response.output_text.unwrap_or_default(),
-                "error": serde_json::Value::Null,
-                "exit_code": 0,
-                "files": response.output_files,
-            }))?);
-        }
-        if response.raw.is_object() {
-            let error = response
-                .raw
-                .get("error")
-                .and_then(|value| value.as_str())
-                .unwrap_or(response.message.as_str());
-            anyhow::bail!("{}", error);
-        }
-        anyhow::bail!("{}", response.message);
-    }
-
-    fn remap_workspace_alias_path(&self, raw: &str) -> Option<PathBuf> {
-        let trimmed = raw.trim();
-        const PREFIXES: &[&str] = &["/workspace", "/repo", "/project"];
-        let matched = PREFIXES.iter().find(|prefix| {
-            trimmed == **prefix
-                || trimmed
-                    .strip_prefix(**prefix)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })?;
-        let workspace_root = self.workspace_root();
-        let suffix = trimmed.strip_prefix(matched).unwrap_or("");
-        let relative = suffix.trim_start_matches('/');
-        if relative.is_empty() {
-            Some(workspace_root)
-        } else {
-            Some(workspace_root.join(relative))
-        }
-    }
-
-    fn allowed_file_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![
-            self.data_dir().to_path_buf(),
-            self.actions_dir.clone(),
-            self.config_dir.clone(),
-            self.workspace_root(),
-        ];
-        if let Ok(cwd) = std::env::current_dir() {
-            roots.push(cwd);
-        }
-
-        let mut deduped = Vec::new();
-        for root in roots {
-            let candidate = root.canonicalize().unwrap_or(root);
-            if !deduped
-                .iter()
-                .any(|existing: &PathBuf| existing == &candidate)
-            {
-                deduped.push(candidate);
-            }
-        }
-        deduped
-    }
-
-    fn absolutize_tool_path(&self, raw: &str) -> Result<PathBuf> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("Path cannot be empty");
-        }
-
-        if let Some(remapped) = self.remap_workspace_alias_path(trimmed) {
-            return Ok(remapped);
-        }
-
-        let path = PathBuf::from(trimmed);
-        if path.is_absolute() {
-            Ok(path)
-        } else {
-            Ok(std::env::current_dir()?.join(path))
-        }
-    }
-
-    fn ensure_tool_path_allowed(&self, candidate: &Path) -> Result<()> {
-        let allowed_roots = self.allowed_file_roots();
-        if allowed_roots.iter().any(|root| candidate.starts_with(root)) {
-            return Ok(());
-        }
-        Err(ToolPathAccessError::OutsideAllowedRoots {
-            attempted_path: candidate.to_path_buf(),
-            allowed_roots,
-        }
-        .into())
-    }
-
-    fn tool_path_looks_sensitive_file(path: &Path) -> bool {
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            return false;
-        };
-        let lower = name.trim().to_ascii_lowercase();
-        lower == ".agentark_runtime_env"
-            || lower == ".env"
-            || lower.starts_with(".env.")
-            || lower.ends_with(".pem")
-            || lower.ends_with(".key")
-            || lower.ends_with(".p12")
-            || lower.ends_with(".pfx")
-            || lower == "secrets.json"
-            || lower == "credentials.json"
-    }
-
-    fn resolve_tool_read_path(&self, raw: &str) -> Result<PathBuf> {
-        let candidate = self.absolutize_tool_path(raw)?;
-        let resolved = candidate.canonicalize()?;
-        self.ensure_tool_path_allowed(&resolved)?;
-        if Self::tool_path_looks_sensitive_file(&resolved) {
-            anyhow::bail!(
-                "Refusing to read sensitive credential file '{}'. Use the secure credential store or app required_inputs flow instead.",
-                resolved.display()
-            );
-        }
-        Ok(resolved)
-    }
-
-    fn display_tool_path(path: &Path) -> String {
-        let text = path.display().to_string();
-        #[cfg(windows)]
-        {
-            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-                return format!(r"\\{}", rest);
-            }
-            if let Some(rest) = text.strip_prefix(r"\\?\") {
-                return rest.to_string();
-            }
-        }
-        text
-    }
-
-    fn resolve_tool_write_path(&self, raw: &str) -> Result<PathBuf> {
-        let candidate = self.absolutize_tool_path(raw)?;
-        if candidate.exists() {
-            let resolved = candidate.canonicalize()?;
-            self.ensure_tool_path_allowed(&resolved)?;
-            if resolved.is_dir() {
-                anyhow::bail!("Refusing to overwrite directory '{}'", resolved.display());
-            }
-            return Ok(resolved);
-        }
-
-        let mut missing_components = Vec::new();
-        let mut cursor = candidate.as_path();
-        while !cursor.exists() {
-            let name = cursor
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Path '{}' has no existing parent", raw))?;
-            missing_components.push(name.to_os_string());
-            cursor = cursor
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("Path '{}' has no existing parent", raw))?;
-        }
-
-        let mut rebuilt = cursor.canonicalize()?;
-        self.ensure_tool_path_allowed(&rebuilt)?;
-        for component in missing_components.into_iter().rev() {
-            let component_text = component.to_string_lossy();
-            if component_text.is_empty() || component_text == "." || component_text == ".." {
-                anyhow::bail!("Invalid path component '{}'", component_text);
-            }
-            rebuilt.push(component);
-        }
-        Ok(rebuilt)
-    }
-
-    fn tool_payload_resource_dir(&self) -> PathBuf {
-        self.data_dir().join(TOOL_PAYLOAD_RESOURCE_DIR)
-    }
-
-    fn parse_runtime_resource_ref(value: &serde_json::Value) -> Option<RuntimeResourceRef> {
-        serde_json::from_value::<RuntimeResourceRef>(value.clone()).ok()
-    }
-
-    fn payload_from_structured_completion(value: &serde_json::Value) -> Option<ToolPayload> {
-        let data = value.get("data").unwrap_or(value);
-        if let Some(resource) = data
-            .get("payload")
-            .and_then(|payload| payload.get("resource"))
-            .and_then(Self::parse_runtime_resource_ref)
-        {
-            return Some(ToolPayload::Resource {
-                resource,
-                metadata: Some(value.clone()),
-            });
-        }
-        if let Some(resource) = data
-            .get("resource")
-            .and_then(Self::parse_runtime_resource_ref)
-        {
-            return Some(ToolPayload::Resource {
-                resource,
-                metadata: Some(value.clone()),
-            });
-        }
-        if let Some(resource) = data
-            .get("saved_body")
-            .and_then(Self::runtime_resource_from_saved_body)
-        {
-            return Some(ToolPayload::Resource {
-                resource,
-                metadata: Some(value.clone()),
-            });
-        }
-        None
-    }
-
-    fn runtime_resource_from_saved_body(value: &serde_json::Value) -> Option<RuntimeResourceRef> {
-        let path = value.get("path")?.as_str()?.trim();
-        if path.is_empty() {
-            return None;
-        }
-        let bytes = value
-            .get("bytes")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        let mime = value
-            .get("content_type")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        Some(RuntimeResourceRef {
-            id: path.to_string(),
-            path: path.to_string(),
-            mime,
-            bytes,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            source_action: None,
-        })
-    }
-
-    fn runtime_resource_from_argument(value: &serde_json::Value) -> Option<RuntimeResourceRef> {
-        if let Some(resource) = Self::parse_runtime_resource_ref(value) {
-            return Some(resource);
-        }
-        let data = value.get("data").unwrap_or(value);
-        if let Some(resource) = data
-            .get("payload")
-            .and_then(|payload| payload.get("resource"))
-            .and_then(Self::parse_runtime_resource_ref)
-        {
-            return Some(resource);
-        }
-        if let Some(resource) = data
-            .get("resource")
-            .and_then(Self::parse_runtime_resource_ref)
-        {
-            return Some(resource);
-        }
-        if let Some(resource) = data
-            .get("saved_body")
-            .and_then(Self::runtime_resource_from_saved_body)
-        {
-            return Some(resource);
-        }
-        let text = value.as_str()?.trim();
-        if text.is_empty() {
-            return None;
-        }
-        if let Some(parsed) = text
-            .strip_prefix(TOOL_COMPLETION_MARKER)
-            .and_then(|payload| {
-                serde_json::from_str::<serde_json::Value>(
-                    payload.lines().next().unwrap_or(payload).trim(),
-                )
-                .ok()
-            })
-            .and_then(|parsed| Self::runtime_resource_from_argument(&parsed))
-        {
-            return Some(parsed);
-        }
-        if let Some(parsed) = serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|parsed| Self::runtime_resource_from_argument(&parsed))
-        {
-            return Some(parsed);
-        }
-        Some(RuntimeResourceRef {
-            id: text.to_string(),
-            path: text.to_string(),
-            mime: None,
-            bytes: 0,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            source_action: None,
-        })
-    }
-
-    async fn resolve_runtime_resource_path(
-        &self,
-        resource: &RuntimeResourceRef,
-    ) -> Result<PathBuf> {
-        let raw_path = resource.path.trim();
-        if !raw_path.is_empty() {
-            if let Ok(path) = self.resolve_tool_read_path(raw_path) {
-                return Ok(path);
-            }
-        }
-
-        let id = resource.id.trim();
-        if !id.is_empty() {
-            let base = self.tool_payload_resource_dir().join(id);
-            let resolved = base.canonicalize().map_err(|_| {
-                anyhow::anyhow!(
-                    "Resource '{}' is not available on disk. Re-fetch it before saving.",
-                    id
-                )
-            })?;
-            self.ensure_tool_path_allowed(&resolved)?;
-            if resolved.is_file() {
-                return Ok(resolved);
-            }
-            if resolved.is_dir() {
-                let mut files = Vec::new();
-                let mut entries = tokio::fs::read_dir(&resolved).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    if entry.file_type().await?.is_file() {
-                        files.push(entry.path().canonicalize()?);
-                    }
-                }
-                match files.len() {
-                    1 => return Ok(files.remove(0)),
-                    0 => anyhow::bail!("Resource '{}' contains no file payload.", id),
-                    _ => anyhow::bail!(
-                        "Resource '{}' contains multiple files; pass the exact resource path.",
-                        id
-                    ),
-                }
-            }
-        }
-
-        anyhow::bail!(
-            "Resource reference could not be resolved. Pass a ResourceRef object, resource id, or allowed resource path."
-        )
-    }
-
-    async fn file_write_payload_from_arguments(
-        &self,
-        arguments: &serde_json::Value,
-    ) -> Result<FileWritePayload> {
-        if let Some(value) = arguments
-            .get("source_resource")
-            .or_else(|| arguments.get("resource"))
-            .or_else(|| arguments.get("input_resource"))
-        {
-            let resource = Self::runtime_resource_from_argument(value).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "source_resource must be a ResourceRef object, structured resource payload, resource id, or resource path"
-                )
-            })?;
-            let path = self.resolve_runtime_resource_path(&resource).await?;
-            let bytes = tokio::fs::read(&path).await?;
-            return Ok(FileWritePayload {
-                bytes,
-                mime: resource.mime.clone(),
-                source_resource: Some(resource),
-            });
-        }
-
-        if let Some(source_path) = arguments
-            .get("source_path")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let path = self.resolve_tool_read_path(source_path)?;
-            return Ok(FileWritePayload {
-                bytes: tokio::fs::read(&path).await?,
-                mime: mime_guess::from_path(&path).first_raw().map(str::to_string),
-                source_resource: None,
-            });
-        }
-
-        if let Some(encoded) = arguments
-            .get("content_base64")
-            .or_else(|| arguments.get("bytes_b64"))
-            .and_then(|value| value.as_str())
-        {
-            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-                .map_err(|error| anyhow::anyhow!("Invalid base64 content: {}", error))?;
-            return Ok(FileWritePayload {
-                bytes,
-                mime: arguments
-                    .get("content_type")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string),
-                source_resource: None,
-            });
-        }
-
-        if let Some(content) = arguments.get("content").and_then(|value| value.as_str()) {
-            let trimmed = content.trim();
-            let structured_resource = trimmed
-                .strip_prefix(TOOL_COMPLETION_MARKER)
-                .and_then(|payload| {
-                    serde_json::from_str::<serde_json::Value>(
-                        payload.lines().next().unwrap_or(payload).trim(),
-                    )
-                    .ok()
-                })
-                .and_then(|parsed| Self::runtime_resource_from_argument(&parsed))
-                .or_else(|| {
-                    serde_json::from_str::<serde_json::Value>(trimmed)
-                        .ok()
-                        .and_then(|parsed| Self::runtime_resource_from_argument(&parsed))
-                });
-            if let Some(resource) = structured_resource {
-                let path = self.resolve_runtime_resource_path(&resource).await?;
-                let bytes = tokio::fs::read(&path).await?;
-                return Ok(FileWritePayload {
-                    bytes,
-                    mime: resource.mime.clone(),
-                    source_resource: Some(resource),
-                });
-            }
-            return Ok(FileWritePayload {
-                bytes: content.as_bytes().to_vec(),
-                mime: arguments
-                    .get("content_type")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string),
-                source_resource: None,
-            });
-        }
-
-        anyhow::bail!(
-            "Missing file body. Provide content, content_base64, source_resource, or source_path."
-        )
-    }
-
-    fn file_write_label(path: &Path) -> String {
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "managed-file".to_string())
-    }
-
-    fn file_write_document_index_requested(arguments: &serde_json::Value) -> bool {
-        for key in ["document_visible", "index_document"] {
-            if let Some(value) = arguments.get(key).and_then(|value| value.as_bool()) {
-                return value;
-            }
-        }
-        false
-    }
-
-    fn duplicate_policy_allows_create(arguments: &serde_json::Value) -> bool {
-        arguments
-            .get("allow_duplicate")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-            || arguments
-                .get("duplicate_policy")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .is_some_and(|value| value == "create_new")
-    }
-
-    fn fingerprint_bytes(bytes: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hex::encode(hasher.finalize())
-    }
-
-    fn document_chunks_from_text(content: &str, chunk_size: usize) -> Vec<String> {
-        let chars = content.chars().collect::<Vec<_>>();
-        chars
-            .chunks(chunk_size.max(1))
-            .map(|chunk| chunk.iter().collect::<String>())
-            .filter(|chunk| !chunk.trim().is_empty())
-            .collect()
-    }
-
-    fn generated_file_metadata_chunk(
-        filename: &str,
-        content_type: &str,
-        file_size: usize,
-        content_fingerprint: &str,
-        text_content_indexed: bool,
-        source_resource: Option<&RuntimeResourceRef>,
-    ) -> String {
-        let mut lines = vec![
-            "artifact_kind: managed_file".to_string(),
-            format!("filename: {}", filename),
-            format!("content_type: {}", content_type),
-            format!("file_size_bytes: {}", file_size),
-            format!("sha256: {}", content_fingerprint),
-            format!("text_content_indexed: {}", text_content_indexed),
-        ];
-        if let Some(resource) = source_resource {
-            lines.push(format!("source_resource_id: {}", resource.id));
-            if let Some(mime) = resource
-                .mime
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                lines.push(format!("source_resource_content_type: {}", mime));
-            }
-            if let Some(source_action) = resource
-                .source_action
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                lines.push(format!("source_action: {}", source_action));
-            }
-        }
-        lines.join("\n")
-    }
-
-    async fn find_duplicate_generated_document(
-        &self,
-        filename: &str,
-        content_type: &str,
-        file_size: u64,
-        content_fingerprint: &str,
-    ) -> Option<IndexedDocumentArtifact> {
-        let storage = self.storage.as_ref()?;
-        let docs = storage.list_documents_for_search(None).await.ok()?;
-        let candidates = docs
-            .into_iter()
-            .filter(|doc| {
-                doc.file_size == file_size.min(i64::MAX as u64) as i64
-                    && doc.content_type == content_type
-            })
-            .collect::<Vec<_>>();
-        for doc in candidates {
-            let Ok(chunks) = storage.get_document_chunks(&doc.id).await else {
-                continue;
-            };
-            let fingerprint_line = format!("sha256: {}", content_fingerprint);
-            let has_matching_fingerprint = chunks.iter().any(|chunk| {
-                chunk
-                    .content
-                    .lines()
-                    .any(|line| line.trim() == fingerprint_line.as_str())
-            });
-            if has_matching_fingerprint {
-                let metadata_only = chunks
-                    .iter()
-                    .any(|chunk| chunk.content.contains("text_content_indexed: false"));
-                return Some(IndexedDocumentArtifact {
-                    id: doc.id,
-                    filename: if doc.filename.trim().is_empty() {
-                        filename.to_string()
-                    } else {
-                        doc.filename
-                    },
-                    content_type: doc.content_type,
-                    chunk_count: chunks.len(),
-                    file_size,
-                    url: "/ui/documents".to_string(),
-                    duplicate_skipped: true,
-                    content_fingerprint: content_fingerprint.to_string(),
-                    metadata_only,
-                    index_mode: if metadata_only {
-                        "metadata".to_string()
-                    } else {
-                        "metadata_and_content".to_string()
-                    },
-                });
-            }
-        }
-        None
-    }
-
-    async fn index_file_write_document_if_requested(
-        &self,
-        path: &Path,
-        arguments: &serde_json::Value,
-        payload: &FileWritePayload,
-        mime: Option<&str>,
-    ) -> Option<IndexedDocumentArtifact> {
-        if !Self::file_write_document_index_requested(arguments) {
-            return None;
-        }
-        let storage = self.storage.clone()?;
-        let filename = Self::file_write_label(path);
-        let content_type = mime
-            .map(str::to_string)
-            .unwrap_or_else(|| "text/plain".to_string());
-        let content_fingerprint = Self::fingerprint_bytes(&payload.bytes);
-        let text_content = std::str::from_utf8(&payload.bytes)
-            .ok()
-            .map(str::trim)
-            .filter(|content| !content.is_empty() && payload.bytes.len() <= 2_000_000)
-            .map(str::to_string);
-        let text_content_indexed = text_content.is_some();
-        let mut chunks = vec![Self::generated_file_metadata_chunk(
-            &filename,
-            &content_type,
-            payload.bytes.len(),
-            &content_fingerprint,
-            text_content_indexed,
-            payload.source_resource.as_ref(),
-        )];
-        if let Some(content) = text_content.as_deref() {
-            chunks.extend(Self::document_chunks_from_text(content, 1000));
-        }
-        if !Self::duplicate_policy_allows_create(arguments) {
-            if let Some(duplicate) = self
-                .find_duplicate_generated_document(
-                    &filename,
-                    &content_type,
-                    payload.bytes.len() as u64,
-                    &content_fingerprint,
-                )
-                .await
-            {
-                tracing::info!(
-                    path = %path.display(),
-                    document_id = %duplicate.id,
-                    "Skipped generated document ingestion because identical content is already indexed"
-                );
-                return Some(duplicate);
-            }
-        }
-        let path_text = path.display().to_string();
-        let id_prefix = format!(
-            "generated-file:{}:",
-            Self::fingerprint_text(&[path_text.as_str()])
-        );
-        let doc_id = format!("{}{}", id_prefix, uuid::Uuid::new_v4());
-        let doc = crate::storage::entities::document::Model {
-            id: doc_id.clone(),
-            filename: filename.clone(),
-            content_type: content_type.clone(),
-            project_id: None,
-            chunk_count: chunks.len() as i32,
-            file_size: payload.bytes.len().min(i64::MAX as usize) as i64,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        let mut chunk_rows = chunks
-            .iter()
-            .enumerate()
-            .map(
-                |(index, chunk)| crate::storage::entities::document_chunk::Model {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    document_id: doc_id.clone(),
-                    chunk_index: index as i32,
-                    content: chunk.clone(),
-                    embedding: None,
-                },
-            )
-            .collect::<Vec<_>>();
-        if let Err(error) = crate::core::document_search::embed_document_chunks(
-            self.embedding_client.as_deref(),
-            &filename,
-            &content_type,
-            None,
-            &mut chunk_rows,
-        )
-        .await
-        {
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "Generated managed file document embedding failed"
-            );
-        }
-        if let Err(error) = storage
-            .replace_documents_by_id_prefix(&id_prefix, &[(doc, chunk_rows)])
-            .await
-        {
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "Failed to index generated managed file in Documents"
-            );
-            return None;
-        }
-        Some(IndexedDocumentArtifact {
-            id: doc_id,
-            filename,
-            content_type,
-            chunk_count: chunks.len(),
-            file_size: payload.bytes.len() as u64,
-            url: "/ui/documents".to_string(),
-            duplicate_skipped: false,
-            content_fingerprint,
-            metadata_only: !text_content_indexed,
-            index_mode: if text_content_indexed {
-                "metadata_and_content".to_string()
-            } else {
-                "metadata".to_string()
-            },
-        })
-    }
-
-    fn file_write_completion_output(
-        &self,
-        path: &Path,
-        payload: &FileWritePayload,
-        document: Option<&IndexedDocumentArtifact>,
-    ) -> String {
-        let path_text = path.display().to_string();
-        let label = Self::file_write_label(path);
-        let mime = payload
-            .mime
-            .clone()
-            .or_else(|| mime_guess::from_path(path).first_raw().map(str::to_string));
-        let resource = RuntimeResourceRef {
-            id: format!("file:{}", Self::fingerprint_text(&[path_text.as_str()])),
-            path: path_text.clone(),
-            mime: mime.clone(),
-            bytes: payload.bytes.len() as u64,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            source_action: Some("file_write".to_string()),
-        };
-        let detail = if document
-            .as_ref()
-            .is_some_and(|document| document.duplicate_skipped)
-        {
-            format!(
-                "Saved managed file {}. Identical document already exists; skipped Documents ingestion.",
-                label
-            )
-        } else if document
-            .as_ref()
-            .is_some_and(|document| document.metadata_only)
-        {
-            format!(
-                "Saved managed file {} and registered its metadata in Documents.",
-                label
-            )
-        } else if document.is_some() {
-            format!(
-                "Saved managed file {} and indexed its metadata and text content in Documents.",
-                label
-            )
-        } else {
-            format!("Saved managed file {}.", label)
-        };
-        let artifact_label = label.clone();
-        let write_label = label;
-        let artifact_mime = mime.clone();
-        let write_mime = mime.clone();
-        structured_tool_completion_output(
-            "file_write",
-            "completed",
-            detail,
-            serde_json::json!({
-                "payload": {
-                    "kind": "resource",
-                    "resource": resource,
-                },
-                "artifact": {
-                    "kind": "managed_file",
-                    "label": artifact_label,
-                    "bytes": payload.bytes.len(),
-                    "content_type": artifact_mime,
-                },
-                "document": document,
-                "write": {
-                    "label": write_label,
-                    "bytes": payload.bytes.len(),
-                    "content_type": write_mime,
-                    "source_resource": payload.source_resource,
-                }
-            }),
-        )
-    }
-
-    pub fn tool_payload_from_legacy_output(_action_name: &str, output: String) -> ToolPayload {
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            return ToolPayload::Empty;
-        }
-        if let Some(payload) = trimmed
-            .strip_prefix(TOOL_COMPLETION_MARKER)
-            .and_then(|payload| {
-                serde_json::from_str::<serde_json::Value>(
-                    payload.lines().next().unwrap_or(payload).trim(),
-                )
-                .ok()
-            })
-        {
-            if let Some(typed) = Self::payload_from_structured_completion(&payload) {
-                return typed;
-            }
-            return ToolPayload::Structured(payload);
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(typed) = Self::payload_from_structured_completion(&value) {
-                return typed;
-            }
-            return ToolPayload::Structured(value);
-        }
-        ToolPayload::Text(output)
-    }
-
-    async fn persist_tool_payload_if_needed(
-        &self,
-        mut payload: ToolPayload,
-        hints: PersistHints,
-    ) -> Result<ToolPayload> {
-        let ToolPayload::Bytes {
-            mime,
-            body,
-            suggested_name,
-        } = payload
-        else {
-            return Ok(payload);
-        };
-        if !hints.force_resource
-            && body.len() <= TOOL_PAYLOAD_INLINE_BYTES
-            && !runtime_response_body_is_probably_binary(mime.as_deref().unwrap_or(""), &body)
-        {
-            payload = ToolPayload::Text(String::from_utf8_lossy(&body).to_string());
-            return Ok(payload);
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        let name = suggested_name
-            .or(hints.suggested_name)
-            .map(|value| Self::normalize_generated_action_name(&value))
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| id.clone());
-        let target = self.tool_payload_resource_dir().join(&id).join(name);
-        if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&target, &body).await?;
-        Self::set_private_file_permissions(&target).await?;
-        let resource = RuntimeResourceRef {
-            id,
-            path: target.display().to_string(),
-            mime: mime.or(hints.mime),
-            bytes: body.len() as u64,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            source_action: hints.source_action,
-        };
-        Ok(ToolPayload::Resource {
-            resource,
-            metadata: None,
-        })
-    }
-
-    pub fn render_tool_payload_for_legacy(action_name: &str, payload: ToolPayload) -> String {
-        match payload {
-            ToolPayload::Text(text) => text,
-            ToolPayload::Structured(value) => {
-                if value.get("tool").and_then(|value| value.as_str()).is_some()
-                    && value
-                        .get("status")
-                        .and_then(|value| value.as_str())
-                        .is_some()
-                {
-                    format!("{}{}", TOOL_COMPLETION_MARKER, value)
-                } else {
-                    structured_tool_completion_output(
-                        action_name,
-                        "completed",
-                        "Structured tool payload.",
-                        serde_json::json!({
-                            "payload": {
-                                "kind": "structured",
-                                "value": value,
-                            }
-                        }),
-                    )
-                }
-            }
-            ToolPayload::Bytes {
-                mime,
-                body,
-                suggested_name,
-            } => structured_tool_completion_output(
-                action_name,
-                "partial",
-                "Tool produced raw bytes that were not persisted.",
-                serde_json::json!({
-                    "payload": {
-                        "kind": "bytes",
-                        "mime": mime,
-                        "bytes": body.len(),
-                        "suggested_name": suggested_name,
-                    },
-                    "body_quality": {
-                        "body_bytes": body.len(),
-                        "binary": true,
-                        "degenerate": true,
-                        "reason": "bytes_not_persisted"
-                    }
-                }),
-            ),
-            ToolPayload::Resource { resource, metadata } => structured_tool_completion_output(
-                action_name,
-                "completed",
-                format!("Tool produced resource {}.", resource.path),
-                serde_json::json!({
-                    "payload": {
-                        "kind": "resource",
-                        "resource": resource,
-                    },
-                    "metadata": metadata,
-                }),
-            ),
-            ToolPayload::Empty => structured_tool_completion_output(
-                action_name,
-                "completed",
-                "Tool completed with no payload.",
-                serde_json::json!({
-                    "payload": {
-                        "kind": "empty"
-                    }
-                }),
-            ),
-        }
-    }
-
-    fn parse_tool_string_list(arguments: &serde_json::Value, key: &str) -> Result<Vec<String>> {
-        let Some(value) = arguments.get(key) else {
-            return Ok(Vec::new());
-        };
-        match value {
-            serde_json::Value::String(item) => Ok(item
-                .trim()
-                .is_empty()
-                .then(Vec::new)
-                .unwrap_or_else(|| vec![item.trim().to_string()])),
-            serde_json::Value::Array(items) => items
-                .iter()
-                .map(|item| {
-                    item.as_str()
-                        .map(str::trim)
-                        .filter(|item| !item.is_empty())
-                        .map(str::to_string)
-                        .ok_or_else(|| anyhow::anyhow!("{} entries must be non-empty strings", key))
-                })
-                .collect(),
-            _ => anyhow::bail!("{} must be a string or an array of strings", key),
-        }
-    }
-
-    fn tool_path_relative_to(root: &Path, path: &Path) -> String {
-        path.strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
-            .replace('\\', "/")
-    }
-
-    fn compile_tool_globs(patterns: &[String]) -> Result<Vec<Regex>> {
-        patterns
-            .iter()
-            .map(|pattern| Self::compile_tool_glob(pattern))
-            .collect()
-    }
-
-    fn compile_tool_glob(pattern: &str) -> Result<Regex> {
-        let normalized = pattern.trim().replace('\\', "/");
-        if normalized.is_empty() {
-            anyhow::bail!("Glob patterns cannot be empty");
-        }
-        let mut regex = String::from("^");
-        let mut chars = normalized.chars().peekable();
-        while let Some(ch) = chars.next() {
-            match ch {
-                '*' => {
-                    if chars.peek() == Some(&'*') {
-                        chars.next();
-                        if chars.peek() == Some(&'/') {
-                            chars.next();
-                            regex.push_str("(?:.*/)?");
-                        } else {
-                            regex.push_str(".*");
-                        }
-                    } else {
-                        regex.push_str("[^/]*");
-                    }
-                }
-                '?' => regex.push_str("[^/]"),
-                '/' => regex.push('/'),
-                _ => regex.push_str(&regex::escape(&ch.to_string())),
-            }
-        }
-        regex.push('$');
-        Regex::new(&regex).with_context(|| format!("Invalid glob pattern '{}'", pattern.trim()))
-    }
-
-    fn tool_globs_match(patterns: &[Regex], relative_path: &str, file_name: &str) -> bool {
-        !patterns.is_empty()
-            && patterns
-                .iter()
-                .any(|pattern| pattern.is_match(relative_path) || pattern.is_match(file_name))
-    }
-
-    fn tool_text_contains(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
-        if needle.is_empty() {
-            return false;
-        }
-        if case_sensitive {
-            haystack.contains(needle)
-        } else {
-            haystack.to_lowercase().contains(&needle.to_lowercase())
-        }
-    }
-
-    async fn execute_file_search(&self, arguments: &serde_json::Value) -> Result<String> {
-        let root = if let Some(raw) = arguments
-            .get("root")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            self.resolve_tool_read_path(raw)?
-        } else {
-            let root = self.workspace_root();
-            let resolved = root.canonicalize().unwrap_or(root);
-            self.ensure_tool_path_allowed(&resolved)?;
-            resolved
-        };
-        if !root.is_dir() {
-            anyhow::bail!("file_search root must be an existing directory");
-        }
-
-        let mode = arguments
-            .get("mode")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("auto")
-            .to_ascii_lowercase();
-        if !matches!(mode.as_str(), "auto" | "filename" | "content" | "both") {
-            anyhow::bail!("file_search mode must be auto, filename, content, or both");
-        }
-
-        let query = arguments
-            .get("query")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let filename_query = arguments
-            .get("filename_query")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or_else(|| if mode != "content" { query } else { None })
-            .map(str::to_string);
-        let content_query = arguments
-            .get("content_query")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or_else(|| if mode != "filename" { query } else { None })
-            .map(str::to_string);
-        let include_globs = Self::parse_tool_string_list(arguments, "globs")?;
-        let exclude_globs = Self::parse_tool_string_list(arguments, "exclude_globs")?;
-        if filename_query.is_none() && content_query.is_none() && include_globs.is_empty() {
-            anyhow::bail!("file_search requires query, filename_query, content_query, or globs");
-        }
-
-        let include_patterns = Self::compile_tool_globs(&include_globs)?;
-        let exclude_patterns = Self::compile_tool_globs(&exclude_globs)?;
-        let case_sensitive = arguments
-            .get("case_sensitive")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let context_lines = arguments
-            .get("context_lines")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(2)
-            .min(8) as usize;
-        let limit = arguments
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(50)
-            .clamp(1, 200) as usize;
-        let max_file_bytes = arguments
-            .get("max_file_bytes")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(1_000_000)
-            .clamp(4_096, 2_000_000);
-
-        let mut matches = Vec::<serde_json::Value>::new();
-        let mut searched_files = 0usize;
-        let mut content_scanned_files = 0usize;
-        let mut skipped_sensitive = 0usize;
-        let mut skipped_large = 0usize;
-        let mut skipped_binary = 0usize;
-        let mut truncated = false;
-
-        for entry in walkdir::WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            if matches.len() >= limit {
-                truncated = true;
-                break;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let resolved = match path.canonicalize() {
-                Ok(path) => path,
-                Err(_) => continue,
-            };
-            if self.ensure_tool_path_allowed(&resolved).is_err() {
-                continue;
-            }
-            if Self::tool_path_looks_sensitive_file(&resolved) {
-                skipped_sensitive += 1;
-                continue;
-            }
-
-            let relative_path = Self::tool_path_relative_to(&root, &resolved);
-            let file_name = resolved
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_string();
-            if (!include_patterns.is_empty()
-                && !Self::tool_globs_match(&include_patterns, &relative_path, &file_name))
-                || Self::tool_globs_match(&exclude_patterns, &relative_path, &file_name)
-            {
-                continue;
-            }
-
-            searched_files += 1;
-            if let Some(query) = filename_query.as_deref() {
-                if Self::tool_text_contains(&relative_path, query, case_sensitive)
-                    || Self::tool_text_contains(&file_name, query, case_sensitive)
-                {
-                    matches.push(serde_json::json!({
-                        "match_type": "filename",
-                        "path": resolved.display().to_string(),
-                        "relative_path": relative_path.clone(),
-                        "file_name": file_name.clone(),
-                    }));
-                    if matches.len() >= limit {
-                        truncated = true;
-                        break;
-                    }
-                }
-            } else if content_query.is_none() && !include_globs.is_empty() {
-                matches.push(serde_json::json!({
-                    "match_type": "path",
-                    "path": resolved.display().to_string(),
-                    "relative_path": relative_path.clone(),
-                    "file_name": file_name.clone(),
-                }));
-                if matches.len() >= limit {
-                    truncated = true;
-                    break;
-                }
-            }
-
-            let Some(query) = content_query.as_deref() else {
-                continue;
-            };
-            let metadata = match std::fs::metadata(&resolved) {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if metadata.len() > max_file_bytes {
-                skipped_large += 1;
-                continue;
-            }
-            let bytes = match std::fs::read(&resolved) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
-            if bytes.iter().any(|byte| *byte == 0) {
-                skipped_binary += 1;
-                continue;
-            }
-            let text = match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(_) => {
-                    skipped_binary += 1;
-                    continue;
-                }
-            };
-            content_scanned_files += 1;
-            let lines = text.lines().collect::<Vec<_>>();
-            for (index, line) in lines.iter().enumerate() {
-                if !Self::tool_text_contains(line, query, case_sensitive) {
-                    continue;
-                }
-                let before_start = index.saturating_sub(context_lines);
-                let after_end = (index + 1 + context_lines).min(lines.len());
-                matches.push(serde_json::json!({
-                    "match_type": "content",
-                    "path": resolved.display().to_string(),
-                    "relative_path": relative_path.clone(),
-                    "line_number": index + 1,
-                    "line": runtime_truncate_chars(line.trim_end(), 800),
-                    "context_before": lines[before_start..index]
-                        .iter()
-                        .map(|line| runtime_truncate_chars(line.trim_end(), 800))
-                        .collect::<Vec<_>>(),
-                    "context_after": lines[(index + 1)..after_end]
-                        .iter()
-                        .map(|line| runtime_truncate_chars(line.trim_end(), 800))
-                        .collect::<Vec<_>>(),
-                }));
-                if matches.len() >= limit {
-                    truncated = true;
-                    break;
-                }
-            }
-            if truncated {
-                break;
-            }
-        }
-
-        let detail = format!(
-            "Found {} match(es) under {}. Searched {} file(s).",
-            matches.len(),
-            root.display(),
-            searched_files
-        );
-        Ok(structured_tool_completion_output(
-            "file_search",
-            "completed",
-            detail,
-            serde_json::json!({
-                "root": root.display().to_string(),
-                "query": query,
-                "filename_query": filename_query,
-                "content_query": content_query,
-                "globs": include_globs,
-                "exclude_globs": exclude_globs,
-                "case_sensitive": case_sensitive,
-                "context_lines": context_lines,
-                "limit": limit,
-                "truncated": truncated,
-                "searched_files": searched_files,
-                "content_scanned_files": content_scanned_files,
-                "skipped_sensitive": skipped_sensitive,
-                "skipped_large": skipped_large,
-                "skipped_binary": skipped_binary,
-                "matches": matches,
-            }),
-        ))
-    }
-
-    fn parse_file_patch_requests(arguments: &serde_json::Value) -> Result<Vec<(String, String)>> {
-        if let Some(items) = arguments.get("patches") {
-            let items = items
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("patches must be an array"))?;
-            if items.is_empty() {
-                anyhow::bail!("patches cannot be empty");
-            }
-            return items
-                .iter()
-                .map(|item| {
-                    let object = item
-                        .as_object()
-                        .ok_or_else(|| anyhow::anyhow!("patches entries must be objects"))?;
-                    let path = object
-                        .get("path")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("patches entries require path"))?;
-                    let patch = object
-                        .get("patch")
-                        .and_then(|value| value.as_str())
-                        .filter(|value| !value.trim().is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("patches entries require patch"))?;
-                    Ok((path.to_string(), patch.to_string()))
-                })
-                .collect();
-        }
-
-        let path = arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("file_patch requires path or patches"))?;
-        let patch = arguments
-            .get("patch")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("file_patch requires patch"))?;
-        Ok(vec![(path.to_string(), patch.to_string())])
-    }
-
-    async fn execute_file_patch(&self, arguments: &serde_json::Value) -> Result<String> {
-        let requests = Self::parse_file_patch_requests(arguments)?;
-        let dry_run = arguments
-            .get("dry_run")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let mut seen = BTreeSet::<PathBuf>::new();
-        let mut changed_files = Vec::<serde_json::Value>::new();
-
-        for (raw_path, patch) in requests {
-            let path = self.resolve_tool_read_path(&raw_path)?;
-            if !seen.insert(path.clone()) {
-                anyhow::bail!("file_patch received duplicate target '{}'", raw_path);
-            }
-            if !path.is_file() {
-                anyhow::bail!(
-                    "file_patch target must be an existing file: {}",
-                    path.display()
-                );
-            }
-            let before = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            let after = crate::actions::app::apply_unified_diff_to_text(&before, &patch)
-                .with_context(|| format!("Failed to apply unified diff to {}", path.display()))?;
-            let changed = before != after;
-            if changed && !dry_run {
-                tokio::fs::write(&path, after.as_bytes())
-                    .await
-                    .with_context(|| format!("Failed to write patched file {}", path.display()))?;
-            }
-            changed_files.push(serde_json::json!({
-                "path": path.display().to_string(),
-                "requested_path": raw_path,
-                "changed": changed,
-                "dry_run": dry_run,
-                "bytes_before": before.len(),
-                "bytes_after": after.len(),
-                "lines_before": before.lines().count(),
-                "lines_after": after.lines().count(),
-                "context_verified": true,
-            }));
-        }
-
-        let changed_count = changed_files
-            .iter()
-            .filter(|file| {
-                file.get("changed")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false)
-            })
-            .count();
-        let detail = if dry_run {
-            format!(
-                "Validated {} patch target(s); {} would change.",
-                changed_files.len(),
-                changed_count
-            )
-        } else {
-            format!(
-                "Patched {} file(s); {} file(s) changed.",
-                changed_files.len(),
-                changed_count
-            )
-        };
-        Ok(structured_tool_completion_output(
-            "file_patch",
-            "completed",
-            detail,
-            serde_json::json!({
-                "dry_run": dry_run,
-                "changed_count": changed_count,
-                "changed_files": changed_files,
-            }),
-        ))
-    }
-
-    async fn execute_file_delete(&self, arguments: &serde_json::Value) -> Result<String> {
-        let raw_path = arguments["path"]
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("file_delete requires path"))?;
-        let path = self.resolve_tool_write_path(raw_path)?;
-        if Self::tool_path_looks_sensitive_file(&path) {
-            anyhow::bail!(
-                "Refusing to delete sensitive credential file '{}'. Use the secure credential store instead.",
-                path.display()
-            );
-        }
-        let label = Self::file_write_label(&path);
-        if !path.exists() {
-            return Ok(structured_tool_completion_output(
-                "file_delete",
-                "completed",
-                format!("File `{}` is already absent.", label),
-                serde_json::json!({
-                    "status": "not_found",
-                    "deleted": false,
-                    "label": label,
-                    "requested_path": raw_path,
-                    "terminal_observation": true,
-                }),
-            ));
-        }
-        if path.is_dir() {
-            anyhow::bail!(
-                "file_delete target must be a file, not a directory: {}",
-                path.display()
-            );
-        }
-        tokio::fs::remove_file(&path).await?;
-        Ok(structured_tool_completion_output(
-            "file_delete",
-            "completed",
-            format!("Deleted file `{}`.", label),
-            serde_json::json!({
-                "status": "deleted",
-                "deleted": true,
-                "label": label,
-                "requested_path": raw_path,
-            }),
-        ))
-    }
-
     fn browser_session_id(arguments: &serde_json::Value) -> Result<&str> {
         arguments
             .get("session_id")
@@ -3043,18 +1206,20 @@ print(json.dumps({
             )));
         };
         match crate::core::BrowserProfileControlPlane::resolve(storage, &selector).await? {
-            crate::core::BrowserProfileResolveOutcome::Resolved { profile, candidates } => {
+            crate::core::BrowserProfileResolveOutcome::Resolved {
+                profile,
+                candidates,
+            } => {
                 let _ = candidates;
                 Ok(Ok((
-                    crate::integrations::browser::BrowserSessionCreateOptions {
-                        profile_id: Some(profile.id.clone()),
-                        profile_name: Some(profile.name.clone()),
-                    },
+                    crate::integrations::browser::BrowserSessionCreateOptions::from_browser_profile(
+                        &profile,
+                    ),
                     Some(profile),
                 )))
             }
-            crate::core::BrowserProfileResolveOutcome::Ambiguous { candidates } => Ok(Err(
-                structured_tool_completion_output(
+            crate::core::BrowserProfileResolveOutcome::Ambiguous { candidates } => {
+                Ok(Err(structured_tool_completion_output(
                     action_name,
                     "needs_input",
                     "More than one saved browser profile matches the requested profile. Choose one profile id or name.",
@@ -3064,10 +1229,10 @@ print(json.dumps({
                         "profile_selector": selector,
                         "candidates": Self::browser_profile_candidates_json(&candidates),
                     }),
-                ),
-            )),
-            crate::core::BrowserProfileResolveOutcome::NotFound { candidates } => Ok(Err(
-                structured_tool_completion_output(
+                )))
+            }
+            crate::core::BrowserProfileResolveOutcome::NotFound { candidates } => {
+                Ok(Err(structured_tool_completion_output(
                     action_name,
                     "needs_input",
                     "No saved browser profile matched the requested profile.",
@@ -3077,8 +1242,8 @@ print(json.dumps({
                         "profile_selector": selector,
                         "candidates": Self::browser_profile_candidates_json(&candidates),
                     }),
-                ),
-            )),
+                )))
+            }
         }
     }
 
@@ -3103,11 +1268,13 @@ print(json.dumps({
                 if action != "start_session" {
                     anyhow::bail!("browser_auto supports action=start_session");
                 }
-                let (create_options, profile) =
-                    match self.browser_session_create_options(action_name, arguments).await? {
-                        Ok(value) => value,
-                        Err(output) => return Ok(output),
-                    };
+                let (create_options, profile) = match self
+                    .browser_session_create_options(action_name, arguments)
+                    .await?
+                {
+                    Ok(value) => value,
+                    Err(output) => return Ok(output),
+                };
                 let session_id = browser.create_session_with_options(&create_options).await?;
                 let url = arguments
                     .get("url")
@@ -3195,7 +1362,8 @@ print(json.dumps({
                             Ok(value) => value,
                             Err(output) => return Ok(output),
                         };
-                        let session_id = browser.create_session_with_options(&create_options).await?;
+                        let session_id =
+                            browser.create_session_with_options(&create_options).await?;
                         if let (Some(storage), Some(profile)) =
                             (self.storage.as_ref(), profile.as_ref())
                         {
@@ -3231,6 +1399,12 @@ print(json.dumps({
             }
             "browser_click" => {
                 let session_id = Self::browser_session_id(arguments)?;
+                let element_index = arguments
+                    .get("element_index")
+                    .or_else(|| arguments.get("index"))
+                    .and_then(|value| value.as_u64())
+                    .map(|value| usize::try_from(value).context("element_index is out of range"))
+                    .transpose()?;
                 let selector = arguments.get("selector").and_then(|value| value.as_str());
                 let text = arguments.get("text").and_then(|value| value.as_str());
                 let x = arguments
@@ -3243,10 +1417,18 @@ print(json.dumps({
                     .and_then(|value| value.as_i64())
                     .map(|value| i32::try_from(value).context("y is out of range"))
                     .transpose()?;
-                if selector.is_none() && text.is_none() && (x.is_none() || y.is_none()) {
-                    anyhow::bail!("browser_click requires selector, text, or both x and y");
+                if element_index.is_none()
+                    && selector.is_none()
+                    && text.is_none()
+                    && (x.is_none() || y.is_none())
+                {
+                    anyhow::bail!(
+                        "browser_click requires element_index, selector, text, or both x and y"
+                    );
                 }
-                browser.click(session_id, selector, text, x, y).await?;
+                browser
+                    .click(session_id, selector, text, x, y, element_index)
+                    .await?;
                 Ok(structured_tool_completion_output(
                     action_name,
                     "completed",
@@ -5651,16 +3833,14 @@ print(json.dumps({
                     RuntimeConfig::default()
                 }
             }
+        } else if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            toml::from_str(&content)?
         } else {
-            if config_path.exists() {
-                let content = std::fs::read_to_string(&config_path)?;
-                toml::from_str(&content)?
-            } else {
-                let default = RuntimeConfig::default();
-                let content = toml::to_string_pretty(&default)?;
-                std::fs::write(&config_path, content)?;
-                default
-            }
+            let default = RuntimeConfig::default();
+            let content = toml::to_string_pretty(&default)?;
+            std::fs::write(&config_path, content)?;
+            default
         };
 
         // User-owned skills go in the data dir and survive release updates.
@@ -5867,7 +4047,7 @@ print(json.dumps({
     fn permission_display_label(permission: &crate::security::action_guard::Permission) -> String {
         permission
             .to_string()
-            .split(|ch: char| ch == '_' || ch == '-')
+            .split(['_', '-'])
             .filter(|part| !part.trim().is_empty())
             .collect::<Vec<_>>()
             .join(" ")
@@ -6605,6 +4785,14 @@ Optional inputs:
                         "type": "string",
                         "description": "Optional title for the reminder"
                     },
+                    "in_app_title": {
+                        "type": "string",
+                        "description": "Optional title for the local notification record. Does not change the external message body."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional semantic notification source/type for the local notification record, such as reminder. Scheduled reminder tasks set this automatically."
+                    },
                     "delivery_channel": {
                         "type": "string",
                         "description": "Optional delivery route for direct chat/API notification requests. Use preferred for the runtime fallback chain, in_app for local-only delivery, or a requested channel such as telegram or whatsapp. Scheduled tasks should use schedule_task.report_to instead."
@@ -6626,7 +4814,7 @@ Optional inputs:
         // Scheduler
         self.register_builtin_action(ActionDef {
             name: "schedule_task".to_string(),
-            description: "Schedule or update durable recurring/one-time AgentArk task records whose execution is intentionally deferred until specified times or recurrences. The result is asynchronous task record(s) that run later and report through the selected delivery route; it is not a substitute for an immediate action that returns the requested result during the current turn. Do not use this for cadence that belongs inside a generated app, dashboard, page, or tool, such as its own refresh, polling, auto-update, or live-data display behavior; keep that behavior in the service artifact unless the user wants AgentArk to run or notify independently outside the artifact. Create the task directly from the task body, cadence, selected action/script, validation policy, and reporting route. When the user asks for multiple independent future notifications, reminders, appointments, or scheduled outcomes in one request, use `items` with one item per outcome instead of collapsing them into one task. Use `task_id` when changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use cron for recurring schedules with minute granularity or at for one-time ISO timestamps. The cron/at value is the run or notification time; for reminders before an event, schedule the notification at the lead-time offset before the event and keep the event details in task/action_arguments. A recurring cron has no expiry unless the user gives an end policy. If notification should happen only after a condition, material change, or trigger match, schedule a recurring action/script with validation and report only when that validation succeeds. If the exact schedule needed to honor the user's requested reminder cannot be inferred, ask for the missing timing detail instead of creating a guess.".to_string(),
+            description: "Schedule or update durable recurring/one-time AgentArk task records whose execution is intentionally deferred until specified times or recurrences. The result is asynchronous task record(s) that run later and report through the selected delivery route; it is not a substitute for an immediate action that returns the requested result during the current turn. Do not use this for cadence that belongs inside a generated app, dashboard, page, or tool, such as its own refresh, polling, auto-update, or live-data display behavior; keep that behavior in the service artifact unless the user wants AgentArk to run or notify independently outside the artifact. Create the task directly from the task body, cadence, selected action/script, validation policy, and reporting route. When the user asks for multiple independent future notifications, reminders, appointments, or scheduled outcomes in one request, use `items` with one item per outcome instead of collapsing them into one task. Use `task_id` when changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use cron for recurring schedules, at/scheduled_for for fully known one-time ISO timestamps, or local_time plus timezone for wall-clock times that should be resolved from runtime temporal context. Prefer local_time over manual date arithmetic when the user supplied a time without a full date. The schedule value is the run or notification time; for reminders before an event, schedule the notification at the lead-time offset before the event and keep the event details in task/action_arguments. A recurring cron has no expiry unless the user gives an end policy. If notification should happen only after a condition, material change, or trigger match, schedule a recurring action/script with validation and report only when that validation succeeds. If the exact schedule needed to honor the user's requested reminder cannot be inferred, ask for the missing timing detail instead of creating a guess.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -6635,6 +4823,12 @@ Optional inputs:
                       "task_id": { "type": "string", "description": "Optional existing task ID to update. Use this after `list_tasks` or when the user explicitly references an existing routine/task." },
                       "cron": { "type": "string", "description": "Cron expression for recurring tasks. Minute granularity only for schedule_task. Format: 'minute hour day month weekday'. This is the time AgentArk runs or notifies, not necessarily the event start time. For advance reminders, schedule the reminder at the offset time before the event. Recurring cron schedules continue until the user cancels or changes them unless the task itself encodes a different policy. Examples: '0 9 * * *' = daily at 9am, '45 8 * * 1' = every Monday at 8:45am, '*/30 * * * *' = every 30 minutes" },
                       "at": { "type": "string", "description": "ISO 8601 timestamp for one-time task. This is the time AgentArk runs or notifies. For advance reminders, use the offset timestamp before the event. Example: '2026-02-06T09:00:00+05:30'" },
+                      "scheduled_for": { "type": "string", "description": "ISO 8601 one-time schedule value returned by persisted scheduled-task records. Equivalent to at when updating or recreating a task from an existing task/status payload." },
+                      "local_time": { "type": "string", "description": "Local wall-clock time for a one-time schedule, such as '00:22' or '12:22 AM'. Prefer this with timezone when the user gave a time without a full date; AgentArk resolves the date deterministically from the current temporal context and any existing task being updated." },
+                      "local_date": { "type": "string", "description": "Optional local calendar date for local_time in YYYY-MM-DD. Omit for next occurrence, or when updating an existing one-time task and only the wall-clock time changed." },
+                      "timezone": { "type": "string", "description": "IANA timezone for local_time/local_date, such as Asia/Kolkata. Defaults to the user's profile timezone when available." },
+                      "timezone_offset_minutes": { "type": "integer", "description": "Optional numeric UTC offset in minutes for local_time/local_date when an IANA timezone is unavailable." },
+                      "date_policy": { "type": "string", "enum": ["existing_local_date", "next_occurrence", "same_local_date"], "description": "Resolution policy for local_time without local_date. existing_local_date is default for task_id updates, next_occurrence is default for new tasks, same_local_date forces today's local date." },
                       "items": {
                           "type": "array",
                           "description": "Batch of independent scheduled outcomes. Use one item for each distinct future task/reminder/appointment requested in the same turn. Top-level report_to, action, action_arguments, script, script_language, context_from, workdir, validation, automation_policy, max_attempts, stall_timeout_secs, retry_backoff_secs, and allow_duplicate are inherited by items unless overridden.",
@@ -6645,6 +4839,12 @@ Optional inputs:
                                   "task_id": { "type": "string", "description": "Optional existing task ID to update for this item" },
                                   "cron": { "type": "string", "description": "Cron expression for this recurring task, at the run/notification time" },
                                   "at": { "type": "string", "description": "ISO 8601 timestamp for this one-time task, at the run/notification time" },
+                                  "scheduled_for": { "type": "string", "description": "ISO 8601 one-time schedule value returned by persisted scheduled-task records. Equivalent to at." },
+                                  "local_time": { "type": "string", "description": "Local wall-clock time for this one-time scheduled item" },
+                                  "local_date": { "type": "string", "description": "Optional local date in YYYY-MM-DD for local_time" },
+                                  "timezone": { "type": "string", "description": "IANA timezone for local_time/local_date" },
+                                  "timezone_offset_minutes": { "type": "integer" },
+                                  "date_policy": { "type": "string", "enum": ["existing_local_date", "next_occurrence", "same_local_date"] },
                                   "action": { "type": "string", "description": "Optional explicit action name for this item" },
                                   "action_arguments": { "type": "object", "description": "Optional explicit arguments for this item's action" },
                                   "script": { "type": "string", "description": "Optional script body to run for this item through code_execute" },
@@ -6662,8 +4862,16 @@ Optional inputs:
                               "oneOf": [
                                   { "required": ["task", "cron"] },
                                   { "required": ["task", "at"] },
+                                  { "required": ["task", "scheduled_for"] },
+                                  { "required": ["task", "local_time"] },
                                   { "required": ["task_id", "cron"] },
-                                  { "required": ["task_id", "at"] }
+                                  { "required": ["task_id", "at"] },
+                                  { "required": ["task_id", "scheduled_for"] },
+                                  { "required": ["task_id", "local_time"] },
+                                  { "required": ["action_arguments", "cron"] },
+                                  { "required": ["action_arguments", "at"] },
+                                  { "required": ["action_arguments", "scheduled_for"] },
+                                  { "required": ["action_arguments", "local_time"] }
                               ]
                           }
                       },
@@ -6704,8 +4912,16 @@ Optional inputs:
                   "oneOf": [
                       { "required": ["task", "cron"] },
                       { "required": ["task", "at"] },
+                      { "required": ["task", "scheduled_for"] },
+                      { "required": ["task", "local_time"] },
                       { "required": ["task_id", "cron"] },
                       { "required": ["task_id", "at"] },
+                      { "required": ["task_id", "scheduled_for"] },
+                      { "required": ["task_id", "local_time"] },
+                      { "required": ["action_arguments", "cron"] },
+                      { "required": ["action_arguments", "at"] },
+                      { "required": ["action_arguments", "scheduled_for"] },
+                      { "required": ["action_arguments", "local_time"] },
                       { "required": ["items"] }
                   ]
               }),
@@ -6974,8 +5190,11 @@ Optional inputs:
                     "path": { "type": "string", "description": "Primary path or endpoint path" },
                     "required_inputs": { "type": "array", "items": { "type": "string" }, "description": "Runtime inputs the generated action should require" },
                     "auth_type": { "type": "string", "enum": ["none", "bearer", "api_key_header", "api_key_query", "oauth2", "basic"], "description": "Primary auth strategy" },
+                    "auth_mode": { "type": "string", "enum": ["none", "bearer", "api_key_header", "api_key_query", "oauth2", "basic"], "description": "Alias for auth_type when updating from a saved custom API record." },
                     "auth_secret_name": { "type": "string", "description": "Optional provider credential label from docs. Custom API integrations store credentials under the integration connection; users do not need to know or enter an internal secret storage key." },
                     "auth_header_name": { "type": "string", "description": "Header name for api_key_header auth" },
+                    "auth_header": { "type": "string", "description": "Alias for auth_header_name when updating from a saved custom API record." },
+                    "auth_name": { "type": "string", "description": "Stored auth parameter/header name from a saved custom API record." },
                     "default_headers": { "type": "object", "description": "Static default headers" },
                     "default_query": { "type": "object", "description": "Static default query params" },
                     "body_template": { "description": "Optional request body template" },
@@ -6990,9 +5209,60 @@ Optional inputs:
                     "force": { "type": "boolean", "description": "Request installation after non-blocking warnings. Blocking security findings still prevent loading." },
                     "allow_duplicate": { "type": "boolean", "description": "Create another matching capability scaffold instead of updating/reusing an existing one. Default false." }
                 },
-                "required": ["name", "description"]
+                "anyOf": [
+                    { "required": ["name"] },
+                    { "required": ["id"] }
+                ]
             }),
             capabilities: vec!["integration_builder".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec!["capability_acquire".to_string()],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "custom_api_request".to_string(),
+            description: "Execute a saved read-only custom API operation using the credentials stored with that Custom API integration. Use after inspect_integration/list_integrations identifies the saved custom API id and operation. This is for reads/queries only; state-changing custom API operations must use their generated action and normal approval path.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Saved custom API id." },
+                    "query": { "type": "string", "description": "Optional saved custom API id lookup text when id is unavailable." },
+                    "operation": { "type": "string", "description": "Operation id, generated action name, method/path label, or operation name." },
+                    "operation_id": { "type": "string", "description": "Operation id." },
+                    "action_name": { "type": "string", "description": "Generated custom API action name." },
+                    "body": { "description": "JSON request body for operations that require a body." },
+                    "arguments": { "type": "object", "description": "Explicit generated action arguments. If omitted, remaining request fields become action arguments." }
+                },
+                "required": ["id"],
+                "additionalProperties": true
+            }),
+            capabilities: vec!["custom_api".to_string(), "integration".to_string(), "network".to_string(), "external_read".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "custom_api_manage".to_string(),
+            description: "Delete, enable, or disable an existing saved Custom API integration. Use only when the user intends to manage the saved integration record, not to call the provider API.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Saved custom API id." },
+                    "operation": { "type": "string", "enum": ["delete", "enable", "disable"] }
+                },
+                "required": ["id", "operation"],
+                "additionalProperties": false
+            }),
+            capabilities: vec!["custom_api".to_string(), "integration_builder".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -7787,6 +6057,90 @@ Optional inputs:
             capabilities: vec![
                 "integration_inventory".to_string(),
                 "surface_inventory".to_string(),
+            ],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "integration_catalog_list".to_string(),
+            description: "Return the local integration registry as normalized provider/action entries. Use to discover available built-in connectors and manifest-backed packs, their auth mode, connected/enabled state, required scopes, capabilities, and callable action names before choosing an integration.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional stable integration or pack ids to return. Omit to list the full local registry."
+                    },
+                    "only_connected": {
+                        "type": "boolean",
+                        "description": "Only return entries that are connected and enabled. Default false."
+                    },
+                    "source_kind": {
+                        "type": "string",
+                        "enum": ["native", "extension_pack", "catalog_extension_pack"],
+                        "description": "Optional normalized source kind filter."
+                    }
+                }
+            }),
+            capabilities: vec![
+                "integration_inventory".to_string(),
+                "integration_registry".to_string(),
+                "capability_inventory".to_string(),
+            ],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "integration_catalog_describe".to_string(),
+            description: "Describe one local integration registry entry by stable id. Returns the normalized provider/action metadata needed to decide whether and how an agent can use it.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Exact integration or pack id when known."
+                    }
+                },
+                "required": ["id"]
+            }),
+            capabilities: vec![
+                "integration_inventory".to_string(),
+                "integration_registry".to_string(),
+                "capability_inventory".to_string(),
+            ],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "integration_catalog_status".to_string(),
+            description: "Return concise readiness status for one local integration registry entry by stable id, including connected/enabled flags, auth mode, required scopes, connection requirement, and action names.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Exact integration or pack id when known."
+                    }
+                },
+                "required": ["id"]
+            }),
+            capabilities: vec![
+                "integration_inventory".to_string(),
+                "integration_registry".to_string(),
+                "capability_inventory".to_string(),
             ],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
@@ -8863,11 +7217,12 @@ Optional inputs:
             ),
             (
                 "browser_click",
-                "Click in an existing managed browser session by CSS selector, visible text, or x/y coordinates. Use after browser_snapshot or browser_screenshot identifies the target.",
+                "Click in an existing managed browser session by snapshot element index, CSS selector, visible text, or x/y coordinates. Prefer element_index from browser_snapshot for listed interactive elements.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string" },
+                        "element_index": { "type": "integer", "minimum": 0, "description": "Interactive element index from browser_snapshot." },
                         "selector": { "type": "string", "description": "CSS selector to click." },
                         "text": { "type": "string", "description": "Visible text target to click." },
                         "x": { "type": "integer", "description": "Viewport x coordinate." },
@@ -10243,9 +8598,7 @@ Optional inputs:
             return None;
         }
         let direct_trusted_chat = Self::direct_trusted_chat_tool_override(auth_context);
-        let Some(context_key) = Self::capability_context_key(auth_context) else {
-            return None;
-        };
+        let context_key = Self::capability_context_key(auth_context)?;
         let candidate = self
             .authorization_observations_for_invocation(action_name, action_def, arguments)
             .await;
@@ -11656,7 +10009,9 @@ Optional inputs:
         // Start transaction if rollback is enabled
         let transaction = if self.config.enable_rollback {
             let mut tx_guard = self.transactions.lock().await;
-            Some(tx_guard.begin().await?)
+            let tx = tx_guard.begin().await?;
+            tracing::debug!(action = action_name, transaction_id = %tx.id, "Started action transaction");
+            Some(tx)
         } else {
             None
         };
@@ -11686,10 +10041,11 @@ Optional inputs:
         match (&result, transaction) {
             (Ok(_), Some(tx)) => {
                 let mut tx_guard = self.transactions.lock().await;
+                tracing::debug!(action = action_name, transaction_id = %tx.id, "Committing action transaction");
                 tx_guard.commit(tx).await?;
             }
             (Err(_), Some(tx)) => {
-                tracing::warn!("Rolling back transaction due to error");
+                tracing::warn!(action = action_name, transaction_id = %tx.id, "Rolling back action transaction due to error");
                 let mut tx_guard = self.transactions.lock().await;
                 tx_guard.rollback(tx).await?;
             }
@@ -13563,11 +11919,20 @@ Optional inputs:
                 self.execute_agentark_capability_lookup(arguments).await
             }
             "list_integrations" => self.execute_list_integrations(arguments).await,
+            "integration_catalog_list" => self.execute_integration_catalog_list(arguments).await,
+            "integration_catalog_describe" => {
+                self.execute_integration_catalog_describe(arguments).await
+            }
+            "integration_catalog_status" => {
+                self.execute_integration_catalog_status(arguments).await
+            }
             "inspect_integration" => self.execute_inspect_integration(arguments).await,
             "mcp_server_manage" => self.execute_mcp_server_manage(arguments).await,
             "postgres_schema_inspect" => self.execute_postgres_schema_inspect(arguments).await,
             "postgres_query_readonly" => self.execute_postgres_query_readonly(arguments).await,
             "capability_acquire" => self.execute_capability_acquire(arguments).await,
+            "custom_api_request" => self.execute_custom_api_request(arguments).await,
+            "custom_api_manage" => self.execute_custom_api_manage(arguments).await,
             "capability_resolve" => self.execute_capability_resolve(arguments).await,
             "connector_request" => self.execute_connector_request(arguments).await,
             "lan_discover" => crate::actions::lan::lan_discover(arguments).await,
@@ -13925,14 +12290,46 @@ Optional inputs:
                     .and_then(|v| v.as_str())
                     .unwrap_or("plain");
 
-                let output_path = self.data_dir().join("outputs").join(filename);
+                let filename = Self::pdf_generate_filename(filename);
+                let pdf_bytes = Self::generate_simple_pdf_bytes(title, content, style);
+                let exec_id = uuid::Uuid::new_v4().to_string();
+                let output_path = self
+                    .data_dir()
+                    .join("outputs")
+                    .join(exec_id)
+                    .join(&filename);
                 if let Some(parent) = output_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
 
-                let pdf_bytes = Self::generate_simple_pdf_bytes(title, content, style);
-                tokio::fs::write(&output_path, pdf_bytes).await?;
-                Ok(format!("PDF generated: {}", output_path.display()))
+                tokio::fs::write(&output_path, &pdf_bytes).await?;
+                Self::set_private_file_permissions(&output_path).await?;
+                let payload = FileWritePayload {
+                    bytes: pdf_bytes,
+                    mime: Some("application/pdf".to_string()),
+                    source_resource: None,
+                };
+                let mut document_args = arguments.clone();
+                if let Some(object) = document_args.as_object_mut() {
+                    object.insert(
+                        "document_visible".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+                let document = self
+                    .index_file_write_document_if_requested(
+                        &output_path,
+                        &document_args,
+                        &payload,
+                        Some("application/pdf"),
+                    )
+                    .await;
+                Ok(self.managed_file_completion_output(
+                    "pdf_generate",
+                    &output_path,
+                    &payload,
+                    document.as_ref(),
+                ))
             }
             "expense" => {
                 let action = arguments["action"]
@@ -14667,8 +13064,10 @@ print(result["text"])
 
     async fn action_backed_builtin_integrations(&self) -> BTreeMap<String, serde_json::Value> {
         let enabled_actions = self.list_enabled_actions().await.unwrap_or_default();
-        let mut by_integration: BTreeMap<String, (BTreeSet<String>, BTreeMap<String, String>)> =
-            BTreeMap::new();
+        let mut by_integration: BTreeMap<
+            String,
+            (BTreeSet<String>, BTreeMap<String, String>, bool, bool),
+        > = BTreeMap::new();
 
         for action in enabled_actions {
             let access = &action.authorization.access;
@@ -14694,9 +13093,9 @@ print(result["text"])
             }
 
             for integration_id in integration_ids {
-                let (capabilities, actions) = by_integration
+                let (capabilities, actions, read_capable, write_capable) = by_integration
                     .entry(integration_id)
-                    .or_insert_with(|| (BTreeSet::new(), BTreeMap::new()));
+                    .or_insert_with(|| (BTreeSet::new(), BTreeMap::new(), false, false));
                 capabilities.extend(
                     action
                         .capabilities
@@ -14706,12 +13105,30 @@ print(result["text"])
                         .map(ToOwned::to_owned),
                 );
                 actions.insert(action.name.clone(), action.description.clone());
+                let metadata = action.action_metadata();
+                *read_capable |= action.authorization.outbound.read_only
+                    || matches!(
+                        metadata.role,
+                        crate::actions::ActionRole::Inspection
+                            | crate::actions::ActionRole::DataSource
+                    );
+                *write_capable |= action.authorization.outbound.outbound_write
+                    || matches!(
+                        metadata.role,
+                        crate::actions::ActionRole::Mutation | crate::actions::ActionRole::Delivery
+                    )
+                    || matches!(
+                        metadata.side_effect_level,
+                        crate::actions::ActionSideEffectLevel::Write
+                            | crate::actions::ActionSideEffectLevel::Notify
+                    );
             }
         }
 
         by_integration
             .into_iter()
-            .map(|(integration_id, (capabilities, actions))| {
+            .map(
+                |(integration_id, (capabilities, actions, read_capable, write_capable))| {
                 let action_summaries = actions
                     .iter()
                     .take(16)
@@ -14744,9 +13161,12 @@ print(result["text"])
                         "action_backed": true,
                         "available_actions": action_names,
                         "available_action_summaries": action_summaries,
+                        "read_capable": read_capable,
+                        "write_capable": write_capable,
                     }),
                 )
-            })
+                },
+            )
             .collect()
     }
 
@@ -14765,6 +13185,8 @@ print(result["text"])
             "available_actions",
             "available_action_summaries",
             "capabilities",
+            "read_capable",
+            "write_capable",
         ] {
             if let Some(value) = action_backed.get(key) {
                 row_object.insert(key.to_string(), value.clone());
@@ -15082,7 +13504,7 @@ print(result["text"])
         };
         let ctx = crate::channels::messaging_registry::ChannelQueryContext {
             bundled_configured: &bundled_check,
-            extension_packs: &*packs_guard,
+            extension_packs: &packs_guard,
             storage: &storage,
             config_dir: &self.config_dir,
             data_dir: self.data_dir(),
@@ -15133,7 +13555,7 @@ print(result["text"])
                     object
                         .get("configured")
                         .cloned()
-                        .unwrap_or_else(|| serde_json::json!(false)),
+                        .unwrap_or(serde_json::Value::Bool(false)),
                 );
             }
             channels.push(value);
@@ -15182,12 +13604,7 @@ print(result["text"])
         let mut rows = Vec::new();
         let mut connected_items = Vec::new();
         for api in apis {
-            let connected = api.config.enabled
-                && api.action_count > 0
-                && (matches!(
-                    api.config.auth_mode,
-                    crate::custom_apis::CustomApiAuthMode::None
-                ) || api.secret_configured);
+            let connected = Self::custom_api_view_is_connected(&api);
             if connected {
                 connected_items.push(Self::connected_surface_item(
                     "custom_apis",
@@ -15217,6 +13634,43 @@ print(result["text"])
             }),
             connected_items,
         )
+    }
+
+    fn custom_api_view_is_connected(api: &crate::custom_apis::CustomApiView) -> bool {
+        if !Self::custom_api_view_is_callable(api) {
+            return false;
+        }
+        !api.config
+            .last_test_outcome
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|status| status.eq_ignore_ascii_case("failure"))
+    }
+
+    fn custom_api_view_is_callable(api: &crate::custom_apis::CustomApiView) -> bool {
+        let auth_ready = matches!(
+            api.config.auth_mode,
+            crate::custom_apis::CustomApiAuthMode::None
+        ) || api.secret_configured;
+        api.config.enabled && api.action_count > 0 && auth_ready
+    }
+
+    fn custom_api_operation_allows_read_request(
+        operation: &crate::custom_apis::CustomApiOperation,
+        body: Option<&serde_json::Value>,
+    ) -> bool {
+        if operation.draft.read_only {
+            return true;
+        }
+        let Some(body) = body else {
+            return false;
+        };
+        crate::custom_apis::custom_api_operation_supports_graphql_body(
+            &operation.draft.method,
+            &operation.draft.path,
+            &operation.draft.default_headers,
+            true,
+        ) && crate::custom_apis::custom_api_body_is_read_only_graphql_query(body)
     }
 
     async fn webhook_sources_inventory(
@@ -16099,6 +14553,427 @@ print(result["text"])
         }))?)
     }
 
+    fn extension_pack_view_is_connected(pack: &crate::extension_packs::ExtensionPackView) -> bool {
+        pack.enabled && matches!(pack.status.as_str(), "ready" | "connected")
+    }
+
+    fn integration_catalog_sorted_strings(mut values: Vec<String>) -> Vec<String> {
+        values.retain(|value| !value.trim().is_empty());
+        for value in &mut values {
+            *value = value.trim().to_string();
+        }
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    fn integration_catalog_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+        value
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn integration_catalog_native_auth_mode(integration_id: &str) -> &'static str {
+        if crate::core::connect_flow::spec_by_id(integration_id).is_some() {
+            "secret"
+        } else {
+            "native"
+        }
+    }
+
+    fn integration_catalog_entry_from_builtin(
+        &self,
+        record: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let id = record.get("id").and_then(|value| value.as_str())?;
+        let name = record
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or(id);
+        let capabilities = Self::integration_catalog_sorted_strings(
+            Self::integration_catalog_string_array(record.get("capabilities"))
+                .into_iter()
+                .map(|value| value.to_ascii_lowercase())
+                .collect(),
+        );
+        let action_names = Self::integration_catalog_sorted_strings(
+            Self::integration_catalog_string_array(record.get("available_actions")),
+        );
+        let auth_mode = Self::integration_catalog_native_auth_mode(id);
+        let enabled = crate::integrations::effective_integration_enabled(&self.config_dir, id);
+        let connected = enabled
+            && record
+                .get("connected")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+        let read_capable = record
+            .get("read_capable")
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(|| {
+                capabilities
+                    .iter()
+                    .any(|capability| matches!(capability.as_str(), "read" | "search"))
+            });
+        let write_capable = record
+            .get("write_capable")
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(|| {
+                capabilities.iter().any(|capability| {
+                    matches!(
+                        capability.as_str(),
+                        "write" | "delete" | "notify" | "external_write"
+                    )
+                })
+            });
+        let status = record
+            .get("status_label")
+            .or_else(|| record.get("status"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+
+        Some(serde_json::json!({
+            "id": id,
+            "name": name,
+            "description": record.get("description").and_then(|value| value.as_str()).unwrap_or(""),
+            "source_kind": "native",
+            "auth_mode": auth_mode,
+            "connected": connected,
+            "enabled": enabled,
+            "status": status,
+            "status_detail": record.get("status_detail"),
+            "connection_required": !connected && !matches!(auth_mode, "none"),
+            "read_capable": read_capable,
+            "write_capable": write_capable,
+            "capabilities": capabilities,
+            "action_names": action_names,
+            "required_scopes": [],
+            "connection_required_for_actions": !connected && !action_names.is_empty(),
+            "source_record": record,
+        }))
+    }
+
+    fn extension_pack_auth_mode_label(
+        mode: crate::extension_packs::ExtensionPackAuthMode,
+    ) -> &'static str {
+        match mode {
+            crate::extension_packs::ExtensionPackAuthMode::None => "none",
+            crate::extension_packs::ExtensionPackAuthMode::ApiKey => "api_key",
+            crate::extension_packs::ExtensionPackAuthMode::Basic => "basic",
+            crate::extension_packs::ExtensionPackAuthMode::OAuth2External => "oauth",
+        }
+    }
+
+    fn integration_catalog_entry_from_pack(
+        view: &crate::extension_packs::ExtensionPackView,
+    ) -> serde_json::Value {
+        let mut required_scopes = view.manifest.auth.required_scopes.clone();
+        if let Some(oauth2) = view.manifest.auth.oauth2.as_ref() {
+            required_scopes.extend(oauth2.scopes.clone());
+        }
+        required_scopes = Self::integration_catalog_sorted_strings(required_scopes);
+
+        let action_names = Self::integration_catalog_sorted_strings(
+            view.manifest
+                .features
+                .iter()
+                .filter(|feature| !feature.kind.eq_ignore_ascii_case("event"))
+                .filter(|feature| {
+                    feature.binding.as_ref().is_some_and(|binding| {
+                        !binding.kind.trim().is_empty()
+                            && !binding.kind.eq_ignore_ascii_case("unsupported")
+                    })
+                })
+                .map(|feature| format!("{}.{}", view.manifest.id, feature.id))
+                .collect(),
+        );
+        let mut capabilities = Vec::new();
+        capabilities.extend(view.manifest.tags.clone());
+        capabilities.extend(
+            view.manifest
+                .features
+                .iter()
+                .map(|feature| feature.kind.clone()),
+        );
+        if view
+            .manifest
+            .features
+            .iter()
+            .any(|feature| feature.read_only)
+        {
+            capabilities.push("read".to_string());
+        }
+        if view
+            .manifest
+            .features
+            .iter()
+            .any(|feature| !feature.read_only)
+        {
+            capabilities.push("write".to_string());
+        }
+        capabilities = Self::integration_catalog_sorted_strings(
+            capabilities
+                .into_iter()
+                .map(|value| value.to_ascii_lowercase())
+                .collect(),
+        );
+        let connected = Self::extension_pack_view_is_connected(view);
+        let auth_mode = Self::extension_pack_auth_mode_label(view.manifest.auth.mode);
+
+        serde_json::json!({
+            "id": view.manifest.id.clone(),
+            "name": view.manifest.name.clone(),
+            "description": view.manifest.description.clone(),
+            "source_kind": if view.installed { "extension_pack" } else { "catalog_extension_pack" },
+            "auth_mode": auth_mode,
+            "connected": connected,
+            "enabled": view.enabled,
+            "status": view.status.clone(),
+            "status_detail": view.status_detail.clone(),
+            "connection_required": view.needs_auth && !connected,
+            "read_capable": view.manifest.features.iter().any(|feature| feature.read_only),
+            "write_capable": view.manifest.features.iter().any(|feature| !feature.read_only),
+            "capabilities": capabilities,
+            "action_names": action_names,
+            "required_scopes": required_scopes,
+            "supports_connect_url": view.supports_connect_url,
+            "runtime_required": view.runtime_required,
+            "runtime_status": view.runtime_status,
+            "features": view.feature_summaries.clone(),
+        })
+    }
+
+    async fn integration_catalog_entries(&self) -> Result<Vec<serde_json::Value>> {
+        let (builtin_integrations, _) = self.builtin_integrations_inventory(false).await;
+        let mut entries = builtin_integrations
+            .get("integrations")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|record| self.integration_catalog_entry_from_builtin(record))
+            .collect::<Vec<_>>();
+
+        if let Some(registry) = self.extension_pack_registry.clone() {
+            let guard = registry.read().await;
+            let packs = guard.search_packs(None, None).await?;
+            entries.extend(
+                packs
+                    .installed
+                    .iter()
+                    .map(Self::integration_catalog_entry_from_pack),
+            );
+            entries.extend(
+                packs
+                    .catalog
+                    .iter()
+                    .map(Self::integration_catalog_entry_from_pack),
+            );
+        }
+
+        entries.sort_by(|left, right| {
+            let left_key = format!(
+                "{}:{}",
+                left.get("source_kind")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                left.get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+            );
+            let right_key = format!(
+                "{}:{}",
+                right
+                    .get("source_kind")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                right
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+            );
+            left_key.cmp(&right_key)
+        });
+        Ok(entries)
+    }
+
+    fn integration_catalog_filter_entries(
+        mut entries: Vec<serde_json::Value>,
+        ids: Vec<String>,
+        source_kind: Option<&str>,
+        only_connected: bool,
+    ) -> Vec<serde_json::Value> {
+        if !ids.is_empty() {
+            let ids = ids
+                .into_iter()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect::<BTreeSet<_>>();
+            entries.retain(|entry| {
+                entry
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_ascii_lowercase())
+                    .is_some_and(|id| ids.contains(&id))
+            });
+        }
+        if let Some(source_kind) = source_kind.map(str::trim).filter(|value| !value.is_empty()) {
+            entries.retain(|entry| {
+                entry
+                    .get("source_kind")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(source_kind))
+            });
+        }
+        if only_connected {
+            entries.retain(|entry| {
+                entry
+                    .get("connected")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                    && entry
+                        .get("enabled")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+            });
+        }
+        entries
+    }
+
+    async fn integration_catalog_find_entry(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        let id = arguments
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(id) = id else {
+            anyhow::bail!("integration catalog lookup requires an id");
+        };
+        Ok(self
+            .integration_catalog_entries()
+            .await?
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|entry_id| entry_id.eq_ignore_ascii_case(id))
+            }))
+    }
+
+    async fn execute_integration_catalog_list(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let ids = Self::integration_catalog_string_array(arguments.get("ids"));
+        let source_kind = arguments
+            .get("source_kind")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let only_connected = arguments
+            .get("only_connected")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let entries = Self::integration_catalog_filter_entries(
+            self.integration_catalog_entries().await?,
+            ids.clone(),
+            source_kind,
+            only_connected,
+        );
+        let mut source_counts = serde_json::Map::new();
+        for entry in &entries {
+            let source = entry
+                .get("source_kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let next = source_counts
+                .get(&source)
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default()
+                + 1;
+            source_counts.insert(source, serde_json::json!(next));
+        }
+        let connected_total = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("connected")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            })
+            .count();
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": "ok",
+            "ids": ids,
+            "only_connected": only_connected,
+            "source_kind": source_kind,
+            "total": entries.len(),
+            "connected_total": connected_total,
+            "source_counts": source_counts,
+            "entries": entries,
+            "detail_available_via": "integration_catalog_describe",
+            "status_available_via": "integration_catalog_status",
+        }))?)
+    }
+
+    async fn execute_integration_catalog_describe(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let entry = self.integration_catalog_find_entry(arguments).await?;
+        Ok(serde_json::to_string_pretty(&match entry {
+            Some(entry) => serde_json::json!({
+                "status": "ok",
+                "entry": entry,
+            }),
+            None => serde_json::json!({
+                "status": "not_found",
+                "id": arguments.get("id"),
+            }),
+        })?)
+    }
+
+    async fn execute_integration_catalog_status(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let entry = self.integration_catalog_find_entry(arguments).await?;
+        let Some(entry) = entry else {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "status": "not_found",
+                "id": arguments.get("id"),
+            }))?);
+        };
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": "ok",
+            "id": entry.get("id"),
+            "name": entry.get("name"),
+            "source_kind": entry.get("source_kind"),
+            "auth_mode": entry.get("auth_mode"),
+            "connected": entry.get("connected"),
+            "enabled": entry.get("enabled"),
+            "integration_status": entry.get("status"),
+            "status_detail": entry.get("status_detail"),
+            "connection_required": entry.get("connection_required"),
+            "read_capable": entry.get("read_capable"),
+            "write_capable": entry.get("write_capable"),
+            "capabilities": entry.get("capabilities"),
+            "action_names": entry.get("action_names"),
+            "required_scopes": entry.get("required_scopes"),
+        }))?)
+    }
+
     async fn execute_list_integrations(&self, arguments: &serde_json::Value) -> Result<String> {
         let query = arguments.get("query").and_then(|value| value.as_str());
         let query_terms = Self::integration_inspect_terms(query);
@@ -16111,18 +14986,22 @@ print(result["text"])
             .get("include_details")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let packs = if let Some(registry) = self.extension_pack_registry.clone() {
+        let mut packs = if let Some(registry) = self.extension_pack_registry.clone() {
             let guard = registry.read().await;
             Some(guard.search_packs(query, kind).await?)
         } else {
             None
         };
         let mut connected_items = Vec::new();
-        if let Some(packs) = packs.as_ref() {
+        if let Some(packs) = packs.as_mut() {
+            if only_connected {
+                packs
+                    .installed
+                    .retain(Self::extension_pack_view_is_connected);
+            }
             for pack in &packs.installed {
-                let connected =
-                    pack.enabled && matches!(pack.status.as_str(), "ready" | "connected");
-                if connected && (!only_connected || connected) {
+                let connected = Self::extension_pack_view_is_connected(pack);
+                if connected {
                     connected_items.push(Self::connected_surface_item(
                         "extension_packs",
                         pack.manifest.id.clone(),
@@ -17257,7 +16136,7 @@ print(result["text"])
                 let bytes = response.bytes().await?;
                 let filename = url
                     .path_segments()
-                    .and_then(|segments| segments.last())
+                    .and_then(|mut segments| segments.next_back())
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .unwrap_or("image");
@@ -20105,15 +18984,12 @@ print(result["text"])
 
     async fn execute_capability_acquire(&self, arguments: &serde_json::Value) -> Result<String> {
         let arguments = Self::enrich_capability_acquisition_arguments(arguments).await;
-        let raw_name = arguments
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' for capability acquisition"))?;
-        let description = arguments
-            .get("description")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'description' for capability acquisition"))?;
-        let name = Self::normalize_generated_action_name(raw_name);
+        let raw_name = Self::capability_string_argument(&arguments, "name")
+            .or_else(|| Self::capability_string_argument(&arguments, "id"))
+            .ok_or_else(|| anyhow::anyhow!("Missing 'name' or 'id' for capability acquisition"))?;
+        let description = Self::capability_string_argument(&arguments, "description")
+            .unwrap_or_else(|| "Saved custom API integration".to_string());
+        let name = Self::normalize_generated_action_name(&raw_name);
         if name.is_empty() {
             return Err(anyhow::anyhow!(
                 "Generated action name is empty after normalization"
@@ -20121,12 +18997,247 @@ print(result["text"])
         }
         if Self::capability_acquire_has_http_endpoint(&arguments) {
             return self
-                .execute_capability_acquire_custom_api(&arguments, &name, description)
+                .execute_capability_acquire_custom_api(&arguments, &name, &description)
                 .await;
         }
         Err(anyhow::anyhow!(
             "capability_acquire only saves API integrations. Use the explicit Skills import/create flow for user skills, or extension-pack actions for manifest-based integrations."
         ))
+    }
+
+    async fn execute_custom_api_request(&self, arguments: &serde_json::Value) -> Result<String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Storage is required to use saved custom APIs"))?;
+        let id = Self::capability_string_argument(arguments, "id")
+            .or_else(|| Self::capability_string_argument(arguments, "query"))
+            .ok_or_else(|| anyhow::anyhow!("custom_api_request requires a saved custom API id"))?;
+        let normalized_id = Self::normalize_generated_action_name(&id);
+        let apis = crate::custom_apis::list_custom_apis(storage, &self.config_dir, self.data_dir())
+            .await?;
+        let api = apis
+            .into_iter()
+            .find(|item| {
+                item.config.id == normalized_id
+                    || item.config.id.eq_ignore_ascii_case(&id)
+                    || item.config.name.eq_ignore_ascii_case(&id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Saved custom API '{}' was not found", id))?;
+        if !Self::custom_api_view_is_callable(&api) {
+            anyhow::bail!(
+                "Saved custom API '{}' is not enabled or does not have callable credentials.",
+                api.config.id
+            );
+        }
+
+        let selector = Self::capability_string_argument(arguments, "operation")
+            .or_else(|| Self::capability_string_argument(arguments, "operation_id"))
+            .or_else(|| Self::capability_string_argument(arguments, "action_name"));
+        let request_body = arguments
+            .get("arguments")
+            .and_then(|value| value.get("body"))
+            .or_else(|| arguments.get("body"));
+        let has_body = request_body.is_some();
+        let operation = api
+            .config
+            .operations
+            .iter()
+            .filter(|operation| operation.draft.enabled)
+            .find(|operation| {
+                selector.as_deref().is_some_and(|selector| {
+                    operation.action_name.eq_ignore_ascii_case(selector)
+                        || operation.draft.id.eq_ignore_ascii_case(selector)
+                        || operation.draft.name.eq_ignore_ascii_case(selector)
+                        || format!("{} {}", operation.draft.method, operation.draft.path)
+                            .eq_ignore_ascii_case(selector)
+                })
+            })
+            .or_else(|| {
+                if selector.is_some() {
+                    return None;
+                }
+                let mut enabled = api
+                    .config
+                    .operations
+                    .iter()
+                    .filter(|operation| {
+                        operation.draft.enabled
+                            && Self::custom_api_operation_allows_read_request(
+                                operation,
+                                request_body,
+                            )
+                    });
+                let first = enabled.next()?;
+                if enabled.next().is_none() {
+                    Some(first)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                if !has_body || selector.is_some() {
+                    return None;
+                }
+                api.config.operations.iter().find(|operation| {
+                    operation.draft.enabled
+                        && Self::custom_api_operation_allows_read_request(operation, request_body)
+                        && (operation.draft.body_required
+                            || operation.draft.parameters.iter().any(|parameter| {
+                                matches!(
+                                    parameter.location,
+                                    crate::custom_apis::CustomApiParameterLocation::Body
+                                )
+                            })
+                            || !operation.draft.read_only)
+                })
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No matching read-only operation was found for saved custom API '{}'. Provide an operation id or inspect the integration first.",
+                    api.config.id
+                )
+            })?;
+        if !Self::custom_api_operation_allows_read_request(operation, request_body) {
+            anyhow::bail!(
+                "Saved custom API operation '{}' is not read-only for the supplied request; use its generated action with the normal approval path.",
+                operation.action_name
+            );
+        }
+        let api_id = api.config.id.clone();
+        let operation_id = operation.draft.id.clone();
+        let action_name = operation.action_name.clone();
+
+        let action_arguments = if let Some(object) = arguments
+            .get("arguments")
+            .and_then(|value| value.as_object())
+        {
+            serde_json::Value::Object(object.clone())
+        } else {
+            let mut object = serde_json::Map::new();
+            if let Some(input) = arguments.as_object() {
+                for (key, value) in input {
+                    if matches!(
+                        key.as_str(),
+                        "id" | "query"
+                            | "operation"
+                            | "operation_id"
+                            | "action_name"
+                            | "integration"
+                            | "kind"
+                            | "op"
+                    ) {
+                        continue;
+                    }
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+            serde_json::Value::Object(object)
+        };
+        let output = Box::pin(self.execute_action_with_context(
+            &action_name,
+            &action_arguments,
+            &crate::actions::ActionAuthorizationContext {
+                principal: Some(crate::actions::ActionCallerPrincipal::local_admin(
+                    "custom_api_request",
+                )),
+                surface: crate::actions::ActionExecutionSurface::Chat,
+                direct_user_intent: true,
+                current_turn_is_explicit_approval: false,
+                agent_name: None,
+                agent_access_scope: None,
+                capability_context_id: None,
+            },
+        ))
+        .await?;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": "completed",
+            "integration_type": "custom_api",
+            "custom_api_id": api_id,
+            "operation": operation_id,
+            "action_name": action_name,
+            "result": output,
+        }))?)
+    }
+
+    async fn execute_custom_api_manage(&self, arguments: &serde_json::Value) -> Result<String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Storage is required to manage saved custom APIs"))?;
+        let id = Self::capability_string_argument(arguments, "id")
+            .ok_or_else(|| anyhow::anyhow!("custom_api_manage requires id"))?;
+        let operation = Self::capability_string_argument(arguments, "operation")
+            .map(|value| value.to_ascii_lowercase())
+            .ok_or_else(|| anyhow::anyhow!("custom_api_manage requires operation"))?;
+        match operation.as_str() {
+            "delete" => {
+                crate::custom_apis::delete_custom_api(
+                    storage,
+                    &self.config_dir,
+                    self.data_dir(),
+                    self,
+                    &id,
+                )
+                .await?;
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "deleted",
+                    "integration_type": "custom_api",
+                    "id": id,
+                }))?)
+            }
+            "enable" | "disable" => {
+                let api = crate::custom_apis::list_custom_apis(
+                    storage,
+                    &self.config_dir,
+                    self.data_dir(),
+                )
+                .await?
+                .into_iter()
+                .find(|item| item.config.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Custom API '{}' was not found", id))?;
+                let enabled = operation == "enable";
+                let view = crate::custom_apis::upsert_custom_api(
+                    storage,
+                    &self.config_dir,
+                    self.data_dir(),
+                    self,
+                    crate::custom_apis::CustomApiUpsertRequest {
+                        id: Some(api.config.id.clone()),
+                        name: api.config.name.clone(),
+                        description: Some(api.config.description.clone()),
+                        base_url: api.config.base_url.clone(),
+                        enabled: Some(enabled),
+                        auth_mode: Some(api.config.auth_mode),
+                        auth_profile_id: api.config.auth_profile_id.clone(),
+                        auth_header: api.config.auth_header.clone(),
+                        auth_name: api.config.auth_name.clone(),
+                        auth_username: api.config.auth_username.clone(),
+                        secret: None,
+                        clear_secret: None,
+                        allow_missing_secret: Some(true),
+                        operations: api
+                            .config
+                            .operations
+                            .iter()
+                            .map(|operation| operation.draft.clone())
+                            .collect(),
+                    },
+                    Some(&api.config.id),
+                )
+                .await?;
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "status": if enabled { "enabled" } else { "disabled" },
+                    "integration_type": "custom_api",
+                    "id": view.config.id,
+                    "action_count": view.action_count,
+                }))?)
+            }
+            _ => anyhow::bail!(
+                "Unsupported custom API management operation '{}'",
+                operation
+            ),
+        }
     }
 
     fn capability_acquire_has_http_endpoint(arguments: &serde_json::Value) -> bool {
@@ -20142,23 +19253,118 @@ print(result["text"])
                 .is_some_and(|path| path.starts_with("http://") || path.starts_with("https://"))
             || Self::capability_string_argument(arguments, "openapi_url").is_some()
             || Self::capability_string_argument(arguments, "openapi_text").is_some()
+            || Self::capability_string_argument(arguments, "id").is_some()
+            || arguments
+                .get("operation")
+                .and_then(|value| value.as_object())
+                .is_some_and(|object| {
+                    object
+                        .get("base_url")
+                        .and_then(|value| value.as_str())
+                        .is_some()
+                        || object
+                            .get("path")
+                            .and_then(|value| value.as_str())
+                            .is_some()
+                        || object.get("url").and_then(|value| value.as_str()).is_some()
+                })
+            || arguments
+                .get("operations")
+                .and_then(|value| value.as_array())
+                .is_some_and(|operations| {
+                    operations.iter().any(|operation| {
+                        operation.as_object().is_some_and(|object| {
+                            object
+                                .get("base_url")
+                                .and_then(|value| value.as_str())
+                                .is_some()
+                                || object
+                                    .get("path")
+                                    .and_then(|value| value.as_str())
+                                    .is_some()
+                                || object.get("url").and_then(|value| value.as_str()).is_some()
+                        })
+                    })
+                })
+    }
+
+    fn capability_arguments_have_operation_shape(arguments: &serde_json::Value) -> bool {
+        let has_operation_object = arguments
+            .get("operation")
+            .and_then(|value| value.as_object())
+            .is_some();
+        let has_operations_array = arguments
+            .get("operations")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty());
+        has_operation_object
+            || has_operations_array
+            || [
+                "path",
+                "method",
+                "default_headers",
+                "headers",
+                "default_query",
+                "required_inputs",
+                "read_only",
+                "body_required",
+                "body_template",
+                "parameters",
+                "response_notes",
+            ]
+            .iter()
+            .any(|key| arguments.get(*key).is_some())
     }
 
     fn capability_auth_mode(
         arguments: &serde_json::Value,
     ) -> Option<crate::custom_apis::CustomApiAuthMode> {
-        match Self::capability_string_argument(arguments, "auth_type")?
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        let auth_mode =
+            Self::capability_auth_string_argument(arguments, &["auth_type", "auth_mode"])?;
+        match auth_mode.to_ascii_lowercase().as_str() {
             "bearer" => Some(crate::custom_apis::CustomApiAuthMode::Bearer),
             "api_key_header" => Some(crate::custom_apis::CustomApiAuthMode::ApiKeyHeader),
+            "api_key" => Some(crate::custom_apis::CustomApiAuthMode::ApiKeyHeader),
+            "header" => Some(crate::custom_apis::CustomApiAuthMode::ApiKeyHeader),
             "api_key_query" => Some(crate::custom_apis::CustomApiAuthMode::ApiKeyQuery),
+            "query" => Some(crate::custom_apis::CustomApiAuthMode::ApiKeyQuery),
             "oauth2" => Some(crate::custom_apis::CustomApiAuthMode::OAuth2),
             "basic" => Some(crate::custom_apis::CustomApiAuthMode::Basic),
             "none" => Some(crate::custom_apis::CustomApiAuthMode::None),
             _ => None,
         }
+    }
+
+    fn capability_auth_string_argument(
+        arguments: &serde_json::Value,
+        keys: &[&str],
+    ) -> Option<String> {
+        keys.iter()
+            .find_map(|key| Self::capability_string_argument(arguments, key))
+            .or_else(|| {
+                arguments.get("auth").and_then(|auth| {
+                    keys.iter().find_map(|key| {
+                        auth.get(key)
+                            .or_else(|| {
+                                if *key == "auth_type" {
+                                    auth.get("type").or_else(|| auth.get("kind"))
+                                } else if *key == "auth_mode" {
+                                    auth.get("mode")
+                                } else if *key == "auth_header_name" {
+                                    auth.get("header_name")
+                                        .or_else(|| auth.get("header"))
+                                        .or_else(|| auth.get("name"))
+                                } else {
+                                    None
+                                }
+                            })
+                            .and_then(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string)
+                    })
+                })
+            })
     }
 
     fn capability_object_to_string_map(
@@ -20233,20 +19439,75 @@ print(result["text"])
         crate::custom_apis::CustomApiOperationDraft,
         BTreeMap<String, String>,
     )> {
-        let (base_url, path, mut default_query) = Self::capability_endpoint_parts(arguments)?;
+        let operation_value = arguments.get("operation").cloned();
+        let operation_object = operation_value.as_ref().and_then(|value| value.as_object());
+        let mut endpoint_arguments = arguments.clone();
+        if let (Some(root), Some(operation)) =
+            (endpoint_arguments.as_object_mut(), operation_object)
+        {
+            for key in ["base_url", "path"] {
+                if !root.contains_key(key) {
+                    if let Some(value) = operation.get(key).cloned() {
+                        root.insert(key.to_string(), value);
+                    }
+                }
+            }
+            if !root.contains_key("path") {
+                if let Some(value) = operation.get("url").cloned() {
+                    root.insert("path".to_string(), value);
+                }
+            }
+        }
+        let operation_string = |key: &str| {
+            operation_object
+                .and_then(|object| object.get(key))
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        };
+        let operation_bool = |key: &str| {
+            operation_object
+                .and_then(|object| object.get(key))
+                .and_then(|value| value.as_bool())
+        };
+        let (base_url, path, mut default_query) =
+            Self::capability_endpoint_parts(&endpoint_arguments)?;
         default_query.extend(Self::capability_object_to_string_map(
             arguments.get("default_query"),
         ));
-        let method = Self::capability_string_argument(arguments, "method")
+        if let Some(operation) = operation_object {
+            default_query.extend(Self::capability_object_to_string_map(
+                operation.get("default_query"),
+            ));
+        }
+        let method = operation_string("method")
+            .or_else(|| Self::capability_string_argument(arguments, "method"))
             .unwrap_or_else(|| "get".to_string())
             .to_ascii_uppercase();
-        let default_headers =
+        let mut default_headers =
             Self::capability_object_to_string_map(arguments.get("default_headers"));
-        let requested_read_only = arguments.get("read_only").and_then(|value| value.as_bool());
+        if let Some(operation) = operation_object {
+            default_headers.extend(Self::capability_object_to_string_map(
+                operation
+                    .get("default_headers")
+                    .or_else(|| operation.get("headers")),
+            ));
+        }
+        let requested_read_only = operation_bool("read_only")
+            .or_else(|| arguments.get("read_only").and_then(|value| value.as_bool()));
         let mut read_only = requested_read_only.unwrap_or(method == "GET");
-        let required_inputs = Self::capability_acquire_required_inputs(arguments);
+        let required_inputs = if operation_object
+            .and_then(|object| object.get("required_inputs"))
+            .is_some()
+            && arguments.get("required_inputs").is_none()
+        {
+            Self::capability_acquire_required_inputs(operation_value.as_ref().unwrap())
+        } else {
+            Self::capability_acquire_required_inputs(arguments)
+        };
         let mut parameters = Vec::new();
-        let mut body_required = false;
+        let mut body_required = operation_bool("body_required").unwrap_or(false);
         for input in required_inputs {
             if input.eq_ignore_ascii_case("body") {
                 body_required = true;
@@ -20270,8 +19531,28 @@ print(result["text"])
                 schema_type: Some("string".to_string()),
             });
         }
+        if let Some(parameter_value) = operation_object
+            .and_then(|object| object.get("parameters"))
+            .cloned()
+        {
+            if let Ok(mut operation_parameters) = serde_json::from_value::<
+                Vec<crate::custom_apis::CustomApiParameter>,
+            >(parameter_value)
+            {
+                if operation_parameters.iter().any(|parameter| {
+                    matches!(
+                        parameter.location,
+                        crate::custom_apis::CustomApiParameterLocation::Body
+                    )
+                }) {
+                    body_required = true;
+                }
+                parameters.append(&mut operation_parameters);
+            }
+        }
         let has_body_template = arguments
             .get("body_template")
+            .or_else(|| operation_object.and_then(|object| object.get("body_template")))
             .is_some_and(|value| !value.is_null());
         let graphql_body_endpoint = crate::custom_apis::custom_api_operation_supports_graphql_body(
             &method,
@@ -20297,12 +19578,20 @@ print(result["text"])
                 schema_type: Some("object".to_string()),
             });
         }
-        let operation_id = Self::normalize_generated_action_name(&format!("{} {}", method, path));
-        let response_notes = Self::capability_string_argument(arguments, "response_notes");
+        let operation_id = operation_string("id")
+            .or_else(|| operation_string("operation_id"))
+            .map(|value| Self::normalize_generated_action_name(&value))
+            .unwrap_or_else(|| {
+                Self::normalize_generated_action_name(&format!("{} {}", method, path))
+            });
+        let response_notes = operation_string("response_notes")
+            .or_else(|| Self::capability_string_argument(arguments, "response_notes"));
         let operation_description = response_notes
             .filter(|notes| !notes.eq_ignore_ascii_case(description))
             .map(|notes| format!("{} {}", description.trim(), notes.trim()))
             .unwrap_or_else(|| description.trim().to_string());
+        let operation_name =
+            operation_string("name").unwrap_or_else(|| format!("{} {}", method, path));
         Ok((
             base_url,
             crate::custom_apis::CustomApiOperationDraft {
@@ -20311,7 +19600,7 @@ print(result["text"])
                 } else {
                     operation_id
                 },
-                name: format!("{} {}", method, path),
+                name: operation_name,
                 method,
                 path,
                 description: operation_description,
@@ -20326,34 +19615,80 @@ print(result["text"])
         ))
     }
 
+    fn capability_operation_drafts(
+        arguments: &serde_json::Value,
+        name: &str,
+        description: &str,
+    ) -> Result<(String, Vec<crate::custom_apis::CustomApiOperationDraft>)> {
+        if let Some(operations) = arguments
+            .get("operations")
+            .and_then(|value| value.as_array())
+            .filter(|items| !items.is_empty())
+        {
+            let mut base_url: Option<String> = None;
+            let mut drafts = Vec::new();
+            for operation in operations {
+                let mut operation_arguments = arguments.clone();
+                if let Some(object) = operation_arguments.as_object_mut() {
+                    object.insert("operation".to_string(), operation.clone());
+                    object.remove("operations");
+                }
+                let (operation_base_url, draft, _) =
+                    Self::capability_operation_draft(&operation_arguments, name, description)?;
+                if base_url
+                    .as_deref()
+                    .is_some_and(|existing| existing != operation_base_url)
+                {
+                    anyhow::bail!(
+                        "Custom API operation updates must use one base URL per integration."
+                    );
+                }
+                base_url = Some(operation_base_url);
+                drafts.push(draft);
+            }
+            let base_url = base_url.ok_or_else(|| {
+                anyhow::anyhow!("HTTP/API capability acquisition requires at least one operation")
+            })?;
+            return Ok((base_url, drafts));
+        }
+
+        let (base_url, operation, _) =
+            Self::capability_operation_draft(arguments, name, description)?;
+        Ok((base_url, vec![operation]))
+    }
+
     fn capability_auth_fields(
         arguments: &serde_json::Value,
     ) -> (
-        crate::custom_apis::CustomApiAuthMode,
+        Option<crate::custom_apis::CustomApiAuthMode>,
         Option<String>,
         Option<String>,
         Option<String>,
     ) {
-        let mode = Self::capability_auth_mode(arguments)
-            .unwrap_or(crate::custom_apis::CustomApiAuthMode::None);
-        let header = Self::capability_string_argument(arguments, "auth_header_name");
+        let Some(mode) = Self::capability_auth_mode(arguments) else {
+            return (None, None, None, None);
+        };
+        let header = Self::capability_auth_string_argument(
+            arguments,
+            &["auth_header_name", "auth_header", "auth_name"],
+        );
         match mode {
             crate::custom_apis::CustomApiAuthMode::Bearer
             | crate::custom_apis::CustomApiAuthMode::OAuth2 => (
-                mode,
+                Some(mode),
                 Some(header.unwrap_or_else(|| "Authorization".to_string())),
                 None,
                 None,
             ),
             crate::custom_apis::CustomApiAuthMode::ApiKeyHeader => (
-                mode,
+                Some(mode),
                 None,
                 Some(header.unwrap_or_else(|| "X-API-Key".to_string())),
                 None,
             ),
-            crate::custom_apis::CustomApiAuthMode::ApiKeyQuery => (mode, None, header, None),
-            crate::custom_apis::CustomApiAuthMode::Basic => (mode, None, None, None),
-            crate::custom_apis::CustomApiAuthMode::None => (mode, None, None, None),
+            crate::custom_apis::CustomApiAuthMode::ApiKeyQuery => (Some(mode), None, header, None),
+            crate::custom_apis::CustomApiAuthMode::Basic => (Some(mode), None, None, None),
+            crate::custom_apis::CustomApiAuthMode::None => (Some(mode), None, None, None),
         }
     }
 
@@ -20371,23 +19706,72 @@ print(result["text"])
             .get("allow_duplicate")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        let target_id = Self::capability_string_argument(arguments, "id")
+            .map(|value| Self::normalize_generated_action_name(&value))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| name.to_string());
+        let existing_config =
+            crate::custom_apis::list_custom_apis(storage, &self.config_dir, self.data_dir())
+                .await?
+                .into_iter()
+                .find(|item| item.config.id == target_id)
+                .map(|item| item.config);
+        let request_name = if Self::capability_string_argument(arguments, "name").is_some() {
+            name.to_string()
+        } else {
+            existing_config
+                .as_ref()
+                .map(|config| config.name.clone())
+                .unwrap_or_else(|| name.to_string())
+        };
+        let request_description =
+            if Self::capability_string_argument(arguments, "description").is_some() {
+                description.to_string()
+            } else {
+                existing_config
+                    .as_ref()
+                    .map(|config| config.description.clone())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| description.to_string())
+            };
+        let mut effective_arguments = arguments.clone();
+        if let (Some(object), Some(existing)) = (
+            effective_arguments.as_object_mut(),
+            existing_config.as_ref(),
+        ) {
+            object
+                .entry("base_url".to_string())
+                .or_insert_with(|| serde_json::Value::String(existing.base_url.clone()));
+        }
         let (mut request, operation_count) =
-            if Self::capability_string_argument(arguments, "openapi_url").is_some()
-                || Self::capability_string_argument(arguments, "openapi_text").is_some()
+            if Self::capability_string_argument(&effective_arguments, "openapi_url").is_some()
+                || Self::capability_string_argument(&effective_arguments, "openapi_text").is_some()
             {
                 let preview = crate::custom_apis::preview_custom_api(
                     crate::custom_apis::CustomApiPreviewRequest {
-                        name: Some(name.to_string()),
-                        base_url: Self::capability_string_argument(arguments, "base_url"),
-                        openapi_url: Self::capability_string_argument(arguments, "openapi_url"),
-                        openapi_text: Self::capability_string_argument(arguments, "openapi_text"),
+                        name: Some(request_name.clone()),
+                        base_url: Self::capability_string_argument(
+                            &effective_arguments,
+                            "base_url",
+                        ),
+                        openapi_url: Self::capability_string_argument(
+                            &effective_arguments,
+                            "openapi_url",
+                        ),
+                        openapi_text: Self::capability_string_argument(
+                            &effective_arguments,
+                            "openapi_text",
+                        ),
                         curl_text: None,
                     },
                 )
                 .await?;
-                let auth_mode = Self::capability_auth_mode(arguments).unwrap_or(preview.auth_mode);
-                let auth_header = Self::capability_string_argument(arguments, "auth_header_name")
-                    .or(preview.auth_header);
+                let auth_mode = Self::capability_auth_mode(&effective_arguments)
+                    .or_else(|| existing_config.as_ref().map(|config| config.auth_mode))
+                    .unwrap_or(preview.auth_mode);
+                let auth_header =
+                    Self::capability_string_argument(&effective_arguments, "auth_header_name")
+                        .or(preview.auth_header);
                 let auth_name = if matches!(
                     auth_mode,
                     crate::custom_apis::CustomApiAuthMode::ApiKeyHeader
@@ -20400,9 +19784,9 @@ print(result["text"])
                 let operation_count = preview.operations.len();
                 (
                     crate::custom_apis::CustomApiUpsertRequest {
-                        id: Some(name.to_string()),
+                        id: Some(target_id.clone()),
                         name: preview.suggested_name,
-                        description: Some(description.to_string()),
+                        description: Some(request_description.clone()),
                         base_url: preview.base_url,
                         enabled: Some(true),
                         auth_mode: Some(auth_mode),
@@ -20418,18 +19802,40 @@ print(result["text"])
                     operation_count,
                 )
             } else {
-                let (base_url, operation, _) =
-                    Self::capability_operation_draft(arguments, name, description)?;
+                let (base_url, operations) =
+                    if Self::capability_arguments_have_operation_shape(&effective_arguments) {
+                        Self::capability_operation_drafts(
+                            &effective_arguments,
+                            name,
+                            &request_description,
+                        )?
+                    } else if let Some(existing) = existing_config.as_ref() {
+                        (
+                            existing.base_url.clone(),
+                            existing
+                                .operations
+                                .iter()
+                                .map(|operation| operation.draft.clone())
+                                .collect(),
+                        )
+                    } else {
+                        Self::capability_operation_drafts(
+                            &effective_arguments,
+                            name,
+                            &request_description,
+                        )?
+                    };
+                let operation_count = operations.len();
                 let (auth_mode, auth_header, auth_name, auth_username) =
-                    Self::capability_auth_fields(arguments);
+                    Self::capability_auth_fields(&effective_arguments);
                 (
                     crate::custom_apis::CustomApiUpsertRequest {
-                        id: Some(name.to_string()),
-                        name: name.to_string(),
-                        description: Some(description.to_string()),
+                        id: Some(target_id.clone()),
+                        name: request_name.clone(),
+                        description: Some(request_description.clone()),
                         base_url,
                         enabled: Some(true),
-                        auth_mode: Some(auth_mode),
+                        auth_mode,
                         auth_profile_id: None,
                         auth_header,
                         auth_name,
@@ -20437,9 +19843,9 @@ print(result["text"])
                         secret: None,
                         clear_secret: None,
                         allow_missing_secret: Some(true),
-                        operations: vec![operation],
+                        operations,
                     },
-                    1,
+                    operation_count,
                 )
             };
 
@@ -20451,7 +19857,7 @@ print(result["text"])
                 request.id = Some(format!("{}-{}", name, uuid::Uuid::new_v4().simple()));
             }
         }
-        let request_id = request.id.clone().unwrap_or_else(|| name.to_string());
+        let request_id = request.id.clone().unwrap_or_else(|| target_id.clone());
         let existing =
             crate::custom_apis::list_custom_apis(storage, &self.config_dir, self.data_dir())
                 .await?
@@ -22429,9 +21835,7 @@ print(result["text"])
                     ));
                     continue;
                 }
-                let Some(features) = access.integration_features.get(integration_id) else {
-                    return None;
-                };
+                let features = access.integration_features.get(integration_id)?;
                 if features.is_empty() {
                     return None;
                 }
@@ -22757,6 +22161,14 @@ print(result["text"])
                 '(' => out.push_str("\\("),
                 ')' => out.push_str("\\)"),
                 '\t' => out.push(' '),
+                '\u{00a0}' => out.push(' '),
+                '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' => {
+                    out.push('-')
+                }
+                '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => out.push('\''),
+                '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => out.push('"'),
+                '\u{2022}' | '\u{25e6}' => out.push('*'),
+                '\u{2026}' => out.push_str("..."),
                 ch if ch.is_ascii_graphic() || ch == ' ' => out.push(ch),
                 _ => out.push(' '),
             }
@@ -22850,7 +22262,7 @@ print(result["text"])
             ));
             objects.push(format!(
                 "{content_id} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
-                stream.as_bytes().len(),
+                stream.len(),
                 stream
             ));
         }
@@ -27553,6 +26965,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_search_skips_heavy_directories_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/needle.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("src/app.txt"), "plain\n").unwrap();
+
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let output = runtime
+            .execute_action(
+                "file_search",
+                &serde_json::json!({
+                    "root": root.display().to_string(),
+                    "query": "needle",
+                    "limit": 10
+                }),
+            )
+            .await
+            .unwrap();
+        let payload = parse_tool_completion_output(&output);
+
+        assert_eq!(payload["data"]["matches"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["data"]["skipped_directories"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
     async fn file_write_copies_resource_ref_bytes_exactly() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
@@ -27640,6 +27080,7 @@ mod tests {
             "abc123",
             false,
             Some(&resource),
+            None,
         );
 
         assert!(chunk.contains("artifact_kind: managed_file"));
@@ -27650,6 +27091,15 @@ mod tests {
         assert!(chunk.contains("text_content_indexed: false"));
         assert!(chunk.contains("source_resource_id: resource-1"));
         assert!(!chunk.contains("/hidden/internal/path"));
+    }
+
+    #[test]
+    fn pdf_text_literal_degrades_common_unicode_punctuation() {
+        let text = ActionRuntime::pdf_text_literal(
+            "LocalAgent\u{2014}Hermes \u{201c}agent\u{201d}\u{2026}",
+        );
+
+        assert_eq!(text, "LocalAgent-Hermes \"agent\"...");
     }
 
     #[tokio::test]
@@ -27669,6 +27119,7 @@ mod tests {
             chunk_count: 1,
             file_size: payload.bytes.len() as u64,
             url: "/ui/documents".to_string(),
+            download_url: None,
             duplicate_skipped: false,
             content_fingerprint: "abc123".to_string(),
             metadata_only: true,
@@ -27685,6 +27136,70 @@ mod tests {
         assert_eq!(
             parsed["data"]["document"]["index_mode"].as_str(),
             Some("metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn pdf_generate_returns_managed_pdf_artifact_without_internal_path_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let output = runtime
+            .execute_action(
+                "pdf_generate",
+                &serde_json::json!({
+                    "title": "Market Report",
+                    "filename": "market-report.pdf",
+                    "style": "report",
+                    "content": "Executive summary\n\nGenerated PDF content.",
+                }),
+            )
+            .await
+            .unwrap();
+        let payload = parse_tool_completion_output(&output);
+
+        assert_eq!(payload["tool"].as_str(), Some("pdf_generate"));
+        assert_eq!(payload["status"].as_str(), Some("completed"));
+        assert_eq!(
+            payload["data"]["artifact"]["kind"].as_str(),
+            Some("managed_file")
+        );
+        assert_eq!(
+            payload["data"]["artifact"]["content_type"].as_str(),
+            Some("application/pdf")
+        );
+        let download_url = payload["data"]["artifact"]["download_url"]
+            .as_str()
+            .expect("pdf_generate should expose a direct download URL");
+        assert!(download_url.starts_with("/api/outputs/"));
+        assert!(download_url.ends_with("/market-report.pdf/download"));
+        assert_eq!(
+            payload["data"]["payload"]["resource"]["mime"].as_str(),
+            Some("application/pdf")
+        );
+        let resource_path = payload["data"]["payload"]["resource"]["path"]
+            .as_str()
+            .expect("pdf_generate should keep a private runtime resource path");
+        assert!(
+            std::fs::read(resource_path)
+                .expect("generated PDF should be saved under the served outputs tree")
+                .starts_with(b"%PDF")
+        );
+        assert!(
+            payload["data"].get("document").is_some(),
+            "pdf_generate should report its Documents registration metadata when storage is available"
+        );
+        assert_eq!(
+            payload["data"]["document"]["download_url"].as_str(),
+            Some(download_url)
+        );
+        assert!(
+            !payload["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(temp.path().to_string_lossy().as_ref()),
+            "completion detail must not ask the model to chase an internal path"
         );
     }
 
@@ -28774,6 +28289,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_catalog_tools_register_as_read_only_inventory_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        for action_name in [
+            "integration_catalog_list",
+            "integration_catalog_describe",
+            "integration_catalog_status",
+        ] {
+            let action = action_def_by_name(&runtime, action_name).await;
+            let metadata = action.action_metadata();
+            assert_eq!(metadata.role, crate::actions::ActionRole::Inspection);
+            assert_eq!(
+                metadata.integration_class,
+                crate::actions::ActionIntegrationClass::Internal
+            );
+            assert!(
+                action
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "integration_registry"),
+                "{action_name} should be discoverable as an integration registry tool"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_catalog_list_returns_agent_ready_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        "granted_scopes": [
+                            "https://www.googleapis.com/auth/gmail.readonly",
+                            "https://www.googleapis.com/auth/gmail.send"
+                        ],
+                        "granted_bundles": ["gmail"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_BUNDLES_KEY,
+                Some(serde_json::json!(["gmail"]).to_string()),
+            )
+            .unwrap();
+
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let output = runtime
+            .execute_action("integration_catalog_list", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        let gmail = entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some("gmail"))
+            .expect("catalog should include the connected mail integration");
+
+        assert_eq!(gmail["source_kind"], "native");
+        assert_eq!(gmail["auth_mode"], "native");
+        assert_eq!(gmail["connected"], true);
+        assert_eq!(gmail["enabled"], true);
+        assert_eq!(gmail["connection_required"], false);
+        assert!(
+            gmail["action_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str() == Some("gmail_scan"))
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_catalog_describe_and_status_target_one_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let describe = runtime
+            .execute_action(
+                "integration_catalog_describe",
+                &serde_json::json!({ "id": "media_gen" }),
+            )
+            .await
+            .unwrap();
+        let describe_value: serde_json::Value = serde_json::from_str(&describe).unwrap();
+        assert_eq!(describe_value["status"], "ok");
+        assert_eq!(describe_value["entry"]["id"], "media_gen");
+        assert!(describe_value["entry"]["capabilities"].is_array());
+
+        let status = runtime
+            .execute_action(
+                "integration_catalog_status",
+                &serde_json::json!({ "id": "media_gen" }),
+            )
+            .await
+            .unwrap();
+        let status_value: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status_value["status"], "ok");
+        assert_eq!(status_value["id"], "media_gen");
+        assert!(status_value["connected"].is_boolean());
+        assert!(status_value["enabled"].is_boolean());
+    }
+
+    #[tokio::test]
     async fn inspect_integration_finds_action_backed_surface_by_action_description() {
         let temp = tempfile::tempdir().unwrap();
         let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
@@ -29507,11 +29138,13 @@ version: "1.2.3"
 
     #[test]
     fn configured_chat_vision_candidates_prefer_model_pool_primary() {
-        let mut config = crate::core::config::AgentConfig::default();
-        config.llm = crate::core::LlmProvider::OpenAI {
-            api_key: "legacy-key".to_string(),
-            model: "legacy-model".to_string(),
-            base_url: None,
+        let mut config = crate::core::config::AgentConfig {
+            llm: crate::core::LlmProvider::OpenAI {
+                api_key: "legacy-key".to_string(),
+                model: "legacy-model".to_string(),
+                base_url: None,
+            },
+            ..crate::core::config::AgentConfig::default()
         };
         config.model_pool.slots = vec![
             vision_test_slot(
@@ -29547,10 +29180,12 @@ version: "1.2.3"
 
     #[test]
     fn configured_chat_vision_candidates_skip_missing_managed_provider_keys() {
-        let mut config = crate::core::config::AgentConfig::default();
-        config.llm = crate::core::LlmProvider::Anthropic {
-            api_key: "anthropic-key".to_string(),
-            model: "text-model".to_string(),
+        let mut config = crate::core::config::AgentConfig {
+            llm: crate::core::LlmProvider::Anthropic {
+                api_key: "anthropic-key".to_string(),
+                model: "text-model".to_string(),
+            },
+            ..crate::core::config::AgentConfig::default()
         };
         config.model_pool.slots = vec![
             vision_test_slot(
@@ -30375,6 +30010,189 @@ version: "1.2.3"
                 )
                 && parameter.required
         }));
+    }
+
+    #[test]
+    fn capability_acquire_auth_fields_preserve_existing_auth_when_omitted() {
+        let (auth_mode, auth_header, auth_name, auth_username) =
+            ActionRuntime::capability_auth_fields(&serde_json::json!({}));
+
+        assert!(auth_mode.is_none());
+        assert!(auth_header.is_none());
+        assert!(auth_name.is_none());
+        assert!(auth_username.is_none());
+    }
+
+    #[test]
+    fn capability_acquire_auth_fields_accept_auth_mode_alias_for_header_key() {
+        let (auth_mode, auth_header, auth_name, auth_username) =
+            ActionRuntime::capability_auth_fields(&serde_json::json!({
+                "auth_mode": "api_key_header",
+                "auth_header": "Authorization"
+            }));
+
+        assert_eq!(
+            auth_mode,
+            Some(crate::custom_apis::CustomApiAuthMode::ApiKeyHeader)
+        );
+        assert!(auth_header.is_none());
+        assert_eq!(auth_name.as_deref(), Some("Authorization"));
+        assert!(auth_username.is_none());
+    }
+
+    #[test]
+    fn capability_acquire_auth_fields_accept_auth_object_for_header_key() {
+        let (auth_mode, auth_header, auth_name, auth_username) =
+            ActionRuntime::capability_auth_fields(&serde_json::json!({
+                "auth": {
+                    "type": "header",
+                    "name": "Authorization"
+                }
+            }));
+
+        assert_eq!(
+            auth_mode,
+            Some(crate::custom_apis::CustomApiAuthMode::ApiKeyHeader)
+        );
+        assert!(auth_header.is_none());
+        assert_eq!(auth_name.as_deref(), Some("Authorization"));
+        assert!(auth_username.is_none());
+    }
+
+    #[test]
+    fn capability_acquire_accepts_operation_object_for_http_shape() {
+        let (_, operation, headers) = ActionRuntime::capability_operation_draft(
+            &serde_json::json!({
+                "base_url": "https://api.example.com",
+                "operation": {
+                    "method": "post",
+                    "path": "/graphql",
+                    "default_headers": {
+                        "content-type": "application/json"
+                    },
+                    "body_required": true
+                }
+            }),
+            "graph-api",
+            "Query a saved API",
+        )
+        .expect("operation object should create a custom API operation");
+
+        assert_eq!(operation.method, "POST");
+        assert_eq!(operation.path, "/graphql");
+        assert!(operation.body_required);
+        assert_eq!(headers["content-type"], "application/json");
+    }
+
+    #[test]
+    fn capability_acquire_routes_existing_id_updates_as_http_shape() {
+        assert!(ActionRuntime::capability_acquire_has_http_endpoint(
+            &serde_json::json!({
+                "id": "provider-api",
+                "method": "post",
+                "path": "/graphql"
+            })
+        ));
+    }
+
+    #[test]
+    fn capability_acquire_accepts_operations_array_for_http_shape() {
+        let (base_url, operations) = ActionRuntime::capability_operation_drafts(
+            &serde_json::json!({
+                "base_url": "https://api.example.com",
+                "operations": [
+                    {
+                        "id": "list-items",
+                        "method": "get",
+                        "path": "/items"
+                    },
+                    {
+                        "id": "query-graph",
+                        "method": "post",
+                        "path": "/graphql",
+                        "default_headers": {
+                            "content-type": "application/json"
+                        },
+                        "body_required": true
+                    }
+                ]
+            }),
+            "provider-api",
+            "Read a saved provider API",
+        )
+        .expect("operations array should create custom API operations");
+
+        assert_eq!(base_url, "https://api.example.com");
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].id, "list-items");
+        assert_eq!(operations[1].method, "POST");
+        assert!(operations[1].body_required);
+    }
+
+    #[test]
+    fn custom_api_inventory_marks_failed_test_not_connected() {
+        let view = crate::custom_apis::CustomApiView {
+            config: crate::custom_apis::CustomApiConfig {
+                id: "provider-api".to_string(),
+                name: "Provider API".to_string(),
+                description: String::new(),
+                base_url: "https://api.example.com".to_string(),
+                enabled: true,
+                auth_mode: crate::custom_apis::CustomApiAuthMode::Bearer,
+                auth_profile_id: None,
+                auth_header: Some("Authorization".to_string()),
+                auth_name: None,
+                auth_username: None,
+                created_at: "2026-05-23T00:00:00Z".to_string(),
+                updated_at: "2026-05-23T00:00:00Z".to_string(),
+                last_tested_at: Some("2026-05-23T00:00:00Z".to_string()),
+                last_test_outcome: Some("failure".to_string()),
+                last_test_message: Some("HTTP 400".to_string()),
+                operations: Vec::new(),
+            },
+            secret_configured: true,
+            action_count: 1,
+            test_action_name: None,
+        };
+
+        assert!(!ActionRuntime::custom_api_view_is_connected(&view));
+        assert!(ActionRuntime::custom_api_view_is_callable(&view));
+    }
+
+    #[test]
+    fn custom_api_request_allows_stale_graphql_operation_for_read_query_body() {
+        let operation = crate::custom_apis::CustomApiOperation {
+            draft: crate::custom_apis::CustomApiOperationDraft {
+                id: "post-graphql".to_string(),
+                name: "POST /graphql".to_string(),
+                method: "POST".to_string(),
+                path: "/graphql".to_string(),
+                description: String::new(),
+                read_only: false,
+                enabled: true,
+                default_headers: BTreeMap::new(),
+                default_query: BTreeMap::new(),
+                parameters: Vec::new(),
+                body_required: false,
+            },
+            action_name: "api__graph_api__post-graphql".to_string(),
+        };
+
+        assert!(ActionRuntime::custom_api_operation_allows_read_request(
+            &operation,
+            Some(&serde_json::json!({
+                "query": "query Viewer { viewer { id } }"
+            }))
+        ));
+        assert!(!ActionRuntime::custom_api_operation_allows_read_request(
+            &operation,
+            Some(&serde_json::json!({
+                "query": "mutation Create { createThing { id } }"
+            }))
+        ));
+        assert!(!ActionRuntime::custom_api_operation_allows_read_request(
+            &operation, None
+        ));
     }
 
     #[tokio::test]

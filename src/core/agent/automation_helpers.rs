@@ -469,6 +469,12 @@ pub(super) fn build_notify_user_action_arguments(
             serde_json::Value::String(delivery_channel.trim().to_ascii_lowercase()),
         );
     }
+    payload
+        .entry("source".to_string())
+        .or_insert_with(|| serde_json::Value::String("reminder".to_string()));
+    payload
+        .entry("in_app_title".to_string())
+        .or_insert_with(|| serde_json::Value::String("Reminder".to_string()));
     serde_json::Value::Object(payload)
 }
 
@@ -581,5 +587,18 @@ mod tests {
     #[test]
     fn missing_delivery_still_displays_as_in_app_only() {
         assert_eq!(watcher_delivery_label(""), "In-app notification only");
+    }
+
+    #[test]
+    fn scheduled_notify_user_arguments_are_typed_as_reminders() {
+        let payload = build_notify_user_action_arguments(
+            &serde_json::json!({}),
+            "message Mark at 5 PM",
+            "whatsapp",
+        );
+
+        assert_eq!(payload["source"], "reminder");
+        assert_eq!(payload["in_app_title"], "Reminder");
+        assert_eq!(payload["report_to"], "whatsapp");
     }
 }

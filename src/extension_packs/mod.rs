@@ -5242,46 +5242,54 @@ pub(crate) fn slack_config_from_secret(
     arguments: &Value,
     secret: &Value,
 ) -> Result<crate::channels::slack::SlackChannelConfig> {
-    let mut config = crate::channels::slack::SlackChannelConfig::default();
-    config.bot_token = string_from_arguments_or_secret(
-        arguments,
-        secret,
-        &["bot_token"],
-        &["bot_token", "access_token", "api_key"],
-    )
-    .unwrap_or_default();
-    config.signing_secret = string_from_arguments_or_secret(
-        arguments,
-        secret,
-        &["signing_secret"],
-        &["signing_secret"],
-    )
-    .unwrap_or_default();
-    config.default_channel_id = string_from_arguments_or_secret(
-        arguments,
-        secret,
-        &["channel_id", "destination.channel_id"],
-        &["default_channel_id", "channel_id"],
-    )
-    .unwrap_or_default();
-    config.default_thread_ts = string_from_arguments_or_secret(
-        arguments,
-        secret,
-        &["thread_ts", "destination.thread_ts"],
-        &["default_thread_ts", "thread_ts"],
-    );
-    config.api_base_url =
-        string_from_arguments_or_secret(arguments, secret, &["api_base_url"], &["api_base_url"])
-            .unwrap_or_else(|| "https://slack.com/api".to_string());
-    config.workspace_id =
-        string_from_arguments_or_secret(arguments, secret, &["workspace_id"], &["workspace_id"]);
-    config.workspace_name = string_from_arguments_or_secret(
-        arguments,
-        secret,
-        &["workspace_name"],
-        &["workspace_name"],
-    );
-    Ok(config)
+    Ok(crate::channels::slack::SlackChannelConfig {
+        bot_token: string_from_arguments_or_secret(
+            arguments,
+            secret,
+            &["bot_token"],
+            &["bot_token", "access_token", "api_key"],
+        )
+        .unwrap_or_default(),
+        signing_secret: string_from_arguments_or_secret(
+            arguments,
+            secret,
+            &["signing_secret"],
+            &["signing_secret"],
+        )
+        .unwrap_or_default(),
+        default_channel_id: string_from_arguments_or_secret(
+            arguments,
+            secret,
+            &["channel_id", "destination.channel_id"],
+            &["default_channel_id", "channel_id"],
+        )
+        .unwrap_or_default(),
+        default_thread_ts: string_from_arguments_or_secret(
+            arguments,
+            secret,
+            &["thread_ts", "destination.thread_ts"],
+            &["default_thread_ts", "thread_ts"],
+        ),
+        api_base_url: string_from_arguments_or_secret(
+            arguments,
+            secret,
+            &["api_base_url"],
+            &["api_base_url"],
+        )
+        .unwrap_or_else(|| "https://slack.com/api".to_string()),
+        workspace_id: string_from_arguments_or_secret(
+            arguments,
+            secret,
+            &["workspace_id"],
+            &["workspace_id"],
+        ),
+        workspace_name: string_from_arguments_or_secret(
+            arguments,
+            secret,
+            &["workspace_name"],
+            &["workspace_name"],
+        ),
+    })
 }
 
 pub(crate) fn teams_config_from_secret(

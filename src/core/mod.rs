@@ -59,29 +59,29 @@ mod task;
 pub mod task_router;
 pub mod watcher;
 
-pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
-pub(crate) use agent::USER_SELECTED_MODEL_SLOT_KEY;
 pub(crate) use agent::chat_model_is_configured;
 pub(crate) use agent::queue_stream_event;
+pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
+pub(crate) use agent::USER_SELECTED_MODEL_SLOT_KEY;
+pub(crate) use agent::{parse_direct_chat_approval_submit_text, DirectChatApprovalSubmitDecision};
 pub use agent::{
     Agent, ChatAttachmentHint, ClarificationChoice, ConversationMessage, ExecutionStep,
     ExecutionTrace, QueryComplexity, RequestExecutionHints, SecurityEvents, SecuritySnapshot,
     StreamEvent, UserProfile,
 };
-pub(crate) use agent::{DirectChatApprovalSubmitDecision, parse_direct_chat_approval_submit_text};
 pub use arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitFileEntry, OrbitManifest};
 pub use automation::{
-    AutomationRunStatus, AutomationSupervisorState, list_runs as list_automation_runs,
-    list_supervisor_states as list_automation_supervisor_states,
+    list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
+    AutomationRunStatus, AutomationSupervisorState,
 };
 pub use autonomy::{
-    AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction, RiskEnvelope, RiskLevel,
-    TrustPolicy, score_action_risk,
+    score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,
+    RiskEnvelope, RiskLevel, TrustPolicy,
 };
 pub use background_session::{
+    background_session_id_from_automation, set_background_session_id_in_automation,
     BackgroundSession, BackgroundSessionCreate, BackgroundSessionEvent, BackgroundSessionManager,
     BackgroundSessionPolicy, BackgroundSessionStatus, BackgroundSessionUpdate,
-    background_session_id_from_automation, set_background_session_id_in_automation,
 };
 pub use browser_profiles::{
     BrowserLoginState, BrowserProfileControlPlane, BrowserProfileListResponse,
@@ -90,37 +90,37 @@ pub use browser_profiles::{
     BrowserProfileUpsert,
 };
 pub use companion::{
-    CompanionAttestationClaim, CompanionAuditEvent, CompanionCommand, CompanionCommandCreate,
+    companion_presets, presets_response as companion_presets_response,
+    protocol_document as companion_protocol_document, CompanionAttestationClaim,
+    CompanionAuditEvent, CompanionCommand, CompanionCommandCreate, CompanionCommandDescriptor,
     CompanionCommandStatus, CompanionControlPlane, CompanionDevice, CompanionDeviceAttestation,
     CompanionDeviceState, CompanionGrant, CompanionPairingClaim, CompanionPairingClaimResult,
     CompanionPairingSession, CompanionPairingSessionCreate, CompanionPairingStatus,
     CompanionPresetsResponse, CompanionProtocolDocument, CompanionRiskLevel,
-    CompanionTokenRotationRequest, CompanionTokenRotationResult, companion_presets,
-    presets_response as companion_presets_response,
-    protocol_document as companion_protocol_document,
+    CompanionTokenRotationRequest, CompanionTokenRotationResult,
 };
 pub use config::{
     AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
 };
 pub use embeddings::EmbeddingClient;
 pub use execution::{
-    AttemptPolicy, AttemptRecord, DegradationNote, DelegationStatus, ExecutionCandidateDescriptor,
-    ExecutionCheckpoint, ExecutionOutcome, ExecutionRequest, ExecutionRun, ExecutionRunStatus,
-    ExecutionSupervisor, FailureClass, FailureKind, ModelAttemptRecord, RecoveryAction,
-    RequestState, ToolAttempt, ToolOutcome, ToolOutcomeStatus, UserFacingOutcome,
-    UserFacingOutcomeStatus, execute_supervised_transport_chat,
+    execute_supervised_transport_chat, AttemptPolicy, AttemptRecord, DegradationNote,
+    DelegationStatus, ExecutionCandidateDescriptor, ExecutionCheckpoint, ExecutionOutcome,
+    ExecutionRequest, ExecutionRun, ExecutionRunStatus, ExecutionSupervisor, FailureClass,
+    FailureKind, ModelAttemptRecord, RecoveryAction, RequestState, ToolAttempt, ToolOutcome,
+    ToolOutcomeStatus, UserFacingOutcome, UserFacingOutcomeStatus,
 };
 pub use gateway::{
-    GatewayBroadcastGroup, GatewayBroadcastGroupCreate, GatewayChannelAccount,
-    GatewayChannelAccountUpsert, GatewayChannelDescriptor, GatewayChannelsResponse,
-    GatewayChannelsSummary, GatewayRouteRule, GatewayRouteRuleUpsert, GatewayRoutingResponse,
-    GatewayRoutingSimulation, GatewayRoutingSimulationRequest, GatewayRoutingSummary,
     create_broadcast_group as create_gateway_broadcast_group,
     delete_channel_account as delete_gateway_channel_account,
     delete_route_rule as delete_gateway_route_rule, load_channels as load_gateway_channels,
     load_routing as load_gateway_routing, simulate_routing as simulate_gateway_routing,
     upsert_channel_account as upsert_gateway_channel_account,
-    upsert_route_rule as upsert_gateway_route_rule,
+    upsert_route_rule as upsert_gateway_route_rule, GatewayBroadcastGroup,
+    GatewayBroadcastGroupCreate, GatewayChannelAccount, GatewayChannelAccountUpsert,
+    GatewayChannelDescriptor, GatewayChannelsResponse, GatewayChannelsSummary, GatewayRouteRule,
+    GatewayRouteRuleUpsert, GatewayRoutingResponse, GatewayRoutingSimulation,
+    GatewayRoutingSimulationRequest, GatewayRoutingSummary,
 };
 pub use gateway_ops::{
     GatewayOpsControlPlane, GatewayOpsHighlight, GatewayOpsOperatorCheck, GatewayOpsOverview,
@@ -142,9 +142,9 @@ pub use nodes::{
 pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanSubstep};
 pub use prompt_memory::PromptMemory;
 pub use readiness::{DevelopmentalReadiness, ReadinessPolicy};
-pub use task::{
-    Task, TaskApproval, TaskQueue, TaskStatus, status_for_task_approval,
-    task_requires_explicit_approval,
-};
 pub(crate) use task::{one_shot_reminder_is_expired, one_shot_reminder_needs_delay_notice};
+pub use task::{
+    status_for_task_approval, task_requires_explicit_approval, Task, TaskApproval, TaskQueue,
+    TaskStatus,
+};
 pub(crate) use task::{task_is_one_shot_scheduled_reminder, task_is_scheduled_reminder};

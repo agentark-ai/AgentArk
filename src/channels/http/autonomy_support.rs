@@ -750,7 +750,7 @@ pub(super) async fn server_busy_for_chat_suggestions(state: &AppState) -> bool {
     }
     let recent_foreground_activity = {
         let agent = state.agent.read().await;
-        let last_activity = agent.last_activity.read().await.clone();
+        let last_activity = *agent.last_activity.read().await;
         last_activity.is_some_and(|last_activity| {
             chrono::Utc::now()
                 .signed_duration_since(last_activity)

@@ -17,11 +17,11 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sea_orm::DatabaseTransaction;
 use sea_orm::entity::prelude::PgVector;
+use sea_orm::DatabaseTransaction;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::storage::{Storage, experience_item};
+use crate::storage::{experience_item, Storage};
 
 use super::embeddings::EmbeddingClient;
 

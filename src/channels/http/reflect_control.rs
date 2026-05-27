@@ -5,11 +5,11 @@ use super::*;
 
 use crate::core::arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitChatTranscriptSummary};
 use crate::core::{EmbeddingClient, LlmClient, TaskStatus};
-use crate::storage::Storage;
 use crate::storage::entities::{
     arkpulse_event, conversation, experience_item, experience_run, llm_usage, message,
     procedural_pattern, semantic_work_unit, task,
 };
+use crate::storage::Storage;
 use chrono::{TimeZone, Timelike};
 use sea_orm::entity::prelude::PgVector;
 use sha2::{Digest, Sha256};
@@ -1388,7 +1388,7 @@ fn reflect_latest_suggestion(
     );
     let has_fresh_cache = !reflect_followup_search_is_due(cache, &source_id, now);
     let cache_entry = reflect_search_cache_entry(cache, &source_id);
-    let needs_planning = cache_entry.is_none();
+    let attach_planning_context = cache_entry.is_none();
     let search_results = cache_entry
         .map(|entry| entry.results.clone())
         .unwrap_or_default();
@@ -1449,7 +1449,7 @@ fn reflect_latest_suggestion(
         ),
         feedback_vector: None,
         search_query: Some(planned_search_query),
-        search_planning_context: needs_planning.then(|| {
+        search_planning_context: attach_planning_context.then(|| {
             let mut parts = Vec::new();
             let request =
                 reflect_external_text(run.request_text.as_deref().unwrap_or_default(), 360);
@@ -1481,7 +1481,7 @@ fn reflect_latest_suggestion(
             }
             truncate_chars(&parts.join("\n"), 1200)
         }),
-        search_requires_planning: needs_planning,
+        search_requires_planning: false,
     }
 }
 
@@ -1729,7 +1729,7 @@ fn reflect_semantic_cluster_latest_suggestion(
             .map(|embedding| embedding.as_slice().to_vec()),
         search_query: Some(planned_search_query),
         search_planning_context: Some(planning_context),
-        search_requires_planning: cache_entry.is_none(),
+        search_requires_planning: false,
     })
 }
 
@@ -3633,8 +3633,7 @@ fn watcher_candidate(
 ) -> Option<ReflectCandidateUnit> {
     let occurred = watcher
         .last_poll_at
-        .clone()
-        .unwrap_or_else(|| watcher.created_at.clone())
+        .unwrap_or(watcher.created_at)
         .to_rfc3339();
     if !in_window(&occurred, from, to) {
         return None;
@@ -3677,7 +3676,7 @@ fn watcher_candidate(
         embedding_text,
         occurred_at: occurred,
         period_start: Some(watcher.created_at.to_rfc3339()),
-        period_end: watcher.last_poll_at.clone().map(|value| value.to_rfc3339()),
+        period_end: watcher.last_poll_at.map(|value| value.to_rfc3339()),
         message_count: watcher.poll_count.min(i32::MAX as u32) as i32,
         metadata: serde_json::json!({
             "watcher_id": watcher.id.to_string(),
@@ -4093,9 +4092,7 @@ async fn embedding_for_candidate(
     if let Some(embedding) = candidate.inherited_embedding.clone() {
         return Some(embedding);
     }
-    let Some(embedder) = embedder else {
-        return None;
-    };
+    let embedder = embedder?;
     let input = candidate.embedding_text.trim();
     if input.is_empty() {
         return None;
@@ -4306,35 +4303,33 @@ async fn refresh_reflect_units(
         }
     }
 
-    if let Ok(orbits) =
+    if let Ok(Ok(orbits)) =
         tokio::time::timeout(REFLECT_DB_TIMEOUT, arkorbit.list_orbits(user_id)).await
     {
-        if let Ok(orbits) = orbits {
-            for orbit in orbits.into_iter().take(REFLECT_MAX_ORBITS) {
-                let transcripts =
-                    list_orbit_transcripts_blocking(arkorbit.clone(), orbit.id.clone()).await;
-                for transcript in transcripts
-                    .into_iter()
-                    .take(REFLECT_MAX_TRANSCRIPTS_PER_ORBIT)
-                {
-                    if !in_window(&transcript.updated_at, from, to) {
-                        continue;
-                    }
-                    let messages = read_orbit_transcript_blocking(
-                        arkorbit.clone(),
-                        orbit.id.clone(),
-                        transcript.id.clone(),
-                    )
-                    .await;
-                    let messages = filter_orbit_messages_between(messages, from, to);
-                    upsert_candidates(
-                        storage,
-                        embedder,
-                        orbit_candidates(&orbit, &transcript, messages),
-                        &mut counts,
-                    )
-                    .await;
+        for orbit in orbits.into_iter().take(REFLECT_MAX_ORBITS) {
+            let transcripts =
+                list_orbit_transcripts_blocking(arkorbit.clone(), orbit.id.clone()).await;
+            for transcript in transcripts
+                .into_iter()
+                .take(REFLECT_MAX_TRANSCRIPTS_PER_ORBIT)
+            {
+                if !in_window(&transcript.updated_at, from, to) {
+                    continue;
                 }
+                let messages = read_orbit_transcript_blocking(
+                    arkorbit.clone(),
+                    orbit.id.clone(),
+                    transcript.id.clone(),
+                )
+                .await;
+                let messages = filter_orbit_messages_between(messages, from, to);
+                upsert_candidates(
+                    storage,
+                    embedder,
+                    orbit_candidates(&orbit, &transcript, messages),
+                    &mut counts,
+                )
+                .await;
             }
         }
     }
@@ -5458,8 +5453,8 @@ async fn spawn_reflect_refresh(
         if completed {
             let _ = maybe_spawn_reflect_followup_search_for_range(
                 state.clone(),
-                request.from.clone(),
-                request.to.clone(),
+                request.from,
+                request.to,
                 trigger,
             )
             .await;
@@ -6034,6 +6029,21 @@ pub(super) async fn ark_reflect_endpoint(
     let today_date = reflect_local_date(chrono::Utc::now(), tz);
     let digest_enabled = arkreflect_daily_digest_enabled(&storage).await;
     let daily_digest_status = load_daily_digest_status(&storage, digest_enabled, today_date).await;
+    let followup_state = state.clone();
+    let followup_from = request.from;
+    let followup_to = request.to;
+    crate::spawn_logged!(
+        "src/channels/http/reflect_control.rs:followup_page_probe",
+        async move {
+            let _ = maybe_spawn_reflect_followup_search_for_range(
+                followup_state,
+                followup_from,
+                followup_to,
+                "view",
+            )
+            .await;
+        }
+    );
     let units = match tokio::time::timeout(
         REFLECT_DB_TIMEOUT,
         storage.list_semantic_work_units_between(&from_s, &to_s, REFLECT_MAX_UNITS),
@@ -6301,12 +6311,10 @@ mod tests {
             task_type: task_type.map(str::to_string),
             request_text: Some("Compare current public updates for a topic.".to_string()),
             tool_sequence_digest: None,
-            tool_sequence_json: serde_json::json!(
-                tool_names
-                    .iter()
-                    .map(|name| serde_json::json!({ "tool_name": name }))
-                    .collect::<Vec<_>>()
-            ),
+            tool_sequence_json: serde_json::json!(tool_names
+                .iter()
+                .map(|name| serde_json::json!({ "tool_name": name }))
+                .collect::<Vec<_>>()),
             strategy_version: None,
             policy_version: None,
             prompt_version: None,
@@ -6356,11 +6364,9 @@ mod tests {
             followup("l2", "latest_developments", 96.0),
         ]);
         assert_eq!(selected.len(), REFLECT_MAX_SUGGESTED_FOLLOWUPS);
-        assert!(
-            selected
-                .iter()
-                .any(|item| item.kind == "latest_developments")
-        );
+        assert!(selected
+            .iter()
+            .any(|item| item.kind == "latest_developments"));
         assert!(
             selected
                 .iter()
@@ -6371,7 +6377,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_research_followup_requires_semantic_planning_before_first_search() {
+    fn latest_research_followup_queues_from_structured_research_signal() {
         let run = experience_run_with_tools(Some("research"), &["web_search"]);
         let now = chrono::Utc
             .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
@@ -6383,7 +6389,7 @@ mod tests {
 
         assert_eq!(suggestion.kind, "latest_developments");
         assert_eq!(suggestion.status, "queued");
-        assert!(suggestion.search_requires_planning);
+        assert!(!suggestion.search_requires_planning);
         assert!(suggestion.search_planning_context.is_some());
         assert!(suggestion.search_results.is_empty());
     }
@@ -6413,6 +6419,36 @@ mod tests {
         assert!(selected.iter().any(|item| item.id == "thread-a"));
         assert!(selected.iter().any(|item| item.id == "thread-c"));
         assert!(!selected.iter().any(|item| item.id == "thread-b"));
+    }
+
+    #[test]
+    fn dismissed_semantic_followup_stays_hidden_until_newer_interest() {
+        let mut store = ReflectFollowupFeedbackStore::default();
+        store.entries.insert(
+            "semantic-topic".to_string(),
+            ReflectFollowupFeedbackState {
+                dismiss_count: 1,
+                last_action: Some("dismiss".to_string()),
+                last_at: Some("2026-05-03T00:00:00Z".to_string()),
+                semantic_vector: Some(vec![1.0, 0.0, 0.0]),
+                ..ReflectFollowupFeedbackState::default()
+            },
+        );
+
+        let stale_feedback = reflect_followup_refresh_feedback_for_new_evidence(
+            reflect_followup_semantic_feedback(Some(&[0.99, 0.01, 0.0]), &store),
+            "2026-05-02T00:00:00Z",
+        )
+        .unwrap();
+        assert!(reflect_followup_is_dismissed(Some(&stale_feedback)));
+
+        let renewed_feedback = reflect_followup_refresh_feedback_for_new_evidence(
+            reflect_followup_semantic_feedback(Some(&[0.99, 0.01, 0.0]), &store),
+            "2026-05-04T00:00:00Z",
+        )
+        .unwrap();
+        assert!(renewed_feedback.renewed_after_feedback);
+        assert!(!reflect_followup_is_dismissed(Some(&renewed_feedback)));
     }
 
     #[test]
@@ -6492,7 +6528,7 @@ mod tests {
         assert_eq!(suggestion.kind, "latest_developments");
         assert_eq!(suggestion.status, "queued");
         assert!(suggestion.search_query.is_some());
-        assert!(suggestion.search_requires_planning);
+        assert!(!suggestion.search_requires_planning);
     }
 
     #[test]
@@ -6562,15 +6598,13 @@ mod tests {
         )
         .unwrap();
         assert!(!reflect_semantic_freshness_is_actionable(score));
-        assert!(
-            reflect_semantic_cluster_latest_suggestion(
-                &cluster,
-                &ReflectFollowupSearchCache::default(),
-                now,
-                score,
-            )
-            .is_none()
-        );
+        assert!(reflect_semantic_cluster_latest_suggestion(
+            &cluster,
+            &ReflectFollowupSearchCache::default(),
+            now,
+            score,
+        )
+        .is_none());
     }
 
     #[test]
@@ -6673,6 +6707,26 @@ mod tests {
             &plans,
             &ReflectFollowupPlanCache::default(),
         );
+        assert!(planned.is_empty());
+    }
+
+    #[test]
+    fn external_pursuit_planning_still_drops_private_memory_without_plan() {
+        let mut candidate = followup("memory-topic", "latest_developments", 80.0);
+        candidate.title = "Learned user memory".to_string();
+        candidate.search_requires_planning = true;
+        candidate.search_query = Some("Learned user memory about an ordinary nickname".to_string());
+        candidate.search_planning_context = Some(
+            "source_kind: experience_item\nsource_label: Memory\ntitle: Learned user memory\nsummary: ordinary nickname"
+                .to_string(),
+        );
+
+        let planned = apply_reflect_external_pursuit_plans(
+            vec![candidate],
+            &BTreeMap::new(),
+            &ReflectFollowupPlanCache::default(),
+        );
+
         assert!(planned.is_empty());
     }
 
@@ -6845,12 +6899,14 @@ mod tests {
             from: now - chrono::Duration::days(7),
             to: now,
         };
-        let mut status = ReflectRefreshStatus::default();
-        status.status = "completed".to_string();
-        status.period = Some(request.period.as_str().to_string());
-        status.from = Some(request.from.to_rfc3339());
-        status.to = Some(request.to.to_rfc3339());
-        status.completed_at = Some((now - chrono::Duration::minutes(3)).to_rfc3339());
+        let mut status = ReflectRefreshStatus {
+            status: "completed".to_string(),
+            period: Some(request.period.as_str().to_string()),
+            from: Some(request.from.to_rfc3339()),
+            to: Some(request.to.to_rfc3339()),
+            completed_at: Some((now - chrono::Duration::minutes(3)).to_rfc3339()),
+            ..ReflectRefreshStatus::default()
+        };
 
         assert!(reflect_refresh_recently_completed_for_request(
             &status, &request, now

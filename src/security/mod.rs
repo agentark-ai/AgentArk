@@ -712,7 +712,7 @@ fn luhn_valid(digits: &str) -> bool {
         sum += value;
         double = !double;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 fn spans_overlap(left: RedactionSpan, right: RedactionSpan) -> bool {

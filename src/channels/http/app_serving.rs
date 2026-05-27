@@ -1372,7 +1372,7 @@ pub(super) fn unwrap_nested_public_proxy_url(raw: &str) -> String {
 }
 
 pub(super) fn trim_public_proxy_url_candidate(raw: &str) -> &str {
-    raw.trim_end_matches(|ch: char| matches!(ch, ',' | ';' | '.'))
+    raw.trim_end_matches([',', ';', '.'])
 }
 
 pub(super) fn is_public_proxy_target_url_candidate(url: &reqwest::Url) -> bool {
@@ -2678,8 +2678,13 @@ pub(super) async fn public_proxy_raw(
 
 pub(super) fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
     query.and_then(|q| {
-        url::form_urlencoded::parse(q.as_bytes())
-            .find_map(|(k, v)| if k == key { Some(v.into_owned()) } else { None })
+        url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| {
+            if k == key {
+                Some(v.into_owned())
+            } else {
+                None
+            }
+        })
     })
 }
 
@@ -2947,9 +2952,9 @@ pub(super) fn axum_to_tungstenite_message(msg: AxumWsMessage) -> Option<Tungsten
 pub(super) fn tungstenite_to_axum_message(msg: TungsteniteMessage) -> Option<AxumWsMessage> {
     match msg {
         TungsteniteMessage::Text(text) => Some(AxumWsMessage::Text(text.to_string().into())),
-        TungsteniteMessage::Binary(data) => Some(AxumWsMessage::Binary(data.into())),
-        TungsteniteMessage::Ping(data) => Some(AxumWsMessage::Ping(data.into())),
-        TungsteniteMessage::Pong(data) => Some(AxumWsMessage::Pong(data.into())),
+        TungsteniteMessage::Binary(data) => Some(AxumWsMessage::Binary(data)),
+        TungsteniteMessage::Ping(data) => Some(AxumWsMessage::Ping(data)),
+        TungsteniteMessage::Pong(data) => Some(AxumWsMessage::Pong(data)),
         TungsteniteMessage::Close(_) => Some(AxumWsMessage::Close(None)),
         TungsteniteMessage::Frame(_) => None,
     }
@@ -3691,11 +3696,11 @@ pub(super) async fn serve_app_file_inner(
             }
         }
     } else if !is_static {
-        return (
+        (
             StatusCode::SERVICE_UNAVAILABLE,
             "App runtime is not accepting connections yet.",
         )
-            .into_response();
+            .into_response()
     } else if is_static {
         if method != Method::GET && method != Method::HEAD {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -4013,10 +4018,8 @@ mod tests {
         assert!(rewritten.contains(r#"href="/apps/demo-app/""#));
         assert!(rewritten.contains(r#"src="/apps/demo-app/app.js""#));
         assert!(rewritten.contains(r#"action="/apps/demo-app/api/save""#));
-        assert!(
-            rewritten
-                .contains(r#"srcset="/apps/demo-app/small.png 1x, /apps/demo-app/large.png 2x""#)
-        );
+        assert!(rewritten
+            .contains(r#"srcset="/apps/demo-app/small.png 1x, /apps/demo-app/large.png 2x""#));
         assert!(rewritten.contains(r#"href="/apps/other/style.css""#));
     }
 

@@ -3,7 +3,7 @@
 //! Orbits are folders under `<DATA_DIR>/arkorbit/L2/orbits/<id>/`. No
 //! ArkOrbit database tables are created or queried in this redesign.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;

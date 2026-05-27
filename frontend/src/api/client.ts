@@ -11,6 +11,7 @@ import type {
   CompanionAuditResponse,
   CompanionCommandsResponse,
   CompanionDevicesResponse,
+  CompanionMobileAccessResponse,
   CompanionPresetsResponse,
   CompanionProtocolDocument,
   ExtensionPackConnectionView,
@@ -370,6 +371,164 @@ export async function request<T>(path: string, init?: RequestOptions): Promise<T
   return (await res.json()) as T;
 }
 
+function filenameFromContentDisposition(value: string | null): string {
+  const header = (value || "").trim();
+  if (!header) return "";
+  const encodedMatch = header.match(/filename\*\s*=\s*([^;]+)/i);
+  if (encodedMatch?.[1]) {
+    const raw = encodedMatch[1].trim().replace(/^["']|["']$/g, "");
+    const parts = raw.split("''");
+    const encoded = parts.length > 1 ? parts.slice(1).join("''") : raw;
+    try {
+      return decodeURIComponent(encoded).trim();
+    } catch {
+      return encoded.trim();
+    }
+  }
+  const quotedMatch = header.match(/filename\s*=\s*"([^"]+)"/i);
+  if (quotedMatch?.[1]) return quotedMatch[1].trim();
+  const plainMatch = header.match(/filename\s*=\s*([^;]+)/i);
+  return plainMatch?.[1]?.trim().replace(/^["']|["']$/g, "") || "";
+}
+
+function filenameFromPath(value: string): string {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw, typeof window !== "undefined" ? window.location.href : "http://localhost");
+    const parts = url.pathname.split("/").filter(Boolean);
+    const last = parts[parts.length - 1] === "download"
+      ? parts[parts.length - 2]
+      : parts[parts.length - 1];
+    return last ? decodeURIComponent(last) : "";
+  } catch {
+    const cleaned = raw.split(/[?#]/, 1)[0].replace(/\/download$/, "");
+    const last = cleaned.split("/").filter(Boolean).pop() || "";
+    try {
+      return decodeURIComponent(last);
+    } catch {
+      return last;
+    }
+  }
+}
+
+function safeDownloadFilename(value: string, fallback = "download"): string {
+  const cleaned = (value || "")
+    .trim()
+    .replace(/[/\\:*?"<>|]+/g, "-")
+    .replace(/\s+/g, " ")
+    .slice(0, 180);
+  return cleaned || fallback;
+}
+
+export function apiOutputPathFromHref(value?: string | null): string | null {
+  const raw = (value || "").trim();
+  if (!raw) return null;
+  const safePath = (path: string, suffix = "") => {
+    const next = `${path}${suffix}`;
+    return next.startsWith("/api/outputs/") &&
+      !next.includes("..") &&
+      !next.includes("\\")
+      ? next
+      : null;
+  };
+  if (raw.startsWith("/api/outputs/")) {
+    const [path, suffix = ""] = raw.split(/([?#].*)/, 2);
+    return safePath(path, suffix);
+  }
+  try {
+    const url = new URL(raw, typeof window !== "undefined" ? window.location.href : "http://localhost");
+    if (!url.pathname.startsWith("/api/outputs/")) return null;
+    const currentOrigin =
+      typeof window !== "undefined" ? window.location.origin : url.origin;
+    const apiOrigin = new URL(apiUrl("/api/outputs/probe/file"), currentOrigin)
+      .origin;
+    const localHost = /^(localhost|127\.0\.0\.1|\[?::1\]?)$/i.test(
+      url.hostname,
+    );
+    if (url.origin !== currentOrigin && url.origin !== apiOrigin && !localHost) {
+      return null;
+    }
+    return safePath(url.pathname, `${url.search}${url.hash}`);
+  } catch {
+    return null;
+  }
+}
+
+export type ApiBlobResponse = {
+  blob: Blob;
+  filename: string;
+  contentType: string;
+};
+
+export async function requestBlob(
+  path: string,
+  init?: RequestOptions,
+): Promise<ApiBlobResponse> {
+  const headers = new Headers(init?.headers || undefined);
+  if (!headers.has("Accept")) headers.set("Accept", "*/*");
+  const doFetch = () =>
+    fetchWithOptionalTimeout(
+      path,
+      {
+        ...init,
+        method: init?.method || "GET",
+        headers,
+      },
+      false,
+    );
+  let res = await doFetch();
+  if (!res.ok) {
+    let rawText = await res.text();
+    let text = extractErrorMessage(rawText);
+    if (isMissingAuthError(res.status, text)) {
+      await refreshUiSessionCookie();
+      res = await doFetch();
+      if (!res.ok) {
+        rawText = await res.text();
+        text = extractErrorMessage(rawText);
+        throw new ApiRequestError(text || `Request failed (${res.status})`, res.status);
+      }
+    } else {
+      throw new ApiRequestError(text || `Request failed (${res.status})`, res.status);
+    }
+  }
+  const blob = await res.blob();
+  const contentType = res.headers.get("Content-Type") || blob.type || "";
+  const filename =
+    filenameFromContentDisposition(res.headers.get("Content-Disposition")) ||
+    filenameFromPath(path) ||
+    "download";
+  return { blob, filename: safeDownloadFilename(filename), contentType };
+}
+
+export async function downloadApiFile(
+  path: string,
+  options: { filename?: string; openInline?: boolean } = {},
+): Promise<void> {
+  const response = await requestBlob(path);
+  const filename = safeDownloadFilename(options.filename || response.filename);
+  const objectUrl = window.URL.createObjectURL(response.blob);
+  const revokeLater = () => {
+    window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 60_000);
+  };
+  if (options.openInline) {
+    const opened = window.open(objectUrl, "_blank", "noopener,noreferrer");
+    if (opened) {
+      revokeLater();
+      return;
+    }
+  }
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  anchor.rel = "noopener noreferrer";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  revokeLater();
+}
+
 export async function requestForm<T>(path: string, formData: FormData, init?: RequestOptions): Promise<T> {
   const doFetch = () =>
     fetchWithOptionalTimeout(
@@ -402,6 +561,7 @@ type ChatStreamPayload = {
   channel?: string;
   conversation_id?: string | null;
   deep_research?: boolean;
+  execution_profile?: Record<string, unknown>;
   plan_confirmation_mode?: string;
   execution_mode?: string;
   attachments_present?: boolean;
@@ -413,6 +573,7 @@ type ChatStreamPayload = {
   }>;
   accepted_suggestion_id?: string;
   sentinel_proposal_id?: string;
+  browser_profile_context?: Record<string, unknown>;
 };
 
 type ChatStreamHandlers = {
@@ -1084,6 +1245,7 @@ export const api = {
   getCompanionPresets: () => request<CompanionPresetsResponse>("/companion/presets"),
   getCompanionProtocol: () => request<CompanionProtocolDocument>("/companion/protocol"),
   getCompanionConnectivity: () => request<Record<string, unknown>>("/companion/connectivity"),
+  getCompanionMobileAccess: () => request<CompanionMobileAccessResponse>("/companion/mobile-access"),
   startCompanionTunnel: () =>
     request<Record<string, unknown>>("/companion/connectivity/tunnel/start", {
       method: "POST",
@@ -1184,6 +1346,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
+  launchBrowserProfile: (id: string) =>
+    request<{ status: string; session?: Record<string, unknown>; message?: string }>(
+      `/browser/profiles/${encodeURIComponent(id)}/launch`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  closeBrowserProfile: (id: string) =>
+    request<{ status: string; closed_sessions?: number; sessions?: unknown[]; message?: string }>(
+      `/browser/profiles/${encodeURIComponent(id)}/close`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
   updateBrowserProfile: (id: string, payload: Record<string, unknown>) =>
     request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
       `/browser/profiles/${encodeURIComponent(id)}`,
@@ -1377,7 +1555,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ action, dry_run: false })
       }),
-  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; deep_research?: boolean; plan_confirmation_mode?: string; execution_mode?: string }) =>
+  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; deep_research?: boolean; execution_profile?: Record<string, unknown>; plan_confirmation_mode?: string; execution_mode?: string; browser_profile_context?: Record<string, unknown> }) =>
     request<{ response: string; proof_id?: string; conversation_id?: string; conversation_title?: string }>(
       "/chat",
       {

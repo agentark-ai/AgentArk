@@ -2655,8 +2655,7 @@ pub(super) async fn stop_tunnel(
     payload: Option<Json<StopTunnelRequest>>,
 ) -> Response {
     let requested_app_id = payload
-        .map(|Json(request)| request.app_id)
-        .flatten()
+        .and_then(|Json(request)| request.app_id)
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())

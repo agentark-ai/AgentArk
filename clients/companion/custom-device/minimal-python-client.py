@@ -22,6 +22,23 @@ async def send_json(ws: Any, payload: dict[str, Any]) -> None:
     await ws.send(json.dumps(payload))
 
 
+def command_declarations(capabilities: list[str]) -> list[dict[str, str]]:
+    declarations: list[dict[str, str]] = []
+    for capability in capabilities:
+        action = f"{capability}.invoke"
+        declarations.append(
+            {
+                "id": action,
+                "label": action.replace(".", " ").replace("_", " ").title(),
+                "capability": capability,
+                "action": action,
+                "description": "Custom device adapter action.",
+                "risk": "high" if not capability.startswith("custom.") else "low",
+            }
+        )
+    return declarations
+
+
 async def run(args: argparse.Namespace) -> None:
     headers = {}
     if args.device_id and args.token:
@@ -65,6 +82,7 @@ async def run(args: argparse.Namespace) -> None:
                 "type": "pulse",
                 "state": "online",
                 "capabilities": args.capability,
+                "commands": command_declarations(args.capability),
                 "metadata": {"version": "minimal-python-client"},
             },
         )

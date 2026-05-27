@@ -4,7 +4,7 @@
 //! It never invokes the main agent turn loop, legacy intent planner,
 //! or tool-call envelope path.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
@@ -425,7 +425,7 @@ fn render_orbit_scope_classifier_prompt(surface_kind: OrbitChatSurfaceKind) -> S
             "The selected surface is the Orbit workspace overview. It may answer inventory, comparison, and status requests from Orbit workspace context. It must not directly mutate a canvas from overview; if the intended work is a widget/canvas/frontend change, the downstream Orbit agent may ask the user to select or name the target canvas."
         }
         OrbitChatSurfaceKind::Canvas => {
-            "The selected surface is a created Orbit canvas. It may create, update, remove, inspect, arrange, or style widgets and frontend-only dashboard/app surfaces inside that selected canvas."
+            "The selected surface is a created Orbit canvas. It may create, update, remove, inspect, arrange, or style very small JavaScript-enabled customer-facing widgets and compact frontend-only surfaces inside that selected canvas. Full, detailed, deployable, multi-page, backend-backed, private/authenticated API, or production app builds belong in main chat and the app_deploy path."
         }
     };
     format!(
@@ -433,13 +433,14 @@ fn render_orbit_scope_classifier_prompt(surface_kind: OrbitChatSurfaceKind) -> S
 Classify the intended outcome, not surface wording, keywords, casing, punctuation, grammar, typos, language, tone, or order.\n\
 \n\
 Allowed decision labels:\n\
-- orbit_ui_work: the user wants work on ArkOrbit widgets, the current Orbit canvas, Orbit workspace inventory, widget layout, visual styling, frontend-only dashboard/app surfaces embedded in Orbit, or public-data widgets that run inside Orbit without secrets.\n\
-- out_of_scope: every other intended outcome, including {product} product/support/capability questions, broad app builds outside Orbit, backend/server/API/database/auth work, deployment/install/debugging of the main app or repo, web research/advice, memory/tasks/scheduling, integrations, credential handling, or filesystem work outside the selected Orbit.\n\
+- orbit_ui_work: the user wants work on ArkOrbit widgets, the current Orbit canvas, Orbit workspace inventory, widget layout, visual styling, very small JavaScript-enabled customer-facing widgets, compact frontend-only surfaces embedded in Orbit, or public-data widgets that run inside Orbit without secrets.\n\
+- out_of_scope: every other intended outcome, including {product} product/support/capability questions, detailed or broad app builds, deployable apps, multi-page apps, backend/server/database/auth work, private or authenticated API work, deployment/install/debugging of the main app or repo, web research/advice, memory/tasks/scheduling, integrations, credential handling, or filesystem work outside the selected Orbit.\n\
 \n\
 Decision policy:\n\
 - Choose the user's primary substantive intent. Social wrappers, greetings, tone, typos, abbreviations, wording order, or punctuation must not override a real request to inspect or change an Orbit surface.\n\
 - If a conversational acknowledgement is the whole turn and it belongs in this Orbit surface, choose orbit_ui_work so the Orbit agent can answer naturally.\n\
-- If the requested deliverable is an Orbit widget, canvas, or frontend-only dashboard, choose orbit_ui_work even when the widget displays domain-specific public data at runtime. The displayed subject matter is not itself a request for research or advice.\n\
+- If the requested deliverable is a minimal Orbit widget, canvas layout, compact customer-facing surface, or lightweight frontend-only widget, choose orbit_ui_work even when the widget displays domain-specific public data at runtime. The displayed subject matter is not itself a request for research or advice.\n\
+- If the requested deliverable is a detailed app, full application, production/deployable app, multi-page experience, or app needing backend/server/private API/auth/database/runtime deployment, choose out_of_scope so main chat can use the app deployment path. Public unauthenticated API calls for a small widget can stay in Orbit.\n\
 \n\
 Surface policy:\n\
 {surface_policy}\n\
@@ -474,7 +475,7 @@ fn orbit_security_surface_context(surface_kind: OrbitChatSurfaceKind) -> serde_j
             "arkorbit_frontend_canvas",
             "arkorbit_workspace_inventory"
         ],
-        "scope": "Orbit chat can manage widgets and frontend-only dashboard/app surfaces inside ArkOrbit. Broader AgentArk support, backend, deployment, research, memory, task, integration, and non-Orbit app-build requests belong in main chat.",
+        "scope": "Orbit chat can manage very small JavaScript-enabled customer-facing widgets and compact frontend-only surfaces inside ArkOrbit, including widgets that call public unauthenticated APIs through Orbit helpers. Detailed apps, deployable apps, backend/private API work, deployment, broader AgentArk support, research, memory, task, integration, and non-Orbit app-build requests belong in main chat and the app_deploy path.",
         "security_model": "Orbit browser code runs in a sandboxed iframe. Do not place credentials or session material in orbit files."
     })
 }
@@ -496,7 +497,7 @@ fn orbit_recent_messages_for_guard(history: &[ConversationMessage]) -> Option<se
         })
         .collect::<Vec<_>>();
     recent.reverse();
-    (!recent.is_empty()).then(|| serde_json::Value::Array(recent))
+    (!recent.is_empty()).then_some(serde_json::Value::Array(recent))
 }
 
 fn extract_json_object_from_text(text: &str) -> Option<serde_json::Value> {
@@ -688,6 +689,8 @@ mod orbit_agent_extra_tests {
         assert!(prompt.contains("out_of_scope"));
         assert!(prompt.contains("primary substantive intent"));
         assert!(prompt.contains("displays domain-specific public data"));
+        assert!(prompt.contains("detailed app"));
+        assert!(prompt.contains("app deployment path"));
         assert!(prompt.contains("AgentArk product/support/capability questions"));
     }
 
@@ -703,12 +706,10 @@ mod orbit_agent_extra_tests {
             context.get("surface_kind").and_then(|value| value.as_str()),
             Some("workspace_overview")
         );
-        assert!(
-            context
-                .get("scope")
-                .and_then(|value| value.as_str())
-                .is_some_and(|scope| scope.contains("Broader AgentArk support"))
-        );
+        assert!(context
+            .get("scope")
+            .and_then(|value| value.as_str())
+            .is_some_and(|scope| scope.contains("Detailed apps")));
     }
 
     #[test]
@@ -718,6 +719,25 @@ mod orbit_agent_extra_tests {
         assert!(prompt.contains("To delete or remove a visible widget"));
         assert!(prompt.contains("data/widgets.json"));
         assert!(prompt.contains("Do not invent a separate file-delete operation"));
+    }
+
+    #[test]
+    fn orbit_runtime_prompt_requires_generic_app_shell_design_types() {
+        let prompt = render_orbit_system_prompt(OrbitChatSurfaceKind::Canvas);
+
+        assert!(prompt.contains("spec.visual.design_type"));
+        assert!(prompt.contains("very small JavaScript-enabled themed apps/widgets"));
+        assert!(prompt.contains("space-agent UI"));
+        assert!(prompt.contains("dark/glass"));
+        assert!(prompt.contains("main chat/app_deploy"));
+        assert!(prompt.contains("hero-card"));
+        assert!(prompt.contains("dashboard-grid"));
+        assert!(prompt.contains("profile-panel"));
+        assert!(prompt.contains("not the same generic card"));
+        assert!(prompt.contains("icon by itself is not a design"));
+        assert!(prompt.contains("design quality gate"));
+        assert!(prompt.contains("pale brochure"));
+        assert!(prompt.contains("Size new app widgets for the design type"));
     }
 
     #[test]
@@ -915,13 +935,11 @@ mod orbit_agent_extra_tests {
 
     #[test]
     fn concise_plain_model_content_without_operations_can_be_visible() {
-        assert!(
-            model_content_without_operations_diagnostic(
-                "I could not identify the broken widget from the provided context.",
-                true
-            )
-            .is_none()
-        );
+        assert!(model_content_without_operations_diagnostic(
+            "I could not identify the broken widget from the provided context.",
+            true
+        )
+        .is_none());
     }
 
     #[test]
@@ -988,6 +1006,61 @@ mod orbit_agent_extra_tests {
         });
 
         assert!(!widget_registry_entries_match(&left, &right));
+    }
+
+    #[test]
+    fn custom_widget_module_paths_must_be_mountable_index_modules() {
+        assert_eq!(
+            widget_module_from_orbit_path("mod/weather/index.js").as_deref(),
+            Some("weather")
+        );
+        assert!(widget_module_from_orbit_path("mod/weather.js").is_none());
+        assert!(validate_custom_widget_module_write_content(
+            "mod/weather.js",
+            "export function render(el) { el.textContent = 'ok'; }",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("mod/<name>/index.js"));
+    }
+
+    #[test]
+    fn custom_widget_module_write_allows_public_api_widgets_that_need_code() {
+        let mut lines = vec![
+            "export async function render(el, ctx = {}) {".to_string(),
+            "  el.textContent = 'Loading weather...';".to_string(),
+            "  const data = await ctx.fetchJson('https://api.weather.gov/gridpoints/OKX/33,37/forecast');"
+                .to_string(),
+        ];
+        lines.extend((0..160).map(|index| format!("  const value{} = {};", index, index)));
+        lines.push("  el.textContent = data?.properties?.periods?.[0]?.shortForecast || 'Weather unavailable';".to_string());
+        lines.push("}".to_string());
+        let content = lines.join("\n");
+
+        validate_custom_widget_module_write_content("mod/weather/index.js", &content).unwrap();
+    }
+
+    #[test]
+    fn widget_registry_restore_preserves_existing_canvas_entries() {
+        let previous = vec![serde_json::json!({
+            "id": "def",
+            "module": "def",
+            "title": "Def",
+            "left": 14,
+            "top": 28
+        })];
+        let mut current = Vec::new();
+
+        assert!(merge_missing_widget_registry_entries(
+            &mut current,
+            &previous
+        ));
+
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            current[0].get("module").and_then(|value| value.as_str()),
+            Some("def")
+        );
     }
 
     #[test]
@@ -1650,48 +1723,44 @@ async fn run_single_stream(
                 )
                 .await?;
             }
-        } else {
-            if let Err(error) = apply_orbit_operation_payloads(
-                service,
-                orbit_id,
-                surface_kind,
-                runtime_repair_mode,
-                allow_read_operations,
-                operation_payloads,
-                event_tx,
-                &mut assistant_visible,
-                &mut reads,
-                &mut writes,
-                assistant_draft,
-                persist_prefix,
-            )
-            .await
-            {
-                let diagnostic = orbit_operation_retry_diagnostic(&error);
-                if writes == 0 && reads.is_empty() {
-                    emit_status(
-                        event_tx,
-                        assistant_draft,
-                        "Orbit rejected the generated operation; preparing a corrected update."
-                            .to_string(),
-                    )
-                    .await?;
-                    return Ok(OrbitSingleStreamOutcome {
-                        visible: assistant_visible,
-                        reads,
-                        writes,
-                        usage,
-                        operation_failure: Some(OrbitOperationFailure { diagnostic }),
-                    });
-                }
-                let message = user_visible_orbit_operation_error(&error);
-                append_visible_line(&mut assistant_visible, &message);
-                assistant_draft.persist_content(&combine_visible_content(
-                    persist_prefix,
-                    &assistant_visible,
-                ))?;
-                let _ = event_tx.send(OrbitAgentEvent::Error(message)).await;
+        } else if let Err(error) = apply_orbit_operation_payloads(
+            service,
+            orbit_id,
+            surface_kind,
+            runtime_repair_mode,
+            allow_read_operations,
+            operation_payloads,
+            event_tx,
+            &mut assistant_visible,
+            &mut reads,
+            &mut writes,
+            assistant_draft,
+            persist_prefix,
+        )
+        .await
+        {
+            let diagnostic = orbit_operation_retry_diagnostic(&error);
+            if writes == 0 && reads.is_empty() {
+                emit_status(
+                    event_tx,
+                    assistant_draft,
+                    "Orbit rejected the generated operation; preparing a corrected update."
+                        .to_string(),
+                )
+                .await?;
+                return Ok(OrbitSingleStreamOutcome {
+                    visible: assistant_visible,
+                    reads,
+                    writes,
+                    usage,
+                    operation_failure: Some(OrbitOperationFailure { diagnostic }),
+                });
             }
+            let message = user_visible_orbit_operation_error(&error);
+            append_visible_line(&mut assistant_visible, &message);
+            assistant_draft
+                .persist_content(&combine_visible_content(persist_prefix, &assistant_visible))?;
+            let _ = event_tx.send(OrbitAgentEvent::Error(message)).await;
         }
     } else if !saw_stream_token && !response.content.is_empty() {
         emit_visible_text(
@@ -1740,22 +1809,18 @@ fn orbit_stream_tool_progress_status(
     payload: Option<&serde_json::Value>,
 ) -> Option<String> {
     let Some(payload) = payload else {
-        return Some(
-            content
-                .trim()
-                .is_empty()
-                .then(|| orbit_tool_progress_label(name).to_string())
-                .unwrap_or_else(|| content.trim().to_string()),
-        );
+        return Some(if content.trim().is_empty() {
+            orbit_tool_progress_label(name).to_string()
+        } else {
+            content.trim().to_string()
+        });
     };
     if payload.get("kind").and_then(|value| value.as_str()) != Some("draft_file") {
-        return Some(
-            content
-                .trim()
-                .is_empty()
-                .then(|| orbit_tool_progress_label(name).to_string())
-                .unwrap_or_else(|| content.trim().to_string()),
-        );
+        return Some(if content.trim().is_empty() {
+            orbit_tool_progress_label(name).to_string()
+        } else {
+            content.trim().to_string()
+        });
     }
 
     let file = payload
@@ -1841,8 +1906,7 @@ fn orbit_operation_retry_diagnostic(error: &anyhow::Error) -> String {
 fn user_visible_orbit_operation_failure(diagnostic: &str) -> String {
     let safe_detail = diagnostic
         .trim()
-        .replace('\r', " ")
-        .replace('\n', " ")
+        .replace(['\r', '\n'], " ")
         .chars()
         .take(260)
         .collect::<String>();
@@ -1867,11 +1931,36 @@ fn allow_full_writes_after_read_context(
 }
 
 fn is_widget_module_index_path(path: &str) -> bool {
+    widget_module_from_orbit_path(path).is_some()
+}
+
+fn widget_module_from_orbit_path(path: &str) -> Option<String> {
     let normalized = path.trim().replace('\\', "/");
-    normalized
+    let module = normalized
         .strip_prefix("mod/")
-        .and_then(|rest| rest.strip_suffix("/index.js"))
-        .is_some_and(|module| !module.trim().is_empty() && !module.contains('/'))
+        .and_then(|rest| rest.strip_suffix("/index.js"))?;
+    if module.trim().is_empty() || module.contains('/') {
+        return None;
+    }
+    Some(module.to_string())
+}
+
+fn validate_custom_widget_module_write_content(path: &str, content: &str) -> Result<()> {
+    let normalized = path.trim().replace('\\', "/");
+    if !normalized.starts_with("mod/") || !normalized.ends_with(".js") {
+        return Ok(());
+    }
+    if widget_module_from_orbit_path(&normalized).is_none() {
+        return Err(anyhow!(
+            "Custom Orbit widget modules must be saved as mod/<name>/index.js so the canvas can mount them. Do not write flat mod/<name>.js files."
+        ));
+    }
+    if string_contains_embedded_html_document(content) {
+        return Err(anyhow!(
+            "Custom Orbit widget modules must be compact browser JavaScript, not full HTML documents, script blocks, or style documents."
+        ));
+    }
+    Ok(())
 }
 
 fn reject_existing_module_write_if_needed(
@@ -1994,6 +2083,8 @@ async fn apply_orbit_operation_payloads(
             .filter(|v| !v.is_empty())
             .map(str::to_string);
         let writes_before_payload = *writes;
+        let mut registry_before_payload: Option<Vec<serde_json::Value>> = None;
+        let mut touched_widget_modules = Vec::new();
 
         for operation in args.operations {
             let path = operation.path.trim().to_string();
@@ -2061,8 +2152,14 @@ async fn apply_orbit_operation_payloads(
                         continue;
                     };
                     validate_writable_orbit_path(&path)?;
+                    validate_custom_widget_module_write_content(&path, &content)?;
                     validate_widget_registry_content(&path, &content)?;
                     reject_existing_module_write_if_needed(service, &target_orbit_id, &path)?;
+                    let touched_widget_module = widget_module_from_orbit_path(&path).is_some();
+                    if touched_widget_module && registry_before_payload.is_none() {
+                        registry_before_payload =
+                            Some(read_widget_registry_widgets(service, orbit_id)?);
+                    }
                     emit_status(
                         event_tx,
                         assistant_draft,
@@ -2078,6 +2175,9 @@ async fn apply_orbit_operation_payloads(
                     .await?;
                     service.write_orbit_file(&target_orbit_id, &path, &content)?;
                     upsert_widget_registry_for_module(service, &target_orbit_id, &path)?;
+                    if touched_widget_module {
+                        touched_widget_modules.push(path.clone());
+                    }
                     concrete_operations = concrete_operations.saturating_add(1);
                     let line = format_file_update_line(OrbitFileOperation::Wrote, &path);
                     append_visible_line(assistant_visible, &line);
@@ -2150,6 +2250,11 @@ async fn apply_orbit_operation_payloads(
                         continue;
                     };
                     validate_widget_registry_content(&path, &updated)?;
+                    let touched_widget_module = widget_module_from_orbit_path(&path).is_some();
+                    if touched_widget_module && registry_before_payload.is_none() {
+                        registry_before_payload =
+                            Some(read_widget_registry_widgets(service, orbit_id)?);
+                    }
                     let bytes = updated.len();
                     emit_status(
                         event_tx,
@@ -2159,6 +2264,9 @@ async fn apply_orbit_operation_payloads(
                     .await?;
                     service.write_orbit_file(&target_orbit_id, &path, &updated)?;
                     upsert_widget_registry_for_module(service, &target_orbit_id, &path)?;
+                    if touched_widget_module {
+                        touched_widget_modules.push(path.clone());
+                    }
                     concrete_operations = concrete_operations.saturating_add(1);
                     let line = format_file_update_line(OrbitFileOperation::Edited, &path);
                     append_visible_line(assistant_visible, &line);
@@ -2178,6 +2286,18 @@ async fn apply_orbit_operation_payloads(
                         .send(OrbitAgentEvent::Token(format!("{}\n", line)))
                         .await;
                 }
+            }
+        }
+        if !touched_widget_modules.is_empty() {
+            if let Some(registry_before_payload) = registry_before_payload.as_deref() {
+                restore_missing_widget_registry_entries(
+                    service,
+                    orbit_id,
+                    registry_before_payload,
+                )?;
+            }
+            for path in touched_widget_modules {
+                upsert_widget_registry_for_module(service, orbit_id, &path)?;
             }
         }
         if *writes > writes_before_payload {
@@ -2273,7 +2393,7 @@ fn orbit_operations_action(
     let description = if read_only {
         "Read selected ArkOrbit files for the workspace overview. Use the current inventory to choose relevant canvas files by orbit_id and path. This action cannot write, edit, create, delete, or move widgets."
     } else if allow_read_operations && allow_write_operations {
-        "Apply structured ArkOrbit canvas operations. For compact app/widget creation, prefer a small data/widgets.json app-shell registry spec with views, sections, checklist items, metrics, and actions. Write custom JavaScript only when the requested behavior cannot fit the declarative shell. Existing widget modules must be updated with read-first edit operations."
+        "Apply structured ArkOrbit canvas operations for very small JavaScript-enabled themed widgets and compact canvas surfaces. Use app-shell when a concise declarative spec can still look polished; use a custom browser widget module for Orbit widgets that need stronger visual composition, public API fetching, parsing, state, or simple interaction. Keep the product surface compact; longer code is acceptable when it exists for real widget behavior rather than report sprawl. Only detailed/full/deployable/backend apps belong in main chat/app_deploy. Existing widget modules must be updated with read-first edit operations."
     } else if allow_write_operations {
         "Apply the final structured ArkOrbit canvas update from already inspected files. Reads are disabled for this pass; use write or edit, or answer that the change is blocked."
     } else {
@@ -2373,7 +2493,7 @@ fn collect_orbit_operation_payloads(
 ) -> Vec<serde_json::Value> {
     let mut payloads = tool_calls
         .iter()
-        .filter_map(|call| orbit_payload_from_tool_call(call))
+        .filter_map(orbit_payload_from_tool_call)
         .collect::<Vec<_>>();
     if payloads.is_empty() {
         if let Some(payload) = orbit_payload_from_json_text(model_content) {
@@ -2950,7 +3070,18 @@ fn is_root_shell_decoration_key(key: &str) -> bool {
             | "title"
             | "eyebrow"
             | "status"
+            | "design_type"
+            | "designType"
+            | "design"
+            | "style"
+            | "icon"
+            | "illustration"
+            | "symbol"
+            | "theme"
+            | "tone"
+            | "colorScheme"
             | "accent"
+            | "visual"
             | "background"
             | "left"
             | "top"
@@ -3104,42 +3235,77 @@ fn collapse_duplicate_widget_registry_entries(widgets: &mut Vec<serde_json::Valu
     removed
 }
 
+fn read_widget_registry_widgets(
+    service: &ArkOrbitService,
+    orbit_id: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let raw = match service.read_orbit_file_text(orbit_id, "data/widgets.json") {
+        Ok(raw) => raw,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| anyhow!("data/widgets.json must contain valid JSON: {}", error))?;
+    if let Some(list) = value.as_array() {
+        return Ok(list.clone());
+    }
+    if let Some(list) = value.get("widgets").and_then(|widgets| widgets.as_array()) {
+        return Ok(list.clone());
+    }
+    Ok(Vec::new())
+}
+
+fn merge_missing_widget_registry_entries(
+    widgets: &mut Vec<serde_json::Value>,
+    previous: &[serde_json::Value],
+) -> bool {
+    let original_len = widgets.len();
+    for existing in previous {
+        if !widgets
+            .iter()
+            .any(|candidate| widget_registry_entries_match(candidate, existing))
+        {
+            widgets.push(existing.clone());
+        }
+    }
+    let removed_duplicates = collapse_duplicate_widget_registry_entries(widgets);
+    widgets.len() != original_len || removed_duplicates > 0
+}
+
+fn restore_missing_widget_registry_entries(
+    service: &ArkOrbitService,
+    orbit_id: &str,
+    previous: &[serde_json::Value],
+) -> Result<()> {
+    if previous.is_empty() {
+        return Ok(());
+    }
+    let mut widgets = read_widget_registry_widgets(service, orbit_id)?;
+    if !merge_missing_widget_registry_entries(&mut widgets, previous) {
+        return Ok(());
+    }
+    service.write_orbit_file(
+        orbit_id,
+        "data/widgets.json",
+        &serde_json::to_string_pretty(&widgets)?,
+    )
+}
+
 fn upsert_widget_registry_for_module(
     service: &ArkOrbitService,
     orbit_id: &str,
     path: &str,
 ) -> Result<()> {
-    let Some(module) = path
-        .strip_prefix("mod/")
-        .and_then(|value| value.strip_suffix("/index.js"))
-    else {
+    let Some(module) = widget_module_from_orbit_path(path) else {
         return Ok(());
     };
-    if module.trim().is_empty() || module.contains('/') {
-        return Ok(());
-    }
 
-    let mut widgets = service
-        .read_orbit_file_text(orbit_id, "data/widgets.json")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|value| {
-            if let Some(list) = value.as_array() {
-                Some(list.clone())
-            } else {
-                value
-                    .get("widgets")
-                    .and_then(|widgets| widgets.as_array())
-                    .cloned()
-            }
-        })
-        .unwrap_or_default();
+    let mut widgets = read_widget_registry_widgets(service, orbit_id)?;
 
     let exact_module_registered = widgets.iter().any(|widget| {
         widget
             .get("module")
             .and_then(|value| value.as_str())
-            .map(|value| value == module)
+            .map(|value| value == module.as_str())
             .unwrap_or(false)
     });
     if exact_module_registered {
@@ -3154,10 +3320,11 @@ fn upsert_widget_registry_for_module(
         );
     }
 
+    let title = title_from_module(&module);
     let candidate = serde_json::json!({
-        "id": module,
-        "module": module,
-        "title": title_from_module(module),
+        "id": module.clone(),
+        "module": module.clone(),
+        "title": title.clone(),
         "left": 100 + widgets.len() as i64 * 380,
         "top": 80 + widgets.len() as i64 * 40,
         "width": 340
@@ -3174,7 +3341,7 @@ fn upsert_widget_registry_for_module(
         widgets.push(serde_json::json!({
             "id": module,
             "module": module,
-            "title": title_from_module(module),
+            "title": title,
             "left": 100 + offset * 380,
             "top": 80 + offset * 40,
             "width": 340
@@ -3190,7 +3357,7 @@ fn upsert_widget_registry_for_module(
 
 fn title_from_module(module: &str) -> String {
     module
-        .split(|ch| ch == '-' || ch == '_')
+        .split(['-', '_'])
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mut chars = part.chars();
@@ -3204,7 +3371,7 @@ fn title_from_module(module: &str) -> String {
 }
 
 fn compact_l0_catalog() -> &'static str {
-    "Widget modules are browser JavaScript under mod/<name>/index.js and export render(el, ctx = {}). Built-in helpers include markdown, iframe-html, chart, table, todo, and app-shell. app-shell renders compact data/widgets.json specs with title, summary/content, metrics, sections, rows/items, views/tabs, checklist items, refresh actions, and public fetch bindings. Prefer app-shell registry specs for ordinary apps, dashboards, trackers, plans, and checklists; write custom JavaScript only for behavior the shell cannot represent. Public HTTPS data helpers are ctx.fetchText/ctx.fetchJson/ctx.fetchPublic. Never embed secrets."
+    "Widget modules are browser JavaScript under mod/<name>/index.js and export render(el, ctx = {}). Built-in helpers include markdown, iframe-html, chart, table, todo, and app-shell. app-shell renders compact data/widgets.json specs with title, summary/content, metrics, sections, rows/items, views/tabs, checklist items, refresh actions, public fetch bindings, and visual.design_type values: hero-card, glass-card, dashboard-grid, profile-panel, checklist-board, or feed-panel. Prefer app-shell registry specs for very small JavaScript-enabled themed widgets, dashboards, trackers, plans, and checklists when the result can stay concise, polished, customer-facing, and Orbit-native dark/glass; choose a domain-specific design_type, dark tone, title, labels, palette, and content hierarchy instead of a generic card or report. Detailed deployable apps are not Orbit work. Write custom JavaScript for compact Orbit widget behavior the shell cannot represent, including public API fetching, parsing, state, animation, or focused interaction; keep the visible product surface small and purposeful rather than generating a full app. Public HTTPS data helpers are ctx.fetchText/ctx.fetchJson/ctx.fetchPublic. Never embed secrets."
 }
 
 fn render_orbit_file_tree(files: &[OrbitFileEntry]) -> String {
@@ -3534,8 +3701,8 @@ fn render_orbit_system_prompt(surface_kind: OrbitChatSurfaceKind) -> String {
             "File operation protocol:\n\
 - Use the structured {action} tool for every selected-canvas file read, write, or edit.\n\
 - If native tool calling is unavailable, return JSON only with an agent_tool_calls array that calls {action}.\n\
-- For app/widget creation that can be represented with title, summary, metrics, sections, rows/items, views/tabs, checklist items, and simple actions, write a compact data/widgets.json entry using module app-shell and a spec object. Do not generate custom JavaScript for those cases.\n\
-- For app/widget creation that needs custom rendering, parsing, simulation, canvas drawing, or behavior beyond app-shell, write a browser JavaScript module with complete contents under mod/<name>/index.js.\n\
+- For minimal app/widget creation that can still look like a polished customer-facing canvas surface with title, summary, a few highlights, views/tabs, checklist items, and simple actions, write a compact data/widgets.json entry using module app-shell and a spec object. Include a visual.design_type that fits the requested domain and default to a dark tone unless the user explicitly asks for light.\n\
+- For detailed/full/deployable apps, decline briefly and direct the user to main AgentArk chat/app_deploy. For Orbit widget requests, keep the deliverable as a very small JavaScript-enabled themed widget; if the surface grows into a broad app, reduce visible scope instead of turning it into an AgentArk app deploy. For compact Orbit widgets that need custom rendering, public API fetching, parsing, simulation, canvas drawing, state, animation, or behavior beyond app-shell, write a browser JavaScript module with complete contents under mod/<name>/index.js.\n\
 - For an existing widget module, use a read operation first, then an edit operation with the smallest exact find/replace snippet. Full write operations to an existing module are rejected.\n\
 - Do not emit XML-style file commands such as <file>, <edit>, or <read>; prose is not a file operation protocol.",
             action = ORBIT_OPERATIONS_ACTION
@@ -3566,7 +3733,7 @@ fn render_orbit_system_prompt(surface_kind: OrbitChatSurfaceKind) -> String {
         "You are the agent inside an ArkOrbit canvas. The user owns this canvas.\n\
 Files outside this orbit are off-limits.\n\
 Writable paths are structurally limited to mod/, data/, assets/, index.html, and orbit.json.\n\
-This chat is only for Orbit widgets, canvas inspection, widget layout, visual styling, and frontend-only dashboard/app surfaces. If a request reaches you that is really about AgentArk support, broad app builds outside Orbit, backend or deploy work, research, memory, tasks, integrations, credentials, or filesystem work outside this orbit, decline briefly and direct the user to main AgentArk chat.\n\
+This chat is only for Orbit widgets, canvas inspection, widget layout, visual styling, and very small JavaScript-enabled customer-facing frontend-only surfaces embedded in Orbit. If a request reaches you that is really about AgentArk support, detailed/full/deployable app builds, backend/private API or deploy work, research, memory, tasks, integrations, credentials, or filesystem work outside this orbit, decline briefly and direct the user to main AgentArk chat/app_deploy.\n\
 User local date, user local time, current year, UTC reference, and orbit state are provided in the current user context.\n\n\
 Current surface rules:\n\
 {}\
@@ -3575,9 +3742,17 @@ Current surface rules:\n\
 Available L0 widgets and runtime notes:\n{}\n\n\
 Canvas behavior:\n\
 - index.html is a stable canvas host. Do not rewrite it for ordinary widget requests.\n\
-- If the current Orbit context includes an accent color, use it as the primary canvas/widget accent unless the user asks for a different visual direction.\n\
-- For a new app/widget, prefer a compact data/widgets.json app-shell entry when the requested UI can be represented with views/tabs, metrics, sections, checklist items, rows, and actions.\n\
-- Write a custom JavaScript module at mod/<short-widget-id>/index.js only when the requested UI needs behavior that app-shell cannot represent.\n\
+- If the current Orbit context includes an accent color, treat it as a fallback accent; domain-specific app surfaces may use a complementary palette when that better fits the artifact.\n\
+- Orbit creates very small JavaScript-enabled themed apps/widgets on a dark space-like canvas. Use the same visual family as the surrounding space-agent UI: deep dark base, glass panels, layered depth, strong contrast, subtle orbital glow, compact composition, and readable typography. For ordinary Orbit widget requests, produce a polished public-facing surface with a clear subject, visual composition, concise copy, useful interaction, and an Orbit-native dark/glass visual system; do not produce an internal report, database card, admin dashboard, encyclopedia excerpt, brochure block, raw fact dump, or full app implementation unless the user clearly asks for that kind of tool.\n\
+- Detailed applications are not Orbit work. If the requested artifact needs full app structure, deployment, multiple screens, backend services, private/authenticated APIs, server-side API routes, auth/database, persistent runtime, or production app packaging, decline briefly and tell the user to use main chat/app_deploy. A compact widget that calls a public unauthenticated API through ctx.fetchText/ctx.fetchJson/ctx.fetchPublic can stay in Orbit.\n\
+- For a new app/widget, use app-shell only when a compact declarative spec can still look like a polished customer-facing product surface. If the requested artifact is primarily visual, branded, experiential, editorial, map-like, media-like, game-like, portfolio-like, venue/place-facing, or otherwise needs a distinctive layout beyond app-shell's component vocabulary, write a custom browser JavaScript module with complete CSS instead of forcing it into app-shell.\n\
+- App-shell specs must carry a domain-specific visual direction, not the same generic card every time: set spec.visual.design_type to one of hero-card, glass-card, dashboard-grid, profile-panel, checklist-board, or feed-panel. Choose from the user's underlying artifact intent and information shape, not exact wording. Use hero-card for one primary value or state, glass-card for compact lifestyle/ambient surfaces, dashboard-grid for multi-metric monitoring, profile-panel for concise entity summaries, checklist-board for actionable step lists, and feed-panel for chronological or ranked streams.\n\
+- The app title should name the requested subject, entity, workflow, or utility. Do not use generic placeholder titles, tabs, or section labels; every visible label should describe real app content.\n\
+- Add spec.visual.accent, spec.visual.background, and when useful spec.visual.icon or spec.visual.illustration so the app shell can render a distinctive first screen. Default to dark/glass Orbit-native surfaces that integrate with the canvas; set visual.theme or visual.tone to dark unless the user explicitly asks for a light widget. Treat visual direction as palette, composition, metric hierarchy, and illustration role; an icon by itself is not a design.\n\
+- Keep the first screen edited like a customer-facing product widget: one short summary, a few meaningful highlights, optional tabs/actions, and no long paragraphs or large lists. If there is more detail, place it behind tabs or concise sections instead of making the initial view a scroll-heavy report.\n\
+- Apply a design quality gate before writing files: if the proposed result reads like a generic admin card, report, fact sheet, pale brochure, oversized text dump, or low-contrast surface instead of a minimal customer-facing widget, revise the spec or write a custom module before saving.\n\
+- Size new app widgets for the design type: substantial app surfaces should usually be 680-920px wide and 360-520px tall; compact utilities may be smaller. Keep them within the visible canvas and avoid overlapping existing widgets.\n\
+- Write a custom JavaScript module at mod/<short-widget-id>/index.js when the requested widget needs a customer-facing visual composition, custom illustration, responsive art direction, public API fetching/parsing, state, bespoke interaction, or any behavior that app-shell cannot represent well. Keep the visible product scope compact and purposeful; longer code is acceptable when it serves real API handling, parsing, state, or interaction for a small widget. Do not route ordinary themed Orbit widgets to AgentArk app deploy.\n\
 - The generated artifact must look and behave like the requested app, with the important information visible immediately and no empty divider sections.\n\
 - Custom JavaScript modules must export render(el, ctx = {{}}). The host automatically registers, mounts, reloads, and makes them draggable.\n\
 - Every write operation must include the complete target file content in the content field. Never call a write operation with only a path.\n\
@@ -3605,7 +3780,7 @@ Execution rules:\n\
 - Treat \"live\" as live for the user's requested timeframe. For example, \"live corona dashboard for March 2020\" means data from March 2020, not today's data.\n\
 - For current, recent, latest, pricing, market, news, or other time-sensitive data, label the widget with the resolved timeframe. Do not invent an older snapshot date when the user did not ask for one.\n\
 - Do not claim data is live unless the widget actually fetches a live public source at runtime. If live data is not available, label values as approximate/example data for the resolved timeframe and tell the user what source should be checked.\n\
-- For widget creation, use app-shell registry specs unless custom JavaScript is required by the behavior.\n\
+- For minimal widget creation, use app-shell registry specs only when they can stay concise, polished, and customer-facing; otherwise use a compact custom Orbit widget module. Public API widgets should render a designed shell first and then fetch/update data asynchronously. Detailed apps belong in main chat/app_deploy.\n\
 - Do not say a file was created, updated, edited, written, or placed unless you call the matching structured operation in the same response.\n\
 - After file operations, summarize briefly in plain prose for a human, including what changed and which files were touched.",
         surface_rules,
@@ -3686,7 +3861,7 @@ impl AssistantMessageDraft {
     ) -> Result<Self> {
         let path = messages_path(service, orbit_id)?;
         let message = append_message(service, orbit_id, session_id, "assistant", content)?;
-        Ok(Self {
+        Self {
             service: service.clone(),
             orbit_id: orbit_id.to_string(),
             session_id: session_id.to_string(),
@@ -3697,7 +3872,7 @@ impl AssistantMessageDraft {
             },
             has_visible_content: false,
         }
-        .persist_initial_status()?)
+        .persist_initial_status()
     }
 
     fn persist_initial_status(self) -> Result<Self> {

@@ -3,7 +3,6 @@ import {
   Box,
   Button,
   Chip,
-  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
@@ -43,12 +42,6 @@ import {
   formatUiDateTime,
 } from "../../lib/dateFormat";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
-import ReflectHero from "../arkReflect/ReflectHero";
-import {
-  NarrativeCluster,
-  NarrativeFollowup,
-  NarrativeInput,
-} from "../arkReflect/reflectNarrative";
 import { asRecord, errMessage, num, pickRecords, str } from "./pageHelpers";
 
 type ReflectPageProps = {
@@ -1046,7 +1039,7 @@ function followupWhatThisIs(item: ReflectSuggestedFollowup): string {
   if (item.kind === "recovery_advice") {
     return `Recovery item from ${origin}; a prior run needs follow-up.`;
   }
-  return `Reflect next step from ${origin}.`;
+  return `Reflect opportunity from ${origin}.`;
 }
 
 function latestReflectedTopic(item: ReflectSuggestedFollowup): string {
@@ -1055,7 +1048,7 @@ function latestReflectedTopic(item: ReflectSuggestedFollowup): string {
 
 function followupChatContext(item: ReflectSuggestedFollowup): string {
   const lines = [
-    `Reflect next step: ${item.title}`,
+    `Reflect opportunity: ${item.title}`,
     `Type: ${followupKindLabel(item.kind)}`,
     `Status: ${followupStatusLabel(item)}`,
     `Origin: ${item.source_label || "Reflect"}`,
@@ -1076,7 +1069,7 @@ function followupChatContext(item: ReflectSuggestedFollowup): string {
       );
     }
   }
-  lines.push(`Requested next step: ${item.prompt.trim() || item.title.trim()}`);
+  lines.push(`Requested opportunity: ${item.prompt.trim() || item.title.trim()}`);
   return lines.join("\n\n");
 }
 
@@ -1087,7 +1080,7 @@ function followupKindLabel(kind: string): string {
     case "recovery_advice":
       return "Needs review";
     default:
-      return "Next step";
+      return "Opportunity";
   }
 }
 
@@ -1192,9 +1185,6 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   const [opportunityPage, setOpportunityPage] = useState(0);
   const [localRefreshRunning, setLocalRefreshRunning] = useState(false);
   const [refreshNotice, setRefreshNotice] = useState("");
-  // Default-closed so novice users see only the narrative hero. The
-  // existing analytics view stays one click away for power users.
-  const [showDetails, setShowDetails] = useState(false);
   const bounds = useMemo(() => periodBounds(period, anchor), [period, anchor]);
   const fromIso = bounds.from.toISOString();
   const toIso = bounds.to.toISOString();
@@ -1337,64 +1327,6 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
     if (!safeUrl || typeof window === "undefined") return;
     window.open(safeUrl, "_blank", "noopener,noreferrer");
   };
-  // Reused by the narrative hero's "Try this in Chat" CTA. Same
-  // sessionStorage handoff pattern as the existing followup launcher
-  // so the chat surface picks it up without any extra plumbing.
-  const launchHeroPrompt = (prompt: string, source: string) => {
-    const message = prompt.trim();
-    if (!message) return;
-    storeChatPendingLaunch({
-      createdAt: Date.now(),
-      launchMode: "message",
-      message,
-      newConversation: true,
-      source,
-    });
-    onNavigateToView?.("chat");
-    if (!onNavigateToView && typeof window !== "undefined") {
-      window.location.href = "/ui/chat";
-    }
-  };
-  const showNextStepDetails = () => {
-    setStoryTab("latest");
-    setShowDetails(true);
-  };
-  // Map the technical ReflectResponse into the novice-friendly narrative
-  // shape. Pure mapping — no decisions, no string composition. The
-  // narrative module owns all plain-English copy generation.
-  const narrativeInput = useMemo<NarrativeInput | null>(() => {
-    if (!response) return null;
-    const clustersForNarrative: NarrativeCluster[] = clusters.map((cluster) => ({
-      id: cluster.id,
-      label: cluster.label,
-      plain_summary: cluster.plain_summary,
-      unit_count: cluster.unit_count,
-      message_count: cluster.message_count,
-      color: cluster.color,
-      source_mix: cluster.source_mix,
-    }));
-    const followupsForNarrative: NarrativeFollowup[] = suggestedFollowups.map(
-      (item) => ({
-        id: item.id,
-        title: item.title,
-        detail: item.detail,
-        prompt: item.prompt,
-        source_label: item.source_label,
-        rank_score: item.rank_score,
-      }),
-    );
-    const embeddingMode = response.embedding_status?.mode ?? "";
-    const embeddingsReady =
-      embeddingMode === "ready" || embeddingMode === "available";
-    return {
-      period,
-      source_counts: response.source_counts,
-      clusters: clustersForNarrative,
-      suggested_followups: followupsForNarrative,
-      has_activity: clusters.length > 0 || allUnits.length > 0,
-      embeddings_ready: embeddingsReady,
-    };
-  }, [response, clusters, suggestedFollowups, allUnits, period]);
   const feedbackMutation = useMutation({
     mutationFn: async ({ item, action }: { item: ReflectSuggestedFollowup; action: "useful" | "snooze" | "dismiss" }) => {
       await api.rawPost(`/reflect/followups/${encodeURIComponent(item.id)}/feedback`, {
@@ -1998,7 +1930,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
     recoveryFollowups[0]?.detail ||
     (response?.embedding_status.mode !== "semantic" && totalUnits > 0
       ? "Semantic grouping is still catching up, so some patterns may be grouped by source activity first."
-      : "No major failure stood out in the reflected data. The main risk is leaving the next step implicit.");
+      : "No major failure stood out in the reflected data. The main risk is leaving the opportunity implicit.");
   const overviewStats = [
     {
       label: "Topics found",
@@ -2013,8 +1945,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
         latestSourceCount > 0
           ? `${latestSourceCount} current-source result${latestSourceCount === 1 ? "" : "s"} cached for reflected topics.`
           : latestFollowups.length > 0
-            ? `${latestFollowups.length} next step${latestFollowups.length === 1 ? "" : "s"} queued for source checking.`
-            : "No next steps are queued yet.",
+            ? `${latestFollowups.length} opportunit${latestFollowups.length === 1 ? "y is" : "ies are"} queued for source checking.`
+            : "No opportunities are queued yet.",
       tone: "var(--cyan)",
     },
     ...(hasProblems
@@ -2042,7 +1974,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
       : []),
   ];
   const storyTabs = [
-    { value: "latest" as const, label: "Next Steps", short: "Next Steps", count: opportunityFollowups.length },
+    { value: "latest" as const, label: "Opportunities", short: "Opportunities", count: opportunityFollowups.length },
     { value: "overview" as const, label: "Overview", short: "Overview", count: totalUnits },
     ...(topClusters.length > 0
       ? [{ value: "topics" as const, label: "Topics", short: "Topics", count: topicRows.length }]
@@ -2093,13 +2025,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
 
     return (
       <Stack spacing={1.4}>
-        {/* The "Reflection summary" hero-style panel that used to live here
-            was duplicating the narrative hero shown above the Collapse —
-            same focus label, same narrative line, plus four floating
-            chips for stats that are already in the tabs below. Removed
-            entirely. The tab strip beneath is now the first visible
-            element inside "Show details", which is the right job for it
-            (navigate between overview/topics/next steps/review threads). */}
+        {/* Tabs are the primary Reflect surface: opportunities, overview,
+            topics, and recovery threads share the same page-level frame. */}
         <Box
           className="arkreflect-motion-panel"
           sx={{
@@ -2217,7 +2144,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                       {hasProblems
                         ? whatWentWrong
                         : leadCluster
-                          ? `${leadCluster.unit_count} item${leadCluster.unit_count === 1 ? "" : "s"} support the leading topic. ${latestFollowups.length} possible next step${latestFollowups.length === 1 ? "" : "s"} can be checked against current sources.`
+                          ? `${leadCluster.unit_count} item${leadCluster.unit_count === 1 ? "" : "s"} support the leading topic. ${latestFollowups.length} possible opportunit${latestFollowups.length === 1 ? "y can" : "ies can"} be checked against current sources.`
                           : "When enough activity exists, this area explains the strongest thread and why it is worth attention."}
                     </Typography>
                   </Box>
@@ -2235,7 +2162,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                   "what's going on today" without the jargon side car. */}
               {opportunityFollowups.length > 0 ? (
                 <Box sx={{ ...panelSx, p: 1.35 }}>
-                  <Typography sx={labelSx}>Next useful action</Typography>
+                  <Typography sx={labelSx}>Top opportunity</Typography>
                   <Typography sx={{ ...titleSx, fontSize: "1.35rem", mt: 0.55 }}>
                     {opportunityFollowups.length}
                   </Typography>
@@ -2260,7 +2187,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                     {reviewThreadFollowups.length}
                   </Typography>
                   <Typography sx={{ ...bodySx, mt: 0.65 }}>
-                    Failed or stalled reflected work stays separate from source-checked next steps.
+                    Failed or stalled reflected work stays separate from source-checked opportunities.
                   </Typography>
                   <Button
                     size="small"
@@ -2385,16 +2312,16 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
         <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35 }}>
           <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1.2 }}>
             <Box>
-              <Typography sx={labelSx}>Next steps</Typography>
+              <Typography sx={labelSx}>Opportunities</Typography>
               <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
                 What to do after this recap
               </Typography>
               <Typography sx={{ ...bodySx, mt: 0.55, maxWidth: 720 }}>
-                These are actionable threads Reflect can open in Chat, with source checks shown when current information is useful.
+                These are actionable opportunities Reflect can open in Chat, with source checks shown when current information is useful.
               </Typography>
             </Box>
             <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
-              <Chip className="arkreflect-pill" icon={<TaskAltRoundedIcon />} label={`${opportunityFollowups.length} next step${opportunityFollowups.length === 1 ? "" : "s"}`} />
+              <Chip className="arkreflect-pill" icon={<TaskAltRoundedIcon />} label={`${opportunityFollowups.length} opportunit${opportunityFollowups.length === 1 ? "y" : "ies"}`} />
               {sourceBackedLatestFollowups.length > 0 ? (
                 <Chip className="arkreflect-pill" icon={<SearchRoundedIcon />} label={`${latestSourceCount || sourceBackedLatestFollowups.length} source-backed`} />
               ) : null}
@@ -2422,15 +2349,15 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                   </Box>
                   <Typography sx={{ ...titleSx, fontSize: { xs: "1.15rem", md: "1.35rem" } }}>
                     {isReflectRunning
-                      ? "Looking for useful next steps"
-                      : "No next steps ready for this range yet"}
+                      ? "Looking for useful opportunities"
+                      : "No opportunities ready for this range yet"}
                   </Typography>
                   <Typography sx={bodySx}>
                     {isReflectRunning
-                      ? "Reflect is refreshing this range. Useful next steps will appear here when there is something worth acting on."
+                      ? "Reflect is refreshing this range. Useful opportunities will appear here when there is something worth acting on."
                       : totalUnits > 0
-                        ? "This range has activity, but nothing has been promoted into a clear next step yet. Run Reflect to re-check the range."
-                        : "No activity is cached for this range yet. This tab stays available so users always know where next steps will appear."}
+                        ? "This range has activity, but nothing has been promoted into a clear opportunity yet. Run Reflect to re-check the range."
+                        : "No activity is cached for this range yet. This tab stays available so users always know where opportunities will appear."}
                   </Typography>
                   <Button
                     variant="outlined"
@@ -2747,22 +2674,6 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
         </Alert>
       ) : null}
 
-      {/* Narrative hero: novice-friendly summary of what happened this
-          period. Wraps the technical ReflectResponse in plain English
-          (heroSentence + headlineNumber + topMoments + nextStep) and
-          exposes a "Show details" toggle that controls the analytics
-          view below. */}
-      <ReflectHero
-        input={narrativeInput}
-        loading={reflectQ.isLoading || reflectQ.isFetching}
-        showDetails={showDetails}
-        onToggleDetails={() => setShowDetails((value) => !value)}
-        onLaunchPrompt={launchHeroPrompt}
-        onShowNextSteps={showNextStepDetails}
-      />
-
-      {/* === ARKREFLECT STORY VIEW === */}
-      <Collapse in={showDetails} mountOnEnter timeout={240}>
       {!hasReflectContent ? (
         <Box
           className="arkreflect-status"
@@ -2894,7 +2805,6 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             : ""}
         </Typography>
       ) : null}
-      </Collapse>
 
       <Dialog
         open={Boolean(selectedFollowup)}

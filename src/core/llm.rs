@@ -2,7 +2,7 @@
 
 pub(crate) mod stream_blocks;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,9 +11,9 @@ use tokio::sync::mpsc::Sender;
 
 use crate::core::agent::{ConversationMessage, StreamEvent};
 use crate::core::llm_provider::{
-    PromptCacheCapability, ResolvedOpenAiRequestConfig, display_openai_base_url,
-    force_refresh_codex_cli_api_key, is_codex_cli_base_url, openai_provider_label,
-    resolve_openai_request_config,
+    display_openai_base_url, force_refresh_codex_cli_api_key, is_codex_cli_base_url,
+    openai_provider_label, resolve_openai_request_config, PromptCacheCapability,
+    ResolvedOpenAiRequestConfig,
 };
 
 // OpenRouter enforces request affordability against the declared output budget.
@@ -1131,10 +1131,14 @@ fn build_openai_responses_input(
     input
 }
 
-fn build_openai_responses_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
+fn sorted_action_refs(actions: &[crate::actions::ActionDef]) -> Vec<&crate::actions::ActionDef> {
     let mut sorted = actions.iter().collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.name.cmp(&right.name));
     sorted
+}
+
+fn build_openai_responses_tools(actions: &[crate::actions::ActionDef]) -> Vec<serde_json::Value> {
+    sorted_action_refs(actions)
         .into_iter()
         .map(|action| {
             serde_json::json!({
@@ -1224,7 +1228,9 @@ fn openai_responses_usage(
             estimated: false,
             cost_usd: usage.get("cost").and_then(parse_json_f64),
             cached_prompt_tokens: openai_cached_prompt_tokens_from_usage_value(usage),
-            cache_creation_prompt_tokens: 0,
+            cache_creation_prompt_tokens: openai_cache_creation_prompt_tokens_from_usage_value(
+                usage,
+            ),
         },
         completion_chars,
     ))
@@ -1234,6 +1240,8 @@ fn openai_responses_usage(
 struct OpenAiTokenUsageDetails {
     #[serde(default)]
     cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
 }
 
 fn openai_cached_prompt_tokens_from_details(
@@ -1246,11 +1254,30 @@ fn openai_cached_prompt_tokens_from_details(
         .unwrap_or(0)
 }
 
+fn openai_cache_creation_prompt_tokens_from_details(
+    prompt_tokens_details: Option<&OpenAiTokenUsageDetails>,
+    input_tokens_details: Option<&OpenAiTokenUsageDetails>,
+) -> u64 {
+    prompt_tokens_details
+        .map(|details| details.cache_write_tokens)
+        .or_else(|| input_tokens_details.map(|details| details.cache_write_tokens))
+        .unwrap_or(0)
+}
+
 fn openai_cached_prompt_tokens_from_usage_value(usage: &serde_json::Value) -> u64 {
     usage
         .get("prompt_tokens_details")
         .or_else(|| usage.get("input_tokens_details"))
         .and_then(|details| details.get("cached_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+}
+
+fn openai_cache_creation_prompt_tokens_from_usage_value(usage: &serde_json::Value) -> u64 {
+    usage
+        .get("prompt_tokens_details")
+        .or_else(|| usage.get("input_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
         .and_then(|value| value.as_u64())
         .unwrap_or(0)
 }
@@ -1293,7 +1320,7 @@ fn prompt_fragment_marker_cacheable(line: &str) -> Option<bool> {
     if !trimmed.starts_with(PROMPT_CACHE_FRAGMENT_BEGIN_PREFIX) || !trimmed.ends_with("]]") {
         return None;
     }
-    Some(trimmed.contains(" layer=stable_prefix "))
+    Some(trimmed.contains(" layer=stable_prefix ") || trimmed.contains(" layer=evolvable_policy "))
 }
 
 fn prompt_cache_plan(system_prompt: &str) -> PromptCachePlan {
@@ -1467,9 +1494,7 @@ fn openai_prompt_cache_key(
     hasher.update(b"agentark-llm-cache-v1");
     hasher.update(scope.as_bytes());
     hasher.update(prompt_cache.cache_key_material.as_bytes());
-    let mut sorted_actions = actions.iter().collect::<Vec<_>>();
-    sorted_actions.sort_by(|left, right| left.name.cmp(&right.name));
-    for action in sorted_actions {
+    for action in sorted_action_refs(actions) {
         hasher.update(action.name.as_bytes());
         hasher.update(action.version.as_bytes());
         hasher.update(compact_openai_tool_description(&action.description).as_bytes());
@@ -1484,11 +1509,7 @@ fn openai_prompt_cache_key(
 }
 
 fn prompt_cache_uses_openai_explicit_key(capability: PromptCacheCapability) -> bool {
-    matches!(
-        capability,
-        PromptCacheCapability::OpenAiExplicitKey
-            | PromptCacheCapability::OpenRouterProviderSpecific
-    )
+    matches!(capability, PromptCacheCapability::OpenAiExplicitKey)
 }
 
 fn openai_prompt_cache_retention(capability: PromptCacheCapability) -> Option<String> {
@@ -1528,12 +1549,24 @@ fn prompt_cache_uses_openrouter_cache_control(capability: PromptCacheCapability)
     matches!(
         capability,
         PromptCacheCapability::OpenRouterAnthropicCacheControl
+            | PromptCacheCapability::OpenRouterExplicitCacheControl
+            | PromptCacheCapability::OpenRouterGeminiCacheControl
     )
 }
 
 fn openrouter_prompt_cache_control(capability: PromptCacheCapability) -> Option<serde_json::Value> {
     prompt_cache_uses_openrouter_cache_control(capability)
         .then(|| serde_json::json!({ "type": "ephemeral" }))
+}
+
+fn openrouter_top_level_prompt_cache_control(
+    capability: PromptCacheCapability,
+) -> Option<serde_json::Value> {
+    matches!(
+        capability,
+        PromptCacheCapability::OpenRouterAnthropicCacheControl
+    )
+    .then(|| serde_json::json!({ "type": "ephemeral" }))
 }
 
 fn openrouter_message_content_with_cache_control(
@@ -1563,10 +1596,63 @@ fn openrouter_message_content_with_cache_control(
     }
 }
 
+fn openrouter_system_content_and_deferred_context(
+    text: String,
+    capability: PromptCacheCapability,
+) -> (serde_json::Value, Option<String>) {
+    if !matches!(
+        capability,
+        PromptCacheCapability::OpenRouterGeminiCacheControl
+    ) {
+        return (
+            openrouter_message_content_with_cache_control(text, capability),
+            None,
+        );
+    }
+
+    let prompt_cache = prompt_cache_plan(&text);
+    let Some(cache_control) = openrouter_prompt_cache_control(capability) else {
+        return (serde_json::Value::String(prompt_cache.visible_prompt), None);
+    };
+
+    let mut system_blocks = Vec::new();
+    let mut deferred_blocks = Vec::new();
+    for block in prompt_cache.blocks {
+        if block.cacheable {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": block.text,
+                "cache_control": cache_control.clone(),
+            }));
+        } else {
+            deferred_blocks.push(block.text);
+        }
+    }
+
+    if system_blocks.is_empty() {
+        return (serde_json::Value::String(prompt_cache.visible_prompt), None);
+    }
+
+    let deferred_context = deferred_blocks
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    (
+        serde_json::Value::Array(system_blocks),
+        (!deferred_context.is_empty()).then_some(format!(
+            "Request-specific system context:\n{}",
+            deferred_context
+        )),
+    )
+}
+
 fn openrouter_chat_tool_cache_control(
     capability: PromptCacheCapability,
 ) -> Option<serde_json::Value> {
-    openrouter_prompt_cache_control(capability).map(|cache_control| {
+    openrouter_top_level_prompt_cache_control(capability).map(|cache_control| {
         serde_json::json!([{
             "type": "text",
             "text": "Tool catalog",
@@ -2152,23 +2238,26 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmImageAttachment, LlmTokenUsage, ModelRequestMode, ToolCall,
         anthropic_user_content_value, append_runtime_temporal_context,
         attach_runtime_identity_contract, attach_runtime_temporal_context,
         emit_partial_draft_file_previews, extract_openai_reasoning_delta,
         extract_partial_draft_files, generated_output_chars_for_usage,
         json_contains_tool_call_indicators, merge_usage_field, normalize_openai_tool_schema,
+        openai_cache_creation_prompt_tokens_from_details, openai_cached_prompt_tokens_from_details,
         openai_prompt_cache_key, openai_prompt_cache_key_for_config, openai_prompt_cache_retention,
         openai_stream_data_has_terminal_finish_reason, openai_user_content_value,
+        openrouter_chat_tool_cache_control, openrouter_message_content_with_cache_control,
+        openrouter_system_content_and_deferred_context, openrouter_top_level_prompt_cache_control,
         parse_openai_responses_payload, parse_partial_tool_arguments, prompt_cache_plan,
         prompt_cache_uses_openai_explicit_key, should_request_openai_stream_usage,
-        total_tokens_or_sum, usage_with_generated_output_floor,
+        sorted_action_refs, total_tokens_or_sum, usage_with_generated_output_floor,
+        LlmImageAttachment, LlmTokenUsage, ModelRequestMode, OpenAiTokenUsageDetails, ToolCall,
+    };
+    use crate::core::llm_provider::{
+        PromptCacheCapability, ResolvedOpenAiRequestConfig, OPENAI_PROVIDER_ID,
+        OPENROUTER_PROVIDER_ID,
     };
     use crate::core::StreamEvent;
-    use crate::core::llm_provider::{
-        OPENAI_PROVIDER_ID, OPENROUTER_PROVIDER_ID, PromptCacheCapability,
-        ResolvedOpenAiRequestConfig,
-    };
     use std::collections::HashMap;
 
     #[test]
@@ -2287,12 +2376,10 @@ mod tests {
             .as_array()
             .expect("image attachments should use OpenAI multimodal blocks");
         assert_eq!(blocks[0]["type"], "text");
-        assert!(
-            blocks[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("what is wrong here?")
-        );
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("what is wrong here?"));
         assert_eq!(blocks[1]["type"], "image_url");
         assert_eq!(
             blocks[1]["image_url"]["url"],
@@ -2339,12 +2426,10 @@ mod tests {
             normalized.get("type").and_then(|v| v.as_str()),
             Some("object")
         );
-        assert!(
-            normalized
-                .get("properties")
-                .and_then(|v| v.as_object())
-                .is_some()
-        );
+        assert!(normalized
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .is_some());
         assert!(normalized.get("anyOf").is_none());
         let description = normalized
             .get("description")
@@ -2481,7 +2566,10 @@ mod tests {
                 "input_tokens": 1200,
                 "output_tokens": 40,
                 "total_tokens": 1240,
-                "input_tokens_details": { "cached_tokens": 1024 }
+                "input_tokens_details": {
+                    "cached_tokens": 1024,
+                    "cache_write_tokens": 256
+                }
             }
         });
 
@@ -2491,6 +2579,25 @@ mod tests {
 
         assert_eq!(usage.prompt_tokens, 1200);
         assert_eq!(usage.cached_prompt_tokens, 1024);
+        assert_eq!(usage.cache_creation_prompt_tokens, 256);
+    }
+
+    #[test]
+    fn openai_usage_details_preserve_cache_write_tokens() {
+        let details: OpenAiTokenUsageDetails = serde_json::from_value(serde_json::json!({
+            "cached_tokens": 900,
+            "cache_write_tokens": 300,
+        }))
+        .expect("usage details should parse");
+
+        assert_eq!(
+            openai_cached_prompt_tokens_from_details(Some(&details), None),
+            900
+        );
+        assert_eq!(
+            openai_cache_creation_prompt_tokens_from_details(Some(&details), None),
+            300
+        );
     }
 
     #[test]
@@ -2621,12 +2728,12 @@ mod tests {
         assert!(prompt_cache_uses_openai_explicit_key(
             direct.prompt_cache_capability
         ));
-        assert!(prompt_cache_uses_openai_explicit_key(
+        assert!(!prompt_cache_uses_openai_explicit_key(
             routed.prompt_cache_capability
         ));
         assert!(openai_prompt_cache_key_for_config(&direct, "chat", "sys", &[]).is_some());
         assert!(openai_prompt_cache_retention(direct.prompt_cache_capability).is_some());
-        assert!(openai_prompt_cache_key_for_config(&routed, "chat", "sys", &[]).is_some());
+        assert!(openai_prompt_cache_key_for_config(&routed, "chat", "sys", &[]).is_none());
         assert!(openai_prompt_cache_retention(routed.prompt_cache_capability).is_none());
     }
 
@@ -2652,9 +2759,108 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_key_includes_evolvable_policy_fragments_not_runtime_context() {
+        let left = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v1]]\nStable spine rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.tool_use_style_policy layer=evolvable_policy evolvable=true version=v1]]\nUse tools carefully.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nMemory A.\n[[/agentark_prompt_fragment]]";
+        let changed_runtime = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v1]]\nStable spine rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.tool_use_style_policy layer=evolvable_policy evolvable=true version=v1]]\nUse tools carefully.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nMemory B.\n[[/agentark_prompt_fragment]]";
+        let changed_policy = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v1]]\nStable spine rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.tool_use_style_policy layer=evolvable_policy evolvable=true version=v2]]\nUse tools aggressively.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nMemory A.\n[[/agentark_prompt_fragment]]";
+
+        assert_eq!(
+            openai_prompt_cache_key("chat", left, &[]),
+            openai_prompt_cache_key("chat", changed_runtime, &[])
+        );
+        assert_ne!(
+            openai_prompt_cache_key("chat", left, &[]),
+            openai_prompt_cache_key("chat", changed_policy, &[])
+        );
+
+        let plan = prompt_cache_plan(left);
+        assert_eq!(plan.blocks.len(), 2);
+        assert!(plan.blocks[0].cacheable);
+        assert!(plan.blocks[0].text.contains("Stable spine rules."));
+        assert!(plan.blocks[0].text.contains("Use tools carefully."));
+        assert!(!plan.blocks[1].cacheable);
+    }
+
+    #[test]
+    fn openrouter_explicit_cache_control_uses_content_breakpoints_only() {
+        let prompt = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v1]]\nStable rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nDynamic context.\n[[/agentark_prompt_fragment]]";
+
+        let content = openrouter_message_content_with_cache_control(
+            prompt.to_string(),
+            PromptCacheCapability::OpenRouterExplicitCacheControl,
+        );
+        let blocks = content.as_array().expect("content should be block array");
+
+        assert!(blocks[0].get("cache_control").is_some());
+        assert!(blocks[1].get("cache_control").is_none());
+        assert!(openrouter_top_level_prompt_cache_control(
+            PromptCacheCapability::OpenRouterExplicitCacheControl
+        )
+        .is_none());
+        assert!(openrouter_chat_tool_cache_control(
+            PromptCacheCapability::OpenRouterExplicitCacheControl
+        )
+        .is_none());
+        assert!(openrouter_top_level_prompt_cache_control(
+            PromptCacheCapability::OpenRouterAnthropicCacheControl
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn openrouter_gemini_cache_control_defers_uncached_system_tail() {
+        let prompt = "[[agentark_prompt_fragment id=spine.identity layer=stable_prefix evolvable=false version=v1]]\nStable rules.\n[[/agentark_prompt_fragment]]\n\n[[agentark_prompt_fragment id=spine.runtime.request_context layer=runtime_context evolvable=false version=v1]]\nDynamic context.\n[[/agentark_prompt_fragment]]";
+
+        let (system_content, deferred_context) = openrouter_system_content_and_deferred_context(
+            prompt.to_string(),
+            PromptCacheCapability::OpenRouterGeminiCacheControl,
+        );
+        let system_blocks = system_content
+            .as_array()
+            .expect("system content should be block array");
+
+        assert_eq!(system_blocks.len(), 1);
+        assert!(system_blocks[0].get("cache_control").is_some());
+        assert!(system_blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Stable rules."));
+        assert!(!system_blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Dynamic context."));
+        assert!(deferred_context
+            .as_deref()
+            .unwrap()
+            .contains("Dynamic context."));
+    }
+
+    #[test]
+    fn sorted_action_refs_stabilizes_tool_catalog_order_for_cache_prefixes() {
+        let zeta = crate::actions::ActionDef {
+            name: "zeta_tool".to_string(),
+            ..crate::actions::ActionDef::default()
+        };
+        let alpha = crate::actions::ActionDef {
+            name: "alpha_tool".to_string(),
+            ..crate::actions::ActionDef::default()
+        };
+
+        let actions = vec![zeta, alpha];
+        let sorted_names = sorted_action_refs(&actions)
+            .into_iter()
+            .map(|action| action.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sorted_names.as_slice(), ["alpha_tool", "zeta_tool"]);
+    }
+
+    #[test]
     fn default_llm_total_timeouts_are_enabled() {
-        assert!(super::DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS > 0);
-        assert!(super::DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS > 0);
+        const {
+            assert!(super::DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS > 0);
+            assert!(super::DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS > 0);
+        }
     }
 
     #[test]
@@ -3778,8 +3984,8 @@ impl LlmClient {
             Other,
         }
 
-        let mut tools: Vec<AnthropicTool> = actions
-            .iter()
+        let mut tools: Vec<AnthropicTool> = sorted_action_refs(actions)
+            .into_iter()
             .map(|s| AnthropicTool {
                 name: s.name.clone(),
                 description: s.description.clone(),
@@ -4077,9 +4283,7 @@ impl LlmClient {
                 .await;
         }
 
-        let mut sorted_actions = actions.iter().collect::<Vec<_>>();
-        sorted_actions.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut tools: Vec<OpenAITool> = sorted_actions
+        let mut tools: Vec<OpenAITool> = sorted_action_refs(actions)
             .into_iter()
             .map(|s| OpenAITool {
                 tool_type: "function".to_string(),
@@ -4096,13 +4300,16 @@ impl LlmClient {
                 openrouter_chat_tool_cache_control(request_config.prompt_cache_capability);
         }
 
+        let (system_content, deferred_system_context) =
+            openrouter_system_content_and_deferred_context(
+                system_prompt.to_string(),
+                request_config.prompt_cache_capability,
+            );
+
         // Build messages with system prompt first
         let mut messages = vec![OpenAIMessage {
             role: "system".to_string(),
-            content: openrouter_message_content_with_cache_control(
-                system_prompt.to_string(),
-                request_config.prompt_cache_capability,
-            ),
+            content: system_content,
         }];
 
         // Add conversation history (excluding the current message)
@@ -4113,6 +4320,13 @@ impl LlmClient {
             messages.push(OpenAIMessage {
                 role: msg.role.clone(),
                 content: serde_json::Value::String(msg.content.clone()),
+            });
+        }
+
+        if let Some(deferred_system_context) = deferred_system_context {
+            messages.push(OpenAIMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String(deferred_system_context),
             });
         }
 
@@ -4139,7 +4353,9 @@ impl LlmClient {
                 actions,
                 !request_config.is_openrouter,
             ),
-            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
+            cache_control: openrouter_top_level_prompt_cache_control(
+                request_config.prompt_cache_capability,
+            ),
             messages,
             max_tokens: max_output_tokens,
             reasoning: if request_config.is_openrouter && max_output_tokens.is_some() {
@@ -4477,7 +4693,10 @@ impl LlmClient {
                         u.prompt_tokens_details.as_ref(),
                         u.input_tokens_details.as_ref(),
                     ),
-                    cache_creation_prompt_tokens: 0,
+                    cache_creation_prompt_tokens: openai_cache_creation_prompt_tokens_from_details(
+                        u.prompt_tokens_details.as_ref(),
+                        u.input_tokens_details.as_ref(),
+                    ),
                 }),
                 prompt_chars,
                 completion_chars,
@@ -5099,7 +5318,7 @@ impl LlmClient {
             )
             && request
                 .get("tool_choice")
-                .is_some_and(|value| !value.as_str().is_some_and(|raw| raw == "auto"))
+                .is_some_and(|value| value.as_str().is_none_or(|raw| raw != "auto"))
         {
             let error = match read_response_bytes_limited(response, "OpenAI Subscription").await {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
@@ -5444,9 +5663,7 @@ impl LlmClient {
                 .await;
         }
 
-        let mut sorted_actions = actions.iter().collect::<Vec<_>>();
-        sorted_actions.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut tools: Vec<OpenAITool> = sorted_actions
+        let mut tools: Vec<OpenAITool> = sorted_action_refs(actions)
             .into_iter()
             .map(|s| OpenAITool {
                 tool_type: "function".to_string(),
@@ -5463,13 +5680,16 @@ impl LlmClient {
                 openrouter_chat_tool_cache_control(request_config.prompt_cache_capability);
         }
 
+        let (system_content, deferred_system_context) =
+            openrouter_system_content_and_deferred_context(
+                system_prompt.to_string(),
+                request_config.prompt_cache_capability,
+            );
+
         // Build messages with system prompt first
         let mut messages = vec![OpenAIMessage {
             role: "system".to_string(),
-            content: openrouter_message_content_with_cache_control(
-                system_prompt.to_string(),
-                request_config.prompt_cache_capability,
-            ),
+            content: system_content,
         }];
 
         // Add conversation history (excluding the current message)
@@ -5480,6 +5700,13 @@ impl LlmClient {
             messages.push(OpenAIMessage {
                 role: msg.role.clone(),
                 content: serde_json::Value::String(msg.content.clone()),
+            });
+        }
+
+        if let Some(deferred_system_context) = deferred_system_context {
+            messages.push(OpenAIMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String(deferred_system_context),
             });
         }
 
@@ -5524,7 +5751,9 @@ impl LlmClient {
                 actions,
                 !request_config.is_openrouter,
             ),
-            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
+            cache_control: openrouter_top_level_prompt_cache_control(
+                request_config.prompt_cache_capability,
+            ),
             messages,
             max_tokens: None,
             reasoning: if request_config.is_openrouter
@@ -5887,7 +6116,11 @@ impl LlmClient {
                             chunk_usage.prompt_tokens_details.as_ref(),
                             chunk_usage.input_tokens_details.as_ref(),
                         ),
-                        cache_creation_prompt_tokens: 0,
+                        cache_creation_prompt_tokens:
+                            openai_cache_creation_prompt_tokens_from_details(
+                                chunk_usage.prompt_tokens_details.as_ref(),
+                                chunk_usage.input_tokens_details.as_ref(),
+                            ),
                     });
                     chunk_had_meaningful_progress = true;
                 }
@@ -6440,8 +6673,8 @@ impl LlmClient {
             emitted_draft_snapshots: HashMap<String, (String, bool)>,
         }
 
-        let mut tools: Vec<AnthropicTool> = actions
-            .iter()
+        let mut tools: Vec<AnthropicTool> = sorted_action_refs(actions)
+            .into_iter()
             .map(|s| AnthropicTool {
                 name: s.name.clone(),
                 description: s.description.clone(),

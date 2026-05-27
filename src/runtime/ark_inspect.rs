@@ -1082,7 +1082,7 @@ async fn api_catalog(
             continue;
         };
         for (method, operation) in methods {
-            if method.to_ascii_lowercase() != "get" {
+            if !method.eq_ignore_ascii_case("get") {
                 continue;
             }
             let tags = operation

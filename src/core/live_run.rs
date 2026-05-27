@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, Mutex};
 
 const LIVE_RUN_REPLAY_LIMIT: usize = 12_000;
 const LIVE_RUN_CHANNEL_CAPACITY: usize = 1_024;

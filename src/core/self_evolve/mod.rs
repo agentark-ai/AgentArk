@@ -22,28 +22,27 @@ pub use policy_evolution::{
 };
 pub use promotion_gate::{PromotionGateReason, PromotionGateReport};
 pub use prompt_evolution::{
-    PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY, PROMPT_BUNDLE_CANARY_STATE_KEY,
-    PROMPT_BUNDLE_LAST_RESULT_KEY, PROMPT_BUNDLE_PROFILE_CANARY_KEY, PROMPT_BUNDLE_PROFILE_KEY,
     PromptBundleDiffSummary, PromptBundleProfile, PromptEvolutionConfig, PromptEvolutionEngine,
-    PromptEvolutionResult,
+    PromptEvolutionResult, PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY, PROMPT_BUNDLE_CANARY_STATE_KEY,
+    PROMPT_BUNDLE_LAST_RESULT_KEY, PROMPT_BUNDLE_PROFILE_CANARY_KEY, PROMPT_BUNDLE_PROFILE_KEY,
 };
 pub(crate) use router_learning::maybe_upsert_router_replay_candidate_from_trace;
 pub use router_learning::{
-    ROUTER_LEARNING_CANDIDATE_TYPE, ROUTER_LEARNING_SUBJECT_KEY, RouterLearningCandidatePayload,
-    RouterLearningLayer, RouterLearningMetric, RouterLearningMetricDelta,
-    RouterLearningTraceEvidence, router_learning_benchmark_profile,
-    trace_evidence_from_semantic_steps, validate_router_learning_candidate,
+    router_learning_benchmark_profile, trace_evidence_from_semantic_steps,
+    validate_router_learning_candidate, RouterLearningCandidatePayload, RouterLearningLayer,
+    RouterLearningMetric, RouterLearningMetricDelta, RouterLearningTraceEvidence,
+    ROUTER_LEARNING_CANDIDATE_TYPE, ROUTER_LEARNING_SUBJECT_KEY,
 };
 pub use routing_canonical_evolution::{
-    ROUTING_CANONICAL_CANDIDATE_TYPE, ROUTING_CANONICAL_SUBJECT_KEY,
     RoutingCanonicalCandidatePayload, RoutingCanonicalOverlayEntry,
+    ROUTING_CANONICAL_CANDIDATE_TYPE, ROUTING_CANONICAL_SUBJECT_KEY,
 };
 pub use specialist_prompt_evolution::{
-    SPECIALIST_PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY, SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
-    SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY, SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
-    SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY, SpecialistPromptBundleDiffSummary,
-    SpecialistPromptBundleProfile, SpecialistPromptEvolutionConfig,
-    SpecialistPromptEvolutionEngine, SpecialistPromptEvolutionResult,
+    SpecialistPromptBundleDiffSummary, SpecialistPromptBundleProfile,
+    SpecialistPromptEvolutionConfig, SpecialistPromptEvolutionEngine,
+    SpecialistPromptEvolutionResult, SPECIALIST_PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+    SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY, SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY,
+    SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY, SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
 };
 
 pub(crate) async fn prune_jsonl_archive(archive: &Path, max_entries: usize) -> Result<()> {

@@ -93,7 +93,17 @@ function labelize(value) {
     .replace(/[_-]+/g, " ")
     .trim();
   if (!label) return "Details";
-  return label.charAt(0).toUpperCase() + label.slice(1);
+  return label
+    .split(/\s+/)
+    .map((word) => (word ? word.charAt(0).toUpperCase() + word.slice(1) : ""))
+    .join(" ");
+}
+
+function comparableLabel(value) {
+  return text(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function firstText(...values) {
@@ -104,12 +114,234 @@ function firstText(...values) {
   return "";
 }
 
+const DESIGN_TYPES = new Set([
+  "hero-card",
+  "glass-card",
+  "dashboard-grid",
+  "profile-panel",
+  "checklist-board",
+  "feed-panel",
+]);
+
+function normalizeDesignType(value) {
+  const normalized = text(value)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+  return DESIGN_TYPES.has(normalized) ? normalized : "";
+}
+
+function appShellDesignType(spec, visual, shape) {
+  const explicit = normalizeDesignType(
+    spec.design_type ||
+      spec.designType ||
+      spec.design ||
+      spec.style ||
+      visual.design_type ||
+      visual.designType ||
+      visual.type ||
+      visual.style ||
+      visual.layout,
+  );
+  if (explicit) return explicit;
+  if (asArray(spec.checklist || spec.checks || spec.tasks).length) return "checklist-board";
+  if (shape.sections.length >= 3 || shape.metrics.length >= 4) return "dashboard-grid";
+  if (shape.topRows.length >= 4 || shape.views.length >= 2) return "profile-panel";
+  if (shape.metrics.length >= 1) return "hero-card";
+  return "glass-card";
+}
+
+function appShellIllustration(spec, visual) {
+  return firstText(
+    spec.illustration,
+    spec.icon,
+    spec.symbol,
+    visual.illustration,
+    visual.icon,
+    visual.symbol,
+  );
+}
+
+function hexToRgb(value) {
+  const raw = text(value).replace(/^#/, "");
+  if (!/^[0-9a-f]{3}([0-9a-f]{3})?$/i.test(raw)) return null;
+  const full =
+    raw.length === 3
+      ? raw
+          .split("")
+          .map((part) => part + part)
+          .join("")
+      : raw;
+  return {
+    r: parseInt(full.slice(0, 2), 16),
+    g: parseInt(full.slice(2, 4), 16),
+    b: parseInt(full.slice(4, 6), 16),
+  };
+}
+
+function rgbStringToRgb(value) {
+  const match = text(value).match(/rgba?\(([^)]+)\)/i);
+  if (!match) return null;
+  const parts = match[1]
+    .split(",")
+    .map((part) => Number(part.trim().replace(/%$/, "")))
+    .slice(0, 3);
+  if (parts.length < 3 || parts.some((part) => !Number.isFinite(part))) return null;
+  return {
+    r: Math.max(0, Math.min(255, parts[0])),
+    g: Math.max(0, Math.min(255, parts[1])),
+    b: Math.max(0, Math.min(255, parts[2])),
+  };
+}
+
+function relativeLuminance({ r, g, b }) {
+  const channel = (value) => {
+    const normalized = value / 255;
+    return normalized <= 0.03928
+      ? normalized / 12.92
+      : Math.pow((normalized + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+}
+
+function backgroundLuminance(background) {
+  const raw = text(background).toLowerCase();
+  if (!raw) return null;
+  const colorValues = [
+    ...(raw.match(/#[0-9a-f]{3}(?:[0-9a-f]{3})?\b/gi) || []),
+    ...(raw.match(/rgba?\([^)]+\)/gi) || []),
+  ];
+  if (!colorValues.length) return null;
+  const parsed = colorValues
+    .map((value) => hexToRgb(value) || rgbStringToRgb(value))
+    .filter(Boolean);
+  if (!parsed.length) return null;
+  return parsed.reduce((sum, rgb) => sum + relativeLuminance(rgb), 0) / parsed.length;
+}
+
+function backgroundLooksLight(background) {
+  const luminance = backgroundLuminance(background);
+  return luminance !== null && luminance > 0.58;
+}
+
+function appShellTone(spec, visual) {
+  const explicit = firstText(
+    spec.tone,
+    spec.theme,
+    spec.colorScheme,
+    visual.tone,
+    visual.theme,
+    visual.colorScheme,
+  ).toLowerCase();
+  if (explicit === "light" || explicit === "dark") return explicit;
+  return "dark";
+}
+
+function defaultBackgroundForDesign(designType, tone, accent) {
+  if (tone === "light") {
+    if (designType === "hero-card") {
+      return `linear-gradient(135deg, color-mix(in srgb, ${accent} 18%, #f7fbff), #edf4ff 44%, #f8fff3)`;
+    }
+    if (designType === "dashboard-grid") {
+      return "linear-gradient(145deg, #f8fafc, #e9f1fb)";
+    }
+    return "linear-gradient(145deg, rgba(255,255,255,0.92), rgba(238,247,255,0.9))";
+  }
+  if (designType === "hero-card") {
+    return `linear-gradient(135deg, color-mix(in srgb, ${accent} 18%, #101923), #091015 58%, #141b24)`;
+  }
+  if (designType === "dashboard-grid") {
+    return "linear-gradient(145deg, rgba(10, 14, 20, 0.98), rgba(18, 28, 36, 0.98))";
+  }
+  return "linear-gradient(145deg, rgba(13, 18, 24, 0.98), rgba(21, 31, 37, 0.98))";
+}
+
+function appShellBackground(designType, tone, accent, requestedBackground) {
+  const raw = text(requestedBackground);
+  if (!raw) return defaultBackgroundForDesign(designType, tone, accent);
+  if (/gradient\(|url\(|color-mix\(|var\(/i.test(raw)) {
+    if (tone === "light") return raw;
+    const luminance = backgroundLuminance(raw);
+    const startAlpha = luminance === null ? 0.66 : luminance > 0.58 ? 0.78 : 0.38;
+    const endAlpha = Math.max(0.3, startAlpha - 0.08);
+    return `linear-gradient(135deg, rgba(3, 8, 12, ${startAlpha}), color-mix(in srgb, ${accent} 16%, rgba(6, 16, 20, ${endAlpha})) 54%, rgba(8, 11, 18, ${endAlpha})), ${raw}`;
+  }
+  if (tone === "light") {
+    return `linear-gradient(135deg, color-mix(in srgb, ${raw} 18%, #f8fbff), #eff6ff 48%, color-mix(in srgb, ${accent} 12%, #f7fff8))`;
+  }
+  return `linear-gradient(135deg, color-mix(in srgb, ${raw} 24%, #061015), color-mix(in srgb, ${accent} 16%, #071014) 52%, color-mix(in srgb, ${raw} 22%, #121820))`;
+}
+
+function toneTokens(tone, actionText) {
+  if (tone === "light") {
+    return {
+      fg: "#102033",
+      body: "rgba(16, 32, 51, 0.78)",
+      muted: "rgba(16, 32, 51, 0.62)",
+      soft: "rgba(16, 32, 51, 0.54)",
+      panel: "rgba(255, 255, 255, 0.54)",
+      panelStrong: "rgba(255, 255, 255, 0.76)",
+      line: "rgba(28, 51, 75, 0.16)",
+      shadow: "0 22px 70px rgba(22, 43, 76, 0.22)",
+      status: "#285275",
+      actionText,
+    };
+  }
+  return {
+    fg: "#f8fbff",
+    body: "rgba(230, 242, 250, 0.8)",
+    muted: "rgba(216, 232, 246, 0.68)",
+    soft: "rgba(226, 238, 248, 0.64)",
+    panel: "rgba(255, 255, 255, 0.07)",
+    panelStrong: "rgba(255, 255, 255, 0.1)",
+    line: "rgba(255, 255, 255, 0.11)",
+    shadow: "0 22px 70px rgba(0, 0, 0, 0.28)",
+    status: "rgba(224, 240, 252, 0.72)",
+    actionText,
+  };
+}
+
+function appShellUsesVisualScene(designType) {
+  return designType === "hero-card" || designType === "glass-card" || designType === "profile-panel";
+}
+
+function renderVisualScene(illustration) {
+  const glyph = text(illustration);
+  const showGlyph = glyph && Array.from(glyph).length <= 3;
+  return `<div class="app-shell-visual-scene" aria-hidden="true">
+    <span class="app-shell-scene-orb app-shell-scene-orb-primary"></span>
+    <span class="app-shell-scene-orb app-shell-scene-orb-secondary"></span>
+    <span class="app-shell-scene-panel app-shell-scene-panel-a"></span>
+    <span class="app-shell-scene-panel app-shell-scene-panel-b"></span>
+    <span class="app-shell-scene-lines"></span>
+    ${showGlyph ? `<span class="app-shell-visual-glyph">${escapeHtml(glyph)}</span>` : ""}
+  </div>`;
+}
+
 function appViews(spec) {
   return asArray(spec.views || spec.tabs).filter((view) => view && typeof view === "object");
 }
 
 function viewKey(view, index) {
   return firstText(view.id, view.key, view.value, view.label, view.title) || `view-${index}`;
+}
+
+function appShellTitle(spec, state, views) {
+  const explicit = text(spec.title);
+  const stateTitle = text(state.title);
+  const tabLabels = new Set(
+    views
+      .map((view, index) => comparableLabel(firstText(view.label, view.title, viewKey(view, index))))
+      .filter(Boolean),
+  );
+  const fallbackTitle =
+    [stateTitle, text(state.id)]
+      .map((value) => text(value))
+      .find((value) => value && !tabLabels.has(comparableLabel(value))) || stateTitle || text(state.id);
+  if (!explicit) return fallbackTitle ? labelize(fallbackTitle) : "App";
+  if (tabLabels.has(comparableLabel(explicit))) {
+    return fallbackTitle ? labelize(fallbackTitle) : explicit;
+  }
+  return explicit;
 }
 
 function selectedView(spec, state) {
@@ -129,7 +361,7 @@ function viewSpec(base, view) {
   return {
     ...base,
     ...view,
-    title: firstText(view.title, view.label, base.title),
+    title: firstText(base.title, base.name, base.label, view.title, view.label),
     subtitle: firstText(view.subtitle, view.summary, view.description, base.subtitle, base.summary),
     content: view.content ?? view.body ?? view.description ?? base.content ?? base.body,
     metrics: view.metrics ?? base.metrics,
@@ -249,6 +481,18 @@ function renderMetric(metric, data) {
   </div>`;
 }
 
+function renderPrimaryMetric(metric, data) {
+  const item = asObject(metric);
+  if (!Object.keys(item).length) return "";
+  const label = text(item.label || item.name, "Current");
+  const detail = item.detail ?? item.description ?? "";
+  return `<div class="app-shell-primary-metric">
+    <span>${escapeHtml(label)}</span>
+    <strong>${escapeHtml(formatBoundValue(metricValue(item), data))}</strong>
+    ${detail ? `<em>${escapeHtml(formatBoundValue(detail, data))}</em>` : ""}
+  </div>`;
+}
+
 function renderRows(rows, data) {
   return rows
     .map((row) => {
@@ -285,6 +529,36 @@ function renderRows(rows, data) {
       }</li>`;
     })
     .join("");
+}
+
+function renderInfoStrip(rows, data) {
+  const items = asArray(rows).slice(0, 4);
+  if (!items.length) return "";
+  return `<div class="app-shell-info-strip">${items
+    .map((row) => {
+      const item = asObject(row);
+      const entries = Object.entries(item).filter(([, entryValue]) => {
+        return entryValue != null && entryValue !== "";
+      });
+      const label =
+        item.label ??
+        item.name ??
+        item.title ??
+        (entries[0] ? labelize(entries[0][0]) : "Detail");
+      const value =
+        item.value ??
+        item.detail ??
+        item.summary ??
+        entries
+          .filter(([key]) => !["label", "name", "title", "detail", "value", "summary"].includes(key))
+          .map(([, entryValue]) => entryValue)[0] ??
+        "";
+      return `<div class="app-shell-info-item">
+        <span>${escapeHtml(formatBoundValue(label, data))}</span>
+        ${value ? `<strong>${escapeHtml(formatBoundValue(value, data))}</strong>` : ""}
+      </div>`;
+    })
+    .join("")}</div>`;
 }
 
 function renderObjectRows(value, data) {
@@ -338,6 +612,8 @@ function renderLooseData(spec, data, state) {
   const reserved = new Set([
     "id",
     "module",
+    "label",
+    "name",
     "title",
     "subtitle",
     "summary",
@@ -356,6 +632,16 @@ function renderLooseData(spec, data, state) {
     "dataBindings",
     "defaults",
     "visual",
+    "design_type",
+    "designType",
+    "design",
+    "style",
+    "icon",
+    "illustration",
+    "symbol",
+    "theme",
+    "tone",
+    "colorScheme",
     "accent",
     "background",
     "refresh",
@@ -434,19 +720,33 @@ function renderApp(el, spec, fetched, state) {
   const sections = asArray(spec.sections);
   const actions = asArray(spec.actions).map(renderAction).filter(Boolean);
   const accent = text(spec.accent || visual.accent, "#58e0ff");
-  const background = text(spec.background || visual.background);
-  const title = text(spec.title, text(state.title, "Orbit App"));
+  const requestedBackground = text(spec.background || visual.background);
+  const topRows = asArray(spec.items || spec.rows);
+  const shape = { views, metrics, sections, topRows };
+  const designType = appShellDesignType(spec, visual, shape);
+  const tone = appShellTone(spec, visual);
+  const actionText = backgroundLooksLight(accent) ? "#071019" : "#f8fbff";
+  const tokens = toneTokens(tone, actionText);
+  const background = appShellBackground(designType, tone, accent, requestedBackground);
+  const illustration = appShellIllustration(spec, visual);
+  const title = appShellTitle(spec, state, views);
   const subtitle = spec.subtitle || spec.summary || "";
   const status = state.error || state.status || spec.status || "";
+  const kicker = text(spec.eyebrow || visual.eyebrow || spec.category || visual.category);
+  const renderedVisualScene = appShellUsesVisualScene(designType) ? renderVisualScene(illustration) : "";
   const renderedSections = sections
     .map((section, index) => renderSection(section, data, state, `${state.activeView || "root"}:section-${index}`))
     .filter(Boolean);
-  const topRows = asArray(spec.items || spec.rows);
-  const renderedTopRows = topRows.length
+  const usesCompactInfoStrip = ["profile-panel", "glass-card", "hero-card"].includes(designType) && topRows.length > 0;
+  const renderedInfoStrip = usesCompactInfoStrip ? renderInfoStrip(topRows, data) : "";
+  const renderedTopRows = topRows.length && !usesCompactInfoStrip
     ? renderSection({ title: spec.itemsTitle || spec.rowsTitle || "Details", rows: topRows }, data, state, `${state.activeView || "root"}:rows`)
     : "";
   const renderedContent = renderContentBlock(spec.content || spec.body || spec.description, data);
   const looseSections = renderLooseData(spec, data, state);
+  const usesPrimaryMetric = ["hero-card", "glass-card"].includes(designType) && metrics.length > 0;
+  const renderedPrimaryMetric = usesPrimaryMetric ? renderPrimaryMetric(metrics[0], data) : "";
+  const metricCards = usesPrimaryMetric ? metrics.slice(1) : metrics;
   const renderedFallbackData =
     !renderedContent && !metrics.length && !renderedSections.length && !renderedTopRows
       ? renderDataField(spec.dataTitle || "Data", spec.data || spec.defaults || spec.dataBindings, data, state)
@@ -456,6 +756,7 @@ function renderApp(el, spec, fetched, state) {
     renderedContent ||
     metrics.length > 0 ||
     renderedSections.length > 0 ||
+    renderedInfoStrip ||
     renderedTopRows ||
     renderedFallbackData ||
     looseSections.length > 0 ||
@@ -464,21 +765,86 @@ function renderApp(el, spec, fetched, state) {
   el.innerHTML = `
     <style>
       .app-shell {
+        --app-accent: ${accent};
+        --app-fg: ${tokens.fg};
+        --app-body: ${tokens.body};
+        --app-muted: ${tokens.muted};
+        --app-soft: ${tokens.soft};
+        --app-panel: ${tokens.panel};
+        --app-panel-strong: ${tokens.panelStrong};
+        --app-line: ${tokens.line};
+        --app-status: ${state.error ? "#8a2c16" : tokens.status};
+        --app-action-text: ${tokens.actionText};
         box-sizing: border-box;
         width: 100%;
         height: 100%;
         min-height: 180px;
         overflow: auto;
-        padding: 18px;
+        padding: 28px;
         border-radius: 8px;
-        color: #f8fbff;
+        color: var(--app-fg);
         background:
-          radial-gradient(circle at 12% 0%, color-mix(in srgb, ${accent} 26%, transparent), transparent 42%),
-          ${background || "linear-gradient(145deg, rgba(13, 18, 24, 0.98), rgba(21, 31, 37, 0.98))"};
-        border: 1px solid rgba(190, 221, 244, 0.2);
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+          radial-gradient(circle at 16% -14%, color-mix(in srgb, var(--app-accent) 28%, transparent), transparent 36%),
+          radial-gradient(circle at 92% 12%, rgba(255, 255, 255, 0.13), transparent 24%),
+          ${background};
+        border: 1px solid var(--app-line);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13), ${tokens.shadow};
         font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         scrollbar-width: thin;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 17px;
+      }
+      .app-shell-light {
+        text-shadow: none;
+      }
+      .app-shell-dark {
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+      }
+      .app-shell-hero-card,
+      .app-shell-glass-card {
+        padding: 34px;
+      }
+      .app-shell-stage {
+        min-width: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(150px, 0.72fr) minmax(118px, 0.48fr);
+        align-items: center;
+        gap: 24px;
+      }
+      .app-shell:not(.has-feature) .app-shell-stage {
+        grid-template-columns: minmax(0, 1fr) minmax(150px, 0.68fr);
+      }
+      .app-shell-dashboard-grid .app-shell-stage,
+      .app-shell-checklist-board .app-shell-stage,
+      .app-shell-feed-panel .app-shell-stage {
+        display: block;
+      }
+      .app-shell-copy,
+      .app-shell-body,
+      .app-shell-feature {
+        min-width: 0;
+      }
+      .app-shell-body {
+        display: grid;
+        gap: 14px;
+      }
+      .app-shell-profile-panel .app-shell-body,
+      .app-shell-glass-card .app-shell-body,
+      .app-shell-hero-card .app-shell-body {
+        gap: 15px;
+      }
+      .app-shell-dashboard-grid .app-shell-metrics,
+      .app-shell-dashboard-grid .app-shell-section-metrics {
+        grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+      }
+      .app-shell-profile-panel .app-shell-metrics {
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      }
+      .app-shell-checklist-board .app-shell-checklist,
+      .app-shell-feed-panel .app-shell-section ul {
+        gap: 10px;
       }
       .app-shell-head {
         display: flex;
@@ -486,22 +852,115 @@ function renderApp(el, spec, fetched, state) {
         justify-content: space-between;
         gap: 12px;
       }
+      .app-shell-visual-scene {
+        position: relative;
+        min-width: 0;
+        width: 170px;
+        max-width: 100%;
+        aspect-ratio: 1.22;
+        justify-self: center;
+        border-radius: 26px;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 25% 72%, color-mix(in srgb, var(--app-accent) 46%, transparent), transparent 28%),
+          linear-gradient(145deg, rgba(255, 255, 255, 0.24), rgba(255, 255, 255, 0.06));
+        border: 1px solid var(--app-line);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 18px 46px rgba(0, 0, 0, 0.2);
+      }
+      .app-shell-scene-orb,
+      .app-shell-scene-panel,
+      .app-shell-scene-lines,
+      .app-shell-visual-glyph {
+        position: absolute;
+        display: block;
+      }
+      .app-shell-scene-orb-primary {
+        width: 76px;
+        height: 76px;
+        right: 18px;
+        top: 22px;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--app-accent) 80%, #ffffff);
+        box-shadow: 0 0 34px color-mix(in srgb, var(--app-accent) 36%, transparent);
+      }
+      .app-shell-scene-orb-secondary {
+        width: 88px;
+        height: 56px;
+        left: 22px;
+        bottom: 22px;
+        border-radius: 999px 999px 30px 30px;
+        background: linear-gradient(180deg, rgba(255,255,255,0.34), rgba(255,255,255,0.13));
+        border: 1px solid rgba(255,255,255,0.18);
+      }
+      .app-shell-scene-panel {
+        width: 38px;
+        height: 58px;
+        border-radius: 10px;
+        background: linear-gradient(180deg, rgba(8, 15, 22, 0.58), rgba(255,255,255,0.12));
+        border: 1px solid rgba(255,255,255,0.18);
+      }
+      .app-shell-scene-panel-a {
+        left: 38px;
+        top: 26px;
+        transform: rotate(-4deg);
+      }
+      .app-shell-scene-panel-b {
+        left: 76px;
+        top: 42px;
+        height: 48px;
+        transform: rotate(5deg);
+      }
+      .app-shell-scene-lines {
+        right: 24px;
+        bottom: 24px;
+        width: 44px;
+        height: 28px;
+        background:
+          linear-gradient(var(--app-fg), var(--app-fg)) 0 0 / 100% 2px no-repeat,
+          linear-gradient(var(--app-fg), var(--app-fg)) 0 12px / 72% 2px no-repeat,
+          linear-gradient(var(--app-fg), var(--app-fg)) 0 24px / 88% 2px no-repeat;
+        opacity: 0.52;
+      }
+      .app-shell-visual-glyph {
+        left: 50%;
+        top: 50%;
+        width: 56px;
+        height: 56px;
+        transform: translate(-50%, -50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 18px;
+        background: rgba(255,255,255,0.16);
+        border: 1px solid rgba(255,255,255,0.16);
+        color: var(--app-fg);
+        font-size: 32px;
+        line-height: 1;
+        backdrop-filter: blur(10px);
+      }
       .app-shell-kicker,
       .app-shell-source {
-        color: rgba(216, 232, 246, 0.66);
+        color: var(--app-muted);
         font-size: 11px;
         letter-spacing: 0;
         text-transform: uppercase;
       }
       .app-shell h2 {
-        margin: 4px 0 0;
-        font-size: 22px;
-        line-height: 1.1;
-        font-weight: 760;
+        margin: 0;
+        color: var(--app-fg);
+        font-size: 28px;
+        line-height: 1.02;
+        font-weight: 780;
         letter-spacing: 0;
       }
+      .app-shell-dashboard-grid h2,
+      .app-shell-checklist-board h2,
+      .app-shell-feed-panel h2 {
+        font-size: 24px;
+        line-height: 1.08;
+      }
       .app-shell-status {
-        color: ${state.error ? "#ffd7c2" : "rgba(224, 240, 252, 0.72)"};
+        color: var(--app-status);
         font-size: 12px;
         text-align: right;
       }
@@ -509,15 +968,15 @@ function renderApp(el, spec, fetched, state) {
       .app-shell-empty,
       .app-shell-content p,
       .app-shell-content li {
-        margin: 14px 0 0;
-        color: rgba(230, 242, 250, 0.78);
+        margin: 10px 0 0;
+        color: var(--app-body);
         font-size: 13px;
         line-height: 1.5;
       }
       .app-shell-tabs {
         display: flex;
         gap: 7px;
-        margin-top: 14px;
+        margin-top: 16px;
         overflow-x: auto;
         scrollbar-width: thin;
       }
@@ -526,24 +985,24 @@ function renderApp(el, spec, fetched, state) {
         min-height: 32px;
         padding: 7px 10px;
         border-radius: 8px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        color: rgba(235, 244, 252, 0.78);
-        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--app-line);
+        color: var(--app-muted);
+        background: var(--app-panel);
         font-size: 12px;
         font-weight: 700;
         cursor: pointer;
       }
       .app-shell-tab.is-active {
-        color: #071019;
-        background: ${accent};
-        border-color: color-mix(in srgb, ${accent} 70%, white);
+        color: var(--app-action-text);
+        background: var(--app-accent);
+        border-color: color-mix(in srgb, var(--app-accent) 70%, white);
       }
       .app-shell-content {
-        margin-top: 14px;
+        margin-top: 0;
       }
       .app-shell-content h3 {
         margin: 14px 0 6px;
-        color: rgba(244, 250, 255, 0.9);
+        color: var(--app-fg);
         font-size: 13px;
         line-height: 1.25;
       }
@@ -556,50 +1015,102 @@ function renderApp(el, spec, fetched, state) {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
         gap: 9px;
-        margin-top: 14px;
+        margin-top: 0;
       }
       .app-shell-metric {
         min-width: 0;
-        padding: 10px;
+        padding: 13px;
         border-radius: 8px;
-        background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.055));
-        border: 1px solid rgba(255, 255, 255, 0.09);
+        background: linear-gradient(180deg, var(--app-panel-strong), var(--app-panel));
+        border: 1px solid var(--app-line);
+      }
+      .app-shell-info-strip {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 9px;
+        margin-top: 0;
+      }
+      .app-shell-info-item {
+        min-width: 0;
+        padding: 12px 13px;
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--app-panel) 82%, transparent);
+        border: 1px solid var(--app-line);
+      }
+      .app-shell-info-item span {
+        display: block;
+        color: var(--app-muted);
+        font-size: 10.5px;
+        font-weight: 650;
+        text-transform: uppercase;
+        letter-spacing: 0;
+      }
+      .app-shell-info-item strong {
+        display: block;
+        margin-top: 5px;
+        color: var(--app-fg);
+        font-size: 14px;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+      }
+      .app-shell-primary-metric {
+        width: 100%;
+        max-width: 100%;
+        margin: 0;
+        padding: 16px;
+        border-radius: 16px;
+        background: color-mix(in srgb, var(--app-accent) 16%, var(--app-panel-strong));
+        border: 1px solid color-mix(in srgb, var(--app-accent) 35%, var(--app-line));
+        container-type: inline-size;
       }
       .app-shell-metric span,
+      .app-shell-primary-metric span,
       .app-shell-section h3 {
-        color: rgba(216, 234, 248, 0.68);
+        color: var(--app-muted);
         font-size: 11px;
         font-weight: 620;
         text-transform: uppercase;
         letter-spacing: 0;
       }
-      .app-shell-metric strong {
+      .app-shell-metric strong,
+      .app-shell-primary-metric strong {
         display: block;
         margin-top: 5px;
         overflow-wrap: anywhere;
         font-size: 21px;
         line-height: 1.08;
       }
-      .app-shell-metric em {
+      .app-shell-primary-metric strong {
+        font-size: clamp(24px, 18cqw, 36px);
+        line-height: 0.98;
+        white-space: nowrap;
+      }
+      .app-shell-metric em,
+      .app-shell-primary-metric em {
         display: block;
         margin-top: 5px;
-        color: rgba(226, 238, 248, 0.64);
+        color: var(--app-soft);
         font-size: 11px;
         font-style: normal;
       }
       .app-shell-section {
-        margin-top: 15px;
+        margin-top: 0;
         padding-top: 13px;
-        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        border-top: 1px solid var(--app-line);
       }
       .app-shell-section h3 {
         margin: 0 0 8px;
       }
       .app-shell-section p,
       .app-shell-section li {
-        color: rgba(232, 242, 250, 0.8);
+        color: var(--app-body);
         font-size: 13px;
         line-height: 1.45;
+      }
+      .app-shell-profile-panel .app-shell-section p,
+      .app-shell-glass-card .app-shell-section p,
+      .app-shell-hero-card .app-shell-section p {
+        max-width: 68ch;
       }
       .app-shell-section ul {
         display: grid;
@@ -615,7 +1126,7 @@ function renderApp(el, spec, fetched, state) {
         align-items: baseline;
       }
       .app-shell-section li strong {
-        color: #ffffff;
+        color: var(--app-fg);
         text-align: right;
         overflow-wrap: anywhere;
       }
@@ -634,25 +1145,25 @@ function renderApp(el, spec, fetched, state) {
         min-height: 42px;
         padding: 9px;
         border-radius: 8px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        border: 1px solid var(--app-line);
         color: inherit;
-        background: rgba(255, 255, 255, 0.055);
+        background: var(--app-panel);
         text-align: left;
         cursor: pointer;
       }
       .app-shell-check.is-checked {
-        background: color-mix(in srgb, ${accent} 18%, rgba(255, 255, 255, 0.06));
+        background: color-mix(in srgb, var(--app-accent) 18%, var(--app-panel));
       }
       .app-shell-check-box {
         width: 20px;
         height: 20px;
         border-radius: 6px;
-        border: 1px solid rgba(255, 255, 255, 0.22);
+        border: 1px solid var(--app-line);
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        color: #071019;
-        background: ${accent};
+        color: var(--app-action-text);
+        background: var(--app-accent);
         font-size: 12px;
         font-weight: 900;
         flex: 0 0 auto;
@@ -663,7 +1174,7 @@ function renderApp(el, spec, fetched, state) {
         min-width: 0;
       }
       .app-shell-check-copy strong {
-        color: rgba(224, 239, 250, 0.65);
+        color: var(--app-soft);
         font-size: 11px;
         font-weight: 650;
       }
@@ -674,8 +1185,8 @@ function renderApp(el, spec, fetched, state) {
         margin-top: 16px;
       }
       .app-shell-action {
-        color: #061019;
-        background: ${accent};
+        color: var(--app-action-text);
+        background: var(--app-accent);
         border: 0;
         border-radius: 8px;
         min-height: 36px;
@@ -693,29 +1204,51 @@ function renderApp(el, spec, fetched, state) {
         outline-offset: 2px;
       }
       .app-shell-source {
-        margin-top: 14px;
+        margin-top: 0;
         text-transform: none;
       }
+      @media (max-width: 560px) {
+        .app-shell {
+          padding: 20px;
+          justify-content: flex-start;
+        }
+        .app-shell-stage {
+          grid-template-columns: 1fr;
+          gap: 15px;
+        }
+        .app-shell-visual-scene {
+          width: 148px;
+          justify-self: start;
+        }
+        .app-shell h2 {
+          font-size: 24px;
+        }
+      }
     </style>
-    <article class="app-shell" aria-label="${escapeHtml(title)}">
-      <div class="app-shell-head">
-        <div>
-          <div class="app-shell-kicker">${escapeHtml(text(spec.eyebrow, "Orbit App"))}</div>
+    <article class="app-shell app-shell-${escapeHtml(designType)} app-shell-${escapeHtml(tone)}${renderedPrimaryMetric ? " has-feature" : ""}" aria-label="${escapeHtml(title)}">
+      <div class="app-shell-stage">
+        <div class="app-shell-copy">
+          ${kicker ? `<div class="app-shell-kicker">${escapeHtml(kicker)}</div>` : ""}
           <h2>${escapeHtml(title)}</h2>
+          ${subtitle ? `<p class="app-shell-summary">${escapeHtml(formatBoundValue(subtitle, data))}</p>` : ""}
+          ${renderViewTabs(views, state)}
         </div>
-        ${status ? `<div class="app-shell-status">${escapeHtml(formatBoundValue(status, data))}</div>` : ""}
+        ${renderedVisualScene}
+        ${renderedPrimaryMetric ? `<div class="app-shell-feature">${renderedPrimaryMetric}</div>` : ""}
       </div>
-      ${subtitle ? `<p class="app-shell-summary">${escapeHtml(formatBoundValue(subtitle, data))}</p>` : ""}
-      ${renderViewTabs(views, state)}
-      ${renderedContent}
-      ${metrics.length ? `<div class="app-shell-metrics">${metrics.map((metric) => renderMetric(metric, data)).join("")}</div>` : ""}
-      ${renderedSections.join("")}
-      ${renderedTopRows}
-      ${renderedFallbackData}
-      ${looseSections.join("")}
-      ${hasBody ? "" : `<p class="app-shell-empty">This widget needs app-specific fields before it can render.</p>`}
-      ${actions.length ? `<div class="app-shell-actions">${actions.join("")}</div>` : ""}
-      ${renderSource(spec)}
+      <div class="app-shell-body">
+        ${status ? `<div class="app-shell-status">${escapeHtml(formatBoundValue(status, data))}</div>` : ""}
+        ${renderedContent}
+        ${metricCards.length ? `<div class="app-shell-metrics">${metricCards.map((metric) => renderMetric(metric, data)).join("")}</div>` : ""}
+        ${renderedInfoStrip}
+        ${renderedSections.join("")}
+        ${renderedTopRows}
+        ${renderedFallbackData}
+        ${looseSections.join("")}
+        ${hasBody ? "" : `<p class="app-shell-empty">This widget needs app-specific fields before it can render.</p>`}
+        ${actions.length ? `<div class="app-shell-actions">${actions.join("")}</div>` : ""}
+        ${renderSource(spec)}
+      </div>
     </article>
   `;
 }
@@ -742,7 +1275,7 @@ export function render(el, ctx = {}) {
   const widget = asObject(ctx.widget);
   const spec = asObject(widget.spec);
   const fetchSpec = fetchSpecFrom(spec);
-  const state = { title: widget.title || widget.id, status: "" };
+  const state = { id: widget.id, title: widget.title || widget.id, status: "" };
   let disposed = false;
   let timer = null;
   let currentData = null;

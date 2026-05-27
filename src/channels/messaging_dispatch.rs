@@ -195,7 +195,7 @@ fn mask_template_placeholders(raw: &str) -> String {
             out.push(' ');
             chars.next();
             let mut previous = '\0';
-            while let Some(inner) = chars.next() {
+            for inner in chars.by_ref() {
                 out.push(' ');
                 if previous == '}' && inner == '}' {
                     break;
@@ -854,7 +854,7 @@ mod tests {
     fn header_spec_substitution_uses_templates() {
         // Smoke-test apply_static_headers via the template path it delegates
         // to. A real HTTP call is covered by integration tests.
-        let headers = vec![MessagingHeaderSpec {
+        let headers = [MessagingHeaderSpec {
             name: "X-Trace".to_string(),
             value_template: "conv={{conversation_id}}".to_string(),
         }];

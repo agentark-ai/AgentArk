@@ -98,7 +98,7 @@ pub(super) fn titleize_secret_label(value: &str) -> String {
         return String::new();
     }
     trimmed
-        .split(|ch: char| matches!(ch, '_' | '-' | ':' | '.'))
+        .split(['_', '-', ':', '.'])
         .filter(|part| !part.trim().is_empty())
         .map(|part| {
             let lower = part.to_ascii_lowercase();
@@ -620,13 +620,10 @@ pub(super) async fn chat_secret_prompt_block_message(
         return None;
     }
     let agent = state.agent.read().await;
-    if agent
+    agent
         .pending_chat_credential_prompt(conversation_id)
         .await
-        .is_none()
-    {
-        return None;
-    }
+        .as_ref()?;
     Some(
         "Never paste secrets, API keys, passwords, or sensitive data into normal chat. Use the secure credential form shown in this conversation.".to_string(),
     )

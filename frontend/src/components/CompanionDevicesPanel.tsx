@@ -3,14 +3,17 @@ import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
 import ComputerRoundedIcon from "@mui/icons-material/ComputerRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import DevicesRoundedIcon from "@mui/icons-material/DevicesRounded";
+import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import HomeRoundedIcon from "@mui/icons-material/HomeRounded";
 import LaunchRoundedIcon from "@mui/icons-material/LaunchRounded";
 import PhoneAndroidRoundedIcon from "@mui/icons-material/PhoneAndroidRounded";
 import PhoneIphoneRoundedIcon from "@mui/icons-material/PhoneIphoneRounded";
-import SendRoundedIcon from "@mui/icons-material/SendRounded";
 import SensorsRoundedIcon from "@mui/icons-material/SensorsRounded";
 import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Alert,
   Box,
   Button,
@@ -34,6 +37,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState, type JSX } from "react";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { sessionNeedsPairingPoll } from "./companionPairing";
 import type {
   CompanionCapabilityDescriptor,
   CompanionCommandRecord,
@@ -160,29 +164,7 @@ function latestSession(sessions: CompanionPairingSession[]): CompanionPairingSes
   return sessions[0] ?? null;
 }
 
-function sessionNeedsPairingPoll(data: CompanionDevicesResponse | undefined, sessionId: string): boolean {
-  if (!sessionId) return false;
-  const session = data?.pairing_sessions?.find((item) => item.id === sessionId);
-  if (!session) return true;
-  return ["pending", "claimed"].includes(session.status.toLowerCase());
-}
-
 type PairingWizardStep = "tunnel" | "pairing" | "approve" | "connected";
-
-function shareTextForCompanionLink(url: string): string {
-  return `Open this AgentArk companion pairing link:\n${url}`;
-}
-
-function whatsappShareUrl(url: string): string {
-  return `https://wa.me/?text=${encodeURIComponent(shareTextForCompanionLink(url))}`;
-}
-
-function telegramShareUrl(url: string): string {
-  const shareUrl = new URL("https://t.me/share/url");
-  shareUrl.searchParams.set("url", url);
-  shareUrl.searchParams.set("text", "AgentArk companion pairing");
-  return shareUrl.toString();
-}
 
 export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
@@ -270,6 +252,17 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   }, [devices, selectedDevice, selectedDeviceId]);
 
   useEffect(() => {
+    const declared = selectedDevice?.declared_commands ?? [];
+    if (declared.length) {
+      const stillValid = declared.some(
+        (command) => command.capability === commandCapability && command.action === commandAction
+      );
+      if (!stillValid) {
+        setCommandCapability(declared[0].capability);
+        setCommandAction(declared[0].action);
+      }
+      return;
+    }
     const caps = selectedDevice?.token_capabilities ?? selectedDevice?.granted_capabilities ?? [];
     if (!caps.length) {
       setCommandCapability("");
@@ -278,7 +271,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
     if (!commandCapability || !caps.includes(commandCapability)) {
       setCommandCapability(caps[0]);
     }
-  }, [selectedDevice, commandCapability]);
+  }, [selectedDevice, commandCapability, commandAction]);
 
   const selectedCapabilityRisk = capabilityMap.get(commandCapability)?.risk ?? "high";
   const selectedHighRiskCapabilities = draftCapabilities.filter(
@@ -294,7 +287,6 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   }, [hasHighRiskDraftCapability, bundledMobileNeedsAttestation]);
   const pairingBlockedByAttestation =
     hasHighRiskDraftCapability && (bundledMobileNeedsAttestation || !trustedUnattested);
-  const overview = devicesQ.data?.overview;
   const latestPairing = latestSession(sessions);
   const protocol = protocolQ.data;
 
@@ -440,22 +432,13 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
     setCustomCapability("");
   };
 
+  const declaredCommandRows = selectedDevice?.declared_commands ?? [];
+  const activeDeclaredCommandId =
+    declaredCommandRows.find(
+      (command) => command.capability === commandCapability && command.action === commandAction
+    )?.id ?? "";
   const commandCapabilities = selectedDevice?.token_capabilities ?? selectedDevice?.granted_capabilities ?? [];
   const commandRows = commandsQ.data?.commands ?? [];
-  const metricItems = [
-    { label: "Total", value: overview?.total ?? devices.length, tone: "info" },
-    {
-      label: "Online",
-      value: overview?.online ?? devices.filter((device) => device.state === "online").length,
-      tone: "good"
-    },
-    {
-      label: "Pairing",
-      value: overview?.pending_pairing ?? sessions.filter((session) => ["pending", "claimed"].includes(session.status)).length,
-      tone: "warn"
-    },
-    { label: "Approvals", value: overview?.pending_approvals ?? pendingApprovals.length, tone: "warn" }
-  ];
   const presetCapabilityIds = selectedPreset?.capability_ids ?? [];
   const pairingSessionId = activePairingSessionId;
   const pairingCode = recordString(pairingPayload, "code");
@@ -489,10 +472,15 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   const pairingStepIndex = { tunnel: 0, pairing: 1, approve: 2, connected: 3 }[pairingStep];
   const pairingStepProgress = ((pairingStepIndex + 1) / 4) * 100;
   const primaryPairingButtonLabel = activePairingInProgress
-    ? "Resume companion pairing"
+    ? "Resume pairing"
     : devices.length
-      ? "Pair another companion device"
-      : "Pair companion device";
+      ? "Pair another"
+      : "Pair device";
+  const phoneDevices = devices.filter((device) => {
+    const value = `${device.preset_id} ${device.platform}`.toLowerCase();
+    return value.includes("ios") || value.includes("iphone") || value.includes("android");
+  });
+  const phoneOnlineCount = phoneDevices.filter((device) => device.state.toLowerCase() === "online").length;
 
   useEffect(() => {
     if (!pairingDialogOpen) return;
@@ -549,13 +537,39 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
         </Alert>
       ) : null}
 
-      <Box className="companion-metric-strip">
-        {metricItems.map((item) => (
-          <Box key={item.label} className="companion-metric-item" data-tone={item.tone}>
-            <Typography className="companion-metric-label">{item.label}</Typography>
-            <Typography className="companion-metric-value">{item.value}</Typography>
-          </Box>
-        ))}
+      <Box className="settings-inline-card companion-status-summary">
+        <Stack
+          direction={{ xs: "column", md: "row" }}
+          spacing={1.25}
+          sx={{ alignItems: { xs: "stretch", md: "center" }, justifyContent: "space-between" }}
+        >
+          <Stack direction="row" spacing={1} sx={{ alignItems: "flex-start", minWidth: 0 }}>
+            <Box className="companion-pairing-start-icon">
+              <PhoneIphoneRoundedIcon fontSize="small" />
+            </Box>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography className="settings-inline-card-kicker">Companion status</Typography>
+              <Typography className="settings-inline-card-title">Notifications and approvals only</Typography>
+              <Typography className="settings-inline-card-description">
+                iPhone and Android companions do not read SMS, photos, calls, or app data.
+              </Typography>
+            </Box>
+          </Stack>
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", justifyContent: { xs: "flex-start", md: "flex-end" } }}>
+            <Chip
+              size="small"
+              color={phoneOnlineCount > 0 ? "success" : "default"}
+              variant={phoneOnlineCount > 0 ? "filled" : "outlined"}
+              label={`${phoneOnlineCount} phone online`}
+            />
+            <Chip
+              size="small"
+              color={pendingApprovals.length > 0 ? "warning" : "default"}
+              variant="outlined"
+              label={`${pendingApprovals.length} approval${pendingApprovals.length === 1 ? "" : "s"}`}
+            />
+          </Stack>
+        </Stack>
       </Box>
 
       <Box className="settings-inline-card companion-pairing-start">
@@ -570,9 +584,9 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
             </Box>
             <Box sx={{ minWidth: 0 }}>
               <Typography className="settings-inline-card-kicker">Companion pairing</Typography>
-              <Typography className="settings-inline-card-title">Pair a companion device</Typography>
+              <Typography className="settings-inline-card-title">Pair a notification and approval companion</Typography>
               <Typography className="settings-inline-card-description">
-                Choose the device type, open a secure companion tunnel, send one pairing link, then approve the claimed device in AgentArk.
+                Use this when AgentArk should notify your phone or ask for approvals.
               </Typography>
             </Box>
           </Stack>
@@ -738,24 +752,6 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                     disabled={!webCompanionUrl}
                   >
                     Open
-                  </Button>
-                  <Button
-                    size="small"
-                    variant="outlined"
-                    startIcon={<SendRoundedIcon />}
-                    onClick={() => window.open(whatsappShareUrl(webCompanionUrl), "_blank", "noopener,noreferrer")}
-                    disabled={!webCompanionUrl}
-                  >
-                    WhatsApp
-                  </Button>
-                  <Button
-                    size="small"
-                    variant="outlined"
-                    startIcon={<SendRoundedIcon />}
-                    onClick={() => window.open(telegramShareUrl(webCompanionUrl), "_blank", "noopener,noreferrer")}
-                    disabled={!webCompanionUrl}
-                  >
-                    Telegram
                   </Button>
                 </Stack>
                 {activePairingClaimed ? (
@@ -992,7 +988,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                     Grants
                   </Typography>
                   <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                    Low-risk grants are selected by default. Camera, photos, location, Shortcuts, and other sensitive grants require extra approval.
+                    Low-risk grants are selected by default. High-risk custom or desktop grants require explicit approval and audit.
                   </Typography>
                 </Box>
                 <Chip size="small" variant="outlined" label={`${draftCapabilities.length} selected`} />
@@ -1276,7 +1272,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                   Devices
                 </Typography>
                 <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  Paired identity, granted capabilities, token scope, and last pulse.
+                  Paired companions and last seen status.
                 </Typography>
               </Box>
               <Chip size="small" variant="outlined" label={`${devices.length} device${devices.length === 1 ? "" : "s"}`} />
@@ -1345,6 +1341,29 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
             )}
           </Stack>
         </Box>
+
+        <Accordion className="companion-advanced" disableGutters defaultExpanded={pendingApprovals.length > 0}>
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={0.75}
+              sx={{ alignItems: { xs: "stretch", sm: "center" }, justifyContent: "space-between", width: "100%" }}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                  Advanced
+                </Typography>
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  Command testing, pending approvals, history, and audit.
+                </Typography>
+              </Box>
+              {pendingApprovals.length > 0 ? (
+                <Chip size="small" color="warning" label={`${pendingApprovals.length} waiting`} />
+              ) : null}
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            <Stack className="companion-advanced-stack" spacing={1.25}>
         <Box className="settings-inline-card companion-panel companion-panel-command">
           <Stack spacing={1.25}>
             <Stack
@@ -1354,10 +1373,10 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
             >
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="h6" sx={{ fontWeight: 650, lineHeight: 1.2 }}>
-                  Typed Command
+                  Command test
                 </Typography>
                 <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  Queue adapter actions for the selected device.
+                  Send a declared command to the selected device.
                 </Typography>
               </Box>
               {selectedDevice ? <Chip size="small" variant="outlined" label={selectedDevice.display_name} /> : null}
@@ -1372,6 +1391,27 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                     ? "Fresh approval required before dispatch."
                     : "Scope validation runs before dispatch."}
                 </Alert>
+                {declaredCommandRows.length ? (
+                  <TextField
+                    select
+                    size="small"
+                    label="Command"
+                    value={activeDeclaredCommandId}
+                    onChange={(event) => {
+                      const next = declaredCommandRows.find((command) => command.id === event.target.value);
+                      if (!next) return;
+                      setCommandCapability(next.capability);
+                      setCommandAction(next.action);
+                    }}
+                    helperText="Commands come from the selected companion's latest declaration."
+                  >
+                    {declaredCommandRows.map((command) => (
+                      <MenuItem key={command.id} value={command.id}>
+                        {command.label || command.action}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                ) : null}
                 <TextField
                   select
                   size="small"
@@ -1385,13 +1425,17 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                     </MenuItem>
                   ))}
                 </TextField>
-                <TextField
-                  size="small"
-                  label="Typed action id"
-                  value={commandAction}
-                  onChange={(event) => setCommandAction(event.target.value)}
-                  helperText="Use adapter action ids such as capture_photo or run_shortcut."
-                />
+                {declaredCommandRows.length ? (
+                  <Chip size="small" variant="outlined" label={commandAction || "No command selected"} sx={{ alignSelf: "flex-start" }} />
+                ) : (
+                  <TextField
+                    size="small"
+                    label="Action id"
+                    value={commandAction}
+                    onChange={(event) => setCommandAction(event.target.value)}
+                    helperText="Use a declared adapter action id such as notifications.show."
+                  />
+                )}
                 <TextField
                   size="small"
                   label="Arguments JSON"
@@ -1615,6 +1659,9 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
             )}
           </Stack>
         </Box>
+            </Stack>
+          </AccordionDetails>
+        </Accordion>
       </Box>
     </Stack>
   );

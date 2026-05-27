@@ -3340,7 +3340,7 @@ async fn run_app_health_checks(
     let app_state: HashMap<String, &AppPulseInfo> =
         deployed_apps.iter().map(|a| (a.id.clone(), a)).collect();
 
-    for app in app_endpoints {
+    for app in app_endpoints.iter().cloned() {
         if let Some(snapshot) = app_state.get(&app.id) {
             if !snapshot.process_alive && !snapshot.is_static {
                 push_finding!(
@@ -3694,7 +3694,9 @@ async fn run_doctor_checks(
     let app_scan_started = Instant::now();
     let findings_before = findings.len();
     let mut app_scan_tasks = Vec::new();
-    for app in app_endpoints.iter().cloned() {
+    let app_count = app_endpoints.len();
+    let has_app_endpoints = !app_endpoints.is_empty();
+    for app in app_endpoints.clone() {
         app_scan_tasks.push(tokio::task::spawn_blocking(move || {
             let mut findings = Vec::new();
             run_dependency_and_supply_checks_for_app(&app, &mut findings);
@@ -3718,13 +3720,13 @@ async fn run_doctor_checks(
         "Managed app code scan",
         app_scan_started.elapsed(),
         &findings[findings_before..],
-        if app_endpoints.is_empty() {
+        if !has_app_endpoints {
             "No managed apps were available for dependency or secret scanning.".to_string()
         } else {
             "Scanned managed app directories for dependency drift, risky install hooks, and secret exposure.".to_string()
         },
         "Reviewed app manifests and a bounded subset of source files for code-level risk indicators.",
-        vec![pulse_metric("Apps scanned", app_endpoints.len().to_string())],
+        vec![pulse_metric("Apps scanned", app_count.to_string())],
     ));
 
     let app_health_started = Instant::now();

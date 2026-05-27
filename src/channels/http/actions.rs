@@ -532,7 +532,7 @@ fn yaml_string_vec_field(mapping: &serde_yaml::Mapping, key: &str) -> Vec<String
     }
 }
 
-fn cli_skill_mapping<'a>(root: &'a serde_yaml::Mapping) -> Option<&'a serde_yaml::Mapping> {
+fn cli_skill_mapping(root: &serde_yaml::Mapping) -> Option<&serde_yaml::Mapping> {
     root.get(serde_yaml::Value::String("cli".to_string()))
         .or_else(|| root.get(serde_yaml::Value::String("local_cli".to_string())))
         .and_then(|value| value.as_mapping())

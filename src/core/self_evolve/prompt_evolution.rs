@@ -28,8 +28,8 @@ use crate::core::task_router::{AgentExecResult, RoutingDecision};
 use crate::core::{DelegationStatus, FailureKind};
 
 use super::promotion_gate::{
-    PromotionGateCheck, PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
-    promotion_gate_report, render_legacy_promotion_gate,
+    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
+    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
 };
 
 pub const PROMPT_BUNDLE_PROFILE_KEY: &str = "prompt_bundle_profile_v1";
@@ -430,7 +430,7 @@ impl PromptEvolutionEngine {
 
         let mut evaluated = Vec::new();
         for candidate in candidates {
-            let eval = self.evaluate_bundle(&candidate.bundle, &benchmark).await;
+            let eval = self.evaluate_bundle(&candidate.bundle, benchmark).await;
             let paired = paired_stats(&baseline_eval.case_scores, &eval.case_scores);
             evaluated.push((candidate, eval, paired));
         }
@@ -1389,7 +1389,11 @@ fn prompt_efficiency_delta(
 
 fn signed_ratio_delta(baseline: usize, candidate: usize) -> f64 {
     if baseline == 0 {
-        if candidate == 0 { 0.0 } else { 1.0 }
+        if candidate == 0 {
+            0.0
+        } else {
+            1.0
+        }
     } else {
         candidate as f64 / baseline as f64 - 1.0
     }
@@ -2344,24 +2348,18 @@ mod tests {
 
         assert_eq!(bundle.version, PROMPT_BUNDLE_DEFAULT_VERSION);
         assert!(bundle.router.instruction_template.contains("{message}"));
-        assert!(
-            bundle
-                .router
-                .instruction_template
-                .contains("{policy_block}")
-        );
-        assert!(
-            bundle
-                .delegation_synthesis
-                .instruction_template
-                .contains("{original_task}")
-        );
-        assert!(
-            bundle
-                .delegation_synthesis
-                .instruction_template
-                .contains("{results_text}")
-        );
+        assert!(bundle
+            .router
+            .instruction_template
+            .contains("{policy_block}"));
+        assert!(bundle
+            .delegation_synthesis
+            .instruction_template
+            .contains("{original_task}"));
+        assert!(bundle
+            .delegation_synthesis
+            .instruction_template
+            .contains("{results_text}"));
     }
 
     #[test]
@@ -2477,11 +2475,10 @@ mod tests {
         );
 
         let diff = build_prompt_bundle_diff_summary(&baseline, &candidate);
-        assert!(
-            diff.primary_response_changed_fields
-                .iter()
-                .any(|field| field == "policy_block")
-        );
+        assert!(diff
+            .primary_response_changed_fields
+            .iter()
+            .any(|field| field == "policy_block"));
         assert!(!diff.primary_response_change_preview.is_empty());
     }
 

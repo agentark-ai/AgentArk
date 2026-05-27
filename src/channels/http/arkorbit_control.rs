@@ -4,9 +4,9 @@ use super::*;
 
 use crate::core::arkorbit::store::orbit_file_is_user_artifact_path;
 use crate::core::arkorbit::{
-    OrbitAgentEvent, OrbitChatUsage, OrbitUpdate, content_type_for_name, stream_orbit_chat_turn,
+    content_type_for_name, stream_orbit_chat_turn, OrbitAgentEvent, OrbitChatUsage, OrbitUpdate,
 };
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -574,7 +574,7 @@ fn orbit_widget_layout_number(
     let Some(value) = body.get(key).and_then(|value| value.as_f64()) else {
         return Err(format!("'{}' must be a finite number", key));
     };
-    if !value.is_finite() || value < 0.0 || value > 1_000_000.0 {
+    if !value.is_finite() || !(0.0..=1_000_000.0).contains(&value) {
         return Err(format!("'{}' must be between 0 and 1000000", key));
     }
     Ok(Some(value))
@@ -926,16 +926,46 @@ pub(super) async fn orbit_public_fetch_endpoint(
 pub(super) async fn orbit_chat_transcripts_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let (limit, offset) = orbit_chat_history_page_bounds(&params);
     let agent = state.agent.read().await;
     match agent.arkorbit.list_orbit_chat_transcripts(&id) {
-        Ok(transcripts) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "transcripts": transcripts })),
-        )
-            .into_response(),
+        Ok(transcripts) => {
+            let total = transcripts.len();
+            let page = transcripts
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let has_more = offset.saturating_add(page.len()) < total;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "transcripts": page,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": has_more,
+                })),
+            )
+                .into_response()
+        }
         Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
+}
+
+pub(super) fn orbit_chat_history_page_bounds(params: &HashMap<String, String>) -> (usize, usize) {
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(25)
+        .clamp(1, 50);
+    let offset = params
+        .get("offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    (limit, offset)
 }
 
 pub(super) async fn orbit_chat_transcript_messages_endpoint(
@@ -1125,6 +1155,8 @@ pub(super) async fn orbit_chat_endpoint(
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("orbit_chat".to_string()),
         plan: None,
@@ -1236,14 +1268,13 @@ pub(super) async fn orbit_chat_endpoint(
                 let Ok(data) = serde_json::to_string(&payload) else {
                     continue;
                 };
-                if client_open {
-                    if sse_tx
+                if client_open
+                    && sse_tx
                         .send(Ok(Event::default().event(name).data(data)))
                         .await
                         .is_err()
-                    {
-                        client_open = false;
-                    }
+                {
+                    client_open = false;
                 }
                 if done {
                     persist_orbit_trace(

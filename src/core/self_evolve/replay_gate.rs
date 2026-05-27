@@ -11,15 +11,15 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 use crate::storage::{
-    Storage, experience_item, experience_run, learning_candidate, procedural_pattern,
+    experience_item, experience_run, learning_candidate, procedural_pattern, Storage,
 };
 
 use super::router_learning::{
-    ROUTER_LEARNING_CANDIDATE_TYPE, RouterLearningCandidatePayload,
-    validate_router_learning_candidate,
+    validate_router_learning_candidate, RouterLearningCandidatePayload,
+    ROUTER_LEARNING_CANDIDATE_TYPE,
 };
 use super::routing_canonical_evolution::{
-    ROUTING_CANONICAL_CANDIDATE_TYPE, parse_routing_canonical_candidate,
+    parse_routing_canonical_candidate, ROUTING_CANONICAL_CANDIDATE_TYPE,
 };
 
 const DEFAULT_MIN_EVIDENCE_SAMPLES: usize = 2;
@@ -996,12 +996,10 @@ mod tests {
         assert_eq!(result.avg_total_tokens, 1280.0);
         assert_eq!(result.max_total_tokens, 1280);
         assert_eq!(result.avg_cost_usd, 0.002);
-        assert!(
-            result
-                .signals
-                .iter()
-                .any(|signal| signal.contains("turn decision evidence"))
-        );
+        assert!(result
+            .signals
+            .iter()
+            .any(|signal| signal.contains("turn decision evidence")));
     }
 
     #[test]

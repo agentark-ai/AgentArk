@@ -1,13 +1,13 @@
 use axum::{
-    Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-use super::{AppState, ErrorResponse, auth};
+use super::{auth, AppState, ErrorResponse};
 
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct StartOAuthProfileRequest {

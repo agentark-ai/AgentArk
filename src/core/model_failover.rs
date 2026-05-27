@@ -3,7 +3,7 @@
 //! KV-backed state for auth profiles, provider health, and fallback chains.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::storage::Storage;
 

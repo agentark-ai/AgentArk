@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::RwLock;
 
-use crate::core::StreamEvent;
 use crate::core::runtime_image;
+use crate::core::StreamEvent;
 
 /// Port range for dynamic apps (localhost only)
 const PORT_RANGE_START: u16 = 9100;
@@ -241,9 +241,7 @@ pub(crate) fn detect_unclosed_html_raw_text_element(content: &str) -> Option<&'s
     while let Some(relative_start) = lower[cursor..].find('<') {
         let start = cursor + relative_start;
         let after_lt = start + 1;
-        let Some(next) = lower[after_lt..].chars().next() else {
-            return None;
-        };
+        let next = lower[after_lt..].chars().next()?;
 
         if next == '!' || next == '?' || next == '/' {
             cursor = lower[after_lt..]
@@ -1570,22 +1568,22 @@ fn infer_generated_python_bundle_lifecycle(
 fn infer_generated_rust_bundle_lifecycle(
     files: &HashMap<String, String>,
 ) -> Option<GeneratedBundleLifecycleInference> {
-    for relative_dir in bundle_candidate_dirs_with_file(files, "Cargo.toml") {
-        let entry_command = if relative_dir.trim().is_empty() {
-            "cargo run".to_string()
-        } else {
-            format!(
-                "cargo run --manifest-path {}",
-                shell_quote_arg(&build_relative_file_arg(&relative_dir, "Cargo.toml"))
-            )
-        };
-        return Some(GeneratedBundleLifecycleInference {
-            install_command: None,
-            entry_command,
-            runtime_reason: "generated bundle contains a Cargo manifest".to_string(),
-        });
-    }
-    None
+    let relative_dir = bundle_candidate_dirs_with_file(files, "Cargo.toml")
+        .into_iter()
+        .next()?;
+    let entry_command = if relative_dir.trim().is_empty() {
+        "cargo run".to_string()
+    } else {
+        format!(
+            "cargo run --manifest-path {}",
+            shell_quote_arg(&build_relative_file_arg(&relative_dir, "Cargo.toml"))
+        )
+    };
+    Some(GeneratedBundleLifecycleInference {
+        install_command: None,
+        entry_command,
+        runtime_reason: "generated bundle contains a Cargo manifest".to_string(),
+    })
 }
 
 fn infer_generated_bundle_lifecycle(
@@ -3350,7 +3348,11 @@ async fn discover_current_agent_image() -> Option<String> {
         return None;
     }
     let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if image.is_empty() { None } else { Some(image) }
+    if image.is_empty() {
+        None
+    } else {
+        Some(image)
+    }
 }
 
 fn current_container_ref_from_env() -> Option<String> {
@@ -3373,7 +3375,11 @@ async fn discover_current_container_ref() -> Option<String> {
         return None;
     }
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if id.is_empty() { None } else { Some(id) }
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 async fn resolve_runtime_image(runtime_image: Option<&str>) -> String {
@@ -4781,7 +4787,7 @@ pub async fn launch_dynamic_container(
             let install_container_name = format!(
                 "{}-install-{}",
                 app_container_name(app_id),
-                uuid::Uuid::new_v4().to_string()[..8].to_string()
+                &uuid::Uuid::new_v4().to_string()[..8]
             );
             let install_args = build_dynamic_container_install_args(
                 app_id,
@@ -4797,9 +4803,7 @@ pub async fn launch_dynamic_container(
             match install_output {
                 Ok(output) if output.status.success() => {}
                 Ok(output) => {
-                    let _ = env_file_path
-                        .as_ref()
-                        .map(|path| std::fs::remove_file(path));
+                    let _ = env_file_path.as_ref().map(std::fs::remove_file);
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let detail = if !stderr.trim().is_empty() {
@@ -4810,9 +4814,7 @@ pub async fn launch_dynamic_container(
                     anyhow::bail!("install_command failed for app {}: {}", app_id, detail);
                 }
                 Err(error) => {
-                    let _ = env_file_path
-                        .as_ref()
-                        .map(|path| std::fs::remove_file(path));
+                    let _ = env_file_path.as_ref().map(std::fs::remove_file);
                     return Err(error)
                         .with_context(|| format!("install_command failed for app {}", app_id));
                 }
@@ -5382,9 +5384,7 @@ async fn write_file_with_progress(
     let segments: Vec<&str> = content.split_inclusive('\n').collect();
     let total_lines = segments.len();
     const FILE_WRITE_PROGRESS_MAX_EVENTS: usize = 8;
-    let sampled_step = (total_lines / FILE_WRITE_PROGRESS_MAX_EVENTS)
-        .max(1)
-        .min(250);
+    let sampled_step = (total_lines / FILE_WRITE_PROGRESS_MAX_EVENTS).clamp(1, 250);
     for (idx, segment) in segments.iter().enumerate() {
         file.write_all(segment.as_bytes()).await?;
         let line_no = idx + 1;
@@ -6267,6 +6267,12 @@ fn app_bundle_textual_data_signature(
     let mut parts = Vec::new();
     static HTML_STYLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static HTML_SCRIPT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let style_re = HTML_STYLE_RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)<style\b[^>]*>.*?</style>").expect("valid style block regex")
+    });
+    let script_re = HTML_SCRIPT_RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)<script\b[^>]*>.*?</script>").expect("valid script block regex")
+    });
     for (path, value) in effective_files {
         let Some(text) = value.as_str() else {
             continue;
@@ -6283,14 +6289,6 @@ fn app_bundle_textual_data_signature(
             continue;
         }
         let body = if path_lower.ends_with(".html") || path_lower.ends_with(".htm") {
-            let style_re = HTML_STYLE_RE.get_or_init(|| {
-                regex::Regex::new(r"(?is)<style\b[^>]*>.*?</style>")
-                    .expect("valid style block regex")
-            });
-            let script_re = HTML_SCRIPT_RE.get_or_init(|| {
-                regex::Regex::new(r"(?is)<script\b[^>]*>.*?</script>")
-                    .expect("valid script block regex")
-            });
             let without_style = style_re.replace_all(text, " ");
             let without_script = script_re.replace_all(&without_style, " ");
             let html = Html::parse_document(&without_script);
@@ -10622,10 +10620,9 @@ mod tests {
             "npm run start".to_string(),
         );
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--network" && pair[1] == "container:executor-container-id")
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--network" && pair[1] == "container:executor-container-id"));
         assert!(
             !args.iter().any(|arg| arg == "-p"),
             "shared-network app containers should not publish host-loopback ports"
@@ -10646,10 +10643,9 @@ mod tests {
             "npm run start".to_string(),
         );
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh")
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh"));
         let image_index = args
             .iter()
             .position(|arg| arg == DEFAULT_FALLBACK_APP_RUNTIME_IMAGE)
@@ -10665,11 +10661,9 @@ mod tests {
             None,
             "npm install".to_string(),
         );
-        assert!(
-            install_args
-                .windows(2)
-                .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh")
-        );
+        assert!(install_args
+            .windows(2)
+            .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh"));
         let image_index = install_args
             .iter()
             .position(|arg| arg == DEFAULT_FALLBACK_APP_RUNTIME_IMAGE)

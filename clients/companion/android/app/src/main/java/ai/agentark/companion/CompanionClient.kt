@@ -72,8 +72,36 @@ class CompanionClient(
                 .put("type", "pulse")
                 .put("state", "online")
                 .put("capabilities", JSONArray(capabilities.toList().sorted()))
+                .put("commands", commandDescriptors())
                 .put("metadata", JSONObject().put("version", "0.1.0"))
         )
+    }
+
+    private fun commandDescriptors(): JSONArray {
+        val descriptors = JSONArray()
+        if (capabilities.contains("approval_prompt")) {
+            descriptors.put(
+                JSONObject()
+                    .put("id", "approval.prompt")
+                    .put("label", "Approval prompt")
+                    .put("capability", "approval_prompt")
+                    .put("action", "approval.prompt")
+                    .put("description", "Ask this Android companion for an approval decision.")
+                    .put("risk", "low")
+            )
+        }
+        if (capabilities.contains("notifications")) {
+            descriptors.put(
+                JSONObject()
+                    .put("id", "notifications.show")
+                    .put("label", "Show notification")
+                    .put("capability", "notifications")
+                    .put("action", "notifications.show")
+                    .put("description", "Show a local notification on this Android companion.")
+                    .put("risk", "low")
+            )
+        }
+        return descriptors
     }
 
     private fun send(payload: JSONObject) {

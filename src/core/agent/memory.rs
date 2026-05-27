@@ -1,6 +1,6 @@
 use super::*;
 use crate::storage::entities::user_preference::{
-    MemorySensitivity, classify_saved_memory_sensitivity, normalize_memory_sensitivity,
+    classify_saved_memory_sensitivity, normalize_memory_sensitivity, MemorySensitivity,
 };
 use anyhow::Context;
 
@@ -383,13 +383,11 @@ mod saved_memory_sensitivity_tests {
 
     #[test]
     fn learned_memory_sanitizer_rejects_secret_only_values() {
-        assert!(
-            sanitize_learned_user_memory_content_for_storage(
-                "friend_best_friend_cs_teammate_9_years",
-                "2skdjfkj2wlfrj23kr2rlm"
-            )
-            .is_none()
-        );
+        assert!(sanitize_learned_user_memory_content_for_storage(
+            "friend_best_friend_cs_teammate_9_years",
+            "2skdjfkj2wlfrj23kr2rlm"
+        )
+        .is_none());
     }
 
     #[test]
@@ -2052,7 +2050,7 @@ pub(super) fn parse_user_memory_capture_empty_verdict(
         .get("confidence")
         .or_else(|| payload.get("score"))
         .and_then(|value| value.as_f64())
-        .unwrap_or_else(|| {
+        .unwrap_or({
             if has_durable_memory {
                 USER_FACT_MEMORY_CAPTURE_EMPTY_VERDICT_MIN_CONFIDENCE as f64
             } else {
@@ -4022,8 +4020,6 @@ impl UserMemoryCaptureWorker {
             "applied".to_string()
         } else if rejected_sensitive_count > 0 {
             "rejected_sensitive".to_string()
-        } else if semantic_rejected_count > 0 {
-            "noop".to_string()
         } else {
             "noop".to_string()
         };
@@ -4722,16 +4718,16 @@ impl UserMemoryCaptureWorker {
                 .and_then(normalize_user_fact_key)
                 .as_deref()
                 != Some(key.as_str());
-            if content_changed || previous_key_changed {
-                if append_learned_user_memory_merged_phrasing(
+            if (content_changed || previous_key_changed)
+                && append_learned_user_memory_merged_phrasing(
                     &mut metadata,
                     previous_key.as_deref(),
                     previous_value.as_deref(),
                     Some(source),
                     &now,
-                ) {
-                    metadata.insert("secret_redacted".to_string(), serde_json::Value::Bool(true));
-                }
+                )
+            {
+                metadata.insert("secret_redacted".to_string(), serde_json::Value::Bool(true));
             }
         }
         let build_memory_item =
@@ -5245,7 +5241,6 @@ impl UserMemoryCaptureWorker {
                 .to_string(),
             ),
             message_preview: Some(safe_truncate(prompt, 200)),
-            ..Default::default()
         };
         let memories: [PromptMemory; 0] = [];
         let actions: [crate::actions::ActionDef; 0] = [];
@@ -6107,6 +6102,12 @@ impl UserMemoryCaptureWorker {
             trace.total_tokens = trace
                 .total_tokens
                 .saturating_add(usage.total_tokens.min(i64::MAX as u64) as i64);
+            trace.cached_prompt_tokens = trace
+                .cached_prompt_tokens
+                .saturating_add(usage.cached_prompt_tokens.min(i64::MAX as u64) as i64);
+            trace.cache_creation_prompt_tokens = trace
+                .cache_creation_prompt_tokens
+                .saturating_add(usage.cache_creation_prompt_tokens.min(i64::MAX as u64) as i64);
             if let Some(cost) = usage.cost_usd {
                 trace.cost_usd += cost;
             }

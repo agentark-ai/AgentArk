@@ -291,7 +291,7 @@ impl Agent {
             return "Secret".to_string();
         }
         let parts = trimmed
-            .split(|ch: char| matches!(ch, '_' | '-' | '.' | ':'))
+            .split(['_', '-', '.', ':'])
             .filter(|part| !part.trim().is_empty())
             .collect::<Vec<_>>();
         if parts.is_empty() {
@@ -1493,15 +1493,12 @@ impl Agent {
         }
         match pending.kind {
             PendingSecretFollowupKind::EnableSkill { action_name } => {
-                let Some((_, content)) = self
+                let (_, content) = self
                     .runtime
                     .get_action_content(&action_name)
                     .await
                     .ok()
-                    .flatten()
-                else {
-                    return None;
-                };
+                    .flatten()?;
                 let fields = self
                     .missing_skill_required_envs(&action_name, &content)
                     .await

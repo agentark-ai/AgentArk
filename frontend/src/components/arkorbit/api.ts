@@ -3,6 +3,7 @@ import type {
   Orbit,
   OrbitChatHistoryMessage,
   OrbitChatMessageStatus,
+  OrbitChatTranscriptPage,
   OrbitChatTranscript,
   OrbitFileEntry,
   OrbitId,
@@ -181,6 +182,34 @@ function extractTranscripts(payload: unknown): OrbitChatTranscript[] {
     .filter((transcript): transcript is OrbitChatTranscript => transcript !== null);
 }
 
+function extractTranscriptPage(
+  payload: unknown,
+  fallbackLimit: number,
+  fallbackOffset: number,
+): OrbitChatTranscriptPage {
+  const transcripts = extractTranscripts(payload);
+  if (!payload || typeof payload !== "object") {
+    return {
+      transcripts,
+      total: transcripts.length,
+      limit: fallbackLimit,
+      offset: fallbackOffset,
+      has_more: false,
+    };
+  }
+  const raw = payload as Record<string, unknown>;
+  const total = asNumber(raw.total) ?? transcripts.length;
+  const limit = asNumber(raw.limit) ?? fallbackLimit;
+  const offset = asNumber(raw.offset) ?? fallbackOffset;
+  return {
+    transcripts,
+    total,
+    limit,
+    offset,
+    has_more: typeof raw.has_more === "boolean" ? raw.has_more : undefined,
+  };
+}
+
 function encodePath(path: string): string {
   return path
     .split("/")
@@ -233,11 +262,20 @@ export const arkorbitApi = {
     );
     return extractOrbitFiles(raw);
   },
-  async listTranscripts(orbitId: OrbitId): Promise<OrbitChatTranscript[]> {
+  async listTranscripts(
+    orbitId: OrbitId,
+    options: { limit?: number; offset?: number } = {},
+  ): Promise<OrbitChatTranscriptPage> {
+    const params = new URLSearchParams();
+    if (typeof options.limit === "number") params.set("limit", String(options.limit));
+    if (typeof options.offset === "number") params.set("offset", String(options.offset));
+    const query = params.toString();
     const raw = await api.rawGet(
-      `/api/arkorbit/orbits/${encodeURIComponent(orbitId)}/chat/transcripts`,
+      `/api/arkorbit/orbits/${encodeURIComponent(orbitId)}/chat/transcripts${
+        query ? `?${query}` : ""
+      }`,
     );
-    return extractTranscripts(raw);
+    return extractTranscriptPage(raw, options.limit ?? 25, options.offset ?? 0);
   },
   async getTranscriptMessages(
     orbitId: OrbitId,

@@ -7,14 +7,14 @@
 //! existing `approval_log` entry.
 
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{AppState, error_response, spawn_security_log};
+use super::{error_response, spawn_security_log, AppState};
 use crate::core::config::{AbuseTrackerConfig, SecurityConfig};
 use crate::security::tool_args_guard::ToolArgsGuardConfig;
 
@@ -67,7 +67,7 @@ pub(super) async fn update_security_settings(
     if let Err(error) = agent.config.save(&agent.config_dir, Some(&agent.data_dir)) {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to save security settings: {}", error),
+            format!("Failed to save security settings: {}", error),
         );
     }
 
@@ -95,7 +95,7 @@ pub(super) async fn list_abuse_reviews(State(state): State<AppState>) -> Respons
         }
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to list abuse reviews: {}", error),
+            format!("Failed to list abuse reviews: {}", error),
         ),
     }
 }

@@ -4,8 +4,8 @@
 //! tokens, typed commands, and audit events in the existing KV store. Device
 //! tokens are never equivalent to UI/API sessions.
 
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ const PAIRING_TTL_SECS: i64 = 10 * 60;
 const MAX_AUDIT_EVENTS: usize = 5_000;
 const MAX_PAIRING_FAILED_CLAIMS: u32 = 12;
 const PAIRING_CLAIM_LOCKOUT_SECS: i64 = 60;
+const MAX_DECLARED_COMMANDS: usize = 64;
 
 fn device_key(id: &str) -> String {
     format!("{}{}", DEVICE_PREFIX, id.trim())
@@ -263,14 +264,10 @@ fn companion_audit_hash(event: &CompanionAuditEvent) -> Result<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CompanionTransportKind {
+    #[default]
     WebSocket,
-}
-
-impl Default for CompanionTransportKind {
-    fn default() -> Self {
-        Self::WebSocket
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -301,8 +298,10 @@ pub struct CompanionAttestationClaim {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CompanionDeviceState {
     Pairing,
+    #[default]
     Paired,
     Online,
     Idle,
@@ -312,15 +311,11 @@ pub enum CompanionDeviceState {
     Error,
 }
 
-impl Default for CompanionDeviceState {
-    fn default() -> Self {
-        Self::Paired
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CompanionPairingStatus {
+    #[default]
     Pending,
     Claimed,
     Approved,
@@ -329,56 +324,38 @@ pub enum CompanionPairingStatus {
     Denied,
 }
 
-impl Default for CompanionPairingStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CompanionRiskLevel {
+    #[default]
     Low,
     High,
 }
 
-impl Default for CompanionRiskLevel {
-    fn default() -> Self {
-        Self::Low
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CompanionApprovalStatus {
+    #[default]
     NotRequired,
     Required,
     Approved,
     Denied,
 }
 
-impl Default for CompanionApprovalStatus {
-    fn default() -> Self {
-        Self::NotRequired
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CompanionCommandStatus {
     ApprovalRequired,
+    #[default]
     Queued,
     Running,
     Succeeded,
     Failed,
     Denied,
     Cancelled,
-}
-
-impl Default for CompanionCommandStatus {
-    fn default() -> Self {
-        Self::Queued
-    }
 }
 
 fn default_result_trust() -> String {
@@ -393,6 +370,17 @@ pub struct CompanionCapabilityDescriptor {
     pub risk: CompanionRiskLevel,
     #[serde(default)]
     pub resource_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompanionCommandDescriptor {
+    pub id: String,
+    pub label: String,
+    pub capability: String,
+    pub action: String,
+    #[serde(default)]
+    pub description: String,
+    pub risk: CompanionRiskLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +416,8 @@ pub struct CompanionDevice {
     pub granted_capabilities: Vec<String>,
     #[serde(default)]
     pub token_capabilities: Vec<String>,
+    #[serde(default)]
+    pub declared_commands: Vec<CompanionCommandDescriptor>,
     pub paired_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<String>,
@@ -630,6 +620,7 @@ pub struct CompanionProtocolDocument {
     pub auth: String,
     pub pairing: String,
     pub messages: Vec<String>,
+    pub commands: Vec<CompanionCommandDescriptor>,
     pub security: Vec<String>,
 }
 
@@ -1151,6 +1142,7 @@ impl CompanionControlPlane {
         let grant_id = format!("grant-{}", uuid::Uuid::new_v4());
         let now = now_rfc3339();
         let capabilities = normalize_capabilities(&session.requested_capabilities);
+        let declared_commands = command_descriptors_for_capabilities(&capabilities);
         let grant = CompanionGrant {
             id: grant_id.clone(),
             device_id: device_id.clone(),
@@ -1171,6 +1163,7 @@ impl CompanionControlPlane {
             available_capabilities: capabilities.clone(),
             granted_capabilities: capabilities.clone(),
             token_capabilities: capabilities,
+            declared_commands,
             paired_at: now.clone(),
             last_seen_at: None,
             owner: Some("local_user".to_string()),
@@ -1247,6 +1240,7 @@ impl CompanionControlPlane {
         device_id: &str,
         state: Option<CompanionDeviceState>,
         available_capabilities: Vec<String>,
+        declared_commands: Vec<CompanionCommandDescriptor>,
         metadata: BTreeMap<String, String>,
     ) -> Result<CompanionDevice> {
         let mut device = self
@@ -1263,6 +1257,13 @@ impl CompanionControlPlane {
             let available = normalize_capabilities(&available_capabilities);
             validate_capability_set(&available)?;
             device.available_capabilities = available;
+        }
+        if !declared_commands.is_empty() {
+            device.declared_commands =
+                normalize_declared_commands(declared_commands, &device.token_capabilities)?;
+        } else if device.declared_commands.is_empty() {
+            device.declared_commands =
+                command_descriptors_for_capabilities(&device.available_capabilities);
         }
         for (key, value) in metadata {
             let key = key.trim();
@@ -1745,11 +1746,7 @@ impl CompanionControlPlane {
     pub async fn list_audit_events(&self, limit: usize) -> Result<Vec<CompanionAuditEvent>> {
         let ids = self.read_index(AUDIT_INDEX_KEY).await?;
         let mut out = Vec::new();
-        for id in ids
-            .into_iter()
-            .rev()
-            .take(limit.max(1).min(MAX_AUDIT_EVENTS))
-        {
+        for id in ids.into_iter().rev().take(limit.clamp(1, MAX_AUDIT_EVENTS)) {
             if let Some(event) = self.read_json(&audit_key(&id)).await? {
                 out.push(event);
             }
@@ -1819,12 +1816,138 @@ fn validate_capability_set(values: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn trim_bounded(value: &str, max_chars: usize) -> String {
+    value.trim().chars().take(max_chars).collect()
+}
+
+fn normalize_declared_commands(
+    values: Vec<CompanionCommandDescriptor>,
+    allowed_capabilities: &[String],
+) -> Result<Vec<CompanionCommandDescriptor>> {
+    let allowed = allowed_capabilities
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values.into_iter().take(MAX_DECLARED_COMMANDS) {
+        let id = normalize_id(&value.id);
+        let capability = normalize_id(&value.capability);
+        let action = normalize_id(&value.action);
+        anyhow::ensure!(!id.is_empty(), "declared command id is required");
+        anyhow::ensure!(!action.is_empty(), "declared command action is required");
+        validate_capability_set(std::slice::from_ref(&capability))?;
+        anyhow::ensure!(
+            allowed.contains(capability.as_str()),
+            "declared command '{}' uses capability outside this device token",
+            id
+        );
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let label = trim_bounded(&value.label, 80);
+        out.push(CompanionCommandDescriptor {
+            id,
+            label: if label.is_empty() {
+                action
+                    .split(|ch| matches!(ch, '.' | '_' | ':' | '-'))
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        let mut chars = part.chars();
+                        match chars.next() {
+                            Some(first) => {
+                                format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+                            }
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                label
+            },
+            capability: capability.clone(),
+            action,
+            description: trim_bounded(&value.description, 240),
+            risk: capability_risk(&capability),
+        });
+    }
+    Ok(out)
+}
+
 fn capability_risk(id: &str) -> CompanionRiskLevel {
     capability_catalog()
         .into_iter()
         .find(|cap| cap.id == id)
         .map(|cap| cap.risk)
         .unwrap_or(CompanionRiskLevel::High)
+}
+
+fn command_descriptor(
+    id: &str,
+    label: &str,
+    capability: &str,
+    action: &str,
+    description: &str,
+) -> CompanionCommandDescriptor {
+    CompanionCommandDescriptor {
+        id: id.to_string(),
+        label: label.to_string(),
+        capability: capability.to_string(),
+        action: action.to_string(),
+        description: description.to_string(),
+        risk: capability_risk(capability),
+    }
+}
+
+pub fn command_descriptors_for_capabilities(
+    capabilities: &[String],
+) -> Vec<CompanionCommandDescriptor> {
+    let allowed = capabilities
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<BTreeSet<_>>();
+    let candidates = [
+        command_descriptor(
+            "approval.prompt",
+            "Approval prompt",
+            "approval_prompt",
+            "approval.prompt",
+            "Ask the companion user to approve or deny an AgentArk decision.",
+        ),
+        command_descriptor(
+            "notifications.show",
+            "Show notification",
+            "notifications",
+            "notifications.show",
+            "Show a local AgentArk notification on the companion device.",
+        ),
+        command_descriptor(
+            "files.read",
+            "Read file",
+            "file_read",
+            "files.read",
+            "Read a scoped file path from the companion device.",
+        ),
+        command_descriptor(
+            "files.write",
+            "Write file",
+            "file_write",
+            "files.write",
+            "Write a scoped file path on the companion device.",
+        ),
+        command_descriptor(
+            "system.run",
+            "Run local command",
+            "system_run",
+            "system.run",
+            "Run an explicitly approved local command on the companion device.",
+        ),
+    ];
+    candidates
+        .into_iter()
+        .filter(|command| allowed.contains(command.capability.as_str()))
+        .collect()
 }
 
 pub fn capability_catalog() -> Vec<CompanionCapabilityDescriptor> {
@@ -1874,14 +1997,14 @@ pub fn capability_catalog() -> Vec<CompanionCapabilityDescriptor> {
         cap(
             "sms",
             "SMS",
-            "Send SMS through the paired phone after explicit approval.",
+            "Send or read SMS only through an SMS-capable Android build, Twilio, or a carrier bridge after explicit approval.",
             CompanionRiskLevel::High,
             &["recipient"],
         ),
         cap(
             "whatsapp_handoff",
             "WhatsApp handoff",
-            "Prepare or send WhatsApp messages through the paired device.",
+            "Prepare or send WhatsApp messages through a configured WhatsApp channel or bridge.",
             CompanionRiskLevel::High,
             &["recipient"],
         ),
@@ -1982,41 +2105,25 @@ pub fn companion_presets() -> Vec<CompanionPreset> {
         preset(
             "ios",
             "iPhone / iPad",
-            "Pair an iOS device for approvals, notifications, camera/photos, location, and Shortcuts actions.",
+            "Pair an iPhone or iPad for AgentArk notifications and approval prompts. This companion cannot read SMS, iMessage, photos, location, or Shortcuts.",
             "ios",
-            &[
-                "approval_prompt",
-                "notifications",
-                "camera",
-                "photos",
-                "location",
-                "shortcuts_run",
-            ],
+            &["approval_prompt", "notifications"],
         ),
         preset(
             "android",
             "Android phone",
-            "Pair Android for approvals, notifications, SMS/WhatsApp handoff, camera/photos, and location.",
+            "Pair the bundled Android app for AgentArk notifications and approval prompts. SMS needs a separate SMS-capable Android build or messaging bridge.",
             "android",
-            &[
-                "approval_prompt",
-                "notifications",
-                "sms",
-                "whatsapp_handoff",
-                "camera",
-                "photos",
-                "location",
-            ],
+            &["approval_prompt", "notifications"],
         ),
         preset(
             "desktop",
             "macOS / Windows / Linux",
-            "Pair a desktop agent for screenshots, browser control, scoped files, local commands, and notifications.",
+            "Pair a desktop agent for notifications, approval prompts, scoped files, and opt-in local commands.",
             "desktop",
             &[
+                "approval_prompt",
                 "notifications",
-                "screen_capture",
-                "browser_control",
                 "file_read",
                 "file_write",
                 "system_run",
@@ -2025,12 +2132,12 @@ pub fn companion_presets() -> Vec<CompanionPreset> {
         preset(
             "home_server",
             "Home server / mini PC",
-            "Run scripts, local automations, and private LAN integrations near local resources.",
+            "Run a headless companion for notifications, approval prompts, scoped files, and opt-in local commands near local resources.",
             "headless",
             &[
+                "approval_prompt",
                 "notifications",
                 "system_run",
-                "lan_access",
                 "file_read",
                 "file_write",
             ],
@@ -2038,9 +2145,9 @@ pub fn companion_presets() -> Vec<CompanionPreset> {
         preset(
             "raspberry_pi",
             "Raspberry Pi / IoT",
-            "Read sensors, control local devices, and expose LAN-only services through a small companion.",
+            "Run a small companion for notifications, approval prompts, and opt-in local commands. Add custom capabilities only when a local adapter exists.",
             "iot",
-            &["sensor_read", "smart_home", "lan_access", "system_run"],
+            &["approval_prompt", "notifications", "system_run"],
         ),
         preset(
             "custom",
@@ -2098,17 +2205,24 @@ pub fn protocol_document() -> CompanionProtocolDocument {
             "command_result_ok".to_string(),
             "error".to_string(),
         ],
+        commands: command_descriptors_for_capabilities(&[
+            "approval_prompt".to_string(),
+            "notifications".to_string(),
+            "file_read".to_string(),
+            "file_write".to_string(),
+            "system_run".to_string(),
+        ]),
         security: vec![
             "Requested scopes must be a subset of the paired device grant.".to_string(),
             "Requested scopes must be a subset of the caller's current grant.".to_string(),
             "Production companion connections require TLS; local plaintext is only for development.".to_string(),
             "Pairing approval is bound to the claimed device identity before token issue.".to_string(),
-            "Bundled iOS/Android high-risk grants require verified platform attestation.".to_string(),
+            "Bundled iOS/Android companions currently implement only notifications and approval prompts.".to_string(),
             "Custom or desktop high-risk grants require an audited trusted_unattested override when attestation is unavailable.".to_string(),
             "Command results are stored as device-reported and not independently proven by the server.".to_string(),
             "High-risk actions require fresh UI approval before dispatch.".to_string(),
             "Capability reports cannot expand grants automatically.".to_string(),
-            "Commands are typed JSON actions, not raw free-text instructions.".to_string(),
+            "Command reports declare concrete actions such as notifications.show; commands are typed JSON actions, not raw free-text instructions.".to_string(),
             "Notification and approval_prompt commands may include optional string arguments: title and body.".to_string(),
         ],
     }
@@ -2135,5 +2249,70 @@ mod tests {
         ]);
         assert_eq!(capabilities, vec!["custom.greenhouse_sensor".to_string()]);
         assert!(validate_capability_set(&capabilities).is_ok());
+    }
+
+    #[test]
+    fn bundled_mobile_presets_only_advertise_shipped_adapters() {
+        let presets = companion_presets()
+            .into_iter()
+            .map(|preset| (preset.id.clone(), preset))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            presets["ios"].capability_ids,
+            vec!["approval_prompt".to_string(), "notifications".to_string()]
+        );
+        assert_eq!(
+            presets["android"].capability_ids,
+            vec!["approval_prompt".to_string(), "notifications".to_string()]
+        );
+    }
+
+    #[test]
+    fn desktop_preset_only_advertises_shipped_adapters() {
+        let desktop = companion_presets()
+            .into_iter()
+            .find(|preset| preset.id == "desktop")
+            .expect("desktop preset exists");
+
+        assert_eq!(
+            desktop.capability_ids,
+            vec![
+                "approval_prompt".to_string(),
+                "notifications".to_string(),
+                "file_read".to_string(),
+                "file_write".to_string(),
+                "system_run".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_commands_must_fit_device_token_capabilities() {
+        let commands = vec![CompanionCommandDescriptor {
+            id: "messages.last_sms".to_string(),
+            label: "Last SMS".to_string(),
+            capability: "sms".to_string(),
+            action: "messages.last_sms".to_string(),
+            description: String::new(),
+            risk: CompanionRiskLevel::High,
+        }];
+        let allowed = vec!["approval_prompt".to_string(), "notifications".to_string()];
+
+        assert!(normalize_declared_commands(commands, &allowed).is_err());
+    }
+
+    #[test]
+    fn shipped_mobile_command_descriptors_are_notification_and_approval_only() {
+        let commands = command_descriptors_for_capabilities(&[
+            "approval_prompt".to_string(),
+            "notifications".to_string(),
+        ]);
+        let ids = commands
+            .into_iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["approval.prompt", "notifications.show"]);
     }
 }

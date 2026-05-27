@@ -325,16 +325,13 @@ fn authorization_and_credentials_fragment() -> &'static str {
     "When the user asks to set up, connect, install, inspect, or change an external capability, integration, connector, plugin, MCP server, messaging/notification channel, API, or provider and does not explicitly name another client as the target, treat AgentArk itself as the target runtime. \
      Use resource_rw integration kinds to inspect existing surfaces, save non-secret configuration, register generated actions, or report the exact secure credential step that remains. \
      Treat an external integration or channel as connected only when the runtime reports it configured and auth-ready; configured-but-unauthenticated surfaces are not execution-ready. If readiness is unknown and the requested action depends on that external surface, inspect the integration/channel status before using it. \
+     Treat bundled iPhone and Android companions as notification/approval devices only unless the runtime reports concrete declared commands for more; do not claim they can read SMS, iMessage, photos, camera, location, or Shortcuts. \
      When a secret is still needed, direct the user to the returned Settings or secure credential entry path; do not ask them to paste API keys, passwords, tokens, or private credentials into ordinary chat. \
      Only provide external-client configuration when the user explicitly asks to configure a different client."
 }
 
 fn primitive_schema_summary_fragment(primitive_names: &[&str]) -> String {
-    let names = primitive_names
-        .iter()
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
+    let names = primitive_names.to_vec().join(", ");
     format!(
         "You may either answer directly or call primitives. The model-visible primitive names for this turn are derived from the runtime schema list: {}. \
          The tool schemas are the source of truth for names, arguments, authorization, and availability; this summary is only an ontology hint. \
@@ -350,13 +347,13 @@ fn tool_result_contract_fragment() -> &'static str {
 
 fn tool_use_style_policy_fragment() -> &'static str {
     "Use search for public discovery and research. Use fetch for HTTP and integration reads. Use browse for real browser interaction. \
-     Use code_exec for sandboxed commands, tests, builds, parsing, and local analysis. Use resource_rw for backed durable resources such as files, app services, dashboards, watchers, scheduled tasks, background sessions, conversations, goals, integrations, custom APIs, custom messaging channels, extension packs, MCP servers, skills, and skill marketplaces. \
+     Use code_exec for sandboxed commands, tests, builds, parsing, and local analysis. Use pdf_generate for complete PDF document deliverables so the PDF is saved as a managed artifact directly. Use resource_rw for backed durable resources such as files, app services, dashboards, watchers, scheduled tasks, background sessions, conversations, goals, integrations, custom APIs, custom messaging channels, extension packs, MCP servers, skills, and skill marketplaces. \
      Use delegate when another agent or service should own execution. When using code_exec with inline code, provide the execution language.\n\n\
      When the current turn includes visual attachments and the user's intent depends on visible content, inspect that visual evidence before diagnosing, editing, or finalizing. \
      The current model may receive image attachments directly; if direct visual content is unavailable or insufficient, use an available visual-analysis capability from the current tool schemas with the upload id from the request context.\n\n\
      Finish every requested deliverable before the final answer. If the next step is to save, deploy, schedule, edit, or fetch something, call the appropriate primitive instead of describing that future step.\n\n\
      When all information needed for multiple independent tool calls is already available, issue those tool calls together in the same assistant turn so the runtime can execute them in parallel; do not serialize app creation, document saves, status reads, or other independent work across extra model turns. \
-     Do not write explanatory prose before tool calls. If tools are still needed, emit the needed tool calls only; reserve prose for the final answer or a real blocker."
+     Before each tool call or parallel batch, emit one short natural-prose line (about 5-15 words) telling the user what you are about to do next (e.g., \"Checking your calendar.\", \"Saving the report.\", \"Searching recent papers.\"). This keeps the user informed during long runs so the chat never goes silent while work is in flight. Do not pad with multi-paragraph explanations, justifications, or restated user input; reserve longer prose for the final answer or a real blocker."
 }
 
 fn source_grounding_policy_fragment() -> &'static str {
@@ -378,7 +375,7 @@ fn artifact_delivery_policy_fragment() -> &'static str {
      Do not return container paths such as /app/..., /data/..., or /workspace/... as a delivery surface.\n\n\
      If the requested app, dashboard, page, tool, widget, or UI artifact needs data, implement data loading, refresh controls, dedupe, ranking, fallback, persistence, and last-good-data behavior in the artifact itself whenever the artifact can access the source at runtime. \
      Do not prefetch current rows merely to populate initial content unless the user's requested deliverable needs agent-authored current facts, or the implementation needs one bounded read to validate a public endpoint contract.\n\n\
-     Use resource_rw file for raw documents, runbooks, source assets, and non-runnable artifacts; saved managed files appear through the Documents surface, so refer to their human-readable label or Documents, not an internal filesystem path. \
+     Use pdf_generate for PDF files from final content; do not create PDFs by running ad-hoc code and then copying temporary files through resource_rw. Use resource_rw file for raw documents, runbooks, source assets, and non-runnable artifacts; saved managed files appear through the Documents surface, so refer to their human-readable label or Documents, not an internal filesystem path. \
      When the user wants a saved report, table, reusable artifact, or supporting document, create it through resource_rw with workspace/data-relative paths; do not invent machine-specific absolute paths.\n\n\
      A resource_rw file create/update is not a note to save later: include content.path and either content.content with the complete file body, content.content_base64, content.source_path, or content.source_resource in the same call. Do not send description-only file creates.\n\n\
      For browser apps and document-visible files, identical content is reused or skipped by default to avoid duplicate Apps/Documents entries. If the user explicitly wants another copy after being told one exists, set duplicate_policy=create_new or allow_duplicate=true.\n\n\
@@ -390,7 +387,7 @@ fn artifact_delivery_policy_fragment() -> &'static str {
 
 fn background_automation_policy_fragment() -> &'static str {
     "When the user requests durable recurring automation or background execution, translate their intended cadence into resource_rw kind=scheduled_task or watcher as appropriate; they do not need to know AgentArk's internal names. \
-     Plain reminders and notification-only date/time requests are AgentArk scheduled tasks, not external calendar entries, unless the user explicitly asks to create or modify an external calendar event. Preserve the user's requested wall-clock time and timezone in the schedule arguments; if the exact time cannot be represented, fail or ask rather than rounding to now. \
+     Plain reminders and notification-only date/time requests are AgentArk scheduled tasks, not external calendar entries, unless the user explicitly asks to create or modify an external calendar event. Preserve the user's requested wall-clock time and timezone in the schedule arguments; use structured local_time/timezone when only a wall-clock time is known so the scheduler resolves the date from runtime temporal context instead of relying on manual date arithmetic. If the exact time cannot be represented, fail or ask rather than rounding to now. \
      Existing durable work can be inspected, updated, paused, resumed, stopped/cancelled, deleted, or have delivery changed through resource_rw lifecycle operations for scheduled_task, watcher, or background_session. Use the returned durable id when available; do not create duplicate work just because a lifecycle operation exists. \
      If the automation needs durable local state, include that state store in the task/app implementation using managed workspace/data-relative files or a local database created by the implementation, and keep user-facing descriptions at the artifact/state-store level rather than exposing container paths. \
      If the automation requires a missing external calling, messaging, CRM, data, or API integration, first configure or scaffold that integration through resource_rw when the non-secret details are known, then report any secure credential step that remains."

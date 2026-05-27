@@ -48,21 +48,19 @@ pub(super) fn is_push_notification_channel(channel: &str) -> bool {
 
 pub(super) fn is_external_notification_channel(channel: &str) -> bool {
     let trimmed = channel.trim().to_ascii_lowercase();
-    // Namespaced pack channel ids (see
-    // `crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX`) are
-    // structurally valid external channels even though they aren't in the
-    // bundled compile-time list. The registry is the authoritative source of
-    // truth for whether the id is actually installed and configured; this
-    // function answers the narrower question "is this a well-shaped external
-    // channel id?" without reaching into async registry state.
-    if trimmed.starts_with(crate::channels::messaging_registry::EXTENSION_CHANNEL_ID_PREFIX)
-        || trimmed.starts_with(crate::custom_messaging_channels::CUSTOM_CHANNEL_ID_PREFIX)
+    if trimmed.is_empty()
+        || notification_channel_uses_preferred_fallback(&trimmed)
+        || matches!(
+            trimmed.as_str(),
+            "web" | "app" | "app_notification" | "app_notifications" | "in_app"
+        )
     {
-        return true;
+        return false;
     }
-    crate::channels::messaging_registry::BUNDLED_CHANNEL_IDS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(&trimmed))
+    trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+        && trimmed.bytes().any(|byte| byte.is_ascii_alphanumeric())
 }
 
 pub(super) fn notification_channel_uses_preferred_fallback(channel: &str) -> bool {
@@ -586,7 +584,7 @@ impl Agent {
         let bundled_check = AgentBundledCheck(self);
         let ctx = crate::channels::messaging_registry::ChannelQueryContext {
             bundled_configured: &bundled_check,
-            extension_packs: &*packs_guard,
+            extension_packs: &packs_guard,
             storage: &self.storage,
             config_dir: &self.config_dir,
             data_dir: &self.data_dir,
@@ -631,7 +629,7 @@ impl Agent {
         let bundled_check: fn(&str) -> bool = |_| false;
         let ctx = crate::channels::messaging_registry::ChannelQueryContext {
             bundled_configured: &bundled_check,
-            extension_packs: &*packs_guard,
+            extension_packs: &packs_guard,
             storage: &self.storage,
             config_dir: &self.config_dir,
             data_dir: &self.data_dir,
@@ -643,6 +641,11 @@ impl Agent {
             .ok()
             .flatten()
             .is_some_and(|descriptor| descriptor.configured)
+            || self.integrations.get(&channel).is_some_and(|integration| {
+                integration
+                    .capabilities()
+                    .contains(&crate::integrations::Capability::Notify)
+            }) && self.integrations.is_ready(&channel).await
     }
 
     pub fn notification_store(&self) -> NotificationStore {
@@ -1234,19 +1237,17 @@ impl Agent {
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_lowercase());
 
-        let full_message = if let Some(title) = title {
-            format!("{}\n\n{}", title, message)
-        } else {
-            message.to_string()
-        };
+        let full_message = direct_notification_full_message(title, message);
 
         let Some(delivery_channel) = delivery_channel else {
             return Ok(full_message);
         };
 
-        let in_app_title = title.unwrap_or("AgentArk Notification");
+        let in_app_source = direct_notification_in_app_source(arguments);
+        let in_app_title =
+            direct_notification_in_app_title(arguments, title, in_app_source.as_str());
         let in_app = self
-            .emit_notification_with_status(in_app_title, message, "info", "agent")
+            .emit_notification_with_status(&in_app_title, message, "info", &in_app_source)
             .await;
 
         let mut attempts = Vec::new();
@@ -1385,7 +1386,7 @@ impl Agent {
         let bundled_check: fn(&str) -> bool = |_| false;
         let ctx = crate::channels::messaging_registry::ChannelQueryContext {
             bundled_configured: &bundled_check,
-            extension_packs: &*packs_guard,
+            extension_packs: &packs_guard,
             storage: &self.storage,
             config_dir: &self.config_dir,
             data_dir: &self.data_dir,
@@ -1497,23 +1498,40 @@ impl Agent {
                     sent_chunks += 1;
                 }
                 Err(error) if sent_chunks == 0 => {
-                    return NotificationDispatchOutcome::pre_send_failure(channel_name, error);
+                    let safe_error = crate::security::redact_secret_input(&error).text;
+                    tracing::warn!(
+                        channel = %channel_name,
+                        error = %safe_error,
+                        "Notification delivery failed before any external chunk was sent"
+                    );
+                    return NotificationDispatchOutcome::pre_send_failure(channel_name, safe_error);
                 }
                 Err(error) => {
-                    return NotificationDispatchOutcome::partial_failure(
-                        channel_name,
-                        format!(
-                            "Chunk {}/{} failed after {} chunk(s) were sent: {}",
-                            idx + 1,
-                            total_chunks,
-                            sent_chunks,
-                            error
-                        ),
+                    let safe_error = crate::security::redact_secret_input(&error).text;
+                    let detail = format!(
+                        "Chunk {}/{} failed after {} chunk(s) were sent: {}",
+                        idx + 1,
+                        total_chunks,
+                        sent_chunks,
+                        safe_error
                     );
+                    tracing::warn!(
+                        channel = %channel_name,
+                        sent_chunks = sent_chunks,
+                        total_chunks = total_chunks,
+                        error = %safe_error,
+                        "Notification delivery partially failed"
+                    );
+                    return NotificationDispatchOutcome::partial_failure(channel_name, detail);
                 }
             }
         }
 
+        tracing::info!(
+            channel = %channel_name,
+            chunks = total_chunks,
+            "Notification delivery succeeded"
+        );
         NotificationDispatchOutcome::full_success(channel_name)
     }
 
@@ -1591,6 +1609,83 @@ fn notification_chunks_for_channel(channel: &str, safe_message: &str) -> Vec<Str
     }
 }
 
+fn direct_notification_full_message(title: Option<&str>, message: &str) -> String {
+    let message = message.trim();
+    let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) else {
+        return message.to_string();
+    };
+    if notification_text_key(title) == notification_text_key(message) {
+        message.to_string()
+    } else {
+        format!("{}\n\n{}", title, message)
+    }
+}
+
+fn notification_text_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn direct_notification_in_app_source(arguments: &serde_json::Value) -> String {
+    [
+        "source",
+        "notification_source",
+        "notification_type",
+        "category",
+        "type",
+    ]
+    .iter()
+    .find_map(|key| {
+        arguments
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .and_then(normalize_notification_source)
+    })
+    .unwrap_or_else(|| "agent".to_string())
+}
+
+fn direct_notification_in_app_title(
+    arguments: &serde_json::Value,
+    title: Option<&str>,
+    source: &str,
+) -> String {
+    if let Some(in_app_title) = arguments
+        .get("in_app_title")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return in_app_title.to_string();
+    }
+    if let Some(title) = title {
+        return title.to_string();
+    }
+    if source == "reminder" {
+        "Reminder".to_string()
+    } else {
+        "AgentArk Notification".to_string()
+    }
+}
+
+fn normalize_notification_source(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.chars().count() > 64 {
+        return None;
+    }
+    if normalized
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+        && normalized.bytes().any(|byte| byte.is_ascii_alphanumeric())
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,5 +1713,60 @@ mod tests {
         assert!(push_chunks.len() > 1);
         assert!(push_chunks[0].starts_with("[1/"));
         assert_eq!(email_chunks, vec![long]);
+    }
+
+    #[test]
+    fn external_notification_channel_accepts_structural_route_ids() {
+        for channel in [
+            "slack",
+            "whatsapp",
+            "sms",
+            "pagerduty",
+            "custom.ops-alerts",
+            "ext.team-hub",
+            "vendor:incident-room",
+        ] {
+            assert!(is_external_notification_channel(channel), "{channel}");
+        }
+
+        for channel in ["", " ", "preferred", "push", "web", "in_app", "../secret"] {
+            assert!(!is_external_notification_channel(channel), "{channel}");
+        }
+    }
+
+    #[test]
+    fn direct_notification_full_message_does_not_duplicate_identical_title_and_body() {
+        assert_eq!(
+            direct_notification_full_message(Some("Meeting with Mark"), "Meeting with Mark"),
+            "Meeting with Mark"
+        );
+        assert_eq!(
+            direct_notification_full_message(Some("Reminder"), "Meeting with Mark"),
+            "Reminder\n\nMeeting with Mark"
+        );
+    }
+
+    #[test]
+    fn direct_notification_in_app_source_uses_structured_type() {
+        assert_eq!(
+            direct_notification_in_app_source(&serde_json::json!({
+                "message": "Meeting with Mark",
+                "source": "reminder"
+            })),
+            "reminder"
+        );
+        assert_eq!(
+            direct_notification_in_app_source(&serde_json::json!({
+                "message": "Build failed",
+                "notification_type": "automation_failure"
+            })),
+            "automation_failure"
+        );
+        assert_eq!(
+            direct_notification_in_app_source(&serde_json::json!({
+                "message": "Meeting with Mark"
+            })),
+            "agent"
+        );
     }
 }

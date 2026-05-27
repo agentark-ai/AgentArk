@@ -246,7 +246,7 @@ fn summarize_tool_completion_value(value: &serde_json::Value) -> Option<String> 
         "completed" | "complete" | "succeeded" | "success" | "ok" | "executed" => "Completed",
         "needs_input" | "approval_required" => "Needs input",
         "failed" | "error" => "Failed",
-        other if other.is_empty() => "Completed",
+        "" => "Completed",
         _ => "Status",
     };
 
@@ -589,11 +589,12 @@ fn canonical_machine_status(status: &str) -> Option<String> {
         if ch.is_ascii_alphanumeric() {
             output.push(ch.to_ascii_lowercase());
             last_separator = false;
-        } else if ch == '_' || ch == '-' || ch.is_ascii_whitespace() {
-            if !output.is_empty() && !last_separator {
-                output.push('_');
-                last_separator = true;
-            }
+        } else if (ch == '_' || ch == '-' || ch.is_ascii_whitespace())
+            && !output.is_empty()
+            && !last_separator
+        {
+            output.push('_');
+            last_separator = true;
         }
     }
     while output.ends_with('_') {

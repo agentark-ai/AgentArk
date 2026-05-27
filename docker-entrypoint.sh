@@ -477,11 +477,13 @@ start_playwright_display_stack() {
     export DISPLAY=${DISPLAY:-:99}
     local vnc_port=${PLAYWRIGHT_VNC_PORT:-5900}
     local novnc_port=${PLAYWRIGHT_LIVE_VIEW_INTERNAL_PORT:-6080}
+    local display_width=${PLAYWRIGHT_DISPLAY_WIDTH:-${PLAYWRIGHT_BROWSER_WIDTH:-1920}}
+    local display_height=${PLAYWRIGHT_DISPLAY_HEIGHT:-${PLAYWRIGHT_BROWSER_HEIGHT:-1080}}
 
     cleanup_x_display_state "$DISPLAY"
 
-    echo -e "${GREEN}Starting Playwright live display stack on ${DISPLAY}...${NC}"
-    Xvfb "$DISPLAY" -screen 0 1440x960x24 -ac +extension RANDR >/tmp/agentark-xvfb.log 2>&1 &
+    echo -e "${GREEN}Starting Playwright live display stack on ${DISPLAY} (${display_width}x${display_height})...${NC}"
+    Xvfb "$DISPLAY" -screen 0 "${display_width}x${display_height}x24" -ac +extension RANDR >/tmp/agentark-xvfb.log 2>&1 &
     XVFB_PID=$!
     track_child "$XVFB_PID"
     sleep 1
@@ -563,7 +565,9 @@ start_playwright_bridge() {
         PLAYWRIGHT_EXECUTABLE_PATH=${PLAYWRIGHT_EXECUTABLE_PATH:-} \
         PLAYWRIGHT_HEADLESS=${PLAYWRIGHT_HEADLESS:-false} \
         PLAYWRIGHT_LIVE_VIEW_PORT=${AGENTARK_BROWSER_HANDOFF_PUBLIC_PORT:-${PLAYWRIGHT_LIVE_VIEW_PORT:-6080}} \
-        PLAYWRIGHT_LIVE_VIEW_PATH=${PLAYWRIGHT_LIVE_VIEW_PATH:-/vnc.html?autoconnect=1&resize=remote&path=websockify} \
+        PLAYWRIGHT_LIVE_VIEW_PATH=${PLAYWRIGHT_LIVE_VIEW_PATH:-/vnc.html?autoconnect=1&resize=scale&path=websockify} \
+        PLAYWRIGHT_BROWSER_WIDTH=${PLAYWRIGHT_BROWSER_WIDTH:-1920} \
+        PLAYWRIGHT_BROWSER_HEIGHT=${PLAYWRIGHT_BROWSER_HEIGHT:-1080} \
         PORT=${PLAYWRIGHT_BRIDGE_PORT:-3100} \
         PLAYWRIGHT_BRIDGE_HOST=${PLAYWRIGHT_BRIDGE_HOST:-127.0.0.1} \
         gosu agent node /app/bridges/playwright-bridge/index.js &

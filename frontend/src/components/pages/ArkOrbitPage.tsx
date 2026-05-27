@@ -949,8 +949,8 @@ export function ArkOrbitPage() {
     const rect = canvasRef.current?.getBoundingClientRect();
     const width = rect?.width ?? 1200;
     const height = rect?.height ?? 800;
-    const panelWidth = Math.min(430, Math.max(280, width - 44));
-    const panelHeight = Math.min(680, Math.max(360, height - 36));
+    const panelWidth = Math.min(520, Math.max(280, width - 44));
+    const panelHeight = Math.min(720, Math.max(360, height - 36));
     return {
       left: `${Math.min(chatAnchor.x, Math.max(18, width - panelWidth - 18))}px`,
       top: `${Math.min(chatAnchor.y, Math.max(18, height - panelHeight - 18))}px`,

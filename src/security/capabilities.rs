@@ -231,7 +231,7 @@ pub fn normalize_capability_target(raw: &str) -> String {
         .map(|(_, rest)| rest)
         .unwrap_or(trimmed);
     without_scheme
-        .split(|ch| matches!(ch, '/' | '?' | '#'))
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or(without_scheme)
         .trim()
@@ -687,7 +687,7 @@ fn push_permission_observations(
                 .split_once(':')
                 .map(|(kind, target)| (kind, Some(target)))
                 .unwrap_or_else(|| (selector.as_str(), None));
-            if CAPABILITY_VOCABULARY.iter().any(|known| *known == kind) {
+            if CAPABILITY_VOCABULARY.contains(&kind) {
                 push_observation(out, seen, layer, entity_id, kind, target, evidence);
             } else {
                 push_observation(
@@ -1742,9 +1742,7 @@ pub fn evaluate_cross_layer_capabilities(
 
     let mut report = evaluate_capability_observations(observations);
     report.matched_rules.retain(|rule| {
-        correlated_rules
-            .iter()
-            .any(|rule_id| rule.id.as_str() == *rule_id)
+        correlated_rules.contains(&rule.id.as_str())
     });
     report.warnings = report
         .matched_rules

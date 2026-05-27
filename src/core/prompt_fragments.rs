@@ -583,10 +583,8 @@ mod tests {
 
         assert!(fragment.body.contains("standalone static/browser bundle"));
         assert!(fragment.body.contains("Use a dynamic backend/runtime only"));
-        assert!(
-            fragment
-                .body
-                .contains("durable jobs that must continue with no browser open")
-        );
+        assert!(fragment
+            .body
+            .contains("durable jobs that must continue with no browser open"));
     }
 }

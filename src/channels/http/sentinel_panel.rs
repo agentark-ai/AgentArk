@@ -464,21 +464,20 @@ fn build_background_learning_feed(
     jobs: &[BackgroundLearningJobRecord],
 ) -> BackgroundLearningFeed {
     let jobs = normalize_background_learning_jobs(jobs.to_vec());
-    let effective_status = if !learning_enabled {
-        "disabled"
-    } else if settings.autonomy_mode.eq_ignore_ascii_case("off") {
-        "disabled"
-    } else if settings.agent_paused {
-        "paused"
-    } else if jobs.iter().any(|job| job.status == "running") {
-        "running"
-    } else if jobs.iter().any(|job| job.status == "failed") {
-        "failed"
-    } else if jobs.iter().any(|job| job.changed) {
-        "completed"
-    } else {
-        "idle"
-    };
+    let effective_status =
+        if !learning_enabled || settings.autonomy_mode.eq_ignore_ascii_case("off") {
+            "disabled"
+        } else if settings.agent_paused {
+            "paused"
+        } else if jobs.iter().any(|job| job.status == "running") {
+            "running"
+        } else if jobs.iter().any(|job| job.status == "failed") {
+            "failed"
+        } else if jobs.iter().any(|job| job.changed) {
+            "completed"
+        } else {
+            "idle"
+        };
 
     let mut started_at = None::<String>;
     let mut completed_at = None::<String>;
@@ -1015,7 +1014,7 @@ fn reconcile_sentinel_candidates(
             .iter_mut()
             .find(|item| item.fingerprint == candidate.fingerprint)
         {
-            if recent_proposal_blocks_recreation(existing, (*now).clone()) {
+            if recent_proposal_blocks_recreation(existing, *now) {
                 existing.proposal_kind = candidate.proposal_kind;
                 existing.title = candidate.title;
                 existing.detail = candidate.detail;
@@ -2078,6 +2077,8 @@ async fn persist_sentinel_trace_from_agent(
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("sentinel".to_string()),
         plan: None,

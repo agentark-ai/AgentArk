@@ -47,9 +47,7 @@ fn resolve_lightpanda_binary() -> Option<PathBuf> {
         }
     }
 
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return None;
-    };
+    let path_var = std::env::var_os("PATH")?;
 
     for dir in std::env::split_paths(&path_var) {
         for executable_name in &executable_names {

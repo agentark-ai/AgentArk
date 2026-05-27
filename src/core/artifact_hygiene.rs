@@ -1225,11 +1225,9 @@ mod tests {
             archive_cleanup_candidate(temp.path(), &candidate, Some("event".into()), Some(2))
                 .await
                 .unwrap();
-        assert!(
-            outcome
-                .archive_path_label
-                .starts_with("data_dir/artifact_archive/")
-        );
+        assert!(outcome
+            .archive_path_label
+            .starts_with("data_dir/artifact_archive/"));
         assert!(!source.exists());
         let archive_root = temp
             .path()
@@ -1274,21 +1272,17 @@ mod tests {
         }
         let summary = prune_archive_retention(temp.path()).await.unwrap();
         assert_eq!(summary.deleted_entries, 2);
-        assert!(
-            !temp
-                .path()
-                .join(ARTIFACT_ARCHIVE_DIR)
-                .join("managed_apps")
-                .join("old-entry")
-                .exists()
-        );
-        assert!(
-            !temp
-                .path()
-                .join(LEGACY_APP_ARCHIVE_DIR)
-                .join("managed_apps")
-                .join("old-entry")
-                .exists()
-        );
+        assert!(!temp
+            .path()
+            .join(ARTIFACT_ARCHIVE_DIR)
+            .join("managed_apps")
+            .join("old-entry")
+            .exists());
+        assert!(!temp
+            .path()
+            .join(LEGACY_APP_ARCHIVE_DIR)
+            .join("managed_apps")
+            .join("old-entry")
+            .exists());
     }
 }

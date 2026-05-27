@@ -2,19 +2,19 @@
 
 use anyhow::Result;
 use axum::{
-    Json, Router,
     extract::{
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, MatchedPath, Multipart, Path,
         Query, Request, State,
-        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{
-        Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
     },
     routing::{any, delete, get, post, put},
+    Json, Router,
 };
 use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
@@ -26,12 +26,12 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{
-    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub(crate) mod actions;
@@ -95,8 +95,8 @@ pub use locked_control::serve_locked;
 pub(crate) use memory_control::run_arkmemory_learned_review_pass;
 
 pub(crate) use self::sentinel_panel::{
-    BackgroundLearningJobUpdate, load_background_learning_feed,
-    record_background_learning_job_result,
+    load_background_learning_feed, record_background_learning_job_result,
+    BackgroundLearningJobUpdate,
 };
 use analytics_control::*;
 use api_docs_control::*;
@@ -143,20 +143,20 @@ use crate::core::config::{
     TunnelTailscaleConfig,
 };
 use crate::core::data_lifecycle::{
-    DataLifecycleSettings, load_data_lifecycle_settings, save_data_lifecycle_settings,
+    load_data_lifecycle_settings, save_data_lifecycle_settings, DataLifecycleSettings,
 };
 use crate::core::llm_provider::{
-    HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID, OPENAI_DEVICE_REDIRECT_URI,
-    OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL, OPENAI_DEVICE_VERIFY_URL,
-    OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL, canonical_provider_id,
-    display_openai_base_url, force_refresh_codex_cli_api_key, is_openrouter_base_url,
-    normalize_openai_base_url, openai_provider_label, persist_codex_cli_oauth_tokens,
-    provider_allows_model_discovery, resolve_codex_cli_api_key, resolve_openai_request_config,
+    canonical_provider_id, display_openai_base_url, force_refresh_codex_cli_api_key,
+    is_openrouter_base_url, normalize_openai_base_url, openai_provider_label,
+    persist_codex_cli_oauth_tokens, provider_allows_model_discovery, resolve_codex_cli_api_key,
+    resolve_openai_request_config, HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID,
+    OPENAI_DEVICE_REDIRECT_URI, OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL,
+    OPENAI_DEVICE_VERIFY_URL, OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL,
 };
 use crate::core::{
-    Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace, LlmProvider,
-    ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task, TaskApproval,
-    TaskQueue, TaskStatus, TrustPolicy, UserProfile, score_action_risk,
+    score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
+    LlmProvider, ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task,
+    TaskApproval, TaskQueue, TaskStatus, TrustPolicy, UserProfile,
 };
 use crate::hooks;
 
@@ -844,6 +844,8 @@ pub struct ChatRequest {
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub deep_research: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<serde_json::Value>,
     #[serde(default)]
     pub plan_confirmation_mode: Option<String>,
     #[serde(default)]
@@ -859,6 +861,11 @@ pub struct ChatRequest {
     /// involves the page the user has open. Never freeform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arkorbit_context: Option<serde_json::Value>,
+    /// Optional structured browser profile selection supplied by the UI.
+    /// This keeps profile ids and browser metadata out of the visible chat
+    /// message while still giving the agent the selected profile context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profile_context: Option<serde_json::Value>,
     #[serde(default)]
     pub accepted_suggestion_id: Option<String>,
     #[serde(default)]
@@ -1644,6 +1651,10 @@ pub async fn serve(
             get(companion_control::get_connectivity),
         )
         .route(
+            "/companion/mobile-access",
+            get(companion_control::get_mobile_access),
+        )
+        .route(
             "/companion/connectivity/tunnel/start",
             post(companion_control::start_companion_tunnel),
         )
@@ -1700,6 +1711,14 @@ pub async fn serve(
             "/browser/profiles/{id}",
             post(browser_profiles_control::update_profile)
                 .delete(browser_profiles_control::delete_profile),
+        )
+        .route(
+            "/browser/profiles/{id}/launch",
+            post(browser_profiles_control::launch_profile_browser),
+        )
+        .route(
+            "/browser/profiles/{id}/close",
+            post(browser_profiles_control::close_profile_browser),
         )
         .route(
             "/browser/profiles/{id}/lock",

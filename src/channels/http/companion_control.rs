@@ -1,18 +1,18 @@
 use axum::{
-    Json,
     extract::{
-        ConnectInfo, Path, Query, State,
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Path, Query, State,
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
+    Json,
 };
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
-use super::{AppState, ErrorResponse, request_matches_active_tunnel};
+use super::{request_matches_active_tunnel, AppState, ErrorResponse};
 
 fn actor_label(
     maybe_caller: Option<&crate::actions::ActionCallerPrincipal>,
@@ -39,6 +39,34 @@ fn json_error(status: axum::http::StatusCode, error: impl Into<String>) -> Respo
         }),
     )
         .into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionPhoneSummary {
+    paired: usize,
+    online: usize,
+    capabilities: Vec<String>,
+    can_read_phone_messages: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionMobileAccessChannel {
+    id: String,
+    label: String,
+    kind: String,
+    configured: bool,
+    ready: bool,
+    detail: String,
+    settings_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionMobileAccessResponse {
+    phone_companion: CompanionPhoneSummary,
+    message_channels: Vec<CompanionMobileAccessChannel>,
+    sms: CompanionMobileAccessChannel,
+    truth_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -588,6 +616,24 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
         device_id: saved.device_id,
         state: "online",
         capabilities: ["approval_prompt", "notifications"],
+        commands: [
+          {
+            id: "approval.prompt",
+            label: "Approval prompt",
+            capability: "approval_prompt",
+            action: "approval.prompt",
+            description: "Ask this browser companion for an approval decision.",
+            risk: "low"
+          },
+          {
+            id: "notifications.show",
+            label: "Show notification",
+            capability: "notifications",
+            action: "notifications.show",
+            description: "Show a browser notification on this companion.",
+            risk: "low"
+          }
+        ],
         metadata: {
           client: "agentark-web-companion",
           notification_permission: "Notification" in window ? Notification.permission : "unavailable"
@@ -773,6 +819,206 @@ async fn companion_connectivity_payload(state: &AppState) -> serde_json::Value {
 
 pub(super) async fn get_connectivity(State(state): State<AppState>) -> Response {
     Json(companion_connectivity_payload(&state).await).into_response()
+}
+
+fn configured_secret(value: &str) -> bool {
+    !value.trim().is_empty() && value.trim() != "[ENCRYPTED]"
+}
+
+fn mobile_channel(
+    id: &str,
+    label: &str,
+    kind: &str,
+    configured: bool,
+    ready: bool,
+    detail: impl Into<String>,
+    settings_path: &str,
+) -> CompanionMobileAccessChannel {
+    CompanionMobileAccessChannel {
+        id: id.to_string(),
+        label: label.to_string(),
+        kind: kind.to_string(),
+        configured,
+        ready,
+        detail: detail.into(),
+        settings_path: settings_path.to_string(),
+    }
+}
+
+pub(super) async fn get_mobile_access(State(state): State<AppState>) -> Response {
+    let plane = plane_from_state(&state).await;
+    let devices = match plane.list_devices().await {
+        Ok(devices) => devices,
+        Err(error) => {
+            return json_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+            );
+        }
+    };
+    let (config, config_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config.clone(), agent.config_dir.clone())
+    };
+
+    let phone_devices = devices
+        .iter()
+        .filter(|device| {
+            let id = format!("{} {}", device.preset_id, device.platform).to_ascii_lowercase();
+            id.contains("ios") || id.contains("iphone") || id.contains("android")
+        })
+        .collect::<Vec<_>>();
+    let online_phone_devices = phone_devices
+        .iter()
+        .filter(|device| device.state == crate::core::CompanionDeviceState::Online)
+        .count();
+    let mut phone_capabilities = phone_devices
+        .iter()
+        .flat_map(|device| {
+            let capabilities = if device.available_capabilities.is_empty() {
+                &device.token_capabilities
+            } else {
+                &device.available_capabilities
+            };
+            capabilities.iter().cloned()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if phone_capabilities.is_empty() && !phone_devices.is_empty() {
+        phone_capabilities = vec!["approval_prompt".to_string(), "notifications".to_string()];
+    }
+
+    let telegram_ready = config.telegram.as_ref().is_some_and(|telegram| {
+        configured_secret(&telegram.bot_token)
+            && telegram.allowed_users.len() == 1
+            && telegram.allowed_users.first().copied().unwrap_or_default() != 0
+    });
+    let telegram_configured = config
+        .telegram
+        .as_ref()
+        .is_some_and(|telegram| configured_secret(&telegram.bot_token));
+
+    let (whatsapp_configured, whatsapp_ready) = config
+        .whatsapp
+        .as_ref()
+        .map(|whatsapp| {
+            let bridge_ready = match whatsapp.mode {
+                crate::channels::whatsapp::WhatsAppMode::CloudApi => {
+                    configured_secret(&whatsapp.access_token)
+                        && configured_secret(&whatsapp.app_secret)
+                        && !whatsapp.phone_number_id.trim().is_empty()
+                        && !whatsapp.verify_token.trim().is_empty()
+                }
+                crate::channels::whatsapp::WhatsAppMode::Baileys => match whatsapp.bridge_runtime()
+                {
+                    crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded => true,
+                    crate::channels::whatsapp::WhatsAppBridgeRuntime::External => {
+                        !whatsapp.bridge_url.trim().is_empty()
+                    }
+                },
+            };
+            (
+                bridge_ready,
+                bridge_ready
+                    && crate::channels::whatsapp::configured_notification_recipient(whatsapp)
+                        .is_some(),
+            )
+        })
+        .unwrap_or((false, false));
+
+    let (imessage_configured, imessage_ready) = config
+        .imessage
+        .as_ref()
+        .map(|imessage| {
+            let configured =
+                configured_secret(&imessage.bridge_token) && !imessage.bridge_url.trim().is_empty();
+            (
+                configured,
+                configured
+                    && (!imessage.default_chat_id.trim().is_empty()
+                        || !imessage.default_handle.trim().is_empty()),
+            )
+        })
+        .unwrap_or((false, false));
+
+    let twilio_ready = crate::integrations::effective_integration_enabled(&config_dir, "twilio");
+
+    Json(CompanionMobileAccessResponse {
+        phone_companion: CompanionPhoneSummary {
+            paired: phone_devices.len(),
+            online: online_phone_devices,
+            capabilities: phone_capabilities,
+            can_read_phone_messages: false,
+            detail: "Bundled iPhone and Android companions handle AgentArk notifications and approvals only.".to_string(),
+        },
+        message_channels: vec![
+            mobile_channel(
+                "telegram",
+                "Telegram",
+                "chat_channel",
+                telegram_configured,
+                telegram_ready,
+                if telegram_ready {
+                    "Ready for phone chat through the Telegram bot."
+                } else if telegram_configured {
+                    "Telegram token exists, but delivery/user targeting is not ready."
+                } else {
+                    "Configure a Telegram bot token and allowed user before using Telegram as a phone channel."
+                },
+                "Settings > Integrations > Channels > Telegram",
+            ),
+            mobile_channel(
+                "whatsapp",
+                "WhatsApp",
+                "chat_channel",
+                whatsapp_configured,
+                whatsapp_ready,
+                if whatsapp_ready {
+                    "Ready for phone chat through the configured WhatsApp channel."
+                } else if whatsapp_configured {
+                    "WhatsApp bridge/API exists, but no delivery recipient is ready."
+                } else {
+                    "Configure WhatsApp Cloud API or the WhatsApp bridge before using WhatsApp as a phone channel."
+                },
+                "Settings > Integrations > Channels > WhatsApp",
+            ),
+            mobile_channel(
+                "imessage",
+                "iMessage bridge",
+                "macos_bridge",
+                imessage_configured,
+                imessage_ready,
+                if imessage_ready {
+                    "Ready through a configured macOS Messages bridge signed into the Apple ID."
+                } else if imessage_configured {
+                    "iMessage bridge credentials exist, but no default handle/chat target is ready."
+                } else {
+                    "Requires a macOS Messages bridge signed into the relevant Apple ID; the iPhone companion cannot read iMessage."
+                },
+                "Settings > Integrations > Channels > iMessage",
+            ),
+        ],
+        sms: mobile_channel(
+            "sms",
+            "SMS",
+            "sms_bridge",
+            twilio_ready,
+            twilio_ready,
+            if twilio_ready {
+                "Twilio Voice & SMS is configured. This is Twilio-number SMS, not your iPhone SMS history."
+            } else {
+                "iPhone companion cannot read SMS. Use Twilio, a carrier bridge, or a custom SMS-capable Android companion."
+            },
+            "Settings > Integrations > Prebuilt Connectors > Twilio",
+        ),
+        truth_notes: vec![
+            "A connected iPhone companion does not expose personal SMS, iMessage, photos, camera, location, or Shortcuts.".to_string(),
+            "Use chat channels when the phone should message AgentArk; use companion devices when AgentArk needs notifications or approval prompts on that device.".to_string(),
+            "Companion commands are concrete declared actions and still pass through scoped grants, approval, dispatch, and audit.".to_string(),
+        ],
+    })
+    .into_response()
 }
 
 pub(super) async fn start_companion_tunnel(State(state): State<AppState>) -> Response {
@@ -1039,6 +1285,8 @@ struct CompanionWsEnvelope {
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default)]
+    commands: Vec<crate::core::companion::CompanionCommandDescriptor>,
+    #[serde(default)]
     metadata: BTreeMap<String, String>,
     #[serde(default)]
     command_id: Option<String>,
@@ -1130,6 +1378,7 @@ async fn handle_companion_socket(
                     .pulse_device(
                         &device.id,
                         Some(crate::core::CompanionDeviceState::Online),
+                        Vec::new(),
                         Vec::new(),
                         BTreeMap::new(),
                     )
@@ -1238,6 +1487,7 @@ async fn handle_companion_socket(
                             .pulse_device(
                                 &device.id,
                                 Some(crate::core::CompanionDeviceState::Online),
+                                Vec::new(),
                                 Vec::new(),
                                 BTreeMap::new(),
                             )
@@ -1366,6 +1616,7 @@ async fn handle_companion_socket(
                         &device_id,
                         parsed.state,
                         parsed.capabilities,
+                        parsed.commands,
                         parsed.metadata,
                     )
                     .await

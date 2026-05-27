@@ -10,6 +10,12 @@
 //! - Local-first HTTP API
 
 #![recursion_limit = "256"]
+#![allow(
+    clippy::large_enum_variant,
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 mod actions;
 mod branding;
@@ -299,6 +305,7 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         attachments_present: false,
         attachments: Vec::new(),
         arkorbit_context: None,
+        browser_profile_context: None,
         recent_actionable_artifacts: Vec::new(),
     }
 }

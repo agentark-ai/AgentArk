@@ -473,6 +473,15 @@ fn structured_success_state(value: &Value) -> Option<bool> {
     None
 }
 
+fn parse_automation_output_json(output: &str) -> Option<Value> {
+    let trimmed = output.trim();
+    if let Some(payload) = trimmed.strip_prefix(crate::runtime::TOOL_COMPLETION_MARKER) {
+        let marker_json = payload.lines().next().unwrap_or(payload).trim();
+        return serde_json::from_str::<Value>(marker_json).ok();
+    }
+    serde_json::from_str::<Value>(trimmed).ok()
+}
+
 fn structured_retryable_state(value: &Value) -> Option<bool> {
     for path in [
         "retryable",
@@ -515,11 +524,16 @@ fn structured_retryable_state(value: &Value) -> Option<bool> {
 pub fn validate_result(validation: &AutomationValidation, output: &str) -> bool {
     let trimmed = output.trim();
     let normalized = validation.normalized();
-    let parsed_json = serde_json::from_str::<Value>(trimmed).ok();
+    let parsed_json = parse_automation_output_json(trimmed);
     match validation.mode {
         AutomationValidationMode::None => true,
         AutomationValidationMode::NonEmptyResult => {
             if parsed_json.is_some() {
+                if let Some(value) = parsed_json.as_ref() {
+                    if let Some(success) = structured_success_state(value) {
+                        return success && !primary_result_text(trimmed).trim().is_empty();
+                    }
+                }
                 !primary_result_text(trimmed).trim().is_empty()
             } else {
                 !trimmed.is_empty()
@@ -614,8 +628,8 @@ pub fn critique_result(
     let normalized = validation.normalized();
     let error_text = error.unwrap_or_default().trim();
     let output_text = output.unwrap_or_default().trim();
-    let error_json = serde_json::from_str::<Value>(error_text).ok();
-    let output_json = serde_json::from_str::<Value>(output_text).ok();
+    let error_json = parse_automation_output_json(error_text);
+    let output_json = parse_automation_output_json(output_text);
     let retryable = error_json
         .as_ref()
         .and_then(structured_retryable_state)
@@ -719,7 +733,7 @@ fn json_value_to_text(value: &Value) -> String {
 
 pub fn primary_result_text(raw_output: &str) -> String {
     let trimmed = raw_output.trim();
-    let Some(value) = serde_json::from_str::<Value>(trimmed).ok() else {
+    let Some(value) = parse_automation_output_json(trimmed) else {
         return raw_output.to_string();
     };
     let Some(output) = json_value_at_path(&value, "output") else {
@@ -858,5 +872,60 @@ mod tests {
             &validation,
             r#"{"output":"{\"new_person\": false}","error":null,"exit_code":0}"#
         ));
+    }
+
+    #[test]
+    fn non_empty_validation_rejects_structured_failure_status() {
+        let validation = AutomationValidation {
+            mode: AutomationValidationMode::NonEmptyResult,
+            ..AutomationValidation::default()
+        };
+
+        assert!(!validate_result(
+            &validation,
+            r#"{"status":"failed","output":"I will retry this later"}"#
+        ));
+        assert!(!validate_result(
+            &validation,
+            r#"{"ok":false,"message":"request failed"}"#
+        ));
+    }
+
+    #[test]
+    fn non_empty_validation_rejects_tool_completion_failure_marker() {
+        let validation = AutomationValidation {
+            mode: AutomationValidationMode::NonEmptyResult,
+            ..AutomationValidation::default()
+        };
+        let marker = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "notify_user",
+                "status": "failed",
+                "detail": "Telegram delivery failed"
+            })
+        );
+
+        assert!(!validate_result(&validation, &marker));
+    }
+
+    #[test]
+    fn structured_success_accepts_tool_completion_completed_marker() {
+        let validation = AutomationValidation {
+            mode: AutomationValidationMode::StructuredSuccess,
+            ..AutomationValidation::default()
+        };
+        let marker = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "notify_user",
+                "status": "completed",
+                "detail": "Notification delivered"
+            })
+        );
+
+        assert!(validate_result(&validation, &marker));
     }
 }

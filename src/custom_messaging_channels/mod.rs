@@ -860,7 +860,7 @@ fn mask_template_placeholders(raw: &str) -> String {
             out.push(' ');
             chars.next();
             let mut previous = '\0';
-            while let Some(inner) = chars.next() {
+            for inner in chars.by_ref() {
                 out.push(' ');
                 if previous == '}' && inner == '}' {
                     break;
@@ -1007,9 +1007,7 @@ fn sanitize_id(value: &str) -> String {
     for ch in value.trim().chars() {
         let next = if ch.is_ascii_alphanumeric() {
             Some(ch.to_ascii_lowercase())
-        } else if ch == '_' || ch == '-' || ch == '.' {
-            Some('_')
-        } else if ch.is_whitespace() {
+        } else if ch == '_' || ch == '-' || ch == '.' || ch.is_whitespace() {
             Some('_')
         } else {
             None

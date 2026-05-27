@@ -15,26 +15,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::storage::Storage;
 
 use super::prompt_evolution::{
-    ExternalPromptCandidate, PROMPT_BUNDLE_PROFILE_KEY, PromptBundleProfile,
-    embedded_prompt_benchmark_profile_json, parse_prompt_bundle_profile,
+    embedded_prompt_benchmark_profile_json, parse_prompt_bundle_profile, ExternalPromptCandidate,
+    PromptBundleProfile, PROMPT_BUNDLE_PROFILE_KEY,
 };
 use super::prompt_fragment_evolution::{
-    ExternalPromptFragmentCandidate, PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH,
-    prompt_fragment_candidate_benchmark_profile,
+    prompt_fragment_candidate_benchmark_profile, ExternalPromptFragmentCandidate,
+    PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH,
 };
 use super::router_learning::{
-    RouterLearningCandidatePayload, router_learning_benchmark_profile,
-    trace_evidence_from_semantic_steps, validate_router_learning_candidate,
+    router_learning_benchmark_profile, trace_evidence_from_semantic_steps,
+    validate_router_learning_candidate, RouterLearningCandidatePayload,
 };
 use super::specialist_prompt_evolution::{
-    ExternalSpecialistPromptCandidate, SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
-    SpecialistPromptBundleProfile, embedded_specialist_prompt_benchmark_profile_json,
-    parse_specialist_prompt_bundle_profile,
+    embedded_specialist_prompt_benchmark_profile_json, parse_specialist_prompt_bundle_profile,
+    ExternalSpecialistPromptCandidate, SpecialistPromptBundleProfile,
+    SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
 };
 use crate::core::prompt_fragments::{
-    PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY, PromptFragmentBundleProfile,
     default_prompt_fragment_bundle, parse_prompt_fragment_bundle_profile,
-    sanitize_prompt_fragment_bundle,
+    sanitize_prompt_fragment_bundle, PromptFragmentBundleProfile,
+    PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
 };
 
 const GEPA_ROOT_REL: &str = ".agentark/self_evolve/gepa";
@@ -340,7 +340,11 @@ pub fn gepa_venv_python(project_root: &Path) -> PathBuf {
 
 fn bundled_gepa_python() -> Option<PathBuf> {
     let path = PathBuf::from("/opt/agentark-gepa/bin/python");
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 pub async fn load_gepa_optimizer_config(storage: &Storage) -> GepaOptimizerConfig {
@@ -1131,7 +1135,7 @@ fn parse_candidate_records(raw: &str) -> Result<Vec<GepaCandidateRecord>> {
         if line.is_empty() {
             continue;
         }
-        if line.as_bytes().len() > MAX_JSONL_RECORD_BYTES {
+        if line.len() > MAX_JSONL_RECORD_BYTES {
             anyhow::bail!(
                 "GEPA candidate JSONL line {} is too large; maximum is {} bytes",
                 idx + 1,
@@ -1738,7 +1742,11 @@ trait IfEmpty {
 
 impl IfEmpty for str {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
-        if self.is_empty() { fallback } else { self }
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
     }
 }
 

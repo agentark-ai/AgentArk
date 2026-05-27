@@ -4,10 +4,11 @@
   "description": "Playwright browser automation sidecar for AgentArk",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "dependencies": {
-    "express": "^4.21.0",
+    "express": "^4.22.2",
     "playwright": "^1.50.0"
   },
   "overrides": {

@@ -10,6 +10,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --chown=bridge:bridge index.js ./
+COPY --chown=bridge:bridge manual-login.js ./
 
 USER bridge
 

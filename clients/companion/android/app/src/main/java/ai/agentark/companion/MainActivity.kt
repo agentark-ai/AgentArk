@@ -46,12 +46,7 @@ class MainActivity : Activity() {
 
     private val capabilities = setOf(
         "approval_prompt",
-        "notifications",
-        "sms",
-        "whatsapp_handoff",
-        "camera",
-        "photos",
-        "location"
+        "notifications"
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {

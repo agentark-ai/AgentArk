@@ -4,6 +4,7 @@ export function normalizeSettingsPreloadTab(
   if (typeof rawTab !== "number" || !Number.isFinite(rawTab)) return null;
   const tab = Math.trunc(rawTab);
   if (tab === 2 || tab === 10 || tab === 15) return 20;
+  if (tab === 21 || tab === 22 || tab === 23) return 20;
   if (tab === 16) return 4;
   if (tab === 9 || tab === 13 || tab === 17) return 0;
   return tab;
@@ -44,7 +45,6 @@ export function preloadSettingsTab(rawTab?: number | null): void {
       break;
     case 8:
     case 20:
-    case 21:
       preloadOnce("settings-integrations", () => import("../IntegrationsPanel"));
       break;
     case 11:
@@ -52,9 +52,6 @@ export function preloadSettingsTab(rawTab?: number | null): void {
       break;
     case 12:
       preloadOnce("settings-memory", () => import("./MemoryPage"));
-      break;
-    case 22:
-      preloadOnce("settings-quickstart", () => import("../IntegrationQuickstartPanel"));
       break;
     default:
       break;

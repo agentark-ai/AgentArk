@@ -1,5 +1,5 @@
 use crate::actions::ActionDef;
-use crate::docs::agentark_manual::{AGENTARK_MANUAL_DOCS, render_agentark_manual_doc};
+use crate::docs::agentark_manual::{render_agentark_manual_doc, AGENTARK_MANUAL_DOCS};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -723,50 +723,32 @@ mod tests {
         ]);
         assert!(items.iter().any(|item| item.source == CURATED_SOURCE));
         assert!(items.iter().any(|item| item.source == RUNTIME_SOURCE));
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title.contains("Main navigation"))
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Models and provider setup")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Embeddings and retrieval")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Input needed and unattended runs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Environment, deployment, and investigation")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Chat shortcuts and safe actions")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Custom integrations and extension packs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "MCP servers, plugins, webhooks, and custom APIs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Runtime environment and investigation")
-        );
+        assert!(items
+            .iter()
+            .any(|item| item.title.contains("Main navigation")));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Models and provider setup"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Embeddings and retrieval"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Input needed and unattended runs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Environment, deployment, and investigation"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Chat shortcuts and safe actions"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Custom integrations and extension packs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "MCP servers, plugins, webhooks, and custom APIs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Runtime environment and investigation"));
     }
 }

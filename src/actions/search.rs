@@ -5,7 +5,7 @@
 //! - Brave Search API
 //! - DuckDuckGo (scraping, no API key needed)
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -1736,7 +1736,7 @@ pub fn format_search_results(response: &SearchResponse) -> String {
         if !snippet.is_empty() {
             output.push_str(&format!("  \n  {}", markdown_inline_text(&snippet)));
         }
-        output.push_str("\n");
+        output.push('\n');
     }
     output
 }
@@ -2155,11 +2155,9 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "India AI policy outlook 2026");
         assert_eq!(results[0].url, "https://example.com/policy/india-ai");
-        assert!(
-            results[0]
-                .snippet
-                .contains("Government strategy, compute constraints")
-        );
+        assert!(results[0]
+            .snippet
+            .contains("Government strategy, compute constraints"));
     }
 
     #[test]
@@ -2255,14 +2253,16 @@ mod tests {
 
     #[test]
     fn ordered_backend_names_prioritizes_configured_providers_then_free_fallbacks() {
-        let mut config = SearchConfig::default();
-        config.provider_order = vec!["tavily".to_string(), "serper".to_string()];
-        config.serper = Some(SearchBackend::Serper {
-            api_key: "test".to_string(),
-        });
-        config.tavily = Some(SearchBackend::Tavily {
-            api_key: "test".to_string(),
-        });
+        let config = SearchConfig {
+            provider_order: vec!["tavily".to_string(), "serper".to_string()],
+            serper: Some(SearchBackend::Serper {
+                api_key: "test".to_string(),
+            }),
+            tavily: Some(SearchBackend::Tavily {
+                api_key: "test".to_string(),
+            }),
+            ..SearchConfig::default()
+        };
 
         let chain = config.ordered_backend_names();
 
@@ -2280,15 +2280,17 @@ mod tests {
 
     #[test]
     fn ordered_backend_names_uses_legacy_primary_and_fallbacks_when_provider_order_absent() {
-        let mut config = SearchConfig::default();
-        config.primary = Some("brave".to_string());
-        config.fallback1 = Some("tavily".to_string());
-        config.brave = Some(SearchBackend::Brave {
-            api_key: "test".to_string(),
-        });
-        config.tavily = Some(SearchBackend::Tavily {
-            api_key: "test".to_string(),
-        });
+        let config = SearchConfig {
+            primary: Some("brave".to_string()),
+            fallback1: Some("tavily".to_string()),
+            brave: Some(SearchBackend::Brave {
+                api_key: "test".to_string(),
+            }),
+            tavily: Some(SearchBackend::Tavily {
+                api_key: "test".to_string(),
+            }),
+            ..SearchConfig::default()
+        };
 
         let chain = config.ordered_backend_names();
 
@@ -2303,15 +2305,17 @@ mod tests {
 
     #[test]
     fn ensure_default_chain_normalizes_provider_order_and_legacy_aliases() {
-        let mut config = SearchConfig::default();
-        config.primary = Some("brave".to_string());
-        config.fallback1 = Some("serper".to_string());
-        config.provider_order = vec![
-            " Brave ".to_string(),
-            "serper".to_string(),
-            "brave_api".to_string(),
-            String::new(),
-        ];
+        let mut config = SearchConfig {
+            primary: Some("brave".to_string()),
+            fallback1: Some("serper".to_string()),
+            provider_order: vec![
+                " Brave ".to_string(),
+                "serper".to_string(),
+                "brave_api".to_string(),
+                String::new(),
+            ],
+            ..SearchConfig::default()
+        };
 
         config.ensure_default_chain();
 
@@ -2340,10 +2344,12 @@ mod tests {
 
     #[test]
     fn backend_attempt_chain_keeps_configured_explicit_provider() {
-        let mut config = SearchConfig::default();
-        config.serper = Some(SearchBackend::Serper {
-            api_key: "test".to_string(),
-        });
+        let config = SearchConfig {
+            serper: Some(SearchBackend::Serper {
+                api_key: "test".to_string(),
+            }),
+            ..SearchConfig::default()
+        };
 
         let (chain, fallback_backend_name) = config.backend_attempt_chain(Some("serper"));
 
@@ -2353,8 +2359,10 @@ mod tests {
 
     #[test]
     fn ordered_backend_names_skips_lightpanda_when_runtime_marks_it_unavailable() {
-        let mut config = SearchConfig::default();
-        config.lightpanda_available = false;
+        let config = SearchConfig {
+            lightpanda_available: false,
+            ..SearchConfig::default()
+        };
 
         let chain = config.ordered_backend_names();
 

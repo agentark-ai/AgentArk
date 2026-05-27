@@ -15,6 +15,7 @@ export function normalizeSettingsTab(rawTab?: number | null): number {
   if (typeof rawTab !== "number" || !Number.isFinite(rawTab)) return 0;
   const tab = Math.max(0, Math.trunc(rawTab));
   if (tab === 2 || tab === 10 || tab === 15) return 20;
+  if (tab === 21 || tab === 22 || tab === 23) return 20;
   if (tab === 16) return 4;
   if (tab === 9 || tab === 13 || tab === 17) return 0;
   return tab;
@@ -41,14 +42,14 @@ export function settingsTabFromLocation(): number {
     senderverification: 4,
     observability: 6,
     telemetry: 6,
-    webhooks: 22,
-    plugins: 23,
-    plugin: 23,
-    sdk: 23,
-    ingress: 22,
-    events: 22,
-    connectors: 21,
-    prebuilt: 21,
+    webhooks: 20,
+    plugins: 20,
+    plugin: 20,
+    sdk: 20,
+    ingress: 20,
+    events: 20,
+    connectors: 20,
+    prebuilt: 20,
     companion: 26,
     "companion-devices": 26,
     companiondevices: 26,
@@ -105,7 +106,7 @@ export function getSettingsTabLoadingMessage(tab: number): string {
     case 14:
       return "Loading data cleanup...";
     case 20:
-      return "Loading messaging channels...";
+      return "Loading integrations...";
     case 21:
       return "Loading integrations...";
     case 22:
@@ -214,7 +215,8 @@ export function getSettingsPageMeta(tab: number): SettingsPageMeta {
     case 20:
       return {
         kicker: "Integrations",
-        description: "Messaging channels, target routing, and delivery readiness.",
+        description:
+          "Messaging channels, built-in connectors, custom APIs, webhooks, plugins, and extension packs in one hub.",
       };
     case 21:
       return {
@@ -238,7 +240,7 @@ export function getSettingsPageMeta(tab: number): SettingsPageMeta {
       return {
         kicker: "Integrations",
         description:
-          "Pair devices, control what each one can do, approve sensitive commands, and review device history.",
+          "Pair phone or desktop companions for AgentArk notifications and approval prompts.",
       };
     default:
       return {

@@ -17,8 +17,8 @@ use crate::channels::{
 };
 use crate::crypto::KeyManager;
 use crate::security::ModelPrivacyConfig;
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use anyhow::{anyhow, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -113,18 +113,10 @@ pub fn global_settings_storage() -> Option<crate::storage::Storage> {
         .and_then(|guard| guard.clone())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct BootstrapMetadata {
     #[serde(default)]
     deployment_mode: DeploymentMode,
-}
-
-impl Default for BootstrapMetadata {
-    fn default() -> Self {
-        Self {
-            deployment_mode: DeploymentMode::default(),
-        }
-    }
 }
 
 pub fn bootstrap_metadata_path(config_dir: &Path) -> PathBuf {
@@ -3315,16 +3307,8 @@ impl Default for SandboxConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemoryConfig {
     #[serde(default)]
     pub embedding_model: String,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            embedding_model: String::new(),
-        }
-    }
 }

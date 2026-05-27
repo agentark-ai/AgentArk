@@ -1509,7 +1509,11 @@ impl Agent {
                 serde_json::Value::String(content.to_string()),
             );
         }
-        if out.is_empty() { None } else { Some(out) }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn safe_app_relative_file_key(key: &str) -> Option<String> {
@@ -1852,7 +1856,11 @@ impl Agent {
                 }
             }
         }
-        if files.is_empty() { None } else { Some(files) }
+        if files.is_empty() {
+            None
+        } else {
+            Some(files)
+        }
     }
 
     /// Recover files from a top-level object that has no `files` key and no nested wrapper.
@@ -2893,9 +2901,9 @@ impl Agent {
                         obj.insert("running".to_string(), serde_json::json!(status.running));
                         obj.insert(
                             "runtime_mode".to_string(),
-                            serde_json::json!(
-                                status.runtime_mode.unwrap_or_else(|| "stopped".to_string())
-                            ),
+                            serde_json::json!(status
+                                .runtime_mode
+                                .unwrap_or_else(|| "stopped".to_string())),
                         );
                         obj.insert(
                             "port".to_string(),
@@ -4888,22 +4896,22 @@ impl Agent {
             crate::core::BrowserProfileResolveOutcome::Resolved { profile, .. } => {
                 Ok(Ok(Some(profile)))
             }
-            crate::core::BrowserProfileResolveOutcome::Ambiguous { candidates } => Ok(Err(
-                serde_json::json!({
+            crate::core::BrowserProfileResolveOutcome::Ambiguous { candidates } => {
+                Ok(Err(serde_json::json!({
                     "success": false,
                     "reason": "browser_profile_ambiguous",
                     "profile_selector": selector,
                     "candidates": Self::browser_profile_candidates_payload(&candidates),
-                }),
-            )),
-            crate::core::BrowserProfileResolveOutcome::NotFound { candidates } => Ok(Err(
-                serde_json::json!({
+                })))
+            }
+            crate::core::BrowserProfileResolveOutcome::NotFound { candidates } => {
+                Ok(Err(serde_json::json!({
                     "success": false,
                     "reason": "browser_profile_not_found",
                     "profile_selector": selector,
                     "candidates": Self::browser_profile_candidates_payload(&candidates),
-                }),
-            )),
+                })))
+            }
         }
     }
 
@@ -4911,12 +4919,14 @@ impl Agent {
         &self,
         session_id: &str,
     ) -> Option<crate::core::browser_session::BrowserSessionView> {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(540);
         loop {
             let view = self.browser_sessions.describe_session(session_id).await?;
-            match view.status.as_str() {
-                "active" => {}
-                _ => return Some(view),
+            if !matches!(
+                browser_auto_checkpoint_kind(&view),
+                BrowserAutoCheckpointKind::Running
+            ) {
+                return Some(view);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Some(view);
@@ -4925,84 +4935,13 @@ impl Agent {
         }
     }
 
-    async fn handle_browser_auto_tool_call(
-        &self,
-        arguments: &serde_json::Value,
-        channel: &str,
-        conversation_id: Option<&str>,
+    fn browser_auto_notification_fn(
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
-    ) -> Result<String> {
-        let action = action_text_arg(arguments, "action").unwrap_or_else(|| "start_session".to_string());
-        if action != "start_session" {
-            return Ok(render_tool_completion_marker_with_data(
-                "browser_auto",
-                "failed",
-                "browser_auto supports only start_session.",
-                serde_json::json!({
-                    "success": false,
-                    "reason": "unsupported_browser_auto_action",
-                    "action": action,
-                }),
-            ));
-        }
-
-        let url = action_text_arg(arguments, "url");
-        let task = action_text_arg(arguments, "task")
-            .or_else(|| url.as_ref().map(|url| format!("Open {}", url)))
-            .unwrap_or_default();
-        let task = if let Some(url) = url.as_ref() {
-            format!("Open {}. {}", url, task)
-        } else {
-            task
-        };
-        let task = task.trim().to_string();
-        if task.is_empty() {
-            return Ok(render_tool_completion_marker_with_data(
-                "browser_auto",
-                "needs_input",
-                "A browser task description or URL is required.",
-                serde_json::json!({
-                    "success": false,
-                    "reason": "browser_task_required",
-                }),
-            ));
-        }
-
-        let profile =
-            match self
-                .resolve_browser_profile_for_tool(Self::browser_profile_selector_from_tool(arguments))
-                .await?
-            {
-                Ok(profile) => profile,
-                Err(payload) => {
-                    let reason = payload
-                        .get("reason")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("browser_profile_unresolved");
-                    let message = if reason == "browser_profile_ambiguous" {
-                        "More than one saved browser profile matches the requested profile. Choose one profile id or name."
-                    } else {
-                        "No saved browser profile matched the requested profile."
-                    };
-                    return Ok(render_tool_completion_marker_with_data(
-                        "browser_auto",
-                        "needs_input",
-                        message,
-                        payload,
-                    ));
-                }
-            };
-        let profile_context =
-            profile
-                .as_ref()
-                .map(|profile| crate::core::browser_session::BrowserSessionProfileContext {
-                    profile_id: profile.id.clone(),
-                    profile_name: Some(profile.name.clone()),
-                });
+    ) -> std::sync::Arc<
+        dyn Fn(crate::core::browser_session::BrowserSessionNotification) + Send + Sync,
+    > {
         let stream_target = stream_tx.cloned();
-        let notify_fn: std::sync::Arc<
-            dyn Fn(crate::core::browser_session::BrowserSessionNotification) + Send + Sync,
-        > = std::sync::Arc::new(move |notification| {
+        std::sync::Arc::new(move |notification| {
             let Some(tx) = stream_target.as_ref() else {
                 return;
             };
@@ -5032,7 +4971,297 @@ impl Agent {
                     })),
                 },
             );
-        });
+        })
+    }
+
+    async fn resolve_browser_auto_session_id(
+        &self,
+        arguments: &serde_json::Value,
+        conversation_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(session_id) = action_text_arg(arguments, "session_id") {
+            return Some(session_id);
+        }
+        self.browser_sessions
+            .latest_live_session_view_for_conversation(conversation_id)
+            .await
+            .map(|view| view.id)
+    }
+
+    async fn handle_browser_auto_snapshot_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        conversation_id: Option<&str>,
+    ) -> Result<String> {
+        let Some(session_id) = self
+            .resolve_browser_auto_session_id(arguments, conversation_id)
+            .await
+        else {
+            return Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                "needs_input",
+                "No live browser session is available for this conversation.",
+                serde_json::json!({
+                    "success": false,
+                    "reason": "browser_session_required",
+                }),
+            ));
+        };
+        let element_limit = arguments
+            .get("element_limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(50)
+            .min(50) as usize;
+        match self
+            .browser_sessions
+            .read_session_content(&session_id)
+            .await
+        {
+            Ok((view, content)) => {
+                let elements = content
+                    .elements
+                    .iter()
+                    .take(element_limit)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "completed",
+                    &format!("Read current browser page: {}", content.title.trim()),
+                    serde_json::json!({
+                        "success": true,
+                        "session": view,
+                        "page": {
+                            "title": content.title,
+                            "url": content.url,
+                            "body_text": safe_truncate(&content.body_text, 6_000),
+                            "elements": elements,
+                            "diagnostics": content.diagnostics,
+                        }
+                    }),
+                ))
+            }
+            Err(error) => Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                "failed",
+                &format!("Could not read the live browser session: {}", error),
+                serde_json::json!({
+                    "success": false,
+                    "session_id": session_id,
+                    "reason": "browser_snapshot_failed",
+                    "error": error.to_string(),
+                }),
+            )),
+        }
+    }
+
+    async fn handle_browser_auto_resume_handoff_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        channel: &str,
+        conversation_id: Option<&str>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        let Some(session_id) = self
+            .resolve_browser_auto_session_id(arguments, conversation_id)
+            .await
+        else {
+            return Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                "needs_input",
+                "No live browser session is available for this conversation.",
+                serde_json::json!({
+                    "success": false,
+                    "reason": "browser_session_required",
+                }),
+            ));
+        };
+        let note = action_text_arg(arguments, "note")
+            .or_else(|| action_text_arg(arguments, "response"))
+            .or_else(|| action_text_arg(arguments, "task"))
+            .unwrap_or_default();
+        let resume_in_chat = arguments
+            .get("resume_in_chat")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let notify_fn = Self::browser_auto_notification_fn(stream_tx);
+        match self
+            .browser_sessions
+            .resume_chat_input_session(
+                &session_id,
+                &note,
+                channel,
+                self.llm.clone(),
+                notify_fn.clone(),
+            )
+            .await
+        {
+            Ok(Some(started)) => {
+                if let Some(checkpoint) = self
+                    .wait_for_browser_auto_checkpoint(&started.session_id)
+                    .await
+                {
+                    return Ok(browser_auto_checkpoint_marker(checkpoint));
+                }
+                return Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "running",
+                    "Browser chat input was applied. The browser task is still running.",
+                    serde_json::json!({
+                        "success": true,
+                        "session_id": started.session_id,
+                    }),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "failed",
+                    &format!("Could not resume the browser chat input: {}", error),
+                    serde_json::json!({
+                        "success": false,
+                        "session_id": session_id,
+                        "reason": "browser_chat_input_resume_failed",
+                        "error": error.to_string(),
+                    }),
+                ));
+            }
+        }
+        let view = match self
+            .browser_sessions
+            .complete_operator_handoff(&session_id, &note, resume_in_chat)
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                return Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "failed",
+                    &format!("Could not resume the browser handoff: {}", error),
+                    serde_json::json!({
+                        "success": false,
+                        "session_id": session_id,
+                        "reason": "browser_handoff_resume_failed",
+                        "error": error.to_string(),
+                    }),
+                ));
+            }
+        };
+        if resume_in_chat {
+            return Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                "completed",
+                view.summary
+                    .as_deref()
+                    .unwrap_or("Browser handoff returned control to chat."),
+                serde_json::json!({
+                    "success": true,
+                    "session": view,
+                }),
+            ));
+        }
+
+        if let Some(checkpoint) = self.wait_for_browser_auto_checkpoint(&session_id).await {
+            return Ok(browser_auto_checkpoint_marker(checkpoint));
+        }
+        Ok(render_tool_completion_marker_with_data(
+            "browser_auto",
+            "running",
+            "Browser handoff was resumed. The browser task is still running.",
+            serde_json::json!({
+                "success": true,
+                "session_id": session_id,
+            }),
+        ))
+    }
+
+    async fn handle_browser_auto_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        channel: &str,
+        conversation_id: Option<&str>,
+        _message_hint: Option<&str>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        let action =
+            action_text_arg(arguments, "action").unwrap_or_else(|| "start_session".to_string());
+        match action.as_str() {
+            "snapshot" => {
+                return self
+                    .handle_browser_auto_snapshot_tool_call(arguments, conversation_id)
+                    .await;
+            }
+            "resume_handoff" => {
+                return self
+                    .handle_browser_auto_resume_handoff_tool_call(
+                        arguments,
+                        channel,
+                        conversation_id,
+                        stream_tx,
+                    )
+                    .await;
+            }
+            "start_session" => {}
+            _ => {
+                return Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "failed",
+                    "browser_auto supports start_session, snapshot, and resume_handoff.",
+                    serde_json::json!({
+                        "success": false,
+                        "reason": "unsupported_browser_auto_action",
+                        "action": action,
+                    }),
+                ));
+            }
+        }
+
+        let url = action_text_arg(arguments, "url");
+        let task = browser_auto_task_description(
+            url.as_deref(),
+            action_text_arg(arguments, "task"),
+            action_text_arg(arguments, "expectation"),
+        );
+        if task.is_empty() {
+            return Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                "needs_input",
+                "A browser task description or URL is required.",
+                serde_json::json!({
+                    "success": false,
+                    "reason": "browser_task_required",
+                }),
+            ));
+        }
+
+        let profile = match self
+            .resolve_browser_profile_for_tool(Self::browser_profile_selector_from_tool(arguments))
+            .await?
+        {
+            Ok(profile) => profile,
+            Err(payload) => {
+                let reason = payload
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("browser_profile_unresolved");
+                let message = if reason == "browser_profile_ambiguous" {
+                    "More than one saved browser profile matches the requested profile. Choose one profile id or name."
+                } else {
+                    "No saved browser profile matched the requested profile."
+                };
+                return Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "needs_input",
+                    message,
+                    payload,
+                ));
+            }
+        };
+        let profile_context = profile
+            .as_ref()
+            .map(crate::core::browser_session::BrowserSessionProfileContext::from_browser_profile);
+        let notify_fn = Self::browser_auto_notification_fn(stream_tx);
         let started = self
             .browser_sessions
             .start_session_with_profile(
@@ -5070,68 +5299,22 @@ impl Agent {
             })
         });
         if let Some(view) = checkpoint {
-            let status = view.status.clone();
-            let detail = match status.as_str() {
-                "waiting_for_operator" | "operator_claimed" | "awaiting_resume" => view
-                    .question
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("The browser task needs user input to continue.")
-                    .to_string(),
-                "failed" | "interrupted" => view
-                    .reason
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("The browser task failed.")
-                    .to_string(),
-                "ready" | "completed" => view
-                    .summary
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("The browser task reached a stable checkpoint.")
-                    .to_string(),
-                _ => "The managed browser task is still running. Do not state the requested browser outcome as complete until a later browser status confirms it.".to_string(),
-            };
+            let marker_kind = browser_auto_checkpoint_kind(&view);
+            let detail = browser_auto_checkpoint_detail(&view, marker_kind);
             let data = serde_json::json!({
-                "success": !matches!(status.as_str(), "failed" | "interrupted"),
+                "success": marker_kind.success(),
                 "session_id": started.session_id,
                 "reused_existing": started.reused_existing,
                 "task": task,
                 "profile": profile_json,
                 "session": view,
             });
-            return match status.as_str() {
-                "waiting_for_operator" | "operator_claimed" | "awaiting_resume" => {
-                    Ok(render_tool_completion_marker_with_data(
-                        "browser_auto",
-                        "needs_input",
-                        &detail,
-                        data,
-                    ))
-                }
-                "failed" | "interrupted" => {
-                    Ok(render_tool_completion_marker_with_data(
-                        "browser_auto",
-                        "failed",
-                        &detail,
-                        data,
-                    ))
-                }
-                "ready" | "completed" => {
-                    Ok(render_tool_completion_marker_with_data(
-                        "browser_auto",
-                        "completed",
-                        &detail,
-                        data,
-                    ))
-                }
-                _ => Ok(render_tool_completion_marker_with_data(
-                    "browser_auto",
-                    "running",
-                    &detail,
-                    data,
-                )),
-            };
+            return Ok(render_tool_completion_marker_with_data(
+                "browser_auto",
+                marker_kind.marker_status(),
+                &detail,
+                data,
+            ));
         }
         Ok(render_tool_completion_marker_with_data(
             "browser_auto",
@@ -5234,8 +5417,14 @@ impl Agent {
             self.handle_service_manage_tool_call(arguments, stream_tx, channel, conversation_id)
                 .await
         } else if action_name.eq_ignore_ascii_case("browser_auto") {
-            self.handle_browser_auto_tool_call(arguments, channel, conversation_id, stream_tx)
-                .await
+            self.handle_browser_auto_tool_call(
+                arguments,
+                channel,
+                conversation_id,
+                message_hint,
+                stream_tx,
+            )
+            .await
         } else if action_name.eq_ignore_ascii_case("delegate") {
             let trace_ref = Arc::new(RwLock::new(ExecutionTrace {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -7520,7 +7709,7 @@ impl Agent {
             let removed_live = self.tasks.write().await.remove(task_uuid);
             let storage_result = self.storage.delete_task(&task_id).await;
             self.background_sessions
-                .remove_child_references(&[task_id.clone()], &[], Some("agent"))
+                .remove_child_references(std::slice::from_ref(&task_id), &[], Some("agent"))
                 .await;
             if let Err(error) = storage_result {
                 return render_tool_completion_marker_with_data(
@@ -10401,6 +10590,112 @@ fn action_text_arg(arguments: &serde_json::Value, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn browser_auto_task_description(
+    url: Option<&str>,
+    task: Option<String>,
+    expectation: Option<String>,
+) -> String {
+    let base = task
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            url.map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|url| format!("Open {}", url))
+        })
+        .unwrap_or_default();
+    let Some(expectation) = expectation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return base;
+    };
+    if base.is_empty() {
+        return format!("Expected checkpoint: {}", expectation);
+    }
+    format!("{base}\n\nExpected checkpoint: {expectation}")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserAutoCheckpointKind {
+    NeedsInput,
+    Failed,
+    Completed,
+    Running,
+}
+
+impl BrowserAutoCheckpointKind {
+    fn marker_status(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs_input",
+            Self::Failed => "failed",
+            Self::Completed => "completed",
+            Self::Running => "running",
+        }
+    }
+
+    fn success(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+fn checkpoint_text(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn browser_auto_checkpoint_kind(
+    view: &crate::core::browser_session::BrowserSessionView,
+) -> BrowserAutoCheckpointKind {
+    if view.question.is_some() {
+        BrowserAutoCheckpointKind::NeedsInput
+    } else if view.reason.is_some() {
+        BrowserAutoCheckpointKind::Failed
+    } else if view.summary.is_some() {
+        BrowserAutoCheckpointKind::Completed
+    } else {
+        BrowserAutoCheckpointKind::Running
+    }
+}
+
+fn browser_auto_checkpoint_detail(
+    view: &crate::core::browser_session::BrowserSessionView,
+    kind: BrowserAutoCheckpointKind,
+) -> String {
+    match kind {
+        BrowserAutoCheckpointKind::NeedsInput => checkpoint_text(view.question.as_deref())
+            .unwrap_or("The browser task needs user input to continue.")
+            .to_string(),
+        BrowserAutoCheckpointKind::Failed => checkpoint_text(view.reason.as_deref())
+            .unwrap_or("The browser task failed.")
+            .to_string(),
+        BrowserAutoCheckpointKind::Completed => checkpoint_text(view.summary.as_deref())
+            .unwrap_or("The browser task reached a stable checkpoint.")
+            .to_string(),
+        BrowserAutoCheckpointKind::Running => "The managed browser task is still running. Do not state the requested browser outcome as complete until a later browser status confirms it.".to_string(),
+    }
+}
+
+fn browser_auto_checkpoint_marker(
+    view: crate::core::browser_session::BrowserSessionView,
+) -> String {
+    let marker_kind = browser_auto_checkpoint_kind(&view);
+    let session_id = view.id.clone();
+    let detail = browser_auto_checkpoint_detail(&view, marker_kind);
+    render_tool_completion_marker_with_data(
+        "browser_auto",
+        marker_kind.marker_status(),
+        &detail,
+        serde_json::json!({
+            "success": marker_kind.success(),
+            "session_id": session_id,
+            "session": view,
+        }),
+    )
+}
+
 fn skills_surface_json() -> serde_json::Value {
     serde_json::json!({
         "label": "Skills",
@@ -10631,15 +10926,61 @@ mod tests {
             parsed.get("exit_code").and_then(|value| value.as_i64()),
             Some(1)
         );
-        assert!(
-            parsed
-                .get("message")
-                .and_then(|value| value.as_str())
-                .is_some_and(|message| message.contains("tool stderr explains the failure"))
-        );
+        assert!(parsed
+            .get("message")
+            .and_then(|value| value.as_str())
+            .is_some_and(|message| message.contains("tool stderr explains the failure")));
         assert_eq!(
             super::super::tool_responses::tool_result_completion_success(&envelope),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn browser_auto_checkpoint_kind_uses_structured_session_fields() {
+        fn view(
+            question: Option<&str>,
+            reason: Option<&str>,
+            summary: Option<&str>,
+        ) -> crate::core::browser_session::BrowserSessionView {
+            crate::core::browser_session::BrowserSessionView {
+                id: "session-1".to_string(),
+                conversation_id: None,
+                task_description: "demo".to_string(),
+                profile_id: None,
+                profile_name: None,
+                status: "internal-status-name-does-not-drive-kind".to_string(),
+                question: question.map(str::to_string),
+                summary: summary.map(str::to_string),
+                reason: reason.map(str::to_string),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                page_url: None,
+                page_title: None,
+                live_view_enabled: false,
+                live_view_port: None,
+                live_view_path: None,
+                can_claim: false,
+                can_release: false,
+                can_complete: false,
+            }
+        }
+
+        assert_eq!(
+            browser_auto_checkpoint_kind(&view(Some("Continue?"), None, None)),
+            BrowserAutoCheckpointKind::NeedsInput
+        );
+        assert_eq!(
+            browser_auto_checkpoint_kind(&view(None, Some("Failed"), None)),
+            BrowserAutoCheckpointKind::Failed
+        );
+        assert_eq!(
+            browser_auto_checkpoint_kind(&view(None, None, Some("Done"))),
+            BrowserAutoCheckpointKind::Completed
+        );
+        assert_eq!(
+            browser_auto_checkpoint_kind(&view(None, None, None)),
+            BrowserAutoCheckpointKind::Running
         );
     }
 
@@ -10690,11 +11031,10 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(false)
         );
-        assert!(
-            gate.get("message")
-                .and_then(|value| value.as_str())
-                .is_some_and(|message| message.contains("9.2/10"))
-        );
+        assert!(gate
+            .get("message")
+            .and_then(|value| value.as_str())
+            .is_some_and(|message| message.contains("9.2/10")));
     }
 
     #[test]
@@ -10730,11 +11070,10 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("update")
         );
-        assert!(
-            gate.get("message")
-                .and_then(|value| value.as_str())
-                .is_some_and(|message| message.contains("6.4/10"))
-        );
+        assert!(gate
+            .get("message")
+            .and_then(|value| value.as_str())
+            .is_some_and(|message| message.contains("6.4/10")));
     }
 
     #[test]
@@ -10762,13 +11101,11 @@ mod tests {
             crate::runtime::parse_watch_completion(&result).expect("watch marker should parse");
 
         assert_eq!(completion.status, "failed");
-        assert!(
-            completion
-                .detail
-                .as_deref()
-                .unwrap_or_default()
-                .contains("No durable object was created")
-        );
+        assert!(completion
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No durable object was created"));
         assert_eq!(
             super::super::tool_responses::tool_result_completion_success(&result),
             Some(false)
@@ -11218,6 +11555,47 @@ mod tests {
     }
 
     #[test]
+    fn browser_auto_task_description_uses_explicit_task_without_url_prefix() {
+        let task = browser_auto_task_description(
+            Some("https://www.wikipedia.org"),
+            Some(
+                "Open https://www.wikipedia.org, search for OpenAI, then stop on the article"
+                    .to_string(),
+            ),
+            None,
+        );
+
+        assert_eq!(
+            task,
+            "Open https://www.wikipedia.org, search for OpenAI, then stop on the article"
+        );
+    }
+
+    #[test]
+    fn browser_auto_task_description_falls_back_to_url_when_task_missing() {
+        let task = browser_auto_task_description(Some("https://example.com"), None, None);
+
+        assert_eq!(task, "Open https://example.com");
+    }
+
+    #[test]
+    fn browser_auto_task_description_preserves_explicit_expectation() {
+        let task = browser_auto_task_description(
+            Some("https://www.wikipedia.org"),
+            Some("Open Wikipedia and search for OpenAI.".to_string()),
+            Some(
+                "When the OpenAI article is visible, stop and ask: \"Should I inspect the History section or the Products section?\""
+                    .to_string(),
+            ),
+        );
+
+        assert_eq!(
+            task,
+            "Open Wikipedia and search for OpenAI.\n\nExpected checkpoint: When the OpenAI article is visible, stop and ask: \"Should I inspect the History section or the Products section?\""
+        );
+    }
+
+    #[test]
     fn app_runtime_error_marker_ignores_generic_retry_copy() {
         assert!(
             Agent::detect_app_runtime_error_marker("please try again to refresh data").is_none()
@@ -11271,11 +11649,9 @@ mod tests {
             "   ",
         );
 
-        assert!(
-            result
-                .expect_err("empty body should fail")
-                .contains("empty body")
-        );
+        assert!(result
+            .expect_err("empty body should fail")
+            .contains("empty body"));
     }
 
     #[test]
@@ -11287,11 +11663,9 @@ mod tests {
             r#"{"ok":true}"#,
         );
 
-        assert!(
-            result
-                .expect_err("static app should return html")
-                .contains("did not receive HTML")
-        );
+        assert!(result
+            .expect_err("static app should return html")
+            .contains("did not receive HTML"));
     }
 
     #[test]
@@ -11303,11 +11677,9 @@ mod tests {
             "<html><body><script>const x = 1;</body></html>",
         );
 
-        assert!(
-            result
-                .expect_err("unclosed script should fail")
-                .contains("unclosed <script>")
-        );
+        assert!(result
+            .expect_err("unclosed script should fail")
+            .contains("unclosed <script>"));
     }
 
     #[test]

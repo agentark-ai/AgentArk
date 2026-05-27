@@ -145,25 +145,6 @@ pub async fn send_screenshot(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn channel_errors_have_machine_readable_codes() {
-        let error = ChannelError::not_connected("telegram", "Telegram delivery is not connected");
-
-        assert_eq!(error.code(), "channel_not_connected");
-        assert_eq!(
-            error.to_string(),
-            "ERR/channel/not_connected: Telegram delivery is not connected"
-        );
-
-        let action_error = error.as_action_error();
-        assert_eq!(action_error.code(), "channel_not_connected");
-    }
-}
-
 /// Send a video with caption to the appropriate channel
 #[allow(unused_variables, dead_code)]
 pub async fn send_video_to_channel(
@@ -187,4 +168,23 @@ pub async fn send_video_to_channel(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_errors_have_machine_readable_codes() {
+        let error = ChannelError::not_connected("telegram", "Telegram delivery is not connected");
+
+        assert_eq!(error.code(), "channel_not_connected");
+        assert_eq!(
+            error.to_string(),
+            "ERR/channel/not_connected: Telegram delivery is not connected"
+        );
+
+        let action_error = error.as_action_error();
+        assert_eq!(action_error.code(), "channel_not_connected");
+    }
 }

@@ -69,3 +69,11 @@ export type OrbitChatTranscript = {
   message_count: number;
   current?: boolean;
 };
+
+export type OrbitChatTranscriptPage = {
+  transcripts: OrbitChatTranscript[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more?: boolean;
+};

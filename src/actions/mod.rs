@@ -22,7 +22,7 @@ pub const ACTION_CATALOG_EMBEDDING_DIM: usize = 384;
 #[allow(unused_imports)]
 pub use gmail::{gmail_reply, gmail_scan};
 #[allow(unused_imports)]
-pub use research::{ResearchArgs, ResearchClient, ResearchDepth, ResearchResult, execute_research};
+pub use research::{execute_research, ResearchArgs, ResearchClient, ResearchDepth, ResearchResult};
 #[allow(unused_imports)]
 pub use search::{SearchBackend, SearchClient, SearchConfig, SearchResponse, SearchResult};
 
@@ -83,8 +83,10 @@ pub enum ActionSideEffectLevel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ActionDeliveryMode {
     /// Returns a usable result in the current turn.
+    #[default]
     Immediate,
     /// Queues work for later execution.
     Async,
@@ -92,12 +94,6 @@ pub enum ActionDeliveryMode {
     Conditional,
     /// Delivery timing depends on arguments or external configuration.
     Either,
-}
-
-impl Default for ActionDeliveryMode {
-    fn default() -> Self {
-        Self::Immediate
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -664,9 +660,11 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
         .map(|value| value.trim().to_ascii_lowercase())
         .collect::<std::collections::HashSet<_>>();
 
-    let mut meta = ActionMetadata::default();
-    meta.requires_auth = action.authorization.requires_auth;
-    meta.delivery_mode = infer_delivery_mode(&capabilities);
+    let mut meta = ActionMetadata {
+        requires_auth: action.authorization.requires_auth,
+        delivery_mode: infer_delivery_mode(&capabilities),
+        ..ActionMetadata::default()
+    };
 
     match name.as_str() {
         "current_time" => {
@@ -780,6 +778,9 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
         | "list_tasks"
         | "list_watchers"
         | "list_integrations"
+        | "integration_catalog_list"
+        | "integration_catalog_describe"
+        | "integration_catalog_status"
         | "ark_inspect"
         | "postgres_schema_inspect"
         | "postgres_query_readonly" => {

@@ -61,7 +61,7 @@ async fn wait_for_chat_stream_idle_timeout(
 ) {
     let idle_timeout_ms = idle_timeout_secs.saturating_mul(1_000);
     loop {
-        tokio::time::sleep(Duration::from_secs(idle_timeout_secs.min(30).max(1))).await;
+        tokio::time::sleep(Duration::from_secs(idle_timeout_secs.clamp(1, 30))).await;
         let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let last_activity = last_activity_ms.load(Ordering::Relaxed);
         if elapsed_ms.saturating_sub(last_activity) >= idle_timeout_ms {
@@ -242,6 +242,7 @@ pub(super) fn build_request_execution_hints(
         attachments_present: false,
         attachments: Vec::new(),
         arkorbit_context: None,
+        browser_profile_context: None,
         recent_actionable_artifacts: Vec::new(),
     }
 }
@@ -251,10 +252,12 @@ fn attach_chat_request_context_to_hints(
     attachments_present: bool,
     attachments: Vec<crate::core::ChatAttachmentHint>,
     arkorbit_context: Option<serde_json::Value>,
+    browser_profile_context: Option<serde_json::Value>,
 ) -> crate::core::RequestExecutionHints {
     hints.attachments_present = attachments_present || !attachments.is_empty();
     hints.attachments = attachments;
     hints.arkorbit_context = arkorbit_context;
+    hints.browser_profile_context = browser_profile_context;
     hints
 }
 
@@ -780,6 +783,7 @@ pub(super) async fn chat(
     let attachments_present = request.attachments_present || !request.attachments.is_empty();
     let attachments = request.attachments.clone();
     let arkorbit_context = request.arkorbit_context.clone();
+    let browser_profile_context = request.browser_profile_context.clone();
     if let Some(execution_mode) = execution_mode.as_deref() {
         tracing::debug!(
             execution_mode,
@@ -793,6 +797,9 @@ pub(super) async fn chat(
     }
     if request.arkorbit_context.is_some() {
         tracing::debug!("Chat request included ArkOrbit structural context");
+    }
+    if request.browser_profile_context.is_some() {
+        tracing::debug!("Chat request included browser profile context");
     }
     let caller_principal = maybe_caller.as_ref().map(|Extension(value)| value.clone());
     let agent_for_chat = state.agent.clone();
@@ -822,6 +829,7 @@ pub(super) async fn chat(
                 attachments_present,
                 attachments,
                 arkorbit_context,
+                browser_profile_context,
             );
             hints.recorded_user_message_id = recorded_user_message_id;
             agent_snapshot
@@ -2125,6 +2133,42 @@ pub(super) fn chat_task_terminal_status(response: &str) -> crate::core::TaskStat
     }
 }
 
+pub(super) fn chat_task_terminal_status_for_run(
+    response: &str,
+    run_status: Option<&str>,
+    user_outcome: Option<&crate::core::UserFacingOutcome>,
+) -> crate::core::TaskStatus {
+    let normalized_run_status = run_status
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    match normalized_run_status.as_deref() {
+        Some("degraded") | Some("platform_failed") => crate::core::TaskStatus::Failed {
+            error: truncate_stream_task_text(response, 240),
+        },
+        Some("needs_input") | Some("blocked") | Some("needs_stronger_model") => {
+            crate::core::TaskStatus::Paused
+        }
+        Some("cancelled") => crate::core::TaskStatus::Cancelled,
+        Some("completed") => chat_task_terminal_status(response),
+        _ => match user_outcome.map(|outcome| &outcome.status) {
+            Some(crate::core::UserFacingOutcomeStatus::Degraded)
+            | Some(crate::core::UserFacingOutcomeStatus::ServiceUnavailable) => {
+                crate::core::TaskStatus::Failed {
+                    error: truncate_stream_task_text(response, 240),
+                }
+            }
+            Some(crate::core::UserFacingOutcomeStatus::NeedsClarification)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsPermission)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsIntegration)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsCredentials)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsStrongerModel) => {
+                crate::core::TaskStatus::Paused
+            }
+            _ => chat_task_terminal_status(response),
+        },
+    }
+}
+
 pub(super) fn deep_research_failure_reason(
     response: &str,
     run_status: Option<&str>,
@@ -2210,11 +2254,7 @@ fn deep_research_topic_label(message: &str) -> String {
 }
 
 fn deep_research_plan_text(value: &str, max_chars: usize) -> String {
-    let compact = value
-        .trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_stream_task_text(&compact, max_chars)
 }
 
@@ -2283,12 +2323,11 @@ fn deep_research_focus_substeps(focus_items: &[String]) -> Vec<crate::core::Plan
 
 fn default_deep_research_plan(message: &str, task_id: &str) -> crate::core::ExecutionPlan {
     let (objective, focus_items) = deep_research_plan_focus_label(message);
-    let topic = deep_research_plan_text(&objective, 72);
     let focus_scope = deep_research_focus_scope(&focus_items);
     let mut steps = vec![
         deep_research_plan_step(
             1,
-            format!("Frame {}", topic),
+            "Frame the research question",
             format!(
                 "Turn {} into source requirements, freshness needs, and verification criteria. {}",
                 objective, focus_scope
@@ -2297,25 +2336,25 @@ fn default_deep_research_plan(message: &str, task_id: &str) -> crate::core::Exec
         ),
         deep_research_plan_step(
             2,
-            format!("Search evidence on {}", topic),
+            "Search for evidence",
             "Scan primary, recent, comparative, skeptical, and data-bearing source angles for this topic.",
             message,
         ),
         deep_research_plan_step(
             3,
-            format!("Select strongest sources for {}", topic),
-            "Rank candidate sources for relevance to the topic, dimension coverage, diversity, recency, and primary-source value.",
+            "Select strongest sources",
+            "Rank candidate sources for relevance, dimension coverage, diversity, recency, and primary-source value.",
             message,
         ),
         deep_research_plan_step(
             4,
-            format!("Read evidence across {}", topic),
+            "Read and extract evidence",
             "Open selected sources, extract cited evidence for every requested dimension, and identify coverage gaps or contradictions.",
             message,
         ),
         deep_research_plan_step(
             5,
-            format!("Synthesize recommendation on {}", topic),
+            "Synthesize the recommendation",
             "Compare positions, surface tradeoffs and uncertainty, add grounded charts when applicable, and write the final cited report.",
             message,
         ),
@@ -2408,7 +2447,11 @@ fn deep_research_plan_actions(
         .filter(|action| action.name.trim().eq_ignore_ascii_case("research"))
         .cloned()
         .collect::<Vec<_>>();
-    if scoped.is_empty() { actions } else { scoped }
+    if scoped.is_empty() {
+        actions
+    } else {
+        scoped
+    }
 }
 
 async fn generate_deep_research_plan_preview(
@@ -2417,12 +2460,6 @@ async fn generate_deep_research_plan_preview(
     task_id: &str,
 ) -> crate::core::ExecutionPlan {
     let fallback = default_deep_research_plan(message, task_id);
-    if std::env::var("AGENTARK_DEEP_RESEARCH_LLM_PLAN")
-        .map(|value| value.trim().eq_ignore_ascii_case("0"))
-        .unwrap_or(true)
-    {
-        return fallback;
-    }
     let actions = agent
         .runtime
         .list_enabled_actions()
@@ -2453,7 +2490,11 @@ async fn generate_deep_research_plan_preview(
     };
     let plan = normalize_deep_research_plan(plan, message, task_id);
     let relevance = crate::core::planner::assess_confirmation_plan_relevance(message, &plan);
-    if relevance.accepted { plan } else { fallback }
+    if relevance.accepted {
+        plan
+    } else {
+        fallback
+    }
 }
 
 fn deep_research_step_for_phase(plan: &crate::core::ExecutionPlan, phase: &str) -> (usize, String) {
@@ -2686,6 +2727,219 @@ fn compose_deep_research_report(query: &str, synthesis: &str, evidence_report: &
     output
 }
 
+fn parse_runtime_tool_completion_value(output: &str) -> Option<serde_json::Value> {
+    let payload = output
+        .trim_start()
+        .strip_prefix(crate::runtime::TOOL_COMPLETION_MARKER)?;
+    serde_json::from_str::<serde_json::Value>(payload.lines().next().unwrap_or(payload).trim()).ok()
+}
+
+fn deep_research_pdf_filename(message: &str) -> String {
+    let title = deep_research_topic_label(message);
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in title.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            last_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if !last_dash {
+            last_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            out.push(ch);
+        }
+        if out.len() >= 72 {
+            break;
+        }
+    }
+    let stem = out.trim_matches('-');
+    if stem.is_empty() {
+        "deep-research-report.pdf".to_string()
+    } else {
+        format!("{stem}.pdf")
+    }
+}
+
+fn managed_file_artifact_from_completion(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let data = value.get("data").unwrap_or(value);
+    let artifact_value = data.get("artifact")?;
+    let mut artifact = artifact_value.as_object()?.clone();
+    artifact
+        .entry("format".to_string())
+        .or_insert_with(|| serde_json::Value::String("PDF".to_string()));
+    if let Some(document) = data.get("document").and_then(|value| value.as_object()) {
+        let mut document_ref = serde_json::Map::new();
+        for key in ["id", "filename", "url", "download_url", "duplicate_skipped"] {
+            if let Some(value) = document.get(key).cloned() {
+                document_ref.insert(key.to_string(), value);
+            }
+        }
+        if !document_ref.is_empty() {
+            artifact.insert(
+                "document".to_string(),
+                serde_json::Value::Object(document_ref),
+            );
+        }
+    }
+    Some(serde_json::Value::Object(artifact))
+}
+
+fn managed_file_artifact_label(artifact: &serde_json::Value) -> String {
+    artifact
+        .get("document")
+        .and_then(|document| document.get("filename"))
+        .or_else(|| artifact.get("label"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("PDF report")
+        .to_string()
+}
+
+fn managed_file_artifact_download_href(artifact: &serde_json::Value) -> Option<String> {
+    for key in ["download_url", "url"] {
+        let Some(value) = artifact
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if value.starts_with("/api/outputs/") && !value.contains("..") && !value.contains('\\') {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn markdown_link_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn append_pdf_artifact_note(output: &str, artifact: Option<&serde_json::Value>) -> String {
+    let Some(artifact) = artifact else {
+        return output.to_string();
+    };
+    let label = managed_file_artifact_label(artifact);
+    let artifact_ref = managed_file_artifact_download_href(artifact)
+        .map(|href| format!("[{}]({})", markdown_link_label(&label), href))
+        .unwrap_or(label);
+    format!(
+        "{}\n\nPDF report saved in Documents: {}.",
+        output.trim_end(),
+        artifact_ref
+    )
+}
+
+async fn generate_deep_research_pdf_artifact(
+    app_state: &AppState,
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
+    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
+    run_id: &str,
+    channel: &str,
+    message: &str,
+    conversation_id: Option<&str>,
+    execution_profile: Option<&ChatExecutionProfile>,
+    report: &str,
+) -> Option<serde_json::Value> {
+    if !execution_profile.is_some_and(ChatExecutionProfile::wants_pdf) {
+        return None;
+    }
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "tool_start",
+        serde_json::json!({
+            "name": "pdf_generate",
+            "content": "Creating managed PDF report.",
+            "conversation_id": conversation_id,
+        }),
+        crate::core::RunEventPriority::High,
+    )
+    .await;
+
+    let agent_snapshot = Agent::snapshot(&app_state.agent).await;
+    let args = serde_json::json!({
+        "title": deep_research_topic_label(message),
+        "filename": deep_research_pdf_filename(message),
+        "style": "report",
+        "content": report,
+        "document_visible": true,
+        "metadata": {
+            "source": "deep_research",
+            "execution_profile": execution_profile.map(ChatExecutionProfile::to_value),
+        }
+    });
+    let result = agent_snapshot
+        .runtime
+        .execute_action("pdf_generate", &args)
+        .await;
+    match result {
+        Ok(output) => {
+            let artifact = parse_runtime_tool_completion_value(&output)
+                .and_then(|value| managed_file_artifact_from_completion(&value));
+            let label = artifact
+                .as_ref()
+                .map(managed_file_artifact_label)
+                .unwrap_or_else(|| "PDF report".to_string());
+            let artifact_ref = artifact
+                .as_ref()
+                .and_then(managed_file_artifact_download_href)
+                .map(|href| format!("[{}]({})", markdown_link_label(&label), href))
+                .unwrap_or(label);
+            let mut payload = serde_json::json!({
+                "name": "pdf_generate",
+                "content": format!("PDF report saved in Documents: {}.", artifact_ref),
+                "conversation_id": conversation_id,
+            });
+            if let Some(artifact) = artifact.clone() {
+                payload["artifacts"] = serde_json::json!([artifact]);
+            }
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "tool_result",
+                payload,
+                crate::core::RunEventPriority::High,
+            )
+            .await;
+            artifact
+        }
+        Err(error) => {
+            tracing::warn!("Deep research PDF generation failed: {}", error);
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "tool_result",
+                serde_json::json!({
+                    "name": "pdf_generate",
+                    "content": "Deep research completed, but PDF artifact generation failed.",
+                    "conversation_id": conversation_id,
+                }),
+                crate::core::RunEventPriority::High,
+            )
+            .await;
+            None
+        }
+    }
+}
+
 async fn synthesize_deep_research_report(
     agent: &Agent,
     query: &str,
@@ -2772,6 +3026,7 @@ async fn prepare_deep_research_plan_confirmation(
     _project_id: Option<&str>,
     attachments: &[crate::core::ChatAttachmentHint],
     user_message_already_recorded: bool,
+    execution_profile: Option<&ChatExecutionProfile>,
 ) -> anyhow::Result<()> {
     let task_id = uuid::Uuid::new_v4();
     let agent_snapshot = Agent::snapshot(&app_state.agent).await;
@@ -2799,6 +3054,7 @@ async fn prepare_deep_research_plan_confirmation(
             "channel": channel,
             "conversation_id": conversation_id,
             "deep_research": true,
+            "_execution_profile": execution_profile.map(ChatExecutionProfile::to_value),
             "attachments_present": !attachments.is_empty(),
             "attachments": attachments,
         }),
@@ -2882,7 +3138,9 @@ async fn prepare_deep_research_plan_confirmation(
             "task_id": task.id.to_string(),
             "description": description,
             "status": "paused",
+            "pause_kind": "plan_confirmation",
             "work_type": "research",
+            "source": "deep_research",
             "result_preview": "Deep research plan is awaiting confirmation.",
             "conversation_id": conversation_id,
         }),
@@ -3089,12 +3347,25 @@ async fn run_approved_deep_research_stream(
                 .await;
             }
 
+            let pdf_artifact = generate_deep_research_pdf_artifact(
+                app_state,
+                tx,
+                live_runs,
+                run_id,
+                channel,
+                message,
+                conversation_id,
+                task.execution_profile.as_ref(),
+                &output,
+            )
+            .await;
+            let final_output = append_pdf_artifact_note(&output, pdf_artifact.as_ref());
             let agent_snapshot = Agent::snapshot(&app_state.agent).await;
             persist_deep_research_chat_message(
                 &agent_snapshot,
                 conversation_id,
                 "assistant",
-                &output,
+                &final_output,
                 Some("deep_research"),
                 None,
             )
@@ -3103,13 +3374,13 @@ async fn run_approved_deep_research_stream(
                 .finalize_task(
                     task_uuid,
                     crate::core::TaskStatus::Completed,
-                    Some(truncate_stream_task_text(&output, 400)),
+                    Some(truncate_stream_task_text(&final_output, 400)),
                 )
                 .await?;
             let user_outcome =
                 agent_snapshot
                     .execution_supervisor
-                    .build_success_outcome(&output, &[], &[]);
+                    .build_success_outcome(&final_output, &[], &[]);
             send_chat_stream_event(
                 tx,
                 live_runs,
@@ -3138,7 +3409,7 @@ async fn run_approved_deep_research_stream(
                     "description": task.description,
                     "status": "completed",
                     "work_type": task.work_type,
-                    "result_preview": truncate_stream_task_text(&output, 400),
+                    "result_preview": truncate_stream_task_text(&final_output, 400),
                     "conversation_id": conversation_id,
                 }),
                 crate::core::RunEventPriority::High,
@@ -3152,7 +3423,7 @@ async fn run_approved_deep_research_stream(
                 channel,
                 message,
                 crate::core::ExecutionRunStatus::Completed,
-                Some(truncate_stream_task_text(&output, 1200)),
+                Some(truncate_stream_task_text(&final_output, 1200)),
                 None,
                 None,
                 Vec::new(),
@@ -3167,7 +3438,7 @@ async fn run_approved_deep_research_stream(
                 channel,
                 "content",
                 serde_json::json!({
-                    "content": output,
+                    "content": final_output,
                     "conversation_id": conversation_id,
                     "run_id": run_id,
                     "run_status": "completed",
@@ -3393,6 +3664,7 @@ pub(super) struct StreamedChatTask {
     pub(super) work_type: String,
     pub(super) user_message_already_recorded: bool,
     pub(super) plan_override: Option<serde_json::Value>,
+    pub(super) execution_profile: Option<ChatExecutionProfile>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -3409,6 +3681,222 @@ pub(super) struct AcceptedChatSuggestionRun {
     pub(super) before: suggestions::SuggestionRunSnapshot,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ChatExecutionProfile {
+    pub(super) work_type: String,
+    pub(super) depth: String,
+    pub(super) deliverables: Vec<String>,
+    pub(super) plan_first: bool,
+    pub(super) confidence: Option<f64>,
+    pub(super) source: String,
+}
+
+impl ChatExecutionProfile {
+    fn explicit_deep_research() -> Self {
+        Self {
+            work_type: "research".to_string(),
+            depth: "deep".to_string(),
+            deliverables: Vec::new(),
+            plan_first: false,
+            confidence: Some(1.0),
+            source: "ui_override".to_string(),
+        }
+    }
+
+    fn deep_research_override_with(semantic: Option<Self>) -> Self {
+        let mut profile = semantic.unwrap_or_else(Self::explicit_deep_research);
+        profile.work_type = "research".to_string();
+        profile.depth = "deep".to_string();
+        profile.confidence = Some(1.0);
+        profile.source = if profile.source == "semantic_classifier" {
+            "ui_override+semantic_classifier".to_string()
+        } else {
+            "ui_override".to_string()
+        };
+        profile
+    }
+
+    fn is_ui_override(&self) -> bool {
+        self.source
+            .split('+')
+            .any(|part| part.trim() == "ui_override")
+    }
+
+    fn from_classifier_value(value: &serde_json::Value, source: &str) -> Option<Self> {
+        let confidence = value.get("confidence").and_then(|value| value.as_f64());
+        if confidence.is_some_and(|value| value < 0.65) {
+            return None;
+        }
+        let work_type = normalize_chat_profile_token(
+            value.get("work_type").and_then(|value| value.as_str()),
+            &[
+                "chat",
+                "research",
+                "workspace",
+                "code",
+                "app",
+                "automation",
+                "artifact",
+            ],
+        )
+        .unwrap_or_else(|| "chat".to_string());
+        let depth = normalize_chat_profile_token(
+            value.get("depth").and_then(|value| value.as_str()),
+            &["quick", "standard", "deep"],
+        )
+        .unwrap_or_else(|| "standard".to_string());
+        let deliverables =
+            normalize_chat_profile_deliverables(value.get("deliverables")).unwrap_or_default();
+        let plan_first = value
+            .get("plan_first")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        Some(Self {
+            work_type,
+            depth,
+            deliverables,
+            plan_first,
+            confidence,
+            source: source.to_string(),
+        })
+    }
+
+    fn from_stored_value(value: &serde_json::Value) -> Option<Self> {
+        Self::from_classifier_value(
+            value,
+            value
+                .get("source")
+                .and_then(|item| item.as_str())
+                .unwrap_or("stored"),
+        )
+    }
+
+    fn routes_to_deep_research(&self) -> bool {
+        self.work_type == "research" && self.depth == "deep"
+    }
+
+    fn wants_pdf(&self) -> bool {
+        self.deliverables.iter().any(|value| value == "pdf")
+    }
+
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "work_type": self.work_type,
+            "depth": self.depth,
+            "deliverables": self.deliverables,
+            "plan_first": self.plan_first,
+            "confidence": self.confidence,
+            "source": self.source,
+        })
+    }
+}
+
+fn normalize_chat_profile_token(raw: Option<&str>, allowed: &[&str]) -> Option<String> {
+    let token = raw?.trim().to_ascii_lowercase();
+    if allowed.iter().any(|allowed| *allowed == token.as_str()) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+fn normalize_chat_profile_deliverables(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let allowed = [
+        "answer",
+        "markdown",
+        "pdf",
+        "document",
+        "app",
+        "code",
+        "automation",
+    ];
+    let values = match value? {
+        serde_json::Value::String(item) => vec![item.as_str()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for value in values {
+        if let Some(token) = normalize_chat_profile_token(Some(value), &allowed) {
+            if !out.contains(&token) {
+                out.push(token);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn extract_chat_execution_profile_value(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text.trim())
+        .ok()
+        .or_else(|| {
+            let start = text.find('{')?;
+            let end = text.rfind('}')?;
+            if end <= start {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
+        })
+}
+
+fn chat_execution_profile_classifier_timeout_ms() -> u64 {
+    std::env::var("AGENTARK_CHAT_EXECUTION_PROFILE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(500, 8_000))
+        .unwrap_or(1_500)
+}
+
+async fn infer_chat_execution_profile(
+    agent_ref: &Arc<RwLock<Agent>>,
+    message: &str,
+    attachments_present: bool,
+) -> Option<ChatExecutionProfile> {
+    let agent_snapshot = Agent::snapshot(agent_ref).await;
+    let classifier = agent_snapshot
+        .llm_for_role(&crate::core::ModelRole::Fast)
+        .clone();
+    let system = r#"Classify the user's request into an AgentArk execution profile.
+
+Return only compact JSON with this schema:
+{
+  "work_type": "chat" | "research" | "workspace" | "code" | "app" | "automation" | "artifact",
+  "depth": "quick" | "standard" | "deep",
+  "deliverables": ["answer" | "markdown" | "pdf" | "document" | "app" | "code" | "automation"],
+  "plan_first": boolean,
+  "confidence": number
+}
+
+Infer from the underlying intent and expected work, not from exact words. Use research when the request primarily needs evidence gathering and synthesis across sources. Use deep when the research is broad, multi-source, comparative, decision-grade, or expected to take multiple evidence-gathering passes. Put artifact formats in deliverables when the user expects a saved or rendered output. Set plan_first for expensive or multi-step work where a reviewable plan should be confirmed before execution. If the intent is uncertain, choose chat/standard and confidence below 0.65."#;
+    let user = format!(
+        "User request:\n{}\n\nStructured context:\nattachments_present: {}",
+        message.trim(),
+        attachments_present
+    );
+    let call = classifier.chat_classifier_bounded(system, &user, 260);
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_millis(chat_execution_profile_classifier_timeout_ms()),
+        call,
+    )
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            tracing::debug!("Chat execution profile classification failed: {}", error);
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("Chat execution profile classification timed out");
+            return None;
+        }
+    };
+    let value = extract_chat_execution_profile_value(&response.content)?;
+    ChatExecutionProfile::from_classifier_value(&value, "semantic_classifier")
+}
+
 #[derive(Clone)]
 pub(super) struct ChatStreamRunRequest {
     pub(super) message: String,
@@ -3421,9 +3909,11 @@ pub(super) struct ChatStreamRunRequest {
     pub(super) attachments_present: bool,
     pub(super) attachments: Vec<crate::core::ChatAttachmentHint>,
     pub(super) arkorbit_context: Option<serde_json::Value>,
+    pub(super) browser_profile_context: Option<serde_json::Value>,
     pub(super) caller_principal: Option<crate::actions::ActionCallerPrincipal>,
     pub(super) task_mode: ChatStreamTaskMode,
     pub(super) accepted_suggestion: Option<AcceptedChatSuggestionRun>,
+    pub(super) execution_profile: Option<ChatExecutionProfile>,
 }
 
 pub(super) struct PersistedChatStreamUserMessage {
@@ -3438,6 +3928,15 @@ pub(super) fn chat_stream_run_request_from_persisted_user_message(
     accepted_suggestion: Option<AcceptedChatSuggestionRun>,
 ) -> ChatStreamRunRequest {
     request.conversation_id = Some(persisted_user_message.conversation_id);
+    let request_execution_profile = request
+        .execution_profile
+        .as_ref()
+        .and_then(ChatExecutionProfile::from_stored_value)
+        .or_else(|| {
+            request
+                .deep_research
+                .then(ChatExecutionProfile::explicit_deep_research)
+        });
     ChatStreamRunRequest {
         message: request.message,
         channel: request.channel,
@@ -3449,9 +3948,11 @@ pub(super) fn chat_stream_run_request_from_persisted_user_message(
         attachments_present: request.attachments_present || !request.attachments.is_empty(),
         attachments: request.attachments,
         arkorbit_context: request.arkorbit_context,
+        browser_profile_context: request.browser_profile_context,
         caller_principal,
         task_mode: ChatStreamTaskMode::CreateIfNeeded,
         accepted_suggestion,
+        execution_profile: request_execution_profile,
     }
 }
 
@@ -3634,7 +4135,7 @@ async fn send_chat_stream_event(
         .map(run_event_to_sse_event)
         .unwrap_or_else(|| {
             Event::default()
-                .event(event_name.to_string())
+                .event(event_name)
                 .data(serde_json::to_string(&payload).unwrap_or_default())
         });
     let _ = tx.send(Ok(event)).await;
@@ -3803,14 +4304,16 @@ pub(super) fn spawn_chat_stream_response(
     let request_user_message_already_recorded = request.user_message_already_recorded;
     let request_recorded_user_message_id = request.recorded_user_message_id.clone();
     let project_id: Option<String> = None;
-    let deep_research = request.deep_research;
+    let legacy_deep_research = request.deep_research;
     let plan_confirmation_mode = request.plan_confirmation_mode.clone();
     let attachments_present = request.attachments_present;
     let attachments = request.attachments.clone();
     let arkorbit_context = request.arkorbit_context.clone();
+    let browser_profile_context = request.browser_profile_context.clone();
     let caller_principal = request.caller_principal.clone();
     let accepted_suggestion = request.accepted_suggestion.clone();
     let task_mode = request.task_mode.clone();
+    let requested_execution_profile = request.execution_profile.clone();
     let app_state = state.clone();
     let stream_request_id = uuid::Uuid::new_v4().to_string();
     let stream_started_at = Instant::now();
@@ -3990,6 +4493,7 @@ pub(super) fn spawn_chat_stream_response(
                                 user_message_already_recorded:
                                     request_user_message_already_recorded,
                                 plan_override: None,
+                                execution_profile: None,
                             });
                         }
                         bind_chat_task_cancellation_sender(&app_state, task_id, cancel_tx.clone())
@@ -4323,8 +4827,32 @@ pub(super) fn spawn_chat_stream_response(
             }
         }
 
-        let deep_research_plan_first = deep_research
-            && plan_confirmation_mode.as_deref() == Some("before_execution")
+        let mut execution_profile = requested_execution_profile.clone();
+        if accepted_suggestion.is_none() && task_mode_create_if_needed {
+            let profile_is_override = execution_profile
+                .as_ref()
+                .is_some_and(ChatExecutionProfile::is_ui_override);
+            if legacy_deep_research || profile_is_override {
+                let semantic_profile =
+                    infer_chat_execution_profile(&agent_ref, &message, attachments_present).await;
+                let previous_profile = execution_profile.take();
+                execution_profile = Some(ChatExecutionProfile::deep_research_override_with(
+                    semantic_profile.or(previous_profile),
+                ));
+            } else if execution_profile.is_none() {
+                execution_profile =
+                    infer_chat_execution_profile(&agent_ref, &message, attachments_present).await;
+            }
+        }
+        let profile_routes_to_deep_research = execution_profile
+            .as_ref()
+            .is_some_and(ChatExecutionProfile::routes_to_deep_research);
+        let effective_deep_research = profile_routes_to_deep_research || legacy_deep_research;
+        let semantic_deep_research_plan_first =
+            !legacy_deep_research && profile_routes_to_deep_research;
+        let deep_research_plan_first = effective_deep_research
+            && (plan_confirmation_mode.as_deref() == Some("before_execution")
+                || semantic_deep_research_plan_first)
             && task_mode_create_if_needed;
         if deep_research_plan_first {
             let result = prepare_deep_research_plan_confirmation(
@@ -4339,6 +4867,7 @@ pub(super) fn spawn_chat_stream_response(
                 project_id.as_deref(),
                 &attachments,
                 request_user_message_already_recorded,
+                execution_profile.as_ref(),
             )
             .await;
             if let Err(error) = result {
@@ -4396,7 +4925,7 @@ pub(super) fn spawn_chat_stream_response(
             return;
         }
 
-        if deep_research {
+        if effective_deep_research {
             let existing_task = tracked_task_ref.read().await.clone();
             if let Some(task) = existing_task.as_ref() {
                 let result = run_approved_deep_research_stream(
@@ -4488,6 +5017,7 @@ pub(super) fn spawn_chat_stream_response(
             let attachments_present = attachments_present;
             let attachments = attachments.clone();
             let arkorbit_context = arkorbit_context.clone();
+            let browser_profile_context = browser_profile_context.clone();
             tokio::spawn(async move {
                 let agent_snapshot = Agent::snapshot(&agent_ref).await;
                 if resume_existing_chat_task {
@@ -4508,6 +5038,7 @@ pub(super) fn spawn_chat_stream_response(
                                 attachments_present,
                                 attachments.clone(),
                                 arkorbit_context.clone(),
+                                browser_profile_context.clone(),
                             ),
                         )
                         .await
@@ -4521,6 +5052,7 @@ pub(super) fn spawn_chat_stream_response(
                         attachments_present,
                         attachments.clone(),
                         arkorbit_context.clone(),
+                        browser_profile_context.clone(),
                     );
                     hints.recorded_user_message_id = recorded_user_message_id;
                     agent_snapshot
@@ -4552,6 +5084,7 @@ pub(super) fn spawn_chat_stream_response(
                                 attachments_present,
                                 attachments,
                                 arkorbit_context,
+                                browser_profile_context,
                             ),
                         )
                         .await
@@ -4673,14 +5206,18 @@ pub(super) fn spawn_chat_stream_response(
                     }
                 }
                 if let Some(task) = tracked_task.as_ref() {
-                    let terminal_status = if deep_research {
+                    let terminal_status = if effective_deep_research {
                         deep_research_terminal_status(
                             &processed.response,
                             processed.run_status.as_deref(),
                             processed.user_outcome.as_ref(),
                         )
                     } else {
-                        chat_task_terminal_status(&processed.response)
+                        chat_task_terminal_status_for_run(
+                            &processed.response,
+                            processed.run_status.as_deref(),
+                            processed.user_outcome.as_ref(),
+                        )
                     };
                     let result_preview = truncate_stream_task_text(
                         if processed.response.trim().is_empty() {
@@ -5217,6 +5754,7 @@ pub(super) struct ResumableChatTaskRequest {
     pub(super) deep_research: bool,
     pub(super) work_type: String,
     pub(super) stored_plan_override: Option<serde_json::Value>,
+    pub(super) execution_profile: Option<ChatExecutionProfile>,
     pub(super) paused_for_plan_confirmation: bool,
 }
 
@@ -5367,6 +5905,9 @@ pub(super) fn extract_resumable_web_chat_task(
         .and_then(|value| value.as_object())
         .and_then(|value| value.get("current_plan"))
         .cloned();
+    let execution_profile = arguments
+        .get("_execution_profile")
+        .and_then(ChatExecutionProfile::from_stored_value);
 
     Ok(ResumableChatTaskRequest {
         message,
@@ -5375,6 +5916,7 @@ pub(super) fn extract_resumable_web_chat_task(
         deep_research,
         work_type,
         stored_plan_override,
+        execution_profile,
         paused_for_plan_confirmation,
     })
 }
@@ -5393,6 +5935,9 @@ pub(super) async fn chat_stream(
     }
     if request.arkorbit_context.is_some() {
         tracing::debug!("Chat stream request included ArkOrbit structural context");
+    }
+    if request.browser_profile_context.is_some() {
+        tracing::debug!("Chat stream request included browser profile context");
     }
     if let Some(response) = validate_chat_message_size(&request.message) {
         return response;
@@ -5839,4 +6384,147 @@ pub(super) async fn clear_chat(
         Json(serde_json::json!({ "status": "cleared" })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_task_status_uses_structured_run_status_before_text_fallback() {
+        assert!(matches!(
+            chat_task_terminal_status_for_run("I will keep working.", Some("blocked"), None),
+            crate::core::TaskStatus::Paused
+        ));
+        assert!(matches!(
+            chat_task_terminal_status_for_run("Partial result", Some("platform_failed"), None),
+            crate::core::TaskStatus::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn execution_profile_routes_semantic_deep_research_pdf() {
+        let profile = ChatExecutionProfile::from_classifier_value(
+            &serde_json::json!({
+                "work_type": "research",
+                "depth": "deep",
+                "deliverables": ["pdf", "document"],
+                "plan_first": true,
+                "confidence": 0.91
+            }),
+            "test",
+        )
+        .expect("valid profile");
+
+        assert!(profile.routes_to_deep_research());
+        assert!(profile.wants_pdf());
+        assert!(profile.plan_first);
+    }
+
+    #[test]
+    fn execution_profile_deep_button_override_keeps_semantic_deliverables() {
+        let semantic = ChatExecutionProfile::from_classifier_value(
+            &serde_json::json!({
+                "work_type": "artifact",
+                "depth": "standard",
+                "deliverables": ["pdf", "document"],
+                "plan_first": true,
+                "confidence": 0.9
+            }),
+            "semantic_classifier",
+        );
+        let profile = ChatExecutionProfile::deep_research_override_with(semantic);
+
+        assert!(profile.routes_to_deep_research());
+        assert!(profile.wants_pdf());
+        assert_eq!(profile.source, "ui_override+semantic_classifier");
+    }
+
+    #[test]
+    fn chat_stream_request_uses_execution_profile_over_legacy_boolean() {
+        let request = ChatRequest {
+            message: "Compare the market and make a report".to_string(),
+            channel: "web".to_string(),
+            conversation_id: None,
+            deep_research: false,
+            execution_profile: Some(serde_json::json!({
+                "work_type": "research",
+                "depth": "deep",
+                "deliverables": ["answer", "document"],
+                "plan_first": true,
+                "confidence": 1.0,
+                "source": "ui_override"
+            })),
+            plan_confirmation_mode: None,
+            execution_mode: None,
+            attachments_present: false,
+            attachments: Vec::new(),
+            arkorbit_context: None,
+            browser_profile_context: None,
+            accepted_suggestion_id: None,
+            sentinel_proposal_id: None,
+        };
+        let run_request = chat_stream_run_request_from_persisted_user_message(
+            request,
+            PersistedChatStreamUserMessage {
+                conversation_id: "conv-1".to_string(),
+                message_id: "msg-1".to_string(),
+            },
+            None,
+            None,
+        );
+        let profile = run_request.execution_profile.expect("profile");
+
+        assert!(!run_request.deep_research);
+        assert!(profile.routes_to_deep_research());
+        assert!(profile.plan_first);
+        assert!(profile.is_ui_override());
+    }
+
+    #[test]
+    fn execution_profile_does_not_promote_non_research_work() {
+        let profile = ChatExecutionProfile::from_classifier_value(
+            &serde_json::json!({
+                "work_type": "app",
+                "depth": "deep",
+                "deliverables": ["app"],
+                "plan_first": true,
+                "confidence": 0.94
+            }),
+            "test",
+        )
+        .expect("valid profile");
+
+        assert!(!profile.routes_to_deep_research());
+        assert!(!profile.wants_pdf());
+    }
+
+    #[test]
+    fn execution_profile_rejects_low_confidence_classifier_output() {
+        let profile = ChatExecutionProfile::from_classifier_value(
+            &serde_json::json!({
+                "work_type": "research",
+                "depth": "deep",
+                "deliverables": ["pdf"],
+                "plan_first": true,
+                "confidence": 0.42
+            }),
+            "test",
+        );
+
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn pdf_artifact_note_uses_managed_download_link() {
+        let artifact = serde_json::json!({
+            "label": "local-report.pdf",
+            "download_url": "/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/local-report.pdf/download"
+        });
+        let note = append_pdf_artifact_note("# Report", Some(&artifact));
+
+        assert!(note.contains(
+            "[local-report.pdf](/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/local-report.pdf/download)"
+        ));
+    }
 }

@@ -17,10 +17,15 @@ import {
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState, type ChangeEvent } from "react";
-import { api } from "../../api/client";
+import { api, downloadApiFile } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { errMessage, pickRecords, str } from "./pageHelpers";
-import { formatBytes, humanTs, RowOpsMenu } from "./workspaceUiBits";
+import {
+  formatBytes,
+  humanTs,
+  RowOpsMenu,
+  type RowMenuAction,
+} from "./workspaceUiBits";
 
 const REFRESH_MS = 8000;
 const INTERNAL_AGENTARK_DOCUMENT_ID_PREFIX = "agentark_knowledge:";
@@ -39,6 +44,7 @@ export default function DocumentsPage({
   const [error, setError] = useState<string | null>(null);
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
+  const [downloadingUrl, setDownloadingUrl] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const docsQ = useQuery({
@@ -75,6 +81,22 @@ export default function DocumentsPage({
       !contentType.startsWith(INTERNAL_AGENTARK_DOCUMENT_CONTENT_TYPE_PREFIX)
     );
   });
+
+  const handleDownloadDocument = async (
+    downloadUrl: string,
+    filename: string,
+  ) => {
+    if (!downloadUrl || downloadingUrl) return;
+    setError(null);
+    setDownloadingUrl(downloadUrl);
+    try {
+      await downloadApiFile(downloadUrl, { filename });
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setDownloadingUrl("");
+    }
+  };
 
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -243,6 +265,24 @@ export default function DocumentsPage({
               ) : (
                 docs.map((doc) => {
                   const id = str(doc.id, "");
+                  const downloadUrl = str(doc.download_url, "").trim();
+                  const actions: RowMenuAction[] = [];
+                  if (downloadUrl) {
+                    actions.push({
+                      label:
+                        downloadingUrl === downloadUrl
+                          ? "Downloading..."
+                          : "Download",
+                      disabled: Boolean(downloadingUrl),
+                      onClick: () =>
+                        handleDownloadDocument(downloadUrl, str(doc.filename)),
+                    });
+                  }
+                  actions.push({
+                    label: "Delete",
+                    tone: "error",
+                    onClick: () => deleteMutation.mutate(id),
+                  });
                   return (
                     <TableRow key={id}>
                       <TableCell>{str(doc.filename)}</TableCell>
@@ -254,13 +294,7 @@ export default function DocumentsPage({
                       </TableCell>
                       <TableCell align="right">
                         <RowOpsMenu
-                          actions={[
-                            {
-                              label: "Delete",
-                              tone: "error",
-                              onClick: () => deleteMutation.mutate(id),
-                            },
-                          ]}
+                          actions={actions}
                           ariaLabel="Document options"
                         />
                       </TableCell>
