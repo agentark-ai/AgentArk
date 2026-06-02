@@ -4,7 +4,7 @@
 //! Authenticates via personal access token (GITHUB_TOKEN env var or secure config).
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,7 @@ impl GitHubConnector {
                 .timeout(std::time::Duration::from_secs(15))
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| crate::core::net::build_outgoing_http_client(15)),
             config_dir,
         }
     }

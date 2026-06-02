@@ -221,6 +221,8 @@ mod tests {
                 public_app_bind_addr: None,
                 public_app_base_url: None,
                 release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
+                voice_sessions: Arc::new(RwLock::new(crate::core::VoiceSessionRegistry::default())),
+                webhook_dispatcher: webhooks::WebhookDispatchHandle::disabled(),
             },
             config_dir,
             data_dir,

@@ -1,7 +1,8 @@
 use crate::actions::app::{
-    AppRegistry, DynamicAppRegistration, DynamicRuntimeHandle, DynamicRuntimeLaunch,
-    RuntimePreference, generate_access_key, launch_dynamic_runtime, parse_required_inputs,
+    generate_access_key, launch_dynamic_runtime, parse_required_inputs,
     read_local_runtime_log_tail, resolve_required_env_values, runtime_preference_from_opt,
+    AppRegistry, DynamicAppRegistration, DynamicRuntimeHandle, DynamicRuntimeLaunch,
+    RuntimePreference,
 };
 use crate::executor::protocol::{
     AppActionResponse, AppDeployRequest, AppDeployResponse, AppLifecycleRequest,
@@ -11,26 +12,26 @@ use crate::executor::protocol::{
 use crate::runtime::ActionRuntime;
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
-    body::{Body, to_bytes},
+    body::{to_bytes, Body},
     extract::{
-        FromRequestParts, Path, Request, State,
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        FromRequestParts, Path, Request, State,
     },
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, delete, get, post},
+    Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
+    tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage},
 };
 
 const CONTROL_CONTAINER_NAME: &str = "agentark-control";
@@ -138,6 +139,182 @@ fn validate_internal_service_token(
     Ok(())
 }
 
+async fn wait_for_executor_shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("Executor service shutdown signal received"),
+        Err(error) => tracing::warn!("Executor service shutdown signal failed: {}", error),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerRuntimePolicy {
+    TrustedLocal,
+    ProxyOnly,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerRuntimePolicyStatus {
+    policy: DockerRuntimePolicy,
+    transport: Option<String>,
+    raw_socket_present: bool,
+}
+
+fn docker_runtime_policy_from_env() -> DockerRuntimePolicy {
+    if let Ok(policy) = std::env::var("AGENTARK_DOCKER_ACCESS_POLICY") {
+        match policy.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "off" | "none" => return DockerRuntimePolicy::Disabled,
+            "proxy_only" | "proxy-only" | "proxy" => return DockerRuntimePolicy::ProxyOnly,
+            "trusted_local" | "trusted-local" | "local" => {
+                return DockerRuntimePolicy::TrustedLocal
+            }
+            _ => {}
+        }
+    }
+
+    let deployment_mode = std::env::var("AGENTARK_DEPLOYMENT_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let runtime_isolation = std::env::var("AGENTARK_RUNTIME_ISOLATION")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if deployment_mode == "internet_facing"
+        || deployment_mode == "internet-facing"
+        || runtime_isolation == "hosted"
+        || runtime_isolation == "shared"
+    {
+        DockerRuntimePolicy::ProxyOnly
+    } else {
+        DockerRuntimePolicy::TrustedLocal
+    }
+}
+
+fn docker_host_is_raw_transport(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("unix://") || normalized.starts_with("npipe://")
+}
+
+fn docker_host_is_proxy_transport(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("tcp://")
+        || normalized.starts_with("http://")
+        || normalized.starts_with("https://")
+}
+
+fn evaluate_docker_runtime_policy(
+    policy: DockerRuntimePolicy,
+    docker_host: Option<&str>,
+    raw_socket_present: bool,
+) -> Result<DockerRuntimePolicyStatus> {
+    let transport = docker_host
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let raw_transport = transport
+        .as_deref()
+        .is_some_and(docker_host_is_raw_transport)
+        || raw_socket_present;
+    match policy {
+        DockerRuntimePolicy::TrustedLocal => Ok(DockerRuntimePolicyStatus {
+            policy,
+            transport,
+            raw_socket_present,
+        }),
+        DockerRuntimePolicy::ProxyOnly => {
+            if raw_transport {
+                anyhow::bail!(
+                    "Executor Docker policy forbids raw host Docker sockets in proxy-only mode"
+                );
+            }
+            let Some(ref transport) = transport else {
+                anyhow::bail!(
+                    "Executor Docker policy requires DOCKER_HOST to point at a constrained Docker proxy"
+                );
+            };
+            if !docker_host_is_proxy_transport(transport) {
+                anyhow::bail!("Executor Docker policy requires a TCP/HTTP Docker proxy transport");
+            }
+            Ok(DockerRuntimePolicyStatus {
+                policy,
+                transport: Some(transport.clone()),
+                raw_socket_present,
+            })
+        }
+        DockerRuntimePolicy::Disabled => {
+            if transport.is_some() || raw_socket_present {
+                anyhow::bail!("Executor Docker policy is disabled but Docker access is configured");
+            }
+            Ok(DockerRuntimePolicyStatus {
+                policy,
+                transport,
+                raw_socket_present,
+            })
+        }
+    }
+}
+
+fn current_docker_runtime_policy_status() -> Result<DockerRuntimePolicyStatus> {
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    evaluate_docker_runtime_policy(
+        docker_runtime_policy_from_env(),
+        docker_host.as_deref(),
+        std::path::Path::new("/var/run/docker.sock").exists(),
+    )
+}
+
+fn validate_raw_docker_socket_operation(operation: &str) -> Result<()> {
+    if docker_runtime_policy_from_env() != DockerRuntimePolicy::TrustedLocal {
+        anyhow::bail!(
+            "{} requires trusted-local Docker policy because it launches a helper with the host Docker socket",
+            operation
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_docker_policy_rejects_raw_unix_socket() {
+        let status = evaluate_docker_runtime_policy(
+            DockerRuntimePolicy::ProxyOnly,
+            Some("unix:///var/run/docker.sock"),
+            true,
+        );
+
+        assert!(status.is_err());
+    }
+
+    #[test]
+    fn hosted_docker_policy_accepts_proxy_without_raw_socket() {
+        let status = evaluate_docker_runtime_policy(
+            DockerRuntimePolicy::ProxyOnly,
+            Some("tcp://docker-proxy:2375"),
+            false,
+        )
+        .expect("proxy-only mode should accept an explicit Docker proxy");
+
+        assert_eq!(status.policy, DockerRuntimePolicy::ProxyOnly);
+        assert_eq!(status.transport.as_deref(), Some("tcp://docker-proxy:2375"));
+    }
+
+    #[test]
+    fn trusted_local_docker_policy_allows_default_socket() {
+        let status = evaluate_docker_runtime_policy(
+            DockerRuntimePolicy::TrustedLocal,
+            Some("unix:///var/run/docker.sock"),
+            true,
+        )
+        .expect("trusted-local mode keeps local Docker available");
+
+        assert_eq!(status.policy, DockerRuntimePolicy::TrustedLocal);
+    }
+}
+
 #[derive(Clone)]
 struct ExecutorState {
     config: ExecutorServiceConfig,
@@ -156,6 +333,7 @@ struct LoadedAppSpec {
     is_static: bool,
     entry_command: Option<String>,
     install_command: Option<String>,
+    build_command: Option<String>,
     runtime_image: Option<String>,
     runtime_preference: RuntimePreference,
     required_inputs: Vec<crate::actions::app::AppRequiredInput>,
@@ -174,6 +352,13 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
             "Workspace service",
         )?;
     }
+    let docker_policy = current_docker_runtime_policy_status()?;
+    tracing::info!(
+        policy = ?docker_policy.policy,
+        transport = ?docker_policy.transport,
+        raw_socket_present = docker_policy.raw_socket_present,
+        "Executor Docker runtime policy validated"
+    );
     let registry = AppRegistry::with_paths(config.config_dir.clone(), config.data_dir.clone());
     let _boot_report = registry.reconcile_on_boot().await;
     registry.spawn_restore_from_disk(
@@ -273,12 +458,16 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
         .with_context(|| format!("Failed to bind executor service at {}", config.bind_addr))?;
     tracing::info!("Executor service listening on {}", config.bind_addr);
     axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_executor_shutdown_signal())
         .await
-        .context("Executor service stopped unexpectedly")
+        .context("Executor service failed")
 }
 
 async fn health(State(state): State<ExecutorState>) -> impl IntoResponse {
     let restore = state.registry.restore_snapshot().await;
+    let docker_policy = current_docker_runtime_policy_status()
+        .map(|status| format!("{:?}", status.policy))
+        .unwrap_or_else(|error| format!("error: {}", error));
     Json(InternalServiceHealth {
         service: "executor".to_string(),
         mode: "executor".to_string(),
@@ -294,6 +483,7 @@ async fn health(State(state): State<ExecutorState>) -> impl IntoResponse {
             ),
             ("restore_active".to_string(), restore.active.to_string()),
             ("restore_pending".to_string(), restore.pending.to_string()),
+            ("docker_policy".to_string(), docker_policy),
         ]),
     })
 }
@@ -528,6 +718,7 @@ async fn resolve_stack_workspace_host_dir() -> Result<String> {
 }
 
 async fn spawn_stack_update_job(request: &StackUpdateRequest) -> Result<()> {
+    validate_raw_docker_socket_operation("AgentArk stack update")?;
     let host_workspace_dir = resolve_stack_workspace_host_dir().await?;
     let updater_name = format!(
         "agentark-stack-updater-{}",
@@ -953,6 +1144,7 @@ async fn load_spec(state: &ExecutorState, app_id: &str) -> Result<LoadedAppSpec>
     }
     let entry_command = crate::actions::app::app_meta_lifecycle_command(&meta, "entry_command");
     let install_command = crate::actions::app::app_meta_lifecycle_command(&meta, "install_command");
+    let build_command = crate::actions::app::app_meta_lifecycle_command(&meta, "build_command");
     let is_static = row
         .as_ref()
         .and_then(|v| v.get("is_static").and_then(|v| v.as_bool()))
@@ -967,6 +1159,7 @@ async fn load_spec(state: &ExecutorState, app_id: &str) -> Result<LoadedAppSpec>
         is_static,
         entry_command,
         install_command,
+        build_command,
         runtime_image: str_val(&meta, "runtime_image"),
         runtime_preference: runtime_preference_from_opt(
             str_val(&meta, "runtime_preference").as_deref(),
@@ -976,7 +1169,12 @@ async fn load_spec(state: &ExecutorState, app_id: &str) -> Result<LoadedAppSpec>
     })
 }
 
-async fn wait_for_runtime(registry: &AppRegistry, app_id: &str, port: u16) -> Result<()> {
+async fn wait_for_runtime(
+    registry: &AppRegistry,
+    app_id: &str,
+    port: u16,
+    proxy_path_mode: crate::actions::app::AppProxyPathMode,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if !registry.runtime_is_alive(app_id).await {
@@ -988,11 +1186,24 @@ async fn wait_for_runtime(registry: &AppRegistry, app_id: &str, port: u16) -> Re
         )
         .await
         {
-            return Ok(());
+            let readiness =
+                crate::actions::app::runtime_http_readiness_check(port, proxy_path_mode, app_id)
+                    .await;
+            if readiness.ready {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "App {} accepted TCP connections on port {} but failed HTTP readiness: {}",
+                    app_id,
+                    port,
+                    readiness.detail
+                );
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "App {} did not accept connections on port {} within 30s",
+                "App {} did not become HTTP-ready on port {} within 30s",
                 app_id,
                 port
             );
@@ -1027,6 +1238,7 @@ async fn start_dynamic(state: &ExecutorState, app_id: &str) -> Result<Value> {
     let (resolved_env, missing_sensitive, missing_config) = resolve_required_env_values(
         &state.config.config_dir,
         &state.config.data_dir,
+        Some(app_id),
         &spec.required_inputs,
         &env,
         &spec.config_values,
@@ -1063,6 +1275,7 @@ async fn start_dynamic(state: &ExecutorState, app_id: &str) -> Result<Value> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Missing entry_command"))?,
         install_command: spec.install_command.as_deref(),
+        build_command: spec.build_command.as_deref(),
         port,
         extra_env: &resolved_env,
         runtime_image: spec.runtime_image.as_deref(),
@@ -1094,7 +1307,12 @@ async fn start_dynamic(state: &ExecutorState, app_id: &str) -> Result<Value> {
         )
         .await;
     let _ = state.registry.set_enabled(app_id, true).await;
-    if let Err(error) = wait_for_runtime(&state.registry, app_id, port).await {
+    let proxy_path_mode = crate::actions::app::proxy_path_mode_for_entry_command(
+        spec.entry_command.as_deref(),
+        &spec.app_dir,
+        app_id,
+    );
+    if let Err(error) = wait_for_runtime(&state.registry, app_id, port, proxy_path_mode).await {
         let _ = state.registry.stop_runtime(app_id).await;
         let tail = read_local_runtime_log_tail(&spec.app_dir, 4096).await;
         if tail.is_empty() {
@@ -1393,6 +1611,13 @@ async fn app_deploy(
         .filter(|value| !value.trim().is_empty())
     {
         arguments.insert("install_command".to_string(), json!(value));
+    }
+    if let Some(value) = request
+        .build_command
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        arguments.insert("build_command".to_string(), json!(value));
     }
     if let Some(value) = request
         .entry_command

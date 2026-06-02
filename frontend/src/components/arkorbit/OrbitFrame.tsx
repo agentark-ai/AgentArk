@@ -21,11 +21,8 @@ import {
   Typography,
 } from "@mui/material";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
-import CodeRoundedIcon from "@mui/icons-material/CodeRounded";
-import FolderOpenRoundedIcon from "@mui/icons-material/FolderOpenRounded";
-import InsertDriveFileRoundedIcon from "@mui/icons-material/InsertDriveFileRounded";
 import { arkorbitApi } from "./api";
-import type { OrbitFileEntry, OrbitId } from "./types";
+import type { OrbitId } from "./types";
 
 type Props = {
   orbitId: OrbitId;
@@ -597,191 +594,6 @@ const fetch = (input, init = undefined) => {
 `;
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function fileKind(path: string): string {
-  if (path.endsWith(".js") || path.endsWith(".mjs")) return "JS";
-  if (path.endsWith(".json") || path.endsWith(".jsonl")) return "JSON";
-  if (path.endsWith(".html")) return "HTML";
-  if (path.endsWith(".css")) return "CSS";
-  if (path.endsWith(".md")) return "MD";
-  return "FILE";
-}
-
-async function readOrbitFile(orbitId: OrbitId, path: string): Promise<string> {
-  const normalizedPath = normalizeOrbitModulePath(path);
-  if (!normalizedPath) throw new Error("Rejected unsafe orbit file path.");
-  const response = await fetch(arkorbitApi.orbitFileUrl(orbitId, normalizedPath), {
-    credentials: "include",
-    cache: "no-store",
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(text || `Orbit file request failed (${response.status}).`);
-  }
-  return text;
-}
-
-type OrbitFilesPanelProps = {
-  orbitId: OrbitId;
-  reloadToken: number;
-  onRuntimeNotice?: (message: string) => void;
-};
-
-function OrbitFilesPanel({
-  orbitId,
-  reloadToken,
-  onRuntimeNotice,
-}: OrbitFilesPanelProps) {
-  const [open, setOpen] = useState(false);
-  const [files, setFiles] = useState<OrbitFileEntry[]>([]);
-  const [activePath, setActivePath] = useState<string | null>(null);
-  const [content, setContent] = useState("");
-  const [loadingFiles, setLoadingFiles] = useState(true);
-  const [loadingContent, setLoadingContent] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoadingFiles(true);
-    void arkorbitApi
-      .listFiles(orbitId)
-      .then((next) => {
-        if (cancelled) return;
-        setError(null);
-        setFiles(next);
-        setActivePath((current) =>
-          current && next.some((file) => file.path === current)
-            ? current
-            : next[0]?.path ?? null,
-        );
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        const message = err instanceof Error ? err.message : String(err);
-        setFiles([]);
-        setError(message);
-        onRuntimeNotice?.(message);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingFiles(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [orbitId, onRuntimeNotice, reloadToken]);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    if (!activePath) {
-      setContent("");
-      setError(null);
-      return undefined;
-    }
-    let cancelled = false;
-    setLoadingContent(true);
-    setError(null);
-    void readOrbitFile(orbitId, activePath)
-      .then((text) => {
-        if (!cancelled) setContent(text);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        const message = err instanceof Error ? err.message : String(err);
-        setContent("");
-        setError(message);
-        onRuntimeNotice?.(message);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingContent(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [activePath, open, orbitId, onRuntimeNotice, reloadToken]);
-
-  if (!open) {
-    return (
-      <button
-        type="button"
-        className="orbit-files-collapsed"
-        onClick={() => setOpen(true)}
-        aria-label="Open Orbit files"
-      >
-        <FolderOpenRoundedIcon fontSize="small" />
-        <span>Files</span>
-        <strong>{loadingFiles ? "..." : files.length}</strong>
-      </button>
-    );
-  }
-
-  return (
-    <Box className="orbit-files-panel" role="region" aria-label="Orbit files">
-      <Box className="orbit-files-header">
-        <Box className="orbit-files-title">
-          <CodeRoundedIcon fontSize="small" />
-          <span>Files</span>
-          <strong>{files.length}</strong>
-        </Box>
-        <Tooltip title="Collapse files">
-          <IconButton
-            size="small"
-            className="orbit-files-close"
-            onClick={() => setOpen(false)}
-            aria-label="Collapse Orbit files"
-          >
-            <CloseRoundedIcon fontSize="small" />
-          </IconButton>
-        </Tooltip>
-      </Box>
-      <Box className="orbit-files-content">
-        <Box className="orbit-files-list" role="listbox" aria-label="Orbit file list">
-          {files.map((file) => (
-            <button
-              key={file.path}
-              type="button"
-              role="option"
-              className={`orbit-file-row${file.path === activePath ? " is-active" : ""}`}
-              onClick={() => setActivePath(file.path)}
-              aria-selected={file.path === activePath}
-            >
-              <InsertDriveFileRoundedIcon fontSize="small" />
-              <span className="orbit-file-name">{file.path}</span>
-              <span className="orbit-file-meta">
-                {fileKind(file.path)} - {formatBytes(file.bytes)}
-              </span>
-            </button>
-          ))}
-          {!loadingFiles && files.length === 0 ? (
-            <Box className="orbit-files-empty">No files</Box>
-          ) : null}
-        </Box>
-        <Box className="orbit-file-viewer">
-          <Box className="orbit-file-viewer-header">
-            <span>{activePath ?? "No file"}</span>
-            {activePath ? <strong>{fileKind(activePath)}</strong> : null}
-          </Box>
-          <pre className="orbit-file-code" tabIndex={0}>
-            <code>
-              {error
-                ? error
-                : loadingContent
-                  ? "Loading..."
-                  : activePath
-                    ? content
-                    : ""}
-            </code>
-          </pre>
-        </Box>
-      </Box>
-    </Box>
-  );
-}
-
 type OrbitWidgetSlotProps = {
   orbitId: OrbitId;
   widget: OrbitWidgetRegistryEntry;
@@ -1017,7 +829,6 @@ export function OrbitFrame({
   const [widgets, setWidgets] = useState<OrbitWidgetRegistryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [reloadToken, setReloadToken] = useState(0);
-  const [filesReloadToken, setFilesReloadToken] = useState(0);
   const [pendingRemoveWidgetId, setPendingRemoveWidgetId] = useState<string | null>(null);
   const [removingWidget, setRemovingWidget] = useState(false);
 
@@ -1038,7 +849,6 @@ export function OrbitFrame({
       setWidgets((current) =>
         current.filter((widget, index) => widgetIdentity(widget, index)?.id !== id),
       );
-      setFilesReloadToken((prev) => prev + 1);
       try {
         await arkorbitApi.deleteWidget(orbitId, id);
         reload();
@@ -1096,7 +906,6 @@ export function OrbitFrame({
 
   useEffect(() => {
     if (externalReloadToken === 0) return;
-    setFilesReloadToken((prev) => prev + 1);
     reload();
   }, [externalReloadToken, reload]);
 
@@ -1127,7 +936,6 @@ export function OrbitFrame({
     });
     const handleFileChanged = (event: MessageEvent) => {
       const path = orbitChangedPath(event);
-      if (path) setFilesReloadToken((prev) => prev + 1);
       if (shouldReloadForPath(path)) reload();
     };
     source.addEventListener("file_changed", handleFileChanged as EventListener);
@@ -1152,11 +960,6 @@ export function OrbitFrame({
           Loading orbit
         </Typography>
       ) : null}
-      <OrbitFilesPanel
-        orbitId={orbitId}
-        reloadToken={filesReloadToken}
-        onRuntimeNotice={onRuntimeNotice}
-      />
       <Box className="orbit-frame-canvas">
         {widgets.length === 0 && !loading ? (
           <Box className="orbit-empty-canvas" aria-label="Empty Orbit canvas">

@@ -5,7 +5,7 @@
 //! - Brave Search API
 //! - DuckDuckGo (scraping, no API key needed)
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -57,7 +57,7 @@ const SEARCH_XML_ACCEPT: &str = "application/rss+xml,application/xml,text/xml;q=
 const SEARCH_BACKEND_HEALTH_KEY: &str = "search_backend_health:v1";
 const BUILTIN_BACKEND_COOLDOWN_HOURS: i64 = 24;
 
-pub const SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE: &str = "No search backend is currently available from this environment. Anonymous HTML/browser search may be blocked; configure a reachable SearXNG instance or an API-backed search provider for reliable research.";
+pub const SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE: &str = "No search backend is currently available in AgentArk right now. AgentArk includes free anonymous DuckDuckGo/browser search, but it is best-effort and not always reliable; anonymous HTML/browser search may be blocked or challenged. Configure a reachable SearXNG instance or an API-backed search provider like Serper, Brave, Exa, Tavily, Perplexity, or Firecrawl for reliable live search.";
 
 fn char_prefix(value: &str, max_chars: usize) -> &str {
     if value.chars().count() <= max_chars {
@@ -2155,9 +2155,11 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "India AI policy outlook 2026");
         assert_eq!(results[0].url, "https://example.com/policy/india-ai");
-        assert!(results[0]
-            .snippet
-            .contains("Government strategy, compute constraints"));
+        assert!(
+            results[0]
+                .snippet
+                .contains("Government strategy, compute constraints")
+        );
     }
 
     #[test]

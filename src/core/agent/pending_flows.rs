@@ -928,6 +928,16 @@ impl Agent {
             )
             .await?;
         }
+        crate::custom_apis::clear_custom_api_runtime_health(&self.storage, &api_id).await?;
+        crate::custom_apis::sync_to_runtime(
+            &self.storage,
+            &self.config_dir,
+            &self.data_dir,
+            &self.runtime,
+        )
+        .await?;
+        self.refresh_action_catalog_index("custom_api_auth_saved")
+            .await;
 
         self.clear_pending_chat_credential_prompt(conversation_id)
             .await;
@@ -1837,6 +1847,40 @@ impl Agent {
                 }
             }
         }
+        if let Some(cid) = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(pending) = self.load_pending_secret_followup(cid).await {
+                if (chrono::Utc::now() - pending.requested_at) <= chrono::Duration::minutes(30) {
+                    if let PendingSecretFollowupKind::RestartApp { app_id, title, .. } =
+                        pending.kind
+                    {
+                        let values = cleaned
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect::<HashMap<_, _>>();
+                        crate::actions::app::update_app_scoped_env_values(
+                            &self.config_dir,
+                            &self.data_dir,
+                            &app_id,
+                            &values,
+                            &[],
+                            false,
+                        )?;
+                        let mut response = format!(
+                            "Saved encrypted environment values for app '{}'.",
+                            title
+                        );
+                        if let Some(followup) = self.on_secret_saved_followup(cid).await {
+                            response.push_str("\n\n");
+                            response.push_str(&followup);
+                        }
+                        return Ok(response);
+                    }
+                }
+            }
+        }
         for (key, value) in &cleaned {
             crate::core::secrets::store_user_secret(
                 &self.config_dir,
@@ -1968,7 +2012,14 @@ impl Agent {
                 let still_missing: Vec<String> = missing_env
                     .into_iter()
                     .filter(|key| {
-                        !crate::core::secrets::has_user_secret(custom, key)
+                        let app_has_secret = crate::actions::app::app_env_secret_storage_key(
+                            &app_id,
+                            key,
+                        )
+                        .and_then(|storage_key| custom.get(&storage_key))
+                        .is_some_and(|value| !value.trim().is_empty());
+                        !app_has_secret
+                            && !crate::core::secrets::has_user_secret(custom, key)
                             && !Self::builtin_env_available_for_skill_import(&self.config, key)
                     })
                     .collect();

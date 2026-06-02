@@ -461,14 +461,22 @@ fn lock_is_active(lock: &BrowserProfileLockInfo) -> bool {
     !is_lock_expired(lock)
 }
 
-fn prune_stale_lock(profile: &mut BrowserProfileRecord) {
+fn prune_stale_lock(profile: &mut BrowserProfileRecord) -> bool {
     if profile
         .lock
         .as_ref()
         .is_some_and(|lock| !lock_is_active(lock))
     {
         profile.lock = None;
+        return true;
     }
+    false
+}
+
+fn prune_stale_locks(profiles: &mut [BrowserProfileRecord]) -> bool {
+    profiles.iter_mut().fold(false, |changed, profile| {
+        prune_stale_lock(profile) || changed
+    })
 }
 
 fn ensure_owner(value: &str) -> Result<String> {
@@ -561,7 +569,14 @@ fn merge_upsert(
 
 async fn load_profiles(storage: &Storage) -> Result<Vec<BrowserProfileRecord>> {
     let profiles: Vec<BrowserProfileRecord> = load_json(storage, BROWSER_PROFILES_KEY).await?;
-    Ok(profiles.into_iter().map(normalize_profile).collect())
+    let mut profiles = profiles
+        .into_iter()
+        .map(normalize_profile)
+        .collect::<Vec<_>>();
+    if prune_stale_locks(&mut profiles) {
+        save_profiles(storage, &profiles).await?;
+    }
+    Ok(profiles)
 }
 
 async fn save_profiles(storage: &Storage, profiles: &[BrowserProfileRecord]) -> Result<()> {
@@ -806,5 +821,23 @@ mod tests {
         sessions.reverse();
         let pruned = normalize_sessions(sessions);
         assert_eq!(pruned.len(), MAX_RECENT_SESSIONS);
+    }
+
+    #[test]
+    fn prunes_expired_profile_locks_before_listing() {
+        let expired_at = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let mut profiles = vec![BrowserProfileRecord {
+            lock: Some(BrowserProfileLockInfo {
+                owner: "browser-panel".to_string(),
+                reason: Some("manual handoff".to_string()),
+                locked_at: "2026-01-01T00:00:00Z".to_string(),
+                expires_at: Some(expired_at),
+            }),
+            ..sample_profile()
+        }];
+
+        assert!(prune_stale_locks(&mut profiles));
+        assert!(profiles[0].lock.is_none());
+        assert_eq!(build_summary(&profiles).locked, 0);
     }
 }

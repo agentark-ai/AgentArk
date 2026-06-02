@@ -8,7 +8,7 @@
 //! trips the guard a handful of times from being silently locked out, while
 //! still halting an obvious probing burst.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use once_cell::sync::Lazy;
 use sea_orm::{

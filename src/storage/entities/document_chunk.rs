@@ -10,6 +10,7 @@ pub struct Model {
     pub document_id: String,
     pub chunk_index: i32,
     pub content: String,
+    #[sea_orm(column_type = "Vector(Some(super::PGVECTOR_EMBEDDING_DIM))")]
     pub embedding: Option<PgVector>,
 }
 

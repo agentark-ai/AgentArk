@@ -117,8 +117,8 @@ goto end
 
 :update
 echo Updating AgentArk (your data will be preserved)...
-docker compose pull
-docker compose up -d
+docker compose pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
+docker compose up -d --build
 call :verify_lightpanda_async
 call :verify_gepa_async
 echo Update complete! Your data is intact.

@@ -10,7 +10,7 @@
 //! - Luma AI (Dream Machine video)
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -90,10 +90,7 @@ impl MediaProvider {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        let normalized = value
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_");
+        let normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
         match normalized.as_str() {
             "replicate" => Some(Self::Replicate),
             "stability_ai" | "stability" => Some(Self::StabilityAi),
@@ -215,7 +212,7 @@ impl MediaGenConnector {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            http: reqwest::Client::new(),
+            http: crate::core::net::default_outgoing_http_client(),
             default_image_provider: Arc::new(RwLock::new(None)),
             default_video_provider: Arc::new(RwLock::new(None)),
         }

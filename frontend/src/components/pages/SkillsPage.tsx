@@ -31,6 +31,7 @@ import MoreVertIcon from "@mui/icons-material/MoreVert";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../../lib/displayLabels";
 import type { SkillImportResponse, SkillTestResponse } from "../../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
@@ -4205,8 +4206,8 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
                           return (
                             <TableRow key={id}>
                               <TableCell>{str(hook.name, "-")}</TableCell>
-                              <TableCell>{str(hook.trigger, "-")}</TableCell>
-                              <TableCell>{str(hook.hook_type, "-")}</TableCell>
+                              <TableCell>{humanizeStatusLabel(str(hook.trigger, ""), "-")}</TableCell>
+                              <TableCell>{humanizeMachineLabel(str(hook.hook_type, ""), "-")}</TableCell>
                               <TableCell sx={{ maxWidth: 280 }}>
                                 <Typography
                                   variant="caption"
@@ -5154,7 +5155,7 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
                             color: "text.secondary",
                           }}
                         >
-                          {str(h.trigger, "-")} | {boolText(h.enabled)}
+                          {humanizeStatusLabel(str(h.trigger, ""), "-")} | {boolText(h.enabled)}
                         </Typography>
                         <Typography
                           variant="body2"

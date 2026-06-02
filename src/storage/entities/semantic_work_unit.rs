@@ -29,7 +29,7 @@ pub struct Model {
     pub metadata: Json,
     pub created_at: String,
     pub updated_at: String,
-    #[sea_orm(nullable)]
+    #[sea_orm(nullable, column_type = "Vector(Some(super::PGVECTOR_EMBEDDING_DIM))")]
     pub embedding: Option<PgVector>,
 }
 

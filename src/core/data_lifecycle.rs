@@ -65,6 +65,20 @@ pub struct DataLifecycleSettings {
     pub recall_event_retention_days: u64,
     #[serde(default = "default_recall_test_retention_days")]
     pub recall_test_retention_days: u64,
+    #[serde(default = "default_readiness_retention_days")]
+    pub readiness_retention_days: u64,
+    #[serde(default = "default_operational_memory_retention_days")]
+    pub operational_memory_retention_days: u64,
+    #[serde(default = "default_readiness_evaluation_retention_days")]
+    pub readiness_evaluation_retention_days: u64,
+    #[serde(default = "default_memory_capture_event_retention_days")]
+    pub memory_capture_event_retention_days: u64,
+    #[serde(default = "default_memory_operation_retention_days")]
+    pub memory_operation_retention_days: u64,
+    #[serde(default = "default_memory_evidence_link_retention_days")]
+    pub memory_evidence_link_retention_days: u64,
+    #[serde(default = "default_semantic_work_unit_retention_days")]
+    pub semantic_work_unit_retention_days: u64,
     #[serde(default = "default_housekeeping_interval_secs")]
     pub housekeeping_interval_secs: u64,
     #[serde(default = "default_security_cleanup_interval_days")]
@@ -165,6 +179,34 @@ fn default_recall_test_retention_days() -> u64 {
     365
 }
 
+fn default_readiness_retention_days() -> u64 {
+    30
+}
+
+fn default_operational_memory_retention_days() -> u64 {
+    180
+}
+
+fn default_readiness_evaluation_retention_days() -> u64 {
+    default_readiness_retention_days()
+}
+
+fn default_memory_capture_event_retention_days() -> u64 {
+    default_operational_memory_retention_days()
+}
+
+fn default_memory_operation_retention_days() -> u64 {
+    default_operational_memory_retention_days()
+}
+
+fn default_memory_evidence_link_retention_days() -> u64 {
+    default_operational_memory_retention_days()
+}
+
+fn default_semantic_work_unit_retention_days() -> u64 {
+    default_operational_memory_retention_days()
+}
+
 fn default_housekeeping_interval_secs() -> u64 {
     3600
 }
@@ -205,6 +247,13 @@ impl Default for DataLifecycleSettings {
             procedural_pattern_retention_days: default_procedural_pattern_retention_days(),
             recall_event_retention_days: default_recall_event_retention_days(),
             recall_test_retention_days: default_recall_test_retention_days(),
+            readiness_retention_days: default_readiness_retention_days(),
+            operational_memory_retention_days: default_operational_memory_retention_days(),
+            readiness_evaluation_retention_days: default_readiness_evaluation_retention_days(),
+            memory_capture_event_retention_days: default_memory_capture_event_retention_days(),
+            memory_operation_retention_days: default_memory_operation_retention_days(),
+            memory_evidence_link_retention_days: default_memory_evidence_link_retention_days(),
+            semantic_work_unit_retention_days: default_semantic_work_unit_retention_days(),
             housekeeping_interval_secs: default_housekeeping_interval_secs(),
             security_cleanup_interval_days: default_security_cleanup_interval_days(),
             security_cleanup_idle_threshold_secs: default_security_cleanup_idle_threshold_secs(),
@@ -260,6 +309,24 @@ impl DataLifecycleSettings {
         }
         self.recall_event_retention_days = self.recall_event_retention_days.min(MAX_RETENTION_DAYS);
         self.recall_test_retention_days = self.recall_test_retention_days.min(MAX_RETENTION_DAYS);
+        self.readiness_retention_days = self.readiness_retention_days.min(MAX_RETENTION_DAYS);
+        self.operational_memory_retention_days = self
+            .operational_memory_retention_days
+            .min(MAX_RETENTION_DAYS);
+        self.readiness_evaluation_retention_days = self
+            .readiness_evaluation_retention_days
+            .min(MAX_RETENTION_DAYS);
+        self.memory_capture_event_retention_days = self
+            .memory_capture_event_retention_days
+            .min(MAX_RETENTION_DAYS);
+        self.memory_operation_retention_days =
+            self.memory_operation_retention_days.min(MAX_RETENTION_DAYS);
+        self.memory_evidence_link_retention_days = self
+            .memory_evidence_link_retention_days
+            .min(MAX_RETENTION_DAYS);
+        self.semantic_work_unit_retention_days = self
+            .semantic_work_unit_retention_days
+            .min(MAX_RETENTION_DAYS);
         self.notification_cleanup_interval_secs = self
             .notification_cleanup_interval_secs
             .clamp(MIN_NOTIFICATION_INTERVAL_SECS, MAX_INTERVAL_SECS);
@@ -294,4 +361,64 @@ pub async fn save_data_lifecycle_settings(
     let raw = serde_json::to_vec(&normalized)?;
     storage.set(DATA_LIFECYCLE_SETTINGS_KEY, &raw).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_retain_operational_growth_without_purging_active_memory() {
+        let settings = DataLifecycleSettings::default();
+
+        assert_eq!(settings.experience_item_retention_days, 0);
+        assert_eq!(settings.procedural_pattern_retention_days, 0);
+        assert_eq!(settings.readiness_retention_days, 30);
+        assert_eq!(settings.operational_memory_retention_days, 180);
+        assert_eq!(settings.readiness_evaluation_retention_days, 30);
+        assert_eq!(settings.memory_capture_event_retention_days, 180);
+        assert_eq!(settings.memory_operation_retention_days, 180);
+        assert_eq!(settings.memory_evidence_link_retention_days, 180);
+        assert_eq!(settings.semantic_work_unit_retention_days, 180);
+    }
+
+    #[test]
+    fn normalizes_operational_memory_retention_fields() {
+        let mut settings = DataLifecycleSettings::default();
+        settings.readiness_retention_days = MAX_RETENTION_DAYS + 1;
+        settings.operational_memory_retention_days = MAX_RETENTION_DAYS + 1;
+        settings.readiness_evaluation_retention_days = MAX_RETENTION_DAYS + 1;
+        settings.memory_capture_event_retention_days = MAX_RETENTION_DAYS + 1;
+        settings.memory_operation_retention_days = MAX_RETENTION_DAYS + 1;
+        settings.memory_evidence_link_retention_days = MAX_RETENTION_DAYS + 1;
+        settings.semantic_work_unit_retention_days = MAX_RETENTION_DAYS + 1;
+
+        let normalized = settings.normalized();
+
+        assert_eq!(normalized.readiness_retention_days, MAX_RETENTION_DAYS);
+        assert_eq!(
+            normalized.operational_memory_retention_days,
+            MAX_RETENTION_DAYS
+        );
+        assert_eq!(
+            normalized.readiness_evaluation_retention_days,
+            MAX_RETENTION_DAYS
+        );
+        assert_eq!(
+            normalized.memory_capture_event_retention_days,
+            MAX_RETENTION_DAYS
+        );
+        assert_eq!(
+            normalized.memory_operation_retention_days,
+            MAX_RETENTION_DAYS
+        );
+        assert_eq!(
+            normalized.memory_evidence_link_retention_days,
+            MAX_RETENTION_DAYS
+        );
+        assert_eq!(
+            normalized.semantic_work_unit_retention_days,
+            MAX_RETENTION_DAYS
+        );
+    }
 }

@@ -63,7 +63,20 @@ import CloseIcon from "@mui/icons-material/Close";
 import FilterListRoundedIcon from "@mui/icons-material/FilterListRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Sparkles, UserRound } from "lucide-react";
+import {
+  Sparkles,
+  UserRound,
+  Box as CubeIcon,
+  Eye,
+  Image as ImageIcon,
+  Search,
+  Network,
+  Globe,
+  Lock,
+  ArrowRight,
+  type LucideIcon,
+} from "lucide-react";
+import "./chatLanding.css";
 import {
   Fragment,
   memo,
@@ -105,6 +118,7 @@ import {
 } from "../SuggestionRunDialog";
 import { WebhooksPanel } from "../WebhooksPanel";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
+import { isOmittedContentPlaceholder } from "../chat/computerPaneFileContent";
 import {
   getTunnelAccessMeta,
   getTunnelPanelPasswordPrompt,
@@ -125,6 +139,7 @@ import {
   formatUiDateTimeMeta,
   formatUiRelativeDateTimeMeta,
 } from "../../lib/dateFormat";
+import { humanizeMachineLabel } from "../../lib/displayLabels";
 import {
   isBackgroundSessionVisibleInUi,
   isOneShotReminderTask,
@@ -159,6 +174,14 @@ import {
   isAgentArkChartFence,
 } from "../chat/InlineAgentArkChart";
 import { guessCodeLanguage, renderCodeBlockLines } from "../chat/codeHighlight";
+import {
+  buildChatRunMetricItems,
+  chatRunMetricMessageFieldsFromPayload,
+  chatRunMetricsFromPayload,
+  type ChatRunMetricItem,
+  type ChatRunMetrics,
+} from "./chatRunMetrics";
+import { buildChatLiveRunArchive } from "./chatLiveRunArchive";
 
 // Chat layout mode: "split" runs the prose+action-row chat with a focused
 // Computer pane on the right. "classic" keeps the original inline timeline
@@ -601,19 +624,6 @@ function isDirectChatApprovalChoice(choice: ChatClarificationChoice): boolean {
   );
 }
 
-type ChatRunMetrics = {
-  inputTokens?: number | null;
-  outputTokens?: number | null;
-  totalTokens?: number | null;
-  cachedPromptTokens?: number | null;
-  cacheCreationPromptTokens?: number | null;
-  durationMs?: number | null;
-  timeToFirstTokenMs?: number | null;
-};
-type ChatRunMetricItem = {
-  label: string;
-  value: string;
-};
 type PasswordDialogMode = "set" | "change" | "remove";
 type RowMenuAction = {
   label: string;
@@ -873,6 +883,29 @@ function reactNodeToPlainText(node: ReactNode): string {
   return "";
 }
 
+// Like reactNodeToPlainText but recurses into element children, so we can read
+// the text of already-rendered markdown nodes (e.g. a blockquote's paragraphs)
+// to detect GitHub-style callout markers.
+function deepNodeText(node: ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node))
+    return node.map((child) => deepNodeText(child)).join("");
+  if (isValidElement<{ children?: ReactNode }>(node))
+    return deepNodeText(node.props.children);
+  return "";
+}
+
+// GitHub-style callout / admonition kinds. Pairs with the .chat-md-callout-*
+// styles in styles/20-chat-core.css.
+const CHAT_CALLOUT_META: Record<string, { label: string; icon: string }> = {
+  note: { label: "Note", icon: "ⓘ" },
+  tip: { label: "Tip", icon: "✦" },
+  important: { label: "Important", icon: "❉" },
+  warning: { label: "Warning", icon: "⚠" },
+  caution: { label: "Caution", icon: "⚠" },
+};
+
 function extractMarkdownCodeBlock(
   children: ReactNode,
 ): { className?: string; code: string } | null {
@@ -905,6 +938,7 @@ function InlineCodePreview({
   snippetId?: string;
   onOpenInWorkspace?: (request: CodePreviewOpenRequest) => void;
 }) {
+  const [copied, setCopied] = useState(false);
   const normalizedCode = (code || "").replace(/\r\n/g, "\n").replace(/\n$/, "");
   if (!normalizedCode) return null;
 
@@ -941,6 +975,18 @@ function InlineCodePreview({
           {resolvedFileName}
         </span>
         <span className="chat-md-ide-meta">{languageLabel}</span>
+        <button
+          type="button"
+          className="chat-md-ide-copy"
+          onClick={(event) => {
+            event.stopPropagation();
+            void navigator.clipboard?.writeText(normalizedCode);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1400);
+          }}
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
         {onOpenInWorkspace ? (
           <button
             type="button"
@@ -1091,7 +1137,6 @@ function latestTaskProgressFromSteps(
 }
 
 type PlanConfirmationStage =
-  | "planning"
   | "awaiting_confirmation"
   | "running"
   | "completed"
@@ -1147,14 +1192,6 @@ function planConfirmationOutlineLabel(
   return isDeepResearchPlanSource(source)
     ? "Research outline"
     : "Execution outline";
-}
-
-function planConfirmationPlanningNote(
-  source: string | null | undefined,
-): string {
-  return isDeepResearchPlanSource(source)
-    ? "Building the outline before any research starts."
-    : "Building the outline before any work starts.";
 }
 
 type ToolProgressPresentation = {
@@ -2191,6 +2228,10 @@ function streamPayloadConversationId(payload: unknown, fallback = ""): string {
   ).trim();
 }
 
+function isSyntheticStreamTokenPayload(payload: unknown): boolean {
+  return asRecord(payload).synthetic === true;
+}
+
 function streamPayloadRunId(payload: unknown, fallback = ""): string {
   const obj = asRecord(payload);
   const nested = asRecord(obj.payload);
@@ -2477,6 +2518,8 @@ function isLikelyWorkspaceFileName(pathOrName: string): boolean {
 function isLikelyWorkspaceFileContent(value: string): boolean {
   const trimmed = (value || "").trim();
   if (!trimmed) return false;
+  if (isOmittedContentPlaceholder(trimmed)) return false;
+  if (looksLikeTrailingMarkupFragment(trimmed)) return false;
   if (
     /^(written|saved|created|updated|deleted|moved|renamed)\b/i.test(trimmed) &&
     trimmed.split(/\r?\n/).length <= 3
@@ -2490,6 +2533,12 @@ function isLikelyWorkspaceFileContent(value: string): boolean {
     return false;
   }
   return true;
+}
+
+function looksLikeTrailingMarkupFragment(value: string): boolean {
+  const compact = value.trim();
+  if (!compact || compact.length > 120) return false;
+  return /^(?:<\/[a-z][\w:-]*>\s*)+$/i.test(compact);
 }
 
 function choosePreferredWorkspaceFileContent(
@@ -2531,6 +2580,29 @@ function normalizeWorkspaceFileName(pathOrName: unknown, appDir = ""): string {
   }
   normalized = normalized.replace(/^\/+/, "");
   return normalized || raw;
+}
+
+function workspaceFileDisplayPath(
+  pathOrName: string,
+  appId = "",
+  appDir = "",
+): string {
+  const normalized = normalizeWorkspaceFileName(pathOrName, appDir);
+  if (!normalized) return "";
+  const root = appId.trim()
+    ? `apps/${appId.trim()}`
+    : workspaceAppRootName(appDir)
+      ? `workspace/${workspaceAppRootName(appDir)}`
+      : "workspace";
+  const rootLower = root.toLowerCase();
+  const normalizedLower = normalized.toLowerCase();
+  if (
+    normalizedLower === rootLower ||
+    normalizedLower.startsWith(`${rootLower}/`)
+  ) {
+    return normalized;
+  }
+  return `${root}/${normalized}`.replace(/\/+/g, "/");
 }
 
 function progressFileTargetPath(
@@ -3059,6 +3131,7 @@ type ChatTranscriptItem =
       detail: string;
       status: ChatTranscriptActionStatus;
       details: ChatTranscriptActionDetail[];
+      count?: number;
     };
 
 function isTranscriptOmittedPlaceholder(value: string): boolean {
@@ -3075,6 +3148,15 @@ function normalizeTranscriptContractKey(value: string): string {
     .replace(/^_+|_+$/g, "");
 }
 
+function normalizeTranscriptFieldKey(value: string): string {
+  return (value || "")
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
 function truncateTranscriptAuditBlock(value: string, maxChars = 2400): string {
   const trimmed = value.trim();
   if (!trimmed || isTranscriptOmittedPlaceholder(trimmed)) return "";
@@ -3083,10 +3165,10 @@ function truncateTranscriptAuditBlock(value: string, maxChars = 2400): string {
 }
 
 function firstTranscriptString(records: JsonRecord[], keys: string[]): string {
-  const normalizedKeys = keys.map((key) => key.toLowerCase());
+  const normalizedKeys = keys.map(normalizeTranscriptFieldKey);
   for (const record of records) {
     for (const [key, value] of Object.entries(record)) {
-      if (!normalizedKeys.includes(key.toLowerCase())) continue;
+      if (!normalizedKeys.includes(normalizeTranscriptFieldKey(key))) continue;
       if (typeof value === "string" && value.trim()) {
         const trimmed = value.trim();
         if (isTranscriptOmittedPlaceholder(trimmed)) continue;
@@ -3250,9 +3332,12 @@ function transcriptCommandAuditFromCard(card: ActivityTimelineCard): ChatTranscr
           "tool_error",
           "error",
         ]).map((entry) => `${entry.label}:\n${entry.body}`);
+  const structuredOutput =
+    stepType === "tool_start" ? "" : transcriptReturnedOutputFromCard(card, records);
   const explicitOutput =
     streamOutputParts.join("\n\n") ||
     artifactOutputParts.join("\n\n") ||
+    structuredOutput ||
     (stepType === "tool_start"
       ? ""
       : firstTranscriptString(records, [
@@ -3284,8 +3369,14 @@ function transcriptCommandAuditFromCard(card: ActivityTimelineCard): ChatTranscr
   const outputLabel =
     card.kind === "Issue" || card.tone === "tone-error" ? "Error output" : "Output";
 
-  const cleanedCommand = truncateTranscriptAuditBlock(command, 1600);
-  const cleanedOutput = truncateTranscriptAuditBlock(output, 3200);
+  const cleanedCommand = truncateTranscriptAuditBlock(
+    redactTranscriptSensitiveText(command),
+    1600,
+  );
+  const cleanedOutput = truncateTranscriptAuditBlock(
+    redactTranscriptSensitiveText(output),
+    3200,
+  );
   if (!cleanedCommand && !cleanedOutput) return null;
   return {
     commandLabel,
@@ -3295,26 +3386,203 @@ function transcriptCommandAuditFromCard(card: ActivityTimelineCard): ChatTranscr
   };
 }
 
+function transcriptReturnedOutputFromCard(
+  card: ActivityTimelineCard,
+  records: JsonRecord[],
+): string {
+  const candidates: unknown[] = [];
+  const surface = surfaceFromCard(card);
+  for (const payload of surface?.output || []) {
+    if (payload.json != null) candidates.push(payload.json);
+    if (payload.text) candidates.push(payload.text);
+    if (payload.preview) candidates.push(payload.preview);
+  }
+
+  for (const record of records) {
+    candidates.push(record);
+  }
+
+  for (const candidate of candidates) {
+    const rendered = transcriptReturnedValueText(candidate);
+    if (rendered) return rendered;
+  }
+  return "";
+}
+
+function transcriptReturnedValueText(value: unknown): string {
+  const returnedValue = extractTranscriptReturnedValue(value);
+  if (!transcriptValueHasContent(returnedValue)) return "";
+  const sanitized = sanitizeTranscriptReturnedValue(returnedValue);
+  const rendered =
+    typeof sanitized === "string"
+      ? sanitized.trim()
+      : JSON.stringify(sanitized, null, 2);
+  return rendered ? truncateTranscriptAuditBlock(rendered, 3200) : "";
+}
+
+function extractTranscriptReturnedValue(value: unknown, depth = 0): unknown {
+  if (depth > 6 || value == null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed || isTranscriptOmittedPlaceholder(trimmed)) return null;
+    const parsed = tryParseActivityJson(trimmed);
+    if (parsed != null && parsed !== value) {
+      const nested = extractTranscriptReturnedValue(parsed, depth + 1);
+      if (transcriptValueHasContent(nested)) return nested;
+    }
+    return trimmed;
+  }
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    return value.length > 0 ? value : null;
+  }
+
+  const record = asRecord(value);
+  if (Object.keys(record).length === 0) return null;
+
+  let visibleEntries = Object.entries(record).filter(
+    ([key, entryValue]) =>
+      !transcriptTransportMetadataFieldKey(key) &&
+      !transcriptSensitiveFieldKey(key) &&
+      transcriptValueHasContent(entryValue),
+  );
+  if (visibleEntries.length === 0) {
+    visibleEntries = Object.entries(record).filter(
+      ([key, entryValue]) =>
+        !transcriptSensitiveFieldKey(key) && transcriptValueHasContent(entryValue),
+    );
+  }
+  if (visibleEntries.length === 0) return null;
+
+  const structuredEntries = visibleEntries.filter(([, entryValue]) => {
+    if (Array.isArray(entryValue)) return entryValue.length > 0;
+    const nested = asRecord(entryValue);
+    return Object.keys(nested).length > 0;
+  });
+  if (structuredEntries.length === 1) {
+    const nested = extractTranscriptReturnedValue(
+      structuredEntries[0][1],
+      depth + 1,
+    );
+    return transcriptValueHasContent(nested) ? nested : structuredEntries[0][1];
+  }
+  if (structuredEntries.length > 1) {
+    return Object.fromEntries(structuredEntries);
+  }
+  return visibleEntries.length === 1
+    ? visibleEntries[0][1]
+    : Object.fromEntries(visibleEntries);
+}
+
+function transcriptValueHasContent(value: unknown): boolean {
+  if (value == null) return false;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return Boolean(trimmed && !isTranscriptOmittedPlaceholder(trimmed));
+  }
+  if (typeof value === "number" || typeof value === "boolean") return true;
+  if (Array.isArray(value)) return value.length > 0;
+  return Object.keys(asRecord(value)).length > 0;
+}
+
+function sanitizeTranscriptReturnedValue(
+  value: unknown,
+  key = "",
+  depth = 0,
+): unknown {
+  if (transcriptSensitiveFieldKey(key)) return "[REDACTED]";
+  if (value == null || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    return redactTranscriptSensitiveText(value.trim());
+  }
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 25)
+      .map((entry) => sanitizeTranscriptReturnedValue(entry, "", depth + 1));
+  }
+  if (depth >= 6) return "[TRUNCATED]";
+
+  const out: JsonRecord = {};
+  for (const [entryKey, entryValue] of Object.entries(asRecord(value))) {
+    if (entryKey.startsWith("_")) continue;
+    if (!transcriptValueHasContent(entryValue)) continue;
+    out[entryKey] = sanitizeTranscriptReturnedValue(
+      entryValue,
+      entryKey,
+      depth + 1,
+    );
+  }
+  return out;
+}
+
+function transcriptSensitiveFieldKey(key: string): boolean {
+  const normalized = normalizeTranscriptFieldKey(key);
+  return (
+    ACTIVITY_PAYLOAD_SECRET_KEY_PATTERN.test(key) ||
+    /(?:^|_)(?:authorization|auth|cookie|cookies|set_cookie|session|credential|credentials|secret|token|password|passcode|private_key|api_key|apikey|refresh_token)(?:_|$)/i.test(
+      normalized,
+    )
+  );
+}
+
+function transcriptTransportMetadataFieldKey(key: string): boolean {
+  const normalized = normalizeTranscriptFieldKey(key);
+  if (!normalized || normalized.startsWith("_")) return true;
+  return /(?:^|_)(?:activity|call|cid|conversation|display|id|kind|label|name|ok|renderer|run|seq|sequence|state|status|stream|surface|task|time|timestamp|tool|trace|type|version)(?:_|$)/i.test(
+    normalized,
+  );
+}
+
+function redactTranscriptSensitiveText(value: string): string {
+  let text = value;
+  text = text.replace(
+    /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g,
+    "[REDACTED PRIVATE KEY]",
+  );
+  text = text.replace(
+    /\b(Bearer|Token)\s+[A-Za-z0-9._~+/=-]{16,}\b/gi,
+    "$1 [REDACTED]",
+  );
+  text = text.replace(
+    /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|secret)\s*[:=]\s*["']?[^"'\s,;]{6,}/gi,
+    "$1=[REDACTED]",
+  );
+  text = text.replace(
+    /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+    "[EMAIL]",
+  );
+  text = text.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]");
+  text = text.replace(
+    /\b(?:\+?\d[\d .()-]{7,}\d)\b/g,
+    (match) => (match.replace(/\D/g, "").length >= 10 ? "[PHONE]" : match),
+  );
+  return text;
+}
+
 function inlineToolActivityTitle(toolName: string, card: ActivityTimelineCard): string {
   const records = transcriptCardPayloadRecords(card);
   const surface = surfaceFromCard(card);
-  const structuredTitle = firstTranscriptString(records, [
+  const displayName =
+    str(surface?.tool?.displayName, "").trim() ||
+    firstTranscriptString(records, ["display_name", "displayName"]) ||
+    humanizeToolIdentifier(toolName || "tool");
+  if (displayName) return displayName;
+
+  const surfaceTitle = str(surface?.title, "").trim();
+  if (surfaceTitle) return surfaceTitle;
+  return "Tool";
+}
+
+function inlineToolActivityLabel(card: ActivityTimelineCard): string {
+  return firstTranscriptString(transcriptCardPayloadRecords(card), [
     "activity_label",
     "display_label",
     "activity_title",
     "display_title",
     "label",
   ]);
-  if (structuredTitle) return structuredTitle;
-
-  const surfaceTitle = str(surface?.title, "").trim();
-  if (surfaceTitle) return surfaceTitle;
-
-  const displayName =
-    str(surface?.tool?.displayName, "").trim() ||
-    firstTranscriptString(records, ["display_name", "displayName"]) ||
-    humanizeToolIdentifier(toolName || "tool");
-  return displayName ? `Using ${displayName}` : "Using tool";
 }
 
 function humanizeToolIdentifier(value: string): string {
@@ -3335,6 +3603,20 @@ function inlineToolActivityDetail(
   void toolName;
   const records = transcriptCardPayloadRecords(card);
   const firstValue = (keys: string[]) => firstTranscriptString(records, keys);
+  const structuredLabel = inlineToolActivityLabel(card);
+  if (structuredLabel) {
+    const title = inlineToolActivityTitle(toolName, card);
+    if (
+      normalizeToolStartIntentText(structuredLabel) !==
+      normalizeToolStartIntentText(title)
+    ) {
+      return compactTranscriptDetail(structuredLabel);
+    }
+  }
+  const fallback = compactTranscriptDetail(fallbackDetail || card.detail || card.summary);
+  if (card.stepType.trim().toLowerCase() === "tool_result" && fallback) {
+    return fallback;
+  }
   const structuredDetail = firstValue([
     "activity_detail",
     "display_detail",
@@ -3343,15 +3625,9 @@ function inlineToolActivityDetail(
   ]);
   if (structuredDetail) return compactTranscriptDetail(structuredDetail);
 
-  const detail = compactTranscriptDetail(fallbackDetail || card.detail || card.summary);
+  const detail = fallback;
   if (!detail) return "";
   return detail;
-}
-
-function transcriptStatusLabel(status: ChatTranscriptActionStatus): string {
-  if (status === "done") return "success";
-  if (status === "issue") return "issue";
-  return "running";
 }
 
 const ACTIVITY_PAYLOAD_PREVIEW_PRIORITY = [
@@ -3490,8 +3766,11 @@ function formatActivityToolName(name: string): string {
     run_tests: "Test run",
     lint_check: "Lint check",
     file_read: "Read",
+    file_search: "Search files",
     file_write: "Write",
     file_patch: "Edit",
+    file_delete: "Delete file",
+    skill_manage: "Skill",
     source_read: "Read",
     source_write: "Write",
     source_edit: "Edit",
@@ -3902,9 +4181,10 @@ function summarizeJsonActivityPayload(value: unknown): string {
   if (kind === "run_status") {
     const payload = asRecord(obj.payload);
     const userOutcome = asRecord(payload.user_outcome);
-    const runStatus = str(payload.run_status, str(payload.status, status))
-      .trim()
-      .replace(/_/g, " ");
+    const runStatus = humanizeMachineLabel(
+      str(payload.run_status, str(payload.status, status)),
+      "",
+    );
     const outcomeMessage = str(userOutcome.message, "").trim();
     const totalTokens = num(payload.total_tokens, 0);
     const durationMs = num(payload.duration_ms, 0);
@@ -4008,12 +4288,12 @@ function summarizeActivityDetail(detail: string): string {
     try {
       return summarizeJsonActivityPayload(JSON.parse(trimmed));
     } catch {
-      return "Received structured data.";
+      return compactTranscriptDetail(redactTranscriptSensitiveText(trimmed));
     }
   }
 
   if (looksLikeStructuredActivityText(trimmed)) {
-    return "Received structured data.";
+    return compactTranscriptDetail(redactTranscriptSensitiveText(trimmed));
   }
 
   if (looksLikeHtmlPayload(trimmed)) {
@@ -4182,6 +4462,64 @@ function stripAgentInternalReasoningLeaks(value: string): string {
   );
 }
 
+/**
+ * A cancelled run can leave a bare status artifact as the assistant "reply":
+ * the backend emits a "run cancelled" summary plus a "Chat run cancelled" error,
+ * which concatenate into "run cancelled Chat run cancelled". Detect when the
+ * whole message is just that artifact so we render a proper cancelled state
+ * instead of dumping the raw text. Returns false for real replies that merely
+ * mention cancellation.
+ */
+function isRunCancellationArtifact(value: string): boolean {
+  const normalized = (value || "")
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return false;
+  const stripped = normalized
+    .replace(/chat run cancell?ed/g, " ")
+    .replace(/run cancell?ed/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return stripped.length === 0;
+}
+
+/** Clean, on-palette "Run cancelled" state shown instead of the raw artifact text. */
+function CancelledRunNotice({ detail }: { detail?: string }) {
+  return (
+    <Box
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        gap: 1,
+        mt: 0.5,
+        px: 1.25,
+        py: 1,
+        borderRadius: 1.5,
+        border: "1px solid rgba(255, 190, 99, 0.3)",
+        background: "rgba(255, 190, 99, 0.06)",
+      }}
+    >
+      <StopRoundedIcon
+        fontSize="small"
+        sx={{ color: "warning.main", flex: "0 0 auto" }}
+      />
+      <Box sx={{ minWidth: 0 }}>
+        <Typography
+          variant="body2"
+          sx={{ fontWeight: 600, color: "text.primary", lineHeight: 1.3 }}
+        >
+          Run cancelled
+        </Typography>
+        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+          {detail || "This run was stopped before completion."}
+        </Typography>
+      </Box>
+    </Box>
+  );
+}
+
 function streamedTextStartsNewSentence(text: string): boolean {
   const trimmed = text.trimStart();
   if (!trimmed) return false;
@@ -4322,6 +4660,16 @@ function activityToolNameFromStep(step: JsonRecord): string {
 function transcriptStatusFromCard(
   card: ActivityTimelineCard,
 ): ChatTranscriptActionStatus {
+  const records = transcriptCardPayloadRecords(card);
+  if (
+    records.some((record) => {
+      if (record.ok === false || record.success === false) return true;
+      const status = str(record.status, str(record.state, "")).trim().toLowerCase();
+      return Boolean(status && /^(error|failed|failure|blocked|invalid)$/.test(status));
+    })
+  ) {
+    return "issue";
+  }
   const combined = `${card.kind} ${card.tone} ${card.stepType}`.toLowerCase();
   if (/issue|error|fail|blocked/.test(combined)) return "issue";
   if (/done|complete|success|result/.test(combined)) return "done";
@@ -5881,7 +6229,7 @@ function buildRunStatusActivityStep(
 
   return {
     step_type: "run_status",
-    title: `Run status: ${(effectiveStatus || "updated").replace(/_/g, " ")}`,
+    title: `Run status: ${humanizeMachineLabel(effectiveStatus || "updated")}`,
     detail,
     data: payload,
     timestamp,
@@ -7139,6 +7487,11 @@ function stripAgentControlArtifacts(text: string): string {
   out = out.replace(/<function_calls\b[\s\S]*$/gi, "");
   out = out.replace(/<invoke\b[\s\S]*$/gi, "");
   out = out.replace(/<parameter\b[\s\S]*$/gi, "");
+  out = out.replace(
+    /<agentark_internal_tool_context\b[^>]*>[\s\S]*?<\/agentark_internal_tool_context>/gi,
+    "",
+  );
+  out = out.replace(/<agentark_internal_tool_context\b[\s\S]*$/gi, "");
   // 2. Legacy JSON envelope: `{"agent_action_scope":"expand", ...}`. Strip
   // wherever it appears so it can't render as prose. Tight pattern; only
   // matches the specific control-protocol shape, never legitimate JSON.
@@ -7798,6 +8151,31 @@ function MarkdownBody({
           {children}
         </code>
       );
+    },
+    blockquote({ children }) {
+      const raw = deepNodeText(children);
+      const match = raw.match(
+        /^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*\n?([\s\S]*)$/i,
+      );
+      if (match) {
+        const kind = match[1].toLowerCase();
+        const body = match[2].trim();
+        const meta = CHAT_CALLOUT_META[kind] ?? CHAT_CALLOUT_META.note;
+        return (
+          <div className={`chat-md-callout chat-md-callout-${kind}`}>
+            <span className="chat-md-callout-icon" aria-hidden="true">
+              {meta.icon}
+            </span>
+            <div className="chat-md-callout-body">
+              <span className="chat-md-callout-label">{meta.label}</span>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+                {body}
+              </ReactMarkdown>
+            </div>
+          </div>
+        );
+      }
+      return <blockquote>{children}</blockquote>;
     },
   };
 
@@ -9033,7 +9411,7 @@ function documentFileStem(value: string): string {
 function formatExecutionPlanStatusLabel(status: string): string {
   const normalized = str(status, "").trim().toLowerCase();
   if (!normalized) return "pending";
-  return normalized.replace(/_/g, " ");
+  return humanizeMachineLabel(normalized);
 }
 
 function buildExecutionPlanExportSection(
@@ -9319,164 +9697,186 @@ function charsLabel(value: unknown): string {
   return `${Math.round(amount).toLocaleString()} chars`;
 }
 
-function positiveRunMetric(value: unknown): number | null {
-  const amount = num(value, Number.NaN);
-  if (!Number.isFinite(amount) || amount <= 0) return null;
-  return amount;
-}
-
-const RUN_METRIC_INPUT_KEYS = [
-  "input_tokens",
-  "inputTokens",
-  "prompt_tokens",
-  "promptTokens",
-];
-const RUN_METRIC_OUTPUT_KEYS = [
-  "output_tokens",
-  "outputTokens",
-  "completion_tokens",
-  "completionTokens",
-];
-const RUN_METRIC_TOTAL_KEYS = ["total_tokens", "totalTokens"];
-const RUN_METRIC_CACHED_PROMPT_KEYS = [
-  "cached_prompt_tokens",
-  "cachedPromptTokens",
-  "cache_read_tokens",
-  "cacheReadTokens",
-];
-const RUN_METRIC_CACHE_CREATION_KEYS = [
-  "cache_creation_prompt_tokens",
-  "cacheCreationPromptTokens",
-  "cache_creation_tokens",
-  "cacheCreationTokens",
-];
-const RUN_METRIC_DURATION_KEYS = ["duration_ms", "durationMs"];
-const RUN_METRIC_FIRST_TOKEN_KEYS = [
-  "time_to_first_token_ms",
-  "timeToFirstTokenMs",
-  "first_token_ms",
-  "firstTokenMs",
-];
-
-function runMetricSourceRecords(payload: unknown): JsonRecord[] {
-  const obj = asRecord(payload);
-  const nested = asRecord(obj.payload);
-  return [
-    obj,
-    nested,
-    asRecord(obj.usage),
-    asRecord(nested.usage),
-    asRecord(obj.metrics),
-    asRecord(nested.metrics),
-  ].filter((record) => Object.keys(record).length > 0);
-}
-
-function positiveRunMetricFromPayload(
-  payload: unknown,
-  keys: readonly string[],
-): number | null {
-  for (const record of runMetricSourceRecords(payload)) {
-    for (const key of keys) {
-      const value = positiveRunMetric(record[key]);
-      if (value != null) return value;
-    }
-  }
-  return null;
-}
-
-function chatRunMetricsFromPayload(payload: unknown): ChatRunMetrics {
-  const inputTokens = positiveRunMetricFromPayload(payload, RUN_METRIC_INPUT_KEYS);
-  const outputTokens = positiveRunMetricFromPayload(payload, RUN_METRIC_OUTPUT_KEYS);
-  const explicitTotalTokens = positiveRunMetricFromPayload(
-    payload,
-    RUN_METRIC_TOTAL_KEYS,
+function ChatRunMetricsCard({
+  metrics,
+  keyPrefix,
+}: {
+  metrics: ChatRunMetrics;
+  keyPrefix: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const inputTokens = Math.max(0, Math.round(metrics.inputTokens ?? 0));
+  const outputTokens = Math.max(0, Math.round(metrics.outputTokens ?? 0));
+  const cachedTokens = Math.max(0, Math.round(metrics.cachedPromptTokens ?? 0));
+  const cacheCreationTokens = Math.max(
+    0,
+    Math.round(metrics.cacheCreationPromptTokens ?? 0),
   );
-  const durationMs = positiveRunMetricFromPayload(payload, RUN_METRIC_DURATION_KEYS);
-  const cachedPromptTokens = positiveRunMetricFromPayload(
-    payload,
-    RUN_METRIC_CACHED_PROMPT_KEYS,
+  const explicitTotal = Math.max(0, Math.round(metrics.totalTokens ?? 0));
+  const totalTokens = Math.max(explicitTotal, inputTokens + outputTokens);
+  const durationMs = metrics.durationMs ?? null;
+  const ttftMs = metrics.timeToFirstTokenMs ?? null;
+  // Model/LLM latency awareness: tier the provider response time so slowness is
+  // visible at a glance. Thresholds are deliberately simple and tunable.
+  const modelLatencyMs = metrics.modelLatencyMs ?? null;
+  const latencyTier =
+    modelLatencyMs == null
+      ? null
+      : modelLatencyMs <= 8000
+        ? "good"
+        : modelLatencyMs <= 20000
+          ? "fair"
+          : "slow";
+  const latencyLabel =
+    latencyTier === "good" ? "Good" : latencyTier === "fair" ? "Fair" : "Slow";
+  if (totalTokens <= 0) return null;
+  const inputPct = totalTokens > 0 ? (inputTokens / totalTokens) * 100 : 0;
+  const outputPct = totalTokens > 0 ? (outputTokens / totalTokens) * 100 : 0;
+  const cachedPctOfInput =
+    inputTokens > 0 ? Math.min(100, (cachedTokens / inputTokens) * 100) : 0;
+  const cacheBadge =
+    cachedTokens > 0 ? `${cachedPctOfInput.toFixed(0)}% cached` : null;
+  const formatMs = (ms: number) =>
+    ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`;
+  return (
+    <>
+      <button
+        type="button"
+        className="chat-run-metrics-trigger"
+        onClick={() => setOpen(true)}
+        aria-label={`Show token usage: ${totalTokens.toLocaleString()} tokens`}
+        data-key={keyPrefix}
+      >
+        <span className="chat-run-metrics-trigger-number">
+          {totalTokens.toLocaleString()}
+        </span>
+        <span className="chat-run-metrics-trigger-label">tokens</span>
+        {cacheBadge ? (
+          <span className="chat-run-metrics-trigger-badge">{cacheBadge}</span>
+        ) : null}
+        {latencyTier && modelLatencyMs != null ? (
+          <span
+            className={`chat-run-latency-chip tone-${latencyTier}`}
+            aria-label={`Model latency: ${latencyLabel}, ${formatMs(modelLatencyMs)}`}
+          >
+            <span className="chat-run-latency-dot" aria-hidden="true" />
+            {latencyLabel} · {formatMs(modelLatencyMs)}
+          </span>
+        ) : null}
+        <ChevronRightRoundedIcon
+          className="chat-run-metrics-trigger-chevron"
+          fontSize="inherit"
+          aria-hidden="true"
+        />
+      </button>
+      <Dialog
+        open={open}
+        onClose={() => setOpen(false)}
+        maxWidth="xs"
+        fullWidth
+        slotProps={{ paper: { className: "chat-run-metrics-dialog-paper" } }}
+      >
+        <DialogTitle className="chat-run-metrics-dialog-title">
+          <span className="chat-run-metrics-dialog-total">
+            {totalTokens.toLocaleString()}
+          </span>
+          <span className="chat-run-metrics-dialog-total-suffix">
+            tokens · this turn
+          </span>
+        </DialogTitle>
+        <DialogContent className="chat-run-metrics-dialog-content">
+          <div className="chat-run-metrics-stack-bar" aria-hidden="true">
+            <div
+              className="chat-run-metrics-stack-input"
+              style={{ width: `${inputPct}%` }}
+            />
+            <div
+              className="chat-run-metrics-stack-output"
+              style={{ width: `${outputPct}%` }}
+            />
+          </div>
+          <div className="chat-run-metrics-row">
+            <span className="chat-run-metrics-swatch chat-run-metrics-swatch-input" />
+            <span className="chat-run-metrics-row-label">Input</span>
+            <span className="chat-run-metrics-row-value">
+              {inputTokens.toLocaleString()}
+            </span>
+          </div>
+          <div className="chat-run-metrics-row">
+            <span className="chat-run-metrics-swatch chat-run-metrics-swatch-output" />
+            <span className="chat-run-metrics-row-label">Output</span>
+            <span className="chat-run-metrics-row-value">
+              {outputTokens.toLocaleString()}
+            </span>
+          </div>
+          {cachedTokens > 0 ? (
+            <>
+              <div className="chat-run-metrics-section-divider" />
+              <div className="chat-run-metrics-cache-header">
+                <span className="chat-run-metrics-cache-label">Cache hit</span>
+                <span className="chat-run-metrics-cache-percent">
+                  {cachedPctOfInput.toFixed(0)}%
+                </span>
+              </div>
+              <div className="chat-run-metrics-cache-bar" aria-hidden="true">
+                <div
+                  className="chat-run-metrics-cache-fill"
+                  style={{ width: `${cachedPctOfInput}%` }}
+                />
+              </div>
+              <div className="chat-run-metrics-row chat-run-metrics-row-sub">
+                <span className="chat-run-metrics-row-label">Cached prompt</span>
+                <span className="chat-run-metrics-row-value">
+                  {cachedTokens.toLocaleString()}
+                </span>
+              </div>
+              {cacheCreationTokens > 0 ? (
+                <div className="chat-run-metrics-row chat-run-metrics-row-sub">
+                  <span className="chat-run-metrics-row-label">Cache write</span>
+                  <span className="chat-run-metrics-row-value">
+                    {cacheCreationTokens.toLocaleString()}
+                  </span>
+                </div>
+              ) : null}
+            </>
+          ) : null}
+          {ttftMs != null || durationMs != null || modelLatencyMs != null ? (
+            <>
+              <div className="chat-run-metrics-section-divider" />
+              {latencyTier && modelLatencyMs != null ? (
+                <div className="chat-run-metrics-row chat-run-metrics-row-sub">
+                  <span className="chat-run-metrics-row-label">Model latency</span>
+                  <span
+                    className={`chat-run-metrics-row-value chat-run-latency-value tone-${latencyTier}`}
+                  >
+                    {latencyLabel} · {formatMs(modelLatencyMs)}
+                  </span>
+                </div>
+              ) : null}
+              {ttftMs != null ? (
+                <div className="chat-run-metrics-row chat-run-metrics-row-sub">
+                  <span className="chat-run-metrics-row-label">
+                    Time to first token
+                  </span>
+                  <span className="chat-run-metrics-row-value">
+                    {formatMs(ttftMs)}
+                  </span>
+                </div>
+              ) : null}
+              {durationMs != null ? (
+                <div className="chat-run-metrics-row chat-run-metrics-row-sub">
+                  <span className="chat-run-metrics-row-label">Total time</span>
+                  <span className="chat-run-metrics-row-value">
+                    {formatMs(durationMs)}
+                  </span>
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </>
   );
-  const cacheCreationPromptTokens = positiveRunMetricFromPayload(
-    payload,
-    RUN_METRIC_CACHE_CREATION_KEYS,
-  );
-  const timeToFirstTokenMs = positiveRunMetricFromPayload(
-    payload,
-    RUN_METRIC_FIRST_TOKEN_KEYS,
-  );
-  const totalTokens =
-    explicitTotalTokens ??
-    (inputTokens != null || outputTokens != null
-      ? (inputTokens ?? 0) + (outputTokens ?? 0)
-      : null);
-  return {
-    ...(inputTokens != null ? { inputTokens } : {}),
-    ...(outputTokens != null ? { outputTokens } : {}),
-    ...(totalTokens != null ? { totalTokens } : {}),
-    ...(cachedPromptTokens != null ? { cachedPromptTokens } : {}),
-    ...(cacheCreationPromptTokens != null
-      ? { cacheCreationPromptTokens }
-      : {}),
-    ...(durationMs != null ? { durationMs } : {}),
-    ...(timeToFirstTokenMs != null ? { timeToFirstTokenMs } : {}),
-  };
-}
-
-function buildChatRunMetricItems(metrics: ChatRunMetrics): ChatRunMetricItem[] {
-  const nonNegativeMetric = (value: unknown): number => {
-    const amount = num(value, 0);
-    if (!Number.isFinite(amount) || amount < 0) return 0;
-    return amount;
-  };
-  const inputTokens = nonNegativeMetric(metrics.inputTokens);
-  const outputTokens = nonNegativeMetric(metrics.outputTokens);
-  const cachedPromptTokens = nonNegativeMetric(metrics.cachedPromptTokens);
-  const cacheCreationPromptTokens = nonNegativeMetric(
-    metrics.cacheCreationPromptTokens,
-  );
-  const explicitTotalTokens = positiveRunMetric(metrics.totalTokens);
-  const totalTokens =
-    explicitTotalTokens ??
-    inputTokens + outputTokens;
-  if (totalTokens <= 0 && inputTokens <= 0 && outputTokens <= 0) return [];
-
-  const items: ChatRunMetricItem[] = [
-    { label: "Total tokens", value: Math.round(totalTokens).toLocaleString() },
-    { label: "Input tokens", value: Math.round(inputTokens).toLocaleString() },
-    { label: "Output tokens", value: Math.round(outputTokens).toLocaleString() },
-  ];
-  if (cachedPromptTokens > 0) {
-    items.push({
-      label: "Cached prompt",
-      value: Math.round(cachedPromptTokens).toLocaleString(),
-    });
-  }
-  if (cacheCreationPromptTokens > 0) {
-    items.push({
-      label: "Cache write",
-      value: Math.round(cacheCreationPromptTokens).toLocaleString(),
-    });
-  }
-  return items;
-}
-
-function chatRunMetricMessageFieldsFromPayload(payload: unknown): JsonRecord {
-  const metrics = chatRunMetricsFromPayload(payload);
-  const fields: JsonRecord = {};
-  if (metrics.inputTokens != null) fields.input_tokens = metrics.inputTokens;
-  if (metrics.outputTokens != null) fields.output_tokens = metrics.outputTokens;
-  if (metrics.totalTokens != null) fields.total_tokens = metrics.totalTokens;
-  if (metrics.cachedPromptTokens != null) {
-    fields.cached_prompt_tokens = metrics.cachedPromptTokens;
-  }
-  if (metrics.cacheCreationPromptTokens != null) {
-    fields.cache_creation_prompt_tokens = metrics.cacheCreationPromptTokens;
-  }
-  if (metrics.durationMs != null) fields.duration_ms = metrics.durationMs;
-  if (metrics.timeToFirstTokenMs != null) {
-    fields.time_to_first_token_ms = metrics.timeToFirstTokenMs;
-  }
-  return fields;
 }
 
 function promptProposalStatusColor(
@@ -9499,9 +9899,7 @@ function promptCanarySafetyStatusColor(
 }
 
 function humanizeStatusLabel(value: string): string {
-  const normalized = value.trim();
-  if (!normalized) return "-";
-  return normalized.replace(/_/g, " ");
+  return humanizeMachineLabel(value, "-");
 }
 
 function promptProposalRiskColor(
@@ -9884,6 +10282,20 @@ const CHAT_STARTER_CATEGORY_META: Record<
   },
 };
 
+const CHAT_STARTER_CATEGORY_ICON: Record<ChatStarterCategoryId, LucideIcon> = {
+  build: CubeIcon,
+  watch: Eye,
+  background: ImageIcon,
+  research: Search,
+  swarm: Network,
+  browser: Globe,
+  security: Lock,
+  advanced: Sparkles,
+};
+
+const starterTabIcon = (id: ChatStarterTabId): LucideIcon =>
+  id === "all" ? Sparkles : CHAT_STARTER_CATEGORY_ICON[id];
+
 const CHAT_STARTER_CATEGORY_ORDER: ChatStarterCategoryId[] = [
   "build",
   "watch",
@@ -9906,14 +10318,14 @@ const CHAT_STARTER_TAB_ORDER: ChatStarterTabId[] = [
 ];
 
 const CHAT_STARTER_TAB_LABELS: Record<ChatStarterTabId, string> = {
-  all: "suggested",
-  build: "buildDeploy",
-  watch: "watchersDashboards",
-  background: "backgroundSessions",
-  research: "deepResearch",
-  swarm: "swarm",
-  browser: "browserAutomation",
-  security: "accessPermissions",
+  all: "Suggested",
+  build: "Build",
+  watch: "Watchers",
+  background: "Background",
+  research: "Research",
+  swarm: "Swarm",
+  browser: "Browser",
+  security: "Access",
 };
 
 const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
@@ -9923,7 +10335,7 @@ const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
     summary:
       "Create a personal finance dashboard with budgets, charts, CSV import/export, SQLite, and a local link.",
     prompt:
-      "Build me a personal finance tracker dashboard with budgets, charts, CSV import/export, dark mode, mobile support, local SQLite storage, and deploy it locally with a link.",
+      "Build me a personal finance tracker dashboard with budgets, charts, CSV import/export, dark mode, mobile support and deploy it locally with a link.",
     category: "build",
     defaultVisible: true,
   },
@@ -9974,12 +10386,12 @@ const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
     category: "background",
   },
   {
-    id: "india-ai-research",
-    title: "Research India AI strategy",
+    id: "ai-environmental-impact-research",
+    title: "Research AI's environmental footprint",
     summary:
-      "Produce a source-backed view on AI investment, compute, risks, and policy options.",
+      "Produce a source-backed view on AI infrastructure's energy, water, carbon, and policy tradeoffs.",
     prompt:
-      "Research whether India should aggressively expand domestic AI research investment, frontier-model infrastructure, and public AI compute between 2026 and 2040, including capacity, strategy choices, economic upside, risks, global comparisons, and realistic policy options.",
+      "Research the strategic question of whether aggressively expanding AI research investment, frontier-model infrastructure, and compute capacity over the next 5–10 years is environmentally sustainable. Cover electricity demand, cooling water use, carbon emissions, grid and siting impact, supply-chain footprint, mitigation options (efficiency, renewable colocation, model right-sizing), regional comparisons, and realistic policy responses.",
     category: "research",
     defaultVisible: true,
     deepResearch: true,
@@ -10027,15 +10439,6 @@ const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
     summary:
       "Go to a login page and handle the browser steps directly inside the task.",
     prompt: "Go to https://news.ycombinator.com/login and log in for me.",
-    category: "browser",
-  },
-  {
-    id: "kaggle-skill",
-    title: "Read a skill page first",
-    summary:
-      "Fetch a skill file, inspect the flow, and tell me what it requires before taking action.",
-    prompt:
-      "Fetch and read https://www.kaggle.com/static/experimental/sae/SKILL.md, then tell me what the registration and exam flow requires before you continue.",
     category: "browser",
   },
   {
@@ -10314,44 +10717,58 @@ const ChatComposerInput = memo(function ChatComposerInput({
       />
       <div className="chat-composer-actions">
         <div className="chat-composer-inline-tools" aria-label="Composer tools">
-          <Tooltip title="Upload files">
-            <Button
-              type="button"
-              size="small"
-              variant="outlined"
-              className={`chat-composer-tool-btn${attachedFilesCount > 0 ? " is-active" : ""}`}
-              startIcon={<AttachFileRoundedIcon fontSize="small" />}
-              onClick={onAttachFiles}
-              disabled={isStreaming || composerLocked}
-            >
-              {attachedFilesCount > 0 ? `Files ${attachedFilesCount}` : "Upload"}
-            </Button>
+          <Tooltip
+            title={
+              attachedFilesCount > 0
+                ? `${attachedFilesCount} file${attachedFilesCount === 1 ? "" : "s"} attached`
+                : "Upload files"
+            }
+          >
+            <span>
+              <IconButton
+                type="button"
+                size="small"
+                className={`chat-composer-tool-btn${attachedFilesCount > 0 ? " is-active" : ""}`}
+                aria-label={
+                  attachedFilesCount > 0
+                    ? `${attachedFilesCount} file${attachedFilesCount === 1 ? "" : "s"} attached`
+                    : "Upload files"
+                }
+                onClick={onAttachFiles}
+                disabled={isStreaming || composerLocked}
+              >
+                <AttachFileRoundedIcon fontSize="small" />
+              </IconButton>
+            </span>
           </Tooltip>
           <Tooltip
             title={
               deepResearchDisabled
                 ? "Deep research is unavailable for this state"
-                : "Toggle cited multi-source research"
+                : "Deep research: cited multi-source research"
             }
           >
             <span>
-              <Button
+              <IconButton
                 type="button"
                 size="small"
-                variant="outlined"
                 className={`chat-composer-tool-btn chat-composer-research-btn${
                   deepResearchEnabled && !deepResearchDisabled ? " is-active" : ""
                 }`}
-                startIcon={<TravelExploreRoundedIcon fontSize="small" />}
                 onClick={() => {
                   if (isStreaming || composerLocked || deepResearchDisabled) return;
                   onToggleDeepResearch();
                 }}
                 disabled={isStreaming || composerLocked || deepResearchDisabled}
+                aria-label={
+                  deepResearchEnabled && !deepResearchDisabled
+                    ? "Disable deep research"
+                    : "Enable deep research"
+                }
                 aria-pressed={deepResearchEnabled && !deepResearchDisabled}
               >
-                Deep research
-              </Button>
+                <TravelExploreRoundedIcon fontSize="small" />
+              </IconButton>
             </span>
           </Tooltip>
         </div>
@@ -10897,6 +11314,17 @@ function ChatPageInner({
     const queued = workspaceSnapshotStoreRef.current;
     if (queued) storeChatWorkspaceSnapshot(queued);
   };
+  const storeChatWorkspaceSnapshotNow = (snapshot: ChatWorkspaceSnapshot) => {
+    if (
+      typeof window !== "undefined" &&
+      workspaceSnapshotStoreTimerRef.current !== null
+    ) {
+      window.clearTimeout(workspaceSnapshotStoreTimerRef.current);
+    }
+    workspaceSnapshotStoreTimerRef.current = null;
+    workspaceSnapshotStoreRef.current = snapshot;
+    storeChatWorkspaceSnapshot(snapshot);
+  };
   const canInlineConversationSidebar =
     viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH;
   const canInlineWorkspacePanel =
@@ -11021,7 +11449,7 @@ function ChatPageInner({
         isBackgroundSessionVisibleInUi(
           session as unknown as BackgroundSessionSummary,
         ),
-      ),
+    ),
     [backgroundSessionsQ.data],
   );
   const activeConversationSession = useMemo(
@@ -11079,6 +11507,14 @@ function ChatPageInner({
     Date.now() - selectedConversationUpdatedAtMs < 10 * 60 * 1000;
   const hasPendingSnapshotForConversation =
     !!conversationId && pendingRunSnapshot?.conversationId === conversationId;
+  const currentBackgroundRunSnapshot = conversationId
+    ? backgroundRunSnapshots[conversationId]
+    : null;
+  const currentConversationHasActiveRun =
+    (hasPendingSnapshotForConversation &&
+      (pendingRunSnapshot?.phase ?? "running") === "running") ||
+    (Boolean(currentBackgroundRunSnapshot) &&
+      (currentBackgroundRunSnapshot?.phase ?? "running") === "running");
   const isStreamingForCurrentConversation =
     (isStreaming || liveRunStreamOpen) && hasPendingSnapshotForConversation;
   const liveStreamOpenForCurrentConversation =
@@ -13958,15 +14394,18 @@ function ChatPageInner({
         continue;
       }
       if (stepType === "tool_progress") {
+        // Progress events update an existing action's detail and substeps.
+        // Orphan progress events (no matching parent tool_start) are dropped
+        // from the chat surface — they remain visible in Run Details / Computer.
         const toolName = activityToolNameFromStep(step);
         const key = toolKey(toolName, card);
-        const detail = inlineToolActivityDetail(
-          toolName,
-          card,
-          card.summary || card.detail || str(step.detail, ""),
-        );
         const matchIndex = latestMatchingAction(key);
         if (matchIndex >= 0) {
+          const detail = inlineToolActivityDetail(
+            toolName,
+            card,
+            card.summary || card.detail || str(step.detail, ""),
+          );
           const item = items[matchIndex];
           if (item.kind === "action") {
             item.card = card;
@@ -13977,26 +14416,6 @@ function ChatPageInner({
               buildActionDetail(stepType, card, str(step.detail, "")),
             );
           }
-        } else {
-          pushPendingProse();
-          const childDetail = buildActionDetail(
-            stepType,
-            card,
-            str(step.detail, ""),
-          );
-          const action: ChatTranscriptItem = {
-            kind: "action",
-            id: `${keyPrefix}:action:${card.id}`,
-            card,
-            toolName,
-            title: actionTitle(toolName, card),
-            detail,
-            status: transcriptStatusFromCard(card),
-            details: childDetail ? [childDetail] : [],
-          };
-          const actionIndex = items.length;
-          items.push(action);
-          rememberActionIndex(key, actionIndex);
         }
         continue;
       }
@@ -14048,6 +14467,10 @@ function ChatPageInner({
     }
 
     const finalItems = runLooksComplete() ? completeTranscriptItems(items) : items;
+    // Keep each tool action as its own sequential row. Collapsing consecutive
+    // same-tool actions into a single counted row (×N) hid the individual
+    // calls — expanding the group only ever surfaced one — so we render them
+    // unmerged in execution order.
     return finalItems.slice(-Math.max(1, maxItems));
   };
 
@@ -14213,7 +14636,8 @@ function ChatPageInner({
 
   const detachStreamingRunToBackground = () => {
     if (!isStreaming && !streamLockRef.current) return false;
-    const backgroundSnapshot = pendingRunSnapshot
+    const activeSnapshot = pendingRunSnapshotRef.current ?? pendingRunSnapshot;
+    const backgroundSnapshot = activeSnapshot
       ? movePendingRunSnapshotToBackground()
       : null;
     const streamGeneration = streamGenerationRef.current;
@@ -14256,7 +14680,10 @@ function ChatPageInner({
     if (preserveCurrentRun && (isStreaming || streamLockRef.current)) {
       detachStreamingRunToBackground();
       detachedCurrentRun = true;
-    } else if (preserveCurrentRun && pendingRunSnapshot?.conversationId) {
+    } else if (
+      preserveCurrentRun &&
+      (pendingRunSnapshotRef.current ?? pendingRunSnapshot)?.conversationId
+    ) {
       movePendingRunSnapshotToBackground();
     }
     if (!detachedCurrentRun) {
@@ -14336,8 +14763,9 @@ function ChatPageInner({
     if (isStreaming || streamLockRef.current) {
       detachStreamingRunToBackground();
     } else if (
-      pendingRunSnapshot?.conversationId &&
-      pendingRunSnapshot.conversationId !== id
+      (pendingRunSnapshotRef.current ?? pendingRunSnapshot)?.conversationId &&
+      (pendingRunSnapshotRef.current ?? pendingRunSnapshot)?.conversationId !==
+        id
     ) {
       movePendingRunSnapshotToBackground();
     }
@@ -15417,40 +15845,7 @@ function ChatPageInner({
     <Box
       className={`chat-plan-confirmation-card${threadMode ? " thread" : ""}${planConfirmation?.editing ? " editing" : ""}`}
     >
-      {isPlanningDeepResearch ? (
-        <Stack spacing={1.1}>
-          <Stack
-            direction="row"
-            spacing={0.9}
-            sx={{
-              alignItems: "center",
-            }}
-          >
-            <CircularProgress
-              size={16}
-              thickness={5}
-              className="chat-plan-confirmation-spinner"
-            />
-            <Box sx={{ minWidth: 0 }}>
-              <Typography
-                variant="body2"
-                className="chat-plan-confirmation-title"
-              >
-                Preparing{" "}
-                {planConfirmationDisplayLabel(
-                  planConfirmation?.source,
-                ).toLowerCase()}
-              </Typography>
-            </Box>
-          </Stack>
-          <Typography
-            variant="caption"
-            className="chat-plan-confirmation-inline-note"
-          >
-            {planConfirmationPlanningNote(planConfirmation?.source)}
-          </Typography>
-        </Stack>
-      ) : isAwaitingPlanConfirmation ? (
+      {isAwaitingPlanConfirmation ? (
         <Stack spacing={1.5}>
           <Box sx={{ minWidth: 0 }}>
             {planConfirmation?.editing ? (
@@ -16434,15 +16829,6 @@ function ChatPageInner({
       setExecutionPlanExpanded(
         (prev) => prev || planConfirmation?.stage === "running",
       );
-      setPlanConfirmation((prev) =>
-        prev?.stage === "planning"
-          ? {
-              ...prev,
-              originalPlan: pendingPlan,
-              draft: createPlanConfirmationDraft(pendingPlan),
-            }
-          : prev,
-      );
     }
     if (stepType === "plan_revised") {
       const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
@@ -17131,30 +17517,77 @@ function ChatPageInner({
     handleStreamReasoningDeltaPayload,
   ]);
 
-  const buildArchivedPendingRunSnapshot = (): ChatPendingRunSnapshot | null => {
-    if (!pendingRunSnapshot?.conversationId) return null;
-    return {
-      ...pendingRunSnapshot,
-      taskId: activeChatTaskIdRef.current || pendingRunSnapshot.taskId || "",
-      streamingResponse: (
-        streamingResponse ||
-        pendingRunSnapshot.streamingResponse ||
-        ""
-      ).slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
-      streamingSteps: limitPendingRunStepsForSnapshot(
-        trimTrailingHeartbeatSteps(
-          streamingStepsRef.current.length > 0
-            ? streamingStepsRef.current
-            : streamingSteps,
-        ),
+  const buildLiveRunArchive = ():
+    | {
+        pendingSnapshot: ChatPendingRunSnapshot;
+        workspaceSnapshot: ChatWorkspaceSnapshot | null;
+      }
+    | null => {
+    const activeSnapshot = pendingRunSnapshotRef.current ?? pendingRunSnapshot;
+    const activeConversationId =
+      activeSnapshot?.conversationId || conversationIdRef.current || conversationId || "";
+    if (!activeConversationId) return null;
+    const currentSteps = limitPendingRunStepsForSnapshot(
+      trimTrailingHeartbeatSteps(
+        streamingStepsRef.current.length > 0
+          ? streamingStepsRef.current
+          : streamingSteps,
       ),
+    );
+    const archive = buildChatLiveRunArchive({
+      pendingSnapshot: activeSnapshot,
+      conversationId: activeConversationId,
+      taskId: activeChatTaskIdRef.current || activeSnapshot?.taskId || "",
+      streamingResponse:
+        streamingResponseRef.current ||
+        streamingResponse ||
+        activeSnapshot?.streamingResponse ||
+        "",
+      streamingSteps: currentSteps,
+      deployedFiles: compactWorkspaceFilesForSnapshot(deployedFiles, {
+        includeContent: true,
+      }),
+      liveFileWrites: compactLiveFileWritesForSnapshot(liveFileWrites, {
+        includeContent: true,
+      }),
+      streamedWorkspaceApp: sanitizeWorkspaceAppSnapshot(
+        streamedWorkspaceAppRef.current || streamedWorkspaceApp,
+      ),
+      codeViewerFileIdx,
+      nowMs: Date.now(),
+      maxResponseChars: CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
+    });
+    if (!archive.pendingSnapshot) return null;
+    return {
+      pendingSnapshot: {
+        ...(archive.pendingSnapshot as ChatPendingRunSnapshot),
+        conversationId: activeConversationId,
+        message: str(archive.pendingSnapshot.message, activeSnapshot?.message || ""),
+        startedAt: num(
+          archive.pendingSnapshot.startedAt,
+          activeSnapshot?.startedAt || Date.now(),
+        ),
+        streamingSteps: limitPendingRunStepsForSnapshot(
+          (archive.pendingSnapshot.streamingSteps || []) as JsonRecord[],
+        ),
+      },
+      workspaceSnapshot: archive.workspaceSnapshot
+        ? ({
+            ...(archive.workspaceSnapshot as ChatWorkspaceSnapshot),
+            conversationId: activeConversationId,
+          } satisfies ChatWorkspaceSnapshot)
+        : null,
     };
   };
 
   const movePendingRunSnapshotToBackground =
     (): ChatPendingRunSnapshot | null => {
-      const archivedSnapshot = buildArchivedPendingRunSnapshot();
-      if (!archivedSnapshot) return null;
+      const archivedRun = buildLiveRunArchive();
+      if (!archivedRun) return null;
+      const archivedSnapshot = archivedRun.pendingSnapshot;
+      if (archivedRun.workspaceSnapshot) {
+        storeChatWorkspaceSnapshotNow(archivedRun.workspaceSnapshot);
+      }
       const nextBackgroundSnapshots = {
         ...backgroundRunSnapshots,
         [archivedSnapshot.conversationId]: archivedSnapshot,
@@ -17240,6 +17673,14 @@ function ChatPageInner({
       streamLockRef.current
     )
       return false;
+    if (
+      !isResumeMode &&
+      targetConversationId &&
+      workingConversationIds.has(targetConversationId)
+    ) {
+      setChatNotice("This conversation already has a run in progress.");
+      return false;
+    }
     if (isResumeMode && !targetConversationId) {
       setChatError(
         "This stopped task is missing its conversation, so it cannot be resumed.",
@@ -17250,10 +17691,11 @@ function ChatPageInner({
     const deepResearch = Boolean(opts?.deepResearch);
     const executionProfile = deepResearch
       ? {
-          work_type: "research",
-          depth: "deep",
+          capability_tags: ["research", "source_synthesis", "decision_grade"],
+          depth_hint: "deep",
           deliverables: ["answer", "markdown", "document"],
           plan_first: true,
+          long_running: true,
           confidence: 1,
           source: "ui_override",
         }
@@ -17341,17 +17783,13 @@ function ChatPageInner({
     setLiveRunStreamOpenNow(false);
 
     setChatError(null);
-    if (!isResumeMode && deepResearch) {
-      setPlanConfirmation({
-        stage: "planning",
-        taskId: null,
-        source: "deep_research",
-        originalPlan: null,
-        draft: null,
-        editing: false,
-        messageId: null,
-      });
-    } else if (isResumeMode && planOverride) {
+    // Deep research no longer goes through a plan-confirmation step: the backend
+    // planner that consumed `plan_first` was retired in the spine-substrate
+    // migration, so the run executes end-to-end. Setting an optimistic
+    // `stage: "planning"` here only produced an orphaned "Preparing deep research
+    // plan" card that no backend event ever cleared. Deep research now falls
+    // through to the `null` branch and runs immediately like any other chat turn.
+    if (isResumeMode && planOverride) {
       setPlanConfirmation((prev) =>
         prev
           ? {
@@ -17482,29 +17920,28 @@ function ChatPageInner({
       const obj = asRecord(payload);
       const next: ChatRunMetrics = {};
       const observedElapsedMs = Math.max(1, Date.now() - streamStartedAt);
-      const hasVisibleContent = str(obj.content, "").length > 0;
       const parsedMetrics = chatRunMetricsFromPayload(payload);
       if (parsedMetrics.inputTokens != null) next.inputTokens = parsedMetrics.inputTokens;
       if (parsedMetrics.outputTokens != null) next.outputTokens = parsedMetrics.outputTokens;
       if (parsedMetrics.totalTokens != null) next.totalTokens = parsedMetrics.totalTokens;
       const durationMs = parsedMetrics.durationMs;
+      const timeToFirstStreamActivityMs =
+        parsedMetrics.timeToFirstStreamActivityMs;
       const timeToFirstTokenMs = parsedMetrics.timeToFirstTokenMs;
       if (durationMs != null) {
         next.durationMs = Math.max(durationMs, observedElapsedMs);
       }
+      if (timeToFirstStreamActivityMs != null) {
+        next.timeToFirstStreamActivityMs = timeToFirstStreamActivityMs;
+      }
       if (timeToFirstTokenMs != null) {
-        const serverFirstTokenMs = hasVisibleContent
-          ? Math.max(timeToFirstTokenMs, observedElapsedMs)
-          : timeToFirstTokenMs;
+        const serverFirstTokenMs = timeToFirstTokenMs;
         firstTokenMs =
           firstTokenMs != null
-            ? Math.max(firstTokenMs, serverFirstTokenMs)
+            ? Math.min(firstTokenMs, serverFirstTokenMs)
             : serverFirstTokenMs;
         next.timeToFirstTokenMs = firstTokenMs;
       } else if (firstTokenMs != null) {
-        next.timeToFirstTokenMs = firstTokenMs;
-      } else if (hasVisibleContent) {
-        firstTokenMs = observedElapsedMs;
         next.timeToFirstTokenMs = firstTokenMs;
       }
       if (Object.keys(next).length === 0) return;
@@ -17641,9 +18078,11 @@ function ChatPageInner({
                 if (!streamDetachedToBackground()) setLiveRunStreamOpenNow(true);
               },
               onEvent: handlePlanStreamEvent,
-              onToken: (token) => {
+              onToken: (token, payload) => {
                 if (streamDetachedToBackground()) return;
-                markFirstStreamingToken();
+                if (!isSyntheticStreamTokenPayload(payload)) {
+                  markFirstStreamingToken();
+                }
                 latestStreamingResponse += appendStreamingToken(token);
               },
               onThinking: (step) => {
@@ -17784,9 +18223,9 @@ function ChatPageInner({
               channel: "web",
               conversation_id: targetConversationId || undefined,
               execution_profile: executionProfile,
-              plan_confirmation_mode: deepResearch
-                ? "before_execution"
-                : undefined,
+              // Plan confirmation is retired for deep research — the backend no
+              // longer consumes `plan_first`, so requesting `before_execution`
+              // only set a dead profile flag. Send no plan-confirmation mode.
               execution_mode: executionMode,
               attachments_present: attachmentPayloads.length > 0,
               attachments: attachmentPayloads,
@@ -17800,9 +18239,11 @@ function ChatPageInner({
                 if (!streamDetachedToBackground()) setLiveRunStreamOpenNow(true);
               },
               onEvent: handlePlanStreamEvent,
-              onToken: (token) => {
+              onToken: (token, payload) => {
                 if (streamDetachedToBackground()) return;
-                markFirstStreamingToken();
+                if (!isSyntheticStreamTokenPayload(payload)) {
+                  markFirstStreamingToken();
+                }
                 latestStreamingResponse += appendStreamingToken(token);
               },
               onThinking: (step) => {
@@ -18325,6 +18766,14 @@ function ChatPageInner({
           setExecutionPlanExpanded(false);
           setStreamingResponseNow("");
         }
+      } else if (
+        !detachedToBackground &&
+        !wasStopped &&
+        !awaitingPlanConfirmationFromStream
+      ) {
+        clearPendingRunPresentation(
+          trimTrailingHeartbeatSteps(streamingStepsRef.current),
+        );
       }
       if (isCurrentStreamGeneration) {
         streamAbortRef.current = null;
@@ -18851,7 +19300,7 @@ function ChatPageInner({
       deepResearchEnabled && !deepResearchDisabled;
     if (
       isStreaming ||
-      composerLockedForPlanConfirmation ||
+      currentConversationHasActiveRun ||
       (!trimmed && files.length === 0)
     )
       return false;
@@ -18876,6 +19325,10 @@ function ChatPageInner({
     }
 
     setChatError(null);
+    // Clear any consumed template prefill so it can't re-hydrate the composer
+    // when it remounts (e.g. the starter -> active-conversation view switch on
+    // the first message). Otherwise the chosen template text reappears after send.
+    setComposerPrefillRequest(null);
     void runStreamingChat(trimmed, files, {
       deepResearch: useDeepResearchForSubmit,
       browserProfileContext,
@@ -19181,20 +19634,6 @@ function ChatPageInner({
   // Pin scroll to bottom during streaming - useLayoutEffect runs before paint
   // so the user never sees the intermediate jank position.
   const stickToBottom = useRef(true);
-  useLayoutEffect(() => {
-    const thread = threadRef.current;
-    if (!thread) return;
-    if (stickToBottom.current) {
-      thread.scrollTop = thread.scrollHeight;
-    }
-  }, [
-    messages.length,
-    pendingUserMessage,
-    failedUserMessage,
-    Math.floor(streamingResponse.length / 36),
-    streamingProgressMessages.length,
-    isStreaming,
-  ]);
   // Track whether user is near bottom to decide if we should auto-stick
   useEffect(() => {
     const thread = threadRef.current;
@@ -19529,7 +19968,7 @@ function ChatPageInner({
     return -1;
   }, [messages, pendingSnapshotStartedAt, showStreamingAssistant]);
   const planConfirmationMessageIndex = useMemo(() => {
-    if (!planConfirmation || planConfirmation.stage === "planning") return -1;
+    if (!planConfirmation) return -1;
     const anchoredMessageId = str(planConfirmation.messageId, "").trim();
     if (anchoredMessageId) {
       for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
@@ -19573,6 +20012,26 @@ function ChatPageInner({
     !showStreamingAssistant &&
     !visiblePendingUserMessage &&
     !visibleFailedUserMessage;
+
+  useLayoutEffect(() => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    if (showEmptyHero) {
+      thread.scrollTop = 0;
+      return;
+    }
+    if (stickToBottom.current) {
+      thread.scrollTop = thread.scrollHeight;
+    }
+  }, [
+    showEmptyHero,
+    messages.length,
+    pendingUserMessage,
+    failedUserMessage,
+    Math.floor(streamingResponse.length / 36),
+    streamingProgressMessages.length,
+    isStreaming,
+  ]);
 
   useEffect(() => {
     setEmptyEarlyAccessNoticeDismissed(readEarlyAccessNoticeDismissed());
@@ -19718,8 +20177,11 @@ function ChatPageInner({
               onOpenSnippet: openCodePreviewInWorkspace,
             })
           : null;
-      const runMetricItems = isAssistant
-        ? buildChatRunMetricItems(chatRunMetricsFromPayload(message))
+      const runMetrics = isAssistant
+        ? chatRunMetricsFromPayload(message)
+        : null;
+      const runMetricItems = isAssistant && runMetrics
+        ? buildChatRunMetricItems(runMetrics)
         : [];
       return {
         message,
@@ -19739,6 +20201,7 @@ function ChatPageInner({
         hasTrace,
         markdownNode,
         runMetricItems,
+        runMetrics,
       };
     });
   }, [
@@ -19822,8 +20285,6 @@ function ChatPageInner({
   const planConfirmationIsDeepResearch = isDeepResearchPlanSource(
     planConfirmation?.source,
   );
-  const isPlanningDeepResearch =
-    planConfirmationIsDeepResearch && planConfirmation?.stage === "planning";
   const isAwaitingPlanConfirmation =
     planConfirmationIsDeepResearch &&
     planConfirmation?.stage === "awaiting_confirmation";
@@ -19862,8 +20323,7 @@ function ChatPageInner({
   );
   const showPlanConfirmationCard =
     planConfirmationIsDeepResearch &&
-    (isPlanningDeepResearch ||
-      isAwaitingPlanConfirmation ||
+    (isAwaitingPlanConfirmation ||
       composerAwaitingPlanConfirmation ||
       isRunningPlanConfirmation ||
       isCompletedPlanConfirmation ||
@@ -19914,6 +20374,7 @@ function ChatPageInner({
 
   const renderStarterExampleCard = (item: ChatStarterExample) => {
     const categoryMeta = CHAT_STARTER_CATEGORY_META[item.category];
+    const CategoryIcon = CHAT_STARTER_CATEGORY_ICON[item.category];
     return (
       <Button
         key={item.id}
@@ -19923,25 +20384,33 @@ function ChatPageInner({
         onClick={() => applyStarterExample(item)}
       >
         <Box className="chat-starter-card-body">
-          <Box className="chat-starter-card-meta">
-            <span className="chat-starter-tag">{categoryMeta.label}</span>
-            {item.deepResearch && item.category !== "research" ? (
-              <span className="chat-starter-tag research">Deep research</span>
-            ) : null}
+          <span className="chat-starter-card-icon" aria-hidden="true">
+            <CategoryIcon size={22} strokeWidth={1.75} />
+          </span>
+          <Box className="chat-starter-card-main">
+            <Box className="chat-starter-card-meta">
+              <span className="chat-starter-tag">{categoryMeta.label}</span>
+              {item.deepResearch && item.category !== "research" ? (
+                <span className="chat-starter-tag research">Deep research</span>
+              ) : null}
+            </Box>
+            <Typography component="span" className="chat-starter-card-title">
+              {item.title}
+            </Typography>
+            <Typography component="span" className="chat-starter-card-copy">
+              {item.summary}
+            </Typography>
           </Box>
-          <Typography component="span" className="chat-starter-card-title">
-            {item.title}
-          </Typography>
-          <Typography component="span" className="chat-starter-card-copy">
-            {item.summary}
-          </Typography>
+          <span className="chat-starter-card-go" aria-hidden="true">
+            <ArrowRight size={16} strokeWidth={2} />
+          </span>
         </Box>
       </Button>
     );
   };
 
   useEffect(() => {
-    if (!planConfirmation || planConfirmation.stage === "planning") return;
+    if (!planConfirmation) return;
     if (str(planConfirmation.messageId, "").trim()) return;
     if (planConfirmationMessageIndex < 0) return;
     const candidate = asRecord(messages[planConfirmationMessageIndex]);
@@ -20056,7 +20525,6 @@ function ChatPageInner({
       "execution";
     const needsRepair =
       !planConfirmation ||
-      planConfirmation.stage === "planning" ||
       !planConfirmation.originalPlan ||
       !planConfirmation.draft ||
       (!!resolvedTaskId && planConfirmation.taskId !== resolvedTaskId);
@@ -20646,6 +21114,7 @@ function ChatPageInner({
     activeWorkspaceApp?.id,
     str(activeWorkspaceApp?.app_id, ""),
   ).trim();
+  const activeWorkspaceAppDir = str(activeWorkspaceApp?.app_dir, "").trim();
   const previewPath = str(
     activeWorkspaceApp?.local_access_url,
     str(
@@ -20946,10 +21415,18 @@ function ChatPageInner({
     // Computer pane would render "Files: 0" while the model is mid-draft â€”
     // exactly the Lovable/Bolt hole the user flagged. Live-write content takes
     // precedence over any captured snapshot for the same path.
-    const merged = new Map<string, { path: string; content: string }>();
+    const merged = new Map<
+      string,
+      { path: string; displayPath?: string; content: string }
+    >();
     for (const file of deployedFiles) {
       merged.set(file.name, {
         path: file.name,
+        displayPath: workspaceFileDisplayPath(
+          file.name,
+          activeWorkspaceAppId,
+          activeWorkspaceAppDir,
+        ),
         content: choosePreferredWorkspaceFileContent(
           liveFileWrites[file.name]?.content || "",
           file.content || "",
@@ -20958,10 +21435,20 @@ function ChatPageInner({
     }
     for (const [name, state] of Object.entries(liveFileWrites)) {
       if (merged.has(name)) continue;
-      merged.set(name, { path: name, content: state.content || "" });
+      const content = choosePreferredWorkspaceFileContent("", state.content || "");
+      if (state.done && !content) continue;
+      merged.set(name, {
+        path: name,
+        displayPath: workspaceFileDisplayPath(
+          name,
+          activeWorkspaceAppId,
+          activeWorkspaceAppDir,
+        ),
+        content,
+      });
     }
     return Array.from(merged.values());
-  }, [deployedFiles, liveFileWrites]);
+  }, [activeWorkspaceAppDir, activeWorkspaceAppId, deployedFiles, liveFileWrites]);
   const executionPlanStatusLabel = executionPlanNeedsAttention
     ? "Needs attention"
     : visibleExecutionPlanFailure
@@ -21125,7 +21612,6 @@ function ChatPageInner({
     workspacePlanConfirmationSource,
   ]);
 
-  const composerLockedForPlanConfirmation = isPlanningDeepResearch;
   const renderExecutionPlanStatusIcon = (status: string, className = "") => {
     if (status === "completed") {
       return <CheckCircleRoundedIcon className={className} />;
@@ -21837,14 +22323,12 @@ function ChatPageInner({
   const composerPlaceholder =
     credentialUiActive
       ? "Use the secure credential form above"
-      : composerLockedForPlanConfirmation
-      ? `Preparing the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
       : composerAwaitingPlanConfirmation
         ? "Ask for changes to the plan, or press Start."
         : "Message (Enter to send, Shift+Enter for newline)";
 
   const emptyComposerPlaceholder =
-    credentialUiActive || composerLockedForPlanConfirmation || composerAwaitingPlanConfirmation
+    credentialUiActive || composerAwaitingPlanConfirmation
       ? composerPlaceholder
       : "How can I help you today?";
 
@@ -22004,148 +22488,227 @@ function ChatPageInner({
     items: ChatTranscriptItem[],
     keyPrefix: string,
     isLiveTranscript = false,
-  ) =>
-    items.length > 0 ? (
+  ): ReactNode => {
+    if (items.length === 0) return null;
+
+    const renderActionRow = (
+      item: Extract<ChatTranscriptItem, { kind: "action" }>,
+      key: string,
+    ): ReactNode => {
+      const statusIcon = renderTranscriptStatusIcon(item.status);
+      const expanded = expandedTranscriptActions.has(item.id);
+      const stepCount = item.details.length;
+      return (
+        <Box
+          key={key}
+          className={`chat-transcript-action-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
+        >
+          <button
+            type="button"
+            className={`chat-transcript-action-row status-${item.status}`}
+            onClick={() => {
+              handleActivateStep(item.card.id);
+              toggleExpandedTranscriptAction(item.id);
+            }}
+            aria-expanded={expanded}
+            aria-label={`${expanded ? "Collapse" : "Expand"} ${item.title}${item.detail ? `: ${item.detail}` : ""}`}
+          >
+            <span className="chat-transcript-action-icon" aria-hidden="true">
+              {statusIcon}
+            </span>
+            <span className="chat-transcript-action-main">
+              <span className="chat-transcript-action-title">{item.title}</span>
+              {item.count && item.count > 1 ? (
+                <span
+                  className="chat-transcript-action-count-chip"
+                  aria-label={`${item.count} calls`}
+                >
+                  ×{item.count}
+                </span>
+              ) : null}
+              {item.detail ? (
+                <>
+                  <span
+                    className="chat-transcript-action-separator"
+                    aria-hidden="true"
+                  >
+                    |
+                  </span>
+                  <span className="chat-transcript-action-detail">
+                    {item.detail}
+                  </span>
+                </>
+              ) : null}
+            </span>
+            <ExpandMoreIcon
+              className="chat-transcript-action-chevron"
+              fontSize="inherit"
+              aria-hidden="true"
+            />
+          </button>
+          <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
+            <Box className="chat-transcript-action-details">
+              {item.details.map((entry, entryIdx) =>
+                renderTranscriptActionDetail(item.id, entry, entryIdx)
+              )}
+            </Box>
+          </Collapse>
+        </Box>
+      );
+    };
+
+    const renderActionGroup = (
+      actions: Extract<ChatTranscriptItem, { kind: "action" }>[],
+      groupId: string,
+    ): ReactNode => {
+      const expanded = expandedTranscriptActions.has(groupId);
+      const totalCount = actions.reduce(
+        (sum, a) => sum + (a.count ?? 1),
+        0,
+      );
+      const hasIssue = actions.some((a) => a.status === "issue");
+      const hasRunning = actions.some((a) => a.status === "running");
+      const aggregateStatus: ChatTranscriptActionStatus = hasIssue
+        ? "issue"
+        : hasRunning
+          ? "running"
+          : "done";
+      return (
+        <Box
+          key={groupId}
+          className={`chat-transcript-action-group status-${aggregateStatus}${expanded ? " is-expanded" : ""}`}
+        >
+          <button
+            type="button"
+            className={`chat-transcript-action-group-header status-${aggregateStatus}`}
+            onClick={() => toggleExpandedTranscriptAction(groupId)}
+            aria-expanded={expanded}
+            aria-label={`${expanded ? "Collapse" : "Expand"} ${totalCount} ${totalCount === 1 ? "step" : "steps"}`}
+          >
+            <span className="chat-transcript-action-group-title">
+              {totalCount} {totalCount === 1 ? "step" : "steps"}
+            </span>
+          </button>
+          <Collapse in={expanded} timeout="auto" unmountOnExit>
+            <Box className="chat-transcript-action-group-body">
+              {actions.map((action, i) =>
+                renderActionRow(action, `${groupId}:${action.id}:${i}`)
+              )}
+            </Box>
+          </Collapse>
+        </Box>
+      );
+    };
+
+    const renderProse = (
+      item: Extract<ChatTranscriptItem, { kind: "prose" }>,
+      key: string,
+    ): ReactNode => (
+      <Typography
+        key={key}
+        variant="body2"
+        className={`chat-transcript-prose-line${isLiveTranscript ? " is-live" : ""}`}
+      >
+        {item.text}
+      </Typography>
+    );
+
+    const renderReasoning = (
+      item: Extract<ChatTranscriptItem, { kind: "reasoning" }>,
+      key: string,
+    ): ReactNode => {
+      const expanded = expandedTranscriptActions.has(item.id);
+      const stepCount = item.details.length;
+      return (
+        <Box
+          key={key}
+          className={`chat-transcript-action-shell chat-transcript-reasoning-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
+        >
+          <button
+            type="button"
+            className={`chat-transcript-action-row chat-transcript-reasoning-row status-${item.status}`}
+            onClick={() => toggleExpandedTranscriptAction(item.id)}
+            aria-expanded={expanded}
+            aria-label={`${expanded ? "Collapse" : "Expand"} ${item.title}`}
+          >
+            <span className="chat-transcript-action-icon" aria-hidden="true">
+              {renderTranscriptStatusIcon(item.status)}
+            </span>
+            <span className="chat-transcript-action-main">
+              <span className="chat-transcript-action-title">{item.title}</span>
+              {item.detail ? (
+                <>
+                  <span
+                    className="chat-transcript-action-separator"
+                    aria-hidden="true"
+                  >
+                    |
+                  </span>
+                  <span className="chat-transcript-action-detail">
+                    {item.detail}
+                  </span>
+                </>
+              ) : null}
+            </span>
+            <ExpandMoreIcon
+              className="chat-transcript-action-chevron"
+              fontSize="inherit"
+              aria-hidden="true"
+            />
+          </button>
+          <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
+            <Box className="chat-transcript-action-details chat-transcript-reasoning-details">
+              {item.details.map((entry, entryIdx) =>
+                renderTranscriptActionDetail(item.id, entry, entryIdx)
+              )}
+            </Box>
+          </Collapse>
+        </Box>
+      );
+    };
+
+    // Walk items, grouping consecutive action items into runs.
+    // Every run (1+) sits inside a "N step(s)" parent so the layout shape
+    // stays consistent whether the turn used one tool or twenty.
+    const nodes: ReactNode[] = [];
+    let actionRun: Extract<ChatTranscriptItem, { kind: "action" }>[] = [];
+    let groupCounter = 0;
+    const flushActionRun = () => {
+      if (actionRun.length === 0) return;
+      const groupId = `${keyPrefix}:group:${groupCounter++}`;
+      nodes.push(renderActionGroup(actionRun.slice(), groupId));
+      actionRun = [];
+    };
+
+    items.forEach((item, idx) => {
+      if (item.kind === "action") {
+        actionRun.push(item);
+      } else {
+        flushActionRun();
+        const key = `${keyPrefix}:${item.id}:${idx}`;
+        if (item.kind === "prose") {
+          nodes.push(renderProse(item, key));
+        } else {
+          nodes.push(renderReasoning(item, key));
+        }
+      }
+    });
+    flushActionRun();
+
+    return (
       <Box
         className={`chat-agent-transcript${isLiveTranscript ? " is-live" : ""}`}
         aria-label="Agent activity transcript"
       >
-        {items.map((item, idx) => {
-          if (item.kind === "prose") {
-            return (
-              <Typography
-                key={`${keyPrefix}:${item.id}:${idx}`}
-                variant="body2"
-                className={`chat-transcript-prose-line${isLiveTranscript ? " is-live" : ""}`}
-              >
-                {item.text}
-              </Typography>
-            );
-          }
-          if (item.kind === "reasoning") {
-            const expanded = expandedTranscriptActions.has(item.id);
-            const stepCount = item.details.length;
-            return (
-              <Box
-                key={`${keyPrefix}:${item.id}:${idx}`}
-                className={`chat-transcript-action-shell chat-transcript-reasoning-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
-              >
-                <button
-                  type="button"
-                  className={`chat-transcript-action-row chat-transcript-reasoning-row status-${item.status}`}
-                  onClick={() => toggleExpandedTranscriptAction(item.id)}
-                  aria-expanded={expanded}
-                  aria-label={`${expanded ? "Collapse" : "Expand"} ${item.title}`}
-                >
-                  <span className="chat-transcript-action-icon" aria-hidden="true">
-                    {renderTranscriptStatusIcon(item.status)}
-                  </span>
-                  <span className="chat-transcript-action-main">
-                    <span className="chat-transcript-action-title">
-                      {item.title}
-                    </span>
-                    {item.detail ? (
-                      <>
-                        <span
-                          className="chat-transcript-action-separator"
-                          aria-hidden="true"
-                        >
-                          |
-                        </span>
-                        <span className="chat-transcript-action-detail">
-                          {item.detail}
-                        </span>
-                      </>
-                    ) : null}
-                  </span>
-                  {stepCount > 0 ? (
-                    <span className="chat-transcript-action-status">
-                      {transcriptStatusLabel(item.status)}
-                    </span>
-                  ) : null}
-                  <ExpandMoreIcon
-                    className="chat-transcript-action-chevron"
-                    fontSize="inherit"
-                    aria-hidden="true"
-                  />
-                </button>
-                <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
-                  <Box className="chat-transcript-action-details chat-transcript-reasoning-details">
-                    {item.details.map((entry, entryIdx) =>
-                      renderTranscriptActionDetail(item.id, entry, entryIdx),
-                    )}
-                  </Box>
-                </Collapse>
-              </Box>
-            );
-          }
-          const statusIcon = renderTranscriptStatusIcon(item.status);
-          const expanded = expandedTranscriptActions.has(item.id);
-          const stepCount = item.details.length;
-          return (
-            <Box
-              key={`${keyPrefix}:${item.id}:${idx}`}
-              className={`chat-transcript-action-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
-            >
-              <button
-                type="button"
-                className={`chat-transcript-action-row status-${item.status}`}
-                onClick={() => {
-                  handleActivateStep(item.card.id);
-                  toggleExpandedTranscriptAction(item.id);
-                }}
-                aria-expanded={expanded}
-                aria-label={`${expanded ? "Collapse" : "Expand"} ${item.title}${item.detail ? `: ${item.detail}` : ""}`}
-              >
-                <span className="chat-transcript-action-icon" aria-hidden="true">
-                  {statusIcon}
-                </span>
-                <span className="chat-transcript-action-main">
-                  <span className="chat-transcript-action-title">
-                    {item.title}
-                  </span>
-                  {item.detail ? (
-                    <>
-                      <span
-                        className="chat-transcript-action-separator"
-                        aria-hidden="true"
-                      >
-                        |
-                      </span>
-                      <span className="chat-transcript-action-detail">
-                        {item.detail}
-                      </span>
-                    </>
-                  ) : null}
-                </span>
-                {stepCount > 0 ? (
-                  <span className="chat-transcript-action-status">
-                    {transcriptStatusLabel(item.status)}
-                  </span>
-                ) : null}
-                <ExpandMoreIcon
-                  className="chat-transcript-action-chevron"
-                  fontSize="inherit"
-                  aria-hidden="true"
-                />
-              </button>
-              <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
-                <Box className="chat-transcript-action-details">
-                  {item.details.map((entry, entryIdx) =>
-                    renderTranscriptActionDetail(item.id, entry, entryIdx),
-                  )}
-                </Box>
-              </Collapse>
-            </Box>
-          );
-        })}
+        {nodes}
       </Box>
-    ) : null;
+    );
+  };
 
   const renderComposerInput = (placeholder: string) => (
     <ChatComposerInput
       attachedFilesCount={attachedFiles.length}
-      composerLocked={composerLockedForPlanConfirmation || credentialUiActive}
+      composerLocked={credentialUiActive || currentConversationHasActiveRun}
       deepResearchDisabled={deepResearchDisabled}
       deepResearchEnabled={deepResearchEnabled}
       isStoppingStream={isStoppingStream}
@@ -22351,6 +22914,14 @@ function ChatPageInner({
                     <Typography variant="h4" className="chat-empty-title">
                       {conversationId ? "Conversation" : "AgentArk"}
                     </Typography>
+                    {!conversationId ? (
+                      <Typography
+                        component="p"
+                        className="chat-empty-subtitle"
+                      >
+                        Your local AI command center.
+                      </Typography>
+                    ) : null}
                   </Box>
                   {!emptyEarlyAccessNoticeDismissed ? (
                     <Box
@@ -22409,13 +22980,24 @@ function ChatPageInner({
                         scrollButtons="auto"
                         className="chat-starter-tabs"
                       >
-                        {CHAT_STARTER_TAB_ORDER.map((categoryId) => (
-                          <Tab
-                            key={categoryId}
-                            value={categoryId}
-                            label={CHAT_STARTER_TAB_LABELS[categoryId]}
-                          />
-                        ))}
+                        {CHAT_STARTER_TAB_ORDER.map((categoryId) => {
+                          const TabIcon = starterTabIcon(categoryId);
+                          return (
+                            <Tab
+                              key={categoryId}
+                              value={categoryId}
+                              iconPosition="start"
+                              icon={
+                                <TabIcon
+                                  size={16}
+                                  strokeWidth={1.85}
+                                  className="chat-starter-tab-icon"
+                                />
+                              }
+                              label={CHAT_STARTER_TAB_LABELS[categoryId]}
+                            />
+                          );
+                        })}
                       </Tabs>
                     </Box>
                     <Box
@@ -22425,7 +23007,13 @@ function ChatPageInner({
                     </Box>
                     {CHAT_STARTER_ADVANCED_EXAMPLES.length > 0 ? (
                       <Box className="chat-starter-advanced">
-                        <Box className="chat-starter-section-head">
+                        <Box className="chat-starter-advanced-bar">
+                          <span
+                            className="chat-starter-advanced-icon"
+                            aria-hidden="true"
+                          >
+                            <Sparkles size={16} strokeWidth={1.85} />
+                          </span>
                           <Typography
                             variant="overline"
                             className="chat-starter-section-title"
@@ -22438,8 +23026,6 @@ function ChatPageInner({
                           >
                             {CHAT_STARTER_CATEGORY_META.advanced.description}
                           </Typography>
-                        </Box>
-                        <Box className="chat-starter-advanced-actions">
                           <Button
                             size="small"
                             variant="text"
@@ -22494,6 +23080,7 @@ function ChatPageInner({
                       hasTrace,
                       markdownNode,
                       runMetricItems,
+                      runMetrics,
                     } = bundle;
                     const traceTranscriptItems = isAssistant
                       ? perMessageTraceTranscriptById[messageId] || []
@@ -22650,13 +23237,25 @@ function ChatPageInner({
                                           timestamp: tsRaw,
                                           traceId,
                                         })
-                                      : markdownNode}
-                                    {renderRunMetricPills(
-                                      runMetricItems,
-                                      `response-metrics:${messageId}`,
-                                      "Response token usage",
-                                      "chat-run-metrics-response",
-                                    )}
+                                      : isRunCancellationArtifact(
+                                            renderedContent,
+                                          )
+                                        ? <CancelledRunNotice />
+                                        : markdownNode}
+                                    {runMetrics ? (
+                                      <ChatRunMetricsCard
+                                        metrics={runMetrics}
+                                        keyPrefix={`response-metrics:${messageId}`}
+                                      />
+                                    ) : null}
+                                    {!runMetrics && runMetricItems.length > 0
+                                      ? renderRunMetricPills(
+                                          runMetricItems,
+                                          `response-metrics:${messageId}`,
+                                          "Response token usage",
+                                          "chat-run-metrics-response",
+                                        )
+                                      : null}
                                   </>
                                 )}
                                 {!isUser
@@ -22777,7 +23376,8 @@ function ChatPageInner({
                           >
                             AgentArk | interrupted
                           </Typography>
-                          {visibleStreamingResponse.trim() ? (
+                          {visibleStreamingResponse.trim() &&
+                          !isRunCancellationArtifact(visibleStreamingResponse) ? (
                             streamingResearchReport ? (
                               renderResearchReportCard({
                                 report: streamingResearchReport,
@@ -22849,7 +23449,6 @@ function ChatPageInner({
                   {showStreamingAssistant &&
                   latestStreamingAssistantIndex === -1 ? (
                     !hasVisibleStreamingReply &&
-                    !isPlanningDeepResearch &&
                     !isRunningPlanConfirmation &&
                     visibleStreamingProgressMessages.length === 0 &&
                     liveChatTranscriptItems.length === 0 ? (
@@ -22861,8 +23460,7 @@ function ChatPageInner({
                     </Box>
                   ) : (
                     <>
-                      {(isPlanningDeepResearch ||
-                        isAwaitingPlanConfirmation ||
+                      {(isAwaitingPlanConfirmation ||
                         isRunningPlanConfirmation) &&
                       !hasVisibleStreamingReply ? (
                         <Box className="chat-row chat-row-plan-confirmation">
@@ -24812,7 +25410,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       traceKind === "self_evolve.manual_action.result" ||
       traceKind === "self_evolve.manual_action.request"
     ) {
-      const action = str(data.action, "").trim().replace(/_/g, " ");
+      const action = humanizeMachineLabel(str(data.action, ""), "");
       const canaryState = asRecord(data.canary_state);
       chips.push(action || "Manual action");
       if (Object.keys(canaryState).length > 0) {
@@ -24864,7 +25462,7 @@ function syncRunTriggerLabel(trigger: string): string {
   const normalized = trigger.trim().toLowerCase();
   if (normalized === "manual") return "Manual";
   if (normalized === "background") return "Background";
-  return normalized ? normalized.replace(/_/g, " ") : "Unknown";
+  return humanizeMachineLabel(normalized, "Unknown");
 }
 
 type TraceRange = "1h" | "6h" | "24h" | "7d" | "14d" | "30d";
@@ -24935,10 +25533,7 @@ function bucketizeTraceItems<T>(
 
 function traceSecurityEventTypeLabel(eventType: string): string {
   const normalized = (eventType || "").trim().toLowerCase();
-  if (!normalized) return "Unknown";
-  return normalized
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (m) => m.toUpperCase());
+  return humanizeMachineLabel(normalized, "Unknown");
 }
 
 

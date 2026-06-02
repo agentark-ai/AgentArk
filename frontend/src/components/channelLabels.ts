@@ -1,3 +1,5 @@
+import { humanizeMachineLabel } from "../lib/displayLabels";
+
 const CHANNEL_SOURCE_LABELS: Record<string, string> = {
   arkorbit: "Orbit",
   orbit: "Orbit",
@@ -29,7 +31,5 @@ export function formatChannelSource(
   const key = raw.toLowerCase().replace(/[\s-]+/g, "_");
   const mapped = CHANNEL_SOURCE_LABELS[key];
   if (mapped) return mapped;
-  const normalized = raw.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
-  if (!normalized) return fallback;
-  return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+  return humanizeMachineLabel(raw, fallback);
 }

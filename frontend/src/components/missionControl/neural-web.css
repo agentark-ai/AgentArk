@@ -536,7 +536,10 @@
 
 .nw-dashboard-main--mission {
   grid-template-columns: repeat(12, minmax(0, 1fr));
-  grid-template-rows: minmax(0, var(--nw-dashboard-main-height));
+  /* Grow to the tallest column (>= main-height) so all three columns stretch to
+     the same height and their bottoms align, instead of the fuller column
+     spilling below the others. */
+  grid-template-rows: minmax(var(--nw-dashboard-main-height), auto);
   gap: var(--nw-dashboard-gap);
   align-items: stretch;
   min-height: var(--nw-dashboard-main-height);
@@ -553,10 +556,12 @@
 }
 
 .nw-dashboard-primary--mission {
-  grid-template-rows: var(--nw-dashboard-graph-height) var(--nw-dashboard-row-4);
+  /* Runtime Activity (last row) flexes so the center column fills to the shared
+     bottom line. */
+  grid-template-rows: var(--nw-dashboard-graph-height) minmax(var(--nw-dashboard-row-4), 1fr);
   align-content: stretch;
   min-height: var(--nw-dashboard-main-height);
-  height: auto;
+  height: 100%;
 }
 
 .nw-dashboard-primary--mission .nw-dashboard-graph-panel {
@@ -654,7 +659,8 @@
 }
 
 .nw-dashboard-stack--left {
-  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-tall-card);
+  /* Last track flexes so the Suggested card fills down to the shared bottom line. */
+  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) minmax(var(--nw-dashboard-tall-card), 1fr);
   min-height: var(--nw-dashboard-main-height);
   height: 100%;
   align-content: stretch;
@@ -690,12 +696,14 @@
   grid-column: span 4;
   display: grid;
   gap: var(--nw-dashboard-gap);
+  height: 100%;
 }
 
 .right-stack {
   grid-column: span 5;
   display: grid;
-  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-row-3) var(--nw-dashboard-row-4);
+  /* Last row flexes so the bottom row fills down to the shared bottom line. */
+  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-row-3) minmax(var(--nw-dashboard-row-4), 1fr);
   gap: var(--nw-dashboard-gap);
 }
 
@@ -1061,6 +1069,125 @@
   -webkit-line-clamp: 1;
 }
 
+/* =================================================================
+ *  COGNITION LOOP — NEURAL GRAPH (replaces the vertical stage list)
+ * ================================================================= */
+.nw-cog {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.nw-cog-svg {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: block;
+}
+
+/* Cognition loop is alive: data flows along the mesh, the cycle breathes, and
+   satellites twinkle. (The active stage node already pulses via inline SMIL.) */
+@keyframes nw-cog-dash-flow {
+  to {
+    stroke-dashoffset: -44;
+  }
+}
+@keyframes nw-cog-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+@keyframes nw-cog-twinkle {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.14);
+  }
+}
+.nw-cog-chords path {
+  animation: nw-cog-dash-flow 3.6s linear infinite;
+}
+.nw-cog-connectors line {
+  animation: nw-cog-dash-flow 5.2s linear infinite reverse;
+}
+.nw-cog-cycle {
+  animation: nw-cog-breathe 4s ease-in-out infinite;
+}
+/* Bright energy streaming around the ring. dasharray period 22 (6+16); the
+   keyframe ends at -44 = 2 periods, so the loop is seamless (no jump). Only
+   stroke-dashoffset animates — compositor-cheap, no relayout. */
+.nw-cog-flow {
+  stroke-dasharray: 6 16;
+  opacity: 0.9;
+  animation: nw-cog-dash-flow 2s linear infinite;
+}
+.nw-cog-sat {
+  animation: nw-cog-twinkle 3.2s ease-in-out infinite;
+  transform-origin: center;
+  transform-box: fill-box;
+}
+@media (prefers-reduced-motion: reduce) {
+  .nw-cog-chords path,
+  .nw-cog-connectors line,
+  .nw-cog-cycle,
+  .nw-cog-flow,
+  .nw-cog-sat {
+    animation: none;
+  }
+  /* orbiting packets (SMIL) are not rendered at all under reduced motion —
+     gated in AgentCognitionLoop.tsx via PREFERS_REDUCED_MOTION. */
+}
+
+.nw-cog-caption {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 8px 4px 2px;
+  border-top: 1px solid var(--nw-line);
+  margin-top: 4px;
+}
+
+.nw-cog-caption-num {
+  flex: 0 0 auto;
+  color: var(--nw-green);
+  font-family: var(--nw-mono);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.nw-cog-caption-title {
+  flex: 0 0 auto;
+  color: #fff;
+  font-family: var(--nw-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.nw-cog-caption-detail {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--nw-dim);
+  font-size: 11px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 1180px) {
   .nw-dashboard-main {
     grid-template-columns: 1fr;
@@ -1171,6 +1298,75 @@
   color: var(--nw-dim);
   font-size: 12px;
   line-height: 1.45;
+}
+
+.nw-focus-metric {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.nw-focus-metric-value {
+  color: var(--nw-ink);
+  font-family: var(--nw-mono);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nw-focus-metric-value--waiting {
+  font-size: 15px;
+  color: var(--nw-dim-strong);
+}
+
+.nw-focus-metric-detail {
+  color: var(--nw-dim);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nw-focus-spark-shell {
+  margin-top: 6px;
+  display: grid;
+  gap: 4px;
+}
+
+.nw-focus-spark {
+  width: 100%;
+  height: 20px;
+  display: block;
+}
+
+.nw-focus-spark polyline {
+  fill: none;
+  stroke: var(--nw-green);
+  stroke-width: 1.45;
+  vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 0 4px rgba(124, 231, 255, 0.35));
+}
+
+.nw-focus-spark--empty line {
+  stroke: var(--nw-dim);
+  stroke-width: 1.2;
+  stroke-dasharray: 3 4;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.45;
+}
+
+.nw-focus-spark-caption {
+  display: flex;
+  justify-content: space-between;
+  color: var(--nw-dim);
+  font-family: var(--nw-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 /* =================================================================
@@ -2618,6 +2814,60 @@
   }
 }
 
+/* Desktop (>=1280px): release the "fit everything in one locked viewport" cap.
+   The base rules pin the grid + every stack to a dvh-derived height with
+   overflow:hidden, which clips content and prevents scrolling. Here we let the
+   columns flow to their content height and let the already-scrollable
+   .overview-shell handle vertical scroll naturally. */
+@media (min-width: 1280px) {
+  .nw-dashboard-main--mission.mission-grid {
+    grid-template-rows: none;
+    grid-auto-rows: max-content;
+    align-items: start;
+    min-height: 0;
+    height: auto;
+    overflow: visible;
+  }
+
+  .mission-grid .left-stack,
+  .mission-grid .center-stack,
+  .mission-grid .right-stack {
+    grid-template-rows: none;
+    grid-auto-rows: max-content;
+    align-self: start;
+    align-content: start;
+    min-height: 0;
+    height: auto;
+    overflow: visible;
+  }
+
+  .mission-grid .nw-dashboard-right-row {
+    height: auto;
+    min-height: 0;
+  }
+
+  /* Cards size to their own content rather than a fixed row height. */
+  .mission-grid .nw-panel,
+  .mission-grid .nw-dashboard-graph-panel,
+  .mission-grid .overview-inline-note {
+    height: auto;
+  }
+
+  .mission-grid .nw-row-list,
+  .mission-grid .nw-learning-list,
+  .mission-grid .nw-integration-list,
+  .mission-grid .nw-tool-list,
+  .mission-grid .nw-health-list {
+    max-height: none;
+    overflow: visible;
+  }
+
+  /* Keep the cognition-loop centrepiece tall enough to read well. */
+  .mission-grid .center-stack .nw-dashboard-loop-panel {
+    min-height: 480px;
+  }
+}
+
 @media (max-width: 1023px) {
   .nw-dashboard-main--mission.mission-grid {
     grid-template-columns: 1fr;
@@ -3000,6 +3250,90 @@
 /* Suggested next step: compact command card, not a terminal block. */
 .nw-panel--suggested {
   padding: 11px 12px 12px;
+}
+
+/* In the mission grid this panel is stretched to fill its (tall) left-column
+   track, and the body already flex-fills (.mission-grid .nw-panel > :not(.nw-panel-h)).
+   Keep the prompt + actions at the top and anchor the live-context block to the
+   bottom so the space is used by real content rather than left empty. Scoped to
+   the grid so the hero usage is untouched. */
+.mission-grid .nw-suggested-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+.mission-grid .nw-suggested-body .nw-suggested-actions,
+.mission-grid .nw-suggested-body .nw-suggested-recommendations {
+  margin-top: 0;
+}
+
+/* Live-context block (recommended actions + recent runs) — pinned to the bottom
+   of the card so it fills the otherwise-empty space. */
+.mission-grid .nw-suggested-body .nw-suggested-context {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.nw-suggested-recent {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-top: 10px;
+  border-top: 1px solid var(--nw-line);
+}
+
+.nw-suggested-recent-label {
+  font-family: var(--nw-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.13em;
+  color: var(--nw-dim);
+  margin-bottom: 2px;
+}
+
+.nw-suggested-recent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--nw-ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nw-suggested-recent-row:hover:not(:disabled) {
+  background: rgba(124, 231, 255, 0.06);
+}
+
+.nw-suggested-recent-row:disabled {
+  cursor: default;
+}
+
+.nw-suggested-recent-txt {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.nw-suggested-recent-meta {
+  flex: 0 0 auto;
+  font-family: var(--nw-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--nw-dim);
 }
 
 .nw-suggested-prompt {

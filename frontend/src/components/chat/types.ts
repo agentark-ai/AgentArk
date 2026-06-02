@@ -95,6 +95,7 @@ export interface ChatStepCard {
 
 export interface ComputerPaneFile {
   path: string;
+  displayPath?: string;
   content: string;
 }
 

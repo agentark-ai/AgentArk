@@ -1037,6 +1037,20 @@ pub(super) struct DataLifecycleSettingsUpdate {
     #[serde(default)]
     pub recall_test_retention_days: Option<u64>,
     #[serde(default)]
+    pub readiness_retention_days: Option<u64>,
+    #[serde(default)]
+    pub operational_memory_retention_days: Option<u64>,
+    #[serde(default)]
+    pub readiness_evaluation_retention_days: Option<u64>,
+    #[serde(default)]
+    pub memory_capture_event_retention_days: Option<u64>,
+    #[serde(default)]
+    pub memory_operation_retention_days: Option<u64>,
+    #[serde(default)]
+    pub memory_evidence_link_retention_days: Option<u64>,
+    #[serde(default)]
+    pub semantic_work_unit_retention_days: Option<u64>,
+    #[serde(default)]
     pub housekeeping_interval_secs: Option<u64>,
     #[serde(default)]
     pub security_cleanup_interval_days: Option<u64>,
@@ -1347,6 +1361,75 @@ pub(super) struct PromptTelemetrySummary {
     pub(super) top_sections: Vec<PromptTelemetrySectionSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub(super) struct ArkDistillContextToolSummary {
+    pub(super) tool_name: String,
+    pub(super) action: Option<String>,
+    pub(super) sample_count: usize,
+    pub(super) saved_chars: usize,
+    pub(super) estimated_saved_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub(super) struct ArkDistillContextSummary {
+    pub(super) sample_count: usize,
+    pub(super) original_chars: usize,
+    pub(super) distilled_chars: usize,
+    pub(super) saved_chars: usize,
+    pub(super) estimated_original_tokens: usize,
+    pub(super) estimated_distilled_tokens: usize,
+    pub(super) estimated_saved_tokens: usize,
+    pub(super) estimated_prompt_cost_saved_usd: Option<f64>,
+    pub(super) savings_percent: f64,
+    pub(super) confidence_sample_target: usize,
+    pub(super) sample_confidence_score: f64,
+    pub(super) top_tools: Vec<ArkDistillContextToolSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub(super) struct PromptOptimizationHoldoutCase {
+    pub(super) trace_id: Option<String>,
+    pub(super) run_id: Option<String>,
+    pub(super) outcome: String,
+    pub(super) section_chars: usize,
+    pub(super) final_prompt_chars: usize,
+    pub(super) estimated_total_request_chars: usize,
+    pub(super) latency_ms: Option<i64>,
+    pub(super) cost_usd: Option<f64>,
+    pub(super) total_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub(super) struct PromptOptimizationOpportunityProfile {
+    pub(super) section: String,
+    pub(super) label: String,
+    pub(super) samples: usize,
+    pub(super) failed_samples: usize,
+    pub(super) corrected_samples: usize,
+    pub(super) slow_samples: usize,
+    pub(super) expensive_samples: usize,
+    pub(super) issue_samples: usize,
+    pub(super) issue_rate: f64,
+    pub(super) quality_issue_rate: f64,
+    pub(super) issue_confidence_lower_bound: f64,
+    pub(super) quality_confidence_lower_bound: f64,
+    pub(super) observability_score: f64,
+    pub(super) confidence_sample_target: usize,
+    pub(super) sample_confidence_score: f64,
+    pub(super) risk_confidence_score: f64,
+    pub(super) p50_chars: usize,
+    pub(super) p95_chars: usize,
+    pub(super) p95_final_prompt_chars: usize,
+    pub(super) p95_total_request_chars: usize,
+    pub(super) p95_latency_ms: Option<i64>,
+    pub(super) p95_cost_usd: Option<f64>,
+    pub(super) p95_total_tokens: Option<i64>,
+    pub(super) estimated_saved_tokens_p95: usize,
+    pub(super) estimated_saved_cost_usd_p95: Option<f64>,
+    pub(super) opportunity_score: f64,
+    pub(super) holdout_cases: Vec<PromptOptimizationHoldoutCase>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct PromptOptimizationReviewEntry {
     #[serde(default)]
@@ -1445,6 +1528,8 @@ pub(super) struct PromptOptimizationProposal {
     pub(super) reversible: bool,
     pub(super) lifecycle: PromptOptimizationLifecycleState,
     pub(super) change_preview: EvolutionChangePreview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) opportunity: Option<PromptOptimizationOpportunityProfile>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1487,6 +1572,7 @@ pub(super) struct EvolutionDevResponse {
     pub(super) prompt_canary_safety_events:
         Vec<crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent>,
     pub(super) prompt_telemetry_summary: PromptTelemetrySummary,
+    pub(super) arkdistill_context_summary: ArkDistillContextSummary,
     pub(super) prompt_optimization_opportunities: Vec<PromptOptimizationProposal>,
 }
 

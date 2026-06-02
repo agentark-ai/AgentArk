@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngExt;
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -159,6 +159,26 @@ fn read_token_file(path: &Path) -> Result<Option<String>> {
     })
 }
 
+async fn read_token_file_async(path: &Path) -> Result<Option<String>> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow!(
+                "Failed to read internal auth token file {}: {}",
+                path.display(),
+                error
+            ));
+        }
+    };
+    normalize_token(&raw).map(Some).ok_or_else(|| {
+        anyhow!(
+            "Internal auth token file {} is empty or invalid",
+            path.display()
+        )
+    })
+}
+
 fn persist_token_if_needed(
     config_dir: &Path,
     service: InternalServiceKind,
@@ -178,6 +198,36 @@ fn persist_token_if_needed(
     }
     crate::crypto::atomic_write_file(&token_path, format!("{token}\n").as_bytes())?;
     restrict_token_file_permissions(&token_path)?;
+    Ok(())
+}
+
+async fn persist_token_if_needed_async(
+    config_dir: &Path,
+    service: InternalServiceKind,
+    token: &str,
+) -> Result<()> {
+    tokio::fs::create_dir_all(config_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create config directory for {} internal auth at {}",
+                service.label(),
+                config_dir.display()
+            )
+        })?;
+    let token_path = config_dir.join(service.token_file_name());
+    match read_token_file_async(&token_path).await? {
+        Some(existing) if existing == token => return Ok(()),
+        _ => {}
+    }
+    let write_path = token_path.clone();
+    let payload = format!("{token}\n");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::crypto::atomic_write_file(&write_path, payload.as_bytes())?;
+        restrict_token_file_permissions(&write_path)?;
+        Ok(())
+    })
+    .await??;
     Ok(())
 }
 
@@ -219,6 +269,7 @@ fn normalize_token(raw: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_persisted_internal_service_token(
     config_dir: &Path,
     service: InternalServiceKind,
@@ -226,29 +277,40 @@ pub(crate) fn read_persisted_internal_service_token(
     read_token_file(&service.token_path(config_dir))
 }
 
-pub(crate) fn restore_internal_service_token(
+pub(crate) async fn read_persisted_internal_service_token_async(
+    config_dir: &Path,
+    service: InternalServiceKind,
+) -> Result<Option<String>> {
+    read_token_file_async(&service.token_path(config_dir)).await
+}
+
+pub(crate) async fn restore_internal_service_token_async(
     config_dir: &Path,
     service: InternalServiceKind,
     previous: Option<&str>,
 ) -> Result<()> {
     let token_path = service.token_path(config_dir);
     match previous {
-        Some(token) => persist_token_if_needed(config_dir, service, token),
+        Some(token) => persist_token_if_needed_async(config_dir, service, token).await,
         None => {
-            if token_path.exists() {
-                std::fs::remove_file(&token_path).with_context(|| {
-                    format!(
-                        "Failed to remove {} internal auth token file {} during rollback",
+            match tokio::fs::remove_file(&token_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(anyhow!(
+                        "Failed to remove {} internal auth token file {} during rollback: {}",
                         service.label(),
-                        token_path.display()
-                    )
-                })?;
+                        token_path.display(),
+                        error
+                    ));
+                }
             }
             Ok(())
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn rotate_internal_service_token(
     config_dir: &Path,
     service: InternalServiceKind,
@@ -265,26 +327,44 @@ pub(crate) fn rotate_internal_service_token(
     Ok(token)
 }
 
-pub(crate) fn describe_internal_service_tokens(
+pub(crate) async fn rotate_internal_service_token_async(
     config_dir: &Path,
-) -> Result<Vec<InternalServiceTokenStatus>> {
-    [
-        InternalServiceKind::Executor,
-        InternalServiceKind::Workspace,
-    ]
-    .into_iter()
-    .map(|service| describe_internal_service_token(config_dir, service))
-    .collect()
+    service: InternalServiceKind,
+) -> Result<String> {
+    if read_env_token(service).is_some() {
+        anyhow::bail!(
+            "{} internal credential is managed by {}. Rotate it in the deployment environment instead.",
+            service.label(),
+            service.env_var()
+        );
+    }
+    let token = generate_internal_service_token(service);
+    persist_token_if_needed_async(config_dir, service, &token).await?;
+    Ok(token)
 }
 
-fn describe_internal_service_token(
+pub(crate) async fn describe_internal_service_tokens_async(
+    config_dir: &Path,
+) -> Result<Vec<InternalServiceTokenStatus>> {
+    let mut out = Vec::new();
+    for service in [
+        InternalServiceKind::Executor,
+        InternalServiceKind::Workspace,
+    ] {
+        out.push(describe_internal_service_token_async(config_dir, service).await?);
+    }
+    Ok(out)
+}
+
+async fn describe_internal_service_token_async(
     config_dir: &Path,
     service: InternalServiceKind,
 ) -> Result<InternalServiceTokenStatus> {
     let token_path = service.token_path(config_dir);
     let managed_by_env = read_env_token(service).is_some();
-    let configured = managed_by_env || read_token_file(&token_path)?.is_some();
-    let updated_at = std::fs::metadata(&token_path)
+    let configured = managed_by_env || read_token_file_async(&token_path).await?.is_some();
+    let updated_at = tokio::fs::metadata(&token_path)
+        .await
         .ok()
         .and_then(|meta| meta.modified().ok())
         .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
@@ -311,8 +391,9 @@ fn generate_internal_service_token(service: InternalServiceKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InternalServiceKind, load_or_create_internal_service_token,
-        read_persisted_internal_service_token, rotate_internal_service_token,
+        describe_internal_service_tokens_async, load_or_create_internal_service_token,
+        read_persisted_internal_service_token, read_persisted_internal_service_token_async,
+        rotate_internal_service_token, rotate_internal_service_token_async, InternalServiceKind,
     };
 
     #[test]
@@ -343,5 +424,35 @@ mod tests {
         assert_ne!(first, rotated);
         assert_eq!(rotated, persisted);
         assert!(rotated.starts_with("ak_int_ws_"));
+    }
+
+    #[tokio::test]
+    async fn async_rotation_preserves_workspace_token_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = rotate_internal_service_token_async(dir.path(), InternalServiceKind::Workspace)
+            .await
+            .expect("first token");
+        let rotated =
+            rotate_internal_service_token_async(dir.path(), InternalServiceKind::Workspace)
+                .await
+                .expect("rotated token");
+        let persisted =
+            read_persisted_internal_service_token_async(dir.path(), InternalServiceKind::Workspace)
+                .await
+                .expect("persisted token")
+                .expect("token file present");
+        let statuses = describe_internal_service_tokens_async(dir.path())
+            .await
+            .expect("token statuses");
+
+        assert_ne!(first, rotated);
+        assert_eq!(rotated, persisted);
+        assert!(rotated.starts_with("ak_int_ws_"));
+        assert!(statuses.iter().any(|status| {
+            status.id == InternalServiceKind::Workspace.id()
+                && status.configured
+                && !status.managed_by_env
+                && status.updated_at.is_some()
+        }));
     }
 }

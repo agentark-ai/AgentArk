@@ -35,6 +35,22 @@ export function num(value: unknown, fallback = 0): number {
   return fallback;
 }
 
+export function memoryRefreshInterval(
+  autoRefresh: boolean,
+  pendingCount: number,
+  intervalMs: number,
+): number | false {
+  return autoRefresh || pendingCount > 0 ? intervalMs : false;
+}
+
+export function canSaveUserData(
+  kind: string,
+  title: string,
+  pending: boolean,
+): boolean {
+  return !pending && kind.trim().length > 0 && title.trim().length > 0;
+}
+
 export function toBool(value: unknown): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;

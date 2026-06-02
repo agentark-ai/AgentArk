@@ -20,6 +20,7 @@ import {
 import Grid2 from "@mui/material/Grid";
 import { useMemo, useState, type JSX } from "react";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 
 export type DeviceCapability =
   | "camera"
@@ -83,7 +84,7 @@ function statusLabel(status: DeviceNode["status"]): string {
   if (value === "pairing") return "Pairing";
   if (value === "offline") return "Offline";
   if (value === "error") return "Error";
-  return status || "Unknown";
+  return humanizeStatusLabel(status, "Unknown");
 }
 
 function capabilityIcon(kind: DeviceCapability): JSX.Element {
@@ -100,11 +101,7 @@ function capabilityLabel(kind: DeviceCapability): string {
   const normalized = String(kind || "").trim().toLowerCase();
   const preset = DEVICE_CAPABILITY_OPTIONS.find((option) => option.value === normalized);
   if (preset) return preset.label;
-  return normalized
-    .split(/[_\s-]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+  return humanizeMachineLabel(normalized, "Capability");
 }
 
 function formatDate(raw?: string): string {

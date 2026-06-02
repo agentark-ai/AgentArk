@@ -241,6 +241,7 @@ pub(super) fn build_request_execution_hints(
         recorded_user_message_id: None,
         attachments_present: false,
         attachments: Vec::new(),
+        execution_profile: None,
         arkorbit_context: None,
         browser_profile_context: None,
         recent_actionable_artifacts: Vec::new(),
@@ -853,7 +854,9 @@ pub(super) async fn chat(
         Ok(processed) => (
             StatusCode::OK,
             Json(ChatResponse {
-                response: processed.response,
+                response: crate::core::llm_context_sanitizer::strip_internal_tool_transcript(
+                    &processed.response,
+                ),
                 proof_id: None,
                 conversation_id: processed.conversation_id.or(original_conversation_id),
                 conversation_title: processed.conversation_title,
@@ -946,6 +949,236 @@ fn compact_stream_summary_text(value: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn chat_stream_first_token_metric_value(observed_first_token_ms: u64) -> serde_json::Value {
+    if observed_first_token_ms > 0 {
+        serde_json::json!(observed_first_token_ms)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn redact_stream_visible_text(value: &str) -> String {
+    let secret_redacted = crate::security::redact_secret_input(value).text;
+    crate::security::redact_pii(&secret_redacted)
+}
+
+fn compact_stream_visible_json(value: &serde_json::Value, max_chars: usize) -> Option<String> {
+    let visible = stream_visible_json_value(value, 0).unwrap_or_else(|| value.clone());
+    let redacted_value = redact_stream_visible_json_value(&visible, "");
+    let raw = match &redacted_value {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        _ => serde_json::to_string(&redacted_value).ok()?,
+    };
+    let compacted = compact_stream_summary_text(&raw, max_chars);
+    if compacted.is_empty() {
+        None
+    } else {
+        Some(compacted)
+    }
+}
+
+fn stream_visible_json_value(value: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
+    if depth > 6 {
+        return None;
+    }
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(value.clone()),
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                stream_visible_json_value(&parsed, depth + 1)
+                    .or_else(|| Some(serde_json::Value::String(trimmed.to_string())))
+            } else {
+                Some(serde_json::Value::String(trimmed.to_string()))
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(items.clone()))
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let mut visible_entries = object
+                .iter()
+                .filter(|(key, value)| {
+                    !stream_visible_metadata_key(key)
+                        && !stream_sensitive_field_key(key)
+                        && stream_json_has_visible_content(value)
+                })
+                .collect::<Vec<_>>();
+            if visible_entries.is_empty() {
+                visible_entries = object
+                    .iter()
+                    .filter(|(key, value)| {
+                        !stream_sensitive_field_key(key) && stream_json_has_visible_content(value)
+                    })
+                    .collect::<Vec<_>>();
+            }
+            if visible_entries.is_empty() {
+                return None;
+            }
+
+            let structured_entries = visible_entries
+                .iter()
+                .filter(|(_, value)| match value {
+                    serde_json::Value::Array(items) => !items.is_empty(),
+                    serde_json::Value::Object(object) => !object.is_empty(),
+                    _ => false,
+                })
+                .collect::<Vec<_>>();
+            if structured_entries.len() == 1 {
+                let nested = stream_visible_json_value(structured_entries[0].1, depth + 1);
+                return nested.or_else(|| Some(structured_entries[0].1.clone()));
+            }
+            if !structured_entries.is_empty() {
+                let mut out = serde_json::Map::new();
+                for (key, value) in structured_entries {
+                    out.insert((*key).clone(), (*value).clone());
+                }
+                return Some(serde_json::Value::Object(out));
+            }
+            if visible_entries.len() == 1 {
+                return Some(visible_entries[0].1.clone());
+            }
+            let mut out = serde_json::Map::new();
+            for (key, value) in visible_entries {
+                out.insert(key.clone(), value.clone());
+            }
+            Some(serde_json::Value::Object(out))
+        }
+    }
+}
+
+fn stream_json_has_visible_content(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(object) => !object.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
+}
+
+fn stream_normalized_key(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_was_separator = true;
+    for ch in value.chars() {
+        if ch.is_ascii_uppercase() {
+            if !previous_was_separator && !out.ends_with('_') {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            out.push('_');
+            previous_was_separator = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn stream_visible_metadata_key(key: &str) -> bool {
+    let normalized = stream_normalized_key(key);
+    if normalized.is_empty() || normalized.starts_with('_') {
+        return true;
+    }
+    normalized.split('_').any(|part| {
+        matches!(
+            part,
+            "activity"
+                | "call"
+                | "cid"
+                | "conversation"
+                | "display"
+                | "id"
+                | "kind"
+                | "label"
+                | "name"
+                | "ok"
+                | "renderer"
+                | "run"
+                | "seq"
+                | "sequence"
+                | "state"
+                | "status"
+                | "stream"
+                | "surface"
+                | "task"
+                | "time"
+                | "timestamp"
+                | "tool"
+                | "trace"
+                | "type"
+                | "version"
+        )
+    })
+}
+
+fn stream_sensitive_field_key(key: &str) -> bool {
+    let normalized = stream_normalized_key(key);
+    normalized.split('_').any(|part| {
+        matches!(
+            part,
+            "authorization"
+                | "auth"
+                | "apikey"
+                | "cookie"
+                | "cookies"
+                | "credential"
+                | "credentials"
+                | "password"
+                | "passcode"
+                | "secret"
+                | "session"
+                | "token"
+        )
+    }) || normalized.contains("api_key")
+        || normalized.contains("private_key")
+        || normalized.contains("refresh_token")
+}
+
+fn redact_stream_visible_json_value(value: &serde_json::Value, key: &str) -> serde_json::Value {
+    if stream_sensitive_field_key(key) {
+        return serde_json::Value::String("[REDACTED]".to_string());
+    }
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            value.clone()
+        }
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_stream_visible_text(text.trim()))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .take(25)
+                .map(|item| redact_stream_visible_json_value(item, ""))
+                .collect(),
+        ),
+        serde_json::Value::Object(object) => {
+            let mut out = serde_json::Map::new();
+            for (entry_key, entry_value) in object {
+                if entry_key.starts_with('_') || !stream_json_has_visible_content(entry_value) {
+                    continue;
+                }
+                out.insert(
+                    entry_key.clone(),
+                    redact_stream_visible_json_value(entry_value, entry_key),
+                );
+            }
+            serde_json::Value::Object(out)
+        }
+    }
 }
 
 fn humanize_stream_result_key(key: &str) -> String {
@@ -1083,16 +1316,13 @@ fn summarize_stream_json_tool_output(value: &serde_json::Value) -> Option<String
             return summarize_stream_result_payload(value, None);
         }
 
-        let keys = obj.keys().take(4).cloned().collect::<Vec<_>>().join(", ");
-        if !keys.is_empty() {
-            return Some(format!("Returned structured data: {}.", keys));
+        if !obj.is_empty() {
+            return compact_stream_visible_json(value, 480);
         }
     } else if let Some(items) = value.as_array() {
-        return Some(format!(
-            "Returned list with {} item{}.",
-            items.len(),
-            if items.len() == 1 { "" } else { "s" }
-        ));
+        if !items.is_empty() {
+            return compact_stream_visible_json(value, 480);
+        }
     }
     None
 }
@@ -1140,10 +1370,13 @@ pub(super) fn summarize_stream_tool_activity_content(content: &str) -> String {
             .chars()
             .any(|ch| matches!(ch, '{' | '}' | '<' | '>' | ';'))
     {
-        return "Received detailed tool output.".to_string();
+        return compact_stream_summary_text(&redact_stream_visible_text(trimmed), 240);
     }
 
-    trimmed.chars().take(240).collect::<String>()
+    redact_stream_visible_text(trimmed)
+        .chars()
+        .take(240)
+        .collect::<String>()
 }
 
 pub(super) fn truncate_stream_tool_raw_content(content: &str, max_chars: usize) -> String {
@@ -1541,6 +1774,40 @@ fn attach_stream_surface(
     );
 }
 
+fn stream_reasoning_phase_is_visible(phase: &str) -> bool {
+    let normalized = phase.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "model" | "model_summary" | "reasoning" | "reasoning_summary"
+    )
+}
+
+fn stream_event_first_activity_source(ev: &crate::core::StreamEvent) -> Option<&'static str> {
+    match ev {
+        crate::core::StreamEvent::Token(content) if !content.is_empty() => Some("token"),
+        crate::core::StreamEvent::ReasoningDelta {
+            phase,
+            content_delta,
+            done,
+        } if stream_reasoning_phase_is_visible(phase)
+            && (*done || !content_delta.trim().is_empty()) =>
+        {
+            Some("reasoning_delta")
+        }
+        crate::core::StreamEvent::ToolStart { .. } => Some("tool_start"),
+        crate::core::StreamEvent::ToolProgress {
+            content, payload, ..
+        } if !content.trim().is_empty() || payload.is_some() => Some("tool_progress"),
+        crate::core::StreamEvent::ToolResult { content, .. } if !content.trim().is_empty() => {
+            Some("tool_result")
+        }
+        crate::core::StreamEvent::ChatTaskStarted { .. } => Some("task_started"),
+        crate::core::StreamEvent::PlanGenerated { .. } => Some("plan_generated"),
+        crate::core::StreamEvent::PlanStepUpdate { .. } => Some("plan_step_update"),
+        _ => None,
+    }
+}
+
 pub(super) fn normalize_stream_event_for_sse(
     ev: crate::core::StreamEvent,
     last_thinking_detail: &str,
@@ -1586,7 +1853,7 @@ pub(super) fn normalize_stream_event_for_sse(
             String::new(),
         ),
         crate::core::StreamEvent::Token(content) => (
-            Some(("token", serde_json::json!({ "content": content }))),
+            Some(("token", chat_stream_token_payload(&content, false))),
             String::new(),
         ),
         crate::core::StreamEvent::Thinking(status) => {
@@ -1614,14 +1881,7 @@ pub(super) fn normalize_stream_event_for_sse(
             done,
         } => {
             let normalized_phase = phase.trim();
-            let phase_visible = {
-                let normalized = normalized_phase.to_ascii_lowercase();
-                matches!(
-                    normalized.as_str(),
-                    "model" | "model_summary" | "reasoning" | "reasoning_summary"
-                )
-            };
-            if !phase_visible {
+            if !stream_reasoning_phase_is_visible(normalized_phase) {
                 return (None, String::new());
             }
             let normalized_phase_lower = normalized_phase.to_ascii_lowercase();
@@ -1635,14 +1895,16 @@ pub(super) fn normalize_stream_event_for_sse(
             } else {
                 format!("reasoning:{}", normalized_phase)
             };
-            let detail = if !content_delta.trim().is_empty() {
-                content_delta.trim().to_string()
-            } else if done {
-                format!("{title} completed.")
+            let sanitized_delta =
+                crate::core::llm_context_sanitizer::strip_internal_tool_transcript_preserve_spacing(
+                    &redact_stream_visible_text(&content_delta),
+                );
+            let detail = if !sanitized_delta.trim().is_empty() {
+                sanitized_delta.trim().to_string()
             } else {
-                format!("{title} in progress.")
+                format!("{title} completed.")
             };
-            let content = content_delta.clone();
+            let content = sanitized_delta;
             (
                 Some((
                     "reasoning_delta",
@@ -1652,7 +1914,7 @@ pub(super) fn normalize_stream_event_for_sse(
                         "title": title,
                         "detail": detail,
                         "content": content,
-                        "content_delta": content_delta,
+                        "content_delta": content,
                         "done": done,
                         "stream_key": stream_key,
                     }),
@@ -2119,18 +2381,24 @@ pub(super) fn chat_task_status_key(status: &crate::core::TaskStatus) -> &'static
 }
 
 pub(super) fn chat_task_terminal_status(response: &str) -> crate::core::TaskStatus {
-    let lower = response.trim().to_ascii_lowercase();
-    if lower.contains("waiting for your approval")
-        || lower.contains("waiting for your input")
-        || lower.contains("reply with approval")
-        || lower.contains("needs your approval")
-        || lower.contains("requires approval")
-        || lower.contains("api key")
+    let parsed = serde_json::from_str::<serde_json::Value>(response.trim()).ok();
+    if let Some(status) = parsed
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
     {
-        crate::core::TaskStatus::Paused
-    } else {
-        crate::core::TaskStatus::Completed
+        return match status.as_str() {
+            "needs_input" | "needs_permission" | "needs_credentials" | "needs_integration"
+            | "approval_required" => crate::core::TaskStatus::Paused,
+            "failed" | "failure" | "error" | "platform_failed" => crate::core::TaskStatus::Failed {
+                error: truncate_stream_task_text(response, 240),
+            },
+            "cancelled" => crate::core::TaskStatus::Cancelled,
+            _ => crate::core::TaskStatus::Completed,
+        };
     }
+    crate::core::TaskStatus::Completed
 }
 
 pub(super) fn chat_task_terminal_status_for_run(
@@ -2169,427 +2437,7 @@ pub(super) fn chat_task_terminal_status_for_run(
     }
 }
 
-pub(super) fn deep_research_failure_reason(
-    response: &str,
-    run_status: Option<&str>,
-    user_outcome: Option<&crate::core::UserFacingOutcome>,
-) -> String {
-    let outcome_message = user_outcome
-        .map(|outcome| truncate_stream_task_text(&outcome.message, 240))
-        .filter(|value| !value.is_empty());
-    if let Some(message) = outcome_message {
-        return message;
-    }
-
-    let response_preview = truncate_stream_task_text(response, 240);
-    if !response_preview.is_empty() {
-        return response_preview;
-    }
-
-    let normalized = run_status
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "failed".to_string())
-        .replace('_', " ");
-    format!("Deep research {}.", normalized)
-}
-
-pub(super) fn deep_research_terminal_status(
-    response: &str,
-    run_status: Option<&str>,
-    user_outcome: Option<&crate::core::UserFacingOutcome>,
-) -> crate::core::TaskStatus {
-    let normalized_run_status = run_status
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty());
-
-    match normalized_run_status.as_deref() {
-        Some("degraded") | Some("platform_failed") => crate::core::TaskStatus::Failed {
-            error: deep_research_failure_reason(response, run_status, user_outcome),
-        },
-        Some("needs_input") | Some("blocked") | Some("needs_stronger_model") => {
-            crate::core::TaskStatus::Paused
-        }
-        Some("cancelled") => crate::core::TaskStatus::Cancelled,
-        Some("completed") => chat_task_terminal_status(response),
-        _ => match user_outcome.map(|outcome| &outcome.status) {
-            Some(crate::core::UserFacingOutcomeStatus::Degraded)
-            | Some(crate::core::UserFacingOutcomeStatus::ServiceUnavailable) => {
-                crate::core::TaskStatus::Failed {
-                    error: deep_research_failure_reason(response, run_status, user_outcome),
-                }
-            }
-            Some(crate::core::UserFacingOutcomeStatus::NeedsClarification)
-            | Some(crate::core::UserFacingOutcomeStatus::NeedsPermission)
-            | Some(crate::core::UserFacingOutcomeStatus::NeedsIntegration)
-            | Some(crate::core::UserFacingOutcomeStatus::NeedsCredentials)
-            | Some(crate::core::UserFacingOutcomeStatus::NeedsStrongerModel) => {
-                crate::core::TaskStatus::Paused
-            }
-            _ => chat_task_terminal_status(response),
-        },
-    }
-}
-
-fn deep_research_plan_id(task_id: &str) -> String {
-    let suffix = task_id
-        .chars()
-        .filter(|ch| ch.is_ascii_hexdigit())
-        .take(8)
-        .collect::<String>();
-    if suffix.is_empty() {
-        "deep-research-plan".to_string()
-    } else {
-        format!("deep-research-{}", suffix)
-    }
-}
-
-fn deep_research_topic_label(message: &str) -> String {
-    let label = truncate_stream_task_text(message.trim(), 120);
-    if label.is_empty() {
-        "this topic".to_string()
-    } else {
-        label
-    }
-}
-
-fn deep_research_plan_text(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_stream_task_text(&compact, max_chars)
-}
-
-fn deep_research_plan_focus_label(message: &str) -> (String, Vec<String>) {
-    let (objective, items) =
-        crate::core::planner::confirmation_request_objective_and_items(message);
-    let objective = if objective.trim().is_empty() {
-        deep_research_topic_label(message)
-    } else {
-        deep_research_plan_text(&objective, 120)
-    };
-    let mut seen = std::collections::HashSet::new();
-    let items = items
-        .into_iter()
-        .map(|item| deep_research_plan_text(&item, 96))
-        .filter(|item| !item.trim().is_empty())
-        .filter(|item| seen.insert(item.to_ascii_lowercase()))
-        .take(8)
-        .collect::<Vec<_>>();
-    (objective, items)
-}
-
-fn deep_research_plan_step(
-    id: usize,
-    title: impl Into<String>,
-    description: impl Into<String>,
-    message: &str,
-) -> crate::core::PlanStep {
-    crate::core::PlanStep {
-        id,
-        title: title.into(),
-        description: description.into(),
-        action: Some("research".to_string()),
-        arguments: Some(serde_json::json!({
-            "query": message,
-            "depth": "deep",
-        })),
-        tool_hint: Some("research".to_string()),
-        status: Some(crate::core::PlanStepStatus::Pending),
-        substeps: Vec::new(),
-    }
-}
-
-fn deep_research_focus_scope(focus_items: &[String]) -> String {
-    if focus_items.is_empty() {
-        "Cover the user's requested dimensions and note any evidence gaps.".to_string()
-    } else {
-        format!("Cover requested dimensions: {}.", focus_items.join("; "))
-    }
-}
-
-fn deep_research_focus_substeps(focus_items: &[String]) -> Vec<crate::core::PlanSubstep> {
-    focus_items
-        .iter()
-        .enumerate()
-        .map(|(index, focus)| crate::core::PlanSubstep {
-            id: index + 1,
-            title: deep_research_plan_text(focus, 96),
-            description: "Extract cited evidence for this requested dimension and flag gaps."
-                .to_string(),
-            tool_hint: Some("research".to_string()),
-            status: Some(crate::core::PlanStepStatus::Pending),
-        })
-        .collect()
-}
-
-fn default_deep_research_plan(message: &str, task_id: &str) -> crate::core::ExecutionPlan {
-    let (objective, focus_items) = deep_research_plan_focus_label(message);
-    let focus_scope = deep_research_focus_scope(&focus_items);
-    let mut steps = vec![
-        deep_research_plan_step(
-            1,
-            "Frame the research question",
-            format!(
-                "Turn {} into source requirements, freshness needs, and verification criteria. {}",
-                objective, focus_scope
-            ),
-            message,
-        ),
-        deep_research_plan_step(
-            2,
-            "Search for evidence",
-            "Scan primary, recent, comparative, skeptical, and data-bearing source angles for this topic.",
-            message,
-        ),
-        deep_research_plan_step(
-            3,
-            "Select strongest sources",
-            "Rank candidate sources for relevance, dimension coverage, diversity, recency, and primary-source value.",
-            message,
-        ),
-        deep_research_plan_step(
-            4,
-            "Read and extract evidence",
-            "Open selected sources, extract cited evidence for every requested dimension, and identify coverage gaps or contradictions.",
-            message,
-        ),
-        deep_research_plan_step(
-            5,
-            "Synthesize the recommendation",
-            "Compare positions, surface tradeoffs and uncertainty, add grounded charts when applicable, and write the final cited report.",
-            message,
-        ),
-    ];
-    if let Some(read_step) = steps.get_mut(3) {
-        read_step.substeps = deep_research_focus_substeps(&focus_items);
-    }
-
-    crate::core::ExecutionPlan {
-        plan_id: deep_research_plan_id(task_id),
-        revision: 1,
-        summary: format!(
-            "{}: source discovery, evidence reading, verification, and cited synthesis.",
-            objective
-        ),
-        steps,
-    }
-}
-
-fn normalize_deep_research_plan(
-    mut plan: crate::core::ExecutionPlan,
-    message: &str,
-    task_id: &str,
-) -> crate::core::ExecutionPlan {
-    if plan.plan_id.trim().is_empty() {
-        plan.plan_id = deep_research_plan_id(task_id);
-    }
-    if plan.revision == 0 {
-        plan.revision = 1;
-    }
-    if plan.summary.trim().is_empty() {
-        plan.summary = default_deep_research_plan(message, task_id).summary;
-    }
-    if plan.steps.is_empty() {
-        plan.steps = default_deep_research_plan(message, task_id).steps;
-    }
-    for (index, step) in plan.steps.iter_mut().enumerate() {
-        if step.id == 0 {
-            step.id = index + 1;
-        }
-        if step.title.trim().is_empty() {
-            step.title = format!("Research step {}", index + 1);
-        }
-        step.status = Some(crate::core::PlanStepStatus::Pending);
-        for substep in &mut step.substeps {
-            substep.status = Some(crate::core::PlanStepStatus::Pending);
-        }
-        let maps_to_research = step
-            .action
-            .as_deref()
-            .or(step.tool_hint.as_deref())
-            .map(|value| value.trim().eq_ignore_ascii_case("research"))
-            .unwrap_or(false);
-        if maps_to_research && step.arguments.is_none() {
-            step.arguments = Some(serde_json::json!({
-                "query": message,
-                "depth": "deep",
-            }));
-        }
-    }
-    plan
-}
-
-fn deep_research_plan_from_value(
-    value: Option<&serde_json::Value>,
-    message: &str,
-    task_id: &str,
-) -> crate::core::ExecutionPlan {
-    value
-        .cloned()
-        .and_then(|raw| serde_json::from_value::<crate::core::ExecutionPlan>(raw).ok())
-        .map(|plan| normalize_deep_research_plan(plan, message, task_id))
-        .unwrap_or_else(|| default_deep_research_plan(message, task_id))
-}
-
-fn deep_research_plan_timeout_ms() -> u64 {
-    std::env::var("AGENTARK_DEEP_RESEARCH_PLAN_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value >= 1_000)
-        .unwrap_or(45_000)
-        .min(180_000)
-}
-
-fn deep_research_plan_actions(
-    actions: Vec<crate::actions::ActionDef>,
-) -> Vec<crate::actions::ActionDef> {
-    let scoped = actions
-        .iter()
-        .filter(|action| action.name.trim().eq_ignore_ascii_case("research"))
-        .cloned()
-        .collect::<Vec<_>>();
-    if scoped.is_empty() {
-        actions
-    } else {
-        scoped
-    }
-}
-
-async fn generate_deep_research_plan_preview(
-    agent: &Agent,
-    message: &str,
-    task_id: &str,
-) -> crate::core::ExecutionPlan {
-    let fallback = default_deep_research_plan(message, task_id);
-    let actions = agent
-        .runtime
-        .list_enabled_actions()
-        .await
-        .map(deep_research_plan_actions)
-        .unwrap_or_default();
-    let (system, user) =
-        crate::core::planner::build_confirmation_plan_prompt(message, None, &actions);
-    let planner = agent
-        .llm_for_role(&crate::core::ModelRole::Research)
-        .clone();
-    let response = tokio::time::timeout(
-        std::time::Duration::from_millis(deep_research_plan_timeout_ms()),
-        planner.chat_classifier_bounded(&system, &user, 1_200),
-    )
-    .await;
-    let Ok(Ok(response)) = response else {
-        return fallback;
-    };
-    let Some(plan) = crate::core::planner::parse_plan_from_llm_content(
-        &response.content,
-        &actions,
-        Some(deep_research_plan_id(task_id)),
-        1,
-        false,
-    ) else {
-        return fallback;
-    };
-    let plan = normalize_deep_research_plan(plan, message, task_id);
-    let relevance = crate::core::planner::assess_confirmation_plan_relevance(message, &plan);
-    if relevance.accepted {
-        plan
-    } else {
-        fallback
-    }
-}
-
-fn deep_research_step_for_phase(plan: &crate::core::ExecutionPlan, phase: &str) -> (usize, String) {
-    let count = plan.steps.len().max(1);
-    let ordinal = match phase.trim().to_ascii_lowercase().as_str() {
-        "planning" => 1,
-        "searching" => 2,
-        "ranking" => 3,
-        "reading" => {
-            if count >= 4 {
-                4
-            } else if count >= 3 {
-                3
-            } else {
-                count
-            }
-        }
-        "synthesis" => count,
-        _ => count.min(2),
-    }
-    .clamp(1, count);
-
-    plan.steps
-        .get(ordinal - 1)
-        .map(|step| (step.id, step.title.clone()))
-        .unwrap_or((ordinal, format!("Research step {}", ordinal)))
-}
-
-fn deep_research_plan_step_status_for_stream(status: &str) -> crate::core::PlanStepStatus {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "completed" => crate::core::PlanStepStatus::Completed,
-        "failed" => crate::core::PlanStepStatus::Failed,
-        "skipped" => crate::core::PlanStepStatus::Skipped,
-        "running" => crate::core::PlanStepStatus::Running,
-        _ => crate::core::PlanStepStatus::Pending,
-    }
-}
-
-fn deep_research_substeps_for_step_update(
-    plan: &crate::core::ExecutionPlan,
-    step_id: usize,
-    status: &str,
-) -> Vec<crate::core::PlanSubstep> {
-    let next_status = deep_research_plan_step_status_for_stream(status);
-    plan.steps
-        .iter()
-        .find(|step| step.id == step_id)
-        .map(|step| {
-            step.substeps
-                .iter()
-                .cloned()
-                .map(|mut substep| {
-                    substep.status = Some(next_status);
-                    substep
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-async fn send_deep_research_plan_step_update(
-    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
-    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
-    run_id: &str,
-    channel: &str,
-    plan: &crate::core::ExecutionPlan,
-    step_id: usize,
-    step_title: String,
-    status: &str,
-    detail: impl Into<String>,
-) {
-    let substeps = deep_research_substeps_for_step_update(plan, step_id, status);
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "plan_step_update",
-        serde_json::json!({
-            "step_type": "plan_step_update",
-            "plan_id": plan.plan_id,
-            "revision": plan.revision,
-            "step_id": step_id,
-            "step_title": step_title,
-            "status": status,
-            "detail": detail.into(),
-            "substeps": substeps,
-        }),
-        crate::core::RunEventPriority::High,
-    )
-    .await;
-}
-
-async fn persist_deep_research_chat_message(
+async fn persist_chat_stream_message(
     agent: &Agent,
     conversation_id: Option<&str>,
     role: &str,
@@ -2632,7 +2480,7 @@ async fn persist_deep_research_chat_message(
         .await
     {
         tracing::warn!(
-            "Failed to persist deep research {} message for conversation '{}': {}",
+            "Failed to persist chat stream {} message for conversation '{}': {}",
             role,
             conversation_id,
             error
@@ -2650,1020 +2498,12 @@ async fn persist_deep_research_chat_message(
     }
 }
 
-fn deep_research_setup_issue(error_text: &str) -> bool {
-    let normalized = error_text
-        .trim()
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalized.contains(
-        crate::actions::search::SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE
-            .to_ascii_lowercase()
-            .as_str(),
-    ) || normalized.contains("no search backend")
-        || normalized.contains("search backend") && normalized.contains("not configured")
-        || normalized.contains("no usable sources")
-        || normalized.contains("all search angles failed")
-        || normalized.contains("available search backends")
-        || normalized.contains("not enough evidence for this research depth")
-        || normalized.contains("the search produced only")
-}
-
-fn deep_research_error_message(error: &anyhow::Error) -> String {
-    let error_text = error.to_string();
-    if deep_research_setup_issue(&error_text) {
-        format!(
-            "Deep research stopped because the available search backends failed or returned too little usable source evidence. AgentArk will not generate a cited report from unreliable or unreadable search results. Configure a reliable backend in Search Settings: SearXNG, Serper, Brave Search API, Exa, Tavily, Perplexity, or Firecrawl.\n\nDetails: {}",
-            truncate_stream_task_text(&error_text, 900)
-        )
-    } else {
-        format!(
-            "Deep research stopped before it could produce a trustworthy cited report. I did not synthesize an answer without usable source evidence.\n\nDetails: {}",
-            truncate_stream_task_text(&error_text, 900)
-        )
-    }
-}
-
-fn deep_research_synthesis_timeout_ms() -> Option<u64> {
-    std::env::var("AGENTARK_DEEP_RESEARCH_SYNTHESIS_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|value| {
-            if value == 0 {
-                0
-            } else {
-                value.clamp(30_000, 900_000)
-            }
-        })
-        .filter(|value| *value > 0)
-}
-
-fn strip_leading_markdown_title(markdown: &str) -> String {
-    let trimmed = markdown.trim();
-    let Some(first_line_end) = trimmed.find('\n') else {
-        return if trimmed.starts_with("# ") {
-            String::new()
-        } else {
-            trimmed.to_string()
-        };
-    };
-    let first_line = trimmed[..first_line_end].trim();
-    if !first_line.starts_with("# ") {
-        return trimmed.to_string();
-    }
-    trimmed[first_line_end..].trim_start().to_string()
-}
-
-fn compose_deep_research_report(query: &str, synthesis: &str, evidence_report: &str) -> String {
-    let synthesis = strip_leading_markdown_title(synthesis);
-    let evidence = strip_leading_markdown_title(evidence_report);
-    let title = truncate_stream_task_text(&deep_research_topic_label(query), 180);
-    let mut output = format!("# Deep Research: {}\n\n", title);
-    output.push_str(synthesis.trim());
-    output.push_str("\n\n---\n\n## Evidence Brief Used For Synthesis\n\n");
-    output.push_str(evidence.trim());
-    output.push('\n');
-    output
-}
-
-fn parse_runtime_tool_completion_value(output: &str) -> Option<serde_json::Value> {
-    let payload = output
-        .trim_start()
-        .strip_prefix(crate::runtime::TOOL_COMPLETION_MARKER)?;
-    serde_json::from_str::<serde_json::Value>(payload.lines().next().unwrap_or(payload).trim()).ok()
-}
-
-fn deep_research_pdf_filename(message: &str) -> String {
-    let title = deep_research_topic_label(message);
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in title.chars() {
-        let next = if ch.is_ascii_alphanumeric() {
-            last_dash = false;
-            Some(ch.to_ascii_lowercase())
-        } else if !last_dash {
-            last_dash = true;
-            Some('-')
-        } else {
-            None
-        };
-        if let Some(ch) = next {
-            out.push(ch);
-        }
-        if out.len() >= 72 {
-            break;
-        }
-    }
-    let stem = out.trim_matches('-');
-    if stem.is_empty() {
-        "deep-research-report.pdf".to_string()
-    } else {
-        format!("{stem}.pdf")
-    }
-}
-
-fn managed_file_artifact_from_completion(value: &serde_json::Value) -> Option<serde_json::Value> {
-    let data = value.get("data").unwrap_or(value);
-    let artifact_value = data.get("artifact")?;
-    let mut artifact = artifact_value.as_object()?.clone();
-    artifact
-        .entry("format".to_string())
-        .or_insert_with(|| serde_json::Value::String("PDF".to_string()));
-    if let Some(document) = data.get("document").and_then(|value| value.as_object()) {
-        let mut document_ref = serde_json::Map::new();
-        for key in ["id", "filename", "url", "download_url", "duplicate_skipped"] {
-            if let Some(value) = document.get(key).cloned() {
-                document_ref.insert(key.to_string(), value);
-            }
-        }
-        if !document_ref.is_empty() {
-            artifact.insert(
-                "document".to_string(),
-                serde_json::Value::Object(document_ref),
-            );
-        }
-    }
-    Some(serde_json::Value::Object(artifact))
-}
-
-fn managed_file_artifact_label(artifact: &serde_json::Value) -> String {
-    artifact
-        .get("document")
-        .and_then(|document| document.get("filename"))
-        .or_else(|| artifact.get("label"))
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("PDF report")
-        .to_string()
-}
-
-fn managed_file_artifact_download_href(artifact: &serde_json::Value) -> Option<String> {
-    for key in ["download_url", "url"] {
-        let Some(value) = artifact
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if value.starts_with("/api/outputs/") && !value.contains("..") && !value.contains('\\') {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn markdown_link_label(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('[', "\\[")
-        .replace(']', "\\]")
-}
-
-fn append_pdf_artifact_note(output: &str, artifact: Option<&serde_json::Value>) -> String {
-    let Some(artifact) = artifact else {
-        return output.to_string();
-    };
-    let label = managed_file_artifact_label(artifact);
-    let artifact_ref = managed_file_artifact_download_href(artifact)
-        .map(|href| format!("[{}]({})", markdown_link_label(&label), href))
-        .unwrap_or(label);
-    format!(
-        "{}\n\nPDF report saved in Documents: {}.",
-        output.trim_end(),
-        artifact_ref
-    )
-}
-
-async fn generate_deep_research_pdf_artifact(
-    app_state: &AppState,
-    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
-    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
-    run_id: &str,
-    channel: &str,
-    message: &str,
-    conversation_id: Option<&str>,
-    execution_profile: Option<&ChatExecutionProfile>,
-    report: &str,
-) -> Option<serde_json::Value> {
-    if !execution_profile.is_some_and(ChatExecutionProfile::wants_pdf) {
-        return None;
-    }
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "tool_start",
-        serde_json::json!({
-            "name": "pdf_generate",
-            "content": "Creating managed PDF report.",
-            "conversation_id": conversation_id,
-        }),
-        crate::core::RunEventPriority::High,
-    )
-    .await;
-
-    let agent_snapshot = Agent::snapshot(&app_state.agent).await;
-    let args = serde_json::json!({
-        "title": deep_research_topic_label(message),
-        "filename": deep_research_pdf_filename(message),
-        "style": "report",
-        "content": report,
-        "document_visible": true,
-        "metadata": {
-            "source": "deep_research",
-            "execution_profile": execution_profile.map(ChatExecutionProfile::to_value),
-        }
-    });
-    let result = agent_snapshot
-        .runtime
-        .execute_action("pdf_generate", &args)
-        .await;
-    match result {
-        Ok(output) => {
-            let artifact = parse_runtime_tool_completion_value(&output)
-                .and_then(|value| managed_file_artifact_from_completion(&value));
-            let label = artifact
-                .as_ref()
-                .map(managed_file_artifact_label)
-                .unwrap_or_else(|| "PDF report".to_string());
-            let artifact_ref = artifact
-                .as_ref()
-                .and_then(managed_file_artifact_download_href)
-                .map(|href| format!("[{}]({})", markdown_link_label(&label), href))
-                .unwrap_or(label);
-            let mut payload = serde_json::json!({
-                "name": "pdf_generate",
-                "content": format!("PDF report saved in Documents: {}.", artifact_ref),
-                "conversation_id": conversation_id,
-            });
-            if let Some(artifact) = artifact.clone() {
-                payload["artifacts"] = serde_json::json!([artifact]);
-            }
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "tool_result",
-                payload,
-                crate::core::RunEventPriority::High,
-            )
-            .await;
-            artifact
-        }
-        Err(error) => {
-            tracing::warn!("Deep research PDF generation failed: {}", error);
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "tool_result",
-                serde_json::json!({
-                    "name": "pdf_generate",
-                    "content": "Deep research completed, but PDF artifact generation failed.",
-                    "conversation_id": conversation_id,
-                }),
-                crate::core::RunEventPriority::High,
-            )
-            .await;
-            None
-        }
-    }
-}
-
-async fn synthesize_deep_research_report(
-    agent: &Agent,
-    query: &str,
-    evidence_report: &str,
-    progress: &crate::actions::research::ResearchProgressReporter,
-) -> anyhow::Result<String> {
-    progress.emit(
-        "synthesis",
-        "Analyst synthesis",
-        "Asking the research model to write a source-grounded deep report from the gathered evidence.",
-        "running",
-        "phase-status:research:model-synthesis",
-    );
-
-    let system = r#"You are AgentArk's deep research synthesis engine.
-
-Write like a senior research analyst producing a polished decision-grade report. Use only the supplied evidence brief and its numbered sources. Do not invent facts, citations, dates, statistics, source titles, URLs, chart data, or confidence levels. If the evidence is thin, conflicting, or missing for part of the request, say so directly and explain what would need verification.
-
-The report must be meaningfully deep, not a shallow summary. Synthesize what the evidence implies; compare competing positions; separate supported findings from assumptions; surface tradeoffs, uncertainty, counterarguments, constraints, and practical options; and preserve source grounding for every material claim with bracketed citations such as [1] or [2, 4]. Organize sections around the user's underlying research need and the evidence structure, not around surface wording.
-
-Use compact Markdown tables when they make comparison, options, risks, timelines, actors, source reliability, or evidence coverage easier to scan. Include fenced `agentark-chart` JSON only when the evidence contains concrete comparable numbers, percentages, dates, counts, ratings, or grouped categories that make a visual materially clearer than prose or a table. When charts are justified, include them near the relevant analysis using this shape: `title`, `type`, `x`, `series`, `data`, and `height`. Do not chart qualitative claims without numeric support.
-
-Do not include a Sources section because AgentArk appends the evidence brief separately."#;
-
-    let evidence = if evidence_report.chars().count() > 45_000 {
-        let trimmed = evidence_report.chars().take(45_000).collect::<String>();
-        format!(
-            "{}\n\n[Evidence brief truncated to fit the synthesis context. Preserve uncertainty where support is incomplete.]",
-            trimmed
-        )
-    } else {
-        evidence_report.to_string()
-    };
-    let user = format!(
-        "Original research request:\n{}\n\nEvidence brief:\n{}\n\nWrite the deep research report now. Include an executive summary, detailed analysis organized around the request's real dimensions, compact tables for comparisons or options when useful, charts or plots only when the evidence contains concrete comparable values, the strongest case for and against the likely conclusion, practical recommendations or options, and evidence gaps/open questions. Keep every substantive claim grounded in the supplied numbered sources.",
-        query.trim(),
-        evidence.trim()
-    );
-    let llm = agent
-        .llm_for_role(&crate::core::ModelRole::Research)
-        .clone();
-    let synthesis_call = llm.chat_with_system_bounded(system, &user, 8_000);
-    let response = if let Some(timeout_ms) = deep_research_synthesis_timeout_ms() {
-        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), synthesis_call)
-            .await
-            .map_err(|_| anyhow::anyhow!("research model synthesis timed out"))??
-    } else {
-        synthesis_call.await?
-    };
-    let synthesis = response.content.trim();
-    if synthesis.is_empty() {
-        return Err(anyhow::anyhow!(
-            "research model synthesis returned no report content"
-        ));
-    }
-
-    progress.emit(
-        "synthesis",
-        "Analyst synthesis",
-        format!(
-            "Research model completed a {} character synthesis using {}.",
-            synthesis.chars().count(),
-            response.model
-        ),
-        "completed",
-        "phase-status:research:model-synthesis",
-    );
-    Ok(compose_deep_research_report(
-        query,
-        synthesis,
-        evidence_report,
-    ))
-}
-
-async fn prepare_deep_research_plan_confirmation(
-    app_state: &AppState,
-    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
-    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
-    run_storage: &crate::storage::Storage,
-    run_id: &str,
-    channel: &str,
-    message: &str,
-    conversation_id: Option<&str>,
-    _project_id: Option<&str>,
-    attachments: &[crate::core::ChatAttachmentHint],
-    user_message_already_recorded: bool,
-    execution_profile: Option<&ChatExecutionProfile>,
-) -> anyhow::Result<()> {
-    let task_id = uuid::Uuid::new_v4();
-    let agent_snapshot = Agent::snapshot(&app_state.agent).await;
-    let plan =
-        generate_deep_research_plan_preview(&agent_snapshot, message, &task_id.to_string()).await;
-    let plan_json = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
-    let description = format!(
-        "Deep research: {}",
-        truncate_stream_task_text(&deep_research_topic_label(message), 96)
-    );
-    let mut task = crate::core::Task::new(
-        description.clone(),
-        "chat_request".to_string(),
-        serde_json::json!({
-            "_task_kind": "chat_request",
-            "_origin": "chat",
-            "_work_type": "research",
-            "_pause_kind": "plan_confirmation",
-            "_plan_preview": {
-                "original_plan": plan_json,
-                "current_plan": plan_json,
-                "source": "deep_research"
-            },
-            "message": message,
-            "channel": channel,
-            "conversation_id": conversation_id,
-            "deep_research": true,
-            "_execution_profile": execution_profile.map(ChatExecutionProfile::to_value),
-            "attachments_present": !attachments.is_empty(),
-            "attachments": attachments,
-        }),
-    );
-    task.id = task_id;
-    task.status = crate::core::TaskStatus::Paused;
-    task.capabilities = vec!["network".to_string(), "research".to_string()];
-
-    if !user_message_already_recorded {
-        persist_deep_research_chat_message(
-            &agent_snapshot,
-            conversation_id,
-            "user",
-            message,
-            None,
-            None,
-        )
-        .await;
-    }
-    agent_snapshot.add_task(task.clone()).await?;
-
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "task_started",
-        serde_json::json!({
-            "task_id": task.id.to_string(),
-            "description": task.description,
-            "status": "paused",
-            "work_type": "research",
-            "conversation_id": conversation_id,
-        }),
-        crate::core::RunEventPriority::Critical,
-    )
-    .await;
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "plan_generated",
-        serde_json::json!({
-            "step_type": "plan_generated",
-            "task_id": task.id.to_string(),
-            "source": "deep_research",
-            "plan": plan,
-            "conversation_id": conversation_id,
-        }),
-        crate::core::RunEventPriority::High,
-    )
-    .await;
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "plan_ready_for_confirmation",
-        serde_json::json!({
-            "step_type": "plan_ready_for_confirmation",
-            "task_id": task.id.to_string(),
-            "source": "deep_research",
-            "plan": plan,
-            "conversation_id": conversation_id,
-        }),
-        crate::core::RunEventPriority::Critical,
-    )
-    .await;
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "task_status",
-        serde_json::json!({
-            "task_id": task.id.to_string(),
-            "description": description,
-            "status": "paused",
-            "pause_kind": "plan_confirmation",
-            "work_type": "research",
-            "source": "deep_research",
-            "result_preview": "Deep research plan is awaiting confirmation.",
-            "conversation_id": conversation_id,
-        }),
-        crate::core::RunEventPriority::High,
-    )
-    .await;
-    upsert_chat_stream_execution_run(
-        run_storage,
-        run_id,
-        conversation_id,
-        channel,
-        message,
-        crate::core::ExecutionRunStatus::NeedsInput,
-        Some("Deep research plan is awaiting confirmation.".to_string()),
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-    )
-    .await;
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "run_status",
-        serde_json::json!({
-            "run_id": run_id,
-            "run_status": "needs_input",
-            "trace_id": serde_json::Value::Null,
-            "summary": "Deep research plan is awaiting confirmation.",
-            "conversation_id": conversation_id,
-        }),
-        crate::core::RunEventPriority::High,
-    )
-    .await;
-    Ok(())
-}
-
-async fn run_approved_deep_research_stream(
-    app_state: &AppState,
-    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
-    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
-    run_storage: &crate::storage::Storage,
-    run_id: &str,
-    channel: &str,
-    message: &str,
-    conversation_id: Option<&str>,
-    _project_id: Option<&str>,
-    task: &StreamedChatTask,
-    started_at: std::time::Instant,
-) -> anyhow::Result<()> {
-    let task_uuid = uuid::Uuid::parse_str(&task.task_id)
-        .map_err(|error| anyhow::anyhow!("Invalid deep research task id: {}", error))?;
-    let plan = deep_research_plan_from_value(task.plan_override.as_ref(), message, &task.task_id);
-
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "task_status",
-        serde_json::json!({
-            "task_id": task.task_id,
-            "description": task.description,
-            "status": "in_progress",
-            "work_type": task.work_type,
-            "conversation_id": conversation_id,
-        }),
-        crate::core::RunEventPriority::High,
-    )
-    .await;
-    send_chat_stream_event(
-        tx,
-        live_runs,
-        run_id,
-        "chat",
-        channel,
-        "tool_start",
-        serde_json::json!({
-            "name": "research",
-            "query": message,
-            "depth": "deep",
-            "plan_id": plan.plan_id,
-            "plan_revision": plan.revision,
-        }),
-        crate::core::RunEventPriority::High,
-    )
-    .await;
-
-    let agent_snapshot = Agent::snapshot(&app_state.agent).await;
-    let search_config = crate::runtime::build_search_config(
-        &agent_snapshot.config_dir,
-        Some(&agent_snapshot.storage),
-    )
-    .await;
-    drop(agent_snapshot);
-
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::actions::research::ResearchProgressUpdate>();
-    let progress = crate::actions::research::ResearchProgressReporter::new(progress_tx);
-    let progress_forwarder = {
-        let tx = tx.clone();
-        let live_runs = live_runs.clone();
-        let run_id = run_id.to_string();
-        let channel = channel.to_string();
-        let plan = plan.clone();
-        crate::spawn_logged!("src/channels/http.rs:deep_research_progress", async move {
-            while let Some(update) = progress_rx.recv().await {
-                let (step_id, step_title) = deep_research_step_for_phase(&plan, &update.phase);
-                send_deep_research_plan_step_update(
-                    &tx,
-                    &live_runs,
-                    &run_id,
-                    &channel,
-                    &plan,
-                    step_id,
-                    step_title.clone(),
-                    &update.status,
-                    update.detail.clone(),
-                )
-                .await;
-                send_chat_stream_event(
-                    &tx,
-                    &live_runs,
-                    &run_id,
-                    "chat",
-                    &channel,
-                    "tool_progress",
-                    serde_json::json!({
-                        "name": "research",
-                        "content": update.detail,
-                        "kind": "phase_status",
-                        "phase": update.phase,
-                        "label": update.label,
-                        "detail": update.detail,
-                        "status": update.status,
-                        "elapsed_secs": update.elapsed_secs,
-                        "stream_key": update.stream_key,
-                        "plan_id": plan.plan_id,
-                        "plan_revision": plan.revision,
-                        "plan_step_id": step_id,
-                        "plan_step_title": step_title,
-                    }),
-                    crate::core::RunEventPriority::Normal,
-                )
-                .await;
-            }
-        })
-    };
-
-    let research_args = crate::actions::research::ResearchArgs {
-        query: message.to_string(),
-        max_sources: 24,
-        _include_sources: true,
-        backend: None,
-        depth: crate::actions::research::ResearchDepth::Deep,
-        min_primary_sources: 4,
-        freshness_window_days: None,
-        followup_rounds: 4,
-    };
-    let research_result = crate::actions::research::execute_research_with_progress(
-        &research_args,
-        &search_config,
-        Some(&progress),
-    )
-    .await;
-    let research_result = match research_result {
-        Ok(evidence_output) if evidence_output.trim().is_empty() => Err(anyhow::anyhow!(
-            "Deep research completed without report content. No answer was saved."
-        )),
-        Ok(evidence_output) => {
-            let agent_snapshot = Agent::snapshot(&app_state.agent).await;
-            synthesize_deep_research_report(&agent_snapshot, message, &evidence_output, &progress)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Deep research gathered source evidence, but failed during analyst synthesis: {}",
-                        error
-                    )
-                })
-        }
-        Err(error) => Err(error),
-    };
-    drop(progress);
-    let _ = progress_forwarder.await;
-
-    match research_result {
-        Ok(output) => {
-            for step in &plan.steps {
-                send_deep_research_plan_step_update(
-                    tx,
-                    live_runs,
-                    run_id,
-                    channel,
-                    &plan,
-                    step.id,
-                    step.title.clone(),
-                    "completed",
-                    "Research step completed.",
-                )
-                .await;
-            }
-
-            let pdf_artifact = generate_deep_research_pdf_artifact(
-                app_state,
-                tx,
-                live_runs,
-                run_id,
-                channel,
-                message,
-                conversation_id,
-                task.execution_profile.as_ref(),
-                &output,
-            )
-            .await;
-            let final_output = append_pdf_artifact_note(&output, pdf_artifact.as_ref());
-            let agent_snapshot = Agent::snapshot(&app_state.agent).await;
-            persist_deep_research_chat_message(
-                &agent_snapshot,
-                conversation_id,
-                "assistant",
-                &final_output,
-                Some("deep_research"),
-                None,
-            )
-            .await;
-            agent_snapshot
-                .finalize_task(
-                    task_uuid,
-                    crate::core::TaskStatus::Completed,
-                    Some(truncate_stream_task_text(&final_output, 400)),
-                )
-                .await?;
-            let user_outcome =
-                agent_snapshot
-                    .execution_supervisor
-                    .build_success_outcome(&final_output, &[], &[]);
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "tool_result",
-                serde_json::json!({
-                    "name": "research",
-                    "content": "Deep research completed with a cited report.",
-                    "plan_id": plan.plan_id,
-                    "plan_revision": plan.revision,
-                }),
-                crate::core::RunEventPriority::High,
-            )
-            .await;
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "task_status",
-                serde_json::json!({
-                    "task_id": task.task_id,
-                    "description": task.description,
-                    "status": "completed",
-                    "work_type": task.work_type,
-                    "result_preview": truncate_stream_task_text(&final_output, 400),
-                    "conversation_id": conversation_id,
-                }),
-                crate::core::RunEventPriority::High,
-            )
-            .await;
-            let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            upsert_chat_stream_execution_run(
-                run_storage,
-                run_id,
-                conversation_id,
-                channel,
-                message,
-                crate::core::ExecutionRunStatus::Completed,
-                Some(truncate_stream_task_text(&final_output, 1200)),
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-            )
-            .await;
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "content",
-                serde_json::json!({
-                    "content": final_output,
-                    "conversation_id": conversation_id,
-                    "run_id": run_id,
-                    "run_status": "completed",
-                    "trace_id": serde_json::Value::Null,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                    "duration_ms": duration_ms,
-                    "time_to_first_token_ms": duration_ms.max(1),
-                    "degradation": [],
-                    "attempted_models": [],
-                    "user_outcome": user_outcome,
-                }),
-                crate::core::RunEventPriority::Critical,
-            )
-            .await;
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "run_status",
-                serde_json::json!({
-                    "run_id": run_id,
-                    "run_status": "completed",
-                    "trace_id": serde_json::Value::Null,
-                    "conversation_id": conversation_id,
-                    "duration_ms": duration_ms,
-                    "time_to_first_token_ms": duration_ms.max(1),
-                    "degradation": [],
-                    "attempted_models": [],
-                    "user_outcome": user_outcome,
-                }),
-                crate::core::RunEventPriority::Critical,
-            )
-            .await;
-            Ok(())
-        }
-        Err(error) => {
-            let message_text = deep_research_error_message(&error);
-            let error_text = error.to_string();
-            let setup_issue = deep_research_setup_issue(&error_text);
-            let failed_phase = if setup_issue {
-                "searching"
-            } else {
-                "synthesis"
-            };
-            let (step_id, step_title) = deep_research_step_for_phase(&plan, failed_phase);
-            send_deep_research_plan_step_update(
-                tx,
-                live_runs,
-                run_id,
-                channel,
-                &plan,
-                step_id,
-                step_title,
-                "failed",
-                message_text.clone(),
-            )
-            .await;
-
-            let degradation = vec![crate::core::DegradationNote {
-                kind: if setup_issue {
-                    "search_provider_setup".to_string()
-                } else {
-                    "deep_research_failed".to_string()
-                },
-                summary: if setup_issue {
-                    "search backends returned no usable evidence".to_string()
-                } else {
-                    "deep research failed".to_string()
-                },
-                detail: Some(error_text.clone()),
-            }];
-            let agent_snapshot = Agent::snapshot(&app_state.agent).await;
-            persist_deep_research_chat_message(
-                &agent_snapshot,
-                conversation_id,
-                "assistant",
-                &message_text,
-                Some("deep_research"),
-                None,
-            )
-            .await;
-            agent_snapshot
-                .finalize_task(
-                    task_uuid,
-                    crate::core::TaskStatus::Failed {
-                        error: message_text.clone(),
-                    },
-                    Some(truncate_stream_task_text(&message_text, 400)),
-                )
-                .await?;
-            let user_outcome = if setup_issue {
-                agent_snapshot
-                    .execution_supervisor
-                    .build_integration_outcome(&message_text, &degradation, &[])
-            } else {
-                agent_snapshot
-                    .execution_supervisor
-                    .build_service_outage_outcome(
-                        &message_text,
-                        "deep_research_failed",
-                        &degradation,
-                        &[],
-                    )
-            };
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "tool_progress",
-                serde_json::json!({
-                    "name": "research",
-                    "content": message_text,
-                    "kind": "phase_status",
-                    "phase": failed_phase,
-                    "label": if setup_issue { "Search backends failed" } else { "Research stopped" },
-                    "detail": message_text,
-                    "status": "failed",
-                    "elapsed_secs": started_at.elapsed().as_secs(),
-                    "stream_key": "phase-status:research:failed",
-                    "plan_id": plan.plan_id,
-                    "plan_revision": plan.revision,
-                    "plan_step_id": step_id,
-                }),
-                crate::core::RunEventPriority::High,
-            )
-            .await;
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "task_status",
-                serde_json::json!({
-                    "task_id": task.task_id,
-                    "description": task.description,
-                    "status": "failed",
-                    "work_type": task.work_type,
-                    "result_preview": truncate_stream_task_text(&message_text, 400),
-                    "conversation_id": conversation_id,
-                }),
-                crate::core::RunEventPriority::High,
-            )
-            .await;
-            let run_status = if setup_issue {
-                crate::core::ExecutionRunStatus::NeedsInput
-            } else {
-                crate::core::ExecutionRunStatus::Degraded
-            };
-            upsert_chat_stream_execution_run(
-                run_storage,
-                run_id,
-                conversation_id,
-                channel,
-                message,
-                run_status.clone(),
-                Some(message_text.clone()),
-                Some(error_text),
-                None,
-                degradation.clone(),
-                Vec::new(),
-            )
-            .await;
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "content",
-                serde_json::json!({
-                    "content": message_text,
-                    "conversation_id": conversation_id,
-                    "run_id": run_id,
-                    "run_status": run_status.as_str(),
-                    "trace_id": serde_json::Value::Null,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                    "duration_ms": started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                    "time_to_first_token_ms": started_at.elapsed().as_millis().min(u64::MAX as u128).max(1) as u64,
-                    "degradation": degradation,
-                    "attempted_models": [],
-                    "user_outcome": user_outcome,
-                }),
-                crate::core::RunEventPriority::Critical,
-            )
-            .await;
-            send_chat_stream_event(
-                tx,
-                live_runs,
-                run_id,
-                "chat",
-                channel,
-                "run_status",
-                serde_json::json!({
-                    "run_id": run_id,
-                    "run_status": run_status.as_str(),
-                    "trace_id": serde_json::Value::Null,
-                    "conversation_id": conversation_id,
-                    "degradation": degradation,
-                    "attempted_models": [],
-                    "user_outcome": user_outcome,
-                }),
-                crate::core::RunEventPriority::Critical,
-            )
-            .await;
-            Ok(())
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct StreamedChatTask {
     pub(super) task_id: String,
     pub(super) description: String,
     pub(super) work_type: String,
     pub(super) user_message_already_recorded: bool,
-    pub(super) plan_override: Option<serde_json::Value>,
     pub(super) execution_profile: Option<ChatExecutionProfile>,
 }
 
@@ -3683,10 +2523,10 @@ pub(super) struct AcceptedChatSuggestionRun {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ChatExecutionProfile {
-    pub(super) work_type: String,
-    pub(super) depth: String,
+    pub(super) capability_tags: Vec<String>,
+    pub(super) depth_hint: Option<String>,
     pub(super) deliverables: Vec<String>,
-    pub(super) plan_first: bool,
+    pub(super) long_running: bool,
     pub(super) confidence: Option<f64>,
     pub(super) source: String,
 }
@@ -3694,10 +2534,14 @@ pub(super) struct ChatExecutionProfile {
 impl ChatExecutionProfile {
     fn explicit_deep_research() -> Self {
         Self {
-            work_type: "research".to_string(),
-            depth: "deep".to_string(),
+            capability_tags: vec![
+                "research".to_string(),
+                "source_synthesis".to_string(),
+                "decision_grade".to_string(),
+            ],
+            depth_hint: Some("deep".to_string()),
             deliverables: Vec::new(),
-            plan_first: false,
+            long_running: true,
             confidence: Some(1.0),
             source: "ui_override".to_string(),
         }
@@ -3705,8 +2549,13 @@ impl ChatExecutionProfile {
 
     fn deep_research_override_with(semantic: Option<Self>) -> Self {
         let mut profile = semantic.unwrap_or_else(Self::explicit_deep_research);
-        profile.work_type = "research".to_string();
-        profile.depth = "deep".to_string();
+        for tag in ["research", "source_synthesis", "decision_grade"] {
+            if !profile.capability_tags.iter().any(|value| value == tag) {
+                profile.capability_tags.push(tag.to_string());
+            }
+        }
+        profile.depth_hint = Some("deep".to_string());
+        profile.long_running = true;
         profile.confidence = Some(1.0);
         profile.source = if profile.source == "semantic_classifier" {
             "ui_override+semantic_classifier".to_string()
@@ -3727,35 +2576,32 @@ impl ChatExecutionProfile {
         if confidence.is_some_and(|value| value < 0.65) {
             return None;
         }
-        let work_type = normalize_chat_profile_token(
-            value.get("work_type").and_then(|value| value.as_str()),
-            &[
-                "chat",
-                "research",
-                "workspace",
-                "code",
-                "app",
-                "automation",
-                "artifact",
-            ],
-        )
-        .unwrap_or_else(|| "chat".to_string());
-        let depth = normalize_chat_profile_token(
-            value.get("depth").and_then(|value| value.as_str()),
-            &["quick", "standard", "deep"],
-        )
-        .unwrap_or_else(|| "standard".to_string());
+        let mut capability_tags =
+            normalize_chat_profile_list(value.get("capability_tags")).unwrap_or_default();
+        if capability_tags.is_empty() {
+            if let Some(legacy) = normalize_chat_profile_label(
+                value.get("work_type").and_then(|value| value.as_str()),
+            ) {
+                capability_tags.push(legacy);
+            }
+        }
+        let depth_hint = normalize_chat_profile_label(
+            value
+                .get("depth_hint")
+                .or_else(|| value.get("depth"))
+                .and_then(|value| value.as_str()),
+        );
         let deliverables =
-            normalize_chat_profile_deliverables(value.get("deliverables")).unwrap_or_default();
-        let plan_first = value
-            .get("plan_first")
+            normalize_chat_profile_list(value.get("deliverables")).unwrap_or_default();
+        let long_running = value
+            .get("long_running")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         Some(Self {
-            work_type,
-            depth,
+            capability_tags,
+            depth_hint,
             deliverables,
-            plan_first,
+            long_running,
             confidence,
             source: source.to_string(),
         })
@@ -3771,45 +2617,40 @@ impl ChatExecutionProfile {
         )
     }
 
-    fn routes_to_deep_research(&self) -> bool {
-        self.work_type == "research" && self.depth == "deep"
-    }
-
-    fn wants_pdf(&self) -> bool {
-        self.deliverables.iter().any(|value| value == "pdf")
-    }
-
     fn to_value(&self) -> serde_json::Value {
         serde_json::json!({
-            "work_type": self.work_type,
-            "depth": self.depth,
+            "capability_tags": self.capability_tags,
+            "depth_hint": self.depth_hint,
             "deliverables": self.deliverables,
-            "plan_first": self.plan_first,
+            "long_running": self.long_running,
             "confidence": self.confidence,
             "source": self.source,
         })
     }
 }
 
-fn normalize_chat_profile_token(raw: Option<&str>, allowed: &[&str]) -> Option<String> {
-    let token = raw?.trim().to_ascii_lowercase();
-    if allowed.iter().any(|allowed| *allowed == token.as_str()) {
-        Some(token)
-    } else {
-        None
-    }
+fn normalize_chat_profile_label(raw: Option<&str>) -> Option<String> {
+    let sanitized = raw?
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let token = sanitized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    (!token.is_empty() && token.chars().count() <= 64).then_some(token)
 }
 
-fn normalize_chat_profile_deliverables(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
-    let allowed = [
-        "answer",
-        "markdown",
-        "pdf",
-        "document",
-        "app",
-        "code",
-        "automation",
-    ];
+fn normalize_chat_profile_list(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
     let values = match value? {
         serde_json::Value::String(item) => vec![item.as_str()],
         serde_json::Value::Array(items) => items
@@ -3820,7 +2661,7 @@ fn normalize_chat_profile_deliverables(value: Option<&serde_json::Value>) -> Opt
     };
     let mut out = Vec::new();
     for value in values {
-        if let Some(token) = normalize_chat_profile_token(Some(value), &allowed) {
+        if let Some(token) = normalize_chat_profile_label(Some(value)) {
             if !out.contains(&token) {
                 out.push(token);
             }
@@ -3833,12 +2674,54 @@ fn extract_chat_execution_profile_value(text: &str) -> Option<serde_json::Value>
     serde_json::from_str::<serde_json::Value>(text.trim())
         .ok()
         .or_else(|| {
-            let start = text.find('{')?;
-            let end = text.rfind('}')?;
-            if end <= start {
-                return None;
+            let bytes = text.as_bytes();
+            let mut start = None::<usize>;
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escaped = false;
+
+            for (index, byte) in bytes.iter().enumerate() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    match byte {
+                        b'\\' => escaped = true,
+                        b'"' => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' => {
+                        if depth == 0 {
+                            start = Some(index);
+                        }
+                        depth += 1;
+                    }
+                    b'}' => {
+                        if depth == 0 {
+                            continue;
+                        }
+                        depth -= 1;
+                        if depth == 0 {
+                            let begin = start?;
+                            let candidate = &text[begin..=index];
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate)
+                            {
+                                if value.is_object() {
+                                    return Some(value);
+                                }
+                            }
+                            start = None;
+                        }
+                    }
+                    _ => {}
+                }
             }
-            serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
+            None
         })
 }
 
@@ -3846,8 +2729,8 @@ fn chat_execution_profile_classifier_timeout_ms() -> u64 {
     std::env::var("AGENTARK_CHAT_EXECUTION_PROFILE_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|value| value.clamp(500, 8_000))
-        .unwrap_or(1_500)
+        .map(|value| value.clamp(500, 15_000))
+        .unwrap_or(8_000)
 }
 
 async fn infer_chat_execution_profile(
@@ -3859,18 +2742,18 @@ async fn infer_chat_execution_profile(
     let classifier = agent_snapshot
         .llm_for_role(&crate::core::ModelRole::Fast)
         .clone();
-    let system = r#"Classify the user's request into an AgentArk execution profile.
+    let system = r#"Describe the user's request as an AgentArk execution profile.
 
 Return only compact JSON with this schema:
 {
-  "work_type": "chat" | "research" | "workspace" | "code" | "app" | "automation" | "artifact",
-  "depth": "quick" | "standard" | "deep",
-  "deliverables": ["answer" | "markdown" | "pdf" | "document" | "app" | "code" | "automation"],
-  "plan_first": boolean,
+  "capability_tags": [string],
+  "depth_hint": string | null,
+  "deliverables": [string],
+  "long_running": boolean,
   "confidence": number
 }
 
-Infer from the underlying intent and expected work, not from exact words. Use research when the request primarily needs evidence gathering and synthesis across sources. Use deep when the research is broad, multi-source, comparative, decision-grade, or expected to take multiple evidence-gathering passes. Put artifact formats in deliverables when the user expects a saved or rendered output. Set plan_first for expensive or multi-step work where a reviewable plan should be confirmed before execution. If the intent is uncertain, choose chat/standard and confidence below 0.65."#;
+Infer from the underlying intent and expected work, not from exact words. Use short semantic capability tags for the capabilities likely needed; do not choose from a fixed taxonomy. Use depth_hint and long_running for broad, multi-source, multi-step, expensive, or decision-grade work. Put artifact formats in deliverables when the user expects a saved or rendered output. If the intent is uncertain, keep tags sparse and confidence below 0.65."#;
     let user = format!(
         "User request:\n{}\n\nStructured context:\nattachments_present: {}",
         message.trim(),
@@ -3905,7 +2788,6 @@ pub(super) struct ChatStreamRunRequest {
     pub(super) user_message_already_recorded: bool,
     pub(super) recorded_user_message_id: Option<String>,
     pub(super) deep_research: bool,
-    pub(super) plan_confirmation_mode: Option<String>,
     pub(super) attachments_present: bool,
     pub(super) attachments: Vec<crate::core::ChatAttachmentHint>,
     pub(super) arkorbit_context: Option<serde_json::Value>,
@@ -3944,7 +2826,6 @@ pub(super) fn chat_stream_run_request_from_persisted_user_message(
         user_message_already_recorded: true,
         recorded_user_message_id: Some(persisted_user_message.message_id),
         deep_research: request.deep_research,
-        plan_confirmation_mode: request.plan_confirmation_mode,
         attachments_present: request.attachments_present || !request.attachments.is_empty(),
         attachments: request.attachments,
         arkorbit_context: request.arkorbit_context,
@@ -4178,13 +3059,21 @@ async fn send_chat_stream_synthetic_tokens(
             "chat",
             origin,
             "token",
-            serde_json::json!({ "content": chunk }),
+            chat_stream_token_payload(&chunk, true),
             crate::core::RunEventPriority::Normal,
         )
         .await;
         if idx < 180 {
             tokio::time::sleep(std::time::Duration::from_millis(8)).await;
         }
+    }
+}
+
+fn chat_stream_token_payload(content: &str, synthetic: bool) -> serde_json::Value {
+    if synthetic {
+        serde_json::json!({ "content": content, "synthetic": true })
+    } else {
+        serde_json::json!({ "content": content })
     }
 }
 
@@ -4289,7 +3178,32 @@ async fn upsert_chat_stream_execution_run(
     }
 }
 
-pub(super) fn spawn_chat_stream_response(
+fn active_chat_stream_conflict_response(conversation_id: &str, active_run_id: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "This conversation already has an active run. Stop it or wait for it to finish before sending another message.",
+            "conversation_id": conversation_id,
+            "active_run_id": active_run_id,
+            "retryable": true,
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn reject_if_chat_conversation_stream_active(
+    state: &AppState,
+    conversation_id: Option<&str>,
+) -> Option<Response> {
+    let conversation_id = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    active_chat_conversation_request_id(state, conversation_id)
+        .await
+        .map(|active_run_id| active_chat_stream_conflict_response(conversation_id, &active_run_id))
+}
+
+pub(super) async fn spawn_chat_stream_response(
     state: AppState,
     request: ChatStreamRunRequest,
 ) -> Response {
@@ -4305,7 +3219,6 @@ pub(super) fn spawn_chat_stream_response(
     let request_recorded_user_message_id = request.recorded_user_message_id.clone();
     let project_id: Option<String> = None;
     let legacy_deep_research = request.deep_research;
-    let plan_confirmation_mode = request.plan_confirmation_mode.clone();
     let attachments_present = request.attachments_present;
     let attachments = request.attachments.clone();
     let arkorbit_context = request.arkorbit_context.clone();
@@ -4317,10 +3230,32 @@ pub(super) fn spawn_chat_stream_response(
     let app_state = state.clone();
     let stream_request_id = uuid::Uuid::new_v4().to_string();
     let stream_started_at = Instant::now();
+    let time_to_first_stream_activity_ms = Arc::new(AtomicU64::new(0));
     let time_to_first_token_ms = Arc::new(AtomicU64::new(0));
     let stream_last_activity_ms = Arc::new(AtomicU64::new(0));
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let registered_conversation_id = conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(stream_request_id.as_str())
+        .to_string();
+    if let Err(active_run_id) = try_register_chat_conversation_cancellation_sender(
+        &state,
+        &registered_conversation_id,
+        &stream_request_id,
+        cancel_tx.clone(),
+    )
+    .await
+    {
+        return active_chat_stream_conflict_response(&registered_conversation_id, &active_run_id);
+    }
+    let worker_stream_request_id = stream_request_id.clone();
+    let worker_registered_conversation_id = registered_conversation_id.clone();
 
     if let Err(error) = spawn_chat_worker_logged("http_chat_stream_turn", async move {
+        let stream_request_id = worker_stream_request_id;
+        let registered_conversation_id = worker_registered_conversation_id;
         let (live_runs, run_storage) = {
             let agent = app_state.agent.read().await;
             (agent.live_run_registry(), agent.storage.clone())
@@ -4367,27 +3302,7 @@ pub(super) fn spawn_chat_stream_response(
             }
         };
         let tracked_task_ref = Arc::new(RwLock::new(tracked_task));
-        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-        let registered_conversation_id = conversation_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(stream_request_id.as_str())
-            .to_string();
-        if let Some(previous) = replace_chat_conversation_cancellation_sender(
-            &app_state,
-            &registered_conversation_id,
-            &stream_request_id,
-            cancel_tx.clone(),
-        )
-        .await
-        {
-            let _ = previous.send(true);
-            tracing::info!(
-                "Cancelled prior active chat stream for conversation={} due to replacement request",
-                registered_conversation_id
-            );
-        }
+        let mut cancel_rx = cancel_rx;
         let run_started = crate::core::StreamEvent::RunStarted {
             run_id: stream_request_id.clone(),
             flow_kind: "chat".to_string(),
@@ -4423,6 +3338,7 @@ pub(super) fn spawn_chat_stream_response(
             let app_state = app_state.clone();
             let cancel_tx = cancel_tx.clone();
             let trace_ref = trace_ref.clone();
+            let time_to_first_stream_activity_ms = time_to_first_stream_activity_ms.clone();
             let time_to_first_token_ms = time_to_first_token_ms.clone();
             let stream_last_activity_ms = stream_last_activity_ms.clone();
             let live_runs = live_runs.clone();
@@ -4430,7 +3346,19 @@ pub(super) fn spawn_chat_stream_response(
             let channel = channel.clone();
             crate::spawn_logged!("src/channels/http.rs:14840", async move {
                 let mut last_thinking_detail = String::new();
+                let mut internal_token_filter =
+                    crate::core::llm_context_sanitizer::InternalToolTranscriptStreamFilter::new();
                 while let Some(ev) = stream_rx.recv().await {
+                    let ev = match ev {
+                        crate::core::StreamEvent::Token(content) => {
+                            let content = internal_token_filter.feed(&content);
+                            if content.is_empty() {
+                                continue;
+                            }
+                            crate::core::StreamEvent::Token(content)
+                        }
+                        other => other,
+                    };
                     stream_last_activity_ms.store(
                         stream_started_at
                             .elapsed()
@@ -4438,6 +3366,38 @@ pub(super) fn spawn_chat_stream_response(
                             .min(u128::from(u64::MAX)) as u64,
                         Ordering::Relaxed,
                     );
+                    if let Some(activity_source) = stream_event_first_activity_source(&ev) {
+                        let elapsed_ms = stream_started_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64;
+                        let recorded_ms = elapsed_ms.max(1);
+                        if time_to_first_stream_activity_ms
+                            .compare_exchange(0, recorded_ms, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            let mut trace = trace_ref.write().await;
+                            trace.steps.push(crate::core::ExecutionStep {
+                                icon: "[model]".to_string(),
+                                title: "First Stream Activity".to_string(),
+                                detail: format!(
+                                    "Model stream activity began after {}ms via {}.",
+                                    recorded_ms, activity_source
+                                ),
+                                step_type: "info".to_string(),
+                                data: Some(
+                                    serde_json::json!({
+                                        "metric": "time_to_first_stream_activity",
+                                        "source": activity_source,
+                                        "duration_ms": recorded_ms
+                                    })
+                                    .to_string(),
+                                ),
+                                timestamp: chrono::Utc::now(),
+                                duration_ms: Some(recorded_ms),
+                            });
+                        }
+                    }
                     if let crate::core::StreamEvent::Token(content) = &ev {
                         if !content.is_empty() {
                             let elapsed_ms = stream_started_at
@@ -4458,15 +3418,16 @@ pub(super) fn spawn_chat_stream_response(
                                 let mut trace = trace_ref.write().await;
                                 trace.steps.push(crate::core::ExecutionStep {
                                     icon: "[model]".to_string(),
-                                    title: "First Token".to_string(),
+                                    title: "First Content".to_string(),
                                     detail: format!(
-                                        "Model began streaming after {}ms.",
+                                        "AgentArk produced the first user-visible response content after {}ms.",
                                         recorded_ms
                                     ),
                                     step_type: "info".to_string(),
                                     data: Some(
                                         serde_json::json!({
                                             "metric": "time_to_first_token",
+                                            "source": "token",
                                             "duration_ms": recorded_ms
                                         })
                                         .to_string(),
@@ -4492,7 +3453,6 @@ pub(super) fn spawn_chat_stream_response(
                                 work_type: work_type.clone(),
                                 user_message_already_recorded:
                                     request_user_message_already_recorded,
-                                plan_override: None,
                                 execution_profile: None,
                             });
                         }
@@ -4519,6 +3479,20 @@ pub(super) fn spawn_chat_stream_response(
                         event_name,
                         payload,
                         priority,
+                    )
+                    .await;
+                }
+                let tail = internal_token_filter.finish();
+                if !tail.is_empty() {
+                    send_chat_stream_event(
+                        &tx,
+                        &live_runs,
+                        &stream_request_id,
+                        "chat",
+                        &channel,
+                        "token",
+                        chat_stream_token_payload(&tail, false),
+                        crate::core::RunEventPriority::Normal,
                     )
                     .await;
                 }
@@ -4614,7 +3588,7 @@ pub(super) fn spawn_chat_stream_response(
                 }
                 let agent_snapshot = Agent::snapshot(&agent_ref).await;
                 if !request_user_message_already_recorded {
-                    persist_deep_research_chat_message(
+                    persist_chat_stream_message(
                         &agent_snapshot,
                         conversation_id.as_deref(),
                         "user",
@@ -4665,7 +3639,7 @@ pub(super) fn spawn_chat_stream_response(
                             Some(&summary),
                         )
                         .await;
-                        persist_deep_research_chat_message(
+                        persist_chat_stream_message(
                             &agent_snapshot,
                             conversation_id.as_deref(),
                             "assistant",
@@ -4844,167 +3818,17 @@ pub(super) fn spawn_chat_stream_response(
                     infer_chat_execution_profile(&agent_ref, &message, attachments_present).await;
             }
         }
-        let profile_routes_to_deep_research = execution_profile
-            .as_ref()
-            .is_some_and(ChatExecutionProfile::routes_to_deep_research);
-        let effective_deep_research = profile_routes_to_deep_research || legacy_deep_research;
-        let semantic_deep_research_plan_first =
-            !legacy_deep_research && profile_routes_to_deep_research;
-        let deep_research_plan_first = effective_deep_research
-            && (plan_confirmation_mode.as_deref() == Some("before_execution")
-                || semantic_deep_research_plan_first)
-            && task_mode_create_if_needed;
-        if deep_research_plan_first {
-            let result = prepare_deep_research_plan_confirmation(
-                &app_state,
-                &tx,
-                &live_runs,
-                &run_storage,
-                &stream_request_id,
-                &channel,
-                &message,
-                conversation_id.as_deref(),
-                project_id.as_deref(),
-                &attachments,
-                request_user_message_already_recorded,
-                execution_profile.as_ref(),
-            )
-            .await;
-            if let Err(error) = result {
-                let error_text = error.to_string();
-                send_chat_stream_event(
-                    &tx,
-                    &live_runs,
-                    &stream_request_id,
-                    "chat",
-                    &channel,
-                    "error",
-                    serde_json::json!({ "error": error_text }),
-                    crate::core::RunEventPriority::Critical,
-                )
-                .await;
-                upsert_chat_stream_execution_run(
-                    &run_storage,
-                    &stream_request_id,
-                    conversation_id.as_deref(),
-                    &channel,
-                    &message,
-                    crate::core::ExecutionRunStatus::PlatformFailed,
-                    Some("Deep research could not prepare a reviewable plan.".to_string()),
-                    Some(error_text),
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .await;
-            }
-            send_chat_stream_event(
-                &tx,
-                &live_runs,
-                &stream_request_id,
-                "chat",
-                &channel,
-                "done",
-                serde_json::json!({}),
-                crate::core::RunEventPriority::Critical,
-            )
-            .await;
-            {
-                let mut trace = trace_ref.write().await;
-                trace.completed_at = Some(chrono::Utc::now());
-            }
-            unregister_chat_conversation_cancellation(
-                &app_state,
-                &registered_conversation_id,
-                &stream_request_id,
-            )
-            .await;
-            drop(stream_tx);
-            let _ = trace_poller.await;
-            let _ = stream_forwarder.await;
-            return;
-        }
-
-        if effective_deep_research {
-            let existing_task = tracked_task_ref.read().await.clone();
-            if let Some(task) = existing_task.as_ref() {
-                let result = run_approved_deep_research_stream(
-                    &app_state,
-                    &tx,
-                    &live_runs,
-                    &run_storage,
-                    &stream_request_id,
-                    &channel,
-                    &message,
-                    conversation_id.as_deref(),
-                    project_id.as_deref(),
-                    task,
-                    stream_started_at,
-                )
-                .await;
-                if let Err(error) = result {
-                    let error_text = error.to_string();
-                    send_chat_stream_event(
-                        &tx,
-                        &live_runs,
-                        &stream_request_id,
-                        "chat",
-                        &channel,
-                        "error",
-                        serde_json::json!({ "error": error_text }),
-                        crate::core::RunEventPriority::Critical,
-                    )
-                    .await;
-                    upsert_chat_stream_execution_run(
-                        &run_storage,
-                        &stream_request_id,
-                        conversation_id.as_deref(),
-                        &channel,
-                        &message,
-                        crate::core::ExecutionRunStatus::PlatformFailed,
-                        Some("Deep research hit a framework-level failure.".to_string()),
-                        Some(error_text),
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                    .await;
-                }
-                unregister_chat_task_cancellation(&app_state, &task.task_id).await;
-                unregister_chat_conversation_cancellation(
-                    &app_state,
-                    &registered_conversation_id,
-                    &stream_request_id,
-                )
-                .await;
-                send_chat_stream_event(
-                    &tx,
-                    &live_runs,
-                    &stream_request_id,
-                    "chat",
-                    &channel,
-                    "done",
-                    serde_json::json!({}),
-                    crate::core::RunEventPriority::Critical,
-                )
-                .await;
-                {
-                    let mut trace = trace_ref.write().await;
-                    trace.completed_at = Some(chrono::Utc::now());
-                }
-                drop(stream_tx);
-                let _ = trace_poller.await;
-                let _ = stream_forwarder.await;
-                return;
-            }
-        }
-
         let tracked_task_snapshot = tracked_task_ref.read().await.clone();
         let resume_existing_chat_task = tracked_task_snapshot.is_some();
         let user_message_already_recorded = tracked_task_snapshot
             .as_ref()
             .map(|task| task.user_message_already_recorded)
             .unwrap_or(request_user_message_already_recorded);
+        let execution_profile_value = tracked_task_snapshot
+            .as_ref()
+            .and_then(|task| task.execution_profile.as_ref())
+            .or(execution_profile.as_ref())
+            .map(ChatExecutionProfile::to_value);
         let mut process_handle = {
             let agent_ref = agent_ref.clone();
             let message = message.clone();
@@ -5018,9 +3842,22 @@ pub(super) fn spawn_chat_stream_response(
             let attachments = attachments.clone();
             let arkorbit_context = arkorbit_context.clone();
             let browser_profile_context = browser_profile_context.clone();
+            let execution_profile_value = execution_profile_value.clone();
             tokio::spawn(async move {
                 let agent_snapshot = Agent::snapshot(&agent_ref).await;
                 if resume_existing_chat_task {
+                    let mut hints = attach_chat_request_context_to_hints(
+                        build_request_execution_hints(
+                            caller_principal.as_ref(),
+                            crate::actions::ActionExecutionSurface::Chat,
+                            true,
+                        ),
+                        attachments_present,
+                        attachments.clone(),
+                        arkorbit_context.clone(),
+                        browser_profile_context.clone(),
+                    );
+                    hints.execution_profile = execution_profile_value.clone();
                     agent_snapshot
                         .process_message_stream_resume_with_meta_and_hints(
                             &message,
@@ -5029,17 +3866,7 @@ pub(super) fn spawn_chat_stream_response(
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            attach_chat_request_context_to_hints(
-                                build_request_execution_hints(
-                                    caller_principal.as_ref(),
-                                    crate::actions::ActionExecutionSurface::Chat,
-                                    true,
-                                ),
-                                attachments_present,
-                                attachments.clone(),
-                                arkorbit_context.clone(),
-                                browser_profile_context.clone(),
-                            ),
+                            hints,
                         )
                         .await
                 } else if user_message_already_recorded {
@@ -5055,6 +3882,7 @@ pub(super) fn spawn_chat_stream_response(
                         browser_profile_context.clone(),
                     );
                     hints.recorded_user_message_id = recorded_user_message_id;
+                    hints.execution_profile = execution_profile_value.clone();
                     agent_snapshot
                         .process_message_stream_prerecorded_with_meta_and_hints(
                             &message,
@@ -5075,17 +3903,21 @@ pub(super) fn spawn_chat_stream_response(
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            attach_chat_request_context_to_hints(
-                                build_request_execution_hints(
-                                    caller_principal.as_ref(),
-                                    crate::actions::ActionExecutionSurface::Chat,
-                                    true,
-                                ),
-                                attachments_present,
-                                attachments,
-                                arkorbit_context,
-                                browser_profile_context,
-                            ),
+                            {
+                                let mut hints = attach_chat_request_context_to_hints(
+                                    build_request_execution_hints(
+                                        caller_principal.as_ref(),
+                                        crate::actions::ActionExecutionSurface::Chat,
+                                        true,
+                                    ),
+                                    attachments_present,
+                                    attachments,
+                                    arkorbit_context,
+                                    browser_profile_context,
+                                );
+                                hints.execution_profile = execution_profile_value;
+                                hints
+                            },
                         )
                         .await
                 }
@@ -5162,7 +3994,11 @@ pub(super) fn spawn_chat_stream_response(
         .await;
 
         match result {
-            Ok(processed) => {
+            Ok(mut processed) => {
+                processed.response =
+                    crate::core::llm_context_sanitizer::strip_internal_tool_transcript(
+                        &processed.response,
+                    );
                 let resolved_conversation_id = processed
                     .conversation_id
                     .clone()
@@ -5206,19 +4042,11 @@ pub(super) fn spawn_chat_stream_response(
                     }
                 }
                 if let Some(task) = tracked_task.as_ref() {
-                    let terminal_status = if effective_deep_research {
-                        deep_research_terminal_status(
-                            &processed.response,
-                            processed.run_status.as_deref(),
-                            processed.user_outcome.as_ref(),
-                        )
-                    } else {
-                        chat_task_terminal_status_for_run(
-                            &processed.response,
-                            processed.run_status.as_deref(),
-                            processed.user_outcome.as_ref(),
-                        )
-                    };
+                    let terminal_status = chat_task_terminal_status_for_run(
+                        &processed.response,
+                        processed.run_status.as_deref(),
+                        processed.user_outcome.as_ref(),
+                    );
                     let result_preview = truncate_stream_task_text(
                         if processed.response.trim().is_empty() {
                             "Task completed."
@@ -5274,16 +4102,16 @@ pub(super) fn spawn_chat_stream_response(
                     .await;
                 }
 
-                if time_to_first_token_ms.load(Ordering::Relaxed) == 0
+                if time_to_first_stream_activity_ms.load(Ordering::Relaxed) == 0
                     && !processed.response.trim().is_empty()
                 {
-                    let synthetic_first_token_ms = stream_started_at
+                    let synthetic_first_activity_ms = stream_started_at
                         .elapsed()
                         .as_millis()
                         .min(u64::MAX as u128)
                         as u64;
-                    time_to_first_token_ms
-                        .store(synthetic_first_token_ms.max(1), Ordering::Relaxed);
+                    time_to_first_stream_activity_ms
+                        .store(synthetic_first_activity_ms.max(1), Ordering::Relaxed);
                     send_chat_stream_synthetic_tokens(
                         &tx,
                         &live_runs,
@@ -5308,9 +4136,10 @@ pub(super) fn spawn_chat_stream_response(
                         "duration_ms": duration_ms,
                     })
                 };
-                let first_token_ms = time_to_first_token_ms.load(Ordering::Relaxed);
-                let first_content_ms = if first_token_ms > 0 {
-                    first_token_ms
+                let first_stream_activity_ms =
+                    time_to_first_stream_activity_ms.load(Ordering::Relaxed);
+                let first_activity_ms = if first_stream_activity_ms > 0 {
+                    first_stream_activity_ms
                 } else {
                     stream_started_at
                         .elapsed()
@@ -5318,10 +4147,13 @@ pub(super) fn spawn_chat_stream_response(
                         .min(u64::MAX as u128) as u64
                 }
                 .max(1);
+                let observed_first_token_ms = time_to_first_token_ms.load(Ordering::Relaxed);
                 let wall_duration_ms = stream_started_at
                     .elapsed()
                     .as_millis()
                     .min(u64::MAX as u128) as u64;
+                let first_token_value =
+                    chat_stream_first_token_metric_value(observed_first_token_ms);
                 let trace_total_tokens =
                     trace_metric_snapshot["total_tokens"].as_i64().unwrap_or(0);
                 let trace_input_tokens =
@@ -5369,7 +4201,9 @@ pub(super) fn spawn_chat_stream_response(
                     "cache_creation_prompt_tokens": processed.cache_creation_prompt_tokens,
                     "duration_ms": wall_duration_ms,
                     "trace_duration_ms": trace_metric_snapshot["duration_ms"],
-                    "time_to_first_token_ms": first_content_ms,
+                    "time_to_first_stream_activity_ms": first_activity_ms,
+                    "time_to_first_token_ms": first_token_value,
+                    "model_latency_ms": processed.model_latency_ms(),
                     "degradation": processed.degradation,
                     "attempted_models": processed.attempted_models,
                     "user_outcome": processed.user_outcome,
@@ -5410,6 +4244,7 @@ pub(super) fn spawn_chat_stream_response(
                         "cache_creation_prompt_tokens": content["cache_creation_prompt_tokens"],
                         "duration_ms": content["duration_ms"],
                         "trace_duration_ms": content["trace_duration_ms"],
+                        "time_to_first_stream_activity_ms": content["time_to_first_stream_activity_ms"],
                         "time_to_first_token_ms": content["time_to_first_token_ms"],
                         "degradation": content["degradation"],
                         "attempted_models": content["attempted_models"],
@@ -5737,6 +4572,12 @@ pub(super) fn spawn_chat_stream_response(
         .await;
     }) {
         tracing::error!("Failed to dispatch chat stream worker: {}", error);
+        unregister_chat_conversation_cancellation(
+            &state,
+            &registered_conversation_id,
+            &stream_request_id,
+        )
+        .await;
         return error_response(StatusCode::SERVICE_UNAVAILABLE, error);
     }
 
@@ -5881,25 +4722,13 @@ pub(super) fn extract_resumable_web_chat_task(
         .get("deep_research")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let attachments_present = arguments
-        .get("attachments_present")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
     let work_type = arguments
         .get("_work_type")
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            if deep_research {
-                "research".to_string()
-            } else if attachments_present {
-                "workspace".to_string()
-            } else {
-                "task".to_string()
-            }
-        });
+        .unwrap_or_else(|| "task".to_string());
     let stored_plan_override = arguments
         .get("_plan_preview")
         .and_then(|value| value.as_object())
@@ -6345,6 +5174,12 @@ pub(super) async fn chat_stream(
         .into_response();
     }
 
+    if let Some(response) =
+        reject_if_chat_conversation_stream_active(&state, request.conversation_id.as_deref()).await
+    {
+        return response;
+    }
+
     let persisted_user_message = match persist_chat_stream_user_message_before_run(
         &state,
         &request.channel,
@@ -6366,6 +5201,7 @@ pub(super) async fn chat_stream(
             accepted_suggestion,
         ),
     )
+    .await
 }
 
 /// Clear conversation history for a channel
@@ -6403,40 +5239,48 @@ mod tests {
     }
 
     #[test]
-    fn execution_profile_routes_semantic_deep_research_pdf() {
+    fn execution_profile_uses_semantic_capability_tags_without_routing() {
         let profile = ChatExecutionProfile::from_classifier_value(
             &serde_json::json!({
-                "work_type": "research",
-                "depth": "deep",
+                "capability_tags": ["research", "source synthesis"],
+                "depth_hint": "deep",
                 "deliverables": ["pdf", "document"],
-                "plan_first": true,
+                "long_running": true,
                 "confidence": 0.91
             }),
             "test",
         )
         .expect("valid profile");
 
-        assert!(profile.routes_to_deep_research());
-        assert!(profile.wants_pdf());
-        assert!(profile.plan_first);
+        assert_eq!(
+            profile.capability_tags,
+            vec!["research", "source_synthesis"]
+        );
+        assert_eq!(profile.depth_hint.as_deref(), Some("deep"));
+        assert!(profile.deliverables.iter().any(|value| value == "pdf"));
+        assert!(profile.long_running);
     }
 
     #[test]
     fn execution_profile_deep_button_override_keeps_semantic_deliverables() {
         let semantic = ChatExecutionProfile::from_classifier_value(
             &serde_json::json!({
-                "work_type": "artifact",
-                "depth": "standard",
+                "capability_tags": ["artifact"],
+                "depth_hint": "standard",
                 "deliverables": ["pdf", "document"],
-                "plan_first": true,
                 "confidence": 0.9
             }),
             "semantic_classifier",
         );
         let profile = ChatExecutionProfile::deep_research_override_with(semantic);
 
-        assert!(profile.routes_to_deep_research());
-        assert!(profile.wants_pdf());
+        assert!(profile
+            .capability_tags
+            .iter()
+            .any(|value| value == "research"));
+        assert_eq!(profile.depth_hint.as_deref(), Some("deep"));
+        assert!(profile.long_running);
+        assert!(profile.deliverables.iter().any(|value| value == "pdf"));
         assert_eq!(profile.source, "ui_override+semantic_classifier");
     }
 
@@ -6448,14 +5292,13 @@ mod tests {
             conversation_id: None,
             deep_research: false,
             execution_profile: Some(serde_json::json!({
-                "work_type": "research",
-                "depth": "deep",
+                "capability_tags": ["research"],
+                "depth_hint": "deep",
                 "deliverables": ["answer", "document"],
-                "plan_first": true,
+                "long_running": true,
                 "confidence": 1.0,
                 "source": "ui_override"
             })),
-            plan_confirmation_mode: None,
             execution_mode: None,
             attachments_present: false,
             attachments: Vec::new(),
@@ -6476,37 +5319,55 @@ mod tests {
         let profile = run_request.execution_profile.expect("profile");
 
         assert!(!run_request.deep_research);
-        assert!(profile.routes_to_deep_research());
-        assert!(profile.plan_first);
+        assert!(profile
+            .capability_tags
+            .iter()
+            .any(|value| value == "research"));
+        assert!(profile.long_running);
         assert!(profile.is_ui_override());
     }
 
     #[test]
-    fn execution_profile_does_not_promote_non_research_work() {
+    fn execution_profile_accepts_non_research_capabilities_without_route_logic() {
         let profile = ChatExecutionProfile::from_classifier_value(
             &serde_json::json!({
-                "work_type": "app",
-                "depth": "deep",
+                "capability_tags": ["app_builder"],
+                "depth_hint": "deep",
                 "deliverables": ["app"],
-                "plan_first": true,
                 "confidence": 0.94
             }),
             "test",
         )
         .expect("valid profile");
 
-        assert!(!profile.routes_to_deep_research());
-        assert!(!profile.wants_pdf());
+        assert_eq!(profile.capability_tags, vec!["app_builder".to_string()]);
+        assert!(!profile.deliverables.iter().any(|value| value == "pdf"));
+    }
+
+    #[test]
+    fn execution_profile_keeps_answer_only_work_as_chat_profile() {
+        let profile = ChatExecutionProfile::from_classifier_value(
+            &serde_json::json!({
+                "capability_tags": ["conversation"],
+                "depth_hint": "standard",
+                "deliverables": ["answer"],
+                "confidence": 0.94
+            }),
+            "test",
+        )
+        .expect("valid profile");
+
+        assert_eq!(profile.capability_tags, vec!["conversation".to_string()]);
+        assert_eq!(profile.deliverables, vec!["answer".to_string()]);
     }
 
     #[test]
     fn execution_profile_rejects_low_confidence_classifier_output() {
         let profile = ChatExecutionProfile::from_classifier_value(
             &serde_json::json!({
-                "work_type": "research",
-                "depth": "deep",
+                "capability_tags": ["research"],
+                "depth_hint": "deep",
                 "deliverables": ["pdf"],
-                "plan_first": true,
                 "confidence": 0.42
             }),
             "test",
@@ -6516,15 +5377,128 @@ mod tests {
     }
 
     #[test]
-    fn pdf_artifact_note_uses_managed_download_link() {
-        let artifact = serde_json::json!({
-            "label": "local-report.pdf",
-            "download_url": "/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/local-report.pdf/download"
-        });
-        let note = append_pdf_artifact_note("# Report", Some(&artifact));
+    fn execution_profile_json_extractor_handles_fences_nested_braces_and_trailing_text() {
+        let value = extract_chat_execution_profile_value(
+            "```json\n{\"capability_tags\":[\"research\"],\"meta\":{\"brace\":\"}\"},\"confidence\":0.91}\n```\ntrailing",
+        )
+        .expect("profile JSON should be extracted");
 
-        assert!(note.contains(
-            "[local-report.pdf](/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/local-report.pdf/download)"
-        ));
+        assert_eq!(value["capability_tags"][0], "research");
+        assert_eq!(value["meta"]["brace"], "}");
+    }
+
+    #[test]
+    fn first_stream_activity_counts_public_reasoning_completion_and_tools() {
+        assert_eq!(
+            stream_event_first_activity_source(&crate::core::StreamEvent::ReasoningDelta {
+                phase: "model".to_string(),
+                content_delta: "Preparing the app files.".to_string(),
+                done: false,
+            }),
+            Some("reasoning_delta")
+        );
+        assert_eq!(
+            stream_event_first_activity_source(&crate::core::StreamEvent::ReasoningDelta {
+                phase: "reasoning_summary".to_string(),
+                content_delta: "Checking files before deploying.".to_string(),
+                done: false,
+            }),
+            Some("reasoning_delta")
+        );
+        assert_eq!(
+            stream_event_first_activity_source(&crate::core::StreamEvent::ReasoningDelta {
+                phase: "model".to_string(),
+                content_delta: String::new(),
+                done: true,
+            }),
+            Some("reasoning_delta")
+        );
+        assert_eq!(
+            stream_event_first_activity_source(&crate::core::StreamEvent::ToolStart {
+                name: "app_deploy".to_string(),
+                payload: None,
+            }),
+            Some("tool_start")
+        );
+        assert_eq!(
+            stream_event_first_activity_source(&crate::core::StreamEvent::Thinking(
+                "Waiting on model response.".to_string(),
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_delta_sse_streams_live_model_reasoning_text() {
+        let (event, _) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ReasoningDelta {
+                phase: "model".to_string(),
+                content_delta: "Draft package manifest and server source here.".to_string(),
+                done: false,
+            },
+            "",
+        );
+
+        let (event_name, payload) = event.expect("live model reasoning should be visible");
+
+        assert_eq!(event_name, "reasoning_delta");
+        assert_eq!(payload["title"], "Thinking");
+        assert_eq!(
+            payload["content_delta"],
+            "Draft package manifest and server source here."
+        );
+        assert_eq!(payload["done"], false);
+    }
+
+    #[test]
+    fn reasoning_delta_sse_preserves_token_whitespace() {
+        let (event, _) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ReasoningDelta {
+                phase: "model".to_string(),
+                content_delta: " user".to_string(),
+                done: false,
+            },
+            "",
+        );
+
+        let (event_name, payload) = event.expect("reasoning delta should be emitted");
+        assert_eq!(event_name, "reasoning_delta");
+        assert_eq!(payload["content_delta"], serde_json::json!(" user"));
+        assert_eq!(payload["content"], serde_json::json!(" user"));
+        assert_eq!(payload["detail"], serde_json::json!("user"));
+    }
+
+    #[test]
+    fn reasoning_summary_delta_sse_streams_safe_summary_text() {
+        let (event, _) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ReasoningDelta {
+                phase: "reasoning_summary".to_string(),
+                content_delta: "Checking staged files and deploy readiness.".to_string(),
+                done: false,
+            },
+            "",
+        );
+
+        let (event_name, payload) = event.expect("summary reasoning should be visible");
+
+        assert_eq!(event_name, "reasoning_delta");
+        assert_eq!(payload["title"], "Reasoning summary");
+        assert_eq!(
+            payload["content_delta"],
+            "Checking staged files and deploy readiness."
+        );
+        assert_eq!(payload["done"], false);
+    }
+
+    #[test]
+    fn first_token_metric_requires_observed_real_token() {
+        assert_eq!(
+            chat_stream_first_token_metric_value(0),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            chat_stream_first_token_metric_value(428),
+            serde_json::json!(428)
+        );
     }
 }

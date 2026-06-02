@@ -622,7 +622,7 @@ default_health_watchdog_url() {
             echo "http://127.0.0.1:8993/health"
             ;;
         *)
-            echo "http://127.0.0.1:8990/health"
+            echo "http://127.0.0.1:8990/readiness"
             ;;
     esac
 }

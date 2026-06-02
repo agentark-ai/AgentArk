@@ -390,7 +390,10 @@ pub(super) async fn tunnel_login(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let client_ip = forwarded_client_ip(&headers).unwrap_or_else(|| addr.ip().to_string());
+    let client_ip = {
+        let tunnel = state.tunnel.read().await;
+        tunnel_login_client_ip(&headers, addr, Some(&tunnel))
+    };
     if let Some(wait_seconds) = login_rate_limit_wait(&state, &client_ip).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -494,6 +497,8 @@ fn sanitize_next_target(raw: Option<&str>) -> String {
     if candidate.is_empty()
         || !candidate.starts_with('/')
         || candidate.starts_with("//")
+        || candidate.starts_with("/\\")
+        || candidate.contains('\\')
         || candidate.starts_with("/tunnel/login")
     {
         "/ui/v2".to_string()
@@ -510,16 +515,60 @@ fn redirect_to_path(path: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("cf-connecting-ip")
-        .or_else(|| headers.get("x-real-ip"))
-        .or_else(|| headers.get("x-forwarded-for"))
-        .and_then(|value| value.to_str().ok())
+fn parse_forwarded_ip(value: &HeaderValue) -> Option<String> {
+    value
+        .to_str()
+        .ok()
         .and_then(|value| value.split(',').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
+}
+
+fn forwarded_client_ip(headers: &HeaderMap, provider: TunnelProviderKind) -> Option<String> {
+    match provider {
+        TunnelProviderKind::Cloudflare => {
+            headers.get("cf-connecting-ip").and_then(parse_forwarded_ip)
+        }
+        TunnelProviderKind::Ngrok => headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(parse_forwarded_ip),
+        TunnelProviderKind::TailscalePrivate
+        | TunnelProviderKind::TailscaleFunnel
+        | TunnelProviderKind::Bore => None,
+    }
+}
+
+fn tunnel_login_forwarded_headers_are_trusted(
+    runtime: &tunnel::TunnelState,
+    socket_ip: std::net::IpAddr,
+) -> bool {
+    socket_ip.is_loopback()
+        && runtime.active
+        && runtime.control_plane_enabled
+        && runtime.selected_app_id.is_none()
+        && runtime.exposed_app_ids.is_empty()
+        && matches!(
+            runtime.provider,
+            TunnelProviderKind::Cloudflare | TunnelProviderKind::Ngrok
+        )
+}
+
+fn tunnel_login_client_ip(
+    headers: &HeaderMap,
+    socket_addr: SocketAddr,
+    tunnel: Option<&tunnel::TunnelState>,
+) -> String {
+    let socket_ip = socket_addr.ip();
+    let Some(runtime) = tunnel else {
+        return socket_ip.to_string();
+    };
+    if !tunnel_login_forwarded_headers_are_trusted(runtime, socket_ip) {
+        return socket_ip.to_string();
+    }
+    forwarded_client_ip(headers, runtime.provider).unwrap_or_else(|| socket_ip.to_string())
 }
 
 async fn login_rate_limit_wait(state: &AppState, client_ip: &str) -> Option<u64> {
@@ -550,4 +599,76 @@ async fn register_login_failure(state: &AppState, client_ip: &str) {
 async fn clear_login_failures(state: &AppState, client_ip: &str) {
     let mut attempts = state.remote_login_attempts.write().await;
     attempts.remove(client_ip);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn tunnel_for_login_rate_limit_tests(peer_provider: TunnelProviderKind) -> tunnel::TunnelState {
+        let mut runtime = tunnel::TunnelState::new();
+        runtime.active = true;
+        runtime.provider = peer_provider;
+        runtime.control_plane_enabled = true;
+        runtime
+    }
+
+    #[test]
+    fn tunnel_login_client_ip_defaults_to_socket_ip_when_forwarding_is_not_trusted() {
+        let runtime = tunnel_for_login_rate_limit_tests(TunnelProviderKind::Cloudflare);
+        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 54321);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.77, 198.51.100.88"),
+        );
+
+        assert_eq!(
+            tunnel_login_client_ip(&headers, socket_addr, Some(&runtime)),
+            "203.0.113.10"
+        );
+    }
+
+    #[test]
+    fn tunnel_login_client_ip_uses_forwarded_ip_for_loopback_managed_tunnel_peer() {
+        let runtime = tunnel_for_login_rate_limit_tests(TunnelProviderKind::Ngrok);
+        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.77, 198.51.100.88"),
+        );
+
+        assert_eq!(
+            tunnel_login_client_ip(&headers, socket_addr, Some(&runtime)),
+            "198.51.100.77"
+        );
+    }
+
+    #[test]
+    fn tunnel_login_client_ip_ignores_forwarding_for_app_tunnel_state() {
+        let mut runtime = tunnel_for_login_rate_limit_tests(TunnelProviderKind::Ngrok);
+        runtime.control_plane_enabled = false;
+        runtime.selected_app_id = Some("demo-app".to_string());
+        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.77, 198.51.100.88"),
+        );
+
+        assert_eq!(
+            tunnel_login_client_ip(&headers, socket_addr, Some(&runtime)),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn sanitize_next_target_rejects_backslash_paths() {
+        assert_eq!(sanitize_next_target(Some(r"/\example.com")), "/ui/v2");
+        assert_eq!(sanitize_next_target(Some(r"/ui\v2")), "/ui/v2");
+        assert_eq!(sanitize_next_target(Some("/ui/v2")), "/ui/v2");
+    }
 }

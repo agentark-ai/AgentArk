@@ -1,23 +1,77 @@
 use anyhow::Result;
 use sea_orm::sea_query::{
-    Index, IndexCreateStatement, PostgresQueryBuilder, extension::postgres::Extension,
+    extension::postgres::Extension, ConditionalStatement, Expr, Index, IndexCreateStatement,
+    PostgresQueryBuilder,
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Schema, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Schema, Statement,
+    TransactionTrait,
+};
 
 use super::entities::*;
 
 const CURRENT_SCHEMA_VERSION: i64 = 1;
+const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
+pub(crate) const MIGRATION_ADVISORY_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock($1)";
+
+pub(crate) fn migration_advisory_lock_key() -> i64 {
+    0x4147_454e_5441_524b
+}
 
 pub fn latest_version() -> i64 {
     CURRENT_SCHEMA_VERSION
 }
 
-async fn ensure_table<E: EntityTrait>(
-    db: &DatabaseConnection,
-    backend: DbBackend,
-    schema: &Schema,
-    entity: E,
-) -> Result<()> {
+async fn ensure_schema_migrations_table<C>(db: &C, backend: DbBackend) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    ensure_optional_sql(
+        db,
+        backend,
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
+        "schema_migrations table",
+    )
+    .await
+}
+
+async fn latest_recorded_schema_version<C>(db: &C, backend: DbBackend) -> Result<Option<i64>>
+where
+    C: ConnectionTrait,
+{
+    let row = db
+        .query_one(Statement::from_string(
+            backend,
+            format!(
+                "SELECT MAX(version) AS version FROM {}",
+                SCHEMA_MIGRATIONS_TABLE
+            ),
+        ))
+        .await?;
+    Ok(row.and_then(|row| row.try_get::<i64>("", "version").ok()))
+}
+
+async fn record_schema_version<C>(db: &C, backend: DbBackend) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    db.execute(Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+        vec![
+            CURRENT_SCHEMA_VERSION.into(),
+            chrono::Utc::now().to_rfc3339().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn ensure_table<C, E>(db: &C, backend: DbBackend, schema: &Schema, entity: E) -> Result<()>
+where
+    C: ConnectionTrait,
+    E: EntityTrait,
+{
     let statement = schema
         .create_table_from_entity(entity)
         .if_not_exists()
@@ -26,31 +80,60 @@ async fn ensure_table<E: EntityTrait>(
     Ok(())
 }
 
-async fn ensure_index(
-    db: &DatabaseConnection,
-    backend: DbBackend,
-    statement: IndexCreateStatement,
-) -> Result<()> {
+async fn ensure_index<C>(db: &C, backend: DbBackend, statement: IndexCreateStatement) -> Result<()>
+where
+    C: ConnectionTrait,
+{
     db.execute(backend.build(&statement)).await?;
     Ok(())
 }
 
-async fn ensure_optional_sql(
-    db: &DatabaseConnection,
+async fn ensure_optional_sql<C>(
+    db: &C,
     backend: DbBackend,
     sql: impl Into<String>,
     description: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let savepoint = sql_identifier("agentark_optional_sql");
+    db.execute(Statement::from_string(
+        backend,
+        format!("SAVEPOINT {}", savepoint),
+    ))
+    .await?;
     if let Err(error) = db
         .execute(Statement::from_string(backend, sql.into()))
         .await
     {
+        let rollback_result = db
+            .execute(Statement::from_string(
+                backend,
+                format!("ROLLBACK TO SAVEPOINT {}", savepoint),
+            ))
+            .await;
+        if let Err(rollback_error) = rollback_result {
+            tracing::warn!(
+                "Failed to recover optional {} after {}: {}",
+                description,
+                error,
+                rollback_error
+            );
+            return Err(rollback_error.into());
+        }
         tracing::warn!("Skipping optional {}: {}", description, error);
     }
+    db.execute(Statement::from_string(
+        backend,
+        format!("RELEASE SAVEPOINT {}", savepoint),
+    ))
+    .await?;
     Ok(())
 }
 
-const ACTION_CATALOG_INDEX_HNSW_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_action_catalog_index_embedding_hnsw \
+const ACTION_CATALOG_INDEX_HNSW_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_action_catalog_index_embedding_hnsw \
      ON action_catalog_index USING hnsw (embedding vector_cosine_ops) \
      WHERE enabled = true AND embedding IS NOT NULL";
 
@@ -67,11 +150,10 @@ fn vector_type_has_dimensions(formatted_type: &str) -> bool {
     normalized.starts_with("vector(") || normalized.contains(".vector(")
 }
 
-async fn pgvector_column_has_dimensions(
-    db: &DatabaseConnection,
-    table: &str,
-    column: &str,
-) -> Result<bool> {
+async fn pgvector_column_has_dimensions<C>(db: &C, table: &str, column: &str) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
     let sql = format!(
         "SELECT format_type(a.atttypid, a.atttypmod) AS formatted_type \
          FROM pg_attribute a \
@@ -95,14 +177,17 @@ async fn pgvector_column_has_dimensions(
     Ok(vector_type_has_dimensions(&formatted_type))
 }
 
-async fn ensure_pgvector_hnsw_index(
-    db: &DatabaseConnection,
+async fn ensure_pgvector_hnsw_index<C>(
+    db: &C,
     backend: DbBackend,
     table: &str,
     column: &str,
     sql: impl Into<String>,
     description: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
     if !pgvector_column_has_dimensions(db, table, column).await? {
         tracing::info!(
             "Skipping optional {} because {}.{} uses an unconstrained vector type; HNSW indexes require vector(n)",
@@ -115,8 +200,8 @@ async fn ensure_pgvector_hnsw_index(
     ensure_optional_sql(db, backend, sql, description).await
 }
 
-async fn ensure_foreign_key(
-    db: &DatabaseConnection,
+async fn ensure_foreign_key<C>(
+    db: &C,
     backend: DbBackend,
     constraint_name: &str,
     table: &str,
@@ -124,7 +209,10 @@ async fn ensure_foreign_key(
     referenced_table: &str,
     referenced_column: &str,
     on_delete: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
     let sql = format!(
         "DO $$ BEGIN \
          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = {constraint_name}) THEN \
@@ -146,10 +234,10 @@ async fn ensure_foreign_key(
     Ok(())
 }
 
-async fn ensure_action_catalog_index_table(
-    db: &DatabaseConnection,
-    backend: DbBackend,
-) -> Result<()> {
+async fn ensure_action_catalog_index_table<C>(db: &C, backend: DbBackend) -> Result<()>
+where
+    C: ConnectionTrait,
+{
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS action_catalog_index (\
          action_name TEXT PRIMARY KEY,\
@@ -168,6 +256,96 @@ async fn ensure_action_catalog_index_table(
     Ok(())
 }
 
+fn verified_hot_indexes() -> Vec<IndexCreateStatement> {
+    vec![
+        Index::create()
+            .name("idx_execution_runs_trace_id")
+            .table(execution_run::Entity)
+            .col(execution_run::Column::TraceId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_experience_runs_trace_id")
+            .table(experience_run::Entity)
+            .col(experience_run::Column::TraceId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_messages_trace_id")
+            .table(message::Entity)
+            .col(message::Column::TraceId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_tasks_proof_id")
+            .table(task::Entity)
+            .col(task::Column::ProofId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_tasks_last_run_id")
+            .table(task::Entity)
+            .col(task::Column::LastRunId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_watchers_last_run_id")
+            .table(watcher::Entity)
+            .col(watcher::Column::LastRunId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_automation_supervisor_states_last_run_id")
+            .table(automation_supervisor_state::Entity)
+            .col(automation_supervisor_state::Column::LastRunId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_swarm_delegations_parent_task_id")
+            .table(swarm_delegation::Entity)
+            .col(swarm_delegation::Column::ParentTaskId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_memory_capture_events_source_hash")
+            .table(memory_capture_event::Entity)
+            .col(memory_capture_event::Column::SourceHash)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_notifications_unread_created")
+            .table(notification::Entity)
+            .col(notification::Column::CreatedAt)
+            .and_where(Expr::col(notification::Column::Read).eq(false))
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_readiness_evaluations_created_at")
+            .table(readiness_evaluation::Entity)
+            .col(readiness_evaluation::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_memory_capture_events_completed_at")
+            .table(memory_capture_event::Entity)
+            .col(memory_capture_event::Column::CompletedAt)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_memory_operations_updated_at")
+            .table(memory_operation::Entity)
+            .col(memory_operation::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_memory_evidence_links_created_at")
+            .table(memory_evidence_link::Entity)
+            .col(memory_evidence_link::Column::CreatedAt)
+            .if_not_exists()
+            .to_owned(),
+    ]
+}
+
 macro_rules! ensure_table_list {
     ($db:expr, $backend:expr, $schema:expr, [$($entity:path),+ $(,)?]) => {
         $(
@@ -181,8 +359,50 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         anyhow::bail!("storage bootstrap requires a postgres database backend");
     }
 
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        MIGRATION_ADVISORY_LOCK_SQL,
+        vec![migration_advisory_lock_key().into()],
+    ))
+    .await?;
+
+    let result = run_locked(&txn).await;
+    match result {
+        Ok(()) => {
+            txn.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = txn.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn run_locked<C>(db: &C) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    if db.get_database_backend() != DbBackend::Postgres {
+        anyhow::bail!("storage bootstrap requires a postgres database backend");
+    }
+
     let backend = db.get_database_backend();
     let schema = Schema::new(backend);
+    ensure_schema_migrations_table(db, backend).await?;
+    if let Some(version) = latest_recorded_schema_version(db, backend).await? {
+        if version == CURRENT_SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version > CURRENT_SCHEMA_VERSION {
+            anyhow::bail!(
+                "Database schema version {} is newer than this binary expects ({})",
+                version,
+                CURRENT_SCHEMA_VERSION
+            );
+        }
+    }
 
     let vector_extension = Extension::create()
         .name("vector")
@@ -228,6 +448,9 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             user_preference::Entity,
             user_data_item::Entity,
             knowledge_item::Entity,
+            knowledge_entity::Entity,
+            knowledge_relation::Entity,
+            knowledge_relation_evidence::Entity,
             execution_run::Entity,
             run_checkpoint::Entity,
             tool_attempt::Entity,
@@ -243,17 +466,12 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             recall_event::Entity,
             recall_test::Entity,
             semantic_work_unit::Entity,
-            abuse_tracker_state::Entity
+            abuse_tracker_state::Entity,
+            webhook_source::Entity,
+            webhook_event::Entity
         ]
     );
 
-    ensure_optional_sql(
-        db,
-        backend,
-        "ALTER TABLE swarm_agents ADD COLUMN IF NOT EXISTS access_scope TEXT NOT NULL DEFAULT '{}'",
-        "swarm_agents.access_scope column",
-    )
-    .await?;
     for (constraint_name, table, column, referenced_table, referenced_column, on_delete) in [
         (
             "fk_conversations_project_id",
@@ -536,6 +754,54 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             "CASCADE",
         ),
         (
+            "fk_knowledge_entities_project_id",
+            "knowledge_entities",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_knowledge_relations_source_entity_id",
+            "knowledge_relations",
+            "source_entity_id",
+            "knowledge_entities",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_knowledge_relations_target_entity_id",
+            "knowledge_relations",
+            "target_entity_id",
+            "knowledge_entities",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_knowledge_relations_project_id",
+            "knowledge_relations",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_knowledge_relation_evidence_relation_id",
+            "knowledge_relation_evidence",
+            "relation_id",
+            "knowledge_relations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_knowledge_relation_evidence_memory_id",
+            "knowledge_relation_evidence",
+            "memory_id",
+            "experience_items",
+            "id",
+            "SET NULL",
+        ),
+        (
             "fk_user_preferences_project_id",
             "user_preferences",
             "project_id",
@@ -763,18 +1029,6 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         db,
         backend,
         Index::create()
-            .name("idx_messages_role_timestamp")
-            .table(message::Entity)
-            .col(message::Column::Role)
-            .col(message::Column::Timestamp)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
             .name("idx_messages_conversation_timestamp")
             .table(message::Entity)
             .col(message::Column::ConversationId)
@@ -946,6 +1200,9 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     )
     .await?;
+    for index in verified_hot_indexes() {
+        ensure_index(db, backend, index).await?;
+    }
     ensure_index(
         db,
         backend,
@@ -1038,6 +1295,64 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         db,
         backend,
         Index::create()
+            .name("idx_webhook_sources_updated_at")
+            .table(webhook_source::Entity)
+            .col(webhook_source::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_webhook_sources_provider")
+            .table(webhook_source::Entity)
+            .col(webhook_source::Column::Provider)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_webhook_events_source_idempotency")
+            .table(webhook_event::Entity)
+            .col(webhook_event::Column::SourceId)
+            .col(webhook_event::Column::IdempotencyKey)
+            .unique()
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_webhook_events_received_at")
+            .table(webhook_event::Entity)
+            .col(webhook_event::Column::ReceivedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_webhook_events_source_received")
+            .table(webhook_event::Entity)
+            .col(webhook_event::Column::SourceId)
+            .col(webhook_event::Column::ReceivedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
             .name("idx_security_logs_created")
             .table(security_log::Entity)
             .col(security_log::Column::CreatedAt)
@@ -1071,17 +1386,6 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         db,
         backend,
         Index::create()
-            .name("idx_operational_logs_event_type")
-            .table(operational_log::Entity)
-            .col(operational_log::Column::EventType)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
             .name("idx_operational_logs_event_type_created")
             .table(operational_log::Entity)
             .col(operational_log::Column::EventType)
@@ -1097,39 +1401,6 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .name("idx_operational_logs_tool_name")
             .table(operational_log::Entity)
             .col(operational_log::Column::ToolName)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
-            .name("idx_operational_logs_success")
-            .table(operational_log::Entity)
-            .col(operational_log::Column::Success)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
-            .name("idx_operational_logs_policy_version")
-            .table(operational_log::Entity)
-            .col(operational_log::Column::PolicyVersion)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
-            .name("idx_operational_logs_strategy_version")
-            .table(operational_log::Entity)
-            .col(operational_log::Column::StrategyVersion)
             .if_not_exists()
             .to_owned(),
     )
@@ -1295,6 +1566,95 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .name("idx_knowledge_updated")
             .table(knowledge_item::Entity)
             .col(knowledge_item::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_knowledge_entities_scope_name")
+            .table(knowledge_entity::Entity)
+            .col(knowledge_entity::Column::EntityType)
+            .col(knowledge_entity::Column::ProjectId)
+            .col(knowledge_entity::Column::NormalizedName)
+            .unique()
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_knowledge_entities_status")
+            .table(knowledge_entity::Entity)
+            .col(knowledge_entity::Column::ProjectId)
+            .col(knowledge_entity::Column::Status)
+            .col(knowledge_entity::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_knowledge_relations_source")
+            .table(knowledge_relation::Entity)
+            .col(knowledge_relation::Column::SourceEntityId)
+            .col(knowledge_relation::Column::RelationType)
+            .col(knowledge_relation::Column::Status)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_knowledge_relations_target")
+            .table(knowledge_relation::Entity)
+            .col(knowledge_relation::Column::TargetEntityId)
+            .col(knowledge_relation::Column::RelationType)
+            .col(knowledge_relation::Column::Status)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_knowledge_relations_scope_status")
+            .table(knowledge_relation::Entity)
+            .col(knowledge_relation::Column::ProjectId)
+            .col(knowledge_relation::Column::Status)
+            .col(knowledge_relation::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_knowledge_relation_evidence_relation")
+            .table(knowledge_relation_evidence::Entity)
+            .col(knowledge_relation_evidence::Column::RelationId)
+            .col(knowledge_relation_evidence::Column::Polarity)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_knowledge_relation_evidence_memory")
+            .table(knowledge_relation_evidence::Entity)
+            .col(knowledge_relation_evidence::Column::MemoryId)
             .if_not_exists()
             .to_owned(),
     )
@@ -1880,12 +2240,20 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
     )
     .await?;
 
+    record_schema_version(db, backend).await?;
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTION_CATALOG_INDEX_HNSW_SQL, vector_type_has_dimensions};
+    use super::{
+        document_chunk, experience_item, migration_advisory_lock_key, semantic_work_unit,
+        vector_type_has_dimensions, verified_hot_indexes, ACTION_CATALOG_INDEX_HNSW_SQL,
+        MIGRATION_ADVISORY_LOCK_SQL,
+    };
+    use sea_orm::sea_query::PostgresQueryBuilder;
+    use sea_orm::{DbBackend, Schema};
 
     #[test]
     fn vector_type_dimension_detection_requires_explicit_dimensions() {
@@ -1901,5 +2269,61 @@ mod tests {
         assert!(ACTION_CATALOG_INDEX_HNSW_SQL.contains("vector_cosine_ops"));
         assert!(ACTION_CATALOG_INDEX_HNSW_SQL.contains("enabled = true"));
         assert!(ACTION_CATALOG_INDEX_HNSW_SQL.contains("embedding IS NOT NULL"));
+    }
+
+    #[test]
+    fn v1_pgvector_tables_use_explicit_embedding_dimensions() {
+        let backend = DbBackend::Postgres;
+        let schema = Schema::new(backend);
+        let expected = format!(
+            "\"embedding\" vector({})",
+            crate::actions::ACTION_CATALOG_EMBEDDING_DIM
+        );
+        for statement in [
+            schema
+                .create_table_from_entity(document_chunk::Entity)
+                .to_string(PostgresQueryBuilder),
+            schema
+                .create_table_from_entity(experience_item::Entity)
+                .to_string(PostgresQueryBuilder),
+            schema
+                .create_table_from_entity(semantic_work_unit::Entity)
+                .to_string(PostgresQueryBuilder),
+        ] {
+            assert!(
+                statement.contains(&expected),
+                "missing dimensional vector column in: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_hot_indexes_cover_fk_lookups_and_unread_notifications() {
+        let sql = verified_hot_indexes()
+            .into_iter()
+            .map(|statement| statement.to_string(PostgresQueryBuilder))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for index_name in [
+            "idx_execution_runs_trace_id",
+            "idx_experience_runs_trace_id",
+            "idx_messages_trace_id",
+            "idx_tasks_proof_id",
+            "idx_tasks_last_run_id",
+            "idx_watchers_last_run_id",
+            "idx_automation_supervisor_states_last_run_id",
+            "idx_swarm_delegations_parent_task_id",
+            "idx_memory_capture_events_source_hash",
+            "idx_notifications_unread_created",
+        ] {
+            assert!(sql.contains(index_name), "missing index {index_name}");
+        }
+        assert!(sql.contains("WHERE \"read\" = FALSE"));
+    }
+
+    #[test]
+    fn bootstrap_uses_transaction_scoped_advisory_lock() {
+        assert!(MIGRATION_ADVISORY_LOCK_SQL.contains("pg_advisory_xact_lock"));
+        assert_ne!(migration_advisory_lock_key(), 0);
     }
 }

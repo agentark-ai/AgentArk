@@ -151,7 +151,7 @@ impl MasterPasswordManager {
         let expected = hex::decode(&meta.verification_hash)
             .map_err(|_| anyhow!("Corrupt master.json: bad verification_hash hex"))?;
 
-        if v_hash[..] != expected[..] {
+        if !crate::security::constant_time_eq(&v_hash, &expected) {
             return Err(anyhow!("Invalid master password"));
         }
 
@@ -492,5 +492,34 @@ mod tests {
 
         let _new_key = mgr.remove_password().unwrap();
         assert!(!mgr.is_password_set());
+    }
+
+    #[test]
+    fn custom_password_set_change_remove_state_transitions_do_not_reuse_old_passwords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MasterPasswordManager::new(tmp.path(), tmp.path());
+
+        assert!(!mgr.is_password_set());
+
+        let prepared = mgr.prepare_password("first-password").unwrap();
+        mgr.commit_prepared_password(prepared).unwrap();
+        assert!(mgr.is_password_set());
+        assert!(!mgr.is_bootstrap_password_active().unwrap());
+        assert!(!mgr.is_install_managed_password_active().unwrap());
+        assert!(mgr.unlock("first-password").is_ok());
+
+        let prepared = mgr.prepare_password("second-password").unwrap();
+        mgr.commit_prepared_password(prepared).unwrap();
+        assert!(mgr.unlock("first-password").is_err());
+        assert!(mgr.unlock("second-password").is_ok());
+
+        mgr.commit_password_removal().unwrap();
+        assert!(!mgr.is_password_set());
+        assert!(mgr.unlock("second-password").is_err());
+
+        let keyfile_key = mgr.prepare_keyfile_encryption().unwrap();
+        let ciphertext = keyfile_key.encrypt(b"keyfile-after-remove").unwrap();
+        let plaintext = keyfile_key.decrypt(&ciphertext).unwrap();
+        assert_eq!(&plaintext[..], b"keyfile-after-remove");
     }
 }

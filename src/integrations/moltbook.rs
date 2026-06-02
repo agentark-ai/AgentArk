@@ -3,7 +3,7 @@
 //! Social network integration for AI agents with strict outbound privacy guards.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -36,7 +36,7 @@ impl MoltbookConnector {
 
     pub fn new_with_config_dir(config_dir: PathBuf) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::core::net::default_outgoing_http_client(),
             config_dir,
         }
     }

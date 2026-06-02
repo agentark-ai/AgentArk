@@ -54,7 +54,6 @@ teloxide = { version = "0.13", optional = true, features = ["macros"] }
 
 # LLM clients
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
-fastembed = "5"
 
 # WASM sandbox runtime
 # 43.0.2 is the first patched release for GHSA-p8xm-42r7-89xg / CVE-2026-44216
@@ -145,6 +144,9 @@ crossterm = "0.28"
 mockall = "0.14.0"
 tokio-test = "0.4"
 
+[target.'cfg(not(windows))'.dependencies]
+fastembed = "5"
+
 [[bin]]
 name = "agentark"
 path = "src/main.rs"
@@ -176,6 +178,12 @@ required-features = ["live-smoke-tests"]
 [[test]]
 name = "semantic_benchmark_corpus"
 path = "tests/semantic_benchmark_corpus.rs"
+
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
 
 [profile.release]
 lto = true

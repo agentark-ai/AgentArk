@@ -3853,7 +3853,11 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         .into_iter()
         .max_by_key(|(_, score)| *score)?;
 
-        if best.1 == 0 { None } else { Some(best.0) }
+        if best.1 == 0 {
+            None
+        } else {
+            Some(best.0)
+        }
     }
 
     pub(super) async fn normalize_action_arguments(

@@ -33,6 +33,7 @@ import {
   formatUiDateTime,
 } from "../../lib/dateFormat";
 import { resolveCssToken } from "../../lib/designTokens";
+import { humanizeMachineLabel } from "../../lib/displayLabels";
 import type {
   LlmAnalyticsBreakdownRow,
   LlmAnalyticsResponse,
@@ -156,8 +157,9 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
       const model = str(row.model, "");
       return [provider, model].filter(Boolean).join(" / ") || "Unknown model";
     }
-    if (view === "channel") return str(row.channel, "Unknown channel");
-    return str(row.purpose, "Unknown purpose");
+    if (view === "channel")
+      return humanizeMachineLabel(str(row.channel, ""), "Unknown channel");
+    return humanizeMachineLabel(str(row.purpose, ""), "Unknown purpose");
   }
 
   const [activeRange, setActiveRange] = useState<AnalyticsRange>("24h");
@@ -350,12 +352,34 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
   const spendValue = formatUsd(totals?.cost_usd);
   const requestsValue = compactNumber(num(totals?.request_count, 0));
   const tokensValue = compactNumber(num(totals?.total_tokens, 0));
+  const arkDistillTotals = resp?.arkdistill?.totals;
+  const arkDistillSeries = resp?.arkdistill?.series || [];
+  const arkDistillSavedTokens = num(
+    arkDistillTotals?.estimated_saved_tokens,
+    0,
+  );
+  const arkDistillSavedCost = arkDistillTotals?.estimated_prompt_cost_saved_usd;
+  const arkDistillSavedCostLabel =
+    typeof arkDistillSavedCost === "number"
+      ? formatUsd(arkDistillSavedCost, arkDistillSavedCost >= 1 ? 2 : 4)
+      : "pricing n/a";
+  const arkDistillReductionRatio = num(
+    arkDistillTotals?.average_reduction_ratio,
+    0,
+  );
+  const arkDistillSavingsPercent =
+    typeof arkDistillTotals?.savings_percent === "number"
+      ? arkDistillTotals.savings_percent
+      : arkDistillReductionRatio * 100;
   const spendBucketSeries = analyticsSeries.map((point) => point.cost_usd ?? 0);
   const requestBucketSeries = analyticsSeries.map((point) =>
     num(point.request_count, 0),
   );
   const totalTokenBucketSeries = analyticsSeries.map((point) =>
     num(point.total_tokens, 0),
+  );
+  const arkDistillSavedTokenBucketSeries = arkDistillSeries.map((point) =>
+    num(point.estimated_saved_tokens, 0),
   );
   const cachedPromptTokensTotal = num(totals?.cached_prompt_tokens, 0);
   const cacheCreationPromptTokensTotal = num(
@@ -456,6 +480,11 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
         cacheReadShare * 100
       ).toFixed(1)}% read share`,
     },
+    {
+      label: "ArkDistill saved",
+      value: `${arkDistillSavingsPercent.toFixed(1)}%`,
+      detail: `${compactNumber(arkDistillSavedTokens)} tokens / ${arkDistillSavedCostLabel}`,
+    },
   ];
   const railCards = [
     {
@@ -484,6 +513,14 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
       values: cachedPromptBucketSeries,
       color: "#60a5fa",
       chartType: "line" as const,
+    },
+    {
+      label: "ArkDistill savings",
+      value: `${arkDistillSavingsPercent.toFixed(1)}%`,
+      detail: `${compactNumber(arkDistillSavedTokens)} tokens saved / ${arkDistillSavedCostLabel}`,
+      values: arkDistillSavedTokenBucketSeries,
+      color: "#b7a7ff",
+      chartType: "bar" as const,
     },
     {
       label: "Total requests",
@@ -1090,7 +1127,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                 gridTemplateColumns: {
                   xs: "1fr",
                   md: "repeat(2, minmax(0, 1fr))",
-                  lg: "repeat(4, minmax(0, 1fr))",
+                  lg: "repeat(5, minmax(0, 1fr))",
                 },
                 gap: 1,
               }}
@@ -1104,13 +1141,24 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                     border: "1px solid rgba(130, 170, 160, 0.12)",
                     background:
                       "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
-                    px: 1.15,
-                    py: 1,
+                    px: { xs: 1.15, lg: 1 },
+                    py: 0.9,
+                    minHeight: 72,
                   }}
                 >
                   <Typography
                     variant="overline"
-                    sx={{ color: "text.secondary", letterSpacing: 0 }}
+                    title={card.label}
+                    sx={{
+                      color: "text.secondary",
+                      display: "block",
+                      fontSize: "0.64rem",
+                      letterSpacing: 0,
+                      lineHeight: 1.2,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
                   >
                     {card.label}
                   </Typography>
@@ -1119,7 +1167,9 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                     sx={{
                       mt: 0.25,
                       color: "#fff8ed",
+                      fontSize: { xs: "1rem", lg: "0.92rem" },
                       fontWeight: 700,
+                      lineHeight: 1.2,
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
@@ -1130,7 +1180,16 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   </Typography>
                   <Typography
                     variant="caption"
-                    sx={{ color: "text.secondary", display: "block" }}
+                    title={card.detail}
+                    sx={{
+                      color: "text.secondary",
+                      display: "block",
+                      fontSize: "0.68rem",
+                      lineHeight: 1.25,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
                   >
                     {card.detail}
                   </Typography>

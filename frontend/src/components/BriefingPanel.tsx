@@ -12,6 +12,7 @@ import {
 import Grid2 from "@mui/material/Grid";
 import type { BriefingResponse, RecommendedAction } from "../types";
 import { api } from "../api/client";
+import { humanizeMachineLabel } from "../lib/displayLabels";
 import { useCallback, useState } from "react";
 import IconButton from "@mui/material/IconButton";
 import CloseIcon from "@mui/icons-material/Close";
@@ -134,7 +135,7 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
             mb: 1.5
           }}>
           <Typography variant="h6">Daily Command Brief</Typography>
-          <Chip size="small" label={briefing.scope.toUpperCase()} />
+          <Chip size="small" label={humanizeMachineLabel(briefing.scope)} />
         </Stack>
         {showSignalRow ? (
           <Grid2 container spacing={2}>

@@ -370,6 +370,62 @@ pub(super) fn collect_openrouter_metadata(agent: &Agent) -> (Option<String>, Has
     (openrouter_api_key, openrouter_models)
 }
 
+pub(super) fn collect_arkdistill_pricing_context(agent: &Agent) -> ArkDistillPricingContext {
+    let mut context = ArkDistillPricingContext::default();
+    let mut configured_models = Vec::new();
+
+    for slot in &agent.config.model_pool.slots {
+        let Some(model_context) = arkdistill_model_pricing_context(&slot.provider) else {
+            continue;
+        };
+        context
+            .model_slots
+            .insert(slot.id.clone(), model_context.clone());
+        configured_models.push(model_context);
+    }
+
+    for (slot_id, (slot, _)) in &agent.model_pool {
+        if context.model_slots.contains_key(slot_id) {
+            continue;
+        }
+        let Some(model_context) = arkdistill_model_pricing_context(&slot.provider) else {
+            continue;
+        };
+        context
+            .model_slots
+            .insert(slot_id.clone(), model_context.clone());
+        configured_models.push(model_context);
+    }
+
+    if configured_models.len() == 1 {
+        context.default_model = configured_models.into_iter().next();
+    }
+
+    context
+}
+
+fn arkdistill_model_pricing_context(
+    provider: &LlmProvider,
+) -> Option<ArkDistillModelPricingContext> {
+    match provider {
+        LlmProvider::OpenAI {
+            model, base_url, ..
+        } => Some(ArkDistillModelPricingContext {
+            provider: openai_provider_label(base_url.as_deref()).to_string(),
+            model: model.trim().to_string(),
+        }),
+        LlmProvider::Ollama { model, .. } => Some(ArkDistillModelPricingContext {
+            provider: "ollama".to_string(),
+            model: model.trim().to_string(),
+        }),
+        LlmProvider::Anthropic { model, .. } => Some(ArkDistillModelPricingContext {
+            provider: "anthropic".to_string(),
+            model: model.trim().to_string(),
+        }),
+    }
+    .filter(|context| !context.model.trim().is_empty())
+}
+
 pub(super) fn normalize_analytics_provider(
     provider: &str,
     model: &str,
@@ -555,17 +611,26 @@ pub(super) async fn llm_analytics_endpoint(
         }
     };
     let (openrouter_api_key, openrouter_models) = collect_openrouter_metadata(&agent);
+    let mut arkdistill_pricing_context = collect_arkdistill_pricing_context(&agent);
+    let arkdistill_logs = agent
+        .storage
+        .list_operational_logs_by_event(crate::core::ARKDISTILL_EVENT_TYPE, 4_000)
+        .await
+        .unwrap_or_default();
     drop(agent);
 
     let has_openrouter_like_rows = rows.iter().any(|r| {
         let provider = r.provider.trim().to_ascii_lowercase();
         (provider == "openrouter" || provider == "openai-compatible") && r.cost_usd.is_none()
     });
-    let openrouter_prices = if has_openrouter_like_rows {
+    let arkdistill_needs_openrouter_prices =
+        arkdistill_logs_need_openrouter_pricing(&arkdistill_logs, &arkdistill_pricing_context);
+    let openrouter_prices = if has_openrouter_like_rows || arkdistill_needs_openrouter_prices {
         get_openrouter_pricing_cached(openrouter_api_key.as_deref()).await
     } else {
         HashMap::new()
     };
+    arkdistill_pricing_context.openrouter_prices = openrouter_prices.clone();
 
     use std::collections::BTreeMap;
     let mut series: BTreeMap<String, LlmAnalyticsPoint> = BTreeMap::new();
@@ -762,6 +827,13 @@ pub(super) async fn llm_analytics_endpoint(
     by_channel_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
     let mut by_purpose_list: Vec<LlmAnalyticsBreakdownRow> = by_purpose.into_values().collect();
     by_purpose_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    let arkdistill = summarize_arkdistill_logs_window_with_pricing(
+        &arkdistill_logs,
+        Some(since),
+        Some(until),
+        &bucket,
+        &arkdistill_pricing_context,
+    );
 
     (
         StatusCode::OK,
@@ -778,6 +850,7 @@ pub(super) async fn llm_analytics_endpoint(
             "by_model": by_model_list,
             "by_channel": by_channel_list,
             "by_purpose": by_purpose_list,
+            "arkdistill": arkdistill,
         })),
     )
         .into_response()

@@ -1,4 +1,4 @@
 pub mod protocol;
 pub mod server;
 
-pub use server::{WorkspaceServiceConfig, run_service};
+pub use server::{run_service, WorkspaceServiceConfig};

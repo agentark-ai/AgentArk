@@ -16,6 +16,7 @@ import {
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeMachineLabel } from "../lib/displayLabels";
 
 export type ChannelConnectionState =
   | "connected"
@@ -79,7 +80,7 @@ function statusLabel(status: ChannelConnectionState): string {
   if (value === "missing_config") return "Missing config";
   if (value === "missing_token") return "Missing token";
   if (value === "error") return "Error";
-  return status || "Unknown";
+  return humanizeMachineLabel(status, "Unknown");
 }
 
 function statusHint(channel: ChannelItem): string {
@@ -292,7 +293,10 @@ export function ChannelsControlPanel({
                                   <Typography variant="caption" noWrap sx={{
                                     color: "text.secondary"
                                   }}>
-                                    {channel.kind} {channel.route_scope ? `| ${channel.route_scope}` : ""}
+                                    {humanizeMachineLabel(channel.kind, "Channel")}{" "}
+                                    {channel.route_scope
+                                      ? `| ${humanizeMachineLabel(channel.route_scope)}`
+                                      : ""}
                                   </Typography>
                                 </Box>
                                 <Stack
@@ -344,9 +348,19 @@ export function ChannelsControlPanel({
                     <Stack direction="row" spacing={0.75} useFlexGap sx={{
                       flexWrap: "wrap"
                     }}>
-                      <Chip size="small" variant="outlined" label={selected.kind} />
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label={humanizeMachineLabel(selected.kind, "Channel")}
+                      />
                       <Chip size="small" color={statusTone(selected.status)} label={statusLabel(selected.status)} />
-                      {selected.route_scope ? <Chip size="small" variant="outlined" label={selected.route_scope} /> : null}
+                      {selected.route_scope ? (
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          label={humanizeMachineLabel(selected.route_scope)}
+                        />
+                      ) : null}
                     </Stack>
 
                     <Box>

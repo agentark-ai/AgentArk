@@ -20,13 +20,16 @@ import {
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../../lib/displayLabels";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
+import MemoryGraphPanel from "./MemoryGraphPanel";
 import CurrentMemoryPage from "./MemoryPage";
 import {
   asRecord,
   errMessage,
+  memoryRefreshInterval,
   num,
   pickRecords,
   str,
@@ -242,19 +245,11 @@ function arkmemoryHistoryCanRestore(event: JsonRecord): boolean {
 }
 
 function replayGateLabel(status: string): string {
-  const normalized = status.trim().replace(/_/g, " ");
-  if (!normalized) return "Not checked";
-  return normalized[0].toUpperCase() + normalized.slice(1);
+  return humanizeStatusLabel(status, "Not checked");
 }
 
 function tokenLabel(value: unknown, fallback = "Unknown"): string {
-  const normalized = str(value, "").trim().replace(/[_-]+/g, " ");
-  if (!normalized) return fallback;
-  return normalized
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+  return humanizeMachineLabel(str(value, ""), fallback);
 }
 
 function healthSeverityColor(
@@ -321,14 +316,15 @@ export default function MemoryPage({
   const [historyPage, setHistoryPage] = useState(0);
   const [historyDialogEvent, setHistoryDialogEvent] = useState<JsonRecord | null>(null);
   const HISTORY_PAGE_SIZE = 10;
-  const [memoryTab, setMemoryTab] = useState<"current" | "queue" | "history">(
+  const [memoryTab, setMemoryTab] = useState<"current" | "queue" | "history" | "graph">(
     "current",
   );
+  const [graphFocusMemoryId, setGraphFocusMemoryId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [healthDetailsOpen, setHealthDetailsOpen] = useState(false);
   const [healthPage, setHealthPage] = useState(0);
   const [captureDetailsOpen, setCaptureDetailsOpen] = useState(false);
-  const invalidateMemory = async () => {
+  const invalidateMemory = useCallback(async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["arkmemory-summary"] }),
       queryClient.invalidateQueries({ queryKey: ["arkmemory-queue"] }),
@@ -336,11 +332,16 @@ export default function MemoryPage({
       queryClient.invalidateQueries({ queryKey: ["arkmemory-health"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-stats"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-facts"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-assistant-preferences"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-work-preferences"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-domain-memory"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-ephemeral-context"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-other-memory"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-preferences"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-user-data"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-knowledge"] }),
     ]);
-  };
+  }, [queryClient]);
 
   const summaryQ = useQuery({
     queryKey: ["arkmemory-summary"],
@@ -450,6 +451,11 @@ export default function MemoryPage({
     num(currentMemory.knowledge);
   const pendingConsolidation =
     pendingCaptureEvents.length || num(capturePipeline.pending);
+  const pendingMemoryRefreshInterval = memoryRefreshInterval(
+    false,
+    pendingConsolidation,
+    REFRESH_MS,
+  );
   const failedCaptureCount = num(capturePipeline.failed);
   const healthPageCount = Math.max(
     1,
@@ -475,6 +481,13 @@ export default function MemoryPage({
       setMemoryTab("current");
     }
   }, [memoryTab, showQueueTab]);
+  useEffect(() => {
+    if (!pendingMemoryRefreshInterval) return undefined;
+    const intervalId = window.setInterval(() => {
+      void invalidateMemory();
+    }, pendingMemoryRefreshInterval);
+    return () => window.clearInterval(intervalId);
+  }, [invalidateMemory, pendingMemoryRefreshInterval]);
   useEffect(() => {
     if (healthPage > healthPageCount - 1) {
       setHealthPage(Math.max(0, healthPageCount - 1));
@@ -1103,7 +1116,12 @@ export default function MemoryPage({
           <Tabs
             value={memoryTab}
             onChange={(_event, next) => {
-              if (next === "current" || next === "queue" || next === "history") {
+              if (
+                next === "current" ||
+                next === "queue" ||
+                next === "history" ||
+                next === "graph"
+              ) {
                 setMemoryTab(next);
               }
             }}
@@ -1117,6 +1135,7 @@ export default function MemoryPage({
               <Tab value="queue" label={`Pending Review (${queueItems.length})`} />
             ) : null}
             <Tab value="history" label={`History (${historyEvents.length})`} />
+            <Tab value="graph" label="Graph" />
           </Tabs>
         </Stack>
       </Box>
@@ -1127,7 +1146,15 @@ export default function MemoryPage({
           showHeader={false}
           showScopeControls={false}
           onNavigateToView={onNavigateToView}
+          onViewMemoryEvidence={(memoryId) => {
+            setGraphFocusMemoryId(memoryId);
+            setMemoryTab("graph");
+          }}
         />
+      ) : null}
+
+      {memoryTab === "graph" ? (
+        <MemoryGraphPanel focusMemoryId={graphFocusMemoryId} />
       ) : null}
 
       {memoryTab === "queue" && showQueueTab ? (
@@ -1195,7 +1222,7 @@ export default function MemoryPage({
                             </Typography>
                           </Stack>
                         </TableCell>
-                        <TableCell>{str(item.candidate_type)}</TableCell>
+                        <TableCell>{humanizeMachineLabel(str(item.candidate_type, ""), "-")}</TableCell>
                         <TableCell
                           title="How sure Memory is about this candidate, based on repeated signals."
                         >

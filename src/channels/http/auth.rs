@@ -100,8 +100,15 @@ async fn create_local_ui_bootstrap_token(
     let token = generate_ephemeral_token();
     let mut tokens = state.local_ui_bootstrap_tokens.write().await;
     tokens.retain(|_, expires_at| *expires_at > now);
-    if tokens.len() >= LOCAL_UI_BOOTSTRAP_MAX_TOKENS {
-        tokens.clear();
+    while tokens.len() >= LOCAL_UI_BOOTSTRAP_MAX_TOKENS {
+        let Some(oldest_token) = tokens
+            .iter()
+            .min_by_key(|(_, expires_at)| **expires_at)
+            .map(|(token, _)| token.clone())
+        else {
+            break;
+        };
+        tokens.remove(&oldest_token);
     }
     tokens.insert(token.clone(), now + LOCAL_UI_BOOTSTRAP_TTL_SECS);
     Some(token)
@@ -493,6 +500,18 @@ pub(super) async fn auth_middleware(
     let path = request.uri().path().to_string();
 
     if request.method() == Method::GET && is_public_arkorbit_runtime_asset(&path) {
+        return next.run(request).await;
+    }
+
+    if request.method() == Method::GET
+        && path == "/metrics"
+        && (addr.ip().is_loopback() || is_container_host_gateway_ip(addr.ip()))
+    {
+        request
+            .extensions_mut()
+            .insert(crate::actions::ActionCallerPrincipal::local_admin(
+                "loopback_metrics_scrape",
+            ));
         return next.run(request).await;
     }
 

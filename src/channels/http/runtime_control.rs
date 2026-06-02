@@ -21,6 +21,47 @@ static LAST_RUNTIME_PROC_SAMPLE: once_cell::sync::Lazy<
     parking_lot::Mutex<Option<RuntimeProcSample>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RuntimeHealthStatus {
+    http_status: StatusCode,
+    status_text: &'static str,
+    ready: bool,
+}
+
+pub(super) fn runtime_health_status(
+    readiness_mode: bool,
+    required_ready: bool,
+    optional_degraded: bool,
+) -> RuntimeHealthStatus {
+    if readiness_mode {
+        return RuntimeHealthStatus {
+            http_status: if required_ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            status_text: if !required_ready {
+                "not_ready"
+            } else if optional_degraded {
+                "degraded"
+            } else {
+                "ok"
+            },
+            ready: required_ready,
+        };
+    }
+
+    RuntimeHealthStatus {
+        http_status: StatusCode::OK,
+        status_text: if required_ready && !optional_degraded {
+            "ok"
+        } else {
+            "degraded"
+        },
+        ready: required_ready,
+    }
+}
+
 fn collect_local_runtime_health(uptime_seconds: u64) -> RuntimeHealthResponse {
     let memory = read_linux_memory_pressure();
     let sample = read_linux_proc_sample();
@@ -321,9 +362,11 @@ pub(super) async fn build_runtime_health_payload(
         "messages",
         "notifications",
         "run_checkpoints",
+        "schema_migrations",
         "tasks",
         "tool_attempts",
         "watchers",
+        "webhook_events",
     ];
     let missing_tables = table_names
         .as_ref()
@@ -523,45 +566,38 @@ pub(super) async fn build_runtime_health_payload(
         true
     };
 
-    let healthy = storage_ok
-        && schema_ok
-        && migration_current
-        && pgvector_retrieval_ok
-        && docker_ok
-        && playwright_ok
-        && public_app_origin_ok
-        && scheduler_loop_ok
-        && watcher_loop_ok;
-    let ready = healthy
-        && integration_sync_loop_ok
-        && approval_expiry_loop_ok
-        && arkpulse_loop_ok
-        && auto_analysis_loop_ok
-        && restore_ready
-        && blocking_startup_issue_count == 0;
-    let overall_ok = if readiness_mode { ready } else { true };
-    let status_text = if readiness_mode {
-        if ready {
-            "ok"
-        } else {
-            "not_ready"
-        }
-    } else if healthy {
-        "ok"
-    } else {
-        "degraded"
-    };
+    let required_ready =
+        storage_ok && schema_ok && migration_current && blocking_startup_issue_count == 0;
+    let optional_checks = [
+        ("postgres_pgvector_retrieval", pgvector_retrieval_ok),
+        ("docker", docker_ok),
+        ("playwright_bridge", playwright_ok),
+        ("public_app_origin_ready", public_app_origin_ok),
+        ("scheduler_loop", scheduler_loop_ok),
+        ("watcher_loop", watcher_loop_ok),
+        ("integration_sync_loop", integration_sync_loop_ok),
+        ("approval_expiry_loop", approval_expiry_loop_ok),
+        ("arkpulse_loop", arkpulse_loop_ok),
+        ("auto_analysis_loop", auto_analysis_loop_ok),
+        ("app_restore_ready", restore_ready),
+    ];
+    let degraded_checks = optional_checks
+        .iter()
+        .filter_map(|(name, ok)| (!*ok).then_some((*name).to_string()))
+        .collect::<Vec<_>>();
+    let health_status =
+        runtime_health_status(readiness_mode, required_ready, !degraded_checks.is_empty());
+    let ready = health_status.ready;
+    let status_text = health_status.status_text;
 
     (
-        if overall_ok {
-            StatusCode::OK
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        },
+        health_status.http_status,
         serde_json::json!({
             "status": status_text,
             "mode": if readiness_mode { "readiness" } else { "health" },
             "ready": ready,
+            "degraded": !degraded_checks.is_empty(),
+            "degraded_checks": degraded_checks,
             "server_role": match state.server_role {
                 HttpServerRole::ControlPlane => "control_plane",
                 HttpServerRole::PublicApps => "public_apps",
@@ -585,6 +621,17 @@ pub(super) async fn build_runtime_health_payload(
                 "blocking_issue_count": blocking_startup_issue_count,
                 "issues": startup_issues,
             },
+            "required_checks": {
+                "storage": storage_ok,
+                "postgres_connected": storage_ok,
+                "schema_ok": schema_ok,
+                "migration_current": migration_current,
+                "blocking_startup_issues_clear": blocking_startup_issue_count == 0,
+            },
+            "optional_checks": optional_checks
+                .iter()
+                .map(|(name, ok)| ((*name).to_string(), serde_json::json!(ok)))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
             "apps": {
                 "restore": restore,
             },
@@ -674,6 +721,7 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
 }
 
 pub(super) async fn metrics(State(state): State<AppState>) -> Response {
+    let storage = { state.agent.read().await.storage.clone() };
     let (queue_depth, active_tasks) = {
         let tasks = state.tasks.read().await;
         let all = tasks.all();
@@ -699,7 +747,37 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
             agent.runtime.container_reaper_status().await,
         )
     };
+    let db_activity = storage.connection_activity_counts().await.ok();
+    let expected_migration_version = storage.expected_migration_version();
+    let migration_version = storage.latest_migration_version().await.ok().flatten();
     let mut extra_metrics = Vec::new();
+    extra_metrics.push("# HELP agentark_migration_version Latest schema migration version reported by the database.".to_string());
+    extra_metrics.push("# TYPE agentark_migration_version gauge".to_string());
+    extra_metrics.push(format!(
+        "agentark_migration_version {}",
+        migration_version.unwrap_or(0)
+    ));
+    extra_metrics.push("# HELP agentark_expected_migration_version Schema migration version expected by this binary.".to_string());
+    extra_metrics.push("# TYPE agentark_expected_migration_version gauge".to_string());
+    extra_metrics.push(format!(
+        "agentark_expected_migration_version {}",
+        expected_migration_version
+    ));
+    if let Some(activity) = db_activity {
+        extra_metrics.push("# HELP agentark_db_connections_active Active Postgres sessions for the AgentArk application name in the current database.".to_string());
+        extra_metrics.push("# TYPE agentark_db_connections_active gauge".to_string());
+        extra_metrics.push(format!(
+            "agentark_db_connections_active {}",
+            activity.active
+        ));
+        extra_metrics.push("# HELP agentark_db_connections_idle Idle Postgres sessions for the AgentArk application name in the current database.".to_string());
+        extra_metrics.push("# TYPE agentark_db_connections_idle gauge".to_string());
+        extra_metrics.push(format!("agentark_db_connections_idle {}", activity.idle));
+        extra_metrics.push("# HELP agentark_db_connections_total Postgres sessions for the AgentArk application name in the current database.".to_string());
+        extra_metrics.push("# TYPE agentark_db_connections_total gauge".to_string());
+        extra_metrics.push(format!("agentark_db_connections_total {}", activity.total));
+    }
+    push_sentinel_heartbeat_age_metrics(&storage, &mut extra_metrics).await;
     extra_metrics.push("# HELP agentark_task_queue_depth Total tasks currently stored in the in-memory scheduler queue.".to_string());
     extra_metrics.push("# TYPE agentark_task_queue_depth gauge".to_string());
     extra_metrics.push(format!("agentark_task_queue_depth {}", queue_depth));
@@ -734,6 +812,54 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         body,
     )
         .into_response()
+}
+
+async fn push_sentinel_heartbeat_age_metrics(
+    storage: &crate::storage::Storage,
+    extra_metrics: &mut Vec<String>,
+) {
+    const HEARTBEATS: [(&str, &str); 6] = [
+        (
+            "scheduler",
+            crate::sentinel::SENTINEL_SCHEDULER_HEARTBEAT_KEY,
+        ),
+        ("watcher", crate::sentinel::SENTINEL_WATCHER_HEARTBEAT_KEY),
+        (
+            "integration_sync",
+            crate::sentinel::SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY,
+        ),
+        (
+            "approval_expiry",
+            crate::sentinel::SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY,
+        ),
+        ("arkpulse", crate::sentinel::SENTINEL_ARKPULSE_HEARTBEAT_KEY),
+        (
+            "auto_analysis",
+            crate::sentinel::SENTINEL_AUTO_ANALYSIS_HEARTBEAT_KEY,
+        ),
+    ];
+    extra_metrics.push("# HELP agentark_sentinel_loop_heartbeat_age_seconds Age of the most recent persisted sentinel loop heartbeat.".to_string());
+    extra_metrics.push("# TYPE agentark_sentinel_loop_heartbeat_age_seconds gauge".to_string());
+    let now = chrono::Utc::now();
+    for (loop_name, key) in HEARTBEATS {
+        let Some(raw) = storage
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        else {
+            continue;
+        };
+        let Some(observed_at) = parse_utc_rfc3339(&raw) else {
+            continue;
+        };
+        let age = (now - observed_at).num_seconds().max(0);
+        extra_metrics.push(format!(
+            "agentark_sentinel_loop_heartbeat_age_seconds{{loop=\"{}\"}} {}",
+            loop_name, age
+        ));
+    }
 }
 
 pub(super) async fn get_run(
@@ -2614,6 +2740,29 @@ pub(super) async fn browser_delete(
         )
             .into_response(),
         Err(error) => browser_session_action_error_response(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_optional_degradation_keeps_http_200_when_required_core_is_ready() {
+        let status = runtime_health_status(true, true, true);
+
+        assert_eq!(status.http_status, StatusCode::OK);
+        assert_eq!(status.status_text, "degraded");
+        assert!(status.ready);
+    }
+
+    #[test]
+    fn readiness_required_core_failure_returns_503() {
+        let status = runtime_health_status(true, false, false);
+
+        assert_eq!(status.http_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status.status_text, "not_ready");
+        assert!(!status.ready);
     }
 }
 

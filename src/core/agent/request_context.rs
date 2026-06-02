@@ -101,7 +101,15 @@ impl Agent {
     pub(super) fn retain_actions_for_connected_integrations(
         actions: &mut Vec<crate::actions::ActionDef>,
         calendar_available: bool,
+        gmail_available: bool,
+        google_workspace_granted_bundles: &[String],
     ) {
+        let workspace_bundle_available = |bundle: &str| {
+            google_workspace_granted_bundles
+                .iter()
+                .any(|granted| granted == bundle)
+        };
+        let workspace_any_bundle_available = !google_workspace_granted_bundles.is_empty();
         if !calendar_available {
             actions.retain(|action| {
                 !matches!(
@@ -110,6 +118,19 @@ impl Agent {
                 )
             });
         }
+        actions.retain(|action| match action.name.as_str() {
+            "gmail_scan" | "gmail_reply" => gmail_available,
+            "google_drive_search" => workspace_bundle_available("drive"),
+            "google_docs_read" => workspace_bundle_available("docs"),
+            "google_sheets_read" => workspace_bundle_available("sheets"),
+            "google_chat_list_spaces" => workspace_bundle_available("chat"),
+            "google_admin_list_users" => workspace_bundle_available("admin"),
+            "google_workspace_gws_help"
+            | "google_workspace_gws_schema"
+            | "google_workspace_gws_skills"
+            | "google_workspace_gws_command" => workspace_any_bundle_available,
+            _ => true,
+        });
     }
 
     pub(super) fn automation_candidate_overlap_score(request: &str, candidate_text: &str) -> usize {
@@ -668,5 +689,63 @@ mod tests {
         let custom_note = automation_unavailable_delivery_note("pagerduty");
         assert!(custom_note.contains("pagerduty delivery is requested"));
         assert!(custom_note.contains("use pagerduty automatically once the channel is connected"));
+    }
+
+    fn test_action(name: &str) -> crate::actions::ActionDef {
+        crate::actions::ActionDef {
+            name: name.to_string(),
+            ..crate::actions::ActionDef::default()
+        }
+    }
+
+    #[test]
+    fn disconnected_google_workspace_actions_are_not_exposed_to_chat_catalog() {
+        let mut actions = vec![
+            test_action("file_read"),
+            test_action("gmail_scan"),
+            test_action("calendar_today"),
+            test_action("google_drive_search"),
+            test_action("google_workspace_gws_command"),
+        ];
+
+        Agent::retain_actions_for_connected_integrations(&mut actions, false, false, &[]);
+
+        let names = actions
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["file_read"]);
+    }
+
+    #[test]
+    fn granted_google_workspace_bundles_expose_only_matching_chat_actions() {
+        let mut actions = vec![
+            test_action("gmail_scan"),
+            test_action("calendar_today"),
+            test_action("google_drive_search"),
+            test_action("google_docs_read"),
+            test_action("google_workspace_gws_command"),
+        ];
+
+        Agent::retain_actions_for_connected_integrations(
+            &mut actions,
+            true,
+            true,
+            &["drive".to_string()],
+        );
+
+        let names = actions
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "gmail_scan",
+                "calendar_today",
+                "google_drive_search",
+                "google_workspace_gws_command",
+            ]
+        );
     }
 }

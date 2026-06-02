@@ -216,13 +216,6 @@ pub struct ResearchProgressReporter {
 }
 
 impl ResearchProgressReporter {
-    pub fn new(tx: UnboundedSender<ResearchProgressUpdate>) -> Self {
-        Self {
-            tx,
-            started_at: Instant::now(),
-        }
-    }
-
     pub fn emit(
         &self,
         phase: &str,
@@ -499,6 +492,70 @@ fn ensure_research_result_has_evidence(
         "Unable to complete research because {}",
         reason.trim_end_matches('.').to_ascii_lowercase()
     ))
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn deep_research_quality_failure_reason(
+    focus_gaps: &[String],
+    coverage: ResearchCoverage,
+    min_primary_sources: usize,
+    freshness_window_days: Option<i64>,
+) -> Option<String> {
+    let mut details = Vec::new();
+
+    if !focus_gaps.is_empty() {
+        let preview = focus_gaps
+            .iter()
+            .take(4)
+            .map(|gap| summarize_progress_text(gap, 140))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let remaining = focus_gaps.len().saturating_sub(4);
+        let suffix = if remaining > 0 {
+            format!("; plus {} more", remaining)
+        } else {
+            String::new()
+        };
+        details.push(format!(
+            "{} requested research dimension{} still had no usable source-backed finding: {}{}",
+            focus_gaps.len(),
+            plural_suffix(focus_gaps.len()),
+            preview,
+            suffix
+        ));
+    }
+
+    if min_primary_sources > 0 && coverage.primary_sources < min_primary_sources {
+        details.push(format!(
+            "only {} primary-like source{} found; {} required for this deep research pass",
+            coverage.primary_sources,
+            plural_suffix(coverage.primary_sources),
+            min_primary_sources
+        ));
+    }
+
+    if freshness_window_days.is_some() && coverage.recent_sources == 0 {
+        details.push(
+            "no dated recent source was available to verify the current-time evidence window"
+                .to_string(),
+        );
+    }
+
+    if details.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "not enough evidence for this research depth; {}",
+            details.join("; ")
+        ))
+    }
 }
 
 /// Research client
@@ -1102,6 +1159,34 @@ impl ResearchClient {
                 "completed",
                 "phase-status:research:reading",
             );
+        }
+
+        let final_coverage = self.research_coverage(&sources, freshness_window_days);
+        if let Some(reason) = deep_research_quality_failure_reason(
+            &focus_gaps,
+            final_coverage,
+            min_primary_sources,
+            freshness_window_days,
+        ) {
+            if let Some(progress) = progress {
+                progress.emit(
+                    "synthesis",
+                    "Research failed",
+                    format!(
+                        "{}. Try narrowing the scope, adding known source URLs or domains, or using a search backend that can return primary and current sources.",
+                        reason
+                    ),
+                    "failed",
+                    "phase-status:research:synthesis",
+                );
+            }
+            return Err(anyhow!(
+                "Unable to complete research because {}. Try narrowing the scope, adding known source URLs or domains, or using a search backend that can return primary and current sources.",
+                reason
+            ));
+        }
+
+        if let Some(progress) = progress {
             progress.emit(
                 "synthesis",
                 "Synthesizing report",
@@ -1965,61 +2050,108 @@ impl ResearchClient {
 
     /// Estimate reliability score based on URL
     fn estimate_reliability(&self, url: &str) -> f32 {
-        let url_lower = url.to_lowercase();
-
-        // Academic and government sources are highly reliable
-        if url_lower.contains(".edu") || url_lower.contains(".gov") {
-            return 0.95;
+        if self.looks_like_primary_source(url) {
+            return 0.86;
         }
-
-        // Known reliable domains
-        let reliable_domains = [
-            "wikipedia.org",
-            "arxiv.org",
-            "nature.com",
-            "science.org",
-            "bbc.com",
-            "reuters.com",
-            "apnews.com",
-            "nytimes.com",
-            "sec.gov",
-            "who.int",
-            "imf.org",
-            "worldbank.org",
-            "oecd.org",
-            "europa.eu",
-            "github.com",
-            "stackoverflow.com",
-            "docs.rs",
-            "crates.io",
-        ];
-
-        for domain in &reliable_domains {
-            if url_lower.contains(domain) {
-                return 0.85;
-            }
-        }
-
-        // Default reliability
-        0.6
+        let Some(parsed) = url::Url::parse(url).ok() else {
+            return 0.55;
+        };
+        let https_bonus = if parsed.scheme() == "https" {
+            0.06
+        } else {
+            0.0
+        };
+        let host_depth_bonus = parsed
+            .host_str()
+            .map(|host| (host.split('.').count().saturating_sub(2) as f32 * 0.02).min(0.06))
+            .unwrap_or(0.0);
+        0.54 + https_bonus + host_depth_bonus
     }
 
     fn looks_like_primary_source(&self, url: &str) -> bool {
-        let lower = url.to_lowercase();
-        lower.contains(".gov")
-            || lower.contains(".edu")
-            || lower.contains("docs.")
-            || lower.contains("/docs")
-            || lower.contains("developer.")
-            || lower.contains("github.com")
-            || lower.contains("arxiv.org")
-            || lower.contains("sec.gov")
-            || lower.contains("who.int")
-            || lower.contains("worldbank.org")
-            || lower.contains("oecd.org")
-            || lower.contains("europa.eu")
-            || lower.contains("ietf.org")
-            || lower.contains("w3.org")
+        let Ok(parsed) = url::Url::parse(url) else {
+            return false;
+        };
+        let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+        let labels = host
+            .split('.')
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+        let path_segments = parsed
+            .path_segments()
+            .map(|segments| {
+                segments
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| segment.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let institutional_label = labels.iter().any(|label| {
+            matches!(
+                *label,
+                "gov"
+                    | "govt"
+                    | "gob"
+                    | "gouv"
+                    | "go"
+                    | "edu"
+                    | "ac"
+                    | "mil"
+                    | "parliament"
+                    | "court"
+                    | "courts"
+            )
+        });
+        let country_institutional_host = labels.last().is_some_and(|last| last.len() == 2)
+            && labels.iter().rev().nth(1).is_some_and(|label| {
+                matches!(
+                    *label,
+                    "gov" | "govt" | "gob" | "gouv" | "go" | "edu" | "ac" | "mil" | "org" | "or"
+                )
+            });
+        let documentation_host = labels.first().is_some_and(|label| {
+            matches!(
+                *label,
+                "docs" | "doc" | "developer" | "developers" | "api" | "manual" | "reference"
+            )
+        });
+        let primary_path = path_segments.iter().any(|segment| {
+            matches!(
+                segment.as_str(),
+                "docs"
+                    | "documentation"
+                    | "developer"
+                    | "developers"
+                    | "api"
+                    | "reference"
+                    | "manual"
+                    | "spec"
+                    | "standards"
+                    | "rfc"
+                    | "abs"
+                    | "pdf"
+                    | "paper"
+                    | "papers"
+                    | "press"
+                    | "data"
+                    | "dataset"
+                    | "datasets"
+                    | "blob"
+                    | "tree"
+                    | "releases"
+            ) || [
+                "publication",
+                "report",
+                "pressrelease",
+                "filing",
+                "legislation",
+                "regulation",
+            ]
+            .iter()
+            .any(|marker| segment.contains(marker))
+        });
+        institutional_label || country_institutional_host || documentation_host || primary_path
     }
 
     fn research_rank_score(
@@ -3161,6 +3293,61 @@ mod tests {
     }
 
     #[test]
+    fn deep_research_quality_gate_rejects_uncovered_requested_scope() {
+        let reason = deep_research_quality_failure_reason(
+            &[
+                "compute access, GPUs, data center power demand, semiconductor dependence"
+                    .to_string(),
+                "risks: safety, misuse, surveillance, labor displacement".to_string(),
+            ],
+            ResearchCoverage {
+                primary_sources: 4,
+                recent_sources: 2,
+            },
+            4,
+            Some(365),
+        )
+        .expect("uncovered scope should fail deep research");
+
+        assert!(reason.contains("not enough evidence for this research depth"));
+        assert!(reason.contains("requested research dimension"));
+        assert!(reason.contains("no usable source-backed finding"));
+    }
+
+    #[test]
+    fn deep_research_quality_gate_rejects_missing_primary_and_recent_sources() {
+        let reason = deep_research_quality_failure_reason(
+            &[],
+            ResearchCoverage {
+                primary_sources: 1,
+                recent_sources: 0,
+            },
+            4,
+            Some(365),
+        )
+        .expect("deep research should enforce primary and freshness coverage");
+
+        assert!(reason.contains("not enough evidence for this research depth"));
+        assert!(reason.contains("only 1 primary-like source found"));
+        assert!(reason.contains("no dated recent source"));
+    }
+
+    #[test]
+    fn deep_research_quality_gate_allows_complete_coverage() {
+        let reason = deep_research_quality_failure_reason(
+            &[],
+            ResearchCoverage {
+                primary_sources: 4,
+                recent_sources: 1,
+            },
+            4,
+            Some(365),
+        );
+
+        assert!(reason.is_none());
+    }
+
+    #[test]
     fn normalize_source_url_adds_https_to_scheme_less_domains() {
         let client = test_client();
         assert_eq!(
@@ -3168,6 +3355,20 @@ mod tests {
             Some("https://pib.gov.in/PressReleasePage.aspx?PRID=1".to_string())
         );
         assert_eq!(client.normalize_source_url("/local/path"), None);
+    }
+
+    #[test]
+    fn primary_source_detection_uses_generic_url_structure() {
+        let client = test_client();
+
+        assert!(client.looks_like_primary_source("https://research.gov.uk/publications/report"));
+        assert!(client
+            .looks_like_primary_source("https://rbi.org.in/Scripts/PublicationReportDetails.aspx"));
+        assert!(client.looks_like_primary_source("https://docs.example.dev/reference/api"));
+        assert!(client.looks_like_primary_source("https://example.net/releases/v1.2.3"));
+        assert!(
+            !client.looks_like_primary_source("https://blog.example.com/opinion/market-roundup")
+        );
     }
 
     #[test]

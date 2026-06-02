@@ -29,6 +29,42 @@ pub(super) async fn serve_frontend_asset(Path(path): Path<String>) -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
+/// Serve self-hosted fonts from `frontend/dist/fonts/*` (Vite copies
+/// `frontend/public/fonts/` to the dist root, a sibling of `assets/`).
+///
+/// This MUST be a public, unauthenticated route: a browser loads these via
+/// `@font-face { src: url("/fonts/…") }` in CSS, and CSS-initiated requests
+/// cannot send the app's `Authorization: Bearer` header. If the path is
+/// auth-gated it returns 401, the font load fails silently, and the whole UI
+/// falls back to system fonts.
+pub(super) async fn serve_frontend_font(Path(path): Path<String>) -> Response {
+    if !is_safe_asset_path(&path) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let rel = PathBuf::from("fonts").join(&path);
+    for base in frontend_dist_roots() {
+        let file_path = base.join(&rel);
+        let is_file = tokio::fs::metadata(&file_path)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if is_file {
+            if let Ok(bytes) = tokio::fs::read(&file_path).await {
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, mime_for_asset(&path)),
+                        (header::CACHE_CONTROL, CACHE_CONTROL_FRONTEND_ASSET),
+                    ],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
 pub(super) fn frontend_dist_roots() -> Vec<PathBuf> {
     vec![
         PathBuf::from(FRONTEND_DIST_DIR),
@@ -3819,12 +3855,40 @@ body{
   box-shadow:0 18px 44px rgb(0 0 0 / .42), inset 0 1px 0 rgb(255 255 255 / .03);
   padding:24px;
 }
+.brand-lockup{
+  display:flex;
+  align-items:center;
+  gap:14px;
+  margin-bottom:16px;
+}
+.brand-mark{
+  display:grid;
+  place-items:center;
+  width:58px;
+  height:58px;
+  flex:0 0 58px;
+  border:1px solid rgb(0 255 170 / .14);
+  border-radius:999px;
+  background:
+    radial-gradient(circle at 50% 28%, rgb(124 58 237 / .35), transparent 58%),
+    linear-gradient(180deg,rgb(0 255 170 / .10),rgb(0 0 0 / .10));
+  box-shadow:0 0 28px rgb(124 58 237 / .22), inset 0 1px 0 rgb(255 255 255 / .06);
+  overflow:hidden;
+}
+.mascot-logo{
+  display:block;
+  width:50px;
+  height:50px;
+  object-fit:contain;
+  filter:drop-shadow(0 0 10px rgb(0 255 170 / .16));
+}
 .eyebrow{
   margin-bottom:8px;
   color:#ffbe63;
   font:600 11px/1.4 "JetBrains Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
   text-transform:uppercase;
 }
+.brand-lockup .eyebrow{margin-bottom:0}
 h1{
   margin-bottom:8px;
   color:#eff7ef;
@@ -3885,6 +3949,19 @@ button:focus-visible{
 }
 button:active{transform:scale(.98)}
 strong{color:#eff7ef}
+@media (max-width:420px){
+  .card{padding:20px}
+  .brand-lockup{gap:12px}
+  .brand-mark{
+    width:52px;
+    height:52px;
+    flex-basis:52px;
+  }
+  .mascot-logo{
+    width:44px;
+    height:44px;
+  }
+}
 "#;
 
 /// Access denied page for apps with invalid/missing access password.
@@ -3913,7 +3990,7 @@ pub(super) fn app_access_denied_page(app_id: &str) -> Response {
 <title>AgentArk App Guard</title>
 <style>{style}</style></head>
 <body><div class="card">
-<div class="eyebrow">AgentArk App Guard</div>
+<div class="brand-lockup"><div class="brand-mark"><img class="mascot-logo" src="/logo.svg" alt="AgentArk mascot"></div><div class="eyebrow">AgentArk App Guard</div></div>
 <h1>Access Password Required</h1>
 <p>This app is protected. Enter the access password to continue.</p>
 <form method="POST" action="/apps/{app_id}/">
@@ -3953,7 +4030,7 @@ pub(super) fn app_public_exposure_requires_guard_page(app_id: &str) -> Response 
 <title>Public Access Disabled</title>
 <style>{style}</style></head>
 <body><div class="card">
-<div class="eyebrow">AgentArk App Guard</div>
+<div class="brand-lockup"><div class="brand-mark"><img class="mascot-logo" src="/logo.svg" alt="AgentArk mascot"></div><div class="eyebrow">AgentArk App Guard</div></div>
 <h1>Public Access Disabled</h1>
 <p>App <strong>{app_id}</strong> cannot be served on a public origin until App Guard is enabled with an access password.</p>
 </div></body></html>"#,
@@ -4133,6 +4210,214 @@ pub(super) struct AppAccessGuardUpdateRequest {
     regenerate_key: bool,
     #[serde(default)]
     access_password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AppEnvUpdateRequest {
+    #[serde(default)]
+    values: HashMap<String, String>,
+    #[serde(default)]
+    env_text: Option<String>,
+    #[serde(default)]
+    delete: Vec<String>,
+    #[serde(default)]
+    replace: bool,
+}
+
+fn parse_env_assignment_line(raw: &str) -> Option<Result<(String, String)>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+    let Some((raw_key, raw_value)) = assignment.split_once('=') else {
+        return Some(Err(anyhow::anyhow!(
+            "Invalid .env line '{}': expected KEY=VALUE",
+            raw
+        )));
+    };
+    let key = raw_key.trim();
+    if key.is_empty() {
+        return Some(Err(anyhow::anyhow!(
+            "Invalid .env line '{}': key cannot be empty",
+            raw
+        )));
+    }
+    let value = raw_value.trim();
+    let value = if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            value[1..value.len() - 1].to_string()
+        } else {
+            value.to_string()
+        }
+    } else {
+        value.to_string()
+    };
+    Some(Ok((key.to_string(), value)))
+}
+
+fn parse_env_text(raw: &str) -> Result<HashMap<String, String>> {
+    let mut values = HashMap::new();
+    for line in raw.lines() {
+        if let Some(parsed) = parse_env_assignment_line(line) {
+            let (key, value) = parsed?;
+            values.insert(key, value);
+        }
+    }
+    Ok(values)
+}
+
+fn app_required_env_from_meta(meta: &serde_json::Value) -> Vec<String> {
+    let mut keys = crate::actions::app::parse_required_inputs(meta)
+        .into_iter()
+        .filter(|input| input.sensitive)
+        .map(|input| input.key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+pub(super) async fn get_app_env(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> Response {
+    if !is_valid_app_id(&app_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid app_id" })),
+        )
+            .into_response();
+    }
+    let app_dir = if let Some(path) = state.app_registry.get_dir(&app_id).await {
+        path
+    } else {
+        let data_dir = {
+            let agent = state.agent.read().await;
+            agent.data_dir().to_path_buf()
+        };
+        let fallback = data_dir.join("apps").join(&app_id);
+        if !fallback.exists() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "App not found" })),
+            )
+                .into_response();
+        }
+        fallback
+    };
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir().to_path_buf())
+    };
+    let keys =
+        match crate::actions::app::list_app_scoped_env_keys(&config_dir, &data_dir, &app_id) {
+            Ok(keys) => keys,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+    let meta = tokio::fs::read(app_dir.join(".app_meta.json"))
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let required_env = app_required_env_from_meta(&meta);
+    let configured = keys
+        .iter()
+        .map(|key| serde_json::json!({ "key": key, "configured": true }))
+        .collect::<Vec<_>>();
+    let missing_env = required_env
+        .iter()
+        .filter(|key| !keys.iter().any(|existing| existing == *key))
+        .cloned()
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "status": "ok",
+        "app_id": app_id,
+        "keys": configured,
+        "required_env": required_env,
+        "missing_env": missing_env,
+        "message": "App environment values are stored encrypted and are only injected into the runtime on start or restart."
+    }))
+    .into_response()
+}
+
+pub(super) async fn update_app_env(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    Json(request): Json<AppEnvUpdateRequest>,
+) -> Response {
+    if !is_valid_app_id(&app_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid app_id" })),
+        )
+            .into_response();
+    }
+    let app_exists = state.app_registry.get_dir(&app_id).await.is_some() || {
+        let data_dir = {
+            let agent = state.agent.read().await;
+            agent.data_dir().to_path_buf()
+        };
+        data_dir.join("apps").join(&app_id).exists()
+    };
+    if !app_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "App not found" })),
+        )
+            .into_response();
+    }
+    let mut values = request.values;
+    if let Some(env_text) = request.env_text.as_deref() {
+        match parse_env_text(env_text) {
+            Ok(parsed) => values.extend(parsed),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir().to_path_buf())
+    };
+    match crate::actions::app::update_app_scoped_env_values(
+        &config_dir,
+        &data_dir,
+        &app_id,
+        &values,
+        &request.delete,
+        request.replace,
+    ) {
+        Ok(keys) => {
+            trigger_arkpulse_after_app_change(&state, "app_env_update").await;
+            Json(serde_json::json!({
+                "status": "ok",
+                "app_id": app_id,
+                "keys": keys.into_iter().map(|key| serde_json::json!({ "key": key, "configured": true })).collect::<Vec<_>>(),
+                "restart_required": true,
+                "message": "Saved encrypted app environment values. Restart the app for changes to take effect."
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// Disable an app and stop its runtime if it has one.
@@ -4523,6 +4808,9 @@ pub(super) async fn restart_app(
     let install_command = meta
         .as_object()
         .and_then(|_| crate::actions::app::app_meta_lifecycle_command(&meta, "install_command"));
+    let build_command = meta
+        .as_object()
+        .and_then(|_| crate::actions::app::app_meta_lifecycle_command(&meta, "build_command"));
     let runtime_image = meta
         .get("runtime_image")
         .and_then(|v| v.as_str())
@@ -4591,11 +4879,20 @@ pub(super) async fn restart_app(
                 serde_json::Value::String(command.clone()),
             );
         }
+        if let Some(command) = build_command.as_ref() {
+            obj.insert(
+                "build_command".to_string(),
+                serde_json::Value::String(command.clone()),
+            );
+        }
         if let Some(command) = entry_command.as_ref() {
             commands["start"] = serde_json::Value::String(command.clone());
         }
         if let Some(command) = install_command.as_ref() {
             commands["install"] = serde_json::Value::String(command.clone());
+        }
+        if let Some(command) = build_command.as_ref() {
+            commands["build"] = serde_json::Value::String(command.clone());
         }
         if let Some(command) = stop_command.as_ref() {
             commands["stop"] = serde_json::Value::String(command.clone());
@@ -4667,6 +4964,7 @@ pub(super) async fn restart_app(
             match crate::actions::app::resolve_required_env_values(
                 &config_dir,
                 &data_dir,
+                Some(&app_id),
                 &required_inputs,
                 &llm_env,
                 &config_values,
@@ -4703,15 +5001,22 @@ pub(super) async fn restart_app(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "status": "needs_secrets",
-                    "app_id": app_id,
+                    "app_id": app_id.clone(),
                     "missing_env": missing_sensitive,
                     "missing_config": missing_config,
                     "missing_inputs": missing_all,
                     "required_inputs": required_inputs,
                     "required_secrets": required_secret_keys.clone(),
-                    "required_env": required_secret_keys,
+                    "required_env": required_secret_keys.clone(),
                     "required_config": required_config_keys,
                     "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
+                    "credential_request": {
+                        "kind": "app_runtime_secret",
+                        "app_id": app_id.clone(),
+                        "required_keys": required_secret_keys,
+                        "settings_path": format!("/apps/{}/environment", app_id),
+                        "secure_input_required": true
+                    },
                     "message": "Missing required inputs. Use the secure credential form in chat or Settings for sensitive values; provide config for non-sensitive values."
                 })),
             )
@@ -4724,6 +5029,7 @@ pub(super) async fn restart_app(
                 app_dir: &app_dir,
                 entry_command: &entry_command,
                 install_command: install_command.as_deref(),
+                build_command: build_command.as_deref(),
                 port,
                 extra_env: &resolved_env,
                 runtime_image: runtime_image.as_deref(),
@@ -4736,8 +5042,15 @@ pub(super) async fn restart_app(
             Ok(runtime_handle) => {
                 let mut runtime_handle = runtime_handle;
                 let app_dir_for_diagnostics = app_dir.clone();
-                if let Err(wait_error) =
-                    crate::actions::app::wait_for_runtime_port_open(&app_id, port, &None).await
+                let proxy_mode = crate::actions::app::proxy_path_mode_for_entry_command(
+                    Some(&entry_command),
+                    &app_dir,
+                    &app_id,
+                );
+                if let Err(wait_error) = crate::actions::app::wait_for_runtime_port_open(
+                    &app_id, port, proxy_mode, &None,
+                )
+                .await
                 {
                     crate::actions::app::stop_dynamic_runtime_handle(&app_id, &mut runtime_handle)
                         .await;
@@ -4978,6 +5291,30 @@ pub(super) async fn delete_app(
                 error
             );
             warnings.push(format!("remove_workspace: {}", error));
+        }
+    }
+
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir().to_path_buf())
+    };
+    match crate::actions::app::remove_app_scoped_env_secrets(&config_dir, &data_dir, &app_id) {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!(
+                    "delete_app: removed {} app-scoped environment secret(s) for '{}'",
+                    removed,
+                    app_id
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "delete_app: failed to remove app-scoped env secrets for '{}': {}",
+                app_id,
+                error
+            );
+            warnings.push(format!("remove_app_env_secrets: {}", error));
         }
     }
 

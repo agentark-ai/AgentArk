@@ -33,7 +33,11 @@ import {
   useRef,
   useState,
 } from "react";
-import { api, apiUrl } from "../../api/client";
+import {
+  api,
+  apiUrl,
+  normalizeSettingsApiKeyMetadata,
+} from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
   getTunnelAccessMeta,
@@ -49,6 +53,7 @@ import {
   getSupportedUiTimeZones,
   setUiTimeZoneOverride,
 } from "../../lib/dateFormat";
+import { humanizeStatusLabel } from "../../lib/displayLabels";
 import type {
   PulseRemediationSpec,
   PulseRunFixRequest,
@@ -283,6 +288,7 @@ type PulseInlineResult = {
 };
 
 type PasswordDialogMode = "set" | "change" | "remove";
+type ApiKeyPasswordDialogMode = "reveal" | "regenerate";
 
 function settingsUiEmbeddingsProvider(value: string): "local-hf" | "disabled" {
   const normalized = value.trim().toLowerCase();
@@ -343,6 +349,15 @@ export default function SettingsPage({
   >(null);
   const [initialized, setInitialized] = useState(false);
   const [apiKeyRevealed, setApiKeyRevealed] = useState(false);
+  const [apiKeyFullKey, setApiKeyFullKey] = useState("");
+  const apiKeyFullKeyRef = useRef("");
+  const [apiKeyPasswordDialogMode, setApiKeyPasswordDialogMode] =
+    useState<ApiKeyPasswordDialogMode | null>(null);
+  const [apiKeyMasterPassword, setApiKeyMasterPassword] = useState("");
+  const apiKeyPasswordResolverRef = useRef<
+    ((password: string | null) => void) | null
+  >(null);
+  const ignoreNextApiKeyPromptCancelErrorRef = useRef(false);
   const [apiKeyNowMs, setApiKeyNowMs] = useState(() => Date.now());
   const [secCurrentPassword, setSecCurrentPassword] = useState("");
   const [secNewPassword, setSecNewPassword] = useState("");
@@ -482,6 +497,13 @@ export default function SettingsPage({
     const timer = window.setInterval(() => setApiKeyNowMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [advancedTabActive]);
+
+  useEffect(() => {
+    if (advancedTabActive || !apiKeyRevealed) return;
+    apiKeyFullKeyRef.current = "";
+    setApiKeyFullKey("");
+    setApiKeyRevealed(false);
+  }, [advancedTabActive, apiKeyRevealed]);
 
   const settingsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.settings,
@@ -846,6 +868,8 @@ export default function SettingsPage({
     data_lifecycle_experience_run_retention_days: "90",
     data_lifecycle_experience_edge_retention_days: "90",
     data_lifecycle_learning_candidate_retention_days: "30",
+    data_lifecycle_operational_memory_retention_days: "",
+    data_lifecycle_readiness_retention_days: "",
     data_lifecycle_experience_item_retention_days: "0",
     data_lifecycle_procedural_pattern_retention_days: "0",
     data_lifecycle_recall_event_retention_days: "365",
@@ -1420,6 +1444,14 @@ export default function SettingsPage({
         dataLifecycleSettings.learning_candidate_retention_days,
         "30",
       ),
+      data_lifecycle_operational_memory_retention_days: str(
+        dataLifecycleSettings.operational_memory_retention_days,
+        "",
+      ),
+      data_lifecycle_readiness_retention_days: str(
+        dataLifecycleSettings.readiness_retention_days,
+        "",
+      ),
       data_lifecycle_experience_item_retention_days: str(
         dataLifecycleSettings.experience_item_retention_days,
         "0",
@@ -1619,7 +1651,7 @@ export default function SettingsPage({
         runway: form.media_base_url_runway.trim(),
         luma: form.media_base_url_luma.trim(),
       };
-      const dataLifecycle = {
+      const dataLifecycle: Record<string, unknown> = {
         cleanup_enabled: form.data_lifecycle_cleanup_enabled,
         notifications_cleanup_enabled:
           form.data_lifecycle_notifications_cleanup_enabled,
@@ -1729,6 +1761,28 @@ export default function SettingsPage({
           60,
         ),
       };
+      if (
+        Object.prototype.hasOwnProperty.call(
+          dataLifecycleSettings,
+          "operational_memory_retention_days",
+        )
+      ) {
+        dataLifecycle.operational_memory_retention_days = parseNonNegativeInt(
+          form.data_lifecycle_operational_memory_retention_days,
+          "Operational memory retention (days)",
+        );
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(
+          dataLifecycleSettings,
+          "readiness_retention_days",
+        )
+      ) {
+        dataLifecycle.readiness_retention_days = parseNonNegativeInt(
+          form.data_lifecycle_readiness_retention_days,
+          "Readiness retention (days)",
+        );
+      }
       const embeddingsProviderForSave = settingsUiEmbeddingsProvider(
         form.embeddings_provider,
       );
@@ -2820,7 +2874,21 @@ export default function SettingsPage({
     (needsMediaSettings ? mediaQ.error : null) ||
     (needsModelSettings ? modelsQ.error : null);
 
-  const apiKeyPayload = asRecord(apiKeyQ.data);
+  const apiKeyMetadata = normalizeSettingsApiKeyMetadata(apiKeyQ.data);
+  const apiKeyPayload: JsonRecord = {
+    ...apiKeyMetadata,
+    key: apiKeyRevealed ? apiKeyFullKey : "",
+  };
+  const apiKeyPasswordGateRequired = toBool(
+    apiKeyPayload.password_gate_required,
+  );
+  useEffect(() => {
+    if (apiKeyPasswordGateRequired || apiKeyPasswordDialogMode == null) return;
+    apiKeyPasswordResolverRef.current?.(null);
+    apiKeyPasswordResolverRef.current = null;
+    setApiKeyPasswordDialogMode(null);
+    setApiKeyMasterPassword("");
+  }, [apiKeyPasswordGateRequired, apiKeyPasswordDialogMode]);
   const settingsAutonomyPayload = asRecord(settingsAutonomyQ.data);
   const settingsAutonomy = asRecord(settingsAutonomyPayload.settings);
   const settingsEvolution = asRecord(settingsEvolutionQ.data);
@@ -3289,9 +3357,7 @@ export default function SettingsPage({
     const normalized = (status || "").trim().toLowerCase();
     if (!normalized) return "Unknown";
     if (normalized === "ok") return "OK";
-    return normalized
-      .replace(/_/g, " ")
-      .replace(/\b\w/g, (m) => m.toUpperCase());
+    return humanizeStatusLabel(normalized, "Unknown");
   }
 
   function pulseScanAlertReason(row: JsonRecord): string {
@@ -3377,13 +3443,129 @@ export default function SettingsPage({
     if (!ok) throw new Error("Copy failed.");
   }
 
-  const regenerateApiKeyMutation = useMutation({
-    mutationFn: () => api.rawPost("/settings/api-key/regenerate", {}),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["settings-api-key"] });
+  function requestApiKeyMasterPassword(
+    mode: ApiKeyPasswordDialogMode,
+  ): Promise<string | null> {
+    if (apiKeyPasswordResolverRef.current) {
+      apiKeyPasswordResolverRef.current(null);
+    }
+    setApiKeyMasterPassword("");
+    setApiKeyPasswordDialogMode(mode);
+    return new Promise((resolve) => {
+      apiKeyPasswordResolverRef.current = resolve;
+    });
+  }
+
+  function settleApiKeyMasterPasswordPrompt(password: string | null) {
+    apiKeyPasswordResolverRef.current?.(password);
+    apiKeyPasswordResolverRef.current = null;
+    setApiKeyPasswordDialogMode(null);
+    setApiKeyMasterPassword("");
+  }
+
+  function closeApiKeyPasswordDialog() {
+    settleApiKeyMasterPasswordPrompt(null);
+  }
+
+  function submitApiKeyPasswordDialog() {
+    settleApiKeyMasterPasswordPrompt(apiKeyMasterPassword);
+  }
+
+  const revealApiKeyMutation = useMutation({
+    mutationFn: (masterPassword: string) =>
+      api.revealSettingsApiKey(masterPassword),
+    onSuccess: (payload) => {
+      apiKeyFullKeyRef.current = payload.key;
+      setApiKeyFullKey(payload.key);
+      setApiKeyRevealed(true);
+      queryClient.setQueryData(
+        SETTINGS_QUERY_KEYS.apiKey,
+        normalizeSettingsApiKeyMetadata(payload),
+      );
     },
     onError: (e) => setError(errMessage(e)),
   });
+
+  const regenerateApiKeyMutation = useMutation({
+    mutationFn: (masterPassword: string) =>
+      api.regenerateSettingsApiKey(masterPassword),
+    onSuccess: async (payload) => {
+      apiKeyFullKeyRef.current = payload.key;
+      setApiKeyFullKey(payload.key);
+      setApiKeyRevealed(true);
+      queryClient.setQueryData(
+        SETTINGS_QUERY_KEYS.apiKey,
+        normalizeSettingsApiKeyMetadata(payload),
+      );
+      await queryClient.invalidateQueries({
+        queryKey: SETTINGS_QUERY_KEYS.apiKey,
+      });
+    },
+    onError: (e) => setError(errMessage(e)),
+  });
+
+  async function revealApiKeyFromPrompt() {
+    const masterPassword = apiKeyPasswordGateRequired
+      ? await requestApiKeyMasterPassword("reveal")
+      : "";
+    if (masterPassword == null) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await revealApiKeyMutation.mutateAsync(masterPassword);
+      setSuccess("API key revealed.");
+    } catch {
+      // onError already surfaced the backend error.
+    }
+  }
+
+  function setApiKeyRevealedFromPanel(
+    next: boolean | ((current: boolean) => boolean),
+  ) {
+    const resolved =
+      typeof next === "function" ? next(apiKeyRevealed) : Boolean(next);
+    if (!resolved) {
+      apiKeyFullKeyRef.current = "";
+      setApiKeyRevealed(false);
+      setApiKeyFullKey("");
+      return;
+    }
+    if (apiKeyFullKeyRef.current.trim()) {
+      setApiKeyRevealed(true);
+      return;
+    }
+    void revealApiKeyFromPrompt();
+  }
+
+  const regenerateApiKeyMutationForPanel = {
+    ...regenerateApiKeyMutation,
+    mutateAsync: async () => {
+      const masterPassword = apiKeyPasswordGateRequired
+        ? await requestApiKeyMasterPassword("regenerate")
+        : "";
+      if (masterPassword == null) {
+        ignoreNextApiKeyPromptCancelErrorRef.current = true;
+        throw new Error();
+      }
+      return regenerateApiKeyMutation.mutateAsync(masterPassword);
+    },
+  };
+
+  function setAdvancedPanelError(message: string | null) {
+    if (ignoreNextApiKeyPromptCancelErrorRef.current) {
+      ignoreNextApiKeyPromptCancelErrorRef.current = false;
+      return;
+    }
+    setError(message);
+  }
+
+  async function refreshApiKeyStateAfterPasswordChange() {
+    apiKeyFullKeyRef.current = "";
+    setApiKeyFullKey("");
+    setApiKeyRevealed(false);
+    queryClient.removeQueries({ queryKey: SETTINGS_QUERY_KEYS.apiKey });
+    await queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEYS.apiKey });
+  }
 
   async function refreshTunnelQueries() {
     await Promise.all([
@@ -3746,6 +3928,7 @@ export default function SettingsPage({
       api.rawPost("/security/set-password", { password }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["security-status"] });
+      await refreshApiKeyStateAfterPasswordChange();
       await refreshTunnelQueries();
       setSecCurrentPassword("");
       setSecNewPassword("");
@@ -3764,6 +3947,7 @@ export default function SettingsPage({
       api.rawPost("/security/change-password", payload),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["security-status"] });
+      await refreshApiKeyStateAfterPasswordChange();
       await refreshTunnelQueries();
       setSecCurrentPassword("");
       setSecNewPassword("");
@@ -3782,6 +3966,7 @@ export default function SettingsPage({
       api.rawPost("/security/remove-password", { password }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["security-status"] });
+      await refreshApiKeyStateAfterPasswordChange();
       await refreshTunnelQueries();
       setSuccess("Custom password removed.");
       setSecCurrentPassword("");
@@ -3840,7 +4025,7 @@ export default function SettingsPage({
     if (!hasCustomMasterPassword) return undefined;
     const pw = vaultPassword.trim();
     if (!pw) {
-      setError("Master password is required for secret changes.");
+      setError("Custom master password is required for secret changes.");
       return null;
     }
     return pw;
@@ -4419,6 +4604,77 @@ export default function SettingsPage({
     return <SettingsInlineCard {...props} />;
   }
 
+  function renderOperationalRetentionControls() {
+    const hasDedicatedRetentionFields =
+      operationalMemoryRetentionAvailable || readinessRetentionAvailable;
+    return (
+      <Box className="list-shell">
+        <Stack spacing={2}>
+          {renderSettingsSectionIntro({
+            eyebrow: "Lifecycle",
+            title: "Operational Retention",
+            description:
+              "Retention for growth-oriented operational memory and readiness evidence.",
+          })}
+          <Alert severity={hasDedicatedRetentionFields ? "info" : "warning"}>
+            Active personal memories and user data are not purged by these
+            operational retention defaults.
+            {hasDedicatedRetentionFields
+              ? " Set a value to 0 only when you intentionally want to keep that operational category forever."
+              : " Dedicated operational memory/readiness retention fields are not exposed by the backend yet."}
+          </Alert>
+          {hasDedicatedRetentionFields ? (
+            <Grid2 container spacing={1.5}>
+              {operationalMemoryRetentionAvailable ? (
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Operational memory (days)"
+                    value={form.data_lifecycle_operational_memory_retention_days}
+                    onChange={(e) =>
+                      setField(
+                        "data_lifecycle_operational_memory_retention_days",
+                        e.target.value,
+                      )
+                    }
+                    helperText="Growth-table memory evidence only."
+                    slotProps={{ htmlInput: { min: 0, step: 1 } }}
+                  />
+                </Grid2>
+              ) : null}
+              {readinessRetentionAvailable ? (
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Readiness evidence (days)"
+                    value={form.data_lifecycle_readiness_retention_days}
+                    onChange={(e) =>
+                      setField(
+                        "data_lifecycle_readiness_retention_days",
+                        e.target.value,
+                      )
+                    }
+                    helperText="Readiness samples, checks, and review evidence."
+                    slotProps={{ htmlInput: { min: 0, step: 1 } }}
+                  />
+                </Grid2>
+              ) : null}
+            </Grid2>
+          ) : (
+            <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+              <Chip size="small" variant="outlined" label="Needs operational_memory_retention_days" />
+              <Chip size="small" variant="outlined" label="Needs readiness_retention_days" />
+            </Stack>
+          )}
+        </Stack>
+      </Box>
+    );
+  }
+
   const foreverLifecycleRules = [
     {
       label: "Notifications",
@@ -4513,6 +4769,17 @@ export default function SettingsPage({
     dataCleanupEnabled && form.data_lifecycle_notifications_cleanup_enabled;
   const logsCleanupInputsEnabled =
     dataCleanupEnabled && form.data_lifecycle_logs_cleanup_enabled;
+  const apiKeyPasswordMutationPending =
+    revealApiKeyMutation.isPending || regenerateApiKeyMutation.isPending;
+  const operationalMemoryRetentionAvailable =
+    Object.prototype.hasOwnProperty.call(
+      dataLifecycleSettings,
+      "operational_memory_retention_days",
+    );
+  const readinessRetentionAvailable = Object.prototype.hasOwnProperty.call(
+    dataLifecycleSettings,
+    "readiness_retention_days",
+  );
 
   const openSearchProviderDialog = (
     provider: (typeof SEARCH_API_PROVIDER_OPTIONS)[number],
@@ -5140,7 +5407,7 @@ export default function SettingsPage({
                                   : "var(--ui-rgba-244-245-247-920)",
                             }}
                           >
-                            {s.status}
+                            {humanizeStatusLabel(s.status)}
                           </Typography>
                         </Stack>
                       </Box>
@@ -5697,7 +5964,7 @@ export default function SettingsPage({
                   restartMutation={restartMutation}
                   developerModeEnabled={developerModeEnabled}
                   setDeveloperModeEnabledState={setDeveloperModeEnabledState}
-                  setError={setError}
+                  setError={setAdvancedPanelError}
                   setSuccess={setSuccess}
                   settingsSentinelQ={settingsSentinelQ}
                   settingsSentinel={settingsSentinel}
@@ -5729,26 +5996,29 @@ export default function SettingsPage({
                   apiKeyRemainingSeconds={apiKeyRemainingSeconds}
                   apiKeyRotated={apiKeyRotated}
                   apiKeyRevealed={apiKeyRevealed}
-                  setApiKeyRevealed={setApiKeyRevealed}
+                  setApiKeyRevealed={setApiKeyRevealedFromPanel}
                   apiKeyPayload={apiKeyPayload}
                   apiKeyIssuedAtUnix={apiKeyIssuedAtUnix}
                   apiKeyExpiresAtUnix={apiKeyExpiresAtUnix}
-                regenerateApiKeyMutation={regenerateApiKeyMutation}
+                regenerateApiKeyMutation={regenerateApiKeyMutationForPanel}
               />
             ) : null}
             {tab === 14 ? (
-              <SettingsDataLifecyclePanel
-                form={form}
-                setField={(key, value) => setField(key, value)}
-                foreverLifecycleRules={foreverLifecycleRules}
-                foreverLifecycleSummary={foreverLifecycleSummary}
-                dataCleanupEnabled={dataCleanupEnabled}
-                notificationsCleanupInputsEnabled={
-                  notificationsCleanupInputsEnabled
-                }
-                logsCleanupInputsEnabled={logsCleanupInputsEnabled}
-                renderSettingsSectionIntro={renderSettingsSectionIntro}
-              />
+              <>
+                {renderOperationalRetentionControls()}
+                <SettingsDataLifecyclePanel
+                  form={form}
+                  setField={(key, value) => setField(key, value)}
+                  foreverLifecycleRules={foreverLifecycleRules}
+                  foreverLifecycleSummary={foreverLifecycleSummary}
+                  dataCleanupEnabled={dataCleanupEnabled}
+                  notificationsCleanupInputsEnabled={
+                    notificationsCleanupInputsEnabled
+                  }
+                  logsCleanupInputsEnabled={logsCleanupInputsEnabled}
+                  renderSettingsSectionIntro={renderSettingsSectionIntro}
+                />
+              </>
             ) : null}
             {tab === 25 ? (
               <SettingsUpdatesPanel
@@ -7147,6 +7417,79 @@ export default function SettingsPage({
             }
           >
             {searxngDialogConfigured ? "Replace URL" : "Save URL"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={apiKeyPasswordDialogMode != null}
+        onClose={closeApiKeyPasswordDialog}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          {apiKeyPasswordDialogMode === "regenerate"
+            ? "Regenerate API Key"
+            : "Reveal API Key"}
+        </DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.2} sx={{ mt: 0.5 }}>
+            <Alert
+              severity={
+                apiKeyPasswordDialogMode === "regenerate" ? "warning" : "info"
+              }
+            >
+              {apiKeyPasswordDialogMode === "regenerate"
+                ? "Enter your custom master password to replace the HTTP API key. The previous key stops working after regeneration."
+                : "Enter your custom master password to reveal the full HTTP API key for this session."}
+            </Alert>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={showPasswordInputs}
+                  onChange={(e) => setShowPasswordInputs(e.target.checked)}
+                />
+              }
+              label="Show password text"
+            />
+            <TextField
+              label="Custom master password"
+              value={apiKeyMasterPassword}
+              onChange={(e) => setApiKeyMasterPassword(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !apiKeyPasswordMutationPending) {
+                  e.preventDefault();
+                  submitApiKeyPasswordDialog();
+                }
+              }}
+              fullWidth
+              autoFocus
+              type={showPasswordInputs ? "text" : "password"}
+              size="small"
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={closeApiKeyPasswordDialog}
+            disabled={apiKeyPasswordMutationPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            color={
+              apiKeyPasswordDialogMode === "regenerate" ? "warning" : "primary"
+            }
+            onClick={submitApiKeyPasswordDialog}
+            disabled={apiKeyPasswordMutationPending}
+          >
+            {apiKeyPasswordMutationPending
+              ? apiKeyPasswordDialogMode === "regenerate"
+                ? "Regenerating..."
+                : "Revealing..."
+              : apiKeyPasswordDialogMode === "regenerate"
+                ? "Regenerate"
+                : "Reveal"}
           </Button>
         </DialogActions>
       </Dialog>

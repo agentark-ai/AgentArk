@@ -11,12 +11,12 @@
 //!
 //! All loops run inside a single tokio task with staggered intervals.
 
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::channels;
@@ -39,6 +39,9 @@ const PULSE_MAX_DEFERS: u32 = 3;
 const SENTINEL_STARTUP_SETTLE_SECS: u64 = 120;
 const PULSE_STARTUP_SETTLE_SECS: u64 = 60;
 const AUTO_ANALYSIS_STAGGER_SECS: u64 = 5 * 60;
+const STORAGE_HOUSEKEEPING_INTERVAL_SECS: u64 = 60 * 60;
+const SENTINEL_JOB_LEASE_KEY_PREFIX: &str = "sentinel_job_lease_v1:";
+const SENTINEL_JOB_STATUS_KEY_PREFIX: &str = "sentinel_job_status_v1:";
 static PULSE_RUNNING: AtomicBool = AtomicBool::new(false);
 static SENTINEL_MAINTENANCE_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCHEDULED_TASK_PERMITS: Lazy<Arc<Semaphore>> = Lazy::new(|| {
@@ -101,10 +104,71 @@ static WATCHER_TRIGGER_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
 
 struct PulseRunGuard;
 
+#[derive(Debug, Serialize)]
+struct SentinelJobStatusRecord {
+    label: String,
+    status: String,
+    owner_id: Option<String>,
+    fence_token: Option<u64>,
+    updated_at: String,
+    error: Option<String>,
+}
+
 impl Drop for PulseRunGuard {
     fn drop(&mut self) {
         PULSE_RUNNING.store(false, Ordering::Release);
     }
+}
+
+fn sentinel_job_key_suffix(label: &str) -> String {
+    let mut suffix = String::new();
+    let mut previous_separator = false;
+    for ch in label.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            suffix.push(ch.to_ascii_lowercase());
+            previous_separator = false;
+        } else if !previous_separator {
+            suffix.push('_');
+            previous_separator = true;
+        }
+    }
+    let suffix = suffix.trim_matches('_').to_string();
+    if suffix.is_empty() {
+        "job".to_string()
+    } else {
+        suffix
+    }
+}
+
+fn sentinel_job_lease_key(label: &str) -> String {
+    format!(
+        "{}{}",
+        SENTINEL_JOB_LEASE_KEY_PREFIX,
+        sentinel_job_key_suffix(label)
+    )
+}
+
+fn sentinel_job_status_key(label: &str) -> String {
+    format!(
+        "{}{}",
+        SENTINEL_JOB_STATUS_KEY_PREFIX,
+        sentinel_job_key_suffix(label)
+    )
+}
+
+fn sentinel_job_lease_ttl_secs() -> i64 {
+    ((*SENTINEL_JOB_TIMEOUT_SECS)
+        .saturating_mul(2)
+        .saturating_add(60)) as i64
+}
+
+fn sentinel_job_owner_id(label: &str) -> String {
+    format!(
+        "pid:{}:{}:{}",
+        std::process::id(),
+        sentinel_job_key_suffix(label),
+        uuid::Uuid::new_v4()
+    )
 }
 
 #[cfg(test)]
@@ -135,6 +199,22 @@ mod tests {
         }
         assert!(!watcher_timeout_uses_preferred_fallback("telegram"));
         assert!(!watcher_timeout_uses_preferred_fallback("web"));
+    }
+
+    #[test]
+    fn sentinel_job_lease_and_status_keys_are_namespaced_and_stable() {
+        assert_eq!(
+            sentinel_job_lease_key("watchers"),
+            "sentinel_job_lease_v1:watchers"
+        );
+        assert_eq!(
+            sentinel_job_status_key("watchers"),
+            "sentinel_job_status_v1:watchers"
+        );
+        assert_eq!(
+            sentinel_job_lease_key("storage housekeeping"),
+            "sentinel_job_lease_v1:storage_housekeeping"
+        );
     }
 
     #[test]
@@ -391,11 +471,26 @@ async fn run_with_busy_deferral<F, Fut>(
                 tokio::time::sleep(Duration::from_secs((defer_minutes * 60) as u64)).await;
                 continue;
             };
+            let Some((storage, lease_key, lease_guard)) =
+                acquire_sentinel_job_lease(agent, label).await
+            else {
+                return;
+            };
             tracing::debug!("Sentinel: {} started", label);
-            match tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), job()).await
-            {
+            let result =
+                tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), job()).await;
+            match result {
                 Ok(()) => {
                     tracing::debug!("Sentinel: {} completed", label);
+                    finish_sentinel_job_lease(
+                        storage,
+                        lease_key,
+                        lease_guard,
+                        label,
+                        "completed",
+                        None,
+                    )
+                    .await;
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -403,6 +498,15 @@ async fn run_with_busy_deferral<F, Fut>(
                         label,
                         *SENTINEL_JOB_TIMEOUT_SECS
                     );
+                    finish_sentinel_job_lease(
+                        storage,
+                        lease_key,
+                        lease_guard,
+                        label,
+                        "timed_out",
+                        Some("job timed out"),
+                    )
+                    .await;
                 }
             }
             return;
@@ -429,10 +533,100 @@ async fn run_with_busy_deferral<F, Fut>(
     }
 }
 
-async fn run_loop_with_timeout<F>(label: &str, future: F)
+async fn acquire_sentinel_job_lease(
+    agent: &SharedAgent,
+    label: &str,
+) -> Option<(
+    crate::storage::Storage,
+    String,
+    crate::storage::KvLeaseGuard,
+)> {
+    let storage = { agent.read().await.storage.clone() };
+    let lease_key = sentinel_job_lease_key(label);
+    let owner_id = sentinel_job_owner_id(label);
+    match storage
+        .acquire_kv_lease_guard(&lease_key, &owner_id, sentinel_job_lease_ttl_secs())
+        .await
+    {
+        Ok(Some(guard)) => {
+            record_sentinel_job_status(&storage, label, "running", Some(&guard), None).await;
+            Some((storage, lease_key, guard))
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "Sentinel: {} skipped because another process holds its lease",
+                label
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!("Sentinel: {} lease acquisition failed: {}", label, error);
+            None
+        }
+    }
+}
+
+async fn finish_sentinel_job_lease(
+    storage: crate::storage::Storage,
+    lease_key: String,
+    lease_guard: crate::storage::KvLeaseGuard,
+    label: &str,
+    status: &str,
+    error: Option<&str>,
+) {
+    record_sentinel_job_status(&storage, label, status, Some(&lease_guard), error).await;
+    if let Err(release_error) = storage
+        .release_kv_lease_guard(&lease_key, &lease_guard)
+        .await
+    {
+        tracing::warn!(
+            "Sentinel: {} failed to release job lease '{}': {}",
+            label,
+            lease_key,
+            release_error
+        );
+    }
+}
+
+async fn record_sentinel_job_status(
+    storage: &crate::storage::Storage,
+    label: &str,
+    status: &str,
+    guard: Option<&crate::storage::KvLeaseGuard>,
+    error: Option<&str>,
+) {
+    let record = SentinelJobStatusRecord {
+        label: label.to_string(),
+        status: status.to_string(),
+        owner_id: guard.map(|value| value.owner_id.clone()),
+        fence_token: guard.map(|value| value.fence_token),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        error: error.map(|value| value.to_string()),
+    };
+    match serde_json::to_vec(&record) {
+        Ok(raw) => {
+            if let Err(error) = storage.set(&sentinel_job_status_key(label), &raw).await {
+                tracing::debug!(
+                    "Sentinel: failed to persist {} job status: {}",
+                    label,
+                    error
+                );
+            }
+        }
+        Err(error) => {
+            tracing::debug!("Sentinel: failed to encode {} job status: {}", label, error);
+        }
+    }
+}
+
+async fn run_leased_loop_with_timeout<F>(agent: &SharedAgent, label: &str, future: F)
 where
     F: Future<Output = ()>,
 {
+    let Some((storage, lease_key, lease_guard)) = acquire_sentinel_job_lease(agent, label).await
+    else {
+        return;
+    };
     if tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), future)
         .await
         .is_err()
@@ -442,6 +636,24 @@ where
             label,
             *SENTINEL_JOB_TIMEOUT_SECS
         );
+        finish_sentinel_job_lease(
+            storage,
+            lease_key,
+            lease_guard,
+            label,
+            "timed_out",
+            Some("loop timed out"),
+        )
+        .await;
+    } else {
+        finish_sentinel_job_lease(storage, lease_key, lease_guard, label, "completed", None).await;
+    }
+}
+
+async fn run_storage_housekeeping(agent: &SharedAgent) {
+    let storage = { agent.read().await.storage.clone() };
+    if let Err(error) = storage.run_housekeeping_purge().await {
+        tracing::warn!("Sentinel: storage housekeeping failed: {}", error);
     }
 }
 
@@ -2946,6 +3158,7 @@ async fn run_data_safety_checks(
         "run_checkpoints",
         "tool_attempts",
         "watchers",
+        "webhook_events",
         "arkpulse_events",
         "memory_capture_events",
         "memory_operations",
@@ -3894,7 +4107,7 @@ pub fn start(
                     break;
                 }
                 record_loop_heartbeat(&agent, SENTINEL_SCHEDULER_HEARTBEAT_KEY).await;
-                run_loop_with_timeout("scheduler", run_scheduler(&agent)).await;
+                run_leased_loop_with_timeout(&agent, "scheduler", run_scheduler(&agent)).await;
             }
         })
     });
@@ -3921,7 +4134,7 @@ pub fn start(
                 };
                 let autonomy_paused = is_agent_autonomy_paused(&agent).await;
                 if !autonomy_paused {
-                    run_loop_with_timeout("watchers", run_watchers(&agent)).await;
+                    run_leased_loop_with_timeout(&agent, "watchers", run_watchers(&agent)).await;
                 }
                 let sleep_for = if autonomy_paused {
                     max_sleep.min(Duration::from_secs(60))
@@ -4165,18 +4378,12 @@ pub fn start(
                 }
                 record_loop_heartbeat(&agent, SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY).await;
                 tracing::debug!("Sentinel: approval_expiry started");
-                match tokio::time::timeout(
-                    Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
+                run_leased_loop_with_timeout(
+                    &agent,
+                    "approval_expiry",
                     run_approval_expiry(&agent),
                 )
-                .await
-                {
-                    Ok(()) => tracing::debug!("Sentinel: approval_expiry completed"),
-                    Err(_) => tracing::warn!(
-                        "Sentinel: approval_expiry timed out after {}s",
-                        *SENTINEL_JOB_TIMEOUT_SECS
-                    ),
-                }
+                .await;
             }
         })
     });
@@ -4347,25 +4554,19 @@ pub fn start(
                         let agent_guard = agent.read().await;
                         agent_guard.runtime.clone()
                     };
-                    tracing::debug!("Sentinel: container_reaper started");
-                    let result = tokio::time::timeout(
-                        Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
-                        async move { runtime.reconcile_orphan_containers().await },
-                    )
-                    .await;
-                    match result {
-                        Ok(Ok(_)) => tracing::debug!("Sentinel: container_reaper completed"),
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                "Sentinel: sandbox container reconciliation failed: {}",
-                                error
-                            );
+                    run_leased_loop_with_timeout(&agent, "container_reaper", async move {
+                        tracing::debug!("Sentinel: container_reaper started");
+                        match runtime.reconcile_orphan_containers().await {
+                            Ok(_) => tracing::debug!("Sentinel: container_reaper completed"),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Sentinel: sandbox container reconciliation failed: {}",
+                                    error
+                                );
+                            }
                         }
-                        Err(_) => tracing::warn!(
-                            "Sentinel: container_reaper timed out after {}s",
-                            *SENTINEL_JOB_TIMEOUT_SECS
-                        ),
-                    }
+                    })
+                    .await;
                 }
             })
         });
@@ -4394,6 +4595,35 @@ pub fn start(
                     || {
                         let agent = agent.clone();
                         async move { run_security_log_cleanup(&agent).await }
+                    },
+                )
+                .await;
+            }
+        })
+    });
+
+    // -- Storage Housekeeping (leased, scheduled retention cleanup) ---------
+    handles.push({
+        let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
+        crate::spawn_logged!("src/sentinel.rs:storage_housekeeping", async move {
+            if !sleep_or_shutdown(std::time::Duration::from_secs(300), &mut shutdown).await {
+                return;
+            }
+            let mut interval = sentinel_interval_secs(STORAGE_HOUSEKEEPING_INTERVAL_SECS);
+            interval.tick().await;
+            loop {
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
+                run_with_busy_deferral(
+                    &agent,
+                    "storage_housekeeping",
+                    MAINTENANCE_DEFER_MINUTES,
+                    MAINTENANCE_MAX_DEFERS,
+                    || {
+                        let agent = agent.clone();
+                        async move { run_storage_housekeeping(&agent).await }
                     },
                 )
                 .await;

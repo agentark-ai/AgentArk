@@ -33,6 +33,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
 import AgentLogo from "../../assets/logo.svg";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../../lib/displayLabels";
 import { MetricBarCard } from "../analytics/MetricBarCard";
 import { LiveEventConsole } from "../LiveEventConsole";
 import {
@@ -1458,7 +1459,7 @@ export default function AutonomyPage({
                         <Chip
                           size="small"
                           color="primary"
-                          label={str(action.action_kind, "action")}
+                          label={humanizeMachineLabel(str(action.action_kind, "action"))}
                         />
                         <Typography variant="body2" sx={{ fontWeight: 700 }}>
                           {str(action.title, "Suggested action")}
@@ -1520,13 +1521,13 @@ export default function AutonomyPage({
                         alignItems: "center",
                       }}
                     >
-                      <Chip
-                        size="small"
-                        color={suggestionKindColor(
-                          str(suggestion.kind, "automation"),
-                        )}
-                        label={str(suggestion.kind, "automation")}
-                      />
+                        <Chip
+                          size="small"
+                          color={suggestionKindColor(
+                            str(suggestion.kind, "automation"),
+                          )}
+                          label={humanizeMachineLabel(str(suggestion.kind, "automation"))}
+                        />
                       <Typography variant="body2" sx={{ fontWeight: 700 }}>
                         {str(suggestion.title, "Suggested automation")}
                       </Typography>
@@ -1811,7 +1812,7 @@ export default function AutonomyPage({
                             {str(event.title, "-")}
                           </Typography>
                         </TableCell>
-                        <TableCell>{status || "-"}</TableCell>
+                        <TableCell>{humanizeStatusLabel(status, "-")}</TableCell>
                         <TableCell sx={{ maxWidth: 360 }}>
                           <Typography
                             variant="caption"
@@ -2098,7 +2099,7 @@ export default function AutonomyPage({
                               noWrap
                               title={str(session.status, "-")}
                             >
-                              {str(session.status, "-")}
+                              {humanizeStatusLabel(str(session.status, ""), "-")}
                             </Typography>
                           </TableCell>
                           <TableCell align="right">
@@ -2533,7 +2534,7 @@ export default function AutonomyPage({
                                   <Chip
                                     size="small"
                                     color={suggestionKindColor(kind)}
-                                    label={str(suggestion.kind, "automation")}
+                                    label={humanizeMachineLabel(str(suggestion.kind, "automation"))}
                                   />
                                   <Typography
                                     variant="body2"
@@ -2801,10 +2802,10 @@ export default function AutonomyPage({
                         )}
                       </Typography>
                       <Typography variant="body2">
-                        Promotion mode: {str(evolution.promotion_mode, "none")}
+                        Promotion mode: {humanizeMachineLabel(str(evolution.promotion_mode, "none"))}
                       </Typography>
                       <Typography variant="body2">
-                        Replay gate: {str(evolution.replay_gate_result, "-")}
+                        Replay gate: {humanizeStatusLabel(str(evolution.replay_gate_result, ""), "-")}
                       </Typography>
                       <Typography variant="body2">
                         Learning queue: provisional{" "}
@@ -3044,7 +3045,7 @@ export default function AutonomyPage({
                                     noWrap
                                     title={str(session.status, "-")}
                                   >
-                                    {str(session.status, "-")}
+                                    {humanizeStatusLabel(str(session.status, ""), "-")}
                                   </Typography>
                                 </TableCell>
                                 <TableCell align="right">

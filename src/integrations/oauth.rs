@@ -11,7 +11,7 @@
 //! accidentally expose tokens.
 
 use crate::crypto::KeyManager;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
@@ -247,7 +247,7 @@ pub struct OAuthClient {
 impl OAuthClient {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::core::net::default_outgoing_http_client(),
         }
     }
 
@@ -401,41 +401,49 @@ pub struct TokenStorage {
 }
 
 impl TokenStorage {
-    /// Save tokens for a service (encrypted)
-    pub fn save(&self, service_id: &str, tokens: &OAuthTokens) -> Result<()> {
-        let mut all_tokens = self.load_all_internal()?;
+    /// Save tokens for a service (encrypted) without blocking the async runtime on disk I/O.
+    pub async fn save_async(&self, service_id: &str, tokens: &OAuthTokens) -> Result<()> {
+        let mut all_tokens = self.load_all_internal_async().await?;
         all_tokens.insert(service_id.to_string(), TokensForStorage::from(tokens));
 
         // SECURITY: Serialize to JSON, then encrypt
         let json = serde_json::to_vec(&all_tokens)?;
         let encrypted = self.key_manager.encrypt(&json)?;
-        std::fs::write(&self.storage_path, encrypted)?;
+        tokio::fs::write(&self.storage_path, encrypted).await?;
 
         Ok(())
     }
 
-    /// Delete tokens for a service
-    pub fn delete(&self, service_id: &str) -> Result<()> {
-        let mut all_tokens = self.load_all_internal()?;
+    /// Delete tokens for a service without blocking the async runtime on disk I/O.
+    pub async fn delete_async(&self, service_id: &str) -> Result<()> {
+        let mut all_tokens = self.load_all_internal_async().await?;
         all_tokens.remove(service_id);
 
         if all_tokens.is_empty() {
-            let _ = std::fs::remove_file(&self.storage_path);
+            match tokio::fs::remove_file(&self.storage_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         } else {
             let json = serde_json::to_vec(&all_tokens)?;
             let encrypted = self.key_manager.encrypt(&json)?;
-            std::fs::write(&self.storage_path, encrypted)?;
+            tokio::fs::write(&self.storage_path, encrypted).await?;
         }
 
         Ok(())
     }
 
-    fn load_all_internal(&self) -> Result<std::collections::HashMap<String, TokensForStorage>> {
-        if !self.storage_path.exists() {
-            return Ok(std::collections::HashMap::new());
-        }
-
-        let encrypted = std::fs::read(&self.storage_path)?;
+    async fn load_all_internal_async(
+        &self,
+    ) -> Result<std::collections::HashMap<String, TokensForStorage>> {
+        let encrypted = match tokio::fs::read(&self.storage_path).await {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(std::collections::HashMap::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let decrypted = self.key_manager.decrypt(&encrypted)?;
         let tokens: std::collections::HashMap<String, TokensForStorage> =
             serde_json::from_slice(&decrypted)?;
@@ -483,5 +491,49 @@ mod tests {
         assert!(url.contains("client123"));
         assert!(!url.contains("secret456")); // Secret should NOT be in auth URL
         assert!(url.contains("test_state"));
+    }
+
+    #[tokio::test]
+    async fn async_token_storage_saves_loads_and_deletes_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = TokenStorage {
+            storage_path: dir.path().join("tokens.bin"),
+            key_manager: std::sync::Arc::new(
+                KeyManager::from_password("test-password", &[7u8; crate::crypto::SALT_LEN])
+                    .expect("key manager"),
+            ),
+        };
+        let tokens = OAuthTokens {
+            access_token: Zeroizing::new("access-secret".to_string()),
+            refresh_token: Some(Zeroizing::new("refresh-secret".to_string())),
+            expires_at: Some(12345),
+            token_type: "Bearer".to_string(),
+            scope: Some("calendar".to_string()),
+        };
+
+        storage
+            .save_async("calendar", &tokens)
+            .await
+            .expect("save tokens");
+        let loaded = storage
+            .load_all_internal_async()
+            .await
+            .expect("load tokens");
+        assert_eq!(
+            loaded
+                .get("calendar")
+                .expect("calendar tokens")
+                .access_token
+                .as_str(),
+            "access-secret"
+        );
+
+        storage
+            .delete_async("calendar")
+            .await
+            .expect("delete tokens");
+        assert!(!tokio::fs::try_exists(&storage.storage_path)
+            .await
+            .expect("storage file status"));
     }
 }

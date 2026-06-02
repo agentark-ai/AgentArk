@@ -732,7 +732,7 @@ pub fn action_metadata_for_action(action: &ActionDef) -> ActionMetadata {
             meta.cost = ActionCostTier::Low;
             return meta;
         }
-        "browser_auto" => {
+        "browser_auto" | "browser_profile_manage" => {
             meta.role = ActionRole::Mutation;
             meta.integration_class = ActionIntegrationClass::Browser;
             meta.cost = ActionCostTier::High;

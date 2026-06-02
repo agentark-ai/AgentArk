@@ -4,19 +4,19 @@
 //! configuration, Bot Framework / Graph-friendly outbound payload builders, and
 //! inbound activity handling that persists reply destinations before handing
 //! the message to the agent core.
-use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use once_cell::sync::Lazy;
 use ring::signature::{self, RsaPublicKeyComponents};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
-use crate::core::Agent;
 use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
+use crate::core::Agent;
 use crate::storage::Storage;
 
 type SharedAgent = Arc<RwLock<Agent>>;
@@ -25,6 +25,7 @@ const CONFIG_STORAGE_KEY: &str = "channels:teams:config";
 const LAST_DESTINATION_STORAGE_KEY: &str = "channels:teams:last_destination";
 const TEAMS_DESTINATIONS_KEY_PREFIX: &str = "teams:reply_destinations:v1:";
 const TEAMS_DEFAULT_GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
+const TEAMS_DEFAULT_TIMEOUT_SECS: u64 = 15;
 const TEAMS_BOT_FRAMEWORK_OPENID_CONFIGURATION_URL: &str =
     "https://login.botframework.com/v1/.well-known/openidconfiguration";
 const TEAMS_BOT_FRAMEWORK_AUTH_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
@@ -133,7 +134,7 @@ impl Default for TeamsTransportConfig {
             chat_id: None,
             graph_base_url: Some(TEAMS_DEFAULT_GRAPH_BASE_URL.to_string()),
             delivery_mode: TeamsDeliveryMode::Auto,
-            timeout_secs: 15,
+            timeout_secs: TEAMS_DEFAULT_TIMEOUT_SECS,
             user_agent: None,
         }
     }
@@ -787,7 +788,12 @@ fn graph_base_url(config: &TeamsTransportConfig) -> String {
 }
 
 fn build_client(config: &TeamsTransportConfig) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let timeout_secs = if config.timeout_secs == 0 {
+        TEAMS_DEFAULT_TIMEOUT_SECS
+    } else {
+        config.timeout_secs
+    };
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
     if let Some(user_agent) = config
         .user_agent
         .as_deref()
@@ -795,9 +801,6 @@ fn build_client(config: &TeamsTransportConfig) -> Result<reqwest::Client> {
         .filter(|value| !value.is_empty())
     {
         builder = builder.user_agent(user_agent.to_string());
-    }
-    if config.timeout_secs > 0 {
-        builder = builder.timeout(std::time::Duration::from_secs(config.timeout_secs));
     }
     builder.build().context("failed to build Teams HTTP client")
 }
@@ -861,7 +864,7 @@ pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<TeamsT
     let timeout_secs = std::env::var("TEAMS_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(15);
+        .unwrap_or(TEAMS_DEFAULT_TIMEOUT_SECS);
     let user_agent = std::env::var("TEAMS_USER_AGENT").ok();
 
     if service_url.trim().is_empty() && access_token.trim().is_empty() {
@@ -1284,7 +1287,11 @@ pub async fn handle_activity(
     if let (Some(from), Some(bot_app_id)) = (
         activity.from.as_ref().and_then(|identity| {
             let id = identity.id.trim();
-            if id.is_empty() { None } else { Some(id) }
+            if id.is_empty() {
+                None
+            } else {
+                Some(id)
+            }
         }),
         config
             .bot_app_id
@@ -1571,15 +1578,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            !record_teams_activity_id(&storage, "activity-1")
-                .await
-                .unwrap()
-        );
-        assert!(
-            record_teams_activity_id(&storage, "activity-1")
-                .await
-                .unwrap()
-        );
+        assert!(!record_teams_activity_id(&storage, "activity-1")
+            .await
+            .unwrap());
+        assert!(record_teams_activity_id(&storage, "activity-1")
+            .await
+            .unwrap());
     }
 }

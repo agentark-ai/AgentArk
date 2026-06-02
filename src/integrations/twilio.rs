@@ -5,7 +5,7 @@
 //! Authentication uses HTTP Basic Auth with Account SID and Auth Token.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ impl TwilioConnector {
 
     pub fn new_with_config_dir(config_dir: PathBuf) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::core::net::default_outgoing_http_client(),
             config_dir,
         }
     }

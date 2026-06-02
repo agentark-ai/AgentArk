@@ -10,7 +10,7 @@
 //! Unicode-obfuscated, and encoded instructions are all covered because the
 //! classifier operates on intent, not surface form.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 use tokio::sync::mpsc::Sender;

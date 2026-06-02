@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
 use crate::actions::{ActionDef, ActionSource};
@@ -63,6 +63,8 @@ pub struct CustomApiOperationDraft {
     pub parameters: Vec<CustomApiParameter>,
     #[serde(default)]
     pub body_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_body: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,8 +109,107 @@ pub struct CustomApiView {
     pub config: CustomApiConfig,
     pub secret_configured: bool,
     pub action_count: usize,
+    pub capability_contract: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_action_name: Option<String>,
+}
+
+pub fn operation_required_inputs(operation: &CustomApiOperation) -> Vec<String> {
+    let mut inputs = Vec::new();
+    for parameter in &operation.draft.parameters {
+        if !parameter.required {
+            continue;
+        }
+        match parameter.location {
+            CustomApiParameterLocation::Body => {
+                if operation.draft.default_body.is_none() {
+                    push_unique(&mut inputs, "body".to_string());
+                }
+            }
+            CustomApiParameterLocation::Query => {
+                if !operation.draft.default_query.contains_key(&parameter.name) {
+                    push_unique(&mut inputs, parameter.name.clone());
+                }
+            }
+            CustomApiParameterLocation::Path | CustomApiParameterLocation::Header => {
+                push_unique(&mut inputs, parameter.name.clone());
+            }
+        }
+    }
+    if operation.draft.body_required && operation.draft.default_body.is_none() {
+        push_unique(&mut inputs, "body".to_string());
+    }
+    inputs
+}
+
+pub fn operation_missing_required_inputs(
+    operation: &CustomApiOperation,
+    arguments: &Value,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for input in operation_required_inputs(operation) {
+        let supplied = if input == "body" {
+            arguments.get("body").is_some() || operation.draft.default_body.is_some()
+        } else {
+            arguments
+                .get(&input)
+                .and_then(value_to_http_string)
+                .is_some_and(|value| !value.trim().is_empty())
+                || operation.draft.default_query.contains_key(&input)
+        };
+        if !supplied {
+            missing.push(input);
+        }
+    }
+    missing
+}
+
+pub fn operation_callable_without_arguments(operation: &CustomApiOperation) -> bool {
+    operation_required_inputs(operation).is_empty()
+}
+
+pub fn operation_contract(operation: &CustomApiOperation) -> Value {
+    let required_inputs = operation_required_inputs(operation);
+    json!({
+        "id": operation.draft.id.clone(),
+        "name": operation.draft.name.clone(),
+        "action_name": operation.action_name.clone(),
+        "method": operation.draft.method.clone(),
+        "path": operation.draft.path.clone(),
+        "read_only": operation.draft.read_only,
+        "enabled": operation.draft.enabled,
+        "requires_body": operation.draft.body_required,
+        "has_default_body": operation.draft.default_body.is_some(),
+        "required_inputs": required_inputs,
+        "callable_without_arguments": required_inputs.is_empty(),
+    })
+}
+
+pub fn capability_contract(config: &CustomApiConfig, secret_configured: bool) -> Value {
+    let auth_ready = matches!(config.auth_mode, CustomApiAuthMode::None) || secret_configured;
+    let test_healthy = !config
+        .last_test_outcome
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|status| status.eq_ignore_ascii_case("failure"));
+    let operations = config
+        .operations
+        .iter()
+        .map(operation_contract)
+        .collect::<Vec<_>>();
+    json!({
+        "surface": "custom_apis",
+        "kind": "custom_api",
+        "id": config.id.clone(),
+        "name": config.name.clone(),
+        "enabled": config.enabled,
+        "auth_ready": auth_ready,
+        "connected": config.enabled && auth_ready && test_healthy && config.operations.iter().any(|operation| operation.draft.enabled),
+        "read_capable": config.operations.iter().any(|operation| operation.draft.enabled && operation.draft.read_only),
+        "write_capable": config.operations.iter().any(|operation| operation.draft.enabled && !operation.draft.read_only),
+        "operations": operations,
+        "manage_operations": ["read", "list", "status", "test", "update", "enable", "disable", "delete"],
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,10 +327,12 @@ pub async fn list_custom_apis(
             .iter()
             .filter(|op| op.draft.enabled)
             .count();
+        let capability_contract = capability_contract(&config, secret_configured);
         views.push(CustomApiView {
             config,
             secret_configured,
             action_count,
+            capability_contract,
             test_action_name,
         });
     }
@@ -297,15 +400,29 @@ pub async fn upsert_custom_api(
         .as_ref()
         .map(|item| item.created_at.clone())
         .unwrap_or_else(|| now.clone());
-    let last_tested_at = existing
-        .as_ref()
-        .and_then(|item| item.last_tested_at.clone());
-    let last_test_outcome = existing
-        .as_ref()
-        .and_then(|item| item.last_test_outcome.clone());
-    let last_test_message = existing
-        .as_ref()
-        .and_then(|item| item.last_test_message.clone());
+    let credential_changed = request.clear_secret.unwrap_or(false)
+        || clean_optional_string(request.secret.as_deref()).is_some();
+    let last_tested_at = (!credential_changed)
+        .then(|| {
+            existing
+                .as_ref()
+                .and_then(|item| item.last_tested_at.clone())
+        })
+        .flatten();
+    let last_test_outcome = (!credential_changed)
+        .then(|| {
+            existing
+                .as_ref()
+                .and_then(|item| item.last_test_outcome.clone())
+        })
+        .flatten();
+    let last_test_message = (!credential_changed)
+        .then(|| {
+            existing
+                .as_ref()
+                .and_then(|item| item.last_test_message.clone())
+        })
+        .flatten();
 
     let auth_mode = request.auth_mode.unwrap_or_else(|| {
         existing
@@ -420,6 +537,7 @@ pub async fn upsert_custom_api(
     save_configs(storage, &configs).await?;
     sync_to_runtime(storage, config_dir, data_dir, runtime).await?;
 
+    let capability_contract = capability_contract(&config, secret_configured);
     Ok(CustomApiView {
         secret_configured,
         action_count: config
@@ -429,6 +547,7 @@ pub async fn upsert_custom_api(
             .count(),
         test_action_name: find_testable_operation(&config)
             .map(|operation| operation.action_name.clone()),
+        capability_contract,
         config,
     })
 }
@@ -547,6 +666,35 @@ pub async fn test_custom_api(
     })
 }
 
+pub async fn record_custom_api_runtime_health(
+    storage: &Storage,
+    id: &str,
+    ok: bool,
+    detail: impl Into<String>,
+) -> Result<bool> {
+    let mut configs = load_configs(storage).await?;
+    let Some(config) = configs.iter_mut().find(|item| item.id == id) else {
+        return Ok(false);
+    };
+    config.last_tested_at = Some(chrono::Utc::now().to_rfc3339());
+    config.last_test_outcome = Some(if ok { "success" } else { "failure" }.to_string());
+    config.last_test_message = Some(detail.into());
+    save_configs(storage, &configs).await?;
+    Ok(true)
+}
+
+pub async fn clear_custom_api_runtime_health(storage: &Storage, id: &str) -> Result<bool> {
+    let mut configs = load_configs(storage).await?;
+    let Some(config) = configs.iter_mut().find(|item| item.id == id) else {
+        return Ok(false);
+    };
+    config.last_tested_at = None;
+    config.last_test_outcome = None;
+    config.last_test_message = None;
+    save_configs(storage, &configs).await?;
+    Ok(true)
+}
+
 pub async fn sync_to_runtime(
     storage: &Storage,
     _config_dir: &std::path::Path,
@@ -628,6 +776,7 @@ async fn register_config(runtime: &ActionRuntime, config: &CustomApiConfig) -> R
                     default_query: operation.draft.default_query.clone(),
                     parameters: operation.draft.parameters.clone(),
                     body_required: operation.draft.body_required,
+                    default_body: operation.draft.default_body.clone(),
                 },
             )
             .await;
@@ -679,7 +828,7 @@ fn build_input_schema(operation: &CustomApiOperation) -> Value {
                 "description": "JSON request body for this endpoint"
             }),
         );
-        if operation.draft.body_required {
+        if operation.draft.body_required && operation.draft.default_body.is_none() {
             required.push("body".to_string());
         }
     }
@@ -714,7 +863,7 @@ async fn parse_source(request: CustomApiPreviewRequest) -> Result<ParsedSource> 
     let raw_spec = if let Some(text) = clean_optional_string(request.openapi_text.as_deref()) {
         text
     } else if let Some(url) = clean_optional_string(request.openapi_url.as_deref()) {
-        let response = reqwest::Client::new()
+        let response = crate::core::net::default_outgoing_http_client()
             .get(url.as_str())
             .send()
             .await
@@ -906,6 +1055,7 @@ fn parse_openapi_document(
                 default_query: BTreeMap::new(),
                 parameters,
                 body_required,
+                default_body: None,
             }));
         }
     }
@@ -1059,6 +1209,7 @@ fn parse_curl_text(
     } else {
         body.is_none()
     };
+    let default_body = if read_only { body_value.clone() } else { None };
 
     Ok(ParsedSource {
         suggested_name,
@@ -1080,6 +1231,7 @@ fn parse_curl_text(
             default_query,
             parameters,
             body_required: body.is_some(),
+            default_body,
         })],
         notes: vec![
             "Imported from a curl example. Review the generated endpoint before saving."
@@ -1182,6 +1334,9 @@ fn normalize_operation_draft(mut draft: CustomApiOperationDraft) -> CustomApiOpe
     {
         draft.body_required = true;
     }
+    if draft.default_body.is_some() {
+        draft.body_required = true;
+    }
     draft
 }
 
@@ -1252,22 +1407,26 @@ fn clean_optional_string(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn value_to_http_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 fn find_testable_operation(config: &CustomApiConfig) -> Option<&CustomApiOperation> {
     config.operations.iter().find(|operation| {
         operation.draft.enabled
             && operation.draft.read_only
-            && !operation.draft.body_required
-            && operation.draft.parameters.iter().all(|parameter| {
-                if !parameter.required {
-                    return true;
-                }
-                match parameter.location {
-                    CustomApiParameterLocation::Query => {
-                        operation.draft.default_query.contains_key(&parameter.name)
-                    }
-                    _ => false,
-                }
-            })
+            && operation_callable_without_arguments(operation)
     })
 }
 
@@ -1580,6 +1739,7 @@ mod tests {
     use super::*;
     use crate::runtime::ActionRuntime;
     use crate::storage::Storage;
+    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn preview_openapi_discovers_operations() {
@@ -1758,6 +1918,123 @@ mod tests {
         })));
     }
 
+    #[test]
+    fn operation_contract_marks_default_body_operations_callable_without_arguments() {
+        let operation = CustomApiOperation {
+            draft: CustomApiOperationDraft {
+                id: "viewer".to_string(),
+                name: "Viewer".to_string(),
+                method: "POST".to_string(),
+                path: "/graphql".to_string(),
+                description: String::new(),
+                read_only: true,
+                enabled: true,
+                default_headers: BTreeMap::new(),
+                default_query: BTreeMap::new(),
+                parameters: vec![CustomApiParameter {
+                    name: "body".to_string(),
+                    location: CustomApiParameterLocation::Body,
+                    required: true,
+                    description: None,
+                    schema_type: Some("object".to_string()),
+                }],
+                body_required: true,
+                default_body: Some(json!({
+                    "query": "query Viewer { viewer { id } }"
+                })),
+            },
+            action_name: "api__graph__viewer".to_string(),
+        };
+
+        assert!(operation_callable_without_arguments(&operation));
+        assert!(operation_missing_required_inputs(&operation, &json!({})).is_empty());
+        assert_eq!(
+            operation_contract(&operation)
+                .get("callable_without_arguments")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn read_operation_with_default_body_is_testable_without_model_supplied_body() {
+        let operation = CustomApiOperation {
+            draft: CustomApiOperationDraft {
+                id: "viewer".to_string(),
+                name: "Viewer".to_string(),
+                method: "POST".to_string(),
+                path: "/graphql".to_string(),
+                description: String::new(),
+                read_only: true,
+                enabled: true,
+                default_headers: BTreeMap::new(),
+                default_query: BTreeMap::new(),
+                parameters: vec![CustomApiParameter {
+                    name: "body".to_string(),
+                    location: CustomApiParameterLocation::Body,
+                    required: true,
+                    description: None,
+                    schema_type: Some("object".to_string()),
+                }],
+                body_required: true,
+                default_body: Some(json!({
+                    "query": "query Viewer { viewer { id } }"
+                })),
+            },
+            action_name: "api__graph__viewer".to_string(),
+        };
+        let config = CustomApiConfig {
+            id: "graph".to_string(),
+            name: "Graph".to_string(),
+            description: String::new(),
+            base_url: "https://api.example.com".to_string(),
+            enabled: true,
+            auth_mode: CustomApiAuthMode::None,
+            auth_profile_id: None,
+            auth_header: None,
+            auth_name: None,
+            auth_username: None,
+            created_at: "2026-05-29T00:00:00Z".to_string(),
+            updated_at: "2026-05-29T00:00:00Z".to_string(),
+            last_tested_at: None,
+            last_test_outcome: None,
+            last_test_message: None,
+            operations: vec![operation],
+        };
+
+        let testable = find_testable_operation(&config).expect("default-body query is callable");
+
+        assert_eq!(testable.draft.id, "viewer");
+        assert!(operation_missing_required_inputs(testable, &json!({})).is_empty());
+    }
+
+    #[test]
+    fn operation_contract_reports_missing_body_when_no_default_exists() {
+        let operation = CustomApiOperation {
+            draft: CustomApiOperationDraft {
+                id: "query".to_string(),
+                name: "Query".to_string(),
+                method: "POST".to_string(),
+                path: "/graphql".to_string(),
+                description: String::new(),
+                read_only: true,
+                enabled: true,
+                default_headers: BTreeMap::new(),
+                default_query: BTreeMap::new(),
+                parameters: Vec::new(),
+                body_required: true,
+                default_body: None,
+            },
+            action_name: "api__graph__query".to_string(),
+        };
+
+        assert!(!operation_callable_without_arguments(&operation));
+        assert_eq!(
+            operation_missing_required_inputs(&operation, &json!({})),
+            vec!["body".to_string()]
+        );
+    }
+
     #[cfg_attr(
         not(feature = "db-tests"),
         ignore = "requires explicit isolated Postgres test database"
@@ -1805,6 +2082,7 @@ mod tests {
                     default_query: std::collections::BTreeMap::new(),
                     parameters: Vec::new(),
                     body_required: false,
+                    default_body: None,
                 }],
             },
             None,
@@ -1825,12 +2103,11 @@ mod tests {
             .find(|item| item.config.id == "ops")
             .expect("saved API present");
         assert_eq!(api.config.last_test_outcome.as_deref(), Some("failure"));
-        assert!(
-            api.config
-                .last_test_message
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-        );
+        assert!(api
+            .config
+            .last_test_message
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()));
         assert!(api.config.last_tested_at.is_some());
     }
 
@@ -1881,6 +2158,7 @@ mod tests {
                     default_query: std::collections::BTreeMap::new(),
                     parameters: Vec::new(),
                     body_required: false,
+                    default_body: None,
                 }],
             },
             None,
@@ -1912,24 +2190,18 @@ mod tests {
             .await
             .expect("custom API deleted");
 
-        assert!(
-            list_custom_apis(&storage, dir.path(), dir.path())
-                .await
-                .expect("list custom APIs")
-                .is_empty()
-        );
-        assert!(
-            manager
-                .get_custom_secret(&custom_api_secret_key("ops"))
-                .expect("read deleted custom API secret")
-                .is_none()
-        );
-        assert!(
-            manager
-                .get_custom_secret(&action_env_key)
-                .expect("read deleted action env mapping")
-                .is_none()
-        );
+        assert!(list_custom_apis(&storage, dir.path(), dir.path())
+            .await
+            .expect("list custom APIs")
+            .is_empty());
+        assert!(manager
+            .get_custom_secret(&custom_api_secret_key("ops"))
+            .expect("read deleted custom API secret")
+            .is_none());
+        assert!(manager
+            .get_custom_secret(&action_env_key)
+            .expect("read deleted action env mapping")
+            .is_none());
         assert!(runtime.action_definition(&action_name).await.is_none());
         assert!(runtime.get_action_review(&action_name).await.is_none());
     }

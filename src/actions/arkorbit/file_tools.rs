@@ -13,7 +13,7 @@ pub async fn orbit_file_write(service: &ArkOrbitService, args: &Value) -> Result
         .get("content")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    service.write_orbit_file(orbit_id, path, content)?;
+    service.write_orbit_file(orbit_id, path, content).await?;
     Ok(serde_json::to_string(&serde_json::json!({
         "status": "written",
         "orbit_id": orbit_id,

@@ -196,6 +196,8 @@ async fn read_response_json_limited<T: DeserializeOwned>(
 fn tool_argument_progress_step(tool_name: &str) -> usize {
     if tool_name.trim().eq_ignore_ascii_case("app_deploy") {
         250
+    } else if tool_name.trim().eq_ignore_ascii_case("skill_manage") {
+        400
     } else {
         800
     }
@@ -326,6 +328,35 @@ fn collect_file_write_partial_file(
     })
 }
 
+fn collect_skill_manage_partial_file(
+    parsed: &serde_json::Value,
+    done: bool,
+) -> Option<DraftFilePreview> {
+    let obj = parsed.as_object()?;
+    let content = obj
+        .get("markdown")
+        .and_then(|value| value.as_str())
+        .or_else(|| obj.get("content").and_then(|value| value.as_str()))
+        .unwrap_or("");
+    if content.is_empty() {
+        return None;
+    }
+    let name = obj
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("skill");
+    let line_count = content.lines().count().max(1);
+    Some(DraftFilePreview {
+        file: format!("{}/SKILL.md", name),
+        content_snapshot: content.to_string(),
+        line_count,
+        total_lines: done.then_some(line_count),
+        done,
+    })
+}
+
 fn collect_arkorbit_operation_partial_files(
     parsed: &serde_json::Value,
     done: bool,
@@ -384,6 +415,11 @@ fn extract_partial_draft_files(tool_name: &str, raw_args: &str) -> Vec<DraftFile
             .into_iter()
             .collect();
     }
+    if tool_name.trim().eq_ignore_ascii_case("skill_manage") {
+        return collect_skill_manage_partial_file(&parsed, done)
+            .into_iter()
+            .collect();
+    }
     if tool_name
         .trim()
         .eq_ignore_ascii_case("arkorbit_apply_operations")
@@ -398,6 +434,8 @@ fn tool_argument_phase(tool_name: &str) -> (&'static str, &'static str) {
         ("generating_files", "Generating files")
     } else if tool_name.trim().eq_ignore_ascii_case("file_write") {
         ("writing_files", "Drafting file")
+    } else if tool_name.trim().eq_ignore_ascii_case("skill_manage") {
+        ("authoring_skill", "Authoring skill")
     } else if tool_name
         .trim()
         .eq_ignore_ascii_case("arkorbit_apply_operations")
@@ -411,7 +449,7 @@ fn tool_argument_phase(tool_name: &str) -> (&'static str, &'static str) {
 #[derive(Clone, Copy)]
 enum ModelRequestMode {
     Helper,
-    AppDelivery,
+    LongRunningTool,
     Classifier,
 }
 
@@ -452,7 +490,7 @@ fn attach_runtime_identity_contract(mode: ModelRequestMode, system_prompt: &str)
         return system_prompt.to_string();
     }
     let contract = match mode {
-        ModelRequestMode::Helper | ModelRequestMode::AppDelivery => runtime_identity_contract(),
+        ModelRequestMode::Helper | ModelRequestMode::LongRunningTool => runtime_identity_contract(),
         ModelRequestMode::Classifier => classifier_runtime_identity_contract(),
     };
     format!("{}\n\n{}", system_prompt.trim_end(), contract)
@@ -734,7 +772,25 @@ async fn emit_partial_draft_file_previews(
     tool_name: &str,
     raw_args: &str,
     emitted_snapshots: &mut HashMap<String, (String, bool)>,
-) {
+) -> usize {
+    emit_partial_draft_file_previews_with_elapsed(
+        token_tx,
+        tool_name,
+        raw_args,
+        emitted_snapshots,
+        None,
+    )
+    .await
+}
+
+async fn emit_partial_draft_file_previews_with_elapsed(
+    token_tx: &Sender<StreamEvent>,
+    tool_name: &str,
+    raw_args: &str,
+    emitted_snapshots: &mut HashMap<String, (String, bool)>,
+    stream_elapsed_ms: Option<u64>,
+) -> usize {
+    let mut emitted_count = 0usize;
     for preview in extract_partial_draft_files(tool_name, raw_args) {
         let stream_key = format!("draft-file:{}:{}", tool_name, preview.file);
         let previous = emitted_snapshots
@@ -757,6 +813,19 @@ async fn emit_partial_draft_file_previews(
         let file_name = preview.file.clone();
         let bytes = preview.content_snapshot.len();
         let delta_bytes = delta.len();
+        emitted_count = emitted_count.saturating_add(1);
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            tool = %tool_name,
+            file = %file_name,
+            bytes,
+            delta_bytes,
+            line = preview.line_count,
+            total_lines = preview.total_lines,
+            done = preview.done,
+            stream_elapsed_ms,
+            "LLM draft file preview emitted"
+        );
 
         let mut payload = serde_json::Map::new();
         payload.insert("kind".to_string(), serde_json::json!("draft_file"));
@@ -794,6 +863,7 @@ async fn emit_partial_draft_file_previews(
         )
         .await;
     }
+    emitted_count
 }
 
 fn stream_file_line_count(content: &str) -> usize {
@@ -804,14 +874,23 @@ fn stream_file_line_count(content: &str) -> usize {
     }
 }
 
-async fn emit_stream_block_events(
+async fn emit_stream_block_events_for_mode(
     token_tx: &Sender<StreamEvent>,
     events: Vec<stream_blocks::StreamBlockEvent>,
+    _mode: ModelRequestMode,
+) {
+    emit_stream_block_events_with_text_visibility(token_tx, events, true).await;
+}
+
+async fn emit_stream_block_events_with_text_visibility(
+    token_tx: &Sender<StreamEvent>,
+    events: Vec<stream_blocks::StreamBlockEvent>,
+    emit_text_tokens: bool,
 ) {
     for event in events {
         match event {
             stream_blocks::StreamBlockEvent::Text(text) => {
-                if !text.is_empty() {
+                if emit_text_tokens && !text.is_empty() {
                     queue_stream_event(token_tx, StreamEvent::Token(text));
                 }
             }
@@ -1082,8 +1161,285 @@ fn extract_openai_delta_text(value: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_openai_reasoning_delta(value: &serde_json::Value) -> Option<String> {
+    if value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(|kind| kind.to_ascii_lowercase())
+        .is_some_and(|kind| kind.contains("encrypted") || kind.contains("redacted"))
+    {
+        return None;
+    }
     extract_openai_text_from_value(value, false)
         .or_else(|| value.as_str().map(|text| text.to_string()))
+}
+
+fn openai_reasoning_summary_deltas(value: &serde_json::Value) -> Vec<(String, String)> {
+    fn collect(value: &serde_json::Value, out: &mut Vec<(String, String)>) {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                collect(item, out);
+            }
+            return;
+        }
+
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        let detail_type = object
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let is_summary_type = detail_type == "summary" || detail_type.ends_with(".summary");
+        if !is_summary_type {
+            return;
+        }
+
+        let text = object
+            .get("summary")
+            .or_else(|| object.get("text"))
+            .or_else(|| object.get("content"))
+            .and_then(extract_openai_text_from_value_with_default_trim);
+        let Some(text) = text.filter(|value| !value.trim().is_empty()) else {
+            return;
+        };
+        let key = object
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                object
+                    .get("index")
+                    .and_then(|value| value.as_u64())
+                    .map(|index| format!("summary:{index}"))
+            })
+            .unwrap_or_else(|| format!("summary:{}", out.len()));
+        out.push((key, text));
+    }
+
+    fn extract_openai_text_from_value_with_default_trim(
+        value: &serde_json::Value,
+    ) -> Option<String> {
+        extract_openai_text_from_value(value, false)
+    }
+
+    let mut out = Vec::new();
+    collect(value, &mut out);
+    out
+}
+
+fn openai_reasoning_detail_text_snapshots(value: &serde_json::Value) -> Vec<(String, String)> {
+    fn collect(value: &serde_json::Value, path: String, out: &mut Vec<(String, String)>) {
+        if let Some(items) = value.as_array() {
+            for (index, item) in items.iter().enumerate() {
+                collect(item, format!("{path}:{index}"), out);
+            }
+            return;
+        }
+
+        if let Some(text) = value.as_str() {
+            if !text.trim().is_empty() {
+                out.push((path, text.to_string()));
+            }
+            return;
+        }
+
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        let detail_type = object
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if detail_type.contains("encrypted") || detail_type.contains("redacted") {
+            return;
+        }
+        if detail_type == "summary" || detail_type.ends_with(".summary") {
+            return;
+        }
+
+        let text = object
+            .get("text")
+            .or_else(|| object.get("content"))
+            .and_then(|value| extract_openai_text_from_value(value, false))
+            .filter(|text| !text.trim().is_empty());
+        let Some(text) = text else {
+            return;
+        };
+
+        let key = object
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                object
+                    .get("index")
+                    .and_then(|value| value.as_u64())
+                    .map(|index| format!("detail:{index}"))
+            })
+            .unwrap_or(path);
+        out.push((key, text));
+    }
+
+    let mut out = Vec::new();
+    collect(value, "detail".to_string(), &mut out);
+    out
+}
+
+fn openai_reasoning_summary_delta_from_snapshot(previous: &str, current: &str) -> String {
+    if !previous.is_empty() && current.starts_with(previous) {
+        current[previous.len()..].to_string()
+    } else {
+        current.to_string()
+    }
+}
+
+#[derive(Default)]
+struct OpenAiReasoningDeltaState {
+    summary_snapshots: HashMap<String, String>,
+    detail_snapshots: HashMap<String, String>,
+}
+
+fn openai_stream_reasoning_deltas_from_fields(
+    reasoning_details: Option<&serde_json::Value>,
+    reasoning: Option<&serde_json::Value>,
+    reasoning_content: Option<&str>,
+    state: &mut OpenAiReasoningDeltaState,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut emitted_detail_delta = false;
+
+    if let Some(reasoning_details) = reasoning_details {
+        for (key, summary) in openai_reasoning_summary_deltas(reasoning_details) {
+            let previous = state.summary_snapshots.entry(key).or_default();
+            let delta = openai_reasoning_summary_delta_from_snapshot(previous, &summary);
+            *previous = summary;
+            if !delta.trim().is_empty() {
+                out.push(("reasoning_summary".to_string(), delta));
+            }
+        }
+
+        for (key, snapshot) in openai_reasoning_detail_text_snapshots(reasoning_details) {
+            let previous = state.detail_snapshots.entry(key).or_default();
+            let delta = openai_reasoning_summary_delta_from_snapshot(previous, &snapshot);
+            *previous = snapshot;
+            if !delta.trim().is_empty() {
+                emitted_detail_delta = true;
+                out.push(("model".to_string(), delta));
+            }
+        }
+    }
+
+    // Some OpenAI-compatible providers mirror the same live reasoning token in
+    // both a rich `reasoning_details` block and a scalar `reasoning` field in
+    // the same SSE frame. Prefer the richer schema when it produced visible
+    // detail text; otherwise consume the scalar field normally.
+    if !emitted_detail_delta {
+        let scalar_delta = reasoning_content
+            .map(ToOwned::to_owned)
+            .or_else(|| reasoning.and_then(extract_openai_reasoning_delta));
+        if let Some(delta) = scalar_delta.filter(|delta| !delta.trim().is_empty()) {
+            out.push(("model".to_string(), delta));
+        }
+    }
+
+    out
+}
+
+fn openai_compatible_uses_minimax_reasoning_split(
+    request_config: &ResolvedOpenAiRequestConfig,
+    model: &str,
+) -> bool {
+    if request_config.is_openrouter || request_config.uses_codex_cli_oauth {
+        return false;
+    }
+    let model_lower = model.trim().to_ascii_lowercase();
+    if model_lower.contains("minimax") {
+        return true;
+    }
+    reqwest::Url::parse(&request_config.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| host.contains("minimax"))
+}
+
+fn openai_compatible_reasoning_request(
+    request_config: &ResolvedOpenAiRequestConfig,
+) -> Option<serde_json::Value> {
+    if request_config.is_openrouter {
+        return Some(serde_json::json!({ "exclude": false }));
+    }
+    None
+}
+
+fn openai_compatible_include_reasoning(
+    request_config: &ResolvedOpenAiRequestConfig,
+) -> Option<bool> {
+    request_config.is_openrouter.then_some(true)
+}
+
+fn openai_compatible_thinking_request(
+    request_config: &ResolvedOpenAiRequestConfig,
+    model: &str,
+) -> Option<serde_json::Value> {
+    openai_compatible_uses_minimax_reasoning_split(request_config, model)
+        .then(|| serde_json::json!({ "type": "adaptive" }))
+}
+
+fn openai_stream_idle_without_useful_progress_is_failure(
+    first_token: bool,
+    saw_actionable_stream_progress: bool,
+    content_started: bool,
+    tool_payload_started: bool,
+) -> bool {
+    if first_token {
+        return true;
+    }
+    !(saw_actionable_stream_progress || content_started || tool_payload_started)
+}
+
+fn openai_stream_poll_timeout_secs(idle_timeout_secs: u64, idle_notice_interval_secs: u64) -> u64 {
+    idle_timeout_secs.min(idle_notice_interval_secs).max(1)
+}
+
+fn openai_stream_waiting_detail(first_token: bool, idle_secs: u64) -> String {
+    if first_token {
+        format!("Waiting on model response for {idle_secs}s.")
+    } else {
+        format!("Waiting for the model stream to send the next complete update for {idle_secs}s.")
+    }
+}
+
+fn llm_stream_heartbeat_detail(
+    elapsed_secs: u64,
+    notice_interval_secs: u64,
+    hidden_reasoning_progress_seen: bool,
+) -> String {
+    if elapsed_secs < notice_interval_secs {
+        return "Thinking.".to_string();
+    }
+    if hidden_reasoning_progress_seen {
+        return format!("Model is reasoning internally for {elapsed_secs}s.");
+    }
+    openai_stream_waiting_detail(true, elapsed_secs)
+}
+
+fn queue_openai_stream_waiting_notice(
+    token_tx: &Sender<StreamEvent>,
+    first_token: bool,
+    idle_secs: u64,
+) {
+    queue_stream_event(
+        token_tx,
+        StreamEvent::Thinking(openai_stream_waiting_detail(first_token, idle_secs)),
+    );
 }
 
 fn openai_responses_endpoint(config: &ResolvedOpenAiRequestConfig) -> String {
@@ -1146,7 +1502,9 @@ fn build_openai_responses_tools(actions: &[crate::actions::ActionDef]) -> Vec<se
                 "name": action.name,
                 "description": compact_openai_tool_description(&action.description),
                 "strict": false,
-                "parameters": compact_openai_tool_schema(&action.input_schema),
+                "parameters": compact_openai_tool_schema(
+                    &with_model_tool_call_description_field(&action.input_schema),
+                ),
             })
         })
         .collect()
@@ -1484,6 +1842,69 @@ fn openai_responses_tool_choice_for_actions(
     })
 }
 
+const MODEL_TOOL_CALL_DESCRIPTION_FIELD: &str = "_describe";
+const MODEL_TOOL_CALL_DESCRIPTION_MAX_CHARS: usize = 80;
+
+fn with_model_tool_call_description_field(schema: &serde_json::Value) -> serde_json::Value {
+    let mut schema = if schema.is_object() {
+        schema.clone()
+    } else {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    };
+
+    let Some(root) = schema.as_object_mut() else {
+        return schema;
+    };
+
+    if !root.contains_key("type") {
+        root.insert("type".to_string(), serde_json::json!("object"));
+    }
+
+    let properties = root
+        .entry("properties".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !properties.is_object() {
+        *properties = serde_json::json!({});
+    }
+    if let Some(properties) = properties.as_object_mut() {
+        properties.insert(
+            MODEL_TOOL_CALL_DESCRIPTION_FIELD.to_string(),
+            model_tool_call_description_schema(),
+        );
+    }
+
+    let required = root
+        .entry("required".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !required.is_array() {
+        *required = serde_json::Value::Array(Vec::new());
+    }
+    if let Some(required) = required.as_array_mut() {
+        let already_present = required.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value == MODEL_TOOL_CALL_DESCRIPTION_FIELD)
+        });
+        if !already_present {
+            required.push(serde_json::json!(MODEL_TOOL_CALL_DESCRIPTION_FIELD));
+        }
+    }
+
+    schema
+}
+
+fn model_tool_call_description_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "Brief user-facing description of this specific call; prefer the target or outcome over repeating the tool name. No JSON or secrets.",
+        "minLength": 1,
+        "maxLength": MODEL_TOOL_CALL_DESCRIPTION_MAX_CHARS,
+    })
+}
+
 fn openai_prompt_cache_key(
     scope: &str,
     system_prompt: &str,
@@ -1499,9 +1920,11 @@ fn openai_prompt_cache_key(
         hasher.update(action.version.as_bytes());
         hasher.update(compact_openai_tool_description(&action.description).as_bytes());
         hasher.update(
-            compact_openai_tool_schema(&action.input_schema)
-                .to_string()
-                .as_bytes(),
+            compact_openai_tool_schema(&with_model_tool_call_description_field(
+                &action.input_schema,
+            ))
+            .to_string()
+            .as_bytes(),
         );
     }
     let digest = hasher.finalize().to_hex();
@@ -1743,11 +2166,11 @@ fn parse_openai_responses_payload(
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or(fallback_id.as_str())
                         .to_string();
-                    tool_calls.push(ToolCall {
+                    tool_calls.push(tool_call_from_model(
                         id,
-                        name: name.to_string(),
-                        arguments: openai_responses_tool_arguments(item.get("arguments")),
-                    });
+                        name.to_string(),
+                        openai_responses_tool_arguments(item.get("arguments")),
+                    ));
                 }
                 "reasoning" => {
                     if let Some(summary) = item.get("summary").and_then(|value| value.as_array()) {
@@ -2240,18 +2663,28 @@ mod tests {
     use super::{
         anthropic_user_content_value, append_runtime_temporal_context,
         attach_runtime_identity_contract, attach_runtime_temporal_context,
-        emit_partial_draft_file_previews, extract_openai_reasoning_delta,
-        extract_partial_draft_files, generated_output_chars_for_usage,
-        json_contains_tool_call_indicators, merge_usage_field, normalize_openai_tool_schema,
-        openai_cache_creation_prompt_tokens_from_details, openai_cached_prompt_tokens_from_details,
-        openai_prompt_cache_key, openai_prompt_cache_key_for_config, openai_prompt_cache_retention,
-        openai_stream_data_has_terminal_finish_reason, openai_user_content_value,
+        emit_partial_draft_file_previews, emit_stream_block_events_for_mode,
+        extract_openai_reasoning_delta, extract_partial_draft_files,
+        generated_output_chars_for_usage, json_contains_tool_call_indicators, merge_usage_field,
+        normalize_openai_tool_schema, openai_cache_creation_prompt_tokens_from_details,
+        openai_cached_prompt_tokens_from_details, openai_compatible_include_reasoning,
+        openai_compatible_reasoning_request, openai_compatible_thinking_request,
+        openai_compatible_uses_minimax_reasoning_split, openai_prompt_cache_key,
+        openai_prompt_cache_key_for_config, openai_prompt_cache_retention,
+        openai_reasoning_detail_text_snapshots, openai_stream_reasoning_deltas_from_fields,
+        openai_reasoning_summary_delta_from_snapshot, openai_reasoning_summary_deltas,
+        openai_stream_data_has_terminal_finish_reason, OpenAiReasoningDeltaState,
+        openai_stream_idle_without_useful_progress_is_failure, openai_stream_poll_timeout_secs,
+        llm_stream_heartbeat_detail, openai_stream_waiting_detail, openai_user_content_value,
         openrouter_chat_tool_cache_control, openrouter_message_content_with_cache_control,
         openrouter_system_content_and_deferred_context, openrouter_top_level_prompt_cache_control,
         parse_openai_responses_payload, parse_partial_tool_arguments, prompt_cache_plan,
         prompt_cache_uses_openai_explicit_key, should_request_openai_stream_usage,
-        sorted_action_refs, total_tokens_or_sum, usage_with_generated_output_floor,
-        LlmImageAttachment, LlmTokenUsage, ModelRequestMode, OpenAiTokenUsageDetails, ToolCall,
+        sorted_action_refs, stream_blocks::StreamBlockEvent, tool_call_from_model,
+        total_tokens_or_sum, usage_with_generated_output_floor,
+        with_model_tool_call_description_field, LlmImageAttachment, LlmStreamFailure,
+        LlmStreamFailureKind, LlmTokenUsage, ModelRequestMode, OpenAiTokenUsageDetails, ToolCall,
+        MODEL_TOOL_CALL_DESCRIPTION_FIELD,
     };
     use crate::core::llm_provider::{
         PromptCacheCapability, ResolvedOpenAiRequestConfig, OPENAI_PROVIDER_ID,
@@ -2629,6 +3062,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_partial_draft_files_reads_skill_manage_markdown() {
+        let previews = extract_partial_draft_files(
+            "skill_manage",
+            r#"{"operation":"create","name":"source-checker","markdown":"---\nname: source-checker\n---\n\n# Source Checker"}"#,
+        );
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].file, "source-checker/SKILL.md");
+        assert!(previews[0].content_snapshot.contains("# Source Checker"));
+        assert!(previews[0].done);
+    }
+
+    #[test]
     fn parse_partial_tool_arguments_repairs_truncated_json() {
         let parsed = parse_partial_tool_arguments(
             r#"{"path":"/app/data/apps/new/demo/index.html","content":"<main>Hello""#,
@@ -2684,6 +3130,35 @@ mod tests {
             payload.get("total_lines").and_then(|value| value.as_u64()),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn long_running_tool_stream_block_events_emit_public_model_prose_tokens() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        emit_stream_block_events_for_mode(
+            &tx,
+            vec![StreamBlockEvent::Text(
+                "I am preparing the files now.".to_string(),
+            )],
+            ModelRequestMode::LongRunningTool,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("model prose should be emitted");
+        let StreamEvent::Token(text) = event else {
+            panic!("expected token");
+        };
+        assert_eq!(text, "I am preparing the files now.");
+    }
+
+    #[test]
+    fn reasoning_delta_visibility_is_not_public_model_prose() {
+        assert!(super::reasoning_phase_is_user_visible("model"));
+        assert!(super::reasoning_phase_is_user_visible("reasoning_summary"));
+        assert!(!super::reasoning_phase_is_user_visible(
+            "internal_tool_trace"
+        ));
     }
 
     #[test]
@@ -2864,6 +3339,78 @@ mod tests {
     }
 
     #[test]
+    fn openai_stream_poll_timeout_uses_notice_cadence_before_failure_timeout() {
+        assert_eq!(openai_stream_poll_timeout_secs(120, 15), 15);
+        assert_eq!(openai_stream_poll_timeout_secs(10, 15), 10);
+    }
+
+    #[test]
+    fn openai_stream_idle_failure_only_applies_before_actionable_progress() {
+        assert!(openai_stream_idle_without_useful_progress_is_failure(
+            true, false, false, false
+        ));
+        assert!(openai_stream_idle_without_useful_progress_is_failure(
+            false, false, false, false
+        ));
+        assert!(!openai_stream_idle_without_useful_progress_is_failure(
+            false, true, false, false
+        ));
+        assert!(!openai_stream_idle_without_useful_progress_is_failure(
+            false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn openai_stream_waiting_detail_includes_elapsed_time() {
+        assert_eq!(
+            openai_stream_waiting_detail(true, 15),
+            "Waiting on model response for 15s."
+        );
+        assert_eq!(
+            openai_stream_waiting_detail(false, 45),
+            "Waiting for the model stream to send the next complete update for 45s."
+        );
+    }
+
+    #[test]
+    fn llm_stream_heartbeat_detail_updates_after_notice_interval() {
+        assert_eq!(
+            llm_stream_heartbeat_detail(5, 15, false),
+            "Thinking."
+        );
+        assert_eq!(
+            llm_stream_heartbeat_detail(15, 15, false),
+            "Waiting on model response for 15s."
+        );
+        assert_eq!(
+            llm_stream_heartbeat_detail(30, 15, true),
+            "Model is reasoning internally for 30s."
+        );
+    }
+
+    #[test]
+    fn llm_stream_failure_retryability_is_liveness_only() {
+        for kind in [
+            LlmStreamFailureKind::NoFirstDelta,
+            LlmStreamFailureKind::InterChunkStall,
+            LlmStreamFailureKind::NoUsefulProgress,
+            LlmStreamFailureKind::ChunkErrors,
+            LlmStreamFailureKind::EmptyEnd,
+        ] {
+            let failure = LlmStreamFailure::new(kind, "provider", "model", "stream stalled");
+            assert!(failure.retryable_model_stream_failure());
+        }
+
+        for kind in [
+            LlmStreamFailureKind::TotalTimeout,
+            LlmStreamFailureKind::NoUsableContent,
+        ] {
+            let failure = LlmStreamFailure::new(kind, "provider", "model", "not retryable");
+            assert!(!failure.retryable_model_stream_failure());
+        }
+    }
+
+    #[test]
     fn openai_reasoning_delta_accepts_openrouter_normalized_shapes() {
         assert_eq!(
             extract_openai_reasoning_delta(&serde_json::json!("thinking...")),
@@ -2875,6 +3422,171 @@ mod tests {
                 "text": "planning tool call"
             })),
             Some("planning tool call".to_string())
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_delta_accepts_reasoning_details_payloads() {
+        assert_eq!(
+            extract_openai_reasoning_delta(&serde_json::json!({
+                "type": "reasoning.text",
+                "text": "planning next action",
+            })),
+            Some("planning next action".to_string())
+        );
+        assert_eq!(
+            extract_openai_reasoning_delta(&serde_json::json!({
+                "type": "reasoning.encrypted",
+                "data": "opaque-reasoning-state",
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_detail_text_snapshots_extract_cumulative_detail_text() {
+        let snapshots = openai_reasoning_detail_text_snapshots(&serde_json::json!([
+            {
+                "type": "reasoning.text",
+                "text": "Planning source files."
+            },
+            {
+                "type": "reasoning.encrypted",
+                "data": "opaque"
+            },
+            {
+                "type": "reasoning.summary",
+                "summary": "safe summary handled elsewhere"
+            }
+        ]));
+
+        assert_eq!(
+            snapshots,
+            vec![("detail:0".to_string(), "Planning source files.".to_string())]
+        );
+    }
+
+    #[test]
+    fn openai_stream_reasoning_prefers_detail_snapshots_over_mirrored_scalar_fields() {
+        let mut state = OpenAiReasoningDeltaState::default();
+        let first = openai_stream_reasoning_deltas_from_fields(
+            Some(&serde_json::json!([
+                {
+                    "type": "reasoning.text",
+                    "text": "The"
+                }
+            ])),
+            Some(&serde_json::json!("The")),
+            None,
+            &mut state,
+        );
+        assert_eq!(first, vec![("model".to_string(), "The".to_string())]);
+
+        let second = openai_stream_reasoning_deltas_from_fields(
+            Some(&serde_json::json!([
+                {
+                    "type": "reasoning.text",
+                    "text": "The user"
+                }
+            ])),
+            Some(&serde_json::json!(" user")),
+            None,
+            &mut state,
+        );
+        assert_eq!(second, vec![("model".to_string(), " user".to_string())]);
+    }
+
+    #[test]
+    fn openrouter_reasoning_request_does_not_exclude_reasoning() {
+        let routed = ResolvedOpenAiRequestConfig {
+            api_key: String::new(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_label: OPENROUTER_PROVIDER_ID,
+            is_openrouter: true,
+            uses_codex_cli_oauth: false,
+            prompt_cache_capability: PromptCacheCapability::OpenRouterProviderSpecific,
+        };
+
+        assert_eq!(
+            openai_compatible_reasoning_request(&routed),
+            Some(serde_json::json!({ "exclude": false }))
+        );
+        assert_eq!(openai_compatible_include_reasoning(&routed), Some(true));
+    }
+
+    #[test]
+    fn openai_reasoning_summary_deltas_extract_only_summary_details() {
+        let summaries = openai_reasoning_summary_deltas(&serde_json::json!([
+            {
+                "type": "reasoning.text",
+                "text": "private chain of thought"
+            },
+            {
+                "type": "reasoning.summary",
+                "id": "s1",
+                "summary": "Checking files before deployment."
+            }
+        ]));
+
+        assert_eq!(
+            summaries,
+            vec![(
+                "s1".to_string(),
+                "Checking files before deployment.".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_summary_delta_from_snapshot_handles_cumulative_updates() {
+        assert_eq!(
+            openai_reasoning_summary_delta_from_snapshot(
+                "Checking files",
+                "Checking files before deployment."
+            ),
+            " before deployment."
+        );
+        assert_eq!(
+            openai_reasoning_summary_delta_from_snapshot(
+                "Checking files",
+                "Validating deployment."
+            ),
+            "Validating deployment."
+        );
+    }
+
+    #[test]
+    fn openai_compatible_minimax_direct_endpoint_requests_reasoning_split() {
+        let direct = ResolvedOpenAiRequestConfig {
+            api_key: "test".to_string(),
+            base_url: "https://api.minimax.io/v1".to_string(),
+            provider_label: "openai-compatible",
+            is_openrouter: false,
+            uses_codex_cli_oauth: false,
+            prompt_cache_capability: PromptCacheCapability::None,
+        };
+        let routed = ResolvedOpenAiRequestConfig {
+            is_openrouter: true,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_label: OPENROUTER_PROVIDER_ID,
+            ..direct.clone()
+        };
+
+        assert!(openai_compatible_uses_minimax_reasoning_split(
+            &direct,
+            "MiniMax-M2"
+        ));
+        assert_eq!(
+            openai_compatible_thinking_request(&direct, "MiniMax-M3"),
+            Some(serde_json::json!({ "type": "adaptive" }))
+        );
+        assert!(!openai_compatible_uses_minimax_reasoning_split(
+            &routed,
+            "minimax/minimax-m2"
+        ));
+        assert_eq!(
+            openai_compatible_thinking_request(&routed, "minimax/minimax-m3"),
+            None
         );
     }
 
@@ -2916,9 +3628,51 @@ mod tests {
                     "app.py": "x".repeat(4_000)
                 }
             }),
+            activity_label: None,
         };
 
         assert!(generated_output_chars_for_usage("", &[call]) > 4_000);
+    }
+
+    #[test]
+    fn model_tool_call_schema_requires_describe_for_any_tool() {
+        let schema = with_model_tool_call_description_field(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }));
+
+        assert!(schema["properties"][MODEL_TOOL_CALL_DESCRIPTION_FIELD].is_object());
+        let required = schema["required"]
+            .as_array()
+            .expect("required list should be present");
+        assert!(required.iter().any(|value| value.as_str() == Some("path")));
+        assert!(required
+            .iter()
+            .any(|value| value.as_str() == Some(MODEL_TOOL_CALL_DESCRIPTION_FIELD)));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn model_tool_call_describe_is_stripped_into_activity_label() {
+        let call = tool_call_from_model(
+            "call-1",
+            "file_read",
+            serde_json::json!({
+                "_describe": " Reading SKILL.md\nnow ",
+                "path": "SKILL.md"
+            }),
+        );
+
+        assert_eq!(call.activity_label.as_deref(), Some("Reading SKILL.md now"));
+        assert!(call
+            .arguments
+            .get(MODEL_TOOL_CALL_DESCRIPTION_FIELD)
+            .is_none());
+        assert_eq!(call.arguments["path"], "SKILL.md");
     }
 
     #[test]
@@ -3001,6 +3755,46 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_label: Option<String>,
+}
+
+fn tool_call_from_model(
+    id: impl Into<String>,
+    name: impl Into<String>,
+    mut arguments: serde_json::Value,
+) -> ToolCall {
+    let activity_label = pop_model_tool_call_description(&mut arguments);
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments,
+        activity_label,
+    }
+}
+
+fn pop_model_tool_call_description(arguments: &mut serde_json::Value) -> Option<String> {
+    let raw = arguments
+        .as_object_mut()?
+        .remove(MODEL_TOOL_CALL_DESCRIPTION_FIELD)?;
+    clean_model_tool_call_description(raw.as_str()?)
+}
+
+fn clean_model_tool_call_description(raw: &str) -> Option<String> {
+    let text = raw.replace(['\r', '\n', '\t'], " ");
+    let label = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if label.is_empty() {
+        None
+    } else if label.chars().count() > MODEL_TOOL_CALL_DESCRIPTION_MAX_CHARS {
+        Some(
+            label
+                .chars()
+                .take(MODEL_TOOL_CALL_DESCRIPTION_MAX_CHARS)
+                .collect(),
+        )
+    } else {
+        Some(label)
+    }
 }
 
 /// LLM response
@@ -3051,6 +3845,17 @@ impl LlmStreamFailure {
             model: model.into(),
             message: message.into(),
         }
+    }
+
+    pub(crate) fn retryable_model_stream_failure(&self) -> bool {
+        matches!(
+            self.kind,
+            LlmStreamFailureKind::NoFirstDelta
+                | LlmStreamFailureKind::InterChunkStall
+                | LlmStreamFailureKind::NoUsefulProgress
+                | LlmStreamFailureKind::ChunkErrors
+                | LlmStreamFailureKind::EmptyEnd
+        )
     }
 }
 
@@ -3172,6 +3977,7 @@ struct AnthropicStreamParams<'a> {
     image_attachments: &'a [LlmImageAttachment],
     actions: &'a [crate::actions::ActionDef],
     token_tx: Sender<StreamEvent>,
+    mode: ModelRequestMode,
 }
 
 fn openai_user_content_value(
@@ -3359,6 +4165,8 @@ const DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_LLM_REQUIRED_TOOL_START_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_LLM_STREAM_HIDDEN_ONLY_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_LLM_STREAM_IDLE_NOTICE_INTERVAL_SECS: u64 = 15;
 
 fn llm_http_timeout_secs() -> u64 {
     std::env::var("AGENTARK_LLM_HTTP_TIMEOUT_SECS")
@@ -3431,6 +4239,22 @@ fn llm_required_tool_start_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_LLM_REQUIRED_TOOL_START_TIMEOUT_SECS)
 }
 
+fn llm_stream_hidden_only_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_STREAM_HIDDEN_ONLY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 15 && *secs <= 300)
+        .unwrap_or(DEFAULT_LLM_STREAM_HIDDEN_ONLY_TIMEOUT_SECS)
+}
+
+fn llm_stream_idle_notice_interval_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_STREAM_IDLE_NOTICE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 5 && *secs <= 60)
+        .unwrap_or(DEFAULT_LLM_STREAM_IDLE_NOTICE_INTERVAL_SECS)
+}
+
 fn openai_stream_data_has_terminal_finish_reason(data: &str) -> bool {
     #[derive(Deserialize)]
     struct TerminalChunk {
@@ -3458,7 +4282,7 @@ fn openai_stream_data_has_terminal_finish_reason(data: &str) -> bool {
 fn model_request_mode_label(mode: ModelRequestMode) -> &'static str {
     match mode {
         ModelRequestMode::Helper => "helper",
-        ModelRequestMode::AppDelivery => "app_delivery",
+        ModelRequestMode::LongRunningTool => "long_running_tool",
         ModelRequestMode::Classifier => "classifier",
     }
 }
@@ -3712,6 +4536,32 @@ impl LlmClient {
         .await
     }
 
+    pub async fn chat_with_history_for_long_running_tool_with_images(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::core::PromptMemory],
+        actions: &[crate::actions::ActionDef],
+        image_attachments: &[LlmImageAttachment],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_in_mode(
+            ModelRequestMode::LongRunningTool,
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            policy,
+            allow_sensitive_context,
+            image_attachments,
+            None,
+        )
+        .await
+    }
+
     async fn chat_with_history_for_helper_limited(
         &self,
         system_prompt: &str,
@@ -3783,7 +4633,11 @@ impl LlmClient {
         );
 
         let mode_label = model_request_mode_label(mode);
-        let timeout_secs = llm_non_stream_total_timeout_secs();
+        let timeout_secs = if matches!(mode, ModelRequestMode::LongRunningTool) {
+            None
+        } else {
+            llm_non_stream_total_timeout_secs()
+        };
         let start = std::time::Instant::now();
         let request_call = async {
             match &self.provider {
@@ -3989,7 +4843,7 @@ impl LlmClient {
             .map(|s| AnthropicTool {
                 name: s.name.clone(),
                 description: s.description.clone(),
-                input_schema: s.input_schema.clone(),
+                input_schema: with_model_tool_call_description_field(&s.input_schema),
                 cache_control: None,
             })
             .collect();
@@ -4078,11 +4932,7 @@ impl LlmClient {
                     }
                 }
                 ContentBlock::ToolUse { id, name, input } => {
-                    tool_calls.push(ToolCall {
-                        id,
-                        name,
-                        arguments: input,
-                    });
+                    tool_calls.push(tool_call_from_model(id, name, input));
                 }
                 ContentBlock::Other => {}
             }
@@ -4179,6 +5029,12 @@ impl LlmClient {
             max_tokens: Option<u32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            include_reasoning: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning_split: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thinking: Option<serde_json::Value>,
         }
 
         #[derive(Clone, Serialize)]
@@ -4243,6 +5099,10 @@ impl LlmClient {
             /// OpenRouter's current normalized field for reasoning tokens.
             #[serde(default)]
             reasoning: Option<serde_json::Value>,
+            /// Some OpenAI-compatible reasoning models expose encrypted or
+            /// structured reasoning blocks separately from the visible answer.
+            #[serde(default)]
+            reasoning_details: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -4291,7 +5151,9 @@ impl LlmClient {
                 function: OpenAIFunction {
                     name: s.name.clone(),
                     description: compact_openai_tool_description(&s.description),
-                    parameters: compact_openai_tool_schema(&s.input_schema),
+                    parameters: compact_openai_tool_schema(
+                        &with_model_tool_call_description_field(&s.input_schema),
+                    ),
                 },
             })
             .collect();
@@ -4358,13 +5220,11 @@ impl LlmClient {
             ),
             messages,
             max_tokens: max_output_tokens,
-            reasoning: if request_config.is_openrouter && max_output_tokens.is_some() {
-                Some(serde_json::json!({
-                    "effort": "none"
-                }))
-            } else {
-                None
-            },
+            reasoning: openai_compatible_reasoning_request(&request_config),
+            include_reasoning: openai_compatible_include_reasoning(&request_config),
+            reasoning_split: openai_compatible_uses_minimax_reasoning_split(&request_config, model)
+                .then_some(true),
+            thinking: openai_compatible_thinking_request(&request_config, model),
         };
 
         let mut last_err: Option<anyhow::Error> = None;
@@ -4640,28 +5500,44 @@ impl LlmClient {
                 .as_ref()
                 .and_then(extract_openai_message_text)
                 .unwrap_or_default();
-            let reasoning = choice.message.reasoning_content.or_else(|| {
-                choice
-                    .message
-                    .reasoning
-                    .as_ref()
-                    .and_then(extract_openai_message_text)
-            });
+            let reasoning = choice
+                .message
+                .reasoning_content
+                .or_else(|| {
+                    choice
+                        .message
+                        .reasoning
+                        .as_ref()
+                        .and_then(extract_openai_message_text)
+                })
+                .or_else(|| {
+                    choice
+                        .message
+                        .reasoning_details
+                        .as_ref()
+                        .and_then(|value| {
+                            let parts = openai_reasoning_detail_text_snapshots(value)
+                                .into_iter()
+                                .map(|(_, text)| text)
+                                .filter(|text| !text.trim().is_empty())
+                                .collect::<Vec<_>>();
+                            (!parts.is_empty()).then(|| parts.concat())
+                        })
+                });
             let tool_calls: Vec<ToolCall> = choice
                 .message
                 .tool_calls
                 .unwrap_or_default()
                 .into_iter()
-                .map(|tc| ToolCall {
-                    id: tc.id,
-                    name: tc.function.name,
-                    arguments: match tc.function.arguments {
+                .map(|tc| {
+                    let arguments = match tc.function.arguments {
                         Some(OpenAIFunctionArguments::String(raw)) => {
                             parse_tool_arguments_with_self_heal(&raw)
                         }
                         Some(OpenAIFunctionArguments::Json(v)) => v,
                         None => serde_json::Value::Null,
-                    },
+                    };
+                    tool_call_from_model(tc.id, tc.function.name, arguments)
                 })
                 .collect();
 
@@ -4798,7 +5674,7 @@ impl LlmClient {
         .await
     }
 
-    pub async fn chat_with_history_stream_for_app_delivery(
+    pub async fn chat_with_history_stream_for_long_running_tool(
         &self,
         system_prompt: &str,
         user_message: &str,
@@ -4810,7 +5686,7 @@ impl LlmClient {
         allow_sensitive_context: bool,
     ) -> Result<LlmResponse> {
         self.chat_with_history_stream_in_mode(
-            ModelRequestMode::AppDelivery,
+            ModelRequestMode::LongRunningTool,
             system_prompt,
             user_message,
             history,
@@ -4820,6 +5696,33 @@ impl LlmClient {
             policy,
             allow_sensitive_context,
             &[],
+        )
+        .await
+    }
+
+    pub async fn chat_with_history_stream_for_long_running_tool_with_images(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        history: &[ConversationMessage],
+        _memories: &[crate::core::PromptMemory],
+        actions: &[crate::actions::ActionDef],
+        token_tx: Sender<StreamEvent>,
+        image_attachments: &[LlmImageAttachment],
+        policy: &crate::security::ModelPrivacyConfig,
+        allow_sensitive_context: bool,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_stream_in_mode(
+            ModelRequestMode::LongRunningTool,
+            system_prompt,
+            user_message,
+            history,
+            _memories,
+            actions,
+            token_tx,
+            policy,
+            allow_sensitive_context,
+            image_attachments,
         )
         .await
     }
@@ -4861,6 +5764,7 @@ impl LlmClient {
                     image_attachments,
                     actions,
                     token_tx,
+                    mode,
                 })
                 .await
             }
@@ -4890,6 +5794,7 @@ impl LlmClient {
                     &system_prompt,
                     &user_message,
                     &history,
+                    mode,
                     token_tx,
                 )
                 .await
@@ -5047,6 +5952,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[crate::core::agent::ConversationMessage],
+        mode: ModelRequestMode,
         token_tx: Sender<StreamEvent>,
     ) -> Result<LlmResponse> {
         #[derive(Serialize)]
@@ -5142,6 +6048,27 @@ impl LlmClient {
         let mut done = false;
         let mut prompt_eval_count: Option<u64> = None;
         let mut eval_count: Option<u64> = None;
+        let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_done_clone = heartbeat_done.clone();
+        let hb_tx = token_tx.clone();
+        let heartbeat_started_at = send_start;
+        let heartbeat_notice_interval_secs = llm_stream_idle_notice_interval_secs();
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                queue_stream_event(
+                    &hb_tx,
+                    StreamEvent::Thinking(llm_stream_heartbeat_detail(
+                        heartbeat_started_at.elapsed().as_secs(),
+                        heartbeat_notice_interval_secs,
+                        false,
+                    )),
+                );
+            }
+        });
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -5163,9 +6090,14 @@ impl LlmClient {
                 }
                 if let Some(msg) = parsed.message {
                     if !msg.content.is_empty() {
+                        heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
                         content.push_str(&msg.content);
-                        emit_stream_block_events(&token_tx, stream_block_parser.feed(&msg.content))
-                            .await;
+                        emit_stream_block_events_for_mode(
+                            &token_tx,
+                            stream_block_parser.feed(&msg.content),
+                            mode,
+                        )
+                        .await;
                     }
                 }
                 if parsed.done {
@@ -5181,7 +6113,9 @@ impl LlmClient {
                 break;
             }
         }
-        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
+        heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        heartbeat_handle.abort();
+        emit_stream_block_events_for_mode(&token_tx, stream_block_parser.finish(), mode).await;
         tracing::debug!(
             target: "agentark.turn_timing",
             provider = "ollama",
@@ -5257,7 +6191,7 @@ impl LlmClient {
                 .sum::<usize>();
         let send_start = std::time::Instant::now();
         let mut forced_oauth_refresh = false;
-        let stream_total_timeout_label = if matches!(mode, ModelRequestMode::AppDelivery) {
+        let stream_total_timeout_label = if matches!(mode, ModelRequestMode::LongRunningTool) {
             "none".to_string()
         } else if let Some(timeout_secs) = llm_stream_total_timeout_secs() {
             format!("{}s", timeout_secs)
@@ -5364,7 +6298,7 @@ impl LlmClient {
         let mut first_token = true;
         let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
         let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
-        let total_timeout_secs = if matches!(mode, ModelRequestMode::AppDelivery) {
+        let total_timeout_secs = if matches!(mode, ModelRequestMode::LongRunningTool) {
             None
         } else {
             llm_stream_total_timeout_secs()
@@ -5373,13 +6307,22 @@ impl LlmClient {
         let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb_done_clone = heartbeat_done.clone();
         let hb_tx = token_tx.clone();
+        let heartbeat_started_at = send_start;
+        let heartbeat_notice_interval_secs = llm_stream_idle_notice_interval_secs();
         let heartbeat_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                queue_stream_event(&hb_tx, StreamEvent::Thinking("Thinking.".to_string()));
+                queue_stream_event(
+                    &hb_tx,
+                    StreamEvent::Thinking(llm_stream_heartbeat_detail(
+                        heartbeat_started_at.elapsed().as_secs(),
+                        heartbeat_notice_interval_secs,
+                        false,
+                    )),
+                );
             }
         });
 
@@ -5436,8 +6379,12 @@ impl LlmClient {
                                 heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             content.push_str(delta);
-                            emit_stream_block_events(&token_tx, stream_block_parser.feed(delta))
-                                .await;
+                            emit_stream_block_events_for_mode(
+                                &token_tx,
+                                stream_block_parser.feed(delta),
+                                mode,
+                            )
+                            .await;
                         }
                     }
                     "response.reasoning_summary_text.delta" => {
@@ -5456,7 +6403,7 @@ impl LlmClient {
         }
         heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
         heartbeat_handle.abort();
-        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
+        emit_stream_block_events_for_mode(&token_tx, stream_block_parser.finish(), mode).await;
         tracing::debug!(
             target: "agentark.turn_timing",
             provider = %request_config.provider_label,
@@ -5541,6 +6488,12 @@ impl LlmClient {
             max_tokens: Option<u32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            include_reasoning: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning_split: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thinking: Option<serde_json::Value>,
             stream: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             stream_options: Option<OpenAIStreamOptions>,
@@ -5610,6 +6563,8 @@ impl LlmClient {
             reasoning_content: Option<String>,
             #[serde(default)]
             reasoning: Option<serde_json::Value>,
+            #[serde(default)]
+            reasoning_details: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -5671,7 +6626,9 @@ impl LlmClient {
                 function: OpenAIFunction {
                     name: s.name.clone(),
                     description: compact_openai_tool_description(&s.description),
-                    parameters: compact_openai_tool_schema(&s.input_schema),
+                    parameters: compact_openai_tool_schema(
+                        &with_model_tool_call_description_field(&s.input_schema),
+                    ),
                 },
             })
             .collect();
@@ -5756,19 +6713,18 @@ impl LlmClient {
             ),
             messages,
             max_tokens: None,
-            reasoning: if request_config.is_openrouter
-                && matches!(params.mode, ModelRequestMode::AppDelivery)
-            {
-                Some(serde_json::json!({ "effort": "none" }))
-            } else {
-                None
-            },
+            reasoning: openai_compatible_reasoning_request(&request_config),
+            include_reasoning: openai_compatible_include_reasoning(&request_config),
+            reasoning_split: openai_compatible_uses_minimax_reasoning_split(&request_config, model)
+                .then_some(true),
+            thinking: openai_compatible_thinking_request(&request_config, model),
             stream: true,
             stream_options,
         };
         let mut effective_tool_choice = request.tool_choice.clone();
         let send_start = std::time::Instant::now();
-        let stream_total_timeout_label = if matches!(params.mode, ModelRequestMode::AppDelivery) {
+        let stream_total_timeout_label = if matches!(params.mode, ModelRequestMode::LongRunningTool)
+        {
             "none".to_string()
         } else if let Some(timeout_secs) = llm_stream_total_timeout_secs() {
             format!("{}s", timeout_secs)
@@ -5940,6 +6896,8 @@ impl LlmClient {
         let mut reasoning: Option<String> = None;
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
         let mut stream_block_parser = stream_blocks::StreamBlockParser::new();
+        let mut internal_transcript_filter =
+            crate::core::llm_context_sanitizer::InternalToolTranscriptStreamFilter::new();
         let mut first_token = true;
         let provider_display = if request_config
             .provider_label
@@ -5951,7 +6909,7 @@ impl LlmClient {
         };
         let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
         let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
-        let total_timeout_secs = if matches!(params.mode, ModelRequestMode::AppDelivery) {
+        let total_timeout_secs = if matches!(params.mode, ModelRequestMode::LongRunningTool) {
             None
         } else {
             llm_stream_total_timeout_secs()
@@ -5966,19 +6924,39 @@ impl LlmClient {
             None
         };
         let required_tool_start_timeout_secs = llm_required_tool_start_timeout_secs();
+        let hidden_only_timeout_secs = llm_stream_hidden_only_timeout_secs();
+        let idle_notice_interval_secs = llm_stream_idle_notice_interval_secs();
         let mut last_meaningful_progress_at = std::time::Instant::now();
+        let mut last_stream_idle_notice_at = std::time::Instant::now();
+        let mut first_reasoning_delta_logged = false;
+        let mut first_tool_delta_logged = false;
+        let mut first_tool_arguments_logged = false;
+        let mut saw_actionable_stream_progress = false;
 
-        // Spawn heartbeat: emit Thinking events every 5s while waiting for first token
+        // Keep the heartbeat alive until visible text, reasoning, or tool progress
+        // arrives, so the UI does not sit on an older step while the model works.
         let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb_done_clone = heartbeat_done.clone();
+        let heartbeat_reasoning_seen =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_reasoning_seen_clone = heartbeat_reasoning_seen.clone();
         let hb_tx = token_tx.clone();
+        let heartbeat_started_at = send_start;
+        let heartbeat_notice_interval_secs = idle_notice_interval_secs;
         let heartbeat_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                queue_stream_event(&hb_tx, StreamEvent::Thinking("Thinking.".to_string()));
+                queue_stream_event(
+                    &hb_tx,
+                    StreamEvent::Thinking(llm_stream_heartbeat_detail(
+                        heartbeat_started_at.elapsed().as_secs(),
+                        heartbeat_notice_interval_secs,
+                        hb_reasoning_seen_clone.load(std::sync::atomic::Ordering::Relaxed),
+                    )),
+                );
             }
         });
 
@@ -5990,6 +6968,7 @@ impl LlmClient {
         let mut stream_broken = false;
         let mut stream_failure: Option<LlmStreamFailure> = None;
         let mut usage: Option<LlmTokenUsage> = None;
+        let mut reasoning_delta_state = OpenAiReasoningDeltaState::default();
         loop {
             if let Some(total_timeout_secs) = total_timeout_secs {
                 if send_start.elapsed().as_secs() >= total_timeout_secs {
@@ -6008,14 +6987,15 @@ impl LlmClient {
                     break;
                 }
             }
-            // Use a much longer timeout while waiting for the first token
-            let timeout_secs = if first_token {
+            let idle_timeout_secs = if first_token {
                 first_token_timeout_secs
             } else {
                 inter_chunk_timeout_secs
             };
+            let poll_timeout_secs =
+                openai_stream_poll_timeout_secs(idle_timeout_secs, idle_notice_interval_secs);
             let chunk = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
+                std::time::Duration::from_secs(poll_timeout_secs),
                 stream.next(),
             )
             .await
@@ -6051,15 +7031,43 @@ impl LlmClient {
                     break;
                 } // stream ended normally
                 Err(_) => {
+                    let idle_secs = if first_token {
+                        send_start.elapsed().as_secs()
+                    } else {
+                        last_meaningful_progress_at.elapsed().as_secs()
+                    };
+                    if idle_secs < idle_timeout_secs {
+                        if last_stream_idle_notice_at.elapsed().as_secs()
+                            >= idle_notice_interval_secs
+                        {
+                            queue_openai_stream_waiting_notice(&token_tx, first_token, idle_secs);
+                            last_stream_idle_notice_at = std::time::Instant::now();
+                        }
+                        continue;
+                    }
+
+                    if !openai_stream_idle_without_useful_progress_is_failure(
+                        first_token,
+                        saw_actionable_stream_progress,
+                        !content.is_empty(),
+                        tool_builders.values().any(|entry| {
+                            !entry.name.trim().is_empty() || !entry.args.trim().is_empty()
+                        }),
+                    ) {
+                        queue_openai_stream_waiting_notice(&token_tx, first_token, idle_secs);
+                        last_stream_idle_notice_at = std::time::Instant::now();
+                        continue;
+                    }
+
                     let reason = if first_token {
                         format!(
                             "{} stream for model {} accepted the request but did not send a token or tool-call delta within {}s.",
-                            provider_display, model, timeout_secs,
+                            provider_display, model, idle_timeout_secs,
                         )
                     } else {
                         format!(
                             "{} stream for model {} stalled for {}s between chunks.",
-                            provider_display, model, timeout_secs,
+                            provider_display, model, idle_timeout_secs,
                         )
                     };
                     tracing::warn!("{}", reason);
@@ -6126,55 +7134,76 @@ impl LlmClient {
                 }
 
                 for choice in parsed.choices {
-                    let reasoning_delta = choice.delta.reasoning_content.or_else(|| {
-                        choice
-                            .delta
-                            .reasoning
-                            .as_ref()
-                            .and_then(extract_openai_reasoning_delta)
-                    });
-                    if let Some(rc) = reasoning_delta {
-                        if first_token {
-                            tracing::info!(
-                                "LLM stream first reasoning delta after {}ms",
-                                send_start.elapsed().as_millis()
-                            );
-                            first_token = false;
-                            heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    for (phase, delta) in openai_stream_reasoning_deltas_from_fields(
+                        choice.delta.reasoning_details.as_ref(),
+                        choice.delta.reasoning.as_ref(),
+                        choice.delta.reasoning_content.as_deref(),
+                        &mut reasoning_delta_state,
+                    ) {
+                        heartbeat_reasoning_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if phase == "model" {
+                            if !first_reasoning_delta_logged {
+                                first_reasoning_delta_logged = true;
+                                tracing::info!(
+                                    "LLM stream first reasoning delta after {}ms",
+                                    send_start.elapsed().as_millis()
+                                );
+                            }
+                            reasoning.get_or_insert_with(String::new).push_str(&delta);
                         }
-                        reasoning.get_or_insert_with(String::new).push_str(&rc);
-                        queue_reasoning_delta(&token_tx, "model", rc);
+                        queue_reasoning_delta(&token_tx, &phase, delta);
                         chunk_had_meaningful_progress = true;
                     }
                     if let Some(content_delta) = choice.delta.content {
                         if let Some(tok) = extract_openai_delta_text(&content_delta) {
-                            if first_token {
-                                tracing::info!(
-                                    "LLM stream first token after {}ms",
-                                    send_start.elapsed().as_millis()
-                                );
-                                first_token = false;
-                                // Stop the heartbeat now that real tokens are flowing
-                                heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            content.push_str(&tok);
-                            emit_stream_block_events(&token_tx, stream_block_parser.feed(&tok))
+                            let tok = internal_transcript_filter.feed(&tok);
+                            if !tok.is_empty() {
+                                if first_token {
+                                    tracing::info!(
+                                        "LLM stream first token after {}ms",
+                                        send_start.elapsed().as_millis()
+                                    );
+                                    first_token = false;
+                                    // Stop the heartbeat now that real tokens are flowing
+                                    heartbeat_done
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                saw_actionable_stream_progress = true;
+                                content.push_str(&tok);
+                                emit_stream_block_events_for_mode(
+                                    &token_tx,
+                                    stream_block_parser.feed(&tok),
+                                    params.mode,
+                                )
                                 .await;
+                            }
                             chunk_had_meaningful_progress = true;
                         }
                     }
                     if let Some(tcs) = choice.delta.tool_calls {
+                        if !tcs.is_empty() && !first_tool_delta_logged {
+                            first_tool_delta_logged = true;
+                            tracing::info!(
+                                target: "agentark.turn_timing",
+                                provider = %request_config.provider_label,
+                                model = %model,
+                                elapsed_ms = send_start.elapsed().as_millis() as u64,
+                                "LLM stream first tool-call delta"
+                            );
+                        }
                         if first_token {
                             tracing::info!(
                                 "LLM stream first tool delta after {}ms",
                                 send_start.elapsed().as_millis()
                             );
                             first_token = false;
-                            // Stop the heartbeat now that usable output is flowing.
-                            heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Tool deltas are model activity, but they are not
+                            // necessarily user-visible until draft/progress
+                            // events or actual tool execution surface.
                         }
                         if !tcs.is_empty() {
                             chunk_had_meaningful_progress = true;
+                            saw_actionable_stream_progress = true;
                         }
                         for tc in tcs {
                             let progress_update = {
@@ -6203,6 +7232,18 @@ impl LlmClient {
                                         }
                                     }
                                     let arg_chars = entry.args.chars().count();
+                                    if arg_chars > 0 && !first_tool_arguments_logged {
+                                        first_tool_arguments_logged = true;
+                                        tracing::info!(
+                                            target: "agentark.turn_timing",
+                                            provider = %request_config.provider_label,
+                                            model = %model,
+                                            tool = %entry.name,
+                                            elapsed_ms = send_start.elapsed().as_millis() as u64,
+                                            arg_chars,
+                                            "LLM stream first tool-call arguments"
+                                        );
+                                    }
                                     let progress_step = tool_argument_progress_step(&entry.name);
                                     let now = std::time::Instant::now();
                                     let should_emit_progress = !entry.name.is_empty()
@@ -6243,18 +7284,32 @@ impl LlmClient {
                                 tool_name,
                                 raw_args,
                                 _progress_msg,
-                                _elapsed_secs,
+                                elapsed_secs,
                                 _arg_chars,
                             )) = progress_update
                             {
                                 if let Some(entry) = tool_builders.get_mut(&tc.index) {
-                                    emit_partial_draft_file_previews(
+                                    let emitted = emit_partial_draft_file_previews_with_elapsed(
                                         &token_tx,
                                         &tool_name,
                                         &raw_args,
                                         &mut entry.emitted_draft_snapshots,
+                                        Some(elapsed_secs.saturating_mul(1000)),
                                     )
                                     .await;
+                                    if emitted > 0 {
+                                        heartbeat_done
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::debug!(
+                                            target: "agentark.turn_timing",
+                                            provider = %request_config.provider_label,
+                                            model = %model,
+                                            tool = %tool_name,
+                                            elapsed_ms = send_start.elapsed().as_millis() as u64,
+                                            emitted,
+                                            "LLM stream emitted draft file previews"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -6279,6 +7334,19 @@ impl LlmClient {
             buffer = last.to_string();
             if chunk_had_meaningful_progress {
                 last_meaningful_progress_at = chunk_received_at;
+                last_stream_idle_notice_at = chunk_received_at;
+            } else {
+                let idle_secs = if first_token {
+                    send_start.elapsed().as_secs()
+                } else {
+                    last_meaningful_progress_at.elapsed().as_secs()
+                };
+                if idle_secs >= idle_notice_interval_secs
+                    && last_stream_idle_notice_at.elapsed().as_secs() >= idle_notice_interval_secs
+                {
+                    queue_openai_stream_waiting_notice(&token_tx, first_token, idle_secs);
+                    last_stream_idle_notice_at = std::time::Instant::now();
+                }
             }
             if let Some(required_tool_name) = required_tool_name.as_deref() {
                 if !tool_builders.values().any(|tb| !tb.name.trim().is_empty())
@@ -6302,6 +7370,24 @@ impl LlmClient {
                     break;
                 }
             }
+            if first_reasoning_delta_logged
+                && !saw_actionable_stream_progress
+                && send_start.elapsed().as_secs() >= hidden_only_timeout_secs
+            {
+                let reason = format!(
+                    "{} stream for model {} produced hidden reasoning but no visible text or tool-call payload within {}s.",
+                    provider_display, model, hidden_only_timeout_secs,
+                );
+                tracing::warn!("{}", reason);
+                stream_failure = Some(LlmStreamFailure::new(
+                    LlmStreamFailureKind::NoUsefulProgress,
+                    provider_display.clone(),
+                    model,
+                    reason,
+                ));
+                stream_broken = true;
+                break;
+            }
             if done {
                 break;
             }
@@ -6311,6 +7397,24 @@ impl LlmClient {
                 inter_chunk_timeout_secs
             };
             if last_meaningful_progress_at.elapsed().as_secs() >= allowed_idle_secs {
+                if !openai_stream_idle_without_useful_progress_is_failure(
+                    first_token,
+                    saw_actionable_stream_progress,
+                    !content.is_empty(),
+                    tool_builders.values().any(|entry| {
+                        !entry.name.trim().is_empty() || !entry.args.trim().is_empty()
+                    }),
+                ) {
+                    if last_stream_idle_notice_at.elapsed().as_secs() >= idle_notice_interval_secs {
+                        queue_openai_stream_waiting_notice(
+                            &token_tx,
+                            first_token,
+                            last_meaningful_progress_at.elapsed().as_secs(),
+                        );
+                        last_stream_idle_notice_at = std::time::Instant::now();
+                    }
+                    continue;
+                }
                 let reason = if first_token {
                     format!(
                         "{} stream for model {} sent bytes but no token or tool-call delta for {}s.",
@@ -6356,7 +7460,18 @@ impl LlmClient {
         // Ensure heartbeat is stopped after stream loop exits
         heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
         heartbeat_handle.abort();
-        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
+        let tail = internal_transcript_filter.finish();
+        if !tail.is_empty() {
+            content.push_str(&tail);
+            emit_stream_block_events_for_mode(
+                &token_tx,
+                stream_block_parser.feed(&tail),
+                params.mode,
+            )
+            .await;
+        }
+        emit_stream_block_events_for_mode(&token_tx, stream_block_parser.finish(), params.mode)
+            .await;
         if reasoning.is_some() {
             queue_stream_event(
                 &token_tx,
@@ -6465,13 +7580,25 @@ impl LlmClient {
             }
             let tool_name = entry.name.clone();
             let raw_args = entry.args.clone();
-            emit_partial_draft_file_previews(
+            let emitted = emit_partial_draft_file_previews_with_elapsed(
                 &token_tx,
                 &tool_name,
                 &raw_args,
                 &mut entry.emitted_draft_snapshots,
+                Some(send_start.elapsed().as_millis() as u64),
             )
             .await;
+            if emitted > 0 {
+                tracing::debug!(
+                    target: "agentark.turn_timing",
+                    provider = %request_config.provider_label,
+                    model = %model,
+                    tool = %tool_name,
+                    elapsed_ms = send_start.elapsed().as_millis() as u64,
+                    emitted,
+                    "LLM stream final draft file preview flush"
+                );
+            }
         }
 
         let mut tool_calls: Vec<(usize, ToolCall)> = tool_builders
@@ -6480,15 +7607,15 @@ impl LlmClient {
                 let args = parse_tool_arguments_with_self_heal(&tb.args);
                 (
                     idx,
-                    ToolCall {
-                        id: if tb.id.is_empty() {
+                    tool_call_from_model(
+                        if tb.id.is_empty() {
                             uuid::Uuid::new_v4().to_string()
                         } else {
                             tb.id
                         },
-                        name: tb.name,
-                        arguments: args,
-                    },
+                        tb.name,
+                        args,
+                    ),
                 )
             })
             .collect();
@@ -6678,7 +7805,7 @@ impl LlmClient {
             .map(|s| AnthropicTool {
                 name: s.name.clone(),
                 description: s.description.clone(),
-                input_schema: s.input_schema.clone(),
+                input_schema: with_model_tool_call_description_field(&s.input_schema),
                 cache_control: None,
             })
             .collect();
@@ -6771,6 +7898,30 @@ impl LlmClient {
         let mut output_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
         let mut cache_read_input_tokens: Option<u64> = None;
+        let heartbeat_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_done_clone = heartbeat_done.clone();
+        let heartbeat_reasoning_seen =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_reasoning_seen_clone = heartbeat_reasoning_seen.clone();
+        let hb_tx = token_tx.clone();
+        let heartbeat_started_at = send_start;
+        let heartbeat_notice_interval_secs = llm_stream_idle_notice_interval_secs();
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                queue_stream_event(
+                    &hb_tx,
+                    StreamEvent::Thinking(llm_stream_heartbeat_detail(
+                        heartbeat_started_at.elapsed().as_secs(),
+                        heartbeat_notice_interval_secs,
+                        hb_reasoning_seen_clone.load(std::sync::atomic::Ordering::Relaxed),
+                    )),
+                );
+            }
+        });
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -6832,10 +7983,13 @@ impl LlmClient {
                                         .insert(parsed.index, AnthropicStreamBlockKind::Text);
                                     if let Some(text) = text {
                                         if !text.is_empty() {
+                                            heartbeat_done
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                             content.push_str(&text);
-                                            emit_stream_block_events(
+                                            emit_stream_block_events_for_mode(
                                                 &token_tx,
                                                 stream_block_parser.feed(&text),
+                                                params.mode,
                                             )
                                             .await;
                                         }
@@ -6846,6 +8000,8 @@ impl LlmClient {
                                         .insert(parsed.index, AnthropicStreamBlockKind::Thinking);
                                     if let Some(thinking) = thinking {
                                         if !thinking.is_empty() {
+                                            heartbeat_reasoning_seen
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                             reasoning
                                                 .get_or_insert_with(String::new)
                                                 .push_str(&thinking);
@@ -6857,6 +8013,8 @@ impl LlmClient {
                                     block_kinds
                                         .insert(parsed.index, AnthropicStreamBlockKind::Thinking);
                                     if data.as_deref().is_some_and(|value| !value.is_empty()) {
+                                        heartbeat_reasoning_seen
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
                                         let reasoning = reasoning.get_or_insert_with(String::new);
                                         if !reasoning.is_empty() {
                                             reasoning.push('\n');
@@ -6887,15 +8045,20 @@ impl LlmClient {
                                         if block_kinds.get(&parsed.index).is_some_and(|kind| {
                                             *kind == AnthropicStreamBlockKind::Thinking
                                         }) {
+                                            heartbeat_reasoning_seen
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                             reasoning
                                                 .get_or_insert_with(String::new)
                                                 .push_str(&text);
                                             queue_reasoning_delta(&token_tx, "model", text);
                                         } else {
+                                            heartbeat_done
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                             content.push_str(&text);
-                                            emit_stream_block_events(
+                                            emit_stream_block_events_for_mode(
                                                 &token_tx,
                                                 stream_block_parser.feed(&text),
+                                                params.mode,
                                             )
                                             .await;
                                         }
@@ -6908,6 +8071,8 @@ impl LlmClient {
                                     .or(parsed.delta.text)
                                     .unwrap_or_default();
                                 if !delta.is_empty() {
+                                    heartbeat_reasoning_seen
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     reasoning.get_or_insert_with(String::new).push_str(&delta);
                                     queue_reasoning_delta(&token_tx, "model", delta);
                                 }
@@ -6918,6 +8083,8 @@ impl LlmClient {
                                     .as_deref()
                                     .is_some_and(|value| !value.is_empty())
                                 {
+                                    heartbeat_reasoning_seen
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     let reasoning = reasoning.get_or_insert_with(String::new);
                                     if !reasoning.is_empty() {
                                         reasoning.push('\n');
@@ -6981,13 +8148,19 @@ impl LlmClient {
                                     )) = progress_update
                                     {
                                         if let Some(entry) = tool_builders.get_mut(&parsed.index) {
-                                            emit_partial_draft_file_previews(
+                                            let emitted = emit_partial_draft_file_previews(
                                                 &token_tx,
                                                 &tool_name,
                                                 &raw_input_json,
                                                 &mut entry.emitted_draft_snapshots,
                                             )
                                             .await;
+                                            if emitted > 0 {
+                                                heartbeat_done.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -7007,7 +8180,10 @@ impl LlmClient {
                 break;
             }
         }
-        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
+        heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        heartbeat_handle.abort();
+        emit_stream_block_events_for_mode(&token_tx, stream_block_parser.finish(), params.mode)
+            .await;
 
         for entry in tool_builders.values_mut() {
             if entry.name.trim().is_empty() {
@@ -7046,15 +8222,15 @@ impl LlmClient {
                 } else {
                     tb.input_value.unwrap_or(serde_json::Value::Null)
                 };
-                Some(ToolCall {
-                    id: if tb.id.is_empty() {
+                Some(tool_call_from_model(
+                    if tb.id.is_empty() {
                         uuid::Uuid::new_v4().to_string()
                     } else {
                         tb.id
                     },
-                    name: tb.name,
-                    arguments: args,
-                })
+                    tb.name,
+                    args,
+                ))
             })
             .collect();
 

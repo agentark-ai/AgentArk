@@ -29,6 +29,7 @@ import ExtensionRoundedIcon from "@mui/icons-material/ExtensionRounded";
 import AppsRoundedIcon from "@mui/icons-material/AppsRounded";
 import HubRoundedIcon from "@mui/icons-material/HubRounded";
 import HistoryRoundedIcon from "@mui/icons-material/HistoryRounded";
+import KeyboardVoiceRoundedIcon from "@mui/icons-material/KeyboardVoiceRounded";
 import FlagRoundedIcon from "@mui/icons-material/FlagRounded";
 import TaskRoundedIcon from "@mui/icons-material/TaskRounded";
 import VisibilityRoundedIcon from "@mui/icons-material/VisibilityRounded";
@@ -84,6 +85,7 @@ const PING_STALE_MS = 30_000;
 const APPROVAL_FALLBACK_POLL_MS = 2500;
 const AUTO_REFRESH_IDLE_PAUSE_MS = 5 * 60 * 1000;
 const NAV_HIDDEN_STORAGE_KEY = "agentark.ui.navHidden";
+const VOICE_PAGE_ENABLED = false;
 
 function memoizeModuleLoader<T>(
   loader: () => Promise<T>,
@@ -212,6 +214,7 @@ function WorkspacePaneFallback() {
 type ViewKey =
   | "overview"
   | "chat"
+  | "voice"
   | "library"
   | "connections"
   | "channels"
@@ -325,6 +328,7 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   overview: "overview",
   workspace: "chat",
   chat: "chat",
+  voice: VOICE_PAGE_ENABLED ? "voice" : "chat",
   inbox: "overview",
   task: "tasks",
   tasks: "tasks",
@@ -381,6 +385,7 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
 const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "overview",
   "chat",
+  "voice",
   "library",
   "connections",
   "channels",
@@ -427,6 +432,16 @@ const NAV_GROUPS: NavGroup[] = [
         icon: <ChatRoundedIcon fontSize="small" />,
         tooltip: "Talk with AgentArk and run work.",
       },
+      ...(VOICE_PAGE_ENABLED
+        ? [
+            {
+              key: "voice" as const,
+              label: "Voice",
+              icon: <KeyboardVoiceRoundedIcon fontSize="small" />,
+              tooltip: "Talk with AgentArk through an interactive voice page.",
+            },
+          ]
+        : []),
       {
         key: "arkorbit",
         label: "Orbit",
@@ -554,6 +569,7 @@ const NAV_GROUPS: NavGroup[] = [
 const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   overview: "home",
   chat: "chat",
+  voice: "voice",
   library: "library",
   connections: "connections",
   channels: "channels",
@@ -591,6 +607,7 @@ const PATH_SEGMENT_TO_VIEW: Record<string, ViewKey> = (() => {
     },
     {} as Record<string, ViewKey>,
   );
+  if (!VOICE_PAGE_ENABLED) base.voice = "chat";
   base.overview = "overview";
   base.chat = "chat";
   base.workspace = "chat";

@@ -103,3 +103,22 @@ jobs:
 
       - name: Build frontend
         run: npm run build
+
+  compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate Docker Compose configuration
+        run: docker compose -f docker-compose.yml config >/tmp/agentark-compose.yml
+
+      - name: Verify control healthcheck targets readiness
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          rendered = Path("/tmp/agentark-compose.yml").read_text()
+          if "127.0.0.1:8990/readiness" not in rendered:
+              raise SystemExit("control healthcheck must target /readiness")
+          PY

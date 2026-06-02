@@ -72,6 +72,11 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
         use_for: "final prompt and tool-schema telemetry, Trace prompt-telemetry steps, Evolve review signals, observability export, and prompt-profile canary safety review flows",
     },
     AgentDocTocEntry {
+        label: "ArkDistill context savings",
+        location: "src/core/agent/ark_distill.rs; src/core/agent/spine.rs; src/channels/http/arkdistill_analytics.rs; frontend/src/components/pages/AnalyticsPage.tsx; assets/docs/arkdistill.md; src/docs/agentark_manual.rs",
+        use_for: "tool-output compaction, saved-token and saved-cost percentages, arkdistill_tool_output operational logs, KV profile keys, and debugging whether context savings are working",
+    },
+    AgentDocTocEntry {
         label: "Security and secrets",
         location: "SECURITY.md; src/security/; src/security/capabilities.rs; src/security/skill_review.rs; src/crypto/; src/docs/agentark_manual.rs",
         use_for: "secret handling, encryption, API-token safety, approvals, inbound guard behavior, security alerts, and security expectations",
@@ -126,6 +131,6 @@ mod tests {
         assert!(rendered.contains("src/docs/agentark_manual.rs"));
         assert!(rendered.contains("src/core/agent/prompt_builder.rs"));
         assert!(rendered.contains("src/storage/"));
-        assert!(rendered.lines().count() <= 22);
+        assert!(rendered.lines().count() <= 23);
     }
 }

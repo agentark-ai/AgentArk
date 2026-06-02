@@ -34,6 +34,10 @@ compose_dev() {
     docker compose -f docker-compose.yml -f docker-compose.dev.yml "$@"
 }
 
+pull_runtime_images() {
+    compose pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
+}
+
 verify_lightpanda_runtime() {
     local attempts=20
 
@@ -168,8 +172,8 @@ case "${1:-start}" in
         ;;
     update)
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
-        compose pull
-        compose up -d
+        pull_runtime_images
+        compose up -d --build
         verify_lightpanda_runtime_async
         verify_gepa_optimizer_runtime_async
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"

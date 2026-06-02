@@ -42,6 +42,7 @@ const loadGoalsPage: PageLoader = () => import("./pages/GoalsPage");
 const loadSkillsPage: PageLoader = () => import("./pages/SkillsPage");
 const loadTasksPage: PageLoader = () => import("./pages/TasksPage");
 const loadTracePage: PageLoader = () => import("./pages/TracePage");
+const loadVoicePage: PageLoader = () => import("./pages/VoicePage");
 const loadWatchersPage: PageLoader = () => import("./pages/WatchersPage");
 const loadBrowserSessionsPage: PageLoader = () =>
   import("./pages/BrowserSessionsPage");
@@ -176,6 +177,14 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
     load: loadBrowserSessionsPage,
     render: (BrowserSessionsPage, { autoRefresh }) => (
       <BrowserSessionsPage autoRefresh={autoRefresh} />
+    ),
+  },
+  voice: {
+    componentKey: "voice",
+    message: "Loading voice...",
+    load: loadVoicePage,
+    render: (VoicePage, { autoRefresh, onNavigateToView }) => (
+      <VoicePage autoRefresh={autoRefresh} onNavigateToView={onNavigateToView} />
     ),
   },
   gatewayops: {

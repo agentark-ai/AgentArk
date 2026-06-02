@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
 
+const DEFAULT_OUTGOING_HTTP_TIMEOUT_SECS: u64 = 30;
+
 pub fn internal_api_base_url() -> String {
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
     let tls_enabled = std::env::var("AGENTARK_TLS_CERT")
@@ -31,6 +33,60 @@ pub fn build_internal_control_client(timeout_secs: u64) -> Result<reqwest::Clien
     }
 
     Ok(builder.build()?)
+}
+
+pub fn build_outgoing_http_client(timeout_secs: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .pool_max_idle_per_host(8)
+        .build()
+        .expect("outgoing HTTP client should build")
+}
+
+pub fn default_outgoing_http_client() -> reqwest::Client {
+    build_outgoing_http_client(DEFAULT_OUTGOING_HTTP_TIMEOUT_SECS)
+}
+
+#[derive(Clone)]
+pub struct SafeHttpClient {
+    client: reqwest::Client,
+}
+
+impl SafeHttpClient {
+    pub fn new(timeout_secs: u64) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+        })
+    }
+
+    pub async fn public_get_follow_redirects(
+        &self,
+        raw_url: &str,
+        max_redirects: usize,
+    ) -> Result<reqwest::Response> {
+        let mut current = validate_public_url(raw_url).await?;
+        for _ in 0..=max_redirects {
+            let response = self.client.get(current.clone()).send().await?;
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| anyhow!("Redirect missing Location header"))?;
+                let next = current
+                    .join(location)
+                    .map_err(|error| anyhow!("Invalid redirect URL: {}", error))?;
+                current = validate_public_url(next.as_str()).await?;
+                continue;
+            }
+            return Ok(response);
+        }
+        Err(anyhow!("Too many redirects"))
+    }
 }
 
 pub fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
@@ -127,6 +183,17 @@ pub async fn validate_public_url_host(url: &reqwest::Url) -> Result<()> {
     Ok(())
 }
 
+pub async fn validate_public_url(raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).map_err(|error| anyhow!("Invalid URL: {}", error))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err(anyhow!("Only HTTP(S) URLs are supported")),
+    }
+    validate_no_userinfo(&url)?;
+    validate_public_url_host(&url).await?;
+    Ok(url)
+}
+
 pub async fn validate_public_https_url(raw: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw).map_err(|error| anyhow!("Invalid URL: {}", error))?;
     if url.scheme() != "https" {
@@ -176,4 +243,22 @@ pub async fn validate_public_https_url(raw: &str) -> Result<reqwest::Url> {
     }
 
     Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn public_url_validation_blocks_private_targets() {
+        let error = validate_public_url("http://169.254.169.254/latest/meta-data")
+            .await
+            .expect_err("metadata service URL should be blocked");
+        assert!(error.to_string().contains("private") || error.to_string().contains("local"));
+
+        let error = validate_public_url("http://127.0.0.1:8080/")
+            .await
+            .expect_err("loopback URL should be blocked");
+        assert!(error.to_string().contains("private") || error.to_string().contains("local"));
+    }
 }

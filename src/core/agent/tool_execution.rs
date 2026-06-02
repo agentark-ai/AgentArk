@@ -7,6 +7,90 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static GEPA_IDLE_WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+struct GepaIdleWorkerActiveGuard;
+
+impl Drop for GepaIdleWorkerActiveGuard {
+    fn drop(&mut self) {
+        GEPA_IDLE_WORKER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn background_session_blocks_gepa_idle(
+    session: &crate::core::background_session::BackgroundSession,
+    now: chrono::DateTime<chrono::Utc>,
+    quiet_window_seconds: i64,
+) -> bool {
+    if !matches!(
+        session.status,
+        crate::core::background_session::BackgroundSessionStatus::Active
+    ) {
+        return false;
+    }
+    let quiet_window_seconds = quiet_window_seconds.max(60);
+    now.signed_duration_since(session.last_activity_at)
+        .num_seconds()
+        < quiet_window_seconds
+}
+
+async fn stable_deployment_cadence_allows_auto_promotion(
+    storage: &crate::storage::Storage,
+    surface: &str,
+    version: &str,
+) -> bool {
+    match crate::core::self_evolve::deployment_cadence::stable_deployment_cadence_block_for_storage(
+        storage,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(Some(block)) => {
+            tracing::info!(
+                surface = %surface,
+                version = %version,
+                pause_until = %block.next_allowed_at.to_rfc3339(),
+                "Skipping direct stable deployment during Evolve observation window"
+            );
+            false
+        }
+        Ok(None) => true,
+        Err(error) => {
+            tracing::warn!(
+                surface = %surface,
+                version = %version,
+                error = %error,
+                "Skipping direct stable deployment because cadence check failed"
+            );
+            false
+        }
+    }
+}
+
+async fn record_auto_stable_deployment(
+    storage: &crate::storage::Storage,
+    surface: &str,
+    version: &str,
+) {
+    if let Err(error) = crate::core::self_evolve::deployment_cadence::record_stable_deployment(
+        storage,
+        crate::core::self_evolve::deployment_cadence::StableDeploymentRecord {
+            deployed_at: chrono::Utc::now().to_rfc3339(),
+            surface: surface.to_string(),
+            action: "auto_promote_from_canary_replay".to_string(),
+            proposal_id: None,
+            version: Some(version.to_string()),
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            surface = %surface,
+            version = %version,
+            error = %error,
+            "Failed to record automatic Evolve stable deployment cadence"
+        );
+    }
+}
+
 /// Convert any tool-execution `anyhow::Error` into a structured JSON envelope
 /// the LLM can parse without surface-form pattern matching. If the underlying
 /// error is a typed `ActionError`, its domain/reason/message and a remediation
@@ -340,8 +424,16 @@ fn gepa_job_value_failed(value: &serde_json::Value) -> bool {
     value
         .get("status")
         .and_then(|status| status.as_str())
-        .map(|status| matches!(status, "failed" | "timed_out" | "error"))
+        .map(|status| matches!(status, "failed" | "timed_out" | "error" | "blocked"))
         .unwrap_or(false)
+}
+
+fn gepa_job_failure_retryable(value: &serde_json::Value) -> bool {
+    value
+        .get("status")
+        .and_then(|status| status.as_str())
+        .map(|status| !matches!(status, "failed" | "timed_out" | "error" | "blocked"))
+        .unwrap_or(true)
 }
 
 fn gepa_effective_status(value: &serde_json::Value) -> String {
@@ -365,6 +457,55 @@ fn gepa_effective_reason(value: &serde_json::Value) -> Option<String> {
         .or_else(|| value.get("message"))
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
+}
+
+fn gepa_prompt_optimization_metadata(
+    proposal_id: &str,
+    opportunity_context: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "source".to_string(),
+        serde_json::Value::String("prompt_optimization_approval".to_string()),
+    );
+    metadata.insert(
+        "proposal_id".to_string(),
+        serde_json::Value::String(proposal_id.trim().to_string()),
+    );
+    if let Some(context) = opportunity_context {
+        if !context.is_null() {
+            metadata.insert("opportunity_context".to_string(), context);
+        }
+    }
+    serde_json::Value::Object(metadata)
+}
+
+fn gepa_prompt_optimization_confidence_sample_target(
+    opportunity_context: Option<&serde_json::Value>,
+) -> Option<usize> {
+    opportunity_context
+        .and_then(|context| context.get("confidence"))
+        .and_then(|confidence| confidence.get("confidence_sample_target"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value.min(20_000) as usize)
+        .filter(|value| *value > 0)
+}
+
+fn gepa_prompt_optimization_promotion_settings(
+    opportunity_context: Option<&serde_json::Value>,
+) -> crate::core::self_evolve::gepa_bridge::GepaPromotionSettings {
+    crate::core::self_evolve::gepa_bridge::GepaPromotionSettings {
+        apply_promotion: true,
+        canary_rollout_percent: 20,
+        canary_min_samples_per_version: gepa_prompt_optimization_confidence_sample_target(
+            opportunity_context,
+        )
+        .unwrap_or(25)
+        .max(25),
+        canary_min_success_gain: 0.03,
+        canary_max_sign_test_p_value: 0.10,
+        replay_log_limit: 160,
+    }
 }
 
 fn typed_tool_error_fields(error: &anyhow::Error) -> Option<TypedToolErrorFields> {
@@ -762,6 +903,12 @@ struct AppDuplicateMatch {
     match_kind: &'static str,
     score: f32,
     reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppDeployQualityContract {
+    request_context: String,
+    sub_goals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1726,6 +1873,8 @@ impl Agent {
         "delete_paths",
         "source_dir",
         "source_paths",
+        "request_context",
+        "acceptance_criteria",
         "entry_command",
         "install_command",
         "runtime_image",
@@ -2093,11 +2242,12 @@ impl Agent {
             }
         }
 
-        if source_url.starts_with("http://") || source_url.starts_with("https://") {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(90))
-                .build()?;
-            let resp = client.get(source_url).send().await?;
+        if let Ok(parsed) = reqwest::Url::parse(source_url) {
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                anyhow::bail!("Unsupported video URL format for delivery");
+            }
+            let client = crate::core::net::SafeHttpClient::new(90)?;
+            let resp = client.public_get_follow_redirects(source_url, 5).await?;
             if !resp.status().is_success() {
                 anyhow::bail!("Failed to fetch video URL (status {})", resp.status());
             }
@@ -2263,6 +2413,16 @@ impl Agent {
                     error
                 );
             }
+        }
+
+        if let Err(error) =
+            crate::actions::app::remove_app_scoped_env_secrets(&self.config_dir, &self.data_dir, app_id)
+        {
+            tracing::warn!(
+                "failed to delete app-scoped env secrets during replacement for {}: {}",
+                app_id,
+                error
+            );
         }
 
         if let Err(error) = self
@@ -2888,7 +3048,20 @@ impl Agent {
             "file_count": file_count,
             "file_bytes": file_bytes,
             "suggested_read_files": suggested_read_files,
-            "suggested_actions": ["file_read", "file_write", "app_restart", "app_stop", "app_delete", "http_get"],
+            "suggested_actions": ["http_get", "app_restart", "file_read", "file_patch", "app_deploy(mode=patch)", "app_stop", "app_delete"],
+            "repair_guidance": {
+                "inspect_first": true,
+                "prefer_existing_app_id": app_id,
+                "minimal_operations": [
+                    "Use app_restart when files and metadata are already correct but the runtime is stopped.",
+                    "Use file_read/file_patch plus app_deploy mode=patch with app_id for localized source or metadata fixes.",
+                    "Use full replacement only when the requested change is broad enough that patching would be less accurate."
+                ],
+                "avoid": [
+                    "Do not create a duplicate app unless the user intentionally wants a separate deployment.",
+                    "Do not regenerate unrelated files or reinstall dependencies when a targeted patch or restart is sufficient."
+                ]
+            },
         });
         if let Some(obj) = out.as_object_mut() {
             if !app
@@ -3220,6 +3393,7 @@ impl Agent {
         &self,
         request_context: &str,
         rendered: &crate::integrations::browser::PageContent,
+        source_evidence: Option<&serde_json::Value>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<(bool, String)> {
         let request_context = request_context.trim();
@@ -3268,6 +3442,7 @@ impl Agent {
         let diagnostics = rendered
             .diagnostics
             .iter()
+            .filter(|entry| Self::rendered_app_diagnostic_can_block(rendered, entry))
             .take(60)
             .map(|entry| {
                 serde_json::json!({
@@ -3279,6 +3454,7 @@ impl Agent {
                 })
             })
             .collect::<Vec<_>>();
+        let source_evidence = source_evidence.cloned().unwrap_or(serde_json::Value::Null);
         let prompt = serde_json::json!({
             "request_context": request_context,
             "rendered_page": {
@@ -3288,9 +3464,12 @@ impl Agent {
                 "interactive_elements": elements,
                 "browser_diagnostics": diagnostics,
             },
+            "deployed_source_and_runtime": source_evidence,
             "judgement_rules": [
                 "Judge semantically from the request and rendered-page evidence, not by exact wording alone.",
                 "Pass only when the visible page and interactive elements provide concrete evidence that the requested product, content, workflow, controls, and fallback states are present.",
+                "Use deployed source and runtime evidence for requested implementation requirements that cannot be proven from the DOM alone, such as persistence model, backend/runtime ownership, lifecycle, integrations, background work, and data flow.",
+                "Fail when source/runtime evidence contradicts a requested capability or substitutes a weaker implementation for an explicit user preference.",
                 "Treat browser diagnostics, runtime errors, blocked embeds, missing controls, placeholder-only content, or an empty/locked page as acceptance failures unless the rendered page visibly handles that condition as requested.",
                 "Do not assume hidden source code works if the rendered evidence does not show the requested behavior or controls.",
                 "Return JSON only."
@@ -3309,7 +3488,7 @@ impl Agent {
                 "app_deploy_acceptance_validation",
                 &ModelRole::Fast,
                 self.llm_candidates_for_role(&ModelRole::Fast),
-                "You validate a deployed app against the user's requested outcome using rendered DOM evidence, interactive element labels, and browser diagnostics. Be strict: successful deployment requires evidence that the requested app is actually present and usable, not just that a nonblank page loaded. Return strict JSON only.",
+                "You validate a deployed app against the user's requested outcome using rendered DOM evidence, interactive element labels, browser diagnostics, and deployed source/runtime metadata. Be strict: successful deployment requires evidence that the requested app is actually present, usable, and implemented with any requested runtime or storage properties, not just that a nonblank page loaded. Return strict JSON only.",
                 &prompt.to_string(),
                 &[],
                 &[],
@@ -3696,6 +3875,111 @@ impl Agent {
         !content.body_text.trim().is_empty() || !content.elements.is_empty()
     }
 
+    fn first_blocking_rendered_app_diagnostic(
+        content: &crate::integrations::browser::PageContent,
+    ) -> Option<String> {
+        content.diagnostics.iter().find_map(|entry| {
+            if !Self::rendered_app_diagnostic_can_block(content, entry) {
+                return None;
+            }
+            let severity = entry.severity.trim();
+            let kind = entry.kind.trim();
+            let message = entry.message.trim();
+            let is_blocking = severity.eq_ignore_ascii_case("error")
+                || kind.eq_ignore_ascii_case("pageerror")
+                || kind.eq_ignore_ascii_case("requestfailed");
+            if !is_blocking {
+                return None;
+            }
+            Some(safe_truncate(
+                &format!(
+                    "{}{}{}{}",
+                    if kind.is_empty() { "browser" } else { kind },
+                    if message.is_empty() { "" } else { ": " },
+                    message,
+                    if entry.url.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", entry.url.trim())
+                    }
+                ),
+                500,
+            ))
+        })
+    }
+
+    fn rendered_app_diagnostic_can_block(
+        content: &crate::integrations::browser::PageContent,
+        entry: &crate::integrations::browser::PageDiagnostic,
+    ) -> bool {
+        let severity = entry.severity.trim();
+        let kind = entry.kind.trim();
+        let is_error = severity.eq_ignore_ascii_case("error")
+            || kind.eq_ignore_ascii_case("pageerror")
+            || kind.eq_ignore_ascii_case("requestfailed");
+        if !is_error {
+            return false;
+        }
+        if kind.eq_ignore_ascii_case("pageerror") || entry.url.trim().is_empty() {
+            return true;
+        }
+
+        let resource_type = entry.resource_type.trim().to_ascii_lowercase();
+        let passive_resource = matches!(
+            resource_type.as_str(),
+            "font" | "image" | "media" | "prefetch" | "preflight" | "favicon"
+        );
+        if passive_resource && Self::diagnostic_url_is_outside_rendered_app_scope(content, entry) {
+            return false;
+        }
+        true
+    }
+
+    fn diagnostic_url_is_outside_rendered_app_scope(
+        content: &crate::integrations::browser::PageContent,
+        entry: &crate::integrations::browser::PageDiagnostic,
+    ) -> bool {
+        let page_url = content.url.trim();
+        let diagnostic_url = entry.url.trim();
+        if page_url.is_empty() || diagnostic_url.is_empty() {
+            return false;
+        }
+        let Ok(page) = reqwest::Url::parse(page_url) else {
+            return false;
+        };
+        let diagnostic = match reqwest::Url::parse(diagnostic_url) {
+            Ok(url) => url,
+            Err(_) => match page.join(diagnostic_url) {
+                Ok(url) => url,
+                Err(_) => return false,
+            },
+        };
+        if page.scheme() != diagnostic.scheme()
+            || page.host_str() != diagnostic.host_str()
+            || page.port_or_known_default() != diagnostic.port_or_known_default()
+        {
+            return false;
+        }
+        let page_path = page.path();
+        let Some(app_scope) = Self::rendered_app_path_scope(page_path) else {
+            return false;
+        };
+        !diagnostic.path().starts_with(&app_scope)
+    }
+
+    fn rendered_app_path_scope(page_path: &str) -> Option<String> {
+        let mut parts = page_path.split('/').filter(|part| !part.is_empty());
+        let first = parts.next()?;
+        if !first.eq_ignore_ascii_case("apps") {
+            return None;
+        }
+        let app_id = parts.next()?.trim();
+        if app_id.is_empty() {
+            return None;
+        }
+        Some(format!("/apps/{}/", app_id))
+    }
+
     #[cfg(feature = "image")]
     fn app_screenshot_has_visual_signal(bytes: &[u8]) -> bool {
         let Ok(image) = image::load_from_memory(bytes) else {
@@ -3740,6 +4024,183 @@ impl Agent {
     #[cfg(not(feature = "image"))]
     fn app_screenshot_has_visual_signal(bytes: &[u8]) -> bool {
         !bytes.is_empty()
+    }
+
+    fn app_deploy_quality_contract_from_inputs(
+        arguments: &serde_json::Value,
+        recent_messages: &[(&str, &str)],
+    ) -> AppDeployQualityContract {
+        let request_context = Self::app_deploy_request_context_from_arguments(arguments)
+            .or_else(|| Self::latest_user_message_context(recent_messages))
+            .unwrap_or_default();
+        let mut sub_goals = Self::app_deploy_acceptance_criteria_from_arguments(arguments);
+        if sub_goals.is_empty() && !request_context.is_empty() {
+            sub_goals.push(request_context.clone());
+        }
+        AppDeployQualityContract {
+            request_context,
+            sub_goals,
+        }
+    }
+
+    fn app_deploy_request_context_from_arguments(arguments: &serde_json::Value) -> Option<String> {
+        arguments
+            .get("request_context")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| safe_truncate(value, 4000))
+    }
+
+    fn app_deploy_acceptance_criteria_from_arguments(arguments: &serde_json::Value) -> Vec<String> {
+        arguments
+            .get("acceptance_criteria")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .take(20)
+                    .map(|item| safe_truncate(item, 300))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn latest_user_message_context(recent_messages: &[(&str, &str)]) -> Option<String> {
+        recent_messages.iter().rev().find_map(|(role, content)| {
+            let content = content.trim();
+            if role.trim().eq_ignore_ascii_case("user") && !content.is_empty() {
+                Some(safe_truncate(content, 4000))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn app_quality_file_is_app_relative(path: &str) -> bool {
+        let path = path.trim();
+        !path.is_empty()
+            && !path.starts_with('/')
+            && !path.starts_with('\\')
+            && !path
+                .replace('\\', "/")
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+    }
+
+    async fn build_app_quality_source_evidence(
+        &self,
+        app_id: &str,
+        app_type: &str,
+    ) -> serde_json::Value {
+        let Some(app_dir) = self.app_registry.get_dir(app_id).await else {
+            return serde_json::json!({
+                "available": false,
+                "reason": "app directory was not available",
+            });
+        };
+        let meta = tokio::fs::read(app_dir.join(".app_meta.json"))
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(|value| value.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let managed_files = meta
+            .get("managed_files")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|path| Self::app_quality_file_is_app_relative(path))
+                    .take(30)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut file_evidence = Vec::new();
+        let mut remaining_excerpt_bytes = 20_000usize;
+        for path in &managed_files {
+            let file_path = app_dir.join(path);
+            let Ok(bytes) = tokio::fs::read(&file_path).await else {
+                file_evidence.push(serde_json::json!({
+                    "path": path,
+                    "readable": false,
+                }));
+                continue;
+            };
+            let size_bytes = bytes.len();
+            let mut entry = serde_json::json!({
+                "path": path,
+                "readable": true,
+                "size_bytes": size_bytes,
+            });
+            if remaining_excerpt_bytes > 0 {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    let excerpt_limit = remaining_excerpt_bytes.min(2500);
+                    let excerpt = safe_truncate(&text, excerpt_limit);
+                    remaining_excerpt_bytes = remaining_excerpt_bytes.saturating_sub(excerpt.len());
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("excerpt".to_string(), serde_json::json!(excerpt));
+                    }
+                }
+            }
+            file_evidence.push(entry);
+        }
+
+        serde_json::json!({
+            "available": true,
+            "app_id": app_id,
+            "app_type": app_type,
+            "metadata": {
+                "runtime_required": meta.get("runtime_required").cloned().unwrap_or(serde_json::Value::Null),
+                "runtime_preference": meta.get("runtime_preference").cloned().unwrap_or(serde_json::Value::Null),
+                "runtime_reason": meta.get("runtime_reason").cloned().unwrap_or(serde_json::Value::Null),
+                "entry_command": meta.get("entry_command").cloned().unwrap_or(serde_json::Value::Null),
+                "start_command": meta.get("start_command").cloned().unwrap_or(serde_json::Value::Null),
+                "install_command": meta.get("install_command").cloned().unwrap_or(serde_json::Value::Null),
+                "repo_url": meta.get("repo_url").cloned().unwrap_or(serde_json::Value::Null),
+                "repo_subdir": meta.get("repo_subdir").cloned().unwrap_or(serde_json::Value::Null),
+                "required_inputs": meta.get("required_inputs").cloned().unwrap_or(serde_json::Value::Null),
+                "runtime_actions": meta.get("runtime_actions").cloned().unwrap_or(serde_json::Value::Null),
+            },
+            "managed_file_count": managed_files.len(),
+            "files": file_evidence,
+        })
+    }
+
+    async fn app_deploy_quality_contract(
+        &self,
+        arguments: &serde_json::Value,
+        conversation_id: Option<&str>,
+    ) -> AppDeployQualityContract {
+        if Self::app_deploy_request_context_from_arguments(arguments).is_some() {
+            return Self::app_deploy_quality_contract_from_inputs(arguments, &[]);
+        }
+        let Some(conversation_id) = conversation_id else {
+            return Self::app_deploy_quality_contract_from_inputs(arguments, &[]);
+        };
+        match self.storage.get_recent_messages(conversation_id, 24).await {
+            Ok(messages) => {
+                let pairs = messages
+                    .iter()
+                    .map(|message| (message.role.as_str(), message.content.as_str()))
+                    .collect::<Vec<_>>();
+                Self::app_deploy_quality_contract_from_inputs(arguments, &pairs)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    conversation_id = %conversation_id,
+                    error = %error,
+                    "app_deploy_quality_context_recent_messages_failed"
+                );
+                Self::app_deploy_quality_contract_from_inputs(arguments, &[])
+            }
+        }
     }
 
     async fn app_meta_updated_at(app_dir: &std::path::Path) -> Option<String> {
@@ -3918,6 +4379,110 @@ impl Agent {
         .await
     }
 
+    async fn run_app_quality_check_for_deploy(
+        &self,
+        app_id: &str,
+        app_url_with_key: &str,
+        app_type: &str,
+        quality_contract: &AppDeployQualityContract,
+    ) -> Option<serde_json::Value> {
+        let app_dir = self.app_registry.get_dir(app_id).await?;
+        let app_updated_at = Self::app_meta_updated_at(&app_dir).await;
+        if let Err(error) = self
+            .persist_app_sub_goals(app_id, &quality_contract.sub_goals)
+            .await
+        {
+            tracing::debug!(app_id = %app_id, error = %error, "app_sub_goals_persist_failed");
+        }
+        let report = self
+            .build_app_quality_report(
+                app_id,
+                app_url_with_key,
+                app_type,
+                &quality_contract.request_context,
+                &quality_contract.sub_goals,
+                app_updated_at.as_deref(),
+            )
+            .await;
+        if Self::app_meta_updated_at(&app_dir).await == app_updated_at {
+            if let Err(error) = Self::write_app_json_file_atomic(
+                &app_dir,
+                crate::actions::app::APP_QUALITY_REPORT_FILE,
+                &report,
+            )
+            .await
+            {
+                tracing::debug!(app_id = %app_id, error = %error, "app_quality_report_write_failed");
+            }
+        }
+        Some(report)
+    }
+
+    fn app_quality_tool_summary(
+        report: Option<&serde_json::Value>,
+        quality_contract: &AppDeployQualityContract,
+    ) -> serde_json::Value {
+        let request_context_attached = !quality_contract.request_context.trim().is_empty();
+        let acceptance_criteria_count = quality_contract.sub_goals.len();
+        let Some(report) = report else {
+            return serde_json::json!({
+                "status": "unavailable",
+                "request_context_attached": request_context_attached,
+                "acceptance_criteria_count": acceptance_criteria_count,
+                "needs_repair": false,
+            });
+        };
+        let status = report
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let browser_ok = report
+            .get("browser_ok")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let judge_passed = report
+            .pointer("/judge/passed")
+            .and_then(|value| value.as_bool());
+        let judge_available = report
+            .pointer("/judge/available")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let effective_judge_passed = judge_available.then_some(judge_passed).flatten();
+        let judge_summary = report
+            .pointer("/judge/summary")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| safe_truncate(value, 900));
+        let concerns = report
+            .get("judge_concerns")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .take(5)
+                    .map(|item| safe_truncate(item, 500))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let needs_repair =
+            status == "error" || (request_context_attached && effective_judge_passed == Some(false));
+        serde_json::json!({
+            "status": status,
+            "request_context_attached": request_context_attached,
+            "acceptance_criteria_count": acceptance_criteria_count,
+            "browser_ok": browser_ok,
+            "judge_available": judge_available,
+            "judge_passed": effective_judge_passed,
+            "judge_summary": judge_summary,
+            "concerns": concerns,
+            "needs_repair": needs_repair,
+        })
+    }
+
     async fn build_app_quality_report(
         &self,
         app_id: &str,
@@ -3933,6 +4498,9 @@ impl Agent {
         let mut diagnostics = Vec::<serde_json::Value>::new();
         let mut screenshot_url: Option<String> = None;
         let mut rendered_content: Option<crate::integrations::browser::PageContent> = None;
+        let source_evidence = self
+            .build_app_quality_source_evidence(app_id, app_type)
+            .await;
 
         let browser_result: Result<()> = async {
             let sidecar_session = integration.create_session().await?;
@@ -3958,7 +4526,7 @@ impl Agent {
                     "severity": "info",
                     "message": "Browser quality pass completed navigation.",
                     "url": final_url,
-                    "title": title,
+                    "title": title.clone(),
                 }));
                 rendered_content = Some(content);
                 Ok(())
@@ -3979,11 +4547,14 @@ impl Agent {
 
         let mut browser_ok = false;
         let mut runtime_marker: Option<String> = None;
+        let mut blocking_diagnostic: Option<String> = None;
         if let Some(content) = rendered_content.as_ref() {
             let combined = format!("{}\n{}", content.title, content.body_text).to_lowercase();
             runtime_marker = Self::detect_app_runtime_error_marker(&combined).map(str::to_string);
-            browser_ok =
-                Self::rendered_app_content_has_dom_signal(content) && runtime_marker.is_none();
+            blocking_diagnostic = Self::first_blocking_rendered_app_diagnostic(content);
+            browser_ok = Self::rendered_app_content_has_dom_signal(content)
+                && runtime_marker.is_none()
+                && blocking_diagnostic.is_none();
             for entry in content.diagnostics.iter().take(60) {
                 diagnostics.push(serde_json::json!({
                     "kind": &entry.kind,
@@ -3995,18 +4566,26 @@ impl Agent {
             }
         }
 
-        let (judge_passed, judge_detail) = match rendered_content.as_ref() {
-            Some(content) => self
-                .validate_rendered_app_against_request(request_context, content, None)
+        let (judge_available, judge_passed, judge_detail) = match rendered_content.as_ref() {
+            Some(content) => match self
+                .validate_rendered_app_against_request(
+                    request_context,
+                    content,
+                    Some(&source_evidence),
+                    None,
+                )
                 .await
-                .unwrap_or_else(|error| {
-                    (
-                        false,
-                        format!("Advisory model quality check failed: {}", error),
-                    )
-                }),
+            {
+                Ok((passed, detail)) => (true, Some(passed), detail),
+                Err(error) => (
+                    false,
+                    None,
+                    format!("Advisory model quality check unavailable: {}", error),
+                ),
+            },
             None => (
                 false,
+                None,
                 "Browser content was not available for advisory model quality check.".to_string(),
             ),
         };
@@ -4036,7 +4615,10 @@ impl Agent {
         if let Some(marker) = runtime_marker.as_deref() {
             concerns.push(format!("Rendered page reported runtime marker: {}", marker));
         }
-        if !judge_passed {
+        if let Some(issue) = blocking_diagnostic.as_deref() {
+            concerns.push(format!("Browser diagnostic blocked validation: {}", issue));
+        }
+        if judge_passed == Some(false) {
             concerns.push(safe_truncate(&judge_detail, 700));
         }
         if coverage_missing > 0 {
@@ -4066,7 +4648,16 @@ impl Agent {
             "browser_url": browser_url,
             "browser_ok": browser_ok,
             "screenshot_url": screenshot_url,
+            "source_summary": {
+                "available": source_evidence.get("available").and_then(|value| value.as_bool()).unwrap_or(false),
+                "managed_file_count": source_evidence.get("managed_file_count").and_then(|value| value.as_u64()).unwrap_or(0),
+                "runtime_required": source_evidence.pointer("/metadata/runtime_required").cloned().unwrap_or(serde_json::Value::Null),
+                "runtime_preference": source_evidence.pointer("/metadata/runtime_preference").cloned().unwrap_or(serde_json::Value::Null),
+                "entry_command": source_evidence.pointer("/metadata/entry_command").cloned().unwrap_or(serde_json::Value::Null),
+                "install_command": source_evidence.pointer("/metadata/install_command").cloned().unwrap_or(serde_json::Value::Null),
+            },
             "judge": {
+                "available": judge_available,
                 "passed": judge_passed,
                 "summary": safe_truncate(&judge_detail, 900),
             },
@@ -4699,6 +5290,280 @@ impl Agent {
         Ok(result)
     }
 
+    async fn browser_profile_from_manage_arguments(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<Option<crate::core::BrowserProfileRecord>> {
+        let selector = action_text_arg(arguments, "profile_id")
+            .or_else(|| action_text_arg(arguments, "id"))
+            .or_else(|| action_text_arg(arguments, "profile"))
+            .or_else(|| action_text_arg(arguments, "query"))
+            .or_else(|| action_text_arg(arguments, "selector"));
+        let Some(selector) = selector else {
+            return Ok(None);
+        };
+        let listed = crate::core::BrowserProfileControlPlane::list(&self.storage).await?;
+        if let Some(profile) = listed
+            .profiles
+            .iter()
+            .find(|profile| profile.id == selector)
+        {
+            return Ok(Some(profile.clone()));
+        }
+        match crate::core::BrowserProfileControlPlane::resolve(&self.storage, &selector).await? {
+            crate::core::BrowserProfileResolveOutcome::Resolved { profile, .. } => {
+                Ok(Some(profile))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn handle_browser_profile_manage_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let operation = action_text_arg(arguments, "operation")
+            .or_else(|| action_text_arg(arguments, "action"))
+            .or_else(|| action_text_arg(arguments, "op"))
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_else(|| "list".to_string());
+
+        match operation.as_str() {
+            "list" | "status" => {
+                let profiles = crate::core::BrowserProfileControlPlane::list(&self.storage).await?;
+                let sessions = self.browser_sessions.list_session_views().await;
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "browser_profile",
+                    "operation": operation,
+                    "profiles": profiles.profiles,
+                    "summary": profiles.summary,
+                    "sessions": sessions,
+                }))
+            }
+            "read" | "resolve" => {
+                let Some(profile) = self
+                    .browser_profile_from_manage_arguments(arguments)
+                    .await?
+                else {
+                    return Ok(serde_json::json!({
+                        "status": "needs_input",
+                        "resource": "browser_profile",
+                        "operation": operation,
+                        "reason": "browser_profile_selector_required",
+                        "message": "Choose a saved browser profile id or selector.",
+                    }));
+                };
+                let sessions = self
+                    .browser_sessions
+                    .list_session_views()
+                    .await
+                    .into_iter()
+                    .filter(|session| session.profile_id.as_deref() == Some(profile.id.as_str()))
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "browser_profile",
+                    "operation": operation,
+                    "profile": profile,
+                    "sessions": sessions,
+                }))
+            }
+            "create" | "update" => {
+                let target_kind = browser_profile_target_kind_from_arguments(arguments)?;
+                let managed = arguments
+                    .get("managed")
+                    .and_then(|value| value.as_bool())
+                    .or_else(|| {
+                        target_kind.map(|kind| {
+                            matches!(kind, crate::core::BrowserProfileTargetKind::Sandbox)
+                        })
+                    });
+                let browser = action_text_arg(arguments, "browser");
+                let metadata = arguments.get("metadata").cloned().or_else(|| {
+                    if browser.is_none() && managed.is_none() {
+                        None
+                    } else {
+                        Some(serde_json::json!({
+                            "browser": browser.clone().unwrap_or_else(|| "chrome".to_string()),
+                            "managed": managed.unwrap_or(true),
+                        }))
+                    }
+                });
+                let profile = crate::core::BrowserProfileControlPlane::upsert(
+                    &self.storage,
+                    crate::core::BrowserProfileUpsert {
+                        id: action_text_arg(arguments, "profile_id")
+                            .or_else(|| action_text_arg(arguments, "id")),
+                        name: action_text_arg(arguments, "name")
+                            .or_else(|| action_text_arg(arguments, "profile_name")),
+                        description: action_text_arg(arguments, "description"),
+                        target_kind,
+                        target_endpoint: action_text_arg(arguments, "target_endpoint"),
+                        target_profile_path: action_text_arg(arguments, "target_profile_path"),
+                        target_workspace: action_text_arg(arguments, "target_workspace"),
+                        login_state: browser_profile_login_state_from_arguments(arguments)?,
+                        login_checked_at: Some(chrono::Utc::now().to_rfc3339()),
+                        tags: browser_profile_tags_from_arguments(arguments),
+                        enabled: arguments.get("enabled").and_then(|value| value.as_bool()),
+                        last_error: action_text_arg(arguments, "last_error"),
+                        metadata,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "browser_profile",
+                    "operation": operation,
+                    "profile": profile,
+                }))
+            }
+            "delete" => {
+                let Some(profile) = self
+                    .browser_profile_from_manage_arguments(arguments)
+                    .await?
+                else {
+                    return Ok(serde_json::json!({
+                        "status": "needs_input",
+                        "resource": "browser_profile",
+                        "operation": operation,
+                        "reason": "browser_profile_selector_required",
+                        "message": "Choose a saved browser profile to delete.",
+                    }));
+                };
+                let stopped = self
+                    .browser_sessions
+                    .stop_profile_sessions(&profile.id)
+                    .await
+                    .unwrap_or_default();
+                let storage_deleted = self
+                    .browser_sessions
+                    .delete_profile_storage(&profile.id)
+                    .await
+                    .is_ok();
+                let deleted =
+                    crate::core::BrowserProfileControlPlane::delete(&self.storage, &profile.id)
+                        .await?;
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "browser_profile",
+                    "operation": operation,
+                    "profile_id": profile.id,
+                    "deleted": deleted,
+                    "closed_sessions": stopped.len(),
+                    "storage_deleted": storage_deleted,
+                }))
+            }
+            "launch" => {
+                let Some(profile) = self
+                    .browser_profile_from_manage_arguments(arguments)
+                    .await?
+                else {
+                    return Ok(serde_json::json!({
+                        "status": "needs_input",
+                        "resource": "browser_profile",
+                        "operation": operation,
+                        "reason": "browser_profile_selector_required",
+                        "message": "Choose a saved browser profile to launch.",
+                    }));
+                };
+                let view = self
+                    .browser_sessions
+                    .start_profile_login_session(
+                        crate::core::browser_session::BrowserSessionProfileContext::from_browser_profile(
+                            &profile,
+                        ),
+                    )
+                    .await?;
+                Ok(serde_json::json!({
+                    "status": "needs_input",
+                    "resource": "browser_profile",
+                    "operation": operation,
+                    "profile": {
+                        "id": profile.id,
+                        "name": profile.name,
+                    },
+                    "session": view,
+                    "message": "Profile browser launched. Complete login or profile repair in the live browser, then close and save it.",
+                }))
+            }
+            "close" => {
+                let Some(profile) = self
+                    .browser_profile_from_manage_arguments(arguments)
+                    .await?
+                else {
+                    return Ok(serde_json::json!({
+                        "status": "needs_input",
+                        "resource": "browser_profile",
+                        "operation": operation,
+                        "reason": "browser_profile_selector_required",
+                        "message": "Choose a saved browser profile to close.",
+                    }));
+                };
+                let stopped = self
+                    .browser_sessions
+                    .stop_profile_sessions(&profile.id)
+                    .await?;
+                let ended_at = chrono::Utc::now().to_rfc3339();
+                for view in &stopped {
+                    let _ = crate::core::BrowserProfileControlPlane::record_session(
+                        &self.storage,
+                        crate::core::BrowserProfileSessionRecord {
+                            profile_id: profile.id.clone(),
+                            session_id: Some(view.id.clone()),
+                            started_at: view.created_at.clone(),
+                            ended_at: Some(ended_at.clone()),
+                            title: view.page_title.clone(),
+                            url: view.page_url.clone(),
+                            outcome: "saved".to_string(),
+                            channel: Some("web".to_string()),
+                            note: Some("Browser profile session closed and saved.".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+                let profile = if stopped.is_empty() {
+                    profile
+                } else {
+                    crate::core::BrowserProfileControlPlane::upsert(
+                        &self.storage,
+                        crate::core::BrowserProfileUpsert {
+                            id: Some(profile.id.clone()),
+                            login_state: Some(crate::core::BrowserLoginState::Unknown),
+                            login_checked_at: Some(ended_at),
+                            login_note: Some(
+                                "Browser state was saved. Login success was not verified by AgentArk."
+                                    .to_string(),
+                            ),
+                            last_error: Some(String::new()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+                };
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "resource": "browser_profile",
+                    "operation": operation,
+                    "profile": profile,
+                    "closed_sessions": stopped.len(),
+                }))
+            }
+            _ => Ok(serde_json::json!({
+                "status": "failed",
+                "resource": "browser_profile",
+                "operation": operation,
+                "reason": "unsupported_browser_profile_operation",
+                "supported_operations": [
+                    "create", "read", "update", "delete", "list", "status", "launch", "close",
+                    "resolve",
+                ],
+            })),
+        }
+    }
+
     async fn handle_skill_marketplace_manage_action(
         &self,
         arguments: &serde_json::Value,
@@ -4886,11 +5751,25 @@ impl Agent {
     async fn resolve_browser_profile_for_tool(
         &self,
         selector: Option<String>,
+        allow_single_enabled_default: bool,
     ) -> anyhow::Result<
         std::result::Result<Option<crate::core::BrowserProfileRecord>, serde_json::Value>,
     > {
         let Some(selector) = selector else {
-            return Ok(Ok(None));
+            if !allow_single_enabled_default {
+                return Ok(Ok(None));
+            }
+            let response = crate::core::BrowserProfileControlPlane::list(&self.storage).await?;
+            let enabled = response
+                .profiles
+                .into_iter()
+                .filter(|profile| profile.enabled)
+                .collect::<Vec<_>>();
+            return if enabled.len() == 1 {
+                Ok(Ok(enabled.into_iter().next()))
+            } else {
+                Ok(Ok(None))
+            };
         };
         match crate::core::BrowserProfileControlPlane::resolve(&self.storage, &selector).await? {
             crate::core::BrowserProfileResolveOutcome::Resolved { profile, .. } => {
@@ -5217,9 +6096,22 @@ impl Agent {
             }
         }
 
-        let url = action_text_arg(arguments, "url");
+        let explicit_url = action_text_arg(arguments, "url");
+        let recent_artifact = if explicit_url.is_none() {
+            match conversation_id {
+                Some(conversation_id) => self
+                    .load_recent_artifact_contexts(conversation_id)
+                    .await
+                    .into_iter()
+                    .find(|artifact| !artifact.url.trim().is_empty()),
+                None => None,
+            }
+        } else {
+            None
+        };
         let task = browser_auto_task_description(
-            url.as_deref(),
+            explicit_url.as_deref(),
+            recent_artifact.as_ref(),
             action_text_arg(arguments, "task"),
             action_text_arg(arguments, "expectation"),
         );
@@ -5236,7 +6128,10 @@ impl Agent {
         }
 
         let profile = match self
-            .resolve_browser_profile_for_tool(Self::browser_profile_selector_from_tool(arguments))
+            .resolve_browser_profile_for_tool(
+                Self::browser_profile_selector_from_tool(arguments),
+                true,
+            )
             .await?
         {
             Ok(profile) => profile,
@@ -5258,11 +6153,74 @@ impl Agent {
                 ));
             }
         };
+        let profile_json = profile.as_ref().map(|profile| {
+            serde_json::json!({
+                "id": profile.id.clone(),
+                "name": profile.name.clone(),
+            })
+        });
         let profile_context = profile
             .as_ref()
             .map(crate::core::browser_session::BrowserSessionProfileContext::from_browser_profile);
+        if let (Some(profile), Some(profile_context)) = (profile.as_ref(), profile_context.clone())
+        {
+            if matches!(
+                profile.login_state,
+                crate::core::BrowserLoginState::LoggedOut
+                    | crate::core::BrowserLoginState::NeedsMfa
+                    | crate::core::BrowserLoginState::Expired
+                    | crate::core::BrowserLoginState::Error
+            ) {
+                match self
+                    .browser_sessions
+                    .start_profile_login_session(profile_context)
+                    .await
+                {
+                    Ok(view) => {
+                        return Ok(render_tool_completion_marker_with_data(
+                            "browser_auto",
+                            "needs_input",
+                            "The saved browser profile needs attention before AgentArk can reuse it. Sign in or repair it in the live browser, then close and save the profile before retrying the task.",
+                            serde_json::json!({
+                                "success": false,
+                                "reason": "browser_profile_login_required",
+                                "profile": profile_json,
+                                "session": view,
+                            }),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = crate::core::BrowserProfileControlPlane::upsert(
+                            &self.storage,
+                            crate::core::BrowserProfileUpsert {
+                                id: Some(profile.id.clone()),
+                                login_state: Some(crate::core::BrowserLoginState::Error),
+                                login_checked_at: Some(chrono::Utc::now().to_rfc3339()),
+                                last_error: Some(error.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                        return Ok(render_tool_completion_marker_with_data(
+                            "browser_auto",
+                            "needs_input",
+                            &format!(
+                                "The saved browser profile needs attention, but AgentArk could not launch the profile repair browser: {}",
+                                error
+                            ),
+                            serde_json::json!({
+                                "success": false,
+                                "reason": "browser_profile_repair_launch_failed",
+                                "profile": profile_json,
+                                "error": error.to_string(),
+                            }),
+                        ));
+                    }
+                }
+            }
+        }
         let notify_fn = Self::browser_auto_notification_fn(stream_tx);
-        let started = self
+        let started = match self
             .browser_sessions
             .start_session_with_profile(
                 &task,
@@ -5272,7 +6230,49 @@ impl Agent {
                 self.llm.clone(),
                 notify_fn,
             )
-            .await?;
+            .await
+        {
+            Ok(started) => started,
+            Err(error) => {
+                if let Some(profile) = profile.as_ref() {
+                    let _ = crate::core::BrowserProfileControlPlane::upsert(
+                        &self.storage,
+                        crate::core::BrowserProfileUpsert {
+                            id: Some(profile.id.clone()),
+                            login_state: Some(crate::core::BrowserLoginState::Error),
+                            login_checked_at: Some(chrono::Utc::now().to_rfc3339()),
+                            last_error: Some(error.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    return Ok(render_tool_completion_marker_with_data(
+                        "browser_auto",
+                        "needs_input",
+                        &format!(
+                            "The saved browser profile could not be used for this browser task: {}",
+                            error
+                        ),
+                        serde_json::json!({
+                            "success": false,
+                            "reason": "browser_profile_launch_failed",
+                            "profile": profile_json,
+                            "error": error.to_string(),
+                        }),
+                    ));
+                }
+                return Ok(render_tool_completion_marker_with_data(
+                    "browser_auto",
+                    "needs_input",
+                    &format!("The browser task could not be started: {}", error),
+                    serde_json::json!({
+                        "success": false,
+                        "reason": "browser_session_launch_failed",
+                        "error": error.to_string(),
+                    }),
+                ));
+            }
+        };
         if let Some(profile) = profile.as_ref() {
             let _ = crate::core::BrowserProfileControlPlane::record_session(
                 &self.storage,
@@ -5283,7 +6283,9 @@ impl Agent {
                     outcome: "started".to_string(),
                     channel: Some(channel.to_string()),
                     note: Some(task.clone()),
-                    url,
+                    url: explicit_url
+                        .clone()
+                        .or_else(|| recent_artifact.as_ref().map(|artifact| artifact.url.clone())),
                     ..Default::default()
                 },
             )
@@ -5292,15 +6294,20 @@ impl Agent {
         let checkpoint = self
             .wait_for_browser_auto_checkpoint(&started.session_id)
             .await;
-        let profile_json = profile.as_ref().map(|profile| {
-            serde_json::json!({
-                "id": profile.id.clone(),
-                "name": profile.name.clone(),
-            })
-        });
         if let Some(view) = checkpoint {
             let marker_kind = browser_auto_checkpoint_kind(&view);
             let detail = browser_auto_checkpoint_detail(&view, marker_kind);
+            let current_page = match self
+                .browser_sessions
+                .read_session_content(&started.session_id)
+                .await
+            {
+                Ok((_, content)) => Some(browser_auto_page_snapshot_payload(&content)),
+                Err(_) => view
+                    .last_page
+                    .as_ref()
+                    .map(browser_auto_page_snapshot_payload),
+            };
             let data = serde_json::json!({
                 "success": marker_kind.success(),
                 "session_id": started.session_id,
@@ -5308,6 +6315,7 @@ impl Agent {
                 "task": task,
                 "profile": profile_json,
                 "session": view,
+                "current_page": current_page,
             });
             return Ok(render_tool_completion_marker_with_data(
                 "browser_auto",
@@ -5413,9 +6421,20 @@ impl Agent {
             Ok(self
                 .handle_work_manage_tool_call(arguments, conversation_id)
                 .await)
+        } else if action_name.eq_ignore_ascii_case("app_deploy") {
+            self.handle_app_deploy_tool_call(arguments, stream_tx, channel, conversation_id)
+                .await
         } else if action_name.eq_ignore_ascii_case("service_manage") {
             self.handle_service_manage_tool_call(arguments, stream_tx, channel, conversation_id)
                 .await
+        } else if action_name.eq_ignore_ascii_case("browser_profile_manage") {
+            match self
+                .handle_browser_profile_manage_tool_call(arguments)
+                .await
+            {
+                Ok(value) => Ok(serde_json::to_string_pretty(&value)?),
+                Err(error) => Err(error),
+            }
         } else if action_name.eq_ignore_ascii_case("browser_auto") {
             self.handle_browser_auto_tool_call(
                 arguments,
@@ -6266,6 +7285,7 @@ impl Agent {
             .get("install_command")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let build_command = crate::actions::app::app_meta_lifecycle_command(&meta, "build_command");
         let runtime_image = meta
             .get("runtime_image")
             .and_then(|v| v.as_str())
@@ -6416,6 +7436,7 @@ impl Agent {
                 crate::actions::app::resolve_required_env_values(
                     &self.config_dir,
                     &self.data_dir,
+                    Some(app_id),
                     &required_inputs,
                     &llm_env,
                     &config_values,
@@ -6442,7 +7463,7 @@ impl Agent {
                 return Ok(serde_json::json!({
                     "status": "needs_secrets",
                     "app_id": app_id,
-                    "title": title,
+                    "title": title.clone(),
                     "url": relative_url,
                     "local_url": local_url,
                     "missing_env": missing_sensitive,
@@ -6450,9 +7471,17 @@ impl Agent {
                     "missing_inputs": missing_all,
                     "required_inputs": required_inputs,
                     "required_secrets": required_secret_keys.clone(),
-                    "required_env": required_secret_keys,
+                    "required_env": required_secret_keys.clone(),
                     "required_config": required_config_keys,
                     "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
+                    "credential_request": {
+                        "kind": "app_runtime_secret",
+                        "app_id": app_id,
+                        "display_name": title,
+                        "required_keys": required_secret_keys,
+                        "settings_path": format!("/apps/{}/environment", app_id),
+                        "secure_input_required": true
+                    },
                     "message": "Missing required inputs. Use the secure credential form in chat or Settings for sensitive values; provide config for non-sensitive values."
                 }));
             }
@@ -6463,6 +7492,7 @@ impl Agent {
                     app_dir: &app_dir,
                     entry_command: &entry_command,
                     install_command: install_command.as_deref(),
+                    build_command: build_command.as_deref(),
                     port,
                     extra_env: &resolved_env,
                     runtime_image: runtime_image.as_deref(),
@@ -7199,6 +8229,103 @@ impl Agent {
         serde_json::Value::Object(deploy)
     }
 
+    fn service_manage_allows_duplicate(arguments: &serde_json::Value) -> bool {
+        let duplicate_policy = arguments
+            .get("duplicate_policy")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        arguments
+            .get("allow_duplicate")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || duplicate_policy.eq_ignore_ascii_case("create_new")
+    }
+
+    fn deploy_create_should_reuse_recent_app(
+        operation: &str,
+        arguments: &serde_json::Value,
+        has_recent_app: bool,
+    ) -> bool {
+        let has_explicit_target = arguments
+            .get("service_id")
+            .or_else(|| arguments.get("app_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        operation.trim().eq_ignore_ascii_case("create")
+            && !has_explicit_target
+            && has_recent_app
+            && !Self::service_manage_allows_duplicate(arguments)
+    }
+
+    fn app_exists_in_registry(app_id: &str, apps: &[serde_json::Value]) -> bool {
+        let app_id = app_id.trim();
+        !app_id.is_empty()
+            && apps.iter().any(|app| {
+                app.get("id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    == Some(app_id)
+            })
+    }
+
+    async fn recent_conversation_app_id(
+        &self,
+        conversation_id: Option<&str>,
+        apps: &[serde_json::Value],
+    ) -> Option<String> {
+        let conversation_id = conversation_id?.trim();
+        if conversation_id.is_empty() {
+            return None;
+        }
+        self.load_recent_artifact_contexts(conversation_id)
+            .await
+            .into_iter()
+            .find_map(|artifact| {
+                if !artifact.artifact_type.eq_ignore_ascii_case("app") {
+                    return None;
+                }
+                let app_id = artifact.artifact_id.trim();
+                if Self::app_exists_in_registry(app_id, apps) {
+                    Some(app_id.to_string())
+                } else {
+                    None
+                }
+            })
+    }
+
+    async fn resolve_service_manage_deploy_target(
+        &self,
+        arguments: &serde_json::Value,
+        apps: &[serde_json::Value],
+        conversation_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(service_id) = arguments
+            .get("service_id")
+            .or_else(|| arguments.get("app_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(service_id.to_string());
+        }
+
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
+        if !query.is_empty() {
+            let ranked = Self::rank_deployed_apps(query, apps);
+            if let Some((_, app_id, _, _)) = Self::select_best_ranked_app(query, &ranked) {
+                return Some(app_id.clone());
+            }
+        }
+
+        self.recent_conversation_app_id(conversation_id, apps).await
+    }
+
     fn service_manage_control_call(
         operation: &str,
         arguments: &serde_json::Value,
@@ -7243,6 +8370,7 @@ impl Agent {
             id: uuid::Uuid::new_v4().to_string(),
             name: format!("service_manage.{}", operation),
             arguments: serde_json::Value::Object(control),
+            activity_label: None,
         }
     }
 
@@ -7305,47 +8433,77 @@ impl Agent {
 
         let output = match operation.as_str() {
             "create" | "update" | "patch" => {
-                let deploy_args = Self::normalize_service_manage_deploy_arguments(arguments);
-                let llm_env = self.app_model_env_vars();
-                let raw = crate::actions::app::app_deploy(
-                    &self.config_dir,
-                    &self.data_dir,
-                    &deploy_args,
-                    &self.app_registry,
-                    &llm_env,
-                    stream_tx.cloned(),
-                )
-                .await?;
-                let mut parsed = serde_json::from_str::<serde_json::Value>(&raw)
-                    .unwrap_or_else(|_| serde_json::json!({ "status": "ok", "raw": raw }));
-                if let Some(obj) = parsed.as_object_mut() {
-                    obj.insert("tool".to_string(), serde_json::json!("service_manage"));
-                    if let Some(app_id) = obj
-                        .get("app_id")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(ToString::to_string)
-                    {
-                        obj.insert("service_id".to_string(), serde_json::json!(app_id.clone()));
-                        if let Some(cid) = conversation_id {
-                            let title = obj
-                                .get("title")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("Service");
-                            let url = obj
-                                .get("url")
-                                .and_then(|value| value.as_str())
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                                .map(ToString::to_string)
-                                .unwrap_or_else(|| format!("/apps/{}/", app_id));
-                            self.persist_last_deployed_app_context(cid, &app_id, title, &url)
-                                .await;
+                let apps = self.app_registry.list().await;
+                if operation == "create" {
+                    let mut deploy_args =
+                        Self::normalize_service_manage_deploy_arguments(arguments);
+                    let recent_app_id = self
+                        .recent_conversation_app_id(conversation_id, &apps)
+                        .await;
+                    if Self::deploy_create_should_reuse_recent_app(
+                        &operation,
+                        arguments,
+                        recent_app_id.is_some(),
+                    ) {
+                        if let Some(app_id) = recent_app_id {
+                            if let Some(obj) = deploy_args.as_object_mut() {
+                                obj.insert("app_id".to_string(), serde_json::json!(app_id));
+                            }
                         }
                     }
+                    let quality_contract = self
+                        .app_deploy_quality_contract(&deploy_args, conversation_id)
+                        .await;
+                    let llm_env = self.app_model_env_vars();
+                    let raw = crate::actions::app::app_deploy(
+                        &self.config_dir,
+                        &self.data_dir,
+                        &deploy_args,
+                        &self.app_registry,
+                        &llm_env,
+                        stream_tx.cloned(),
+                    )
+                    .await?;
+                    self.service_manage_deploy_response_payload(
+                        raw,
+                        conversation_id,
+                        request_channel,
+                        &quality_contract,
+                    )
+                    .await
+                } else if let Some(app_id) = self
+                    .resolve_service_manage_deploy_target(arguments, &apps, conversation_id)
+                    .await
+                {
+                    let mut deploy_args =
+                        Self::normalize_service_manage_deploy_arguments(arguments);
+                    if let Some(obj) = deploy_args.as_object_mut() {
+                        obj.insert("app_id".to_string(), serde_json::json!(app_id));
+                    }
+                    let quality_contract = self
+                        .app_deploy_quality_contract(&deploy_args, conversation_id)
+                        .await;
+                    let llm_env = self.app_model_env_vars();
+                    let raw = crate::actions::app::app_deploy(
+                        &self.config_dir,
+                        &self.data_dir,
+                        &deploy_args,
+                        &self.app_registry,
+                        &llm_env,
+                        stream_tx.cloned(),
+                    )
+                    .await?;
+                    self.service_manage_deploy_response_payload(
+                        raw,
+                        conversation_id,
+                        request_channel,
+                        &quality_contract,
+                    )
+                    .await
+                } else {
+                    self.service_manage_target_not_found_payload(arguments, &apps)
+                        .await
                 }
-                parsed
             }
             "start" | "restart" => {
                 let call = Self::service_manage_control_call("restart", arguments);
@@ -7479,6 +8637,150 @@ impl Agent {
             );
         }
         Ok(formatted)
+    }
+
+    async fn service_manage_deploy_response_payload(
+        &self,
+        raw: String,
+        conversation_id: Option<&str>,
+        _request_channel: &str,
+        quality_contract: &AppDeployQualityContract,
+    ) -> serde_json::Value {
+        let mut parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "status": "ok", "raw": raw }));
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("tool".to_string(), serde_json::json!("service_manage"));
+            if let Some(app_id) = obj
+                .get("app_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+            {
+                obj.insert("service_id".to_string(), serde_json::json!(app_id.clone()));
+                let title = obj
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Service")
+                    .to_string();
+                let url = obj
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("/apps/{}/", app_id));
+                let app_type = obj
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("static")
+                    .to_string();
+                if let Some(cid) = conversation_id {
+                    self.persist_last_deployed_app_context(cid, &app_id, &title, &url)
+                        .await;
+                }
+                let quality_report = self
+                    .run_app_quality_check_for_deploy(&app_id, &url, &app_type, quality_contract)
+                    .await;
+                obj.insert(
+                    "quality_check".to_string(),
+                    Self::app_quality_tool_summary(quality_report.as_ref(), quality_contract),
+                );
+            }
+        }
+        parsed
+    }
+
+    async fn app_deploy_response_payload(
+        &self,
+        raw: String,
+        conversation_id: Option<&str>,
+        quality_contract: &AppDeployQualityContract,
+    ) -> serde_json::Value {
+        let mut parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "status": "ok", "raw": raw }));
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("tool".to_string(), serde_json::json!("app_deploy"));
+            if let Some(app_id) = obj
+                .get("app_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+            {
+                let title = obj
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("App")
+                    .to_string();
+                let url = obj
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("/apps/{}/", app_id));
+                let app_type = obj
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("static")
+                    .to_string();
+                if let Some(cid) = conversation_id {
+                    self.persist_last_deployed_app_context(cid, &app_id, &title, &url)
+                        .await;
+                }
+                let quality_report = self
+                    .run_app_quality_check_for_deploy(&app_id, &url, &app_type, quality_contract)
+                    .await;
+                obj.insert(
+                    "quality_check".to_string(),
+                    Self::app_quality_tool_summary(quality_report.as_ref(), quality_contract),
+                );
+            }
+        }
+        parsed
+    }
+
+    pub(crate) async fn handle_app_deploy_tool_call(
+        &self,
+        arguments: &serde_json::Value,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        _request_channel: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<String> {
+        let apps = self.app_registry.list().await;
+        let mut deploy_args = Self::normalize_app_deploy_arguments(arguments);
+        let recent_app_id = self
+            .recent_conversation_app_id(conversation_id, &apps)
+            .await;
+        if Self::deploy_create_should_reuse_recent_app(
+            "create",
+            &deploy_args,
+            recent_app_id.is_some(),
+        ) {
+            if let Some(app_id) = recent_app_id {
+                if let Some(obj) = deploy_args.as_object_mut() {
+                    obj.insert("app_id".to_string(), serde_json::json!(app_id));
+                }
+            }
+        }
+        let quality_contract = self
+            .app_deploy_quality_contract(&deploy_args, conversation_id)
+            .await;
+        let llm_env = self.app_model_env_vars();
+        let raw = crate::actions::app::app_deploy(
+            &self.config_dir,
+            &self.data_dir,
+            &deploy_args,
+            &self.app_registry,
+            &llm_env,
+            stream_tx.cloned(),
+        )
+        .await?;
+        Ok(self
+            .app_deploy_response_payload(raw, conversation_id, &quality_contract)
+            .await
+            .to_string())
     }
 
     pub(crate) async fn handle_work_manage_tool_call(
@@ -8094,16 +9396,14 @@ impl Agent {
             Err(error) => reasons.push(format!("lease_status_unknown={}", error)),
         }
 
+        let now = chrono::Utc::now();
         let background_active = self
             .background_sessions
             .list()
             .await
             .into_iter()
             .filter(|session| {
-                matches!(
-                    session.status,
-                    crate::core::background_session::BackgroundSessionStatus::Active
-                )
+                background_session_blocks_gepa_idle(session, now, quiet_window_seconds)
             })
             .count();
         if background_active > 0 {
@@ -8206,11 +9506,11 @@ impl Agent {
         }
         let agent = self.clone();
         tokio::spawn(async move {
+            let _guard = GepaIdleWorkerActiveGuard;
             let result = agent.run_gepa_idle_worker().await;
             if let Err(error) = result {
                 tracing::warn!("GEPA pending job worker failed: {}", error);
             }
-            GEPA_IDLE_WORKER_ACTIVE.store(false, Ordering::Release);
         });
     }
 
@@ -8246,26 +9546,19 @@ impl Agent {
         proposal_id: &str,
         request: &str,
         quiet_window_seconds: i64,
+        opportunity_context: Option<serde_json::Value>,
     ) -> Result<String> {
+        let promotion_settings =
+            gepa_prompt_optimization_promotion_settings(opportunity_context.as_ref());
         self.queue_gepa_job(
             crate::core::self_evolve::gepa_bridge::GepaJobKind::Run,
             request,
-            serde_json::json!({
-                "source": "prompt_optimization_approval",
-                "proposal_id": proposal_id,
-            }),
+            gepa_prompt_optimization_metadata(proposal_id, opportunity_context),
             None,
             None,
             None,
             quiet_window_seconds,
-            crate::core::self_evolve::gepa_bridge::GepaPromotionSettings {
-                apply_promotion: true,
-                canary_rollout_percent: 20,
-                canary_min_samples_per_version: 25,
-                canary_min_success_gain: 0.03,
-                canary_max_sign_test_p_value: 0.10,
-                replay_log_limit: 160,
-            },
+            promotion_settings,
             crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds(),
             true,
         )
@@ -8339,14 +9632,25 @@ impl Agent {
                             .or_else(|| value.get("error"))
                             .and_then(|value| value.as_str())
                             .unwrap_or("GEPA job returned a failed status");
-                        let (status, status_path) =
+                        let (status, status_path) = if gepa_job_failure_retryable(&value) {
                             crate::core::self_evolve::gepa_bridge::fail_claimed_job(
                                 &project_root,
                                 &running_path,
                                 job_for_failure,
                                 message,
                             )
-                            .await?;
+                            .await?
+                        } else {
+                            let status_path =
+                                crate::core::self_evolve::gepa_bridge::fail_claimed_job_terminal(
+                                    &project_root,
+                                    &running_path,
+                                    job_for_failure,
+                                    message,
+                                )
+                                .await?;
+                            ("failed".to_string(), status_path)
+                        };
                         let failed = serde_json::json!({
                             "status": status,
                             "status_path": status_path.display().to_string(),
@@ -8439,11 +9743,12 @@ impl Agent {
         let project_root = self.find_project_root();
         match job.kind {
             crate::core::self_evolve::gepa_bridge::GepaJobKind::Export => {
-                let result = crate::core::self_evolve::gepa_bridge::export_optimization_bundle(
+                let result = crate::core::self_evolve::gepa_bridge::export_optimization_bundle_with_metadata(
                     &self.storage,
                     &project_root,
                     &job.request,
                     job.promotion.replay_log_limit,
+                    Some(&job.metadata),
                 )
                 .await?;
                 Ok(serde_json::to_value(result)?)
@@ -8452,11 +9757,12 @@ impl Agent {
                 let export_path = if let Some(path) = job.export_path.as_ref() {
                     resolve_gepa_workspace_path(&project_root, path)?
                 } else {
-                    let export = crate::core::self_evolve::gepa_bridge::export_optimization_bundle(
+                    let export = crate::core::self_evolve::gepa_bridge::export_optimization_bundle_with_metadata(
                         &self.storage,
                         &project_root,
                         &job.request,
                         job.promotion.replay_log_limit,
+                        Some(&job.metadata),
                     )
                     .await?;
                     std::path::PathBuf::from(export.export_path)
@@ -8498,6 +9804,18 @@ impl Agent {
                     }
                 };
                 let budget_run_id = job.run_id.as_deref().unwrap_or(&job.job_id);
+                if let Err(error) =
+                    crate::core::self_evolve::gepa_bridge::validate_python_optimizer_runtime(
+                        &runtime,
+                    )
+                    .await
+                {
+                    return Ok(serde_json::json!({
+                        "status": "blocked",
+                        "mode": "gepa_run",
+                        "error": error.to_string(),
+                    }));
+                }
                 if let Err(error) = crate::core::self_evolve::gepa_bridge::reserve_gepa_budget(
                     &self.storage,
                     budget_run_id,
@@ -9060,6 +10378,82 @@ impl Agent {
             results.push(value);
         }
 
+        if !imported.arkdistill_candidates.is_empty() {
+            let current_arkdistill_raw = self
+                .storage
+                .get(crate::core::agent::ark_distill::ARKDISTILL_PROFILE_KEY)
+                .await
+                .ok()
+                .flatten();
+            let result = crate::core::agent::ark_distill::evaluate_external_arkdistill_candidates(
+                request,
+                current_arkdistill_raw.as_deref(),
+                imported.arkdistill_candidates,
+            )?;
+            let mut promotion_applied = false;
+            if result.promoted && apply_promotion {
+                if let Some(profile) = result.promoted_profile.as_ref() {
+                    if let Some(existing_baseline) = current_arkdistill_raw.as_ref() {
+                        let _ = self
+                            .storage
+                            .set(
+                                crate::core::agent::ark_distill::ARKDISTILL_PROFILE_BASELINE_SNAPSHOT_KEY,
+                                existing_baseline,
+                            )
+                            .await;
+                    }
+                    self.storage
+                        .set(
+                            crate::core::agent::ark_distill::ARKDISTILL_PROFILE_KEY,
+                            &serde_json::to_vec(profile)?,
+                        )
+                        .await?;
+                    promotion_applied = true;
+                }
+            }
+            let mut value = serde_json::to_value(&result)?;
+            if let serde_json::Value::Object(obj) = &mut value {
+                obj.insert(
+                    "mode".to_string(),
+                    serde_json::json!("gepa_import_arkdistill_profile"),
+                );
+                obj.insert(
+                    "promotion_applied".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
+                    "runtime_promotion_applied".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
+                    "apply_promotion_requested".to_string(),
+                    serde_json::json!(apply_promotion),
+                );
+                obj.insert(
+                    "promotion_requires_user_acceptance".to_string(),
+                    serde_json::json!(true),
+                );
+                obj.insert(
+                    "candidate_source_path".to_string(),
+                    serde_json::json!(candidates_path.display().to_string()),
+                );
+                obj.insert(
+                    "rollback_available".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+            }
+            if let Ok(bytes) = serde_json::to_vec(&value) {
+                let _ = self
+                    .storage
+                    .set(
+                        crate::core::agent::ark_distill::ARKDISTILL_PROFILE_LAST_RESULT_KEY,
+                        &bytes,
+                    )
+                    .await;
+            }
+            results.push(value);
+        }
+
         if !imported.router_learning_candidates.is_empty() {
             let router_learning_candidates = imported.router_learning_candidates;
             results.push(serde_json::json!({
@@ -9388,6 +10782,17 @@ impl Agent {
                                 let budget_run_id = budget_run_id
                                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                                 if let Err(error) =
+                                    crate::core::self_evolve::gepa_bridge::validate_python_optimizer_runtime(
+                                        &runtime,
+                                    )
+                                    .await
+                                {
+                                    serde_json::json!({
+                                        "status": "blocked",
+                                        "mode": "gepa_run",
+                                        "error": error.to_string(),
+                                    })
+                                } else if let Err(error) =
                                     crate::core::self_evolve::gepa_bridge::reserve_gepa_budget(
                                         &self.storage,
                                         &budget_run_id,
@@ -9556,7 +10961,14 @@ impl Agent {
                                     state.min_success_gain,
                                     state.max_sign_test_p_value,
                                 );
-                            if replay_eval.promote {
+                            if replay_eval.promote
+                                && stable_deployment_cadence_allows_auto_promotion(
+                                    &self.storage,
+                                    "routing_policy",
+                                    &candidate_version,
+                                )
+                                .await
+                            {
                                 self.storage
                                     .set(
                                         crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
@@ -9574,6 +10986,12 @@ impl Agent {
                                     .await?;
                                 promoted_directly_to_baseline = true;
                                 canary_state = Some(disabled_state);
+                                record_auto_stable_deployment(
+                                    &self.storage,
+                                    "routing_policy",
+                                    &candidate_version,
+                                )
+                                .await;
                             }
                             replay_result = Some(replay_eval);
                         }
@@ -9896,7 +11314,14 @@ impl Agent {
                                 state.min_success_gain,
                                 state.max_sign_test_p_value,
                             );
-                            if replay_eval.promote {
+                            if replay_eval.promote
+                                && stable_deployment_cadence_allows_auto_promotion(
+                                    &self.storage,
+                                    "prompt",
+                                    &candidate_version,
+                                )
+                                .await
+                            {
                                 self.storage
                                     .set(
                                         crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_KEY,
@@ -9914,6 +11339,12 @@ impl Agent {
                                     .await?;
                                 promoted_directly_to_baseline = true;
                                 canary_state = Some(disabled_state);
+                                record_auto_stable_deployment(
+                                    &self.storage,
+                                    "prompt",
+                                    &candidate_version,
+                                )
+                                .await;
                             }
                             replay_result = Some(replay_eval);
                         }
@@ -10303,7 +11734,14 @@ impl Agent {
                         state.min_success_gain,
                         state.max_sign_test_p_value,
                     );
-                    if replay_eval.promote {
+                    if replay_eval.promote
+                        && stable_deployment_cadence_allows_auto_promotion(
+                            &self.storage,
+                            "specialist_prompt",
+                            &candidate_version,
+                        )
+                        .await
+                    {
                         self.storage
                             .set(
                                 crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
@@ -10321,6 +11759,12 @@ impl Agent {
                             .await?;
                         promoted_directly_to_baseline = true;
                         canary_state = Some(disabled_state);
+                        record_auto_stable_deployment(
+                            &self.storage,
+                            "specialist_prompt",
+                            &candidate_version,
+                        )
+                        .await;
                     }
                     replay_result = Some(replay_eval);
                 }
@@ -10552,28 +11996,9 @@ impl Agent {
         }
     }
 
-    /// Determine the project root (where Cargo.toml lives).
+    /// Determine the root used for GEPA artifacts and workspace-relative paths.
     fn find_project_root(&self) -> std::path::PathBuf {
-        // In Docker, the app is at /app
-        let app_path = std::path::Path::new("/app");
-        if app_path.join("Cargo.toml").exists() {
-            return app_path.to_path_buf();
-        }
-        // In development, walk up from current dir
-        if let Ok(cwd) = std::env::current_dir() {
-            let mut dir = cwd.as_path();
-            loop {
-                if dir.join("Cargo.toml").exists() {
-                    return dir.to_path_buf();
-                }
-                match dir.parent() {
-                    Some(parent) => dir = parent,
-                    None => break,
-                }
-            }
-        }
-        // Fallback
-        std::path::PathBuf::from(".")
+        crate::core::self_evolve::gepa_bridge::resolve_gepa_project_root()
     }
 }
 
@@ -10590,22 +12015,120 @@ fn action_text_arg(arguments: &serde_json::Value, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn normalized_enum_token(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn browser_profile_target_kind_from_arguments(
+    arguments: &serde_json::Value,
+) -> Result<Option<crate::core::BrowserProfileTargetKind>> {
+    let Some(raw) = action_text_arg(arguments, "target_kind") else {
+        return Ok(None);
+    };
+    serde_json::from_value::<crate::core::BrowserProfileTargetKind>(serde_json::Value::String(
+        normalized_enum_token(&raw),
+    ))
+    .map(Some)
+    .map_err(|error| anyhow::anyhow!("Invalid browser profile target kind: {}", error))
+}
+
+fn browser_profile_login_state_from_arguments(
+    arguments: &serde_json::Value,
+) -> Result<Option<crate::core::BrowserLoginState>> {
+    let Some(raw) = action_text_arg(arguments, "login_state") else {
+        return Ok(None);
+    };
+    serde_json::from_value::<crate::core::BrowserLoginState>(serde_json::Value::String(
+        normalized_enum_token(&raw),
+    ))
+    .map(Some)
+    .map_err(|error| anyhow::anyhow!("Invalid browser profile login state: {}", error))
+}
+
+fn browser_profile_tags_from_arguments(arguments: &serde_json::Value) -> Vec<String> {
+    let Some(value) = arguments.get("tags") else {
+        return Vec::new();
+    };
+    let values = if let Some(items) = value.as_array() {
+        items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else if let Some(text) = value.as_str() {
+        text.split(',').map(str::to_string).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn browser_auto_task_description(
     url: Option<&str>,
+    recent_artifact: Option<&ConversationArtifactContext>,
     task: Option<String>,
     expectation: Option<String>,
 ) -> String {
-    let base = task
+    let explicit_url = url
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let recent_artifact = if explicit_url.is_none() {
+        recent_artifact.and_then(|artifact| {
+            let artifact_url = artifact.url.trim();
+            (!artifact_url.is_empty()).then_some((artifact, artifact_url))
+        })
+    } else {
+        None
+    };
+    let task_text = task
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| {
-            url.map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|url| format!("Open {}", url))
-        })
-        .unwrap_or_default();
+        .map(ToString::to_string);
+    let base = if let Some(task_text) = task_text {
+        if let Some((artifact, artifact_url)) = recent_artifact {
+            let title = artifact.title.trim();
+            let target = if title.is_empty() {
+                artifact_url.to_string()
+            } else {
+                format!("{} ({})", title, artifact_url)
+            };
+            format!(
+                "Recent actionable URL: {target}\nUse this URL when the browser task refers to the current conversation artifact and no other URL is specified.\n\nTask: {task_text}"
+            )
+        } else {
+            task_text
+        }
+    } else if let Some(url) = explicit_url {
+        format!("Open {}", url)
+    } else if let Some((artifact, artifact_url)) = recent_artifact {
+        let title = artifact.title.trim();
+        if title.is_empty() {
+            format!("Open {}", artifact_url)
+        } else {
+            format!("Open {} ({})", title, artifact_url)
+        }
+    } else {
+        String::new()
+    };
     let Some(expectation) = expectation
         .as_deref()
         .map(str::trim)
@@ -10678,12 +12201,72 @@ fn browser_auto_checkpoint_detail(
     }
 }
 
+fn browser_auto_page_snapshot_payload(
+    content: &crate::integrations::browser::PageContent,
+) -> serde_json::Value {
+    let downloads = content
+        .downloads
+        .iter()
+        .map(browser_auto_download_payload)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "title": content.title,
+        "url": content.url,
+        "body_text": safe_truncate(&content.body_text, 6_000),
+        "elements": content.elements.iter().take(50).cloned().collect::<Vec<_>>(),
+        "diagnostics": content.diagnostics,
+        "downloads": downloads,
+        "download_dir": content.download_dir,
+    })
+}
+
+fn browser_auto_download_payload(
+    download: &crate::integrations::browser::BrowserDownloadArtifact,
+) -> serde_json::Value {
+    let created_at = if download.downloaded_at.trim().is_empty() {
+        chrono::Utc::now().to_rfc3339()
+    } else {
+        download.downloaded_at.clone()
+    };
+    let mime = mime_guess::from_path(if download.path.trim().is_empty() {
+        download.filename.as_str()
+    } else {
+        download.path.as_str()
+    })
+    .first_raw()
+    .map(str::to_string);
+    let mut payload = serde_json::json!({
+        "id": download.id,
+        "filename": download.filename,
+        "path": download.path,
+        "bytes": download.bytes,
+        "url": download.url,
+        "downloaded_at": download.downloaded_at,
+        "status": download.status,
+    });
+    if !download.path.trim().is_empty() {
+        payload["source_resource"] = serde_json::json!({
+            "id": format!("browser-download:{}", download.id),
+            "path": download.path,
+            "mime": mime,
+            "bytes": download.bytes,
+            "created_at": created_at,
+            "source_action": "browser_auto",
+        });
+    }
+    payload
+}
+
 fn browser_auto_checkpoint_marker(
     view: crate::core::browser_session::BrowserSessionView,
 ) -> String {
     let marker_kind = browser_auto_checkpoint_kind(&view);
     let session_id = view.id.clone();
     let detail = browser_auto_checkpoint_detail(&view, marker_kind);
+    let current_page = view
+        .last_page
+        .as_ref()
+        .map(browser_auto_page_snapshot_payload);
     render_tool_completion_marker_with_data(
         "browser_auto",
         marker_kind.marker_status(),
@@ -10691,6 +12274,7 @@ fn browser_auto_checkpoint_marker(
         serde_json::json!({
             "success": marker_kind.success(),
             "session_id": session_id,
+            "current_page": current_page,
             "session": view,
         }),
     )
@@ -10895,7 +12479,159 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments,
+            activity_label: None,
         }
+    }
+
+    fn background_session_with_activity(
+        status: crate::core::background_session::BackgroundSessionStatus,
+        last_activity_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::core::background_session::BackgroundSession {
+        crate::core::background_session::BackgroundSession {
+            id: "background-session-1".to_string(),
+            title: "Background work".to_string(),
+            objective: "Do background work".to_string(),
+            status,
+            summary: None,
+            current_focus: None,
+            waiting_on: None,
+            next_expected_action: None,
+            working_memory: None,
+            last_error: None,
+            preferred_delivery_channel: None,
+            channel: None,
+            conversation_id: None,
+            project_id: None,
+            linked_task_ids: Vec::new(),
+            linked_watcher_ids: Vec::new(),
+            policy: crate::core::background_session::BackgroundSessionPolicy::default(),
+            created_at: last_activity_at,
+            updated_at: last_activity_at,
+            last_activity_at,
+            last_consolidated_at: None,
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stale_active_background_sessions_do_not_block_gepa_idle() {
+        let now = chrono::Utc::now();
+        let quiet_window_seconds = 300;
+
+        assert!(background_session_blocks_gepa_idle(
+            &background_session_with_activity(
+                crate::core::background_session::BackgroundSessionStatus::Active,
+                now - chrono::Duration::seconds(30),
+            ),
+            now,
+            quiet_window_seconds,
+        ));
+        assert!(!background_session_blocks_gepa_idle(
+            &background_session_with_activity(
+                crate::core::background_session::BackgroundSessionStatus::Active,
+                now - chrono::Duration::seconds(900),
+            ),
+            now,
+            quiet_window_seconds,
+        ));
+        assert!(!background_session_blocks_gepa_idle(
+            &background_session_with_activity(
+                crate::core::background_session::BackgroundSessionStatus::Waiting,
+                now,
+            ),
+            now,
+            quiet_window_seconds,
+        ));
+    }
+
+    #[test]
+    fn gepa_idle_worker_guard_clears_active_flag_on_drop() {
+        GEPA_IDLE_WORKER_ACTIVE.store(true, Ordering::Release);
+        {
+            let _guard = GepaIdleWorkerActiveGuard;
+        }
+        assert!(!GEPA_IDLE_WORKER_ACTIVE.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn gepa_job_value_failed_treats_blocked_as_unsuccessful() {
+        let blocked = json!({
+            "status": "blocked",
+            "mode": "gepa_run",
+            "error": "budget gate prevented optimizer execution"
+        });
+
+        assert!(gepa_job_value_failed(&blocked));
+    }
+
+    #[test]
+    fn gepa_job_failure_retry_policy_does_not_repeat_bounded_terminal_failures() {
+        let timeout = json!({
+            "status": "timed_out",
+            "timeout_seconds": 600
+        });
+        let blocked = json!({
+            "status": "blocked",
+            "error": "budget gate prevented optimizer execution"
+        });
+        let failed = json!({
+            "status": "failed",
+            "error": "optimizer process exited unsuccessfully"
+        });
+        let format_failure = json!({
+            "status": "failed",
+            "error": "Expected to find output fields in the LM response"
+        });
+
+        assert!(!gepa_job_failure_retryable(&timeout));
+        assert!(!gepa_job_failure_retryable(&blocked));
+        assert!(!gepa_job_failure_retryable(&failed));
+        assert!(!gepa_job_failure_retryable(&format_failure));
+    }
+
+    #[test]
+    fn gepa_prompt_optimization_metadata_attaches_opportunity_context() {
+        let metadata = gepa_prompt_optimization_metadata(
+            " prompt-opt-section-custom ",
+            Some(json!({
+                "section": "custom",
+                "holdout_cases": [
+                    { "trace_id": "trace-1", "outcome": "slow" }
+                ],
+                "opportunity_score": 7.25
+            })),
+        );
+
+        assert_eq!(
+            metadata.get("proposal_id").and_then(|value| value.as_str()),
+            Some("prompt-opt-section-custom")
+        );
+        assert_eq!(
+            metadata
+                .get("opportunity_context")
+                .and_then(|value| value.get("section"))
+                .and_then(|value| value.as_str()),
+            Some("custom")
+        );
+        assert!(metadata
+            .get("opportunity_context")
+            .and_then(|value| value.get("holdout_cases"))
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.len() == 1));
+    }
+
+    #[test]
+    fn gepa_prompt_optimization_promotion_uses_opportunity_confidence_target() {
+        let default_settings = gepa_prompt_optimization_promotion_settings(None);
+        assert_eq!(default_settings.canary_min_samples_per_version, 25);
+
+        let profiled_settings = gepa_prompt_optimization_promotion_settings(Some(&json!({
+            "confidence": {
+                "confidence_sample_target": 64
+            }
+        })));
+
+        assert_eq!(profiled_settings.canary_min_samples_per_version, 64);
     }
 
     #[test]
@@ -10957,6 +12693,9 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 page_url: None,
                 page_title: None,
+                download_dir: None,
+                downloads: Vec::new(),
+                last_page: None,
                 live_view_enabled: false,
                 live_view_port: None,
                 live_view_path: None,
@@ -11319,6 +13058,201 @@ mod tests {
     }
 
     #[test]
+    fn deploy_create_reuses_recent_app_without_explicit_duplicate_signal() {
+        assert!(
+            Agent::deploy_create_should_reuse_recent_app(
+                "create",
+                &json!({ "files": { "index.html": "<html></html>" } }),
+                true
+            ),
+            "create without an explicit duplicate signal should target the recent app"
+        );
+        assert!(
+            !Agent::deploy_create_should_reuse_recent_app(
+                "create",
+                &json!({
+                    "allow_duplicate": true,
+                    "files": { "index.html": "<html></html>" }
+                }),
+                true
+            ),
+            "explicit duplicate permission should allow a separate new app"
+        );
+        assert!(
+            !Agent::deploy_create_should_reuse_recent_app(
+                "update",
+                &json!({ "files": { "index.html": "<html></html>" } }),
+                true
+            ),
+            "update operations should resolve an existing target instead of being treated as new app creation"
+        );
+    }
+
+    #[test]
+    fn app_deploy_quality_contract_prefers_structured_deploy_acceptance() {
+        let contract = Agent::app_deploy_quality_contract_from_inputs(
+            &json!({
+                "request_context": "Build an inventory manager with durable server storage and complete item editing.",
+                "acceptance_criteria": [
+                    "Items can be created.",
+                    "Items can be edited.",
+                    "Items can be deleted."
+                ]
+            }),
+            &[
+                ("user", "older app request"),
+                ("assistant", "working on it"),
+                ("user", "latest unrelated follow-up"),
+            ],
+        );
+
+        assert_eq!(
+            contract.request_context,
+            "Build an inventory manager with durable server storage and complete item editing."
+        );
+        assert_eq!(
+            contract.sub_goals,
+            vec![
+                "Items can be created.".to_string(),
+                "Items can be edited.".to_string(),
+                "Items can be deleted.".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn app_deploy_quality_contract_falls_back_to_recent_user_intent() {
+        let contract = Agent::app_deploy_quality_contract_from_inputs(
+            &json!({
+                "title": "Generated tool",
+                "files": { "index.html": "<!doctype html><html><body>Tool</body></html>" }
+            }),
+            &[
+                (
+                    "user",
+                    "Build a planning tool with create, update, delete, and persistent records.",
+                ),
+                ("assistant", "I will build it."),
+            ],
+        );
+
+        assert_eq!(
+            contract.request_context,
+            "Build a planning tool with create, update, delete, and persistent records."
+        );
+        assert_eq!(
+            contract.sub_goals,
+            vec![
+                "Build a planning tool with create, update, delete, and persistent records."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn blocking_runtime_diagnostics_are_generic_validation_failures() {
+        let content = crate::integrations::browser::PageContent {
+            title: "Demo".to_string(),
+            url: "http://localhost/apps/demo/".to_string(),
+            body_text: "Loaded".to_string(),
+            elements: vec![],
+            diagnostics: vec![crate::integrations::browser::PageDiagnostic {
+                time: "2026-05-28T00:00:00Z".to_string(),
+                kind: "response".to_string(),
+                severity: "error".to_string(),
+                message: "HTTP 502".to_string(),
+                url: "http://localhost/apps/demo/__agentark/http/fetch".to_string(),
+                resource_type: "fetch".to_string(),
+            }],
+            downloads: vec![],
+            download_dir: None,
+        };
+
+        let issue = Agent::first_blocking_rendered_app_diagnostic(&content)
+            .expect("error diagnostics should block app validation");
+        assert!(
+            issue.contains("response"),
+            "diagnostic summary should name the structured failing diagnostic kind"
+        );
+
+        let warning_only = crate::integrations::browser::PageContent {
+            diagnostics: vec![crate::integrations::browser::PageDiagnostic {
+                time: "2026-05-28T00:00:00Z".to_string(),
+                severity: "warning".to_string(),
+                kind: "response".to_string(),
+                message: "HTTP 404".to_string(),
+                url: "http://localhost/apps/demo/missing.png".to_string(),
+                resource_type: "image".to_string(),
+            }],
+            ..content
+        };
+        assert!(
+            Agent::first_blocking_rendered_app_diagnostic(&warning_only).is_none(),
+            "ordinary non-error response warnings should remain advisory"
+        );
+    }
+
+    #[test]
+    fn passive_host_resource_errors_do_not_block_rendered_app_validation() {
+        let content = crate::integrations::browser::PageContent {
+            title: "Demo".to_string(),
+            url: "http://localhost:8990/apps/demo/".to_string(),
+            body_text: "Loaded dashboard".to_string(),
+            elements: vec![],
+            diagnostics: vec![
+                crate::integrations::browser::PageDiagnostic {
+                    time: "2026-06-03T00:00:00Z".to_string(),
+                    kind: "response".to_string(),
+                    severity: "error".to_string(),
+                    message: "HTTP 401".to_string(),
+                    url: "http://localhost:8990/favicon.ico".to_string(),
+                    resource_type: "image".to_string(),
+                },
+                crate::integrations::browser::PageDiagnostic {
+                    time: "2026-06-03T00:00:00Z".to_string(),
+                    kind: "response".to_string(),
+                    severity: "error".to_string(),
+                    message: "HTTP 401".to_string(),
+                    url: "http://localhost:8990/fonts/ui.woff2".to_string(),
+                    resource_type: "font".to_string(),
+                },
+            ],
+            downloads: vec![],
+            download_dir: None,
+        };
+
+        assert!(
+            Agent::first_blocking_rendered_app_diagnostic(&content).is_none(),
+            "host chrome/passive asset failures outside the rendered app scope should not make a loaded app look broken"
+        );
+    }
+
+    #[test]
+    fn app_scoped_fetch_errors_still_block_rendered_app_validation() {
+        let content = crate::integrations::browser::PageContent {
+            title: "Demo".to_string(),
+            url: "http://localhost:8990/apps/demo/".to_string(),
+            body_text: "Loaded dashboard".to_string(),
+            elements: vec![],
+            diagnostics: vec![crate::integrations::browser::PageDiagnostic {
+                time: "2026-06-03T00:00:00Z".to_string(),
+                kind: "response".to_string(),
+                severity: "error".to_string(),
+                message: "HTTP 500".to_string(),
+                url: "http://localhost:8990/apps/demo/api/transactions".to_string(),
+                resource_type: "fetch".to_string(),
+            }],
+            downloads: vec![],
+            download_dir: None,
+        };
+
+        assert!(
+            Agent::first_blocking_rendered_app_diagnostic(&content).is_some(),
+            "actual app-owned fetch failures should still surface as validation blockers"
+        );
+    }
+
+    #[test]
     fn normalize_app_deploy_arguments_unwraps_double_encoded_payload() {
         let payload = "\"{\\\"title\\\":\\\"Demo\\\",\\\"files\\\":{\\\"index.html\\\":\\\"<h1>ok</h1>\\\"}}\"";
         let input = json!({
@@ -11558,6 +13492,7 @@ mod tests {
     fn browser_auto_task_description_uses_explicit_task_without_url_prefix() {
         let task = browser_auto_task_description(
             Some("https://www.wikipedia.org"),
+            None,
             Some(
                 "Open https://www.wikipedia.org, search for OpenAI, then stop on the article"
                     .to_string(),
@@ -11573,7 +13508,7 @@ mod tests {
 
     #[test]
     fn browser_auto_task_description_falls_back_to_url_when_task_missing() {
-        let task = browser_auto_task_description(Some("https://example.com"), None, None);
+        let task = browser_auto_task_description(Some("https://example.com"), None, None, None);
 
         assert_eq!(task, "Open https://example.com");
     }
@@ -11582,6 +13517,7 @@ mod tests {
     fn browser_auto_task_description_preserves_explicit_expectation() {
         let task = browser_auto_task_description(
             Some("https://www.wikipedia.org"),
+            None,
             Some("Open Wikipedia and search for OpenAI.".to_string()),
             Some(
                 "When the OpenAI article is visible, stop and ask: \"Should I inspect the History section or the Products section?\""
@@ -11593,6 +13529,61 @@ mod tests {
             task,
             "Open Wikipedia and search for OpenAI.\n\nExpected checkpoint: When the OpenAI article is visible, stop and ask: \"Should I inspect the History section or the Products section?\""
         );
+    }
+
+    #[test]
+    fn browser_auto_task_description_uses_recent_artifact_url_when_url_missing() {
+        let artifact = ConversationArtifactContext {
+            artifact_type: "app".to_string(),
+            artifact_id: "demo-app".to_string(),
+            title: "Demo App".to_string(),
+            summary: "Recently deployed app".to_string(),
+            url: "/apps/demo-app/".to_string(),
+            related_actions: vec!["service_manage".to_string()],
+            updated_at: "2026-06-02T00:00:00Z".to_string(),
+        };
+
+        let task = browser_auto_task_description(
+            None,
+            Some(&artifact),
+            Some("Open the page and take a full-page snapshot.".to_string()),
+            None,
+        );
+
+        assert!(
+            task.contains("/apps/demo-app/"),
+            "the browser task should include the structured artifact URL"
+        );
+        assert!(
+            task.contains("Open the page and take a full-page snapshot."),
+            "the browser task should preserve the model's requested browser work"
+        );
+    }
+
+    #[test]
+    fn app_quality_summary_does_not_repair_for_unavailable_advisory_judge() {
+        let contract = AppDeployQualityContract {
+            request_context: "Build a usable dashboard.".to_string(),
+            sub_goals: vec!["Build a usable dashboard.".to_string()],
+        };
+        let report = json!({
+            "status": "concerns",
+            "browser_ok": true,
+            "judge": {
+                "available": false,
+                "passed": false,
+                "summary": "The advisory quality judge was unavailable."
+            },
+            "judge_concerns": ["The advisory quality judge was unavailable."]
+        });
+
+        let summary = Agent::app_quality_tool_summary(Some(&report), &contract);
+
+        assert_eq!(
+            summary["needs_repair"], false,
+            "an unavailable advisory judge must not convert a served app into a repair loop"
+        );
+        assert_eq!(summary["judge_passed"], serde_json::Value::Null);
     }
 
     #[test]

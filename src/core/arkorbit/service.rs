@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -14,7 +14,7 @@ use crate::storage::Storage;
 use super::models::{
     Orbit, OrbitChatMessage, OrbitChatTranscriptSummary, OrbitFileEntry, OrbitManifest, OrbitUpdate,
 };
-use super::store::{LayeredStore, ResolvedModule};
+use super::store::{validate_readable_orbit_path, LayeredStore, ResolvedModule};
 
 #[derive(Clone)]
 pub struct ArkOrbitService {
@@ -30,6 +30,25 @@ impl ArkOrbitService {
 
     fn now() -> String {
         Utc::now().to_rfc3339()
+    }
+
+    async fn run_store_blocking<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<LayeredStore>) -> Result<T> + Send + 'static,
+    {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || operation(store)).await?
+    }
+
+    async fn ensure_orbit_dir_async(&self, orbit_id: &str) -> Result<PathBuf> {
+        LayeredStore::validate_orbit_id(orbit_id)?;
+        let dir = self.store.orbit_dir(orbit_id);
+        tokio::fs::create_dir_all(dir.join("mod")).await?;
+        tokio::fs::create_dir_all(dir.join("data")).await?;
+        tokio::fs::create_dir_all(dir.join("assets")).await?;
+        tokio::fs::create_dir_all(dir.join(".tmp")).await?;
+        Ok(dir)
     }
 
     fn require_non_empty(value: &str, field: &str) -> Result<String> {
@@ -82,18 +101,23 @@ impl ArkOrbitService {
 
     pub async fn list_orbits(&self, user_id: &str) -> Result<Vec<Orbit>> {
         let user_id = Self::require_non_empty(user_id, "user_id")?;
-        let mut orbits = Vec::new();
-        for id in self.store.list_orbit_dirs()? {
-            match self.store.read_orbit_manifest(&id) {
-                Ok(manifest) => orbits.push(Orbit::from(manifest)),
-                Err(error) => tracing::warn!(
-                    target: "arkorbit.fs",
-                    orbit_id = %id,
-                    error = %error,
-                    "Skipping unreadable ArkOrbit manifest"
-                ),
-            }
-        }
+        let mut orbits = self
+            .run_store_blocking(|store| {
+                let mut orbits = Vec::new();
+                for id in store.list_orbit_dirs()? {
+                    match store.read_orbit_manifest(&id) {
+                        Ok(manifest) => orbits.push(Orbit::from(manifest)),
+                        Err(error) => tracing::warn!(
+                            target: "arkorbit.fs",
+                            orbit_id = %id,
+                            error = %error,
+                            "Skipping unreadable ArkOrbit manifest"
+                        ),
+                    }
+                }
+                Ok(orbits)
+            })
+            .await?;
         if orbits.is_empty() {
             let orbit = self
                 .create_orbit_internal(&user_id, "Home", None, None, None, true)
@@ -106,7 +130,11 @@ impl ArkOrbitService {
 
     pub async fn get_orbit(&self, orbit_id: &str) -> Result<Option<Orbit>> {
         let orbit_id = Self::require_non_empty(orbit_id, "orbit_id")?;
-        match self.store.read_orbit_manifest(&orbit_id) {
+        let orbit_id_for_read = orbit_id.clone();
+        match self
+            .run_store_blocking(move |store| store.read_orbit_manifest(&orbit_id_for_read))
+            .await
+        {
             Ok(manifest) => Ok(Some(Orbit::from(manifest))),
             Err(error) => {
                 if error
@@ -165,8 +193,13 @@ impl ArkOrbitService {
             updated_at: now,
         };
         let manifest = OrbitManifest::from(&orbit);
-        self.store.write_orbit_manifest(&manifest)?;
-        self.store.write_default_index(&orbit.id)?;
+        let orbit_id = orbit.id.clone();
+        self.run_store_blocking(move |store| {
+            store.write_orbit_manifest(&manifest)?;
+            store.write_default_index(&orbit_id)?;
+            Ok(())
+        })
+        .await?;
         Ok(orbit)
     }
 
@@ -192,43 +225,72 @@ impl ArkOrbitService {
             orbit.agent_instructions = Self::normalize_optional(agent_instructions);
         }
         orbit.updated_at = Self::now();
-        self.store
-            .write_orbit_manifest(&OrbitManifest::from(&orbit))?;
+        let manifest = OrbitManifest::from(&orbit);
+        self.run_store_blocking(move |store| store.write_orbit_manifest(&manifest))
+            .await?;
         Ok(orbit)
     }
 
     pub async fn delete_orbit(&self, orbit_id: &str) -> Result<()> {
         let orbit_id = Self::require_non_empty(orbit_id, "orbit_id")?;
-        self.store.remove_orbit(&orbit_id)
+        self.run_store_blocking(move |store| store.remove_orbit(&orbit_id))
+            .await
     }
 
-    pub fn read_orbit_index(&self, orbit_id: &str) -> Result<Vec<u8>> {
-        self.store.read_orbit_index(orbit_id)
+    pub async fn read_orbit_index_async(&self, orbit_id: &str) -> Result<Vec<u8>> {
+        let orbit_id = orbit_id.to_string();
+        self.run_store_blocking(move |store| store.read_orbit_index(&orbit_id))
+            .await
     }
 
-    pub fn resolve_module(&self, orbit_id: &str, mod_path: &str) -> Result<Option<ResolvedModule>> {
-        self.store.resolve_module(orbit_id, mod_path)
+    pub async fn resolve_module_async(
+        &self,
+        orbit_id: &str,
+        mod_path: &str,
+    ) -> Result<Option<ResolvedModule>> {
+        let orbit_id = orbit_id.to_string();
+        let mod_path = mod_path.to_string();
+        self.run_store_blocking(move |store| store.resolve_module(&orbit_id, &mod_path))
+            .await
     }
 
-    pub fn orbit_dir(&self, orbit_id: &str) -> Result<std::path::PathBuf> {
-        self.store.ensure_orbit_dir(orbit_id)
+    pub async fn orbit_dir_async(&self, orbit_id: &str) -> Result<PathBuf> {
+        self.ensure_orbit_dir_async(orbit_id).await
     }
 
-    pub fn list_orbit_files(&self, orbit_id: &str) -> Result<Vec<OrbitFileEntry>> {
-        self.store.list_orbit_files(orbit_id)
+    pub async fn list_orbit_files_async(&self, orbit_id: &str) -> Result<Vec<OrbitFileEntry>> {
+        let orbit_id = orbit_id.to_string();
+        self.run_store_blocking(move |store| store.list_orbit_files(&orbit_id))
+            .await
     }
 
-    pub fn read_orbit_file_text(&self, orbit_id: &str, path: &str) -> Result<String> {
-        self.store.read_orbit_file_text(orbit_id, path)
+    pub async fn read_orbit_file_text_async(&self, orbit_id: &str, path: &str) -> Result<String> {
+        let rel = validate_readable_orbit_path(path)?;
+        let root = self.ensure_orbit_dir_async(orbit_id).await?;
+        let path = root.join(rel);
+        let root_canon = tokio::fs::canonicalize(&root).await?;
+        let resolved = tokio::fs::canonicalize(&path).await?;
+        if !resolved.starts_with(&root_canon) {
+            bail!("arkorbit: resolved path escapes root");
+        }
+        Ok(tokio::fs::read_to_string(resolved).await?)
     }
 
-    pub fn write_orbit_file(&self, orbit_id: &str, path: &str, content: &str) -> Result<()> {
+    pub async fn write_orbit_file(&self, orbit_id: &str, path: &str, content: &str) -> Result<()> {
         self.store
-            .write_orbit_file(orbit_id, path, content.as_bytes())
+            .write_orbit_file_async(orbit_id, path, content.as_bytes())
+            .await
     }
 
-    pub fn remove_orbit_module_dir(&self, orbit_id: &str, module_name: &str) -> Result<bool> {
-        self.store.remove_orbit_module_dir(orbit_id, module_name)
+    pub async fn remove_orbit_module_dir_async(
+        &self,
+        orbit_id: &str,
+        module_name: &str,
+    ) -> Result<bool> {
+        let orbit_id = orbit_id.to_string();
+        let module_name = module_name.to_string();
+        self.run_store_blocking(move |store| store.remove_orbit_module_dir(&orbit_id, &module_name))
+            .await
     }
 
     fn messages_path(&self, orbit_id: &str) -> Result<std::path::PathBuf> {
@@ -246,48 +308,67 @@ impl ArkOrbitService {
             .join("chat-history"))
     }
 
-    pub fn chat_session_path(&self, orbit_id: &str) -> Result<std::path::PathBuf> {
+    async fn messages_path_async(&self, orbit_id: &str) -> Result<PathBuf> {
         Ok(self
-            .store
-            .ensure_orbit_dir(orbit_id)?
+            .ensure_orbit_dir_async(orbit_id)
+            .await?
+            .join("messages.jsonl"))
+    }
+
+    async fn chat_history_dir_async(&self, orbit_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .ensure_orbit_dir_async(orbit_id)
+            .await?
+            .join("data")
+            .join("chat-history"))
+    }
+
+    async fn chat_session_path_async(&self, orbit_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .ensure_orbit_dir_async(orbit_id)
+            .await?
             .join("data")
             .join("chat-session.txt"))
     }
 
-    pub fn ensure_orbit_chat_session(&self, orbit_id: &str) -> Result<String> {
+    pub async fn ensure_orbit_chat_session_async(&self, orbit_id: &str) -> Result<String> {
         LayeredStore::validate_orbit_id(orbit_id)?;
-        let path = self.chat_session_path(orbit_id)?;
-        match std::fs::read_to_string(&path) {
+        let path = self.chat_session_path_async(orbit_id).await?;
+        match tokio::fs::read_to_string(&path).await {
             Ok(raw) => {
                 let session_id = raw.trim();
                 if Uuid::parse_str(session_id).is_ok() {
                     Ok(session_id.to_string())
                 } else {
-                    self.rotate_orbit_chat_session(orbit_id)
+                    self.rotate_orbit_chat_session_async(orbit_id).await
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.rotate_orbit_chat_session(orbit_id)
+                self.rotate_orbit_chat_session_async(orbit_id).await
             }
             Err(error) => Err(error.into()),
         }
     }
 
-    pub fn rotate_orbit_chat_session(&self, orbit_id: &str) -> Result<String> {
+    pub async fn rotate_orbit_chat_session_async(&self, orbit_id: &str) -> Result<String> {
         LayeredStore::validate_orbit_id(orbit_id)?;
-        let path = self.chat_session_path(orbit_id)?;
+        let path = self.chat_session_path_async(orbit_id).await?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         let session_id = Uuid::new_v4().to_string();
-        std::fs::write(path, &session_id)?;
+        tokio::fs::write(path, &session_id).await?;
         Ok(session_id)
     }
 
-    pub fn orbit_chat_session_matches(&self, orbit_id: &str, expected: &str) -> Result<bool> {
+    pub async fn orbit_chat_session_matches_async(
+        &self,
+        orbit_id: &str,
+        expected: &str,
+    ) -> Result<bool> {
         LayeredStore::validate_orbit_id(orbit_id)?;
-        let path = self.chat_session_path(orbit_id)?;
-        match std::fs::read_to_string(path) {
+        let path = self.chat_session_path_async(orbit_id).await?;
+        match tokio::fs::read_to_string(path).await {
             Ok(raw) => Ok(raw.trim() == expected),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
@@ -314,6 +395,15 @@ impl ArkOrbitService {
 
     fn read_chat_messages_from_path(path: &Path) -> Result<Vec<OrbitChatMessage>> {
         let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self::parse_chat_messages(&raw))
+    }
+
+    async fn read_chat_messages_from_path_async(path: &Path) -> Result<Vec<OrbitChatMessage>> {
+        let raw = match tokio::fs::read_to_string(path).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
@@ -381,6 +471,18 @@ impl ArkOrbitService {
         Ok(messages.into_iter().skip(keep_from).collect())
     }
 
+    pub async fn read_orbit_chat_messages_async(
+        &self,
+        orbit_id: &str,
+        limit: usize,
+    ) -> Result<Vec<OrbitChatMessage>> {
+        LayeredStore::validate_orbit_id(orbit_id)?;
+        let path = self.messages_path_async(orbit_id).await?;
+        let messages = Self::read_chat_messages_from_path_async(&path).await?;
+        let keep_from = messages.len().saturating_sub(limit.max(1));
+        Ok(messages.into_iter().skip(keep_from).collect())
+    }
+
     pub fn list_orbit_chat_transcripts(
         &self,
         orbit_id: &str,
@@ -422,6 +524,48 @@ impl ArkOrbitService {
         Ok(summaries)
     }
 
+    pub async fn list_orbit_chat_transcripts_async(
+        &self,
+        orbit_id: &str,
+    ) -> Result<Vec<OrbitChatTranscriptSummary>> {
+        LayeredStore::validate_orbit_id(orbit_id)?;
+        let mut summaries = Vec::new();
+        let current = self
+            .read_orbit_chat_messages_async(orbit_id, usize::MAX)
+            .await?;
+        if let Some(summary) = Self::summarize_chat_transcript("current".to_string(), true, current)
+        {
+            summaries.push(summary);
+        }
+
+        let history_dir = self.chat_history_dir_async(orbit_id).await?;
+        let mut entries = match tokio::fs::read_dir(&history_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(summaries),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".jsonl").map(|value| value.to_string()) else {
+                continue;
+            };
+            if !is_valid_chat_transcript_id(&id) {
+                continue;
+            }
+            let messages = Self::read_chat_messages_from_path_async(&entry.path()).await?;
+            if let Some(summary) = Self::summarize_chat_transcript(id, false, messages) {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(summaries)
+    }
+
     pub fn read_orbit_chat_transcript(
         &self,
         orbit_id: &str,
@@ -444,55 +588,70 @@ impl ArkOrbitService {
         Ok(messages.into_iter().skip(keep_from).collect())
     }
 
-    pub fn reset_orbit_chat(&self, orbit_id: &str) -> Result<Option<OrbitChatTranscriptSummary>> {
+    pub async fn read_orbit_chat_transcript_async(
+        &self,
+        orbit_id: &str,
+        transcript_id: &str,
+        limit: usize,
+    ) -> Result<Vec<OrbitChatMessage>> {
         LayeredStore::validate_orbit_id(orbit_id)?;
-        let path = self.messages_path(orbit_id)?;
-        let messages = Self::read_chat_messages_from_path(&path)?;
+        let messages = if transcript_id == "current" {
+            self.read_orbit_chat_messages_async(orbit_id, usize::MAX)
+                .await?
+        } else {
+            if !is_valid_chat_transcript_id(transcript_id) {
+                bail!("ArkOrbit: invalid chat transcript id");
+            }
+            let path = self
+                .chat_history_dir_async(orbit_id)
+                .await?
+                .join(format!("{}.jsonl", transcript_id));
+            Self::read_chat_messages_from_path_async(&path).await?
+        };
+        let keep_from = messages.len().saturating_sub(limit.max(1));
+        Ok(messages.into_iter().skip(keep_from).collect())
+    }
+
+    pub async fn reset_orbit_chat_async(
+        &self,
+        orbit_id: &str,
+    ) -> Result<Option<OrbitChatTranscriptSummary>> {
+        LayeredStore::validate_orbit_id(orbit_id)?;
+        let path = self.messages_path_async(orbit_id).await?;
+        let messages = Self::read_chat_messages_from_path_async(&path).await?;
+        let orbit_dir = self.ensure_orbit_dir_async(orbit_id).await?;
+        let summary_path = orbit_dir.join("data").join("chat-summary.md");
         if messages.is_empty() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            let summary_path = self
-                .store
-                .ensure_orbit_dir(orbit_id)?
-                .join("data")
-                .join("chat-summary.md");
-            match std::fs::remove_file(summary_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            self.rotate_orbit_chat_session(orbit_id)?;
+            remove_file_if_exists(&path).await?;
+            remove_file_if_exists(&summary_path).await?;
+            self.rotate_orbit_chat_session_async(orbit_id).await?;
             return Ok(None);
         }
-        let history_dir = self.chat_history_dir(orbit_id)?;
-        std::fs::create_dir_all(&history_dir)?;
+        let history_dir = self.chat_history_dir_async(orbit_id).await?;
+        tokio::fs::create_dir_all(&history_dir).await?;
         let id = format!(
             "{}-{}",
             Utc::now().format("%Y%m%dT%H%M%SZ"),
             Uuid::new_v4().simple()
         );
         let archive_path = history_dir.join(format!("{}.jsonl", id));
-        std::fs::rename(&path, &archive_path)?;
-        let summary_path = self
-            .store
-            .ensure_orbit_dir(orbit_id)?
-            .join("data")
-            .join("chat-summary.md");
-        match std::fs::remove_file(summary_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.rotate_orbit_chat_session(orbit_id)?;
+        tokio::fs::rename(&path, &archive_path).await?;
+        remove_file_if_exists(&summary_path).await?;
+        self.rotate_orbit_chat_session_async(orbit_id).await?;
         Ok(Self::summarize_chat_transcript(id, false, messages))
     }
 
     pub async fn reconcile_filesystem(&self) -> Result<()> {
-        std::fs::create_dir_all(self.store.orbits_root())?;
+        tokio::fs::create_dir_all(self.store.orbits_root()).await?;
         Ok(())
+    }
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -502,4 +661,88 @@ fn is_valid_chat_transcript_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_service(data_dir: &Path) -> ArkOrbitService {
+        ArkOrbitService {
+            store: Arc::new(LayeredStore::new(data_dir)),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_chat_session_round_trips_and_rotates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = test_service(dir.path());
+        let orbit_id = Uuid::new_v4().to_string();
+
+        let first = service
+            .ensure_orbit_chat_session_async(&orbit_id)
+            .await
+            .expect("first session");
+        let second = service
+            .ensure_orbit_chat_session_async(&orbit_id)
+            .await
+            .expect("second session");
+        let rotated = service
+            .rotate_orbit_chat_session_async(&orbit_id)
+            .await
+            .expect("rotated session");
+
+        assert_eq!(first, second);
+        assert_ne!(first, rotated);
+        assert!(service
+            .orbit_chat_session_matches_async(&orbit_id, &rotated)
+            .await
+            .expect("session matches"));
+    }
+
+    #[tokio::test]
+    async fn async_chat_history_reads_recent_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = test_service(dir.path());
+        let orbit_id = Uuid::new_v4().to_string();
+        let path = service
+            .messages_path_async(&orbit_id)
+            .await
+            .expect("messages path");
+        let first = OrbitChatMessage {
+            id: Uuid::new_v4().to_string(),
+            role: "user".to_string(),
+            content: "first".to_string(),
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            status: None,
+            activity: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cost_usd: None,
+            estimated: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        };
+        let second = OrbitChatMessage {
+            content: "second".to_string(),
+            created_at: "2026-05-28T00:01:00Z".to_string(),
+            ..first.clone()
+        };
+        let lines = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).expect("first json"),
+            serde_json::to_string(&second).expect("second json")
+        );
+        tokio::fs::write(path, lines).await.expect("write messages");
+
+        let recent = service
+            .read_orbit_chat_messages_async(&orbit_id, 1)
+            .await
+            .expect("recent messages");
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, "second");
+    }
 }

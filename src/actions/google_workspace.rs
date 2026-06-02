@@ -1,10 +1,13 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub const GOOGLE_WORKSPACE_OAUTH_CONFIG_KEY: &str = "google_workspace_oauth_config";
 pub const GOOGLE_WORKSPACE_TOKENS_KEY: &str = "google_workspace_tokens";
@@ -20,6 +23,8 @@ const ADMIN_API_BASE: &str = "https://admin.googleapis.com/admin/directory/v1";
 const GWS_BINARY_ENV: &str = "AGENTARK_GWS_BINARY";
 const GWS_SKILLS_CACHE_DIR: &str = "gws_skills_cache";
 const GWS_BUNDLED_SKILLS_DIR: &str = "/app/gws-skills/skills";
+static WORKSPACE_REFRESH_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GwsHelpArgs {
@@ -437,6 +442,29 @@ fn remove_secret(config_dir: &Path, key: &str) -> Result<()> {
     Ok(())
 }
 
+fn workspace_refresh_lock_key(config_dir: &Path, _bundles: &[&str]) -> String {
+    let config_dir = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    format!(
+        "google_workspace:{}:{}",
+        GOOGLE_WORKSPACE_TOKENS_KEY,
+        config_dir.display()
+    )
+}
+
+async fn workspace_refresh_guard(config_dir: &Path) -> OwnedMutexGuard<()> {
+    let key = workspace_refresh_lock_key(config_dir, &[]);
+    let lock = {
+        let mut locks = WORKSPACE_REFRESH_LOCKS.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
+}
+
 pub fn load_saved_bundles(config_dir: &Path) -> Result<Vec<String>> {
     match read_secret_json::<Vec<String>>(config_dir, GOOGLE_WORKSPACE_BUNDLES_KEY)? {
         Some(bundles) if !bundles.is_empty() => Ok(bundles
@@ -711,6 +739,7 @@ fn sheets_api_base(_config_dir: &Path) -> &'static str {
 }
 
 async fn current_workspace_access_token(config_dir: &Path) -> Result<String> {
+    let _guard = workspace_refresh_guard(config_dir).await;
     let mut tokens = load_workspace_tokens(config_dir)?.ok_or_else(|| {
         anyhow!("Google Workspace is not connected yet. Complete the sign-in flow first.")
     })?;
@@ -1104,6 +1133,7 @@ pub async fn exchange_code(
     }
 
     let token: TokenResponse = response.json().await?;
+    let _guard = workspace_refresh_guard(config_dir).await;
     let existing = load_workspace_tokens(config_dir)?.unwrap_or(GoogleWorkspaceTokens {
         access_token: String::new(),
         refresh_token: String::new(),
@@ -2270,6 +2300,16 @@ metadata:
         let error = ensure_granted_bundle_visibility(dir.path(), &["drive".to_string()])
             .expect_err("drive should be hidden when only gmail is granted");
         assert!(error.to_string().contains("Drive"));
+    }
+
+    #[test]
+    fn workspace_refresh_lock_key_is_shared_for_bundle_order() {
+        let dir = std::path::Path::new("C:/agentark/config");
+        assert_eq!(
+            workspace_refresh_lock_key(dir, &["gmail", "calendar"]),
+            workspace_refresh_lock_key(dir, &["calendar", "gmail"])
+        );
+        assert!(workspace_refresh_lock_key(dir, &["gmail"]).contains("google_workspace"));
     }
 
     #[tokio::test]

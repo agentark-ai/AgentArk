@@ -4,10 +4,10 @@ use eframe::egui;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::core::Agent;
-use crate::core::LlmProvider;
 use crate::core::orchestra::SubAgentType;
 use crate::core::swarm::{AgentCapability, SpecialistConfig};
+use crate::core::Agent;
+use crate::core::LlmProvider;
 
 /// Active view in the GUI
 #[derive(Debug, Clone, PartialEq)]

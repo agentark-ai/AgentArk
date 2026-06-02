@@ -40,6 +40,7 @@ where
         match std::panic::AssertUnwindSafe(future).catch_unwind().await {
             Ok(output) => output.log_if_error(task_name),
             Err(payload) => {
+                crate::metrics::record_background_task_panic(task_name);
                 tracing::error!(
                     task = task_name,
                     panic = %panic_payload_to_string(payload),

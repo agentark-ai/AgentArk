@@ -81,6 +81,7 @@ const APP_SHELL_INDEX: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/core/arkorbit/l0/widgets/app-shell/index.js"
 ));
+const NODE_SYNTAX_CHECK_TIMEOUT_SECS: u64 = 60;
 const SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/core/arkorbit/l0/skills/SKILL.md"
@@ -248,20 +249,27 @@ impl LayeredStore {
         Ok(files)
     }
 
-    pub fn read_orbit_file_text(&self, orbit_id: &str, rel_path: &str) -> Result<String> {
-        let rel = validate_readable_orbit_path(rel_path)?;
-        let root = self.ensure_orbit_dir(orbit_id)?;
-        let path = root.join(rel);
-        let resolved = canonicalize_existing_under(&root, &path)?;
-        Ok(std::fs::read_to_string(resolved)?)
-    }
-
+    #[cfg(test)]
     pub fn write_orbit_file(&self, orbit_id: &str, rel_path: &str, content: &[u8]) -> Result<()> {
         let rel = validate_writable_orbit_path(rel_path)?;
         let root = self.ensure_orbit_dir(orbit_id)?;
         validate_orbit_file_content(&root, &rel, content)?;
         let path = root.join(rel);
         self.atomic_write_under_orbit(orbit_id, &path, content)
+    }
+
+    pub async fn write_orbit_file_async(
+        &self,
+        orbit_id: &str,
+        rel_path: &str,
+        content: &[u8],
+    ) -> Result<()> {
+        let rel = validate_writable_orbit_path(rel_path)?;
+        let root = self.ensure_orbit_dir(orbit_id)?;
+        validate_orbit_file_content_async(&root, &rel, content).await?;
+        let path = root.join(rel);
+        self.atomic_write_under_orbit_async(orbit_id, &path, content)
+            .await
     }
 
     pub fn remove_orbit_module_dir(&self, orbit_id: &str, module_name: &str) -> Result<bool> {
@@ -395,6 +403,30 @@ impl LayeredStore {
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+
+    async fn atomic_write_under_orbit_async(
+        &self,
+        orbit_id: &str,
+        path: &Path,
+        content: &[u8],
+    ) -> Result<()> {
+        let root = self.ensure_orbit_dir(orbit_id)?;
+        let root_canon = tokio::fs::canonicalize(&root).await?;
+        let Some(parent) = path.parent() else {
+            bail!("arkorbit: file path has no parent");
+        };
+        tokio::fs::create_dir_all(parent).await?;
+        let parent_canon = tokio::fs::canonicalize(parent).await?;
+        if !parent_canon.starts_with(&root_canon) {
+            bail!("arkorbit: target path escapes orbit directory");
+        }
+        let tmp_dir = root.join(".tmp");
+        tokio::fs::create_dir_all(&tmp_dir).await?;
+        let tmp = tmp_dir.join(format!("{}.tmp", Uuid::new_v4()));
+        tokio::fs::write(&tmp, content).await?;
+        tokio::fs::rename(&tmp, path).await?;
+        Ok(())
+    }
 }
 
 pub fn validate_writable_orbit_path(raw: &str) -> Result<PathBuf> {
@@ -486,6 +518,7 @@ fn canonicalize_existing_under(root: &Path, candidate: &Path) -> Result<PathBuf>
     Ok(candidate_canon)
 }
 
+#[cfg(test)]
 fn validate_orbit_file_content(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
     validate_orbit_json_content(rel, content)?;
     if !is_browser_javascript_path(rel) {
@@ -495,6 +528,17 @@ fn validate_orbit_file_content(root: &Path, rel: &Path, content: &[u8]) -> Resul
         .with_context(|| format!("arkorbit: {} must be valid UTF-8", rel.display()))?;
     validate_widget_module_contract(rel, source)?;
     validate_browser_javascript_syntax(root, rel, content)
+}
+
+async fn validate_orbit_file_content_async(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    validate_orbit_json_content(rel, content)?;
+    if !is_browser_javascript_path(rel) {
+        return Ok(());
+    }
+    let source = std::str::from_utf8(content)
+        .with_context(|| format!("arkorbit: {} must be valid UTF-8", rel.display()))?;
+    validate_widget_module_contract(rel, source)?;
+    validate_browser_javascript_syntax_async(root, rel, content).await
 }
 
 fn validate_orbit_json_content(rel: &Path, content: &[u8]) -> Result<()> {
@@ -764,6 +808,7 @@ fn strip_javascript_comments_and_strings(source: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn validate_browser_javascript_syntax(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
     let tmp_dir = root.join(".tmp");
     std::fs::create_dir_all(&tmp_dir)?;
@@ -790,6 +835,37 @@ fn validate_browser_javascript_syntax(root: &Path, rel: &Path, content: &[u8]) -
     }
 }
 
+async fn validate_browser_javascript_syntax_async(
+    root: &Path,
+    rel: &Path,
+    content: &[u8],
+) -> Result<()> {
+    let tmp_dir = root.join(".tmp");
+    tokio::fs::create_dir_all(&tmp_dir).await?;
+    let tmp = tmp_dir.join(format!("syntax-{}.mjs", Uuid::new_v4()));
+    tokio::fs::write(&tmp, content).await?;
+    let outcome = run_node_syntax_check_async(&tmp).await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) if is_node_not_found_error(&error) => {
+            tracing::warn!(
+                target: "arkorbit.fs",
+                path = %rel.display(),
+                "Skipping ArkOrbit JavaScript syntax validation because node is unavailable"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "arkorbit: refusing to write invalid browser JavaScript to {}",
+                rel.display()
+            )
+        }),
+    }
+}
+
+#[cfg(test)]
 fn run_node_syntax_check(path: &Path) -> Result<()> {
     let mut command = std::process::Command::new("node");
     command
@@ -817,6 +893,34 @@ fn run_node_syntax_check(path: &Path) -> Result<()> {
             bail!("syntax validation timed out");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+async fn run_node_syntax_check_async(path: &Path) -> Result<()> {
+    let mut command = tokio::process::Command::new("node");
+    command
+        .arg("--check")
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(NODE_SYNTAX_CHECK_TIMEOUT_SECS),
+        command.output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("node_not_found")
+        }
+        Ok(Err(error)) => return Err(error.into()),
+        Err(_) => bail!("syntax validation timed out"),
+    };
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!("{}", summarize_process_output(&output))
     }
 }
 

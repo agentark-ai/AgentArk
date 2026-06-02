@@ -1,15 +1,21 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
+const net = require('net');
+const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
 const { chromium, firefox } = require('playwright');
 const {
   activeManualLoginSessionForUserDataDir,
+  activePersistentProfileSessionForUserDataDir,
   browserProfileLockInfo,
+  browserSessionTimeoutMs,
   buildManualLoginBrowserArgs,
+  clearStaleProfileLockMarkers,
   closeManualLoginLog,
+  defaultRealBrowserNoSandbox,
   openManualLoginLog,
+  resolveExternalBrowserCommand,
   savedProfileUsesPersistentContext,
   waitForBrowserProfileUnlock,
   waitForManualLoginBrowserReady,
@@ -28,21 +34,63 @@ function readPositiveIntEnv(names, fallback) {
   return fallback;
 }
 
+function readBooleanEnv(names, fallback = false) {
+  const keys = Array.isArray(names) ? names : [names];
+  for (const key of keys) {
+    const value = String(process.env[key] || '').trim();
+    if (!value) continue;
+    if (/^(1|true|yes|on)$/i.test(value)) return true;
+    if (/^(0|false|no|off)$/i.test(value)) return false;
+  }
+  return fallback;
+}
+
 const PORT = process.env.PORT || 3100;
 const HOST = process.env.PLAYWRIGHT_BRIDGE_HOST || process.env.HOST || '127.0.0.1';
-const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 min inactivity timeout
+const SESSION_TIMEOUT_MS = browserSessionTimeoutMs(process.env);
 const HEADLESS = /^(1|true|yes|on)$/i.test(process.env.PLAYWRIGHT_HEADLESS || '');
 const LIVE_VIEW_PORT = Number.parseInt(process.env.PLAYWRIGHT_LIVE_VIEW_PORT || '6080', 10) || 6080;
 const LIVE_VIEW_PATH = process.env.PLAYWRIGHT_LIVE_VIEW_PATH || '/vnc.html?autoconnect=1&resize=scale&path=websockify';
 const LIVE_VIEW_ENABLED = !HEADLESS && Boolean(process.env.DISPLAY);
-const PROFILE_ROOT = process.env.PLAYWRIGHT_PROFILE_ROOT || path.join(process.env.AGENTARK_DATA || '/app/data', 'browser-profiles');
+const AGENTARK_DATA_ROOT = resolveAgentArkDataRoot();
+const PROFILE_ROOT = process.env.PLAYWRIGHT_PROFILE_ROOT || path.join(AGENTARK_DATA_ROOT, 'browser-profiles');
+const DOWNLOAD_ROOT = process.env.PLAYWRIGHT_DOWNLOAD_ROOT || path.join(AGENTARK_DATA_ROOT, 'browser-downloads');
 const BROWSER_WIDTH = readPositiveIntEnv(['PLAYWRIGHT_BROWSER_WIDTH', 'PLAYWRIGHT_VIEWPORT_WIDTH'], 1920);
 const BROWSER_HEIGHT = readPositiveIntEnv(['PLAYWRIGHT_BROWSER_HEIGHT', 'PLAYWRIGHT_VIEWPORT_HEIGHT'], 1080);
+const CLOSE_ACTIVE_PROFILE_LOCK = !/^(0|false|no|off)$/i.test(
+  String(process.env.PLAYWRIGHT_CLOSE_ACTIVE_PROFILE_LOCK || 'true').trim(),
+);
+const REAL_BROWSER_SANDBOX_FLAGS = readBooleanEnv(
+  ['PLAYWRIGHT_REAL_BROWSER_NO_SANDBOX', 'AGENTARK_REAL_BROWSER_NO_SANDBOX'],
+  defaultRealBrowserNoSandbox(),
+);
+const HOST_PROFILE_SANDBOX_FLAGS = readBooleanEnv(['PLAYWRIGHT_HOST_PROFILE_NO_SANDBOX'], false);
 
-// Active browser sessions: id -> { context, page, mode, claimed, claimedAt, lastActivity, cleanupTimer, diagnostics }
+// Active browser sessions: id -> { context, page, mode, claimed, claimedAt, lastActivity, cleanupTimer, diagnostics, downloads }
 const sessions = new Map();
 
 let browser = null;
+
+function resolveAgentArkDataRoot() {
+  const configured = String(process.env.AGENTARK_DATA || process.env.AGENTARK_DATA_DIR || '').trim();
+  if (configured) return path.resolve(configured);
+
+  let cursor = process.cwd();
+  for (let i = 0; i < 6; i++) {
+    if (
+      fs.existsSync(path.join(cursor, 'Cargo.toml')) &&
+      fs.existsSync(path.join(cursor, 'src')) &&
+      fs.existsSync(path.join(cursor, 'bridges'))
+    ) {
+      return path.join(cursor, '.agentark', 'data');
+    }
+    const parent = path.dirname(cursor);
+    if (!parent || parent === cursor) break;
+    cursor = parent;
+  }
+
+  return path.join(process.cwd(), '.agentark', 'data');
+}
 
 function normalizeBrowserName(raw) {
   const value = String(raw || '').trim().toLowerCase();
@@ -66,15 +114,22 @@ function browserChannelFor(browserName, targetKind) {
 }
 
 function buildLaunchOptions(browserName, targetKind) {
+  const hostProfile = targetKind === 'host';
   const launchOptions = {
     headless: HEADLESS,
   };
   if (browserName !== 'firefox') {
-    const args = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
+    const args = [];
+    if (!hostProfile || HOST_PROFILE_SANDBOX_FLAGS) {
+      args.push('--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage');
+    }
     if (!HEADLESS) {
       args.push('--start-maximized', `--window-size=${BROWSER_WIDTH},${BROWSER_HEIGHT}`);
     }
     launchOptions.args = args;
+    if (hostProfile) {
+      launchOptions.ignoreDefaultArgs = ['--enable-automation'];
+    }
   }
   const executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
   if (executablePath) {
@@ -82,8 +137,18 @@ function buildLaunchOptions(browserName, targetKind) {
       throw new Error(`Configured PLAYWRIGHT_EXECUTABLE_PATH does not exist: ${executablePath}`);
     }
     launchOptions.executablePath = executablePath;
+  } else if (hostProfile) {
+    const resolved = resolveRealBrowser(browserName);
+    launchOptions.executablePath = resolved.command;
+    if (resolved.fallback) {
+      console.warn(
+        `Real browser profile requested ${resolved.requestedBrowserName}, using installed ${resolved.browserName} at ${resolved.command}`,
+      );
+    }
   }
-  const channel = browserName === 'firefox' ? '' : browserChannelFor(browserName, targetKind);
+  const channel = launchOptions.executablePath || browserName === 'firefox'
+    ? ''
+    : browserChannelFor(browserName, targetKind);
   if (channel) {
     launchOptions.channel = channel;
   }
@@ -123,6 +188,8 @@ async function sessionStatePayload(session) {
     live_view_path: LIVE_VIEW_ENABLED ? LIVE_VIEW_PATH : null,
     profile_id: session.profileId || null,
     profile_name: session.profileName || null,
+    download_dir: session.downloadDir || null,
+    downloads: await sessionDownloadArtifacts(session),
   };
 }
 
@@ -131,6 +198,18 @@ function safeProfileId(raw) {
   if (!value) return '';
   const safe = value.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120);
   return safe || '';
+}
+
+function safeDownloadFilename(raw) {
+  const value = String(raw || 'download').trim() || 'download';
+  const base = path.basename(value).replace(/[<>:"/\\|?*\x00-\x1F]+/g, '_').slice(0, 160);
+  return base || 'download';
+}
+
+function browserDownloadDir(sessionId, profileId) {
+  const safeProfile = safeProfileId(profileId);
+  if (safeProfile) return path.join(DOWNLOAD_ROOT, 'profiles', safeProfile);
+  return path.join(DOWNLOAD_ROOT, 'sessions', safeProfileId(sessionId) || sessionId);
 }
 
 function profileStorageStatePath(profileId) {
@@ -181,20 +260,7 @@ function externalBrowserInitialUrl(profile, req) {
   ).trim() || 'about:blank';
 }
 
-function firstAvailableCommand(candidates) {
-  const probe = process.platform === 'win32' ? 'where' : 'which';
-  for (const candidate of candidates.filter(Boolean)) {
-    if (path.isAbsolute(candidate) && fs.existsSync(candidate)) return candidate;
-    const result = spawnSync(probe, [candidate], { encoding: 'utf8' });
-    if (result.status === 0) {
-      const found = String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-      return found || candidate;
-    }
-  }
-  return '';
-}
-
-function externalBrowserCommand(browserName) {
+function resolveRealBrowser(browserName) {
   const configured = String(
     process.env.PLAYWRIGHT_REAL_BROWSER_EXECUTABLE ||
     process.env.AGENTARK_REAL_BROWSER_EXECUTABLE ||
@@ -204,28 +270,14 @@ function externalBrowserCommand(browserName) {
     if (!fs.existsSync(configured)) {
       throw new Error(`Configured real browser executable does not exist: ${configured}`);
     }
-    return configured;
+    return {
+      browserName,
+      requestedBrowserName: browserName,
+      command: configured,
+      fallback: false,
+    };
   }
-  const windowsChrome = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  ];
-  const windowsEdge = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  ];
-  const candidates = browserName === 'edge'
-    ? ['microsoft-edge', 'msedge', ...windowsEdge]
-    : browserName === 'firefox'
-      ? ['firefox']
-      : browserName === 'chromium'
-        ? ['chromium', 'chromium-browser']
-        : ['google-chrome', 'google-chrome-stable', 'chrome', ...windowsChrome];
-  const command = firstAvailableCommand(candidates);
-  if (!command) {
-    throw new Error(`No real ${browserName} executable was found. Install ${browserName} or set PLAYWRIGHT_REAL_BROWSER_EXECUTABLE to the browser path.`);
-  }
-  return command;
+  return resolveExternalBrowserCommand(browserName);
 }
 
 function browserProfileLockedError(lockInfo, userDataDir) {
@@ -244,21 +296,62 @@ function browserProfileLockedError(lockInfo, userDataDir) {
   return err;
 }
 
-async function launchExternalBrowserProfile(browserName, userDataDir, initialUrl) {
-  const executable = externalBrowserCommand(browserName);
-  if (executable && /[\\/]/.test(executable) && !fs.existsSync(executable)) {
-    throw new Error(`Browser executable not found for ${browserName}: ${executable}`);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, readPositiveIntEnv([], ms || 1)));
+}
+
+async function reserveLocalPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = address && typeof address === 'object' ? address.port : 0;
+      server.close(() => {
+        if (port > 0) resolve(port);
+        else reject(new Error('Unable to reserve local browser debugging port'));
+      });
+    });
+  });
+}
+
+async function connectToExternalBrowserOverCdp(port, { timeoutMs = 6000, intervalMs = 150 } = {}) {
+  const endpoint = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + readPositiveIntEnv([], timeoutMs);
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      return await chromium.connectOverCDP(endpoint);
+    } catch (err) {
+      lastError = err;
+      await sleep(intervalMs);
+    }
   }
-  if (browserName !== 'firefox') {
+  const detail = lastError && lastError.message ? lastError.message : String(lastError || 'unknown error');
+  throw new Error(`Unable to attach to real browser over CDP at ${endpoint}: ${detail}`);
+}
+
+async function launchExternalBrowserProfile(browserName, userDataDir, initialUrl, {
+  remoteDebuggingPort,
+} = {}) {
+  const resolved = resolveRealBrowser(browserName);
+  const executable = resolved.command;
+  const launchBrowserName = resolved.browserName;
+  if (executable && /[\\/]/.test(executable) && !fs.existsSync(executable)) {
+    throw new Error(`Browser executable not found for ${launchBrowserName}: ${executable}`);
+  }
+  if (launchBrowserName !== 'firefox') {
     const lockInfo = browserProfileLockInfo(userDataDir);
     if (lockInfo.locked) throw browserProfileLockedError(lockInfo, userDataDir);
   }
   const args = buildManualLoginBrowserArgs({
-    browserName,
+    browserName: launchBrowserName,
     userDataDir,
     initialUrl,
     width: BROWSER_WIDTH,
     height: BROWSER_HEIGHT,
+    remoteDebuggingPort,
+    includeSandboxFlags: REAL_BROWSER_SANDBOX_FLAGS,
   });
   const displayValue = process.env.DISPLAY && process.env.DISPLAY.trim()
     ? process.env.DISPLAY
@@ -266,7 +359,15 @@ async function launchExternalBrowserProfile(browserName, userDataDir, initialUrl
   const launchEnv = { ...process.env, DISPLAY: displayValue };
   const logPath = '/tmp/agentark-manual-login.log';
   const log = openManualLoginLog(logPath);
-  writeManualLoginLog(log, `\n[${new Date().toISOString()}] launching ${executable} (${browserName}) DISPLAY=${displayValue} url=${initialUrl}\n`);
+  const fallbackNote = resolved.fallback
+    ? ` requested=${resolved.requestedBrowserName} resolved=${resolved.browserName}`
+    : '';
+  writeManualLoginLog(log, `\n[${new Date().toISOString()}] launching ${executable} (${launchBrowserName})${fallbackNote} DISPLAY=${displayValue} url=${initialUrl}\n`);
+  if (resolved.fallback) {
+    console.warn(
+      `Real browser profile requested ${resolved.requestedBrowserName}, using installed ${resolved.browserName} at ${resolved.command}`,
+    );
+  }
   const child = spawn(executable, args, {
     detached: true,
     stdio: ['ignore', log ? 'pipe' : 'ignore', log ? 'pipe' : 'ignore'],
@@ -304,7 +405,75 @@ async function launchExternalBrowserProfile(browserName, userDataDir, initialUrl
     throw err;
   }
   child.unref();
-  return { process: child, executable, initialUrl };
+  return {
+    process: child,
+    executable,
+    initialUrl,
+    browserName: launchBrowserName,
+    requestedBrowserName: resolved.requestedBrowserName,
+  };
+}
+
+async function prepareBrowserDownloadDirectory(downloadDir) {
+  if (!downloadDir) return;
+  await fs.promises.mkdir(downloadDir, { recursive: true });
+}
+
+async function prepareChromiumDownloadPreferences(userDataDir, downloadDir) {
+  if (!userDataDir || !downloadDir) return;
+  const defaultDir = path.join(userDataDir, 'Default');
+  const preferencesPath = path.join(defaultDir, 'Preferences');
+  await fs.promises.mkdir(defaultDir, { recursive: true });
+  let preferences = {};
+  try {
+    preferences = JSON.parse(await fs.promises.readFile(preferencesPath, 'utf8'));
+  } catch (_) {
+    preferences = {};
+  }
+  preferences.download = {
+    ...(preferences.download || {}),
+    default_directory: downloadDir,
+    directory_upgrade: true,
+    prompt_for_download: false,
+  };
+  preferences.savefile = {
+    ...(preferences.savefile || {}),
+    default_directory: downloadDir,
+  };
+  await fs.promises.writeFile(preferencesPath, JSON.stringify(preferences, null, 2));
+}
+
+async function prepareFirefoxDownloadPreferences(userDataDir, downloadDir) {
+  if (!userDataDir || !downloadDir) return;
+  await fs.promises.mkdir(userDataDir, { recursive: true });
+  const escapedDir = downloadDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const userJsPath = path.join(userDataDir, 'user.js');
+  const block = [
+    'user_pref("browser.download.folderList", 2);',
+    `user_pref("browser.download.dir", "${escapedDir}");`,
+    'user_pref("browser.download.useDownloadDir", true);',
+  ].join('\n');
+  let existing = '';
+  try {
+    existing = await fs.promises.readFile(userJsPath, 'utf8');
+  } catch (_) {}
+  const markerStart = '// AgentArk managed download preferences start';
+  const markerEnd = '// AgentArk managed download preferences end';
+  const managedBlock = `${markerStart}\n${block}\n${markerEnd}`;
+  const next = existing.includes(markerStart) && existing.includes(markerEnd)
+    ? existing.replace(new RegExp(`${markerStart}[\\s\\S]*?${markerEnd}`), managedBlock)
+    : `${existing.trim() ? `${existing.trim()}\n\n` : ''}${managedBlock}\n`;
+  await fs.promises.writeFile(userJsPath, next);
+}
+
+async function prepareProfileDownloadDefaults(browserName, userDataDir, downloadDir) {
+  await prepareBrowserDownloadDirectory(downloadDir);
+  const normalized = normalizeBrowserName(browserName);
+  if (normalized === 'firefox') {
+    await prepareFirefoxDownloadPreferences(userDataDir, downloadDir);
+  } else {
+    await prepareChromiumDownloadPreferences(userDataDir, downloadDir);
+  }
 }
 
 async function saveSessionProfileState(session) {
@@ -506,6 +675,20 @@ function touchSession(session) {
   session.cleanupTimer = setTimeout(() => destroySession(session.id), SESSION_TIMEOUT_MS);
 }
 
+function terminateExternalBrowserProcess(child) {
+  if (!child || child.killed) return;
+  const pid = Number.parseInt(String(child.pid || ''), 10);
+  if (process.platform !== 'win32' && Number.isInteger(pid) && pid > 0) {
+    try {
+      process.kill(-pid, 'SIGTERM');
+      return;
+    } catch (err) {
+      if (err && err.code === 'ESRCH') return;
+    }
+  }
+  try { child.kill(); } catch (_) {}
+}
+
 function recordDiagnostic(session, entry) {
   if (!session || !Array.isArray(session.diagnostics)) return;
   const normalized = {
@@ -523,19 +706,136 @@ function recordDiagnostic(session, entry) {
   }
 }
 
+async function sessionDownloadArtifacts(session) {
+  const seen = new Map();
+  for (const download of session.downloads || []) {
+    if (download && download.path) seen.set(download.path, { ...download });
+  }
+
+  const downloadDir = session.downloadDir;
+  if (downloadDir) {
+    try {
+      const entries = await fs.promises.readdir(downloadDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const filePath = path.join(downloadDir, entry.name);
+        if (seen.has(filePath)) continue;
+        const stat = await fs.promises.stat(filePath).catch(() => null);
+        seen.set(filePath, {
+          id: `file:${entry.name}`,
+          filename: entry.name,
+          path: filePath,
+          bytes: stat ? stat.size : 0,
+          url: '',
+          downloaded_at: stat ? stat.mtime.toISOString() : '',
+          status: 'completed',
+        });
+      }
+    } catch (_) {}
+  }
+
+  return Array.from(seen.values())
+    .sort((left, right) => String(right.downloaded_at || '').localeCompare(String(left.downloaded_at || '')))
+    .slice(0, 80);
+}
+
+async function recordDownload(session, download) {
+  if (!session || !download) return;
+  if (!Array.isArray(session.downloads)) session.downloads = [];
+  const id = randomUUID();
+  const filename = safeDownloadFilename(download.suggestedFilename && download.suggestedFilename());
+  const sessionDir = session.downloadDir || browserDownloadDir(session.id, session.profileId);
+  const filePath = path.join(sessionDir, `${Date.now()}-${id}-${filename}`);
+  const entry = {
+    id,
+    filename,
+    path: filePath,
+    bytes: 0,
+    url: '',
+    downloaded_at: new Date().toISOString(),
+    status: 'pending',
+  };
+  session.downloads.push(entry);
+  if (session.downloads.length > 40) {
+    session.downloads.splice(0, session.downloads.length - 40);
+  }
+  try {
+    entry.url = typeof download.url === 'function' ? String(download.url() || '') : '';
+    await fs.promises.mkdir(sessionDir, { recursive: true });
+    await download.saveAs(filePath);
+    const stat = await fs.promises.stat(filePath).catch(() => null);
+    entry.bytes = stat ? stat.size : 0;
+    entry.status = 'completed';
+  } catch (err) {
+    entry.status = 'failed';
+    recordDiagnostic(session, {
+      kind: 'download',
+      severity: 'error',
+      message: err && err.message ? err.message : String(err || 'download failed'),
+      url: entry.url,
+    });
+  }
+}
+
 async function destroySession(id) {
   const session = sessions.get(id);
   if (!session) return;
   if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  const userDataDir = session.persistentProfile ? session.userDataDir : '';
   await saveSessionProfileState(session);
-  if (session.externalProcess && !session.externalProcess.killed) {
-    try { session.externalProcess.kill(); } catch (_) {}
+  if (session.cdpBrowser) {
+    try { await session.cdpBrowser.close(); } catch (_) {}
   }
-  if (session.context) {
+  if (session.externalProcess && !session.externalProcess.killed) {
+    terminateExternalBrowserProcess(session.externalProcess);
+  }
+  if (session.context && !session.cdpBrowser) {
     try { await session.context.close(); } catch (_) {}
+  }
+  if (userDataDir) {
+    await cleanupPersistentProfileLocks(userDataDir, id);
   }
   sessions.delete(id);
   console.log(`Session ${id} destroyed (${sessions.size} remaining)`);
+}
+
+async function cleanupPersistentProfileLocks(userDataDir, sessionId) {
+  const timeoutMs = readPositiveIntEnv(
+    ['PLAYWRIGHT_PROFILE_DESTROY_UNLOCK_TIMEOUT_MS', 'PLAYWRIGHT_PROFILE_CLOSE_TIMEOUT_MS'],
+    3000,
+  );
+  const intervalMs = readPositiveIntEnv(['PLAYWRIGHT_PROFILE_UNLOCK_POLL_MS'], 100);
+  let info;
+  try {
+    info = await waitForBrowserProfileUnlock(userDataDir, {
+      timeoutMs,
+      intervalMs,
+      closeActiveOwner: false,
+    });
+  } catch (err) {
+    console.warn(`Failed to inspect browser profile locks after closing session ${sessionId}: ${err.message}`);
+    return;
+  }
+  if (info && info.staleLockCleanup && info.staleLockCleanup.errors?.length) {
+    console.warn(
+      `Failed to clear stale browser singleton locks after closing session ${sessionId}: ${JSON.stringify(info.staleLockCleanup.errors)}`,
+    );
+    return;
+  }
+  if (info && info.locked && info.stale && !info.active) {
+    const cleanup = clearStaleProfileLockMarkers(userDataDir);
+    if (cleanup.errors.length) {
+      console.warn(
+        `Failed to clear stale browser singleton locks after closing session ${sessionId}: ${JSON.stringify(cleanup.errors)}`,
+      );
+    } else if (cleanup.cleared > 0) {
+      console.log(`Cleared ${cleanup.cleared} stale browser singleton lock markers for session ${sessionId}`);
+    }
+  } else if (info && info.staleLockCleanup && info.staleLockCleanup.cleared > 0) {
+    console.log(
+      `Cleared ${info.staleLockCleanup.cleared} stale browser singleton lock markers for session ${sessionId}`,
+    );
+  }
 }
 
 function sendBridgeError(res, err) {
@@ -562,9 +862,12 @@ app.post('/session', async (req, res) => {
     const targetKind = profileTargetKind(profile, req);
     const manualLogin = manualLoginRequested(profile, req);
     const storageStatePath = profileId ? profileStorageStatePath(profileId) : '';
+    const id = randomUUID();
+    const downloadDir = browserDownloadDir(id, profileId);
     const contextOptions = {
       viewport: null,
       screen: { width: BROWSER_WIDTH, height: BROWSER_HEIGHT },
+      acceptDownloads: true,
     };
     const persistentProfile = savedProfileUsesPersistentContext({
       profileId,
@@ -582,11 +885,13 @@ app.post('/session', async (req, res) => {
     }
     let context;
     let page;
+    let cdpBrowser = null;
     let externalProcess = null;
     let externalTitle = '';
     let externalUrl = '';
     if (persistentProfile && manualLogin) {
       await fs.promises.mkdir(userDataDir, { recursive: true });
+      await prepareProfileDownloadDefaults(browserName, userDataDir, downloadDir);
       const activeSession = activeManualLoginSessionForUserDataDir(sessions, userDataDir);
       if (activeSession) {
         touchSession(activeSession);
@@ -594,31 +899,63 @@ app.post('/session', async (req, res) => {
       }
       const launched = await launchExternalBrowserProfile(browserName, userDataDir, externalBrowserInitialUrl(profile, req));
       externalProcess = launched.process;
-      externalTitle = `${browserName} manual login`;
+      externalTitle = `${launched.browserName || browserName} manual login`;
       externalUrl = launched.initialUrl;
     } else if (persistentProfile) {
       await fs.promises.mkdir(userDataDir, { recursive: true });
-      const activeSession = activeManualLoginSessionForUserDataDir(sessions, userDataDir);
-      if (activeSession) {
+      await prepareProfileDownloadDefaults(browserName, userDataDir, downloadDir);
+      let activeSession = activePersistentProfileSessionForUserDataDir(sessions, userDataDir);
+      while (activeSession) {
         await destroySession(activeSession.id);
+        activeSession = activePersistentProfileSessionForUserDataDir(sessions, userDataDir);
       }
       const lockInfo = await waitForBrowserProfileUnlock(userDataDir, {
         timeoutMs: readPositiveIntEnv(['PLAYWRIGHT_PROFILE_UNLOCK_TIMEOUT_MS'], 5000),
+        closeActiveOwner: CLOSE_ACTIVE_PROFILE_LOCK,
+        closeTimeoutMs: readPositiveIntEnv(['PLAYWRIGHT_PROFILE_CLOSE_TIMEOUT_MS'], 3000),
         intervalMs: readPositiveIntEnv(['PLAYWRIGHT_PROFILE_UNLOCK_POLL_MS'], 100),
       });
+      if (lockInfo.closeAttempted) {
+        console.warn(
+          `Closed active browser profile owner for ${profileId || userDataDir} before automation launch`,
+        );
+      }
       if (lockInfo.locked) throw browserProfileLockedError(lockInfo, userDataDir);
-      const browserType = browserTypeFor(browserName);
-      context = await browserType.launchPersistentContext(userDataDir, {
-        ...buildLaunchOptions(browserName, targetKind),
-        ...contextOptions,
-      });
-      page = context.pages()[0] || await context.newPage();
+      if (targetKind === 'host' && browserName !== 'firefox') {
+        const debuggingPort = await reserveLocalPort();
+        const launched = await launchExternalBrowserProfile(browserName, userDataDir, 'about:blank', {
+          remoteDebuggingPort: debuggingPort,
+        });
+        externalProcess = launched.process;
+        externalTitle = `${launched.browserName || browserName} real browser`;
+        externalUrl = launched.initialUrl;
+        try {
+          cdpBrowser = await connectToExternalBrowserOverCdp(debuggingPort, {
+            timeoutMs: readPositiveIntEnv(['PLAYWRIGHT_CDP_ATTACH_TIMEOUT_MS'], 6000),
+            intervalMs: readPositiveIntEnv(['PLAYWRIGHT_CDP_ATTACH_POLL_MS'], 150),
+          });
+          context = cdpBrowser.contexts()[0];
+          if (!context) throw new Error('Real browser did not expose a default context');
+          page = context.pages()[0] || await context.newPage();
+        } catch (err) {
+          terminateExternalBrowserProcess(externalProcess);
+          externalProcess = null;
+          throw err;
+        }
+      } else {
+        const browserType = browserTypeFor(browserName);
+        context = await browserType.launchPersistentContext(userDataDir, {
+          ...buildLaunchOptions(browserName, targetKind),
+          ...contextOptions,
+        });
+        page = context.pages()[0] || await context.newPage();
+      }
     } else {
+      await prepareBrowserDownloadDirectory(downloadDir);
       const b = await ensureBrowser();
       context = await b.newContext(contextOptions);
       page = await context.newPage();
     }
-    const id = randomUUID();
     const session = {
       id,
       context,
@@ -630,6 +967,7 @@ app.post('/session', async (req, res) => {
       manualLogin,
       userDataDir,
       externalProcess,
+      cdpBrowser,
       externalTitle,
       externalUrl,
       claimed: false,
@@ -637,6 +975,8 @@ app.post('/session', async (req, res) => {
       lastActivity: Date.now(),
       cleanupTimer: null,
       diagnostics: [],
+      downloads: [],
+      downloadDir,
       profileId,
       profileName,
       storageStatePath,
@@ -679,6 +1019,16 @@ app.post('/session', async (req, res) => {
             url: response.url(),
           });
         }
+      });
+      page.on('download', (download) => {
+        recordDownload(session, download).catch((err) => {
+          recordDiagnostic(session, {
+            kind: 'download',
+            severity: 'error',
+            message: err && err.message ? err.message : String(err || 'download failed'),
+            url: page.url(),
+          });
+        });
       });
     }
     sessions.set(id, session);
@@ -900,7 +1250,12 @@ app.get('/session/:id/content', async (req, res) => {
   touchSession(session);
   try {
     const snapshot = await readPageSnapshotWithRetry(session.page);
-    res.json({ ...snapshot, diagnostics: session.diagnostics || [] });
+    res.json({
+      ...snapshot,
+      diagnostics: session.diagnostics || [],
+      download_dir: session.downloadDir || null,
+      downloads: await sessionDownloadArtifacts(session),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

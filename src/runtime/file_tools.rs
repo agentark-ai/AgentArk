@@ -481,17 +481,7 @@ print(json.dumps({
         }
     }
 
-    pub(super) fn allowed_file_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![
-            self.data_dir().to_path_buf(),
-            self.actions_dir.clone(),
-            self.config_dir.clone(),
-            self.workspace_root(),
-        ];
-        if let Ok(cwd) = std::env::current_dir() {
-            roots.push(cwd);
-        }
-
+    fn dedupe_allowed_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
         let mut deduped = Vec::new();
         for root in roots {
             let candidate = root.canonicalize().unwrap_or(root);
@@ -503,6 +493,19 @@ print(json.dumps({
             }
         }
         deduped
+    }
+
+    pub(super) fn allowed_write_file_roots(&self) -> Vec<PathBuf> {
+        Self::dedupe_allowed_roots(vec![
+            self.data_dir().to_path_buf(),
+            self.actions_dir.clone(),
+            self.config_dir.clone(),
+            self.workspace_root(),
+        ])
+    }
+
+    pub(super) fn allowed_file_roots(&self) -> Vec<PathBuf> {
+        self.allowed_write_file_roots()
     }
 
     pub(super) fn absolutize_tool_path(&self, raw: &str) -> Result<PathBuf> {
@@ -519,12 +522,24 @@ print(json.dumps({
         if path.is_absolute() {
             Ok(path)
         } else {
-            Ok(std::env::current_dir()?.join(path))
+            Ok(self.workspace_root().join(path))
         }
     }
 
     pub(super) fn ensure_tool_path_allowed(&self, candidate: &Path) -> Result<()> {
         let allowed_roots = self.allowed_file_roots();
+        if allowed_roots.iter().any(|root| candidate.starts_with(root)) {
+            return Ok(());
+        }
+        Err(ToolPathAccessError::OutsideAllowedRoots {
+            attempted_path: candidate.to_path_buf(),
+            allowed_roots,
+        }
+        .into())
+    }
+
+    pub(super) fn ensure_tool_write_path_allowed(&self, candidate: &Path) -> Result<()> {
+        let allowed_roots = self.allowed_write_file_roots();
         if allowed_roots.iter().any(|root| candidate.starts_with(root)) {
             return Ok(());
         }
@@ -551,16 +566,22 @@ print(json.dumps({
             || lower == "credentials.json"
     }
 
+    pub(super) fn ensure_tool_target_not_sensitive_file(path: &Path, verb: &str) -> Result<()> {
+        if Self::tool_path_looks_sensitive_file(path) {
+            anyhow::bail!(
+                "Refusing to {} sensitive credential file '{}'. Use the secure credential store or app required_inputs flow instead.",
+                verb,
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn resolve_tool_read_path(&self, raw: &str) -> Result<PathBuf> {
         let candidate = self.absolutize_tool_path(raw)?;
         let resolved = candidate.canonicalize()?;
         self.ensure_tool_path_allowed(&resolved)?;
-        if Self::tool_path_looks_sensitive_file(&resolved) {
-            anyhow::bail!(
-                "Refusing to read sensitive credential file '{}'. Use the secure credential store or app required_inputs flow instead.",
-                resolved.display()
-            );
-        }
+        Self::ensure_tool_target_not_sensitive_file(&resolved, "read")?;
         Ok(resolved)
     }
 
@@ -579,13 +600,18 @@ print(json.dumps({
     }
 
     pub(super) fn resolve_tool_write_path(&self, raw: &str) -> Result<PathBuf> {
+        self.resolve_tool_mutation_path(raw, "write")
+    }
+
+    pub(super) fn resolve_tool_mutation_path(&self, raw: &str, verb: &str) -> Result<PathBuf> {
         let candidate = self.absolutize_tool_path(raw)?;
         if candidate.exists() {
             let resolved = candidate.canonicalize()?;
-            self.ensure_tool_path_allowed(&resolved)?;
+            self.ensure_tool_write_path_allowed(&resolved)?;
             if resolved.is_dir() {
                 anyhow::bail!("Refusing to overwrite directory '{}'", resolved.display());
             }
+            Self::ensure_tool_target_not_sensitive_file(&resolved, verb)?;
             return Ok(resolved);
         }
 
@@ -602,7 +628,7 @@ print(json.dumps({
         }
 
         let mut rebuilt = cursor.canonicalize()?;
-        self.ensure_tool_path_allowed(&rebuilt)?;
+        self.ensure_tool_write_path_allowed(&rebuilt)?;
         for component in missing_components.into_iter().rev() {
             let component_text = component.to_string_lossy();
             if component_text.is_empty() || component_text == "." || component_text == ".." {
@@ -610,6 +636,7 @@ print(json.dumps({
             }
             rebuilt.push(component);
         }
+        Self::ensure_tool_target_not_sensitive_file(&rebuilt, verb)?;
         Ok(rebuilt)
     }
 
@@ -1908,7 +1935,7 @@ print(json.dumps({
         let mut changed_files = Vec::<serde_json::Value>::new();
 
         for (raw_path, patch) in requests {
-            let path = self.resolve_tool_read_path(&raw_path)?;
+            let path = self.resolve_tool_mutation_path(&raw_path, "patch")?;
             if !seen.insert(path.clone()) {
                 anyhow::bail!("file_patch received duplicate target '{}'", raw_path);
             }
@@ -1984,7 +2011,7 @@ print(json.dumps({
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("file_delete requires path"))?;
-        let path = self.resolve_tool_write_path(raw_path)?;
+        let path = self.resolve_tool_mutation_path(raw_path, "delete")?;
         if Self::tool_path_looks_sensitive_file(&path) {
             anyhow::bail!(
                 "Refusing to delete sensitive credential file '{}'. Use the secure credential store instead.",

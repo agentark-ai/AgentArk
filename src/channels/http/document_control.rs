@@ -354,9 +354,16 @@ pub(super) async fn insert_document_artifact(
         .insert_document_with_chunks(&doc, &chunk_rows)
         .await
         .map_err(|e| e.to_string())?;
+    let queued_memory_extract = text_content_indexed
+        && source == DocumentIngestionSource::ManualUpload
+        && arkmemory_mark_document_memory_extract_candidate(&agent.storage, &doc_id, None).await;
 
     let notification_detail = if text_content_indexed {
-        format!("{} chunks indexed", chunks.len())
+        if queued_memory_extract {
+            format!("{} chunks indexed; Memory review queued", chunks.len())
+        } else {
+            format!("{} chunks indexed", chunks.len())
+        }
     } else {
         "Metadata indexed".to_string()
     };

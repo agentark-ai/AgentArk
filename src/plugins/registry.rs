@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
 use std::collections::{HashMap, HashSet};
@@ -165,7 +165,9 @@ impl PluginRegistry {
             .timeout(std::time::Duration::from_secs(PLUGIN_REQUEST_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| {
+                crate::core::net::build_outgoing_http_client(PLUGIN_REQUEST_TIMEOUT_SECS)
+            });
         Self {
             storage,
             config_dir,

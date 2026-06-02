@@ -1,4 +1,5 @@
 import { isRecord, str, type JsonRecord } from "./pageHelpers";
+import { humanizeMachineLabel } from "../../lib/displayLabels";
 
 export const REFRESH_MS = 8000;
 export const EVOLUTION_DEV_QUERY_LIMIT = 250;
@@ -45,9 +46,7 @@ export function boolText(value: unknown): string {
 }
 
 export function humanizeStatusLabel(value: string): string {
-  const normalized = value.trim();
-  if (!normalized) return "-";
-  return normalized.replace(/_/g, " ");
+  return humanizeMachineLabel(value, "-");
 }
 
 export function dedupeStrings(values: string[]): string[] {

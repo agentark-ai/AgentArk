@@ -1,4 +1,5 @@
 import type { BackgroundSessionSummary, Task } from "../types";
+import { humanizeMachineLabel } from "./displayLabels";
 
 export function taskKind(task: Task | null | undefined): string {
   if (!task) return "task";
@@ -28,7 +29,7 @@ export function taskActionDisplay(task: Task | null | undefined): string {
   if (!task) return "Task";
   return taskKind(task) === "reminder"
     ? taskKindLabel(task)
-    : String(task.action || "").trim() || taskKindLabel(task);
+    : humanizeMachineLabel(String(task.action || "").trim(), taskKindLabel(task));
 }
 
 export function isOneShotReminderTask(task: Task | null | undefined): boolean {

@@ -8,6 +8,50 @@ const MAX_TOOL_HISTORY_ITEMS: usize = 12;
 const MAX_ARRAY_ITEMS: usize = 80;
 const MAX_OBJECT_FIELDS: usize = 120;
 const MAX_JSON_DEPTH: usize = 10;
+const INTERNAL_TOOL_CONTEXT_BEGIN: &str = "<agentark_internal_tool_context>";
+const INTERNAL_TOOL_CONTEXT_END: &str = "</agentark_internal_tool_context>";
+const LEGACY_TOOL_CALL_CONTEXT_HEADER: &str =
+    "Previous tool call context for interpreting the following tool results:";
+const LEGACY_TOOL_RESULT_HEADER: &str = "Tool result for";
+
+pub(crate) fn wrap_internal_tool_context(body: &str) -> String {
+    format!(
+        "{INTERNAL_TOOL_CONTEXT_BEGIN}\n{}\n{INTERNAL_TOOL_CONTEXT_END}",
+        body.trim()
+    )
+}
+
+pub(crate) fn strip_internal_tool_transcript(input: &str) -> String {
+    strip_internal_tool_transcript_impl(input, false, true)
+}
+
+pub(crate) fn strip_internal_tool_transcript_preserve_spacing(input: &str) -> String {
+    strip_internal_tool_transcript_impl(input, false, false)
+}
+
+pub(crate) struct InternalToolTranscriptStreamFilter {
+    pending: String,
+}
+
+impl InternalToolTranscriptStreamFilter {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: String::new(),
+        }
+    }
+
+    pub(crate) fn feed(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+        self.pending.push_str(chunk);
+        drain_stream_internal_tool_transcript(&mut self.pending, false)
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        drain_stream_internal_tool_transcript(&mut self.pending, true)
+    }
+}
 
 pub(crate) fn sanitize_prompt_text(input: &str) -> String {
     let normalized = normalize_prompt_text(input);
@@ -63,6 +107,257 @@ fn normalize_prompt_text(input: &str) -> String {
         }
         blank_run = 0;
         out.push_str(trimmed_end);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+fn drain_stream_internal_tool_transcript(pending: &mut String, finish: bool) -> String {
+    let mut output = String::new();
+    loop {
+        if pending.is_empty() {
+            break;
+        }
+        let Some(start) = find_internal_tool_block_start(pending) else {
+            let keep = if finish {
+                0
+            } else {
+                longest_internal_marker_prefix_suffix_len(pending)
+            };
+            let emit_len = pending.len().saturating_sub(keep);
+            if emit_len > 0 {
+                output.push_str(&pending[..emit_len]);
+                pending.drain(..emit_len);
+            }
+            break;
+        };
+        if start > 0 {
+            output.push_str(&pending[..start]);
+            pending.drain(..start);
+            continue;
+        }
+        if let Some(end) = internal_tool_block_end(pending) {
+            pending.drain(..end);
+            while pending.starts_with('\n') || pending.starts_with('\r') {
+                pending.drain(..1);
+            }
+            continue;
+        }
+        if finish {
+            pending.clear();
+        }
+        break;
+    }
+    output
+}
+
+fn longest_internal_marker_prefix_suffix_len(text: &str) -> usize {
+    [
+        INTERNAL_TOOL_CONTEXT_BEGIN,
+        LEGACY_TOOL_CALL_CONTEXT_HEADER,
+        LEGACY_TOOL_RESULT_HEADER,
+    ]
+    .into_iter()
+    .flat_map(|marker| {
+        text.char_indices().filter_map(move |(idx, _)| {
+            let suffix = &text[idx..];
+            (!suffix.is_empty() && marker.starts_with(suffix)).then_some(text.len() - idx)
+        })
+    })
+    .max()
+    .unwrap_or(0)
+}
+
+fn strip_internal_tool_transcript_impl(input: &str, streaming: bool, normalize: bool) -> String {
+    let mut remaining = input;
+    let mut output = String::with_capacity(input.len());
+    while !remaining.is_empty() {
+        let Some(start) = find_internal_tool_block_start(remaining) else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        let block = &remaining[start..];
+        match internal_tool_block_end(block) {
+            Some(end) => {
+                remaining = trim_leading_block_separator(&block[end..]);
+            }
+            None if streaming => {
+                break;
+            }
+            None => {
+                break;
+            }
+        }
+    }
+    if normalize {
+        normalize_visible_text_after_internal_strip(&output)
+    } else {
+        output
+    }
+}
+
+fn find_internal_tool_block_start(input: &str) -> Option<usize> {
+    let tagged_or_context = [INTERNAL_TOOL_CONTEXT_BEGIN, LEGACY_TOOL_CALL_CONTEXT_HEADER]
+        .into_iter()
+        .filter_map(|needle| input.find(needle))
+        .min();
+    [tagged_or_context, find_legacy_tool_result_start(input)]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+fn find_legacy_tool_result_start(input: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while offset < input.len() {
+        let Some(relative) = input[offset..].find(LEGACY_TOOL_RESULT_HEADER) else {
+            return None;
+        };
+        let absolute = offset + relative;
+        if legacy_tool_result_header_is_internal(&input[absolute..]) {
+            return Some(absolute);
+        }
+        offset = absolute + LEGACY_TOOL_RESULT_HEADER.len();
+    }
+    None
+}
+
+fn legacy_tool_result_header_is_internal(block: &str) -> bool {
+    let header = block.lines().next().unwrap_or_default();
+    header.contains("tool_call")
+}
+
+fn internal_tool_block_end(block: &str) -> Option<usize> {
+    if block.starts_with(INTERNAL_TOOL_CONTEXT_BEGIN) {
+        return block
+            .find(INTERNAL_TOOL_CONTEXT_END)
+            .map(|idx| idx + INTERNAL_TOOL_CONTEXT_END.len());
+    }
+    if block.starts_with(LEGACY_TOOL_CALL_CONTEXT_HEADER) {
+        return legacy_tool_call_context_end(block);
+    }
+    if block.starts_with(LEGACY_TOOL_RESULT_HEADER) {
+        return legacy_tool_result_end(block);
+    }
+    None
+}
+
+fn legacy_tool_call_context_end(block: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut consumed_header = false;
+    for segment in block.split_inclusive('\n') {
+        let line = segment.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+        let trimmed = line.trim();
+        let next_offset = offset + segment.len();
+        if !consumed_header {
+            consumed_header = true;
+            offset = next_offset;
+            continue;
+        }
+        if trimmed.is_empty() || legacy_tool_context_line_is_internal(line) {
+            offset = next_offset;
+            continue;
+        }
+        return Some(offset);
+    }
+    if consumed_header {
+        Some(block.len())
+    } else {
+        None
+    }
+}
+
+fn legacy_tool_context_line_is_internal(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- `tool_call")
+        || trimmed.starts_with("`tool_call")
+        || trimmed.starts_with("tool_call")
+        || trimmed.starts_with("called ")
+}
+
+fn legacy_tool_result_end(block: &str) -> Option<usize> {
+    let header_end = block.find('\n').map(|idx| idx + 1).unwrap_or(block.len());
+    let body = &block[header_end..];
+    let body_trimmed = body.trim_start();
+    let whitespace_before_body = body.len().saturating_sub(body_trimmed.len());
+    if body_trimmed.starts_with('{') {
+        return balanced_json_object_end(body_trimmed)
+            .map(|json_end| header_end + whitespace_before_body + json_end);
+    }
+    if body_trimmed.starts_with('[') {
+        return balanced_json_array_end(body_trimmed)
+            .map(|json_end| header_end + whitespace_before_body + json_end);
+    }
+    Some(header_end)
+}
+
+fn balanced_json_object_end(text: &str) -> Option<usize> {
+    balanced_json_end(text, b'{', b'}')
+}
+
+fn balanced_json_array_end(text: &str) -> Option<usize> {
+    balanced_json_end(text, b'[', b']')
+}
+
+fn balanced_json_end(text: &str, open: u8, close: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.first().copied() != Some(open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, byte) in bytes.iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            continue;
+        }
+        if byte == open {
+            depth = depth.saturating_add(1);
+            continue;
+        }
+        if byte == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(idx + 1);
+            }
+        }
+    }
+    None
+}
+
+fn trim_leading_block_separator(text: &str) -> &str {
+    let mut remaining = text;
+    while remaining.starts_with('\n') || remaining.starts_with('\r') {
+        remaining = &remaining[1..];
+    }
+    remaining
+}
+
+fn normalize_visible_text_after_internal_strip(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0usize;
+    for line in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        if line.trim().is_empty() {
+            blank_run = blank_run.saturating_add(1);
+            if blank_run <= 2 {
+                out.push('\n');
+            }
+            continue;
+        }
+        blank_run = 0;
+        out.push_str(line.trim_end());
         out.push('\n');
     }
     out.trim().to_string()
@@ -442,5 +737,42 @@ mod tests {
 
         assert_eq!(sanitized.len(), 1);
         assert!(sanitized[0].content.contains("orphan_tool_result"));
+    }
+
+    #[test]
+    fn strips_tagged_internal_tool_context_from_visible_text() {
+        let text = format!(
+            "Working.\n\n{}\n\nStill working.",
+            wrap_internal_tool_context("tool_result:\n{\"ok\":true}")
+        );
+
+        let visible = strip_internal_tool_transcript(&text);
+
+        assert_eq!(visible, "Working.\n\nStill working.");
+    }
+
+    #[test]
+    fn strips_legacy_internal_tool_scaffold_without_removing_public_prose() {
+        let text = "I'll build it.\n\nPrevious tool call context for interpreting the following tool results:\n\n    tool_call_3 called file_write with chars: 4725; omitted: true; path: expense-tracker/server.js.\n\nLet me continue.\n\nTool result for tool_call_4:\n{\"ok\":true,\"message\":\"Saved managed file App.css.\"}\n\nDone.";
+
+        let visible = strip_internal_tool_transcript(text);
+
+        assert!(visible.contains("I'll build it."));
+        assert!(visible.contains("Let me continue."));
+        assert!(visible.contains("Done."));
+        assert!(!visible.contains("tool_call_3"));
+        assert!(!visible.contains("Saved managed file App.css"));
+    }
+
+    #[test]
+    fn stream_filter_handles_split_internal_markers() {
+        let mut filter = InternalToolTranscriptStreamFilter::new();
+        let mut visible = String::new();
+        visible.push_str(&filter.feed("Before.\n<agentark_internal_tool"));
+        visible
+            .push_str(&filter.feed("_context>\nsecret\n</agentark_internal_tool_context>\nAfter."));
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "Before.\nAfter.");
     }
 }

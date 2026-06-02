@@ -510,6 +510,7 @@ export default function BrowserSessionsPage({
           <Stack spacing={0.25}>
             {visibleSessions.map((session) => {
               const detailLine = sessionDetailLine(session);
+              const terminal = isTerminal(session);
               return (
                 <Box
                   key={session.id}
@@ -556,19 +557,21 @@ export default function BrowserSessionsPage({
                         variant="outlined"
                         label={statusLabel(session.status)}
                       />
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={() =>
-                          window.open(
-                            browserSessionHandoffUrl(session.id),
-                            "_blank",
-                            "noopener,noreferrer",
-                          )
-                        }
-                      >
-                        Open
-                      </Button>
+                      {!terminal ? (
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() =>
+                            window.open(
+                              browserSessionHandoffUrl(session.id),
+                              "_blank",
+                              "noopener,noreferrer",
+                            )
+                          }
+                        >
+                          Open
+                        </Button>
+                      ) : null}
                     </Stack>
                     <Typography
                       variant="caption"

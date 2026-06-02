@@ -75,6 +75,8 @@ pub struct SpineToolCall {
     pub name: String,
     #[serde(default)]
     pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,10 +100,13 @@ pub struct SpineRequest {
     pub caller_kind: CallerKind,
     pub max_turns: usize,
     pub streaming: bool,
+    pub long_running: bool,
     pub cancel_token: SpineCancelToken,
     pub channel: String,
     pub conversation_id: Option<String>,
     pub project_id: Option<String>,
+    pub execution_profile: Option<serde_json::Value>,
+    pub browser_profile_context: Option<serde_json::Value>,
     pub visual_attachments: Vec<ChatAttachmentHint>,
     pub authorization: ActionAuthorizationContext,
 }
@@ -125,10 +130,13 @@ impl SpineRequest {
             caller_kind,
             max_turns: caller_kind.default_max_turns(),
             streaming: caller_kind.default_streaming(),
+            long_running: false,
             cancel_token: SpineCancelToken::new(),
             channel: channel.into(),
             conversation_id: None,
             project_id: None,
+            execution_profile: None,
+            browser_profile_context: None,
             visual_attachments: Vec::new(),
             authorization,
         }
@@ -196,6 +204,9 @@ pub enum SpineTraceEvent {
     PromptTelemetry {
         data: serde_json::Value,
     },
+    ArkDistillTelemetry {
+        data: serde_json::Value,
+    },
     TurnStarted {
         turn: usize,
         prompt_token_estimate: usize,
@@ -207,12 +218,19 @@ pub enum SpineTraceEvent {
         tool_calls_count: usize,
         cache_read_tokens: usize,
         cache_creation_tokens: usize,
+        /// Wall-clock latency of the model call for this turn, in milliseconds —
+        /// the real time the user waited for the model to respond.
+        latency_ms: u64,
     },
     ToolStarted {
         tool_call_id: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         intent_summary: Option<String>,
     },

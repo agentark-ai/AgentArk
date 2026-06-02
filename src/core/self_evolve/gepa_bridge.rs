@@ -36,6 +36,10 @@ use crate::core::prompt_fragments::{
     sanitize_prompt_fragment_bundle, PromptFragmentBundleProfile,
     PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
 };
+use crate::core::{
+    arkdistill_contract, sanitize_arkdistill_profile, validate_arkdistill_candidate,
+    ArkDistillProfile, ExternalArkDistillCandidate, ARKDISTILL_PROFILE_KEY,
+};
 
 const GEPA_ROOT_REL: &str = ".agentark/self_evolve/gepa";
 const MAX_EXPORTED_TEXT_CHARS: usize = 1600;
@@ -46,7 +50,7 @@ const MAX_EXPORT_FILE_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_CANDIDATE_RECORDS: usize = 64;
 const MAX_EXPORTED_EXPERIENCE_RUNS: u64 = 500;
 const DEFAULT_GEPA_QUIET_WINDOW_SECONDS: i64 = 60;
-const DEFAULT_GEPA_OPTIMIZER_TIMEOUT_SECONDS: u64 = 15 * 60;
+const DEFAULT_GEPA_OPTIMIZER_TIMEOUT_SECONDS: u64 = 5 * 60;
 const DEFAULT_GEPA_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_GEPA_RETENTION_DAYS: u64 = 30;
 const DEFAULT_GEPA_MAX_RUN_DIRS: usize = 80;
@@ -264,6 +268,8 @@ pub struct GepaImportSummary {
     pub specialist_prompt_candidates: usize,
     pub prompt_fragment_candidates: usize,
     #[serde(default)]
+    pub arkdistill_candidates: usize,
+    #[serde(default)]
     pub router_learning_candidates: usize,
     pub rejected_candidates: Vec<String>,
 }
@@ -274,6 +280,7 @@ pub(crate) struct GepaImportedCandidates {
     pub(crate) prompt_candidates: Vec<ExternalPromptCandidate>,
     pub(crate) specialist_prompt_candidates: Vec<ExternalSpecialistPromptCandidate>,
     pub(crate) prompt_fragment_candidates: Vec<ExternalPromptFragmentCandidate>,
+    pub(crate) arkdistill_candidates: Vec<ExternalArkDistillCandidate>,
     pub(crate) router_learning_candidates: Vec<RouterLearningCandidatePayload>,
 }
 
@@ -296,6 +303,45 @@ pub struct GepaCandidateRecord {
 
 pub fn gepa_root(project_root: &Path) -> PathBuf {
     project_root.join(GEPA_ROOT_REL)
+}
+
+fn env_path(value: Option<&str>) -> Option<PathBuf> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn path_looks_like_source_checkout(path: &Path) -> bool {
+    path.join("Cargo.toml").is_file() && path.join("src").is_dir()
+}
+
+fn gepa_state_root_candidate(path: PathBuf) -> Option<PathBuf> {
+    if path_looks_like_source_checkout(&path) {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+pub(crate) fn resolve_gepa_project_root_from(
+    app_path: &Path,
+    _cwd: Option<&Path>,
+    _workspace_root: Option<&str>,
+    data_root: Option<&str>,
+) -> PathBuf {
+    if let Some(path) = env_path(data_root).and_then(gepa_state_root_candidate) {
+        return path;
+    }
+    if let Some(path) = gepa_state_root_candidate(app_path.join("data")) {
+        return path;
+    }
+    std::env::temp_dir().join("agentark").join("gepa")
+}
+
+pub fn resolve_gepa_project_root() -> PathBuf {
+    let data_root = std::env::var("AGENTARK_DATA").ok();
+    resolve_gepa_project_root_from(Path::new("/app"), None, None, data_root.as_deref())
 }
 
 pub fn gepa_runs_dir(project_root: &Path) -> PathBuf {
@@ -562,7 +608,14 @@ pub async fn reserve_gepa_budget(
     let config = load_gepa_optimizer_config(storage).await;
     let mut ledger = load_gepa_budget_ledger(storage).await;
     prune_gepa_budget_ledger(&mut ledger);
-    let status_snapshot = gepa_budget_status_from_ledger(&config, &ledger);
+    let now = chrono::Utc::now();
+    let timezone = gepa_budget_timezone();
+    if gepa_budget_has_today_reservation(&ledger, run_id, now, timezone) {
+        return Ok(gepa_budget_status_for_reservation_at(
+            &config, &ledger, run_id, now, timezone,
+        ));
+    }
+    let status_snapshot = gepa_budget_status_from_ledger_at(&config, &ledger, now, timezone);
     if !status_snapshot.allowed {
         anyhow::bail!(
             "{}",
@@ -574,9 +627,9 @@ pub async fn reserve_gepa_budget(
     }
     ledger.entries.push(GepaBudgetLedgerEntry {
         run_id: run_id.to_string(),
-        reserved_usd: config.per_run_budget_usd.max(0.0),
+        reserved_usd: 0.0,
         status: status.to_string(),
-        recorded_at: chrono::Utc::now().to_rfc3339(),
+        recorded_at: now.to_rfc3339(),
     });
     storage
         .set(
@@ -584,7 +637,9 @@ pub async fn reserve_gepa_budget(
             &serde_json::to_vec(&ledger)?,
         )
         .await?;
-    Ok(gepa_budget_status_from_ledger(&config, &ledger))
+    Ok(gepa_budget_status_from_ledger_at(
+        &config, &ledger, now, timezone,
+    ))
 }
 
 pub async fn write_pending_job(project_root: &Path, job: &PendingGepaJob) -> Result<String> {
@@ -725,6 +780,29 @@ pub async fn fail_claimed_job(
     Ok(("failed".to_string(), failed_path))
 }
 
+pub async fn fail_claimed_job_terminal(
+    project_root: &Path,
+    running_path: &Path,
+    mut job: PendingGepaJob,
+    error: &str,
+) -> Result<PathBuf> {
+    job.last_error = Some(error.to_string());
+    job.started_at = None;
+    let failed_dir = gepa_failed_dir(project_root);
+    tokio::fs::create_dir_all(&failed_dir).await?;
+    job.finished_at = Some(chrono::Utc::now().to_rfc3339());
+    let failed_path = failed_dir.join(format!("{}.json", job.job_id));
+    let record = serde_json::json!({
+        "status": "failed",
+        "job": job,
+        "error": error,
+        "recorded_at": chrono::Utc::now().to_rfc3339(),
+    });
+    write_json_file_atomic(&failed_path, &record).await?;
+    remove_file_if_exists(running_path).await?;
+    Ok(failed_path)
+}
+
 pub async fn has_pending_jobs(project_root: &Path) -> Result<bool> {
     Ok(!list_pending_jobs(project_root).await?.is_empty())
 }
@@ -830,6 +908,17 @@ pub async fn export_optimization_bundle(
     request: &str,
     recent_limit: u64,
 ) -> Result<GepaExportResult> {
+    export_optimization_bundle_with_metadata(storage, project_root, request, recent_limit, None)
+        .await
+}
+
+pub async fn export_optimization_bundle_with_metadata(
+    storage: &Storage,
+    project_root: &Path,
+    request: &str,
+    recent_limit: u64,
+    job_metadata: Option<&Value>,
+) -> Result<GepaExportResult> {
     let run_id = format!("gepa-{}", uuid::Uuid::new_v4().simple());
     let run_dir = gepa_runs_dir(project_root).join(&run_id);
     tokio::fs::create_dir_all(&run_dir).await?;
@@ -849,6 +938,11 @@ pub async fn export_optimization_bundle(
         .await?
         .and_then(|raw| parse_prompt_fragment_bundle_profile(&raw))
         .unwrap_or_else(default_prompt_fragment_bundle);
+    let arkdistill_profile = storage
+        .get(ARKDISTILL_PROFILE_KEY)
+        .await?
+        .and_then(|raw| crate::core::parse_arkdistill_profile(&raw))
+        .unwrap_or_default();
     let recent_runs = storage
         .list_recent_experience_runs_any_scope(recent_limit.clamp(1, MAX_EXPORTED_EXPERIENCE_RUNS))
         .await
@@ -863,15 +957,22 @@ pub async fn export_optimization_bundle(
         "run_id": run_id,
         "created_at": chrono::Utc::now().to_rfc3339(),
         "request": redact_and_truncate(request, MAX_EXPORTED_TEXT_CHARS),
+        "job_metadata": job_metadata.cloned().unwrap_or(Value::Null),
+        "opportunity_context": job_metadata
+            .and_then(|metadata| metadata.get("opportunity_context"))
+            .cloned()
+            .unwrap_or(Value::Null),
         "surfaces": {
             "prompt_bundle": prompt_bundle,
             "specialist_prompt_bundle": specialist_bundle,
             "prompt_fragment_bundle": prompt_fragment_bundle,
+            "arkdistill_profile": arkdistill_profile,
         },
         "benchmarks": {
             "prompt_bundle": serde_json::from_str::<Value>(embedded_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
             "specialist_prompt_bundle": serde_json::from_str::<Value>(embedded_specialist_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
             "prompt_fragment_bundle": prompt_fragment_candidate_benchmark_profile(),
+            "arkdistill_profile": arkdistill_contract(),
             "router_learning": router_learning_benchmark_profile(),
         },
         "recent_lineage": {
@@ -883,7 +984,7 @@ pub async fn export_optimization_bundle(
         "router_trace_evidence": router_trace_evidence,
         "candidate_contract": {
             "format": "jsonl",
-            "surfaces": ["prompt_bundle", "specialist_prompt_bundle", "prompt_fragment_bundle", "router_learning"],
+            "surfaces": ["prompt_bundle", "specialist_prompt_bundle", "prompt_fragment_bundle", "arkdistill_profile", "router_learning"],
             "required_fields": ["run_id", "surface", "source", "candidate", "objective_scores", "feedback_summary", "trace_refs", "created_at"]
         }
     });
@@ -938,19 +1039,7 @@ pub async fn run_python_optimizer(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    command.env("AGENTARK_GEPA_MODEL", &runtime.model);
-    command.env("AGENTARK_GEPA_AUTO", &runtime.auto_mode);
-    command.env(
-        "AGENTARK_GEPA_MAX_METRIC_CALLS",
-        runtime.max_metric_calls.to_string(),
-    );
-    command.env(
-        "AGENTARK_GEPA_COST_BUDGET_USD",
-        format!("{:.4}", runtime.per_run_budget_usd.max(0.0)),
-    );
-    for (key, value) in &runtime.env {
-        command.env(key, value);
-    }
+    apply_gepa_optimizer_env(&mut command, runtime);
     let child = command
         .spawn()
         .context("failed to start GEPA optimizer process")?;
@@ -989,6 +1078,66 @@ pub async fn run_python_optimizer(
     })
 }
 
+fn apply_gepa_optimizer_env(command: &mut tokio::process::Command, runtime: &GepaOptimizerRuntime) {
+    command.env("MALLOC_ARENA_MAX", "2");
+    command.env("OMP_NUM_THREADS", "1");
+    command.env("OPENBLAS_NUM_THREADS", "1");
+    command.env("MKL_NUM_THREADS", "1");
+    command.env("NUMEXPR_NUM_THREADS", "1");
+    command.env("TOKENIZERS_PARALLELISM", "false");
+    command.env("AGENTARK_GEPA_MODEL", &runtime.model);
+    command.env("AGENTARK_GEPA_AUTO", &runtime.auto_mode);
+    command.env(
+        "AGENTARK_GEPA_MAX_METRIC_CALLS",
+        runtime.max_metric_calls.to_string(),
+    );
+    command.env(
+        "AGENTARK_GEPA_COST_BUDGET_USD",
+        format!("{:.4}", runtime.per_run_budget_usd.max(0.0)),
+    );
+    for (key, value) in &runtime.env {
+        command.env(key, value);
+    }
+}
+
+pub async fn validate_python_optimizer_runtime(runtime: &GepaOptimizerRuntime) -> Result<()> {
+    let mut command = tokio::process::Command::new(&runtime.python_path);
+    command
+        .arg("-m")
+        .arg("bridges.gepa_optimizer")
+        .arg("validate")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    apply_gepa_optimizer_env(&mut command, runtime);
+    let child = command
+        .spawn()
+        .context("failed to start GEPA optimizer preflight process")?;
+    let output = match tokio::time::timeout(Duration::from_secs(45), child.wait_with_output()).await
+    {
+        Ok(output) => output.context("failed while waiting for GEPA optimizer preflight")?,
+        Err(_) => anyhow::bail!("GEPA optimizer preflight timed out after 45 seconds"),
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = tail_string(&String::from_utf8_lossy(&output.stderr), 1600);
+    let stdout = tail_string(&String::from_utf8_lossy(&output.stdout), 1600);
+    let detail = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::bail!(
+        "GEPA optimizer preflight failed{}",
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", detail)
+        }
+    );
+}
+
 pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImportedCandidates> {
     let metadata = tokio::fs::metadata(candidates_path)
         .await
@@ -1007,6 +1156,7 @@ pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImpo
     let mut prompt_candidates = Vec::new();
     let mut specialist_prompt_candidates = Vec::new();
     let mut prompt_fragment_candidates = Vec::new();
+    let mut arkdistill_candidates = Vec::new();
     let mut router_learning_candidates = Vec::new();
     let mut rejected_candidates = Vec::new();
 
@@ -1072,6 +1222,25 @@ pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImpo
                     )),
                 }
             }
+            "arkdistill_profile" => {
+                match serde_json::from_value::<ArkDistillProfile>(record.candidate.clone()) {
+                    Ok(profile) => {
+                        let profile = sanitize_arkdistill_profile(profile);
+                        match validate_arkdistill_candidate(&profile) {
+                            Ok(()) => arkdistill_candidates
+                                .push(ExternalArkDistillCandidate { source, profile }),
+                            Err(error) => rejected_candidates.push(format!(
+                                "{}:arkdistill_profile rejected because candidate failed validation: {}",
+                                record.run_id, error
+                            )),
+                        }
+                    }
+                    Err(error) => rejected_candidates.push(format!(
+                        "{}:arkdistill_profile rejected because profile JSON was invalid: {}",
+                        record.run_id, error
+                    )),
+                }
+            }
             "router_learning" => {
                 match serde_json::from_value::<RouterLearningCandidatePayload>(
                     record.candidate.clone(),
@@ -1102,12 +1271,14 @@ pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImpo
             prompt_candidates: prompt_candidates.len(),
             specialist_prompt_candidates: specialist_prompt_candidates.len(),
             prompt_fragment_candidates: prompt_fragment_candidates.len(),
+            arkdistill_candidates: arkdistill_candidates.len(),
             router_learning_candidates: router_learning_candidates.len(),
             rejected_candidates,
         },
         prompt_candidates,
         specialist_prompt_candidates,
         prompt_fragment_candidates,
+        arkdistill_candidates,
         router_learning_candidates,
     })
 }
@@ -1619,29 +1790,63 @@ fn gepa_budget_status_from_ledger(
     config: &GepaOptimizerConfig,
     ledger: &GepaBudgetLedger,
 ) -> GepaBudgetStatus {
-    let today = chrono::Utc::now().date_naive();
+    gepa_budget_status_from_ledger_at(config, ledger, chrono::Utc::now(), gepa_budget_timezone())
+}
+
+fn gepa_budget_timezone() -> Option<chrono_tz::Tz> {
+    ["AGENTARK_BUDGET_TIMEZONE", "AGENTARK_LOG_TIMEZONE", "TZ"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .find_map(|value| value.parse::<chrono_tz::Tz>().ok())
+}
+
+fn gepa_budget_local_date(
+    timestamp: chrono::DateTime<chrono::Utc>,
+    timezone: Option<chrono_tz::Tz>,
+) -> chrono::NaiveDate {
+    match timezone {
+        Some(timezone) => timestamp.with_timezone(&timezone).date_naive(),
+        None => timestamp.date_naive(),
+    }
+}
+
+fn gepa_budget_status_from_ledger_at(
+    config: &GepaOptimizerConfig,
+    ledger: &GepaBudgetLedger,
+    now: chrono::DateTime<chrono::Utc>,
+    timezone: Option<chrono_tz::Tz>,
+) -> GepaBudgetStatus {
+    let today = gepa_budget_local_date(now, timezone);
     let todays_entries = ledger.entries.iter().filter(|entry| {
         chrono::DateTime::parse_from_rfc3339(&entry.recorded_at)
-            .map(|timestamp| timestamp.with_timezone(&chrono::Utc).date_naive() == today)
+            .map(|timestamp| {
+                gepa_budget_local_date(timestamp.with_timezone(&chrono::Utc), timezone) == today
+            })
             .unwrap_or(false)
     });
     let mut runs_today = 0u32;
     let mut used_today_usd = 0.0f64;
     for entry in todays_entries {
         runs_today = runs_today.saturating_add(1);
-        used_today_usd += entry.reserved_usd.max(0.0);
+        if gepa_budget_entry_counts_as_spend(entry) {
+            used_today_usd += entry.reserved_usd.max(0.0);
+        }
     }
     let daily_budget_usd = config.daily_budget_usd.max(0.0);
     let per_run_budget_usd = config.per_run_budget_usd.max(0.0);
     let max_runs_per_day = config.max_runs_per_day;
-    let remaining_today_usd = (daily_budget_usd - used_today_usd).max(0.0);
-    let reason = if max_runs_per_day == 0 {
-        Some("GEPA daily run budget is set to zero.".to_string())
-    } else if runs_today >= max_runs_per_day {
-        Some("GEPA daily run limit has been reached.".to_string())
-    } else if per_run_budget_usd > daily_budget_usd {
+    let remaining_today_usd = if daily_budget_usd > 0.0 {
+        (daily_budget_usd - used_today_usd).max(0.0)
+    } else {
+        0.0
+    };
+    let reason = if max_runs_per_day > 0 && runs_today >= max_runs_per_day {
+        Some("GEPA daily run count limit has been reached.".to_string())
+    } else if daily_budget_usd > 0.0 && per_run_budget_usd > daily_budget_usd {
         Some("GEPA per-run budget is larger than the daily budget.".to_string())
-    } else if per_run_budget_usd > remaining_today_usd {
+    } else if daily_budget_usd > 0.0 && per_run_budget_usd > remaining_today_usd {
         Some("GEPA daily spend budget has been reached.".to_string())
     } else {
         None
@@ -1656,6 +1861,48 @@ fn gepa_budget_status_from_ledger(
         allowed: reason.is_none(),
         reason,
     }
+}
+
+fn gepa_budget_entry_counts_as_spend(entry: &GepaBudgetLedgerEntry) -> bool {
+    matches!(
+        entry.status.trim(),
+        "spent" | "charged" | "actual" | "completed_spend"
+    )
+}
+
+fn gepa_budget_has_today_reservation(
+    ledger: &GepaBudgetLedger,
+    run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    timezone: Option<chrono_tz::Tz>,
+) -> bool {
+    let today = gepa_budget_local_date(now, timezone);
+    ledger.entries.iter().any(|entry| {
+        entry.run_id == run_id
+            && chrono::DateTime::parse_from_rfc3339(&entry.recorded_at)
+                .map(|timestamp| {
+                    gepa_budget_local_date(timestamp.with_timezone(&chrono::Utc), timezone) == today
+                })
+                .unwrap_or(false)
+    })
+}
+
+fn gepa_budget_status_for_reservation_at(
+    config: &GepaOptimizerConfig,
+    ledger: &GepaBudgetLedger,
+    run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    timezone: Option<chrono_tz::Tz>,
+) -> GepaBudgetStatus {
+    let ledger_without_existing_run = GepaBudgetLedger {
+        entries: ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.run_id != run_id)
+            .cloned()
+            .collect(),
+    };
+    gepa_budget_status_from_ledger_at(config, &ledger_without_existing_run, now, timezone)
 }
 
 fn prune_gepa_budget_ledger(ledger: &mut GepaBudgetLedger) {
@@ -1721,7 +1968,7 @@ fn default_gepa_enabled() -> bool {
 }
 
 fn default_gepa_max_metric_calls() -> u32 {
-    24
+    2
 }
 
 fn default_gepa_daily_budget_usd() -> f64 {
@@ -1733,7 +1980,7 @@ fn default_gepa_per_run_budget_usd() -> f64 {
 }
 
 fn default_gepa_max_runs_per_day() -> u32 {
-    1
+    0
 }
 
 trait IfEmpty {
@@ -1786,6 +2033,147 @@ mod tests {
     fn gepa_promotion_settings_default_allows_gate_to_decide() {
         let settings = GepaPromotionSettings::default();
         assert!(settings.apply_promotion);
+    }
+
+    #[test]
+    fn gepa_budget_day_uses_configured_timezone() {
+        let config = GepaOptimizerConfig {
+            max_runs_per_day: 1,
+            ..GepaOptimizerConfig::default()
+        };
+        let ledger = GepaBudgetLedger {
+            entries: vec![GepaBudgetLedgerEntry {
+                run_id: "run-1".to_string(),
+                reserved_usd: 0.50,
+                status: "reserved".to_string(),
+                recorded_at: "2026-05-27T14:39:54Z".to_string(),
+            }],
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-27T18:35:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let utc_status = gepa_budget_status_from_ledger_at(&config, &ledger, now, None);
+        let local_status = gepa_budget_status_from_ledger_at(
+            &config,
+            &ledger,
+            now,
+            Some(chrono_tz::Asia::Kolkata),
+        );
+
+        assert_eq!(utc_status.runs_today, 1);
+        assert!(!utc_status.allowed);
+        assert_eq!(local_status.runs_today, 0);
+        assert!(local_status.allowed);
+    }
+
+    #[test]
+    fn gepa_budget_reservation_reuses_same_day_run_id() {
+        let config = GepaOptimizerConfig {
+            max_runs_per_day: 1,
+            daily_budget_usd: 1.0,
+            per_run_budget_usd: 0.5,
+            ..GepaOptimizerConfig::default()
+        };
+        let ledger = GepaBudgetLedger {
+            entries: vec![GepaBudgetLedgerEntry {
+                run_id: "run-1".to_string(),
+                reserved_usd: 0.50,
+                status: "reserved".to_string(),
+                recorded_at: "2026-05-29T10:00:00Z".to_string(),
+            }],
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let same_run = gepa_budget_status_for_reservation_at(&config, &ledger, "run-1", now, None);
+        let different_run =
+            gepa_budget_status_for_reservation_at(&config, &ledger, "run-2", now, None);
+
+        assert!(
+            same_run.allowed,
+            "a retry of the same GEPA job should reuse its existing reservation"
+        );
+        assert!(
+            !different_run.allowed,
+            "a different GEPA job should still respect the daily run cap"
+        );
+    }
+
+    #[test]
+    fn gepa_budget_reservations_do_not_consume_daily_spend() {
+        let config = GepaOptimizerConfig {
+            max_runs_per_day: 0,
+            daily_budget_usd: 2.0,
+            per_run_budget_usd: 0.5,
+            ..GepaOptimizerConfig::default()
+        };
+        let ledger = GepaBudgetLedger {
+            entries: (0..4)
+                .map(|idx| GepaBudgetLedgerEntry {
+                    run_id: format!("run-{idx}"),
+                    reserved_usd: 0.50,
+                    status: "reserved".to_string(),
+                    recorded_at: "2026-05-29T10:00:00Z".to_string(),
+                })
+                .collect(),
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let status = gepa_budget_status_from_ledger_at(&config, &ledger, now, None);
+
+        assert_eq!(status.runs_today, 4);
+        assert_eq!(status.used_today_usd, 0.0);
+        assert_eq!(status.remaining_today_usd, 2.0);
+        assert!(status.allowed);
+    }
+
+    #[test]
+    fn gepa_budget_run_count_cap_only_applies_when_configured() {
+        let ledger = GepaBudgetLedger {
+            entries: vec![GepaBudgetLedgerEntry {
+                run_id: "run-1".to_string(),
+                reserved_usd: 0.0,
+                status: "reserved".to_string(),
+                recorded_at: "2026-05-29T10:00:00Z".to_string(),
+            }],
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let uncapped = gepa_budget_status_from_ledger_at(
+            &GepaOptimizerConfig {
+                max_runs_per_day: 0,
+                ..GepaOptimizerConfig::default()
+            },
+            &ledger,
+            now,
+            None,
+        );
+        let capped = gepa_budget_status_from_ledger_at(
+            &GepaOptimizerConfig {
+                max_runs_per_day: 1,
+                ..GepaOptimizerConfig::default()
+            },
+            &ledger,
+            now,
+            None,
+        );
+
+        assert!(uncapped.allowed);
+        assert!(!capped.allowed);
+        assert_eq!(
+            capped.reason.as_deref(),
+            Some("GEPA daily run count limit has been reached.")
+        );
+    }
+
+    #[test]
+    fn gepa_default_metric_call_budget_keeps_background_runs_bounded() {
+        assert_eq!(GepaOptimizerConfig::default().max_metric_calls, 2);
     }
 
     #[test]

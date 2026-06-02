@@ -424,8 +424,11 @@ pub(super) async fn get_orbit_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    match agent.arkorbit.get_orbit(&id).await {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.get_orbit(&id).await {
         Ok(Some(orbit)) => {
             (StatusCode::OK, Json(serde_json::json!({ "orbit": orbit }))).into_response()
         }
@@ -509,8 +512,11 @@ pub(super) async fn orbit_index_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    match agent.arkorbit.read_orbit_index(&id) {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.read_orbit_index_async(&id).await {
         Ok(bytes) => set_orbit_index_headers(bytes.into_response()),
         Err(err) => json_error(StatusCode::NOT_FOUND, err.to_string()),
     }
@@ -520,8 +526,11 @@ pub(super) async fn orbit_messages_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    match agent.arkorbit.read_orbit_chat_messages(&id, 200) {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.read_orbit_chat_messages_async(&id, 200).await {
         Ok(messages) => (
             StatusCode::OK,
             Json(serde_json::json!({ "messages": messages })),
@@ -535,8 +544,11 @@ pub(super) async fn orbit_files_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    match agent.arkorbit.list_orbit_files(&id) {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.list_orbit_files_async(&id).await {
         Ok(files) => (StatusCode::OK, Json(serde_json::json!({ "files": files }))).into_response(),
         Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
@@ -552,8 +564,11 @@ pub(super) async fn orbit_file_endpoint(
             "Orbit file is not a user-created artifact",
         );
     }
-    let agent = state.agent.read().await;
-    match agent.arkorbit.read_orbit_file_text(&id, &path) {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.read_orbit_file_text_async(&id, &path).await {
         Ok(content) => {
             set_orbit_security_headers(content.into_response(), content_type_for_name(&path))
         }
@@ -603,16 +618,19 @@ pub(super) async fn update_orbit_widget_endpoint(
         );
     }
 
-    let agent = state.agent.read().await;
-    match agent.arkorbit.get_orbit(&id).await {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.get_orbit(&id).await {
         Ok(Some(_)) => {}
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "orbit not found"),
         Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
 
-    let raw = match agent
-        .arkorbit
-        .read_orbit_file_text(&id, "data/widgets.json")
+    let raw = match arkorbit
+        .read_orbit_file_text_async(&id, "data/widgets.json")
+        .await
     {
         Ok(raw) => raw,
         Err(err) => return json_error(StatusCode::NOT_FOUND, err.to_string()),
@@ -671,9 +689,9 @@ pub(super) async fn update_orbit_widget_endpoint(
     };
     match next {
         Ok(next) => {
-            if let Err(err) = agent
-                .arkorbit
+            if let Err(err) = arkorbit
                 .write_orbit_file(&id, "data/widgets.json", &next)
+                .await
             {
                 return internal_error(err);
             }
@@ -699,16 +717,19 @@ pub(super) async fn delete_orbit_widget_endpoint(
         return json_error(StatusCode::BAD_REQUEST, "invalid widget id");
     };
 
-    let agent = state.agent.read().await;
-    match agent.arkorbit.get_orbit(&id).await {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.get_orbit(&id).await {
         Ok(Some(_)) => {}
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "orbit not found"),
         Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
 
-    let raw = match agent
-        .arkorbit
-        .read_orbit_file_text(&id, "data/widgets.json")
+    let raw = match arkorbit
+        .read_orbit_file_text_async(&id, "data/widgets.json")
+        .await
     {
         Ok(raw) => raw,
         Err(_) => {
@@ -764,9 +785,9 @@ pub(super) async fn delete_orbit_widget_endpoint(
     };
     match next {
         Ok(next) => {
-            if let Err(err) = agent
-                .arkorbit
+            if let Err(err) = arkorbit
                 .write_orbit_file(&id, "data/widgets.json", &next)
+                .await
             {
                 return internal_error(err);
             }
@@ -779,7 +800,7 @@ pub(super) async fn delete_orbit_widget_endpoint(
         if widget_module_still_registered(&widgets, &module) {
             continue;
         }
-        match agent.arkorbit.remove_orbit_module_dir(&id, &module) {
+        match arkorbit.remove_orbit_module_dir_async(&id, &module).await {
             Ok(true) => deleted_modules.push(module),
             Ok(false) => {}
             Err(err) => return internal_error(err),
@@ -804,13 +825,14 @@ pub(super) async fn orbit_public_fetch_endpoint(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    {
+    let arkorbit = {
         let agent = state.agent.read().await;
-        match agent.arkorbit.get_orbit(&id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return json_error(StatusCode::NOT_FOUND, "orbit not found"),
-            Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
-        }
+        agent.arkorbit.clone()
+    };
+    match arkorbit.get_orbit(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return json_error(StatusCode::NOT_FOUND, "orbit not found"),
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
 
     let raw_url = extract_public_proxy_target_from_query(uri.query(), "url")
@@ -929,8 +951,11 @@ pub(super) async fn orbit_chat_transcripts_endpoint(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let (limit, offset) = orbit_chat_history_page_bounds(&params);
-    let agent = state.agent.read().await;
-    match agent.arkorbit.list_orbit_chat_transcripts(&id) {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.list_orbit_chat_transcripts_async(&id).await {
         Ok(transcripts) => {
             let total = transcripts.len();
             let page = transcripts
@@ -972,10 +997,13 @@ pub(super) async fn orbit_chat_transcript_messages_endpoint(
     State(state): State<AppState>,
     Path((id, transcript_id)): Path<(String, String)>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    match agent
-        .arkorbit
-        .read_orbit_chat_transcript(&id, &transcript_id, 200)
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit
+        .read_orbit_chat_transcript_async(&id, &transcript_id, 200)
+        .await
     {
         Ok(messages) => (
             StatusCode::OK,
@@ -990,8 +1018,11 @@ pub(super) async fn reset_orbit_chat_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    match agent.arkorbit.reset_orbit_chat(&id) {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.reset_orbit_chat_async(&id).await {
         Ok(transcript) => (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "ok", "transcript": transcript })),
@@ -1005,8 +1036,11 @@ pub(super) async fn resolve_module_endpoint(
     State(state): State<AppState>,
     Path((orbit_id, path)): Path<(String, String)>,
 ) -> Response {
-    let agent = state.agent.read().await;
-    match agent.arkorbit.resolve_module(&orbit_id, &path) {
+    let arkorbit = {
+        let agent = state.agent.read().await;
+        agent.arkorbit.clone()
+    };
+    match arkorbit.resolve_module_async(&orbit_id, &path).await {
         Ok(Some(resolved)) => {
             set_orbit_security_headers(resolved.bytes.into_response(), &resolved.content_type)
         }
@@ -1019,14 +1053,13 @@ pub(super) async fn orbit_events_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let (service, orbit_dir) = {
+    let service = {
         let agent = state.agent.read().await;
-        let service = agent.arkorbit.clone();
-        let orbit_dir = match service.orbit_dir(&id) {
-            Ok(dir) => dir,
-            Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
-        };
-        (service, orbit_dir)
+        agent.arkorbit.clone()
+    };
+    let orbit_dir = match service.orbit_dir_async(&id).await {
+        Ok(dir) => dir,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
     };
     drop(service);
 

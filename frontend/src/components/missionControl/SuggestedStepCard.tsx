@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { FileText, MessageSquare, Play } from "lucide-react";
-import type { BriefingResponse, RecommendedAction } from "../../types";
+import type { BriefingResponse, RecommendedAction, TraceSummary } from "../../types";
+import { formatUiRelativeDateTimeMeta } from "../../lib/dateFormat";
 import { NeuralPanel } from "./NeuralPanel";
 
 export type SuggestedStepCardProps = {
@@ -11,6 +12,8 @@ export type SuggestedStepCardProps = {
   briefing?: BriefingResponse | null;
   onExecuteAction?: (action: RecommendedAction) => void;
   executing?: boolean;
+  recentRuns?: TraceSummary[];
+  onOpenActivity?: () => void;
 };
 
 export function SuggestedStepCard({
@@ -21,6 +24,8 @@ export function SuggestedStepCard({
   briefing,
   onExecuteAction,
   executing = false,
+  recentRuns = [],
+  onOpenActivity,
 }: SuggestedStepCardProps) {
   const heroPrompts = useMemo(() => (prompts && prompts.length > 0 ? prompts : [""]), [prompts]);
   const promptSignature = heroPrompts.join("\n");
@@ -72,9 +77,20 @@ export function SuggestedStepCard({
   }, [heroPrompts.length, prefersReducedMotion]);
 
   const recommended = briefing?.recommended_actions ?? [];
+  const recentTwo = useMemo(() => {
+    const all = Array.isArray(recentRuns) ? recentRuns.slice() : [];
+    all.sort((a, b) => ((a.started_at || "") < (b.started_at || "") ? 1 : -1));
+    return all.slice(0, 2);
+  }, [recentRuns]);
 
   return (
-    <NeuralPanel title="Suggested Next Step" tag="DAILY USE" tagTone="default" className="nw-panel--suggested">
+    <NeuralPanel
+      title="Suggested Next Step"
+      tag="DAILY USE"
+      tagTone="default"
+      className="nw-panel--suggested"
+      bodyClassName="nw-suggested-body"
+    >
       <div className="nw-suggested-prompt" title={activePrompt}>
         <span className="nw-suggested-prompt-text">{displayPrompt}</span>
       </div>
@@ -100,29 +116,57 @@ export function SuggestedStepCard({
         ) : null}
       </div>
 
-      {recommended.length > 0 ? (
-        <div className="nw-suggested-recommendations">
-          {recommended.slice(0, 2).map((act) => (
-            <div key={act.id} className="nw-suggested-recommendation">
-              <div className="nw-suggested-run-mark">
-                <Play size={11} fill="currentColor" strokeWidth={0} aria-hidden />
-              </div>
-              <div className="nw-suggested-recommendation-copy">
-                <div className="nw-activity-ts">RECOMMENDED</div>
-                <div className="nw-activity-txt">{act.title}</div>
-              </div>
-              {onExecuteAction ? (
-                <button
-                  className="nw-btn nw-btn--small nw-suggested-run"
-                  type="button"
-                  disabled={executing}
-                  onClick={() => onExecuteAction(act)}
-                >
-                  Run <span className="nw-arrow">-&gt;</span>
-                </button>
-              ) : null}
+      {recommended.length > 0 || recentTwo.length > 0 ? (
+        <div className="nw-suggested-context">
+          {recommended.length > 0 ? (
+            <div className="nw-suggested-recommendations">
+              {recommended.slice(0, 2).map((act) => (
+                <div key={act.id} className="nw-suggested-recommendation">
+                  <div className="nw-suggested-run-mark">
+                    <Play size={11} fill="currentColor" strokeWidth={0} aria-hidden />
+                  </div>
+                  <div className="nw-suggested-recommendation-copy">
+                    <div className="nw-activity-ts">RECOMMENDED</div>
+                    <div className="nw-activity-txt">{act.title}</div>
+                  </div>
+                  {onExecuteAction ? (
+                    <button
+                      className="nw-btn nw-btn--small nw-suggested-run"
+                      type="button"
+                      disabled={executing}
+                      onClick={() => onExecuteAction(act)}
+                    >
+                      Run <span className="nw-arrow">-&gt;</span>
+                    </button>
+                  ) : null}
+                </div>
+              ))}
             </div>
-          ))}
+          ) : null}
+
+          {recentTwo.length > 0 ? (
+            <div className="nw-suggested-recent">
+              <div className="nw-suggested-recent-label">RECENT RUNS</div>
+              {recentTwo.map((run) => {
+                const meta = formatUiRelativeDateTimeMeta(run.started_at);
+                return (
+                  <button
+                    type="button"
+                    className="nw-suggested-recent-row"
+                    key={run.id}
+                    onClick={onOpenActivity}
+                    disabled={!onOpenActivity}
+                    title={`${run.message_preview || "(no preview)"} - ${String(run.status || "").toUpperCase()}`}
+                  >
+                    <span className="nw-suggested-recent-txt">
+                      {run.message_preview || "(no preview)"}
+                    </span>
+                    <span className="nw-suggested-recent-meta">{meta.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </NeuralPanel>

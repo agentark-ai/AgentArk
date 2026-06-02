@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <em>Not an agent. An Ark for agents: build from prompts and tools, deploy as apps, automations, or watchers, monitor every action, secure every boundary, self-evolve from your usage.</em>
+  <em>Not an agent. An Ark for agents: build from prompts and tools, deploy as apps, automations, or watchers, distill noisy context, monitor every action, secure every boundary, self-evolve from your usage.</em>
 </p>
 
 <p align="center">
@@ -23,7 +23,8 @@
   A self-hosted runtime for the full agent lifecycle.<br>
   Build agents from structured prompts, tools, and integrations. Deploy them as live apps, scheduled automations, conditional watchers, or chat sessions.<br>
   Monitor every step through Sentinel with action traces, failure classification, and drift detection. Secure every capability boundary with intent classification, output guards, approval gates, and per-action authorization.<br>
-  Self-evolve prompts, classifiers, routing policies, and specialist behavior from your own usage.<br>
+  Save context with ArkDistill: deterministic tool-output compaction before noisy browser pages, logs, traces, HTML, and integration dumps reach the model, often cutting noisy outputs by 60-90%.<br>
+  Self-evolve prompts, classifiers, routing policies, specialist behavior, and context-saving profiles from your own usage.<br>
   Review your day, week, or month through Reflect: a local visual panorama of where chat, ArkOrbit, apps, goals, watchers, memory, background agents, usage, and learned workflows clustered.<br>
   Chat, memory, devices, integrations, and reviewable actions, all in one place, all on your machine, private by default.<br>
   <code>~3.1GB Docker image &middot; ~500MB idle, ~1GB RAM steady-state under load (5 containers, embeddings loaded) &middot; AES-256-GCM encrypted &middot; model-agnostic</code>
@@ -80,12 +81,13 @@ It does not stop at a reply. It can **save the preference**, **schedule the foll
 
 **AgentArk is not an agent. It is an Ark for agents.** The Ark is the security layer: the wrapper that contains, observes, and enforces what every agent inside it is allowed to do, and the audit surface where every action becomes reviewable. Agents are the things that run inside the Ark - chat handlers, deployed apps, scheduled automations, conditional watchers, specialist sub-agents dispatched by the router. The Ark is what makes any of them safe to point at your real data.
 
-Inside that boundary AgentArk also builds the agents you ask for, deploys them as apps with public URLs, automations, or watchers, monitors every step, and self-evolves their prompts and policies from your usage. Chat, memory, tasks, integrations, documents, companion devices, and audit trails live together in one private workspace on your machine. It can keep track of your preferences, deliver a daily brief, follow up across channels, schedule routines, monitor things in the background, build apps, and take action safely when you ask.
+Inside that boundary AgentArk also builds the agents you ask for, deploys them as apps with public URLs, automations, or watchers, monitors every step, distills noisy tool output before it expands the model context, and self-evolves prompts, policies, and context-saving profiles from your usage. Chat, memory, tasks, integrations, documents, companion devices, and audit trails live together in one private workspace on your machine. It can keep track of your preferences, deliver a daily brief, follow up across channels, schedule routines, monitor things in the background, build apps, and take action safely when you ask.
 
 It is built to evolve with you. Accepted work, user corrections, repeated routines, and live tool outcomes are reflected into local memory, prompts, routing, and strategy so the OS gets more aligned with your workflow instead of acting like every session is day one.
 
 - If you keep rewriting replies to be shorter, it learns to stay concise by default
 - If a certain tool path keeps succeeding for a task, it becomes more likely to choose that path again
+- If browser pages, logs, or traces keep wasting context, Evolve can improve ArkDistill profiles that shrink them while preserving required fields
 - If you correct how it briefs, routes, or follows up, future runs reflect that correction
 
 Your data stays with you. Your secrets are encrypted. You keep the final say on risky actions.
@@ -103,6 +105,20 @@ Your data stays with you. Your secrets are encrypted. You keep the final say on 
 | **Device layer**      | Companion device pairing, scoped grants, and high-risk command approvals                  |
 | **Safety layer**      | Sandboxing, secrets, policy checks, action review, and trace history                      |
 | **Evolution layer**   | Memory, Reflect, Sentinel, Evolve, and Pulse working together              |
+
+---
+
+## Why AgentArk
+
+**Lives where you do.** Docker on your machine, period. Memory, secrets, integration tokens, conversation history, audit trails — all in local volumes, never in someone else's cloud. No managed backend you depend on, no account you have to keep, no telemetry you have to opt out of.
+
+**You pay your model, not us.** Point AgentArk at Ollama or any local model and every prompt after install is genuinely free — no rate limits, no surprise invoice. Bring your own Anthropic, OpenAI, Gemini, or Groq key and you pay the provider's published rate directly; AgentArk never proxies, intermediates, or marks up a single token. No subscription, no per-seat, no minimum.
+
+**Bounded by design.** Every action that touches the world goes through a permission gate. The agent runs inside a Docker boundary with an approval queue for anything not pre-authorized. Your host filesystem stays off-limits unless you explicitly mount what you want it to see.
+
+**Adapts to *you*.** Accepted work, your corrections, and live tool outcomes feed back into local memory, prompts, and routing. Over weeks of use the OS gets shaped by how you actually work — your follow-up style, your routing preferences, the tool paths that keep succeeding for your tasks — not by a generic mix of every other user.
+
+**Open and inspectable.** MIT and Apache 2.0. Read every line, fork it, run it. Audit trails on every action mean you can always see what the agent did, why, and when — across chat, automations, watchers, deployed apps, and integrations.
 
 ---
 
@@ -140,7 +156,7 @@ The installer records the selected method, so later `agentark start` and `agenta
 
 Open **http://localhost:8990**, pick your LLM provider in Settings, start chatting.
 
-> **Use the Web UI.** AgentArk is designed to run through the Docker Compose stack and Mission Control at `http://localhost:8990`. Do not use the native `agentark` CLI as your normal entry point; it is an operator/developer escape hatch and may not initialize or expose the full runtime, approvals, integrations, browser/app tooling, and UI-backed settings.
+> **Use the Web UI.** AgentArk is designed to run through the Docker Compose stack and Mission Control at `http://localhost:8990`.
 
 The supported install path uses Docker Compose defaults plus named Docker volumes for runtime state and preserves those volumes across updates. AgentArk does not create or require a root project `.env`. Generated apps may have framework-owned env files inside their own app directories when required, but secret keys stay in AgentArk's managed secret storage or runtime injection path.
 
@@ -237,45 +253,6 @@ docker pull ghcr.io/agentark-ai/agentark:1.2.3     # pinned version
 
 For production or first-time installs, prefer a pinned version tag and verify the attestation first. See [VERIFY.md](VERIFY.md).
 
-### CLI mode
-
-The native CLI is not the recommended way to use AgentArk. Use the Web UI for normal operation, onboarding, settings, approvals, integrations, apps, and day-to-day chat.
-
-The CLI exists mainly for development, diagnostics, and operator checks inside a configured runtime:
-
-```bash
-agentark --pulse                 # run Pulse health check
-agentark --chat                  # developer/operator chat path
-agentark --setup                 # legacy CLI setup path
-```
-
-```
-    _                    _      _        _
-   / \   __ _  ___ _ __ | |_   / \   _ _| | __
-  / _ \ / _` |/ _ \ '_ \| __| / _ \ | '__| |/ /
- / ___ \ (_| |  __/ | | | |_ / ___ \| |  |   <
-/_/   \_\__, |\___|_| |_|\__/_/   \_\_|  |_|\_\
-        |___/
-------------------------------------------------------------
-                  AgentArk v0.1.0 | CLI Chat
-------------------------------------------------------------
-
-Type your message and press Enter.
-Commands: /exit  /new  /help
-
-you ➜ what can you do?
-agentark ➜ I can help with...
-```
-
-| Action                          | How                                                                   |
-| :------------------------------ | :-------------------------------------------------------------------- |
-| Run a quick health check        | `agentark --pulse`                                                    |
-| Exercise the operator chat path | `agentark --chat` inside a configured runtime                         |
-| Inspect CLI startup behavior    | start the binary from the same environment used by the Docker runtime |
-| Exit CLI chat                   | `Ctrl+D` or `/exit`                                                   |
-
-The CLI does not replace Mission Control. Some capabilities depend on the web control plane, browser session handoff, approval UI, app management, and Docker Compose service wiring.
-
 ### Build from source
 
 Source builds are for contributors and runtime-image development. For normal use, run the Docker Compose stack and use the Web UI.
@@ -338,7 +315,7 @@ docker compose down -v                          # stop and full reset
 
 ```text
 User Interfaces
-Web UI | Chat | CLI | Channels | Devices
+Web UI | Chat | Channels | Devices
         |
         v
 AgentArk Control Plane
@@ -376,6 +353,8 @@ Ark Core is the left-nav group for the five core operating surfaces. The product
 
 ArkOrbit is adjacent to Ark Core: it is the canvas workspace where the agent builds and live-updates widgets, files, and inline tools alongside chat. See [ArkOrbit docs](assets/docs/arkorbit.md).
 
+ArkDistill sits underneath the agent loop: it deterministically shrinks noisy tool output before it reaches model context, often saving 60-90% on noisy browser pages, logs, traces, HTML, and integration dumps. Analytics reports saved tokens, saved cost, and percentage reduction for the selected time range. See [ArkDistill docs](assets/docs/arkdistill.md).
+
 For deeper technical detail, each system has a standalone reference covering its data model, pipeline, HTTP API, UI surface, and known limits.
 
 ---
@@ -391,12 +370,13 @@ For deeper technical detail, each system has a standalone reference covering its
 | **Memory**                 | Memory with episodic, semantic, procedural memory, provenance, review, rollback, and retention                                                                                                                                                                                                            | Memory core plus optional dreaming/background consolidation                                                | Local-first Memory Tree: integration feeds ingested into canonical ≤3k-token Markdown chunks in local SQLite, browsable and editable through an Obsidian-style wiki                                                      | Agent-curated memory with periodic nudges, FTS5 full-text session search with LLM summarization, and Honcho dialectic user modeling                 |
 | **Background work**        | Sentinel with tasks, watchers, routines, schedules, and follow-up loops                                                                                                                                                                                                                                   | Cron jobs, dreaming schedules, gateway events, nodes                                                       | Auto-fetch pulls fresh data from every active connection every 20 minutes and writes into the Memory Tree; general task/watcher/cron surface not documented                                                              | Built-in cron scheduler that delivers daily reports, nightly backups, and weekly audits to any connected platform in natural language               |
 | **Health / operations**    | Pulse health checks across runtime, config, integrations, security posture, storage, and automation reliability                                                                                                                                                                                           | Gateway health, event log, node status, and cron visibility                                                | Not documented in public docs                                                                                                                                                                                            | `hermes doctor` diagnostic plus `/compress`, `/usage`, and `/insights` slash commands                                                               |
-| **Learning / adaptation**  | Evolve with self-tune, experience consolidation, heuristic reflection, procedural pattern induction, routing-policy benchmarks, prompt/classifier/specialist prompt evolution, tests on past examples, limited live rollout, change history, review, and rollback; skills remain separately designed or installed capabilities | No reviewed self-editing agent loop documented                                                             | TokenJuice context compression (HTML to Markdown, dedup, URL shortening; about 70% token reduction in their published test); reviewed self-editing agent loop not documented                                            | Agent-authored skills that self-improve during use, plus Atropos RL environments and trajectory compression for training future tool-calling models |
+| **Learning / adaptation**  | Evolve with self-tune, experience consolidation, heuristic reflection, procedural pattern induction, routing-policy benchmarks, prompt/classifier/specialist prompt evolution, deterministic ArkDistill tool-output compaction, context-saving profile optimization, tests on past examples, limited live rollout, change history, review, and rollback; skills remain separately designed or installed capabilities | No reviewed self-editing agent loop documented                                                             | TokenJuice context compression (HTML to Markdown, dedup, URL shortening; about 70% token reduction in their published test); reviewed self-editing agent loop not documented                                            | Agent-authored skills that self-improve during use, plus Atropos RL environments and trajectory compression for training future tool-calling models |
 | **Messaging / channels**   | Web, CLI, Telegram, WhatsApp, Slack, webhooks, MCP, and custom channels                                                                                                                                                                                                                                      | Discord, Google Chat, iMessage, Matrix, Teams, Signal, Slack, Telegram, WhatsApp, Zalo, WebChat, and nodes | Native Slack, Gmail, and Notion through the OAuth integration layer plus a live Google Meet agent that joins meetings, transcribes into Memory Tree, and speaks back into the call                                      | Telegram, Discord, Slack, WhatsApp, Signal, CLI, and Home Assistant through a single gateway, with voice memo transcription                         |
 | **Execution isolation**    | WASM sandbox, Docker runtime, approval gates, guarded action review, and execution proofs                                                                                                                                                                                                                    | Managed browser profile, pairing, node scopes, and exec approvals                                          | Not documented in public docs                                                                                                                                                                                            | Six pluggable terminal backends: local, Docker, SSH, Daytona, Singularity, and Modal                                                                |
 | **Security / trust model** | Cross-layer capability vocabulary, scoped grants, semantic action review, signed action integrity, approval escalation, abuse throttling, output guards, secret redaction, and security events                                                                                                               | Gateway auth, browser/device pairing, node scopes, and exec approval controls                              | Local-first storage and OAuth-scoped integration credentials; explicit approval gates, capability vocabulary, or output guards not documented                                                                            | Command approval, DM pairing, and container isolation                                                                                               |
+| **Integration data path**  | **No third party in the integration path.** OAuth tokens AES-256-GCM encrypted in your local Docker volume; integration calls go straight from your machine to the upstream service. MCP servers run locally (stdio) or against endpoints you choose. No managed-cloud proxy, no gateway-style toolkit       | Direct — the gateway runs on your machine, so integration calls leave only to the upstream services you configure | **OAuth tokens and integration API calls transit Composio's infrastructure.** The "118+ via Composio" figure refers to their managed auth + tool-execution toolkit, which sits between OpenHuman and the upstream services it ingests; the resulting data lands locally in the Memory Tree, but the fetch path goes through Composio | Direct — MCP servers and local tools call upstream services from your runtime, no third-party gateway in the integration path                       |
 | **Audit / accountability** | Trace history, approval records, security logs, execution proofs, action review snapshots, companion audit chain, and rollback-aware memory provenance                                                                                                                                                       | Gateway logs, live event log, cron run history, and routed conversation history                            | Memory Tree and Obsidian wiki expose ingested data; dedicated execution trace, approval log, or signed-action history not documented                                                                                     | FTS5 session search and conversation history through the memory layer; dedicated execution trace not documented                                     |
-| **Extensibility**          | Skills, extension packs, plugins, MCP servers, custom messaging channels, and companion devices                                                                                                                                                                                                              | Skills, plugins, MCP server/client, browser profiles, nodes, and channel plugins                           | 118+ one-click OAuth integrations and built-in native tools (web search, scraping, coding utilities, browser/computer control, scheduling, voice); plugin marketplace and MCP not documented                              | 40+ built-in tools, agent-authored self-improving skills, and MCP server integration                                                                |
+| **Extensibility**          | **Open install surface — no vendor catalog limit.** Any MCP server, signed extension pack, plugin, custom messaging channel, or companion device installs through one control plane. Skills and extension packs ship as built-ins; the ceiling is the MCP/pack ecosystem, not a fixed list                                                          | Skills, plugins, MCP server/client, browser profiles, nodes, and channel plugins                           | **118+ one-click OAuth integrations via Composio** plus built-in native tools (web search, scraping, coding utilities, browser/computer control, scheduling, voice); plugin marketplace and MCP not documented                              | 40+ built-in tools, agent-authored self-improving skills, and MCP server integration                                                                |
 | **Multi-agent**            | Specialist agents, delegation, routing, and swarms                                                                                                                                                                                                                                                           | Agent sessions and routed harnesses; node-backed capabilities                                              | "Agent coordination" with sub-agent spawning listed in the native toolset                                                                                                                                                | Isolated subagents spawned for parallel workstreams                                                                                                 |
 | **Device / app layer**     | Generated apps, app runtime, companion-device grants, and scoped approvals                                                                                                                                                                                                                                   | Mobile/headless nodes with pairing and command surfaces                                                    | Desktop app with native voice (STT/TTS) and browser/computer control; generated apps, public-URL hosting, and companion-device grants not documented                                                                     | Runs on Linux, macOS, WSL2, and Android via Termux; Home Assistant integration via gateway; managed app runtime not documented                      |
 
@@ -404,7 +384,7 @@ For deeper technical detail, each system has a standalone reference covering its
 
 Source notes: [OpenClaw overview](https://docs.openclaw.ai/), [OpenClaw Control UI](https://docs.openclaw.ai/web/control-ui), [OpenClaw browser](https://docs.openclaw.ai/tools/browser), [OpenClaw nodes](https://docs.openclaw.ai/nodes), [OpenClaw memory dreaming](https://docs.openclaw.ai/concepts/memory), [Hermes Agent GitHub](https://github.com/NousResearch/hermes-agent), [Hermes skills](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills), [Hermes memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory), [Hermes checkpoints](https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback), [OpenHuman docs](https://tinyhumans.gitbook.io/openhuman), [OpenHuman GitHub](https://github.com/tinyhumansai/openhuman).
 
-In short: choose OpenClaw when the main job is routing many chat apps into agents, Hermes Agent when you want a terminal-first agent that builds its own skills and memory across sessions, OpenHuman when you want a desktop AI that auto-ingests your OAuth services into a local Memory Tree, or **AgentArk if you want one self-hosted AI OS that connects chat, memory, apps, integrations, companion devices, review, and long-running automation in one control plane**.
+In short: choose OpenClaw when the main job is routing many chat apps into agents, Hermes Agent when you want a terminal-first agent that builds its own skills and memory across sessions, OpenHuman when you want a desktop AI that auto-ingests a fixed catalog of OAuth services into a local Memory Tree on day one (with the trade-off that integration calls and tokens transit Composio's infrastructure), or **AgentArk if you want one self-hosted AI OS that connects chat, memory, apps, integrations, companion devices, review, and long-running automation in one control plane — with an open install surface (any MCP server, signed extension pack, or custom channel) rather than a vendor-curated catalog, and an integration data path that stays between your machine and the upstream service (no third-party gateway, OAuth tokens encrypted locally)**.
 
 ### Footprint snapshot
 
@@ -440,8 +420,9 @@ AgentArk's framework compensates instead:
 - **Self-heal and retry** catches malformed tool calls, schema errors, and failed dispatches before they reach you
 - **Model failover** rotates through your configured providers when one rate-limits or errors, without breaking the conversation
 - **Memory** retrieves your preferences instead of asking the model to re-derive them every session
+- **ArkDistill** compacts noisy tool output before the next model turn, often saving 60-90% on browser pages, logs, traces, HTML, and integration dumps; already-structured JSON usually saves less
 - **Capability correlation and approval gates** catch unsafe outputs at the policy layer, not the model layer
-- **Evolve** reinforces prompt shapes that succeed, so the same model performs better over time
+- **Evolve** reinforces prompt shapes and context-saving profiles that succeed, so the same model performs better over time
 - **Structured validation** enforces JSON schemas, SSRF checks, and output sanitization independent of the model's reasoning
 
 Net result: a $0.10-$0.50/1M-token model on AgentArk produces reliable results for workloads that would require $3-$15/1M on a thin wrapper.
@@ -463,7 +444,7 @@ You choose the trade-off at runtime. The core stays the same.
 |                             |                                                                                                                                                                              |
 | :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Sub-Agent Orchestration** | Researcher, Coder, Analyst, Writer, Validator - auto-selected per task                                                                                                       |
-| **Self-Evolve Engine**      | Prompt evolution, policy tuning, strategy learning, and routing benchmarks                                                                                                   |
+| **Self-Evolve Engine**      | Prompt evolution, policy tuning, strategy learning, context-saving ArkDistill profiles, and routing benchmarks                                                                                                   |
 | **Self-Tune**               | Learns your style from local history, tracks tool success rates, adjusts autonomy                                                                                            |
 | **Memory**               | Current memory, provenance, review, rollback, and three-tier memory across episodic conversations, semantic facts, and procedural actions                                    |
 | **Reflect**              | Local day/week/month panorama showing where work clustered across chat, ArkOrbit, apps, goals, watchers, memory, Sentinel, Pulse, Evolve, usage, and learned workflows |
@@ -511,16 +492,9 @@ You choose the trade-off at runtime. The core stays the same.
 
 ### First-time setup
 
-**Web UI:**
-
 1. Open **http://localhost:8990**
 2. Go to **Settings** → pick your **LLM Provider** → enter credentials
 3. Set **Bot Name** and **Personality** → Save → start chatting
-
-**CLI:**
-
-1. Run `agentark --setup` → pick your model/provider
-2. Run `agentark --chat`
 
 ### LLM providers
 
@@ -678,8 +652,10 @@ RUST_LOG=info,agentark=debug ./scripts/start.sh     # agent internals only
 - Support multiple accounts per provider across integrations, channels, and reasoning, with workspace-level account management and selection. Project-specific selection can be revisited in phase 2.
 - Let users refine an active chat run with extra instructions while AgentArk is still working.
 - Re-enable retry, resume, and cancel controls after they are implemented end to end across chat, tasks, traces, streaming state, and backend execution. These controls are intentionally hidden until the future workflow is reliable and usable.
+- Re-document the native `agentark` CLI as a first-class surface. The binary still ships and the flags (`--chat`, `--pulse`, `--setup`, `--headless`) still work, but test coverage is minimal so the CLI is no longer advertised. Bring it back once it has end-to-end coverage parity with the Web UI for chat, settings, approvals, and integrations.
 - Add external database support through a dedicated Databases page with read-only schema inspection and conversational querying. Planned providers: Postgres, Supabase, MySQL, Snowflake, and Databricks SQL.
 - Add local-only message history querying through user-approved companion devices. Planned flow: a user asks AgentArk to search messages, AgentArk sends a typed `messages.search` command to a paired local companion, the user approves the exact query/scope/time range, and only bounded results return to AgentArk. Initial target is macOS iMessage via a local companion because iOS cannot expose Messages history to browser or app companions; WhatsApp, Telegram, SMS, and other local app stores require separate companion support where the platform permits it.
+- Add voice as a future opt-in capability. The planned direction is two-way local voice with interruption support: microphone audio becomes reviewed transcript input, AgentArk runs through the same chat/spine/conversation history path, and optional spoken output returns through a local voice bridge. Voice is not built, installed, or started by default today.
 - Explore optional Zero toolchain support for small reusable native helper tools. AgentArk would use it only when a task or repo needs Zero, because its structured compiler diagnostics and explicit capability model can help agents repair and permission-check generated tools without making Zero a default runtime dependency.
 - Explore install-time capability selection after the default runtime is stable. The current plan is to keep the one-command install low-friction and ship the full runtime by default, then add plain installer questions for larger or privileged capabilities such as Playwright/browser automation, Google Workspace tooling, private networking, and tunnel support. Recommended capabilities should stay selected by default, non-interactive installs should use the recommended defaults automatically, and AgentArk should show size, credential, privilege, health-check, and restart/recreate implications before changing installed capabilities. Settings should eventually let users add or remove these capability packs later without turning startup into a flag matrix.
 - Add generic chat-driven app setup for external repositories and self-hosted tools. AgentArk should be able to read setup instructions, choose an install strategy such as Docker Compose, Dockerfile, Python venv, Node, Rust, or explicit custom commands, create the needed config from safe templates, request secrets only through secure credential prompts, start the service, health-check it, persist lifecycle controls, and register any discovered API, MCP server, webhook, or custom integration so the user can use the running service from chat without a product-specific installer.

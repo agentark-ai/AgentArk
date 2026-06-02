@@ -33,6 +33,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
 import { formatUiTime } from "../../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../../lib/displayLabels";
 import { formatChannelSource } from "../channelLabels";
 import { LiveEventConsole } from "../LiveEventConsole";
 import { MetricBarCard } from "../analytics/MetricBarCard";
@@ -717,11 +718,7 @@ function truncateUiText(value: string, maxChars = 120): string {
 }
 
 function titleCaseLabel(value: string): string {
-  return value
-    .split(/[\s_-]+/)
-    .filter(Boolean)
-    .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
-    .join(" ");
+  return humanizeMachineLabel(value, "");
 }
 
 function learningEvidenceStatusColor(
@@ -759,8 +756,6 @@ function latestLearningEvidenceTimestamp(runs: JsonRecord[]): number {
 
 function learningEvidenceToolLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
-  if (normalized === "schedule_task") return "Scheduled task";
-  if (normalized === "calendar_create") return "Calendar event";
   return titleCaseLabel(normalized);
 }
 
@@ -1149,7 +1144,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       traceKind === "self_evolve.manual_action.result" ||
       traceKind === "self_evolve.manual_action.request"
     ) {
-      const action = str(data.action, "").trim().replace(/_/g, " ");
+      const action = humanizeMachineLabel(str(data.action, ""), "");
       const canaryState = asRecord(data.canary_state);
       chips.push(action || "Manual action");
       if (Object.keys(canaryState).length > 0) {
@@ -1201,7 +1196,7 @@ function syncRunTriggerLabel(trigger: string): string {
   const normalized = trigger.trim().toLowerCase();
   if (normalized === "manual") return "Manual";
   if (normalized === "background") return "Background";
-  return normalized ? normalized.replace(/_/g, " ") : "Unknown";
+  return humanizeMachineLabel(normalized, "Unknown");
 }
 
 type TraceRange = "1h" | "6h" | "24h" | "7d" | "14d" | "30d";
@@ -1229,10 +1224,7 @@ function traceRangeSinceISO(range: TraceRange): string {
 
 function traceSecurityEventTypeLabel(eventType: string): string {
   const normalized = (eventType || "").trim().toLowerCase();
-  if (!normalized) return "Unknown";
-  return normalized
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (m) => m.toUpperCase());
+  return humanizeMachineLabel(normalized, "Unknown");
 }
 
 type TracePageProps = {
@@ -1379,7 +1371,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
       ? `Completed successfully in ${formatTraceDuration(selectedTrace.duration_ms)}`
       : selectedTraceStatus === "failed"
         ? `Failed after ${formatTraceDuration(selectedTrace.duration_ms)}`
-        : `Status: ${selectedTraceStatus}`;
+        : `Status: ${humanizeStatusLabel(selectedTraceStatus)}`;
   const traceRunReceipt = buildTraceRunReceipt(selectedTrace, steps);
   const renderDiagnosticsSectionHeader = ({
     eyebrow,
@@ -2070,7 +2062,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                               <Chip
                                 size="small"
                                 color={syncRunStatusColor(status)}
-                                label={status}
+                                label={humanizeStatusLabel(status)}
                               />
                             </TableCell>
                             <TableCell>
@@ -2372,7 +2364,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                 <Chip
                   size="small"
                   color={traceStatusColor(selectedTraceStatus)}
-                  label={selectedTraceStatus}
+                  label={humanizeStatusLabel(selectedTraceStatus)}
                 />
                 <Typography
                   variant="body2"
@@ -2499,7 +2491,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                                     size="small"
                                     color={traceReceiptStatusColor(item.status)}
                                     variant="outlined"
-                                    label={item.status}
+                                    label={humanizeStatusLabel(item.status)}
                                   />
                                 ) : null}
                                 <Box sx={{ minWidth: 0 }}>
@@ -2565,7 +2557,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                                   size="small"
                                   color={traceReceiptStatusColor(item.status || "failed")}
                                   variant="outlined"
-                                  label={item.status || "failed"}
+                                  label={humanizeStatusLabel(item.status || "failed")}
                                 />
                                 <Box>
                                   <Typography variant="body2" sx={{ fontWeight: 650 }}>
@@ -2651,7 +2643,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                           <Chip
                             size="small"
                             color={traceStepColor(card.status)}
-                            label={card.status}
+                            label={humanizeStatusLabel(card.status)}
                           />
                           {card.chips.map((chip) => (
                             <Chip
@@ -3093,7 +3085,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                   </Box>
                   <Box className="diagnostics-section-meta">
                     {formatTraceDuration(selectedSyncRun.duration_ms)} |{" "}
-                    {str(selectedSyncRun.sync_kind, "activity")}
+                    {humanizeMachineLabel(str(selectedSyncRun.sync_kind, "activity"))}
                   </Box>
                 </Stack>
                 <Stack
@@ -3109,7 +3101,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                   <Chip
                     size="small"
                     color={syncRunStatusColor(selectedSyncRunStatus)}
-                    label={selectedSyncRunStatus || "unknown"}
+                    label={humanizeStatusLabel(selectedSyncRunStatus || "unknown")}
                   />
                   <Chip
                     size="small"

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::integrations::browser::{
-    BrowserIntegration, BrowserSessionCreateOptions, BrowserSidecarSessionState, PageContent,
-    PageElement,
+    BrowserDownloadArtifact, BrowserIntegration, BrowserSessionCreateOptions,
+    BrowserSidecarSessionState, PageContent, PageElement,
 };
 
 const MAX_ITERATIONS: u32 = 30;
@@ -22,9 +22,10 @@ const MAX_LIVE_BROWSER_SESSIONS: usize = 3;
 const CONTENT_SNAPSHOT_ATTEMPTS: usize = 5;
 const MAX_PERSISTED_ACTION_HISTORY: usize = 80;
 const OPERATOR_HANDOFF_TIMEOUT_SECS: u64 = 30 * 60;
-const LIVE_SESSION_IDLE_TIMEOUT_SECS: i64 = 15 * 60;
+const LIVE_SESSION_IDLE_TIMEOUT_SECS: i64 = 5 * 60;
 const LIVE_SESSION_IDLE_WARNING_SECS: i64 = LIVE_SESSION_IDLE_TIMEOUT_SECS - 60;
 const IDLE_WATCHDOG_POLL_SECS: u64 = 15;
+const TERMINAL_SESSION_EVIDENCE_RETENTION_SECS: u64 = 10 * 60;
 const INTERRUPTED_BROWSER_SESSION_REASON: &str =
     "Browser session was interrupted by an app restart before it could finish.";
 const INTERRUPTED_BROWSER_HANDOFF_REASON: &str =
@@ -185,6 +186,12 @@ pub struct BrowserSessionView {
     pub updated_at: String,
     pub page_url: Option<String>,
     pub page_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub downloads: Vec<BrowserDownloadArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_page: Option<PageContent>,
     pub live_view_enabled: bool,
     pub live_view_port: Option<u16>,
     pub live_view_path: Option<String>,
@@ -196,6 +203,7 @@ pub struct BrowserSessionView {
 #[derive(Clone)]
 pub struct BrowserSessionManager {
     sessions: Arc<DashMap<String, BrowserSession>>,
+    page_snapshots: Arc<DashMap<String, PageContent>>,
     integration: Arc<BrowserIntegration>,
     storage: Option<crate::storage::Storage>,
 }
@@ -253,6 +261,7 @@ impl BrowserSessionManager {
     pub async fn new(storage: Option<crate::storage::Storage>) -> Self {
         let manager = Self {
             sessions: Arc::new(DashMap::new()),
+            page_snapshots: Arc::new(DashMap::new()),
             integration: Arc::new(BrowserIntegration::new()),
             storage,
         };
@@ -285,8 +294,7 @@ impl BrowserSessionManager {
         llm_client: super::llm::LlmClient,
         notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
     ) -> Result<StartedBrowserSession> {
-        self.cleanup_stale_sessions().await;
-        self.prune_unreachable_live_sessions().await;
+        self.cleanup_stale_or_unreachable_sessions().await;
         self.close_ready_profile_login_sessions().await;
         let conversation_id = conversation_id
             .map(str::trim)
@@ -323,6 +331,8 @@ impl BrowserSessionManager {
                 reused_existing: true,
             });
         }
+        self.delete_superseded_failed_sessions(conversation_id.as_deref(), requested_profile_id)
+            .await;
 
         if self.active_count() >= MAX_LIVE_BROWSER_SESSIONS {
             anyhow::bail!(
@@ -499,7 +509,7 @@ impl BrowserSessionManager {
                 None
             };
 
-        Some(build_browser_session_view(
+        let mut view = build_browser_session_view(
             id,
             conversation_id,
             task_description,
@@ -509,12 +519,16 @@ impl BrowserSessionManager {
             created_at,
             updated_at,
             sidecar_state,
-        ))
+        );
+        view.last_page = self
+            .page_snapshots
+            .get(session_id)
+            .map(|snapshot| snapshot.clone());
+        Some(view)
     }
 
     pub async fn list_session_views(&self) -> Vec<BrowserSessionView> {
-        self.cleanup_stale_sessions().await;
-        self.prune_unreachable_live_sessions().await;
+        self.cleanup_stale_or_unreachable_sessions().await;
 
         let mut sessions = self
             .sessions
@@ -570,6 +584,8 @@ impl BrowserSessionManager {
                 }
             }
         }
+        sessions = browser_session_views_without_superseded_failures(sessions);
+        sessions.retain(browser_session_view_is_live_listing);
         sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         sessions
     }
@@ -967,6 +983,7 @@ impl BrowserSessionManager {
         if session_id.is_empty() {
             return Ok(false);
         }
+        self.page_snapshots.remove(session_id);
 
         let removed_sidecar_session_id = self
             .sessions
@@ -998,8 +1015,7 @@ impl BrowserSessionManager {
             anyhow::bail!("Browser profile id required");
         }
 
-        self.cleanup_stale_sessions().await;
-        self.prune_unreachable_live_sessions().await;
+        self.cleanup_stale_or_unreachable_sessions().await;
 
         let mut existing = self
             .sessions
@@ -1127,22 +1143,80 @@ impl BrowserSessionManager {
             .count()
     }
 
+    pub async fn cleanup_stale_or_unreachable_sessions(&self) {
+        self.cleanup_stale_sessions().await;
+        self.prune_unreachable_live_sessions().await;
+        self.cleanup_persisted_session_records().await;
+    }
+
     async fn cleanup_stale_sessions(&self) {
+        let now = Utc::now();
         let stale_sessions: Vec<_> = self
             .sessions
             .iter()
-            .filter(|entry| ready_session_is_expired(entry.value()))
-            .map(|entry| (entry.id.clone(), entry.status.kind().to_string()))
+            .filter(|entry| {
+                ready_session_is_expired(entry.value())
+                    || browser_session_record_should_be_cleaned_up(
+                        &entry.status,
+                        &entry.updated_at,
+                        &now,
+                    )
+            })
+            .map(|entry| {
+                (
+                    entry.id.clone(),
+                    entry.status.kind().to_string(),
+                    entry.sidecar_session_id.clone(),
+                )
+            })
             .collect();
 
-        for (session_id, status) in stale_sessions {
+        for (session_id, status, sidecar_session_id) in stale_sessions {
             self.sessions.remove(&session_id);
             tracing::info!(
                 "Cleaning up stale browser session '{}' with status '{}'",
                 session_id,
                 status
             );
+            self.close_sidecar_best_effort(&sidecar_session_id).await;
             delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
+        }
+    }
+
+    async fn cleanup_persisted_session_records(&self) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        let persisted_sessions = match storage.list_browser_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to list persisted browser sessions for cleanup: {}",
+                    error
+                );
+                return;
+            }
+        };
+        let now = Utc::now();
+        for persisted in persisted_sessions {
+            if self.sessions.contains_key(&persisted.id) {
+                continue;
+            }
+            let (session, changed) = BrowserSession::restore_from_persisted(persisted);
+            if browser_session_record_should_be_cleaned_up(
+                &session.status,
+                &session.updated_at,
+                &now,
+            ) {
+                self.page_snapshots.remove(&session.id);
+                delete_persisted_browser_session(Some(storage), &session.id).await;
+            } else if changed {
+                persist_browser_session(
+                    Some(storage),
+                    &PersistedBrowserSession::from_session(&session),
+                )
+                .await;
+            }
         }
     }
 
@@ -1177,6 +1251,7 @@ impl BrowserSessionManager {
                 sidecar_session_id
             );
             self.sessions.remove(&session_id);
+            self.page_snapshots.remove(&session_id);
             delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
         }
     }
@@ -1199,8 +1274,77 @@ impl BrowserSessionManager {
                 session_id
             );
             self.sessions.remove(&session_id);
+            self.page_snapshots.remove(&session_id);
             self.close_sidecar_best_effort(&sidecar_session_id).await;
             delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
+        }
+    }
+
+    async fn delete_superseded_failed_sessions(
+        &self,
+        conversation_id: Option<&str>,
+        requested_profile_id: Option<&str>,
+    ) {
+        let Some(conversation_id) = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+
+        let live_failed_sessions = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                failed_browser_session_is_superseded_candidate(
+                    entry.conversation_id.as_deref(),
+                    entry.profile_id.as_deref(),
+                    &entry.status,
+                    Some(conversation_id),
+                    requested_profile_id,
+                )
+                .then(|| (entry.id.clone(), entry.sidecar_session_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (session_id, sidecar_session_id) in live_failed_sessions {
+            self.sessions.remove(&session_id);
+            self.page_snapshots.remove(&session_id);
+            self.close_sidecar_best_effort(&sidecar_session_id).await;
+            delete_persisted_browser_session(self.storage.as_ref(), &session_id).await;
+        }
+
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        let persisted_sessions = match storage.list_browser_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to inspect persisted browser sessions before superseding failures: {}",
+                    error
+                );
+                return;
+            }
+        };
+        for persisted in persisted_sessions {
+            if !persisted.status.trim().eq_ignore_ascii_case("failed") {
+                continue;
+            }
+            let failed_status = SessionStatus::Failed(
+                persisted
+                    .status_detail
+                    .clone()
+                    .unwrap_or_else(|| "Browser session failed".to_string()),
+            );
+            if failed_browser_session_is_superseded_candidate(
+                persisted.chat_id.as_deref(),
+                persisted.profile_id.as_deref(),
+                &failed_status,
+                Some(conversation_id),
+                requested_profile_id,
+            ) {
+                delete_persisted_browser_session(Some(storage), &persisted.id).await;
+            }
         }
     }
 
@@ -1295,10 +1439,19 @@ impl BrowserSessionManager {
                 return;
             }
         };
+        let now = Utc::now();
         for persisted in restored {
             let (session, changed) = BrowserSession::restore_from_persisted(persisted);
             let session_id = session.id.clone();
             let snapshot = changed.then(|| PersistedBrowserSession::from_session(&session));
+            if browser_session_record_should_be_cleaned_up(
+                &session.status,
+                &session.updated_at,
+                &now,
+            ) {
+                delete_persisted_browser_session(Some(storage), &session_id).await;
+                continue;
+            }
             if !session_status_is_terminal(&session.status) {
                 self.sessions.insert(session_id, session);
             }
@@ -1403,6 +1556,7 @@ impl BrowserSessionManager {
         notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
     ) {
         let sessions = self.sessions.clone();
+        let page_snapshots = self.page_snapshots.clone();
         let integration = self.integration.clone();
         let storage = self.storage.clone();
 
@@ -1436,17 +1590,26 @@ impl BrowserSessionManager {
                 )
                 .await;
 
+                if !sidecar_id.trim().is_empty() {
+                    if let Ok(content) =
+                        browser_content_snapshot(integration.as_ref(), &sidecar_id).await
+                    {
+                        page_snapshots
+                            .insert(session_id.clone(), compact_browser_page_content(&content));
+                    }
+                }
+
                 let mut close_sidecar = false;
                 let snapshot = if let Some(mut entry) = sessions.get_mut(&session_id) {
                     if entry.loop_token.as_deref() != Some(loop_token.as_str()) {
                         None
                     } else {
                         entry.status = match result {
-                            Ok(BrowserLoopOutcome::Ready { summary }) => {
-                                SessionStatus::Ready { summary }
-                            }
-                            Ok(BrowserLoopOutcome::NeedsChatInput { question }) => {
-                                SessionStatus::AwaitingChatInput { question }
+                            Ok(outcome) => {
+                                let (status, should_close_sidecar) =
+                                    browser_loop_success_status(outcome);
+                                close_sidecar = should_close_sidecar;
+                                status
                             }
                             Err(error) => {
                                 close_sidecar = true;
@@ -1483,6 +1646,18 @@ impl BrowserSessionManager {
                     .unwrap_or(false);
                 if should_remove {
                     sessions.remove(&session_id);
+                    let page_snapshots = page_snapshots.clone();
+                    let session_id_for_cleanup = session_id.clone();
+                    crate::spawn_logged!(
+                        "src/core/browser_session.rs:terminal_evidence_cleanup",
+                        async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                TERMINAL_SESSION_EVIDENCE_RETENTION_SECS,
+                            ))
+                            .await;
+                            page_snapshots.remove(&session_id_for_cleanup);
+                        }
+                    );
                 }
             }
         );
@@ -1494,6 +1669,7 @@ impl BrowserSessionManager {
         notify_fn: Arc<dyn Fn(BrowserSessionNotification) + Send + Sync>,
     ) {
         let sessions = self.sessions.clone();
+        let page_snapshots = self.page_snapshots.clone();
         let integration = self.integration.clone();
         let storage = self.storage.clone();
 
@@ -1537,7 +1713,7 @@ impl BrowserSessionManager {
                     {
                         notify_fn(BrowserSessionNotification::notice(
                             &session_id,
-                            "This browser session has been idle for almost 15 minutes. It will close automatically in about 1 minute unless you continue the task or reopen the live handoff.",
+                            "This browser session has been idle for almost 5 minutes. It will close automatically in about 1 minute unless you continue the task or reopen the live handoff.",
                         ));
                         warned_for_updated_at = Some(updated_at.clone());
                     }
@@ -1550,10 +1726,11 @@ impl BrowserSessionManager {
                         let _ = integration.close_session(&sidecar_session_id).await;
                     }
                     sessions.remove(&session_id);
+                    page_snapshots.remove(&session_id);
                     delete_persisted_browser_session(storage.as_ref(), &session_id).await;
                     notify_fn(BrowserSessionNotification::closed(
                         &session_id,
-                        "Browser session closed after 15 minutes of inactivity to keep AgentArk responsive. Ask me to reopen it if you want to continue.",
+                        "Browser session closed after 5 minutes of inactivity to keep AgentArk responsive. Ask me to reopen it if you want to continue.",
                     ));
                     return;
                 }
@@ -1759,6 +1936,363 @@ fn browser_task_site_constraint(task: &str) -> Option<BrowserTaskSiteConstraint>
     }
 }
 
+fn truncate_browser_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn compact_browser_page_content(content: &PageContent) -> PageContent {
+    PageContent {
+        title: content.title.clone(),
+        url: content.url.clone(),
+        body_text: truncate_browser_text(&content.body_text, 12_000),
+        elements: content.elements.iter().take(80).cloned().collect(),
+        diagnostics: content.diagnostics.iter().take(30).cloned().collect(),
+        downloads: content.downloads.iter().take(20).cloned().collect(),
+        download_dir: content.download_dir.clone(),
+    }
+}
+
+fn format_browser_downloads(content: &PageContent) -> String {
+    content
+        .downloads
+        .iter()
+        .take(20)
+        .map(|download| {
+            let status = download.status.trim();
+            let status = if status.is_empty() {
+                "recorded"
+            } else {
+                status
+            };
+            let filename = download.filename.trim();
+            let path = download.path.trim();
+            let label = if filename.is_empty() {
+                download.id.trim()
+            } else {
+                filename
+            };
+            if path.is_empty() {
+                format!("- {} ({}, {} bytes)", label, status, download.bytes)
+            } else {
+                format!(
+                    "- {} ({}, {} bytes) path={}",
+                    label, status, download.bytes, path
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn validate_browser_ask_user_resolution(
+    ctx: &BrowserLoopContext<'_>,
+    question: &str,
+    content: &PageContent,
+    history: &[String],
+) -> BrowserAskUserResolution {
+    let element_preview = content
+        .elements
+        .iter()
+        .take(20)
+        .map(format_browser_loop_element)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let history_preview = history
+        .iter()
+        .rev()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_preview = truncate_browser_text(&content.body_text, 4_000);
+    let downloads = format_browser_downloads(content);
+    let system = "\
+You are validating the next outcome for a browser automation run.
+Return exactly one JSON object with:
+- action: \"complete\", \"ask_user\", or \"continue\"
+- summary: concise user-facing answer when action is complete; this must contain the actual visible facts requested, not a status line
+- message: fuller user-facing answer when action is complete
+- guidance: next browser-loop guidance when action is continue
+
+Judge the underlying requested outcome and the visible page state, not surface wording.
+Use action \"complete\" when the user asked for information, extraction, listing, comparison, or summarization and the current page snapshot already contains enough visible facts to answer. In that case, include the page-derived answer directly.
+Use action \"ask_user\" only when a human decision or site operation is genuinely required.
+Use action \"continue\" when more browser work is needed before either answering or asking the user.
+Do not ask whether the visible snapshot is sufficient when the original task was to report visible facts.";
+    let user = format!(
+        "Original task:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nPage text:\n{}\n\nInteractive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}\n\nProposed ask_user question:\n{}",
+        ctx.task,
+        content.url,
+        content.title,
+        body_preview,
+        element_preview,
+        downloads,
+        history_preview,
+        question
+    );
+    match ctx.llm.chat_classifier_bounded(system, &user, 900).await {
+        Ok(response) => {
+            let response_text = response.content.trim();
+            let json_text = extract_first_json_object(response_text)
+                .map(|(json, _)| json)
+                .unwrap_or(response_text);
+            match serde_json::from_str::<serde_json::Value>(json_text) {
+                Ok(value) => browser_ask_user_resolution_from_value(&value, question),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        response = %truncate_browser_text(response_text, 500),
+                        "Browser ask_user validation returned invalid JSON"
+                    );
+                    BrowserAskUserResolution::AskUser
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "Browser ask_user validation failed");
+            BrowserAskUserResolution::AskUser
+        }
+    }
+}
+
+async fn classify_browser_access_blocker(
+    ctx: &BrowserLoopContext<'_>,
+    content: &PageContent,
+    history: &[String],
+) -> Option<String> {
+    if !browser_snapshot_has_visible_state(content) {
+        return None;
+    }
+    let element_preview = content
+        .elements
+        .iter()
+        .take(20)
+        .map(format_browser_loop_element)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let history_preview = history
+        .iter()
+        .rev()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_preview = truncate_browser_text(&content.body_text, 4_000);
+    let downloads = format_browser_downloads(content);
+    let system = "\
+You are a semantic browser-state classifier.
+Return exactly one JSON object with:
+- blocked: boolean
+- reason: concise user-facing explanation when blocked is true
+
+Set blocked to true only when the current page is an access, authentication, account-selection, permission, verification, security challenge, policy, paywall, or bot-protection gate that prevents completing the user's requested browser outcome without a human account/security action.
+Infer this from the user's underlying intent and the visible page state. Do not rely on exact wording, casing, order, punctuation, or anticipated phrases.
+Set blocked to false when the requested outcome is already visible, when normal navigation can still proceed, or when the user's actual intent is to open or inspect the gate itself.
+When blocked is true, the reason must state the visible blocking condition and the practical consequence. Do not claim hidden account state that is not visible.";
+    let user = format!(
+        "Requested browser outcome:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nVisible page text:\n{}\n\nVisible interactive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}",
+        ctx.task,
+        content.url,
+        content.title,
+        body_preview,
+        element_preview,
+        downloads,
+        history_preview
+    );
+    match ctx.llm.chat_classifier_bounded(system, &user, 700).await {
+        Ok(response) => {
+            let response_text = response.content.trim();
+            let json_text = extract_first_json_object(response_text)
+                .map(|(json, _)| json)
+                .unwrap_or(response_text);
+            match serde_json::from_str::<serde_json::Value>(json_text) {
+                Ok(value) => browser_access_blocker_reason_from_value(&value),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        response = %truncate_browser_text(response_text, 500),
+                        "Browser access-blocker classifier returned invalid JSON"
+                    );
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "Browser access-blocker classifier failed");
+            None
+        }
+    }
+}
+
+async fn validate_browser_done_answer(
+    ctx: &BrowserLoopContext<'_>,
+    content: &PageContent,
+    history: &[String],
+    summary: &str,
+    message: &str,
+) -> BrowserDoneAnswerValidation {
+    let element_preview = content
+        .elements
+        .iter()
+        .take(20)
+        .map(format_browser_loop_element)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let history_preview = history
+        .iter()
+        .rev()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_preview = truncate_browser_text(&content.body_text, 4_000);
+    let downloads = format_browser_downloads(content);
+    let system = "\
+You are validating a proposed final answer from a browser automation run.
+Return exactly one JSON object with:
+- action: \"complete\" or \"continue\"
+- summary: concise user-facing answer when action is complete
+- message: fuller user-facing answer when action is complete
+- guidance: next browser-loop guidance when action is continue
+
+Judge the user's underlying browser objective and the visible page evidence, not surface wording.
+Use action \"complete\" only when the proposed answer, or a corrected answer you can write from the current visible page snapshot and downloaded file records, satisfies the requested outcome.
+For page-reading, checking, extraction, listing, comparison, or summarization outcomes, the completed answer must include the actual requested visible facts, not merely a status line that the page loaded or the information is visible.
+For file download outcomes, the completed answer must include the downloaded file records or enough information for the outer agent to use those artifacts.
+If the current page snapshot contains enough evidence but the proposed answer omitted it, return action \"complete\" with corrected summary and message containing the page-derived facts.
+Use action \"continue\" when more browser navigation or interaction is needed before the requested outcome can be answered from visible evidence.
+Do not introduce browser instructions for the user; this validator is for autonomous browser continuation.";
+    let user = format!(
+        "Requested browser outcome:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nVisible page text:\n{}\n\nVisible interactive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}\n\nProposed summary:\n{}\n\nProposed message:\n{}",
+        ctx.task,
+        content.url,
+        content.title,
+        body_preview,
+        element_preview,
+        downloads,
+        history_preview,
+        summary,
+        message
+    );
+    match ctx.llm.chat_classifier_bounded(system, &user, 900).await {
+        Ok(response) => {
+            let response_text = response.content.trim();
+            let json_text = extract_first_json_object(response_text)
+                .map(|(json, _)| json)
+                .unwrap_or(response_text);
+            match serde_json::from_str::<serde_json::Value>(json_text) {
+                Ok(value) => browser_done_answer_validation_from_value(&value, summary, message),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        response = %truncate_browser_text(response_text, 500),
+                        "Browser done-answer validator returned invalid JSON"
+                    );
+                    BrowserDoneAnswerValidation::Complete {
+                        summary: summary.to_string(),
+                        message: message.to_string(),
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "Browser done-answer validation failed");
+            BrowserDoneAnswerValidation::Complete {
+                summary: summary.to_string(),
+                message: message.to_string(),
+            }
+        }
+    }
+}
+
+async fn classify_browser_done_finalization(
+    ctx: &BrowserLoopContext<'_>,
+    content: &PageContent,
+    history: &[String],
+    summary: &str,
+    message: &str,
+) -> BrowserDoneFinalization {
+    let element_preview = content
+        .elements
+        .iter()
+        .take(20)
+        .map(format_browser_loop_element)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let history_preview = history
+        .iter()
+        .rev()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_preview = truncate_browser_text(&content.body_text, 4_000);
+    let downloads = format_browser_downloads(content);
+    let system = "\
+You are deciding whether a completed browser task should close its live browser session.
+Return exactly one JSON object with:
+- keep_open: boolean
+- reason: concise explanation
+
+Set keep_open to false for ordinary completed browser work where the user asked for information, extraction, checking, summarization, navigation as a means to answer, or any outcome that has already been delivered in chat.
+Set keep_open to true only when the user's underlying requested outcome is itself an ongoing browser state that should remain available for the user to inspect or control after the assistant stops.
+Infer intent from meaning and current page state. Do not rely on exact wording, casing, order, punctuation, or anticipated phrases.
+If unsure, choose keep_open=false so browser processes and profile locks are cleaned up.";
+    let user = format!(
+        "Requested browser outcome:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nVisible page text:\n{}\n\nVisible interactive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}\n\nProposed completion summary:\n{}\n\nProposed completion message:\n{}",
+        ctx.task,
+        content.url,
+        content.title,
+        body_preview,
+        element_preview,
+        downloads,
+        history_preview,
+        summary,
+        message
+    );
+    match ctx.llm.chat_classifier_bounded(system, &user, 500).await {
+        Ok(response) => {
+            let response_text = response.content.trim();
+            let json_text = extract_first_json_object(response_text)
+                .map(|(json, _)| json)
+                .unwrap_or(response_text);
+            match serde_json::from_str::<serde_json::Value>(json_text) {
+                Ok(value) => browser_done_finalization_from_value(&value),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        response = %truncate_browser_text(response_text, 500),
+                        "Browser done finalization classifier returned invalid JSON"
+                    );
+                    BrowserDoneFinalization::Close
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "Browser done finalization classifier failed");
+            BrowserDoneFinalization::Close
+        }
+    }
+}
+
 fn extract_browser_task_urls(task: &str) -> Vec<reqwest::Url> {
     task.split_whitespace()
         .filter_map(|token| {
@@ -1860,6 +2394,39 @@ fn browser_session_profile_matches(
     }
 }
 
+fn browser_session_profile_exactly_matches(
+    session_profile_id: Option<&str>,
+    requested_profile_id: Option<&str>,
+) -> bool {
+    let normalized_session = session_profile_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let normalized_requested = requested_profile_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    normalized_session == normalized_requested
+}
+
+fn failed_browser_session_is_superseded_candidate(
+    session_conversation_id: Option<&str>,
+    session_profile_id: Option<&str>,
+    status: &SessionStatus,
+    conversation_id: Option<&str>,
+    requested_profile_id: Option<&str>,
+) -> bool {
+    let Some(conversation_id) = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    session_conversation_id
+        .map(str::trim)
+        .is_some_and(|session_conversation_id| session_conversation_id == conversation_id)
+        && browser_session_profile_exactly_matches(session_profile_id, requested_profile_id)
+        && matches!(status, SessionStatus::Failed(_))
+}
+
 fn session_counts_against_live_limit(status: &SessionStatus) -> bool {
     session_status_has_live_session(status)
 }
@@ -1869,6 +2436,24 @@ fn session_should_be_cleaned_up(status: &SessionStatus) -> bool {
         status,
         SessionStatus::AwaitingResume { .. } | SessionStatus::Interrupted { .. }
     )
+}
+
+fn browser_session_record_should_be_cleaned_up(
+    status: &SessionStatus,
+    updated_at: &str,
+    now: &chrono::DateTime<Utc>,
+) -> bool {
+    if session_should_be_cleaned_up(status) {
+        return true;
+    }
+    if !session_status_is_terminal(status) {
+        return false;
+    }
+    parse_rfc3339_utc(updated_at)
+        .map(|updated_at| {
+            (*now - updated_at).num_seconds() >= TERMINAL_SESSION_EVIDENCE_RETENTION_SECS as i64
+        })
+        .unwrap_or(true)
 }
 
 fn ready_session_is_expired(session: &BrowserSession) -> bool {
@@ -2010,6 +2595,15 @@ fn build_browser_session_view(
         page_title: sidecar_state
             .as_ref()
             .and_then(|state| (!state.title.trim().is_empty()).then(|| state.title.clone())),
+        download_dir: sidecar_state
+            .as_ref()
+            .and_then(|state| state.download_dir.clone())
+            .filter(|value| !value.trim().is_empty()),
+        downloads: sidecar_state
+            .as_ref()
+            .map(|state| state.downloads.clone())
+            .unwrap_or_default(),
+        last_page: None,
         live_view_enabled: sidecar_state
             .as_ref()
             .map(|state| state.live_view_enabled)
@@ -2024,6 +2618,54 @@ fn build_browser_session_view(
         can_release,
         can_complete,
     }
+}
+
+fn browser_session_views_without_superseded_failures(
+    sessions: Vec<BrowserSessionView>,
+) -> Vec<BrowserSessionView> {
+    sessions
+        .iter()
+        .filter(|session| !browser_session_view_is_superseded_failure(session, sessions.as_slice()))
+        .cloned()
+        .collect()
+}
+
+fn browser_session_view_is_live_listing(session: &BrowserSessionView) -> bool {
+    matches!(
+        session.status.as_str(),
+        "active" | "waiting_for_operator" | "operator_claimed" | "ready" | "awaiting_chat_input"
+    )
+}
+
+fn browser_session_view_is_superseded_failure(
+    candidate: &BrowserSessionView,
+    sessions: &[BrowserSessionView],
+) -> bool {
+    if candidate.status != "failed" {
+        return false;
+    }
+    let Some(conversation_id) = candidate
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    sessions.iter().any(|other| {
+        other.id != candidate.id
+            && other.status != "failed"
+            && other
+                .conversation_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|other_conversation_id| other_conversation_id == conversation_id)
+            && browser_session_profile_exactly_matches(
+                candidate.profile_id.as_deref(),
+                other.profile_id.as_deref(),
+            )
+            && other.updated_at > candidate.updated_at
+    })
 }
 
 async fn persist_browser_session(
@@ -2281,7 +2923,139 @@ enum BrowserOperatorWaitResult {
 
 enum BrowserLoopOutcome {
     Ready { summary: String },
+    Completed { summary: String },
     NeedsChatInput { question: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserAskUserResolution {
+    AskUser,
+    Complete { summary: String, message: String },
+    Continue { guidance: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserDoneFinalization {
+    Close,
+    KeepOpen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserDoneAnswerValidation {
+    Complete { summary: String, message: String },
+    Continue { guidance: String },
+}
+
+fn browser_loop_success_status(outcome: BrowserLoopOutcome) -> (SessionStatus, bool) {
+    match outcome {
+        BrowserLoopOutcome::Ready { summary } => (SessionStatus::Ready { summary }, false),
+        BrowserLoopOutcome::Completed { summary } => (SessionStatus::Completed { summary }, true),
+        BrowserLoopOutcome::NeedsChatInput { question } => {
+            (SessionStatus::AwaitingChatInput { question }, false)
+        }
+    }
+}
+
+fn browser_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|inner| inner.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn browser_ask_user_resolution_from_value(
+    value: &serde_json::Value,
+    fallback_question: &str,
+) -> BrowserAskUserResolution {
+    let action = browser_json_string(value, &["action", "decision", "outcome"])
+        .unwrap_or_else(|| "ask_user".to_string())
+        .to_ascii_lowercase();
+    match action.as_str() {
+        "complete" | "done" => {
+            let summary = browser_json_string(value, &["summary", "answer", "message"])
+                .unwrap_or_else(|| fallback_question.trim().to_string());
+            let message = browser_json_string(value, &["message", "answer"])
+                .unwrap_or_else(|| summary.clone());
+            BrowserAskUserResolution::Complete { summary, message }
+        }
+        "continue" | "continue_browser" | "keep_working" => {
+            let guidance = browser_json_string(value, &["guidance", "reason", "next_step"])
+                .unwrap_or_else(|| {
+                    "Continue browser work from the current page until the requested outcome is either answered from visible page facts or genuinely needs user input."
+                        .to_string()
+                });
+            BrowserAskUserResolution::Continue { guidance }
+        }
+        _ => BrowserAskUserResolution::AskUser,
+    }
+}
+
+fn browser_done_answer_validation_from_value(
+    value: &serde_json::Value,
+    fallback_summary: &str,
+    fallback_message: &str,
+) -> BrowserDoneAnswerValidation {
+    let action = browser_json_string(value, &["action", "decision", "outcome"])
+        .unwrap_or_else(|| "complete".to_string())
+        .to_ascii_lowercase();
+    match action.as_str() {
+        "continue" | "continue_browser" | "keep_working" => {
+            let guidance = browser_json_string(value, &["guidance", "reason", "next_step"])
+                .unwrap_or_else(|| {
+                    "Continue browser work until the requested outcome is backed by visible page evidence."
+                        .to_string()
+                });
+            BrowserDoneAnswerValidation::Continue { guidance }
+        }
+        _ => {
+            let summary = browser_json_string(value, &["summary", "answer", "message"])
+                .unwrap_or_else(|| fallback_summary.trim().to_string());
+            let message = browser_json_string(value, &["message", "answer"])
+                .unwrap_or_else(|| fallback_message.trim().to_string());
+            BrowserDoneAnswerValidation::Complete { summary, message }
+        }
+    }
+}
+
+fn browser_done_finalization_from_value(value: &serde_json::Value) -> BrowserDoneFinalization {
+    let _ = value;
+    BrowserDoneFinalization::Close
+}
+
+fn browser_snapshot_has_visible_state(content: &PageContent) -> bool {
+    let url = content.url.trim();
+    let title = content.title.trim();
+    let body = content.body_text.trim();
+    if url.eq_ignore_ascii_case("about:blank")
+        && title.is_empty()
+        && body.is_empty()
+        && content.elements.is_empty()
+    {
+        return false;
+    }
+    !url.is_empty() || !title.is_empty() || !body.is_empty() || !content.elements.is_empty()
+}
+
+fn browser_access_blocker_reason_from_value(value: &serde_json::Value) -> Option<String> {
+    if value
+        .get("blocked")
+        .and_then(|inner| inner.as_bool())
+        .unwrap_or(false)
+    {
+        Some(
+            browser_json_string(value, &["reason", "summary", "message"])
+                .unwrap_or_else(|| {
+                    "The current page is blocking the requested browser task and requires a human account or security action before AgentArk can continue."
+                        .to_string()
+                }),
+        )
+    } else {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -2412,12 +3186,15 @@ async fn run_browser_loop(
          - Use the current page snapshot and previous action history to decide the next incomplete milestone. Do not restart earlier milestones that the current page already proves complete.\n\
          - Treat any operator note from a live handoff as an unverified hint, never as proof.\n\
          - After a live handoff resumes, inspect the fresh page state before deciding what changed.\n\
-         - If the task asks you to reach a browser state and then stop, wait, confirm, ask a question, request a choice, or otherwise pause for the user, return ask_user as soon as the current page snapshot verifies that state. Do not navigate away, restart, keep exploring, or return done for that checkpoint.\n\
+         - Internally distinguish the requested outcome before choosing ask_user or done: human-input checkpoints require a user decision or site operation; live-browser state checkpoints require leaving the browser open for the user to inspect/control; information-delivery outcomes require reporting facts that are visible in the current page snapshot.\n\
+         - For information-delivery outcomes, keep using the current page snapshot until the requested visible facts are available, then return done with those facts in summary/message. Do not use ask_user as a substitute for the final answer, and do not merely say the information is visible.\n\
+         - For download outcomes, use the browser until the download record appears in the current page snapshot. If the task also asks to use the file elsewhere in AgentArk, finish with the downloaded file record so the outer agent can call the appropriate file or document tool.\n\
+         - For live-browser state checkpoints, return ask_user only when the user needs to inspect/control the browser next or the task explicitly asked you to pause at that state.\n\
          - If the task already states what should happen after login, MFA, CAPTCHA, or another gated checkpoint, continue directly instead of asking for confirmation.\n\
          - Use ask_user only when a real human must operate the site, when the user explicitly requested a checkpoint, or when the task is genuinely underspecified even after considering the task text and current page.\n\
          - Only claim a gated checkpoint succeeded when the current page directly supports that claim.\n\
          - If the requested checkpoint cannot be directly verified from the current page, summarize the visible state conservatively instead of inventing hidden state.\n\
-         - Use done only when the requested outcome is completed, or when you are blocked and have already asked the user for the missing human step.\n\
+         - Use done when the requested outcome is completed. For page-reading, listing, comparison, extraction, or summarization outcomes, done must include the observed page-derived answer.\n\
          - Only stop and ask what to do next when the explicit task is complete and no further action is implied by the task itself.",
         ctx.task, site_constraint_instruction
     );
@@ -2432,6 +3209,15 @@ async fn run_browser_loop(
         let content = browser_loop_content_snapshot(&ctx).await?;
         navigation_progress.observe_page_url(&content.url);
         last_content = Some(content.clone());
+        if let Some(reason) = classify_browser_access_blocker(&ctx, &content, &history).await {
+            history.push(format!(
+                "Step {}: Access blocker detected - {}",
+                iteration + 1,
+                reason
+            ));
+            sync_session_history(ctx.sessions, ctx.storage.as_ref(), session_id, &history).await;
+            return Err(anyhow!(reason));
+        }
         let elements_str = content
             .elements
             .iter()
@@ -2448,15 +3234,17 @@ async fn run_browser_loop(
         } else {
             content.body_text.clone()
         };
+        let downloads_str = format_browser_downloads(&content);
 
         let mut messages = vec![format!(
-            "Step {}/{}\nURL: {}\nTitle: {}\n\nPage text:\n{}\n\nInteractive elements:\n{}",
+            "Step {}/{}\nURL: {}\nTitle: {}\n\nPage text:\n{}\n\nInteractive elements:\n{}\n\nDownloaded files:\n{}",
             iteration + 1,
             MAX_ITERATIONS,
             content.url,
             content.title,
             body_preview,
-            elements_str
+            elements_str,
+            downloads_str
         )];
         if let Some(resume_context) = pending_resume_context.take() {
             messages.insert(0, resume_context);
@@ -2580,7 +3368,7 @@ async fn run_browser_loop(
                             ));
                                 if repeat_count == 1 {
                                     pending_resume_context = Some(format!(
-                                    "The previous navigation request was skipped because {reason}. Do not request that same navigation again. Use the current page snapshot to choose the next incomplete milestone. If the current page satisfies a requested checkpoint, return ask_user. If the task is complete, return done."
+                                    "The previous navigation request was skipped because {reason}. Do not request that same navigation again. Use the current page snapshot to choose the next incomplete milestone. If the current page satisfies an information-delivery outcome, return done with the visible facts. If it satisfies an explicit user checkpoint, return ask_user. If the task is complete, return done."
                                 ));
                                 } else {
                                     let question = stalled_browser_question(&content, reason);
@@ -2788,24 +3576,56 @@ async fn run_browser_loop(
                     .get("question")
                     .and_then(|v| v.as_str())
                     .unwrap_or("I need your help to continue.");
-                history.push(format!("Step {}: Asking user: {}", iteration + 1, question));
-                match wait_for_browser_operator_input(
-                    session_id,
-                    &ctx,
-                    question,
-                    &content,
-                    &mut history,
-                )
-                .await?
+                match validate_browser_ask_user_resolution(&ctx, question, &content, &history).await
                 {
-                    BrowserOperatorWaitResult::ReturnToChat { outcome } => {
-                        return Ok(outcome);
+                    BrowserAskUserResolution::Complete { summary, message } => {
+                        let screenshot = ctx.integration.screenshot(ctx.sidecar_id).await.ok();
+                        history.push(format!(
+                            "Step {}: DONE after validating proposed user checkpoint - {}",
+                            iteration + 1,
+                            summary
+                        ));
+                        sync_session_history(
+                            ctx.sessions,
+                            ctx.storage.as_ref(),
+                            session_id,
+                            &history,
+                        )
+                        .await;
+                        (ctx.notify)(BrowserSessionNotification::completed(
+                            session_id, message, screenshot,
+                        ));
+                        return Ok(BrowserLoopOutcome::Completed { summary });
                     }
-                    BrowserOperatorWaitResult::Continue {
-                        pending_resume_context: resume_context,
-                    } => {
-                        pending_resume_context = Some(resume_context);
+                    BrowserAskUserResolution::Continue { guidance } => {
+                        history.push(format!(
+                            "Step {}: Rejected proposed user checkpoint; continuing browser work",
+                            iteration + 1
+                        ));
+                        pending_resume_context = Some(guidance);
                         stall_tracker.reset();
+                    }
+                    BrowserAskUserResolution::AskUser => {
+                        history.push(format!("Step {}: Asking user: {}", iteration + 1, question));
+                        match wait_for_browser_operator_input(
+                            session_id,
+                            &ctx,
+                            question,
+                            &content,
+                            &mut history,
+                        )
+                        .await?
+                        {
+                            BrowserOperatorWaitResult::ReturnToChat { outcome } => {
+                                return Ok(outcome);
+                            }
+                            BrowserOperatorWaitResult::Continue {
+                                pending_resume_context: resume_context,
+                            } => {
+                                pending_resume_context = Some(resume_context);
+                                stall_tracker.reset();
+                            }
+                        }
                     }
                 }
             }
@@ -2818,18 +3638,45 @@ async fn run_browser_loop(
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or(summary);
+                let (summary, message) =
+                    match validate_browser_done_answer(&ctx, &content, &history, summary, message)
+                        .await
+                    {
+                        BrowserDoneAnswerValidation::Complete { summary, message } => {
+                            (summary, message)
+                        }
+                        BrowserDoneAnswerValidation::Continue { guidance } => {
+                            history.push(format!(
+                                "Step {}: Completion validator requested more browser work - {}",
+                                iteration + 1,
+                                guidance
+                            ));
+                            sync_session_history(
+                                ctx.sessions,
+                                ctx.storage.as_ref(),
+                                session_id,
+                                &history,
+                            )
+                            .await;
+                            pending_resume_context = Some(guidance);
+                            stall_tracker.reset();
+                            continue;
+                        }
+                    };
                 let screenshot = ctx.integration.screenshot(ctx.sidecar_id).await.ok();
-                history.push(format!("Step {}: DONE - {}", iteration + 1, summary));
+                history.push(format!(
+                    "Step {}: DONE (closing browser session) - {}",
+                    iteration + 1,
+                    summary
+                ));
                 sync_session_history(ctx.sessions, ctx.storage.as_ref(), session_id, &history)
                     .await;
                 (ctx.notify)(BrowserSessionNotification::completed(
                     session_id,
-                    message.to_string(),
+                    message.clone(),
                     screenshot,
                 ));
-                return Ok(BrowserLoopOutcome::Ready {
-                    summary: summary.to_string(),
-                });
+                return Ok(BrowserLoopOutcome::Completed { summary });
             }
             other => {
                 history.push(format!(
@@ -2935,6 +3782,18 @@ fn describe_page_snapshot(content: &PageContent) -> String {
     if !element_preview.is_empty() {
         lines.push(format!("Elements: {}", element_preview.join("; ")));
     }
+    if let Some(download_dir) = content
+        .download_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("Download directory: {}", download_dir));
+    }
+    let downloads = format_browser_downloads(content);
+    if !downloads.trim().is_empty() {
+        lines.push(format!("Downloads:\n{}", downloads));
+    }
     lines.join("\n")
 }
 
@@ -3029,6 +3888,7 @@ fn format_browser_loop_element(element: &PageElement) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn build_browser_session_view_flags_operator_handoff_states() {
@@ -3086,6 +3946,259 @@ mod tests {
             ready.summary.as_deref(),
             Some("Browser is ready for follow-up.")
         );
+    }
+
+    #[test]
+    fn browser_ask_user_resolution_can_convert_validated_checkpoint_to_completion() {
+        let value = serde_json::json!({
+            "action": "complete",
+            "summary": "Inbox rows extracted.",
+            "message": "The visible inbox rows are Google, Manus, and OpenAI."
+        });
+
+        let resolution = browser_ask_user_resolution_from_value(&value, "Should I keep going?");
+
+        assert_eq!(
+            resolution,
+            BrowserAskUserResolution::Complete {
+                summary: "Inbox rows extracted.".to_string(),
+                message: "The visible inbox rows are Google, Manus, and OpenAI.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn browser_ask_user_resolution_preserves_true_user_checkpoints() {
+        let value = serde_json::json!({
+            "action": "ask_user",
+            "reason": "The page requires a user choice."
+        });
+
+        let resolution =
+            browser_ask_user_resolution_from_value(&value, "Which account should I use?");
+
+        assert_eq!(resolution, BrowserAskUserResolution::AskUser);
+    }
+
+    #[test]
+    fn browser_ask_user_resolution_can_request_more_browser_work() {
+        let value = serde_json::json!({
+            "action": "continue",
+            "guidance": "Read the visible rows and answer from them."
+        });
+
+        let resolution = browser_ask_user_resolution_from_value(&value, "Is this enough?");
+
+        assert_eq!(
+            resolution,
+            BrowserAskUserResolution::Continue {
+                guidance: "Read the visible rows and answer from them.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn browser_access_blocker_resolution_requires_classifier_block_flag() {
+        let blocked = serde_json::json!({
+            "blocked": true,
+            "reason": "The page requires account access before the requested inbox content is visible."
+        });
+        let clear = serde_json::json!({
+            "blocked": false,
+            "reason": "The requested content is visible."
+        });
+
+        assert_eq!(
+            browser_access_blocker_reason_from_value(&blocked).as_deref(),
+            Some("The page requires account access before the requested inbox content is visible.")
+        );
+        assert!(browser_access_blocker_reason_from_value(&clear).is_none());
+    }
+
+    #[test]
+    fn blank_browser_snapshot_is_not_classified_as_access_blocker() {
+        let content = PageContent {
+            title: String::new(),
+            url: "about:blank".to_string(),
+            body_text: String::new(),
+            elements: Vec::new(),
+            diagnostics: Vec::new(),
+            downloads: Vec::new(),
+            download_dir: None,
+        };
+
+        assert!(!browser_snapshot_has_visible_state(&content));
+    }
+
+    #[test]
+    fn superseded_failed_browser_session_candidate_requires_same_conversation_and_profile() {
+        let failed = SessionStatus::Failed("Loading gate blocked the browser task".to_string());
+        let completed = SessionStatus::Completed {
+            summary: "Inbox loaded".to_string(),
+        };
+
+        assert!(failed_browser_session_is_superseded_candidate(
+            Some("conversation-1"),
+            Some("profile-1"),
+            &failed,
+            Some("conversation-1"),
+            Some("profile-1"),
+        ));
+        assert!(!failed_browser_session_is_superseded_candidate(
+            Some("conversation-1"),
+            Some("profile-1"),
+            &failed,
+            Some("conversation-2"),
+            Some("profile-1"),
+        ));
+        assert!(!failed_browser_session_is_superseded_candidate(
+            Some("conversation-1"),
+            Some("profile-1"),
+            &failed,
+            Some("conversation-1"),
+            Some("profile-2"),
+        ));
+        assert!(!failed_browser_session_is_superseded_candidate(
+            Some("conversation-1"),
+            Some("profile-1"),
+            &completed,
+            Some("conversation-1"),
+            Some("profile-1"),
+        ));
+    }
+
+    #[test]
+    fn browser_done_finalization_always_closes_completed_browser_tasks() {
+        let close = serde_json::json!({
+            "keep_open": false,
+            "reason": "The answer was delivered in chat."
+        });
+        let keep_open = serde_json::json!({
+            "keep_open": true,
+            "reason": "The requested outcome is the live page state."
+        });
+        let missing = serde_json::json!({});
+
+        assert_eq!(
+            browser_done_finalization_from_value(&close),
+            BrowserDoneFinalization::Close
+        );
+        assert_eq!(
+            browser_done_finalization_from_value(&keep_open),
+            BrowserDoneFinalization::Close
+        );
+        assert_eq!(
+            browser_done_finalization_from_value(&missing),
+            BrowserDoneFinalization::Close
+        );
+    }
+
+    #[test]
+    fn browser_session_list_hides_failed_attempt_superseded_by_newer_same_profile_result() {
+        let failed = build_browser_session_view(
+            "failed".to_string(),
+            Some("conversation-1".to_string()),
+            "Try browser task".to_string(),
+            Some("profile-1".to_string()),
+            Some("alex".to_string()),
+            SessionStatus::Failed("Blocked".to_string()),
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            None,
+        );
+        let completed = build_browser_session_view(
+            "completed".to_string(),
+            Some("conversation-1".to_string()),
+            "Retry browser task".to_string(),
+            Some("profile-1".to_string()),
+            Some("alex".to_string()),
+            SessionStatus::Completed {
+                summary: "Done".to_string(),
+            },
+            "2026-01-01T00:02:00Z".to_string(),
+            "2026-01-01T00:03:00Z".to_string(),
+            None,
+        );
+        let different_profile_failed = build_browser_session_view(
+            "other-profile-failed".to_string(),
+            Some("conversation-1".to_string()),
+            "Different profile task".to_string(),
+            Some("profile-2".to_string()),
+            Some("other".to_string()),
+            SessionStatus::Failed("Blocked".to_string()),
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            None,
+        );
+
+        let visible = browser_session_views_without_superseded_failures(vec![
+            failed,
+            completed,
+            different_profile_failed,
+        ]);
+        let ids = visible
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["completed", "other-profile-failed"]);
+    }
+
+    #[test]
+    fn browser_session_listing_keeps_only_live_or_claimable_sessions() {
+        let active = build_browser_session_view(
+            "active".to_string(),
+            Some("conversation-1".to_string()),
+            "Active task".to_string(),
+            None,
+            None,
+            SessionStatus::Active,
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            None,
+        );
+        let awaiting_chat = build_browser_session_view(
+            "awaiting-chat".to_string(),
+            Some("conversation-1".to_string()),
+            "Needs chat input".to_string(),
+            None,
+            None,
+            SessionStatus::AwaitingChatInput {
+                question: "Choose next step".to_string(),
+            },
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            None,
+        );
+        let completed = build_browser_session_view(
+            "completed".to_string(),
+            Some("conversation-1".to_string()),
+            "Done task".to_string(),
+            None,
+            None,
+            SessionStatus::Completed {
+                summary: "Done".to_string(),
+            },
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            None,
+        );
+        let failed = build_browser_session_view(
+            "failed".to_string(),
+            Some("conversation-1".to_string()),
+            "Failed task".to_string(),
+            None,
+            None,
+            SessionStatus::Failed("Blocked".to_string()),
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            None,
+        );
+
+        assert!(browser_session_view_is_live_listing(&active));
+        assert!(browser_session_view_is_live_listing(&awaiting_chat));
+        assert!(!browser_session_view_is_live_listing(&completed));
+        assert!(!browser_session_view_is_live_listing(&failed));
     }
 
     #[test]
@@ -3168,6 +4281,173 @@ mod tests {
                 question: "Choose the next section".to_string(),
             }
         ));
+    }
+
+    #[test]
+    fn terminal_browser_session_records_expire_after_evidence_retention() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 20, 0).single().unwrap();
+        let recent_terminal = (now
+            - chrono::Duration::seconds(TERMINAL_SESSION_EVIDENCE_RETENTION_SECS as i64 - 1))
+        .to_rfc3339();
+        let expired_terminal = (now
+            - chrono::Duration::seconds(TERMINAL_SESSION_EVIDENCE_RETENTION_SECS as i64))
+        .to_rfc3339();
+
+        assert!(!browser_session_record_should_be_cleaned_up(
+            &SessionStatus::Completed {
+                summary: "Done".to_string(),
+            },
+            &recent_terminal,
+            &now,
+        ));
+        assert!(browser_session_record_should_be_cleaned_up(
+            &SessionStatus::Completed {
+                summary: "Done".to_string(),
+            },
+            &expired_terminal,
+            &now,
+        ));
+        assert!(browser_session_record_should_be_cleaned_up(
+            &SessionStatus::Failed("Blocked".to_string()),
+            &expired_terminal,
+            &now,
+        ));
+        assert!(browser_session_record_should_be_cleaned_up(
+            &SessionStatus::Interrupted {
+                reason: "App restarted".to_string(),
+            },
+            &recent_terminal,
+            &now,
+        ));
+        assert!(!browser_session_record_should_be_cleaned_up(
+            &SessionStatus::Active,
+            &expired_terminal,
+            &now,
+        ));
+    }
+
+    #[test]
+    fn browser_done_outcome_marks_session_completed_and_closes_sidecar() {
+        let (status, close_sidecar) = browser_loop_success_status(BrowserLoopOutcome::Completed {
+            summary: "Inbox scan completed".to_string(),
+        });
+
+        assert!(matches!(status, SessionStatus::Completed { .. }));
+        assert!(close_sidecar);
+
+        let (status, close_sidecar) = browser_loop_success_status(BrowserLoopOutcome::Ready {
+            summary: "Browser is ready for follow-up".to_string(),
+        });
+
+        assert!(matches!(status, SessionStatus::Ready { .. }));
+        assert!(!close_sidecar);
+    }
+
+    #[test]
+    fn ready_sessions_expire_after_five_minutes_idle() {
+        let fresh_updated_at = (Utc::now() - chrono::Duration::minutes(4)).to_rfc3339();
+        let stale_updated_at = (Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
+
+        assert!(!ready_session_is_expired(&test_session(
+            "fresh-ready",
+            "",
+            Some("conversation-1"),
+            SessionStatus::Ready {
+                summary: "Ready".to_string(),
+            },
+            &fresh_updated_at,
+        )));
+        assert!(ready_session_is_expired(&test_session(
+            "stale-ready",
+            "",
+            Some("conversation-1"),
+            SessionStatus::Ready {
+                summary: "Ready".to_string(),
+            },
+            &stale_updated_at,
+        )));
+    }
+
+    #[tokio::test]
+    async fn maintenance_cleanup_removes_expired_ready_sessions_without_request_path() {
+        let manager = test_manager();
+        let fresh_updated_at = (Utc::now() - chrono::Duration::minutes(4)).to_rfc3339();
+        let stale_updated_at = (Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
+        manager.sessions.insert(
+            "fresh-ready".to_string(),
+            test_session(
+                "fresh-ready",
+                "",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Ready".to_string(),
+                },
+                &fresh_updated_at,
+            ),
+        );
+        manager.sessions.insert(
+            "stale-ready".to_string(),
+            test_session(
+                "stale-ready",
+                "",
+                Some("conversation-1"),
+                SessionStatus::Ready {
+                    summary: "Ready".to_string(),
+                },
+                &stale_updated_at,
+            ),
+        );
+
+        manager.cleanup_stale_or_unreachable_sessions().await;
+
+        assert!(manager.sessions.contains_key("fresh-ready"));
+        assert!(!manager.sessions.contains_key("stale-ready"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_cleanup_removes_interrupted_and_awaiting_resume_sessions() {
+        let manager = test_manager();
+        let updated_at = Utc::now().to_rfc3339();
+        manager.sessions.insert(
+            "active".to_string(),
+            test_session(
+                "active",
+                "",
+                Some("conversation-1"),
+                SessionStatus::Active,
+                &updated_at,
+            ),
+        );
+        manager.sessions.insert(
+            "interrupted".to_string(),
+            test_session(
+                "interrupted",
+                "",
+                Some("conversation-1"),
+                SessionStatus::Interrupted {
+                    reason: "App restarted".to_string(),
+                },
+                &updated_at,
+            ),
+        );
+        manager.sessions.insert(
+            "awaiting-resume".to_string(),
+            test_session(
+                "awaiting-resume",
+                "",
+                Some("conversation-1"),
+                SessionStatus::AwaitingResume {
+                    question: "Restart the browser task".to_string(),
+                },
+                &updated_at,
+            ),
+        );
+
+        manager.cleanup_stale_or_unreachable_sessions().await;
+
+        assert!(manager.sessions.contains_key("active"));
+        assert!(!manager.sessions.contains_key("interrupted"));
+        assert!(!manager.sessions.contains_key("awaiting-resume"));
     }
 
     #[test]
@@ -3475,6 +4755,8 @@ mod tests {
             body_text: "OpenAI article".to_string(),
             elements: Vec::new(),
             diagnostics: Vec::new(),
+            downloads: Vec::new(),
+            download_dir: None,
         };
         let mut history = Vec::new();
 
@@ -3535,6 +4817,7 @@ mod tests {
     fn test_manager() -> BrowserSessionManager {
         BrowserSessionManager {
             sessions: Arc::new(DashMap::new()),
+            page_snapshots: Arc::new(DashMap::new()),
             integration: Arc::new(BrowserIntegration::new()),
             storage: None,
         }

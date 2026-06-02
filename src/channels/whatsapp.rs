@@ -6,7 +6,7 @@
 //!
 //! API reference: https://developers.facebook.com/docs/whatsapp/cloud-api
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -805,7 +805,7 @@ fn is_whatsapp_markdown_rule(line: &str) -> bool {
 
 /// Build an authenticated `reqwest::Client` with a JSON content-type default.
 fn http_client() -> reqwest::Client {
-    reqwest::Client::new()
+    crate::core::net::default_outgoing_http_client()
 }
 
 /// Send a text message to a WhatsApp recipient.
@@ -1993,7 +1993,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::outbound_split::{SplitProfile, split_outbound_message};
+    use crate::channels::outbound_split::{split_outbound_message, SplitProfile};
 
     #[test]
     fn test_split_message_short() {
@@ -2189,15 +2189,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            !record_whatsapp_message_id(&storage, "wamid.1")
-                .await
-                .unwrap()
-        );
-        assert!(
-            record_whatsapp_message_id(&storage, "wamid.1")
-                .await
-                .unwrap()
-        );
+        assert!(!record_whatsapp_message_id(&storage, "wamid.1")
+            .await
+            .unwrap());
+        assert!(record_whatsapp_message_id(&storage, "wamid.1")
+            .await
+            .unwrap());
     }
 }

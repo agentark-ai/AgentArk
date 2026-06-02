@@ -31,6 +31,7 @@ import {
   isStandaloneBackgroundWorkTask,
 } from "../lib/backgroundSessions";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 import type {
   BackgroundSessionDetail,
   BackgroundSessionSummary,
@@ -141,13 +142,7 @@ function dotColor(status: string): string {
 }
 
 function statusLabel(status: string): string {
-  const normalized = status.toLowerCase();
-  if (normalized === "needs_input") return "Needs input";
-  return normalized
-    .split("_")
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+  return humanizeStatusLabel(status);
 }
 
 function formatTimestamp(value?: string | null): string {
@@ -754,12 +749,16 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                 session.page_url ||
                 "Live browser session";
               const rowActions: RowMenuAction[] = [
-                {
-                  label: "Open live handoff",
-                  onClick: () => {
-                    window.open(browserSessionHandoffUrl(session.id), "_blank", "noopener,noreferrer");
-                  },
-                },
+                ...(!isTerminal
+                  ? [
+                      {
+                        label: "Open live handoff",
+                        onClick: () => {
+                          window.open(browserSessionHandoffUrl(session.id), "_blank", "noopener,noreferrer");
+                        },
+                      },
+                    ]
+                  : []),
                 {
                   label: "Stop",
                   tone: "warning",
@@ -1142,10 +1141,10 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                                 </Typography>
                                 <Chip size="small" label={statusLabel(task.status)} color={chipColor(task.status)} />
                               </Stack>
-                              <Typography variant="caption" sx={{
-                                color: "text.secondary"
-                              }}>
-                                {task.action || "task"} | {formatTimestamp(task.created_at)}
+                            <Typography variant="caption" sx={{
+                              color: "text.secondary"
+                            }}>
+                                {humanizeMachineLabel(task.action, "Task")} | {formatTimestamp(task.created_at)}
                               </Typography>
                             </Box>
                           ))}
@@ -1221,7 +1220,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                               <Typography variant="caption" sx={{
                                 color: "text.secondary"
                               }}>
-                                {watcher.poll_action || "watcher"} | {formatTimestamp(watcher.created_at)}
+                                {humanizeMachineLabel(watcher.poll_action, "Watcher")} | {formatTimestamp(watcher.created_at)}
                               </Typography>
                             </Box>
                           ))}
@@ -1494,7 +1493,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                             <Typography variant="caption" sx={{
                               color: "text.secondary"
                             }}>
-                              {task.action || "task"} | {statusLabel(task.status)}
+                              {humanizeMachineLabel(task.action, "Task")} | {statusLabel(task.status)}
                             </Typography>
                           </Box>
                         }
@@ -1536,7 +1535,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                             <Typography variant="caption" sx={{
                               color: "text.secondary"
                             }}>
-                              {watcher.poll_action || "watcher"} | {statusLabel(watcher.status)}
+                              {humanizeMachineLabel(watcher.poll_action, "Watcher")} | {statusLabel(watcher.status)}
                             </Typography>
                           </Box>
                         }

@@ -2854,6 +2854,7 @@ async fn spawn_reflect_followup_summary_worker(
     {
         return false;
     }
+    let in_flight_guard = ReflectFollowupSummaryInFlightGuard;
     let lease_owner = format!(
         "arkreflect-followup-summary:{}:{}",
         std::process::id(),
@@ -2871,16 +2872,13 @@ async fn spawn_reflect_followup_summary_worker(
     {
         Ok(Ok(Some(guard))) => guard,
         Ok(Ok(None)) => {
-            REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.store(false, Ordering::Release);
             return false;
         }
         Ok(Err(error)) => {
-            REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.store(false, Ordering::Release);
             tracing::debug!(target: "arkreflect", error = %error, "failed to acquire followup summary lease");
             return false;
         }
         Err(_) => {
-            REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.store(false, Ordering::Release);
             tracing::debug!(target: "arkreflect", "followup summary lease timed out");
             return false;
         }
@@ -2888,7 +2886,7 @@ async fn spawn_reflect_followup_summary_worker(
     crate::spawn_logged!(
         "src/channels/http/reflect_control.rs:followup_summary",
         async move {
-            let _guard = ReflectFollowupSummaryInFlightGuard;
+            let _guard = in_flight_guard;
             let result = tokio::time::timeout(
                 REFLECT_FOLLOWUP_SUMMARY_JOB_TIMEOUT,
                 run_reflect_followup_summary_job(storage.clone(), llm, source_ids),
@@ -2944,6 +2942,7 @@ async fn spawn_reflect_followup_search_worker(
     {
         return false;
     }
+    let in_flight_guard = ReflectFollowupSearchInFlightGuard;
     let source_ids = searches
         .iter()
         .map(|(source_id, _)| source_id.clone())
@@ -2965,16 +2964,13 @@ async fn spawn_reflect_followup_search_worker(
     {
         Ok(Ok(Some(guard))) => guard,
         Ok(Ok(None)) => {
-            REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT.store(false, Ordering::Release);
             return false;
         }
         Ok(Err(error)) => {
-            REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT.store(false, Ordering::Release);
             tracing::debug!(target: "arkreflect", error = %error, "failed to acquire followup search lease");
             return false;
         }
         Err(_) => {
-            REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT.store(false, Ordering::Release);
             tracing::debug!(target: "arkreflect", "followup search lease timed out");
             return false;
         }
@@ -2982,7 +2978,7 @@ async fn spawn_reflect_followup_search_worker(
     crate::spawn_logged!(
         "src/channels/http/reflect_control.rs:followup_search",
         async move {
-            let _guard = ReflectFollowupSearchInFlightGuard;
+            let _guard = in_flight_guard;
             let result = tokio::time::timeout(
                 REFLECT_FOLLOWUP_SEARCH_TIMEOUT,
                 run_reflect_followup_search_job(storage.clone(), config_dir, searches),
@@ -5305,6 +5301,7 @@ async fn spawn_reflect_refresh(
         };
     }
 
+    let in_flight_guard = ReflectInFlightGuard;
     let lease_owner = format!("arkreflect:{}:{}", std::process::id(), uuid::Uuid::new_v4());
     let lease_guard = match tokio::time::timeout(
         REFLECT_DB_TIMEOUT,
@@ -5318,7 +5315,6 @@ async fn spawn_reflect_refresh(
     {
         Ok(Ok(Some(guard))) => guard,
         Ok(Ok(None)) => {
-            REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
             let refresh_status = update_refresh_status(|status| {
                 status.running = true;
                 status.status = "already_running".to_string();
@@ -5339,7 +5335,6 @@ async fn spawn_reflect_refresh(
             };
         }
         Ok(Err(error)) => {
-            REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
             tracing::warn!(target: "arkreflect", error = %error, "failed to acquire refresh lease");
             let refresh_status = update_refresh_status(|status| {
                 status.running = false;
@@ -5361,7 +5356,6 @@ async fn spawn_reflect_refresh(
             };
         }
         Err(_) => {
-            REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
             let refresh_status = update_refresh_status(|status| {
                 status.running = false;
                 status.status = "lease_timed_out".to_string();
@@ -5401,7 +5395,7 @@ async fn spawn_reflect_refresh(
     .await;
 
     crate::spawn_logged!("src/channels/http/reflect_control.rs:refresh", async move {
-        let guard = ReflectInFlightGuard;
+        let guard = in_flight_guard;
         let result = tokio::time::timeout(
             REFLECT_REFRESH_TIMEOUT,
             run_reflect_refresh_job(state.clone(), request.clone()),
@@ -5964,22 +5958,29 @@ async fn maybe_prepare_daily_digest(state: AppState) {
         .await;
 }
 
-async fn reflect_idle_loop(state: AppState) {
+async fn reflect_idle_loop(state: AppState, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(REFLECT_IDLE_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            _ = interval.tick() => {}
+        }
         if !reflect_server_is_idle(&state).await {
             continue;
         }
-        if tokio::time::timeout(
-            REFLECT_DAILY_DIGEST_TIMEOUT,
-            maybe_prepare_daily_digest(state.clone()),
-        )
-        .await
-        .is_err()
-        {
+        let digest_result = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            result = tokio::time::timeout(
+                REFLECT_DAILY_DIGEST_TIMEOUT,
+                maybe_prepare_daily_digest(state.clone()),
+            ) => result,
+        };
+        if digest_result.is_err() {
             tracing::debug!(target: "arkreflect", "daily digest background pass timed out");
+        }
+        if *shutdown_rx.borrow() {
+            break;
         }
         if maybe_spawn_reflect_followup_search_from_recent_activity(state.clone(), "idle").await {
             continue;
@@ -5994,19 +5995,22 @@ async fn reflect_idle_loop(state: AppState) {
     }
 }
 
-pub(super) fn spawn_reflect_idle_loop(state: AppState) {
+pub(super) fn spawn_reflect_idle_loop(
+    state: AppState,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if REFLECT_IDLE_LOOP_STARTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return;
+        return None;
     }
-    crate::spawn_logged!(
+    Some(crate::spawn_logged!(
         "src/channels/http/reflect_control.rs:idle_loop",
         async move {
-            reflect_idle_loop(state).await;
+            reflect_idle_loop(state, shutdown_rx).await;
         }
-    );
+    ))
 }
 
 pub(super) async fn ark_reflect_endpoint(
@@ -6020,9 +6024,13 @@ pub(super) async fn ark_reflect_endpoint(
     let from_s = request.from.to_rfc3339();
     let to_s = request.to.to_rfc3339();
 
-    let (storage, profile_arc) = {
+    let (storage, profile_arc, embedding_client) = {
         let agent = state.agent.read().await;
-        (agent.storage.clone(), agent.user_profile.clone())
+        (
+            agent.storage.clone(),
+            agent.user_profile.clone(),
+            agent.embedding_client.clone(),
+        )
     };
     let profile = profile_arc.read().await.clone();
     let tz = reflect_timezone_from_profile(&profile);
@@ -6086,8 +6094,14 @@ pub(super) async fn ark_reflect_endpoint(
     {
         tracing::debug!(target: "arkreflect", "related history enrichment timed out");
     }
-    let suggested_followups =
-        build_suggested_followups(&storage, &clusters, None, None, false).await;
+    let suggested_followups = build_suggested_followups(
+        &storage,
+        &clusters,
+        embedding_client.as_deref(),
+        None,
+        false,
+    )
+    .await;
     (
         StatusCode::OK,
         Json(ReflectResponse {

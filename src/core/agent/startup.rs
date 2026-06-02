@@ -424,7 +424,13 @@ impl Agent {
         // Load persisted user profile (encrypted at rest)
         let mut user_profile = match encrypted_storage.get_decrypted("user_profile").await {
             Ok(Some(bytes)) => serde_json::from_slice::<UserProfile>(&bytes).unwrap_or_default(),
-            _ => UserProfile::default(),
+            Ok(None) => UserProfile::default(),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to load encrypted user profile: {}",
+                    error
+                ));
+            }
         };
         let mut user_profile_dirty = false;
         // Legacy cleanup: these fields were previously auto-extracted from chat and could be noisy.
@@ -867,7 +873,19 @@ impl Agent {
         let mut actions = self.runtime.list_enabled_actions().await?;
         self.append_dynamic_integration_actions(&mut actions).await;
         let calendar_available = self.calendar_integration_is_configured();
-        Self::retain_actions_for_connected_integrations(&mut actions, calendar_available);
+        let gmail_available = self.legacy_gmail_notification_is_configured()
+            || self.workspace_gmail_notification_is_configured();
+        let google_workspace_granted_bundles = if self.integrations.is_enabled("google_workspace") {
+            crate::actions::google_workspace::granted_bundles(&self.config_dir).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self::retain_actions_for_connected_integrations(
+            &mut actions,
+            calendar_available,
+            gmail_available,
+            &google_workspace_granted_bundles,
+        );
         Ok(actions)
     }
 

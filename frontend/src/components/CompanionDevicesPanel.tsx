@@ -37,6 +37,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState, type JSX } from "react";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 import { sessionNeedsPairingPoll } from "./companionPairing";
 import type {
   CompanionCapabilityDescriptor,
@@ -730,7 +731,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                         Expires {formatUiDateTime(pairingExpiresAt, { fallback: "soon" })}
                       </Typography>
                     </Box>
-                    <Chip size="small" variant="outlined" label={activePairingSession?.status ?? "pending"} sx={{ alignSelf: "flex-start" }} />
+                    <Chip size="small" variant="outlined" label={humanizeStatusLabel(activePairingSession?.status ?? "pending")} sx={{ alignSelf: "flex-start" }} />
                   </Stack>
                   <Typography className="companion-connect-url">{webCompanionUrl || "Create the pairing link first"}</Typography>
                 </Box>
@@ -1227,10 +1228,10 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                         {latestPairing.display_name}
                       </Typography>
                       <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                        Latest session - {latestPairing.status}
+                        Latest session - {humanizeStatusLabel(latestPairing.status)}
                       </Typography>
                     </Box>
-                    <Chip size="small" variant="outlined" label={latestPairing.status} />
+                    <Chip size="small" variant="outlined" label={humanizeStatusLabel(latestPairing.status)} />
                   </Stack>
                   {latestPairing.claimed_device_public_key ? (
                     <Typography variant="caption" sx={{ color: "text.secondary", overflowWrap: "anywhere" }}>
@@ -1577,9 +1578,9 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                           sx={{ justifyContent: "space-between", gap: 1, alignItems: { xs: "stretch", sm: "flex-start" } }}
                         >
                           <Typography variant="subtitle2" sx={{ fontWeight: 650, overflowWrap: "anywhere" }}>
-                            {command.action}
+                            {humanizeMachineLabel(command.action)}
                           </Typography>
-                          <Chip size="small" variant="outlined" label={command.status} sx={{ alignSelf: "flex-start" }} />
+                          <Chip size="small" variant="outlined" label={humanizeStatusLabel(command.status)} sx={{ alignSelf: "flex-start" }} />
                         </Stack>
                         <Typography variant="caption" sx={{ color: "text.secondary" }}>
                           {labelForCapability(capabilities, command.capability)} -{" "}

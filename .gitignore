@@ -1,5 +1,6 @@
 /target
 /dist
+.build-logs/
 node_modules/
 .npmcache/
 .npm-cache*/
@@ -10,6 +11,9 @@ frontend/vite.config.d.ts
 frontend/dist/
 frontend/vite-dev*.log
 frontend/vite-dev*.err.log
+
+# Brainstorming visual-companion mockups (local design scratch)
+.superpowers/
 
 # Generated test/scratch artifacts
 /landing.html

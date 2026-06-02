@@ -3,6 +3,7 @@ import { preloadWorkspaceRoute } from "./WorkspaceViewOutlet";
 
 export type WorkspaceView =
   | "chat"
+  | "voice"
   | "connections"
   | "channels"
   | "routing"

@@ -29,6 +29,7 @@ import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
+import { humanizeStatusLabel } from "../../lib/displayLabels";
 import type {
   PulseCleanupCandidate,
   PulseCleanupPreviewResponse,
@@ -118,7 +119,7 @@ function statusLabel(status: string): string {
   const normalized = status.trim().toLowerCase();
   if (!normalized) return "Unknown";
   if (normalized === "ok") return "OK";
-  return normalized.replace(/_/g, " ").replace(/\b\w/g, (match) => match.toUpperCase());
+  return humanizeStatusLabel(normalized, "Unknown");
 }
 
 function eventTimestamp(event: JsonRecord): string {
@@ -1122,7 +1123,7 @@ export default function PulsePage({ autoRefresh }: PulsePageProps) {
                 ) : null}
                 {cleanupJob ? (
                   <Alert severity="success">
-                    Cleanup job {str(cleanupJob.job_id, "-")} is {str(cleanupJob.status, "accepted")}.
+                    Cleanup job {str(cleanupJob.job_id, "-")} is {humanizeStatusLabel(str(cleanupJob.status, "accepted"))}.
                   </Alert>
                 ) : null}
               </>

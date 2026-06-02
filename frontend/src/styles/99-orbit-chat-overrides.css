@@ -1,0 +1,399 @@
+/* Late Orbit chat compactness overrides. */
+
+/* =========================================================================
+   OrbitChat — HUD redesign
+   Role avatars + "YOU" / "ORBIT" labels were retired from the React tree.
+   The message's identity now reads from a 2px left-edge accent stripe
+   (warm for user input, green for orbit output) plus the bubble's own
+   subtle inner glow. Token-usage chips and corner brackets are gone too;
+   the message itself is what matters.
+   ========================================================================= */
+
+/* Tighter base bubble. We override the user-only padded variant with the
+   same shape; the visual difference between user and orbit now comes from
+   the colour of the left edge, not the bubble being padded vs. flat. */
+.orbit-chat-msg.orbit-chat-msg-user,
+.orbit-chat-msg.orbit-chat-msg-assistant {
+  position: relative;
+  padding: 0.55rem 0.7rem 0.55rem 0.85rem;
+  border-radius: 4px;
+  border: 1px solid rgba(130, 170, 160, 0.10);
+  background: linear-gradient(
+    180deg,
+    rgba(8, 16, 22, 0.62),
+    rgba(4, 10, 14, 0.45)
+  );
+  overflow: hidden;
+}
+
+/* Left-edge accent stripe — the only signal that says "this is a user
+   message" vs "this is an orbit reply". 2px wide, full-height, glows. */
+.orbit-chat-msg.orbit-chat-msg-user::before,
+.orbit-chat-msg.orbit-chat-msg-assistant::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  pointer-events: none;
+}
+.orbit-chat-msg.orbit-chat-msg-user::before {
+  background: linear-gradient(
+    180deg,
+    rgba(216, 173, 120, 0.85),
+    rgba(216, 173, 120, 0.4)
+  );
+  box-shadow: 0 0 12px rgba(216, 173, 120, 0.38);
+}
+.orbit-chat-msg.orbit-chat-msg-assistant::before {
+  background: linear-gradient(
+    180deg,
+    rgba(120, 242, 176, 0.85),
+    rgba(120, 242, 176, 0.4)
+  );
+  box-shadow: 0 0 12px rgba(120, 242, 176, 0.45);
+}
+
+/* Suppress the previous decorative corner brackets and after rules — the
+   HUD aesthetic now comes from the accent stripe alone, no extra chrome. */
+.orbit-chat-msg.orbit-chat-msg-user::after,
+.orbit-chat-msg.orbit-chat-msg-assistant::after {
+  display: none;
+}
+
+/* Hide the old role label entirely if any consumer still renders it. */
+.orbit-chat-msg .orbit-chat-msg-role {
+  display: none;
+}
+
+/* Glyph row — sits above the message body. Holds the role glyph and
+   any running/status indicator in one compact line. No background, no
+   chip border — the glyph itself is the affordance. */
+.orbit-chat-msg-glyph-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(213, 228, 225, 0.55);
+}
+
+.orbit-chat-msg-glyph {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+
+/* User glyph: warm-tinted person icon with a subtle outline glow. */
+.orbit-chat-msg-glyph-user {
+  background: rgba(216, 173, 120, 0.06);
+  border: 1px solid rgba(216, 173, 120, 0.32);
+  box-shadow: 0 0 8px rgba(216, 173, 120, 0.2);
+}
+.orbit-chat-msg-glyph-user .orbit-chat-role-user-icon {
+  width: 12px !important;
+  height: 12px !important;
+  color: rgba(216, 173, 120, 0.92);
+  filter: drop-shadow(0 0 4px rgba(216, 173, 120, 0.3));
+}
+
+/* Orbit glyph: AgentArk logo, tinted green by the surrounding glow. */
+.orbit-chat-msg-glyph-assistant {
+  background: rgba(120, 242, 176, 0.06);
+  border: 1px solid rgba(120, 242, 176, 0.32);
+  box-shadow: 0 0 8px rgba(120, 242, 176, 0.22);
+}
+.orbit-chat-msg-glyph-assistant .orbit-chat-role-agent-logo {
+  width: 13px;
+  height: 13px;
+  display: block;
+  filter: drop-shadow(0 0 4px rgba(120, 242, 176, 0.38));
+}
+
+/* Running-dots animation sits inline next to the glyph. */
+.orbit-chat-msg-glyph-row .orbit-chat-running-dots-chip {
+  width: 24px;
+  height: 8px;
+}
+
+/* Message body — terminal-leaning typography so the bubble reads like
+   HUD output, not a chat balloon. Inherits MUI text colour. */
+.orbit-chat-msg-text {
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  line-height: 1.55;
+  color: var(--text-primary, #f6f0e8);
+  letter-spacing: 0;
+}
+
+/* File chips — slimmer, mono caps, no rounded pill background, just a
+   thin outlined badge that reads as data, not as a button. */
+.orbit-chat-msg .orbit-file-chip-row {
+  margin-top: 0.45rem;
+}
+.orbit-chat-msg .orbit-file-chip {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  padding: 0.15rem 0.5rem;
+  border-radius: 3px;
+  border: 1px solid rgba(130, 170, 160, 0.18);
+  background: rgba(130, 170, 160, 0.05);
+  color: rgba(213, 228, 225, 0.85);
+}
+
+/* Tightened activity line ("Working", "Reading", etc.) — keeps the
+   indicator but trims the pulse + dots so the line reads as a quiet
+   status caption, not a separate widget. */
+.orbit-chat-msg-active .orbit-chat-activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  color: rgba(120, 242, 176, 0.78);
+}
+
+/* Compact Orbit sidecar pass. Keep the panel useful for files, but make it
+   read like a slim HUD rail instead of a full-width console. */
+.arkorbit-chat-flyout {
+  width: min(520px, calc(100vw - 44px)) !important;
+  border-radius: 10px !important;
+  background: rgba(4, 6, 9, 0.94) !important;
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.42) !important;
+}
+
+.arkorbit-chat-drag-handle.MuiIconButton-root {
+  top: 7px !important;
+  width: 26px !important;
+  height: 26px !important;
+  border-radius: 7px !important;
+}
+
+.arkorbit-chat-drag-handle.MuiIconButton-root .MuiSvgIcon-root,
+.orbit-chat-tool.MuiIconButton-root .MuiSvgIcon-root,
+.orbit-chat-send-icon.MuiIconButton-root .MuiSvgIcon-root {
+  width: 16px;
+  height: 16px;
+}
+
+.orbit-chat-header {
+  min-height: 42px;
+  padding: 0.38rem 0.62rem !important;
+  gap: 0.5rem;
+}
+
+.orbit-chat-title {
+  font-size: 0.64rem !important;
+  letter-spacing: 0.07em !important;
+}
+
+.orbit-chat-subtitle {
+  font-size: 0.64rem !important;
+  gap: 0.32rem !important;
+  letter-spacing: 0.02em !important;
+}
+
+.orbit-chat-tool.MuiIconButton-root {
+  width: 28px !important;
+  height: 28px !important;
+  border-radius: 6px !important;
+}
+
+.orbit-chat-tabs {
+  gap: 0.25rem !important;
+  padding: 0.28rem 0.5rem 0 !important;
+}
+
+.orbit-chat-tab {
+  min-height: 25px !important;
+  padding: 0 0.5rem !important;
+  border-radius: 5px 5px 0 0 !important;
+  font-size: 0.67rem !important;
+}
+
+.orbit-chat-tab span {
+  min-width: 16px !important;
+  padding: 0 5px !important;
+  font-size: 0.58rem !important;
+}
+
+.orbit-chat-messages {
+  gap: 0.4rem !important;
+  padding: 0.48rem 0.58rem !important;
+}
+
+.orbit-chat-msg.orbit-chat-msg-user,
+.orbit-chat-msg.orbit-chat-msg-assistant {
+  padding: 0.42rem 0.56rem 0.42rem 0.72rem !important;
+  border-radius: 5px !important;
+  border-color: rgba(130, 170, 160, 0.08) !important;
+  background: linear-gradient(180deg, rgba(8, 15, 20, 0.5), rgba(4, 9, 13, 0.32)) !important;
+}
+
+.orbit-chat-msg-glyph-row {
+  gap: 0.4rem !important;
+  margin-bottom: 0.22rem !important;
+}
+
+.orbit-chat-msg-glyph {
+  width: 17px !important;
+  height: 17px !important;
+  border-radius: 4px !important;
+}
+
+.orbit-chat-msg-glyph-user .orbit-chat-role-user-icon {
+  width: 10px !important;
+  height: 10px !important;
+}
+
+.orbit-chat-msg-glyph-assistant .orbit-chat-role-agent-logo {
+  width: 11px !important;
+  height: 11px !important;
+}
+
+.orbit-chat-msg-text {
+  font-size: 0.78rem !important;
+  line-height: 1.46 !important;
+}
+
+.orbit-chat-msg .orbit-file-chip-row {
+  margin-top: 0.28rem !important;
+}
+
+.orbit-chat-msg .orbit-file-chip {
+  padding: 0.1rem 0.38rem !important;
+  font-size: 0.64rem !important;
+}
+
+.orbit-chat-composer {
+  gap: 0.38rem !important;
+  padding: 0.42rem 0.52rem !important;
+}
+
+.orbit-chat-input {
+  min-height: 34px;
+  max-height: 72px;
+  border-radius: 7px !important;
+  padding: 0.38rem 0.52rem !important;
+  font-size: 0.78rem !important;
+  line-height: 1.35;
+}
+
+.orbit-chat-send-icon.MuiIconButton-root {
+  width: 32px !important;
+  height: 32px !important;
+  border-radius: 7px !important;
+}
+
+.orbit-chat-files-view {
+  gap: 0.4rem !important;
+  padding: 0.42rem !important;
+  background:
+    linear-gradient(180deg, rgba(7, 13, 18, 0.72), rgba(2, 5, 8, 0.76)),
+    rgba(2, 5, 8, 0.78) !important;
+}
+
+.orbit-chat-files-toolbar {
+  min-height: 28px;
+}
+
+.orbit-chat-files-title {
+  font-size: 0.66rem !important;
+  letter-spacing: 0.04em !important;
+}
+
+.orbit-chat-files-count {
+  min-width: 17px !important;
+  padding: 0 5px !important;
+  font-size: 0.58rem !important;
+}
+
+.orbit-chat-files-layout {
+  grid-template-columns: minmax(160px, 210px) minmax(0, 1fr) !important;
+  grid-template-rows: minmax(0, 1fr) !important;
+  gap: 0.45rem !important;
+}
+
+.orbit-chat-files-list {
+  min-height: 0 !important;
+  overflow: auto !important;
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 0.22rem !important;
+  padding-right: 0.12rem !important;
+}
+
+.orbit-chat-file-row {
+  grid-template-columns: minmax(0, 1fr) auto !important;
+  gap: 0.06rem 0.45rem !important;
+  min-height: 32px !important;
+  padding: 0.28rem 0.38rem !important;
+  border-radius: 5px !important;
+  border-color: rgba(120, 242, 176, 0.1) !important;
+  background: rgba(237, 247, 244, 0.018) !important;
+}
+
+.orbit-chat-file-name {
+  font-size: 0.68rem !important;
+}
+
+.orbit-chat-file-path,
+.orbit-chat-file-size {
+  font-size: 0.55rem !important;
+}
+
+.orbit-chat-file-row:hover,
+.orbit-chat-file-row.is-active {
+  border-color: rgba(54, 245, 184, 0.34) !important;
+  background: rgba(54, 245, 184, 0.07) !important;
+}
+
+.orbit-chat-file-row.is-active {
+  box-shadow: inset 2px 0 0 rgba(54, 245, 184, 0.72) !important;
+}
+
+.orbit-chat-file-preview {
+  border-radius: 5px !important;
+  min-height: 0 !important;
+}
+
+.orbit-chat-file-preview-head {
+  min-height: 30px !important;
+  padding: 0 0.48rem !important;
+}
+
+.orbit-chat-file-preview-path {
+  font-size: 0.62rem !important;
+}
+
+.orbit-chat-file-preview-meta {
+  font-size: 0.57rem !important;
+}
+
+.orbit-chat-file-code {
+  padding: 0.58rem 0.66rem 0.75rem !important;
+  font-size: 0.66rem !important;
+  line-height: 1.48 !important;
+}
+
+@media (max-width: 820px) {
+  .arkorbit-chat-flyout {
+    width: auto !important;
+  }
+
+  .orbit-chat-files-layout {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: minmax(112px, 30%) minmax(0, 1fr) !important;
+  }
+}

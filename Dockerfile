@@ -98,9 +98,9 @@ ARG AGENTARK_BUILD_PROFILE=release
 RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
-        cargo build --profile "${AGENTARK_BUILD_PROFILE}"; \
+        cargo build --locked --profile "${AGENTARK_BUILD_PROFILE}"; \
     else \
-        cargo build --profile "${AGENTARK_BUILD_PROFILE}" -j "${AGENTARK_BUILD_JOBS}"; \
+        cargo build --locked --profile "${AGENTARK_BUILD_PROFILE}" -j "${AGENTARK_BUILD_JOBS}"; \
     fi && \
     rm -rf src
 
@@ -121,9 +121,9 @@ COPY assets ./assets
 RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
-        cargo build --profile "${AGENTARK_BUILD_PROFILE}" --bins; \
+        cargo build --locked --profile "${AGENTARK_BUILD_PROFILE}" --bins; \
     else \
-        cargo build --profile "${AGENTARK_BUILD_PROFILE}" --bins -j "${AGENTARK_BUILD_JOBS}"; \
+        cargo build --locked --profile "${AGENTARK_BUILD_PROFILE}" --bins -j "${AGENTARK_BUILD_JOBS}"; \
     fi && \
     if find src -type f -newer "target/${AGENTARK_BUILD_PROFILE}/agentark" -print -quit | grep -q .; then \
         echo "ERROR: src/ files newer than target/${AGENTARK_BUILD_PROFILE}/agentark after build; aborting" >&2; \
@@ -147,7 +147,7 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     fi
 
 # -- Stage 2: Frontend build --
-FROM node:25-slim AS frontend-builder
+FROM node:22-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,id=agentark-frontend-npm,target=/root/.npm \
@@ -159,7 +159,7 @@ RUN npm run build
 
 # -- Stage 3: Node.js bridges build --
 # Build node_modules here (git available), then copy only the result to runtime
-FROM node:25-slim AS node-builder
+FROM node:22-slim AS node-builder
 
 ARG INSTALL_WHATSAPP_BRIDGE=true
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
@@ -192,7 +192,7 @@ COPY bridges/playwright-bridge/manual-login.js ./
 # -- Stage 4: Minimal runtime --
 # Keep runtime on the same Debian family so the final binary sees the same
 # glibc generation it was linked against in the builder stage.
-FROM node:25-trixie-slim
+FROM node:22-trixie-slim
 
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
 ARG INSTALL_TAILSCALE=false
@@ -203,7 +203,7 @@ ARG INSTALL_DOCKER_CLI=true
 ARG INSTALL_OLLAMA_CLI=false
 
 RUN set -eux; \
-    apt_packages="ca-certificates curl gosu git postgresql-client python3 python3-pip python3-venv tar binutils"; \
+    apt_packages="ca-certificates curl gosu git postgresql-client python3 python3-pip python3-venv tar binutils build-essential pkg-config"; \
     if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
         apt_packages="${apt_packages} chromium xvfb x11vnc novnc websockify openbox"; \
     fi; \
@@ -357,6 +357,7 @@ ENV PLAYWRIGHT_LIVE_VIEW_PORT=6080
 ENV PLAYWRIGHT_LIVE_VIEW_PATH=/vnc.html?autoconnect=1&resize=scale&path=websockify
 # Default bridge URL for in-container Playwright service
 ENV PLAYWRIGHT_BRIDGE_URL=http://127.0.0.1:3100
+ENV PLAYWRIGHT_REAL_BROWSER_NO_SANDBOX=true
 # Secure logging: suppress SQLx queries to prevent sensitive data exposure
 ENV RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
 
@@ -365,8 +366,8 @@ EXPOSE 8990
 EXPOSE 6080
 
 # Health check
-HEALTHCHECK --interval=2s --timeout=2s --start-period=1s --retries=30 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=1)" || exit 1
+HEALTHCHECK --interval=2s --timeout=2s --start-period=30s --retries=30 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/readiness', timeout=1)" || exit 1
 
 # Run with entrypoint script that checks for volume mounts
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

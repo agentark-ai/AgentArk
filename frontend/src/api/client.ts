@@ -40,6 +40,8 @@ import type {
   RecommendedAction,
   SentinelFeedResponse,
   SentinelSettingsResponse,
+  SettingsApiKeyMetadata,
+  SettingsApiKeySecretResponse,
   TraceResponse
 } from "../types";
 
@@ -562,7 +564,6 @@ type ChatStreamPayload = {
   conversation_id?: string | null;
   deep_research?: boolean;
   execution_profile?: Record<string, unknown>;
-  plan_confirmation_mode?: string;
   execution_mode?: string;
   attachments_present?: boolean;
   attachments?: Array<{
@@ -580,7 +581,7 @@ type ChatStreamHandlers = {
   signal?: AbortSignal;
   onOpen?: () => void;
   onEvent?: (event: string, payload: unknown) => void;
-  onToken?: (token: string) => void;
+  onToken?: (token: string, payload?: Record<string, unknown>) => void;
   onThinking?: (step: Record<string, unknown>) => void;
   onReasoningDelta?: (payload: Record<string, unknown>) => void;
   onToolStart?: (name: string, payload?: Record<string, unknown>) => void;
@@ -591,6 +592,55 @@ type ChatStreamHandlers = {
   onContent?: (payload: Record<string, unknown>) => void;
   onError?: (message: string, payload?: unknown) => void;
   onDone?: (payload?: Record<string, unknown>) => void;
+};
+
+export type VoiceSessionSnapshot = {
+  id: string;
+  conversation_id?: string | null;
+  transport: string;
+  phase: string;
+  created_at?: string;
+  updated_at?: string;
+  last_error?: string | null;
+};
+
+export type VoiceStatusResponse = {
+  status: string;
+  voice_available: boolean;
+  disabled_reason?: string | null;
+  bridge_url?: string | null;
+  session?: VoiceSessionSnapshot | null;
+  transport?: string[];
+  engine?: string;
+  setup_errors?: Array<{ code?: string; message?: string }>;
+  stt?: {
+    provider?: string;
+    engine?: string;
+    model?: string;
+    ready?: boolean;
+  };
+  tts?: {
+    provider?: string;
+    ready?: boolean;
+  };
+};
+
+export type VoiceSessionResponse = {
+  status: string;
+  session?: VoiceSessionSnapshot | null;
+  stream_token?: string | null;
+  voice_available?: boolean;
+  disabled_reason?: string | null;
+  setup_errors?: Array<{ code?: string; message?: string }>;
+};
+
+export type VoiceTurnResponse = {
+  status: string;
+  session?: VoiceSessionSnapshot | null;
+  conversation_id?: string | null;
+  assistant_text?: string;
+  trace_id?: string | null;
+  error?: string;
 };
 
 function parseMaybeJson(raw: string): unknown {
@@ -609,6 +659,72 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  return undefined;
+}
+
+export function normalizeSettingsApiKeyMetadata(
+  value: unknown,
+): SettingsApiKeyMetadata {
+  const raw = asObject(value);
+  const metadata: SettingsApiKeyMetadata = {};
+  if (typeof raw.set === "boolean") metadata.set = raw.set;
+  if (typeof raw.masked === "string" || raw.masked === null) {
+    metadata.masked = raw.masked;
+  }
+  const issuedAt = optionalNumber(raw.issued_at_unix);
+  if (issuedAt !== undefined) metadata.issued_at_unix = issuedAt;
+  const expiresAt = optionalNumber(raw.expires_at_unix);
+  if (expiresAt !== undefined) metadata.expires_at_unix = expiresAt;
+  const ttlSeconds = optionalNumber(raw.ttl_seconds);
+  if (ttlSeconds !== undefined) metadata.ttl_seconds = ttlSeconds;
+  const remainingSeconds = optionalNumber(raw.remaining_seconds);
+  if (remainingSeconds !== undefined) metadata.remaining_seconds = remainingSeconds;
+  const rotated = optionalBoolean(raw.rotated);
+  if (rotated !== undefined) metadata.rotated = rotated;
+  const passwordGateRequired = optionalBoolean(raw.password_gate_required);
+  if (passwordGateRequired !== undefined) {
+    metadata.password_gate_required = passwordGateRequired;
+  }
+  if (typeof raw.password_gate_error === "string" && raw.password_gate_error.trim()) {
+    metadata.password_gate_error = raw.password_gate_error;
+  }
+  if (typeof raw.error === "string" && raw.error.trim()) metadata.error = raw.error;
+  return metadata;
+}
+
+function normalizeSettingsApiKeySecretResponse(
+  value: unknown,
+): SettingsApiKeySecretResponse {
+  const raw = asObject(value);
+  const key = asText(raw.key).trim();
+  if (!key) {
+    throw new Error("API key response did not include a full key.");
+  }
+  const metadata = normalizeSettingsApiKeyMetadata(raw);
+  return {
+    ...metadata,
+    key,
+    ok: optionalBoolean(raw.ok),
+  };
+}
+
+function settingsApiKeyPasswordPayload(masterPassword: string): {
+  master_password: string;
+} {
+  return { master_password: masterPassword };
 }
 
 function extractStreamErrorMessage(payloadValue: unknown): string {
@@ -685,8 +801,9 @@ async function streamSseJson(
     handlers.onEvent?.(eventName, payloadValue);
 
     if (eventName === "token") {
-      const content = asText(asObject(payloadValue).content);
-      if (content) handlers.onToken?.(content);
+      const obj = asObject(payloadValue);
+      const content = asText(obj.content);
+      if (content) handlers.onToken?.(content, obj);
       return;
     }
     if (eventName === "thinking") {
@@ -823,8 +940,9 @@ async function streamRun(runId: string, sinceSeq = 0, handlers: ChatStreamHandle
     handlers.onEvent?.(eventName, payloadValue);
 
     if (eventName === "token") {
-      const content = asText(asObject(payloadValue).content);
-      if (content) handlers.onToken?.(content);
+      const obj = asObject(payloadValue);
+      const content = asText(obj.content);
+      if (content) handlers.onToken?.(content, obj);
       return;
     }
     if (eventName === "thinking") {
@@ -924,6 +1042,22 @@ export const api = {
       ...init,
       method: "POST"
     }),
+  getSettingsApiKeyMetadata: async () =>
+    normalizeSettingsApiKeyMetadata(await request<unknown>("/settings/api-key")),
+  revealSettingsApiKey: async (masterPassword: string) =>
+    normalizeSettingsApiKeySecretResponse(
+      await request<unknown>("/settings/api-key/reveal", {
+        method: "POST",
+        body: JSON.stringify(settingsApiKeyPasswordPayload(masterPassword))
+      })
+    ),
+  regenerateSettingsApiKey: async (masterPassword: string) =>
+    normalizeSettingsApiKeySecretResponse(
+      await request<unknown>("/settings/api-key/regenerate", {
+        method: "POST",
+        body: JSON.stringify(settingsApiKeyPasswordPayload(masterPassword))
+      })
+    ),
   getStatus: () => request<StatusResponse>("/status"),
   getTasks: async () => {
     const raw = await request<unknown>("/tasks?limit=120&sort=ops");
@@ -1555,7 +1689,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ action, dry_run: false })
       }),
-  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; deep_research?: boolean; execution_profile?: Record<string, unknown>; plan_confirmation_mode?: string; execution_mode?: string; browser_profile_context?: Record<string, unknown> }) =>
+  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; deep_research?: boolean; execution_profile?: Record<string, unknown>; execution_mode?: string; browser_profile_context?: Record<string, unknown> }) =>
     request<{ response: string; proof_id?: string; conversation_id?: string; conversation_title?: string }>(
       "/chat",
       {
@@ -1564,6 +1698,22 @@ export const api = {
       }
     ),
   chatStream: (payload: ChatStreamPayload, handlers?: ChatStreamHandlers) => streamChat(payload, handlers),
+  getVoiceStatus: () => request<VoiceStatusResponse>("/voice/status"),
+  createVoiceSession: (payload: { conversation_id?: string | null; transport?: "browser" | string }) =>
+    request<VoiceSessionResponse>("/voice/sessions", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  stopVoiceSession: (id: string) =>
+    request<VoiceSessionResponse>(`/voice/sessions/${encodeURIComponent(id)}/stop`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  submitVoiceTurn: (id: string, transcript: string) =>
+    request<VoiceTurnResponse>(`/voice/sessions/${encodeURIComponent(id)}/turn`, {
+      method: "POST",
+      body: JSON.stringify({ transcript })
+    }),
   resumeChatTaskStream: (
     id: string,
     payloadOrHandlers?: { plan_override?: Record<string, unknown> } | ChatStreamHandlers,

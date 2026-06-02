@@ -4,8 +4,8 @@
 //! sync polling. The module stores sync state and room context in the existing
 //! encrypted KV store so it can be wired into the broader channel system later
 //! without schema churn.
-use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -18,6 +18,8 @@ type SharedAgent = Arc<RwLock<Agent>>;
 const CONFIG_STORAGE_KEY: &str = "channels:matrix:config";
 const MATRIX_STATE_KEY_PREFIX: &str = "matrix:sync_state:v1:";
 const MATRIX_DEFAULT_TIMEOUT_MS: u64 = 0;
+const MATRIX_DEFAULT_CLIENT_TIMEOUT_MS: u64 = 30_000;
+const MATRIX_SYNC_TIMEOUT_GRACE_MS: u64 = 5_000;
 const MATRIX_DEFAULT_LIMIT: usize = 100;
 const MATRIX_MAX_ROOMS_TRACKED: usize = 128;
 
@@ -199,7 +201,12 @@ async fn save_state(
 }
 
 fn build_client(config: &MatrixTransportConfig) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let client_timeout_ms = config
+        .sync_timeout_ms
+        .saturating_add(MATRIX_SYNC_TIMEOUT_GRACE_MS)
+        .max(MATRIX_DEFAULT_CLIENT_TIMEOUT_MS);
+    let mut builder =
+        reqwest::Client::builder().timeout(std::time::Duration::from_millis(client_timeout_ms));
     if let Some(user_agent) = config
         .user_agent
         .as_deref()

@@ -1,12 +1,12 @@
 use crate::workspace::protocol::{BlobResponse, InternalServiceHealth, WorkspaceStatusResponse};
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, put},
+    Json, Router,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -59,6 +59,13 @@ fn validate_internal_service_token(
     Ok(())
 }
 
+async fn wait_for_workspace_shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("Workspace service shutdown signal received"),
+        Err(error) => tracing::warn!("Workspace service shutdown signal failed: {}", error),
+    }
+}
+
 #[derive(Clone)]
 struct WorkspaceState {
     config: WorkspaceServiceConfig,
@@ -94,8 +101,9 @@ pub async fn run_service(config: WorkspaceServiceConfig) -> Result<()> {
         .with_context(|| format!("Failed to bind workspace service at {}", bind_addr))?;
     tracing::info!("Workspace service listening on {}", bind_addr);
     axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_workspace_shutdown_signal())
         .await
-        .context("Workspace service stopped unexpectedly")
+        .context("Workspace service failed")
 }
 
 async fn health(State(state): State<WorkspaceState>) -> impl IntoResponse {

@@ -94,6 +94,7 @@ static CONTAINER_LIFECYCLE_DURATION_SECONDS: Lazy<MetricStore> = Lazy::new(Metri
 static CONTAINER_SWEEPER_RUNS_TOTAL: Lazy<MetricStore> = Lazy::new(MetricStore::default);
 static CONTAINER_SWEEPER_REMOVED_TOTAL: Lazy<MetricStore> = Lazy::new(MetricStore::default);
 static ACTIVE_CONTAINERS_GAUGE: Lazy<MetricStore> = Lazy::new(MetricStore::default);
+static BACKGROUND_TASK_PANICS_TOTAL: Lazy<MetricStore> = Lazy::new(MetricStore::default);
 
 pub fn observe_http_request(method: &str, path: &str, status: u16, duration: Duration) {
     let labels = vec![
@@ -210,6 +211,10 @@ pub fn set_active_containers(count: usize) {
     ACTIVE_CONTAINERS_GAUGE.set_gauge(Vec::new(), count as f64);
 }
 
+pub fn record_background_task_panic(task: &str) {
+    BACKGROUND_TASK_PANICS_TOTAL.increment_counter(vec![("task", task.to_string())], 1);
+}
+
 pub fn render_prometheus(extra_metrics: &[String]) -> String {
     let mut out = String::new();
     render_counter_family(
@@ -280,6 +285,12 @@ pub fn render_prometheus(extra_metrics: &[String]) -> String {
         "agentark_active_containers",
         "Currently tracked active sandbox containers.",
         &ACTIVE_CONTAINERS_GAUGE,
+    );
+    render_counter_family(
+        &mut out,
+        "agentark_background_task_panics_total",
+        "Total caught panics in background tasks.",
+        &BACKGROUND_TASK_PANICS_TOTAL,
     );
     for line in extra_metrics {
         out.push_str(line);
@@ -411,7 +422,10 @@ fn format_bucket(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_container_run, observe_http_request, render_prometheus};
+    use super::{
+        observe_container_run, observe_http_request, record_background_task_panic,
+        render_prometheus,
+    };
 
     #[test]
     fn render_prometheus_includes_observed_metric_families() {
@@ -422,6 +436,7 @@ mod tests {
             std::time::Duration::from_millis(12),
         );
         observe_container_run("test_metrics_action", "standard", false, "ok");
+        record_background_task_panic("test_metrics_background_task");
 
         let rendered = render_prometheus(&["agentark_test_metric 1".to_string()]);
 
@@ -430,6 +445,8 @@ mod tests {
         assert!(rendered.contains("/test-metrics-render"));
         assert!(rendered.contains("# HELP agentark_container_runs_total"));
         assert!(rendered.contains("test_metrics_action"));
+        assert!(rendered.contains("# HELP agentark_background_task_panics_total"));
+        assert!(rendered.contains("test_metrics_background_task"));
         assert!(rendered.contains("agentark_test_metric 1"));
     }
 }

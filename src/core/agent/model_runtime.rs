@@ -334,7 +334,7 @@ impl Agent {
         timeout_ms: u64,
         max_candidates: usize,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
-        app_delivery_stream: bool,
+        long_running_stream: bool,
     ) -> Result<super::llm::LlmResponse, crate::core::UserFacingOutcome> {
         if candidates.is_empty() {
             candidates = self.llm_candidates_for_role(preferred_role);
@@ -396,13 +396,13 @@ impl Agent {
                     user_message,
                     memories,
                     actions,
-                    if app_delivery_stream {
+                    if long_running_stream {
                         None
                     } else {
                         request_timeout_ms
                     },
                     token_tx,
-                    app_delivery_stream,
+                    long_running_stream,
                     &self.config.model_privacy,
                     false,
                 )

@@ -2,6 +2,8 @@ use super::*;
 use anyhow::Context;
 
 static GEPA_AUTO_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+static GEPA_MANUAL_QUEUE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 const GEPA_AUTO_INITIAL_DELAY_SECS: u64 = 90;
 const GEPA_AUTO_POLL_SECS: u64 = 30 * 60;
 const GEPA_AUTO_QUIET_WINDOW_SECS: i64 = 5 * 60;
@@ -10,27 +12,15 @@ const GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS: usize = 6;
 const GEPA_AUTO_EVIDENCE_SCAN_LIMIT: u64 = 160;
 
 pub(super) fn resolve_project_root() -> PathBuf {
-    let app_path = FsPath::new("/app");
-    if app_path.join("Cargo.toml").exists() {
-        return app_path.to_path_buf();
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut dir = cwd.as_path();
-        loop {
-            if dir.join("Cargo.toml").exists() {
-                return dir.to_path_buf();
-            }
-            match dir.parent() {
-                Some(parent) => dir = parent,
-                None => break,
-            }
-        }
-    }
-    PathBuf::from(".")
+    crate::core::self_evolve::gepa_bridge::resolve_gepa_project_root()
 }
 
 pub(super) fn round4(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 pub(super) fn compute_p95(mut values: Vec<i64>) -> Option<i64> {
@@ -39,6 +29,18 @@ pub(super) fn compute_p95(mut values: Vec<i64>) -> Option<i64> {
     }
     values.sort_unstable();
     let idx = (((values.len() as f64) * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len().saturating_sub(1));
+    Some(values[idx])
+}
+
+pub(super) fn compute_percentile_i64(mut values: Vec<i64>, percentile: f64) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let pct = percentile.clamp(0.0, 1.0);
+    let idx = (((values.len() as f64) * pct).ceil() as usize)
         .saturating_sub(1)
         .min(values.len().saturating_sub(1));
     Some(values[idx])
@@ -138,6 +140,48 @@ pub(super) async fn rollback_tool_strategy_baseline(
     storage: &crate::storage::Storage,
 ) -> Result<String> {
     storage.rollback_tool_strategy_baseline().await
+}
+
+async fn stable_deployment_cadence_pause_message(
+    storage: &crate::storage::Storage,
+) -> Result<Option<String>> {
+    let block =
+        crate::core::self_evolve::deployment_cadence::stable_deployment_cadence_block_for_storage(
+            storage,
+            chrono::Utc::now(),
+        )
+        .await?;
+    Ok(block
+        .as_ref()
+        .map(crate::core::self_evolve::deployment_cadence::stable_deployment_cadence_block_message))
+}
+
+async fn record_evolve_stable_deployment(
+    storage: &crate::storage::Storage,
+    surface: &str,
+    action: &str,
+    proposal_id: Option<String>,
+    version: Option<String>,
+) {
+    if let Err(error) = crate::core::self_evolve::deployment_cadence::record_stable_deployment(
+        storage,
+        crate::core::self_evolve::deployment_cadence::StableDeploymentRecord {
+            deployed_at: chrono::Utc::now().to_rfc3339(),
+            surface: surface.to_string(),
+            action: action.to_string(),
+            proposal_id,
+            version,
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            surface = %surface,
+            action = %action,
+            error = %error,
+            "Failed to record Evolve stable deployment cadence"
+        );
+    }
 }
 
 pub(super) async fn load_last_self_evolve_result(
@@ -1122,16 +1166,6 @@ pub(super) fn prompt_telemetry_usize(value: Option<&serde_json::Value>) -> Optio
     })
 }
 
-pub(super) fn prompt_telemetry_section_summary<'a>(
-    summary: &'a PromptTelemetrySummary,
-    section: &str,
-) -> Option<&'a PromptTelemetrySectionSummary> {
-    summary
-        .top_sections
-        .iter()
-        .find(|item| item.section == section)
-}
-
 pub(super) fn prompt_section_coverage_label(
     section_chars: usize,
     total_chars: usize,
@@ -1156,6 +1190,934 @@ pub(super) fn format_char_count(value: usize) -> String {
     }
     let formatted = grouped.chars().rev().collect::<String>();
     format!("{} chars", formatted)
+}
+
+const PROMPT_OPTIMIZATION_PROFILE_LIMIT: usize = 24;
+const PROMPT_OPTIMIZATION_HOLDOUT_LIMIT: usize = 8;
+
+struct PromptOptimizationOpportunityDraft {
+    id: String,
+    title: String,
+    proposal_summary: String,
+    evidence: Vec<String>,
+    expected_benefit: Vec<String>,
+    caveats: Vec<String>,
+    risk_level: String,
+    target_scope: String,
+    change_preview: EvolutionChangePreview,
+    opportunity: Option<PromptOptimizationOpportunityProfile>,
+    score: f64,
+}
+
+#[derive(Clone)]
+struct PromptOptimizationTelemetrySample {
+    trace_id: Option<String>,
+    run_id: Option<String>,
+    success: bool,
+    corrected: bool,
+    final_prompt_chars: usize,
+    estimated_total_request_chars: usize,
+    latency_ms: Option<i64>,
+    cost_usd: Option<f64>,
+    total_tokens: Option<i64>,
+    sections: Vec<(String, usize)>,
+}
+
+struct PromptOptimizationHoldoutCandidate {
+    case: PromptOptimizationHoldoutCase,
+    severity: f64,
+}
+
+#[derive(Default)]
+struct PromptOptimizationOpportunityBucket {
+    section: String,
+    samples: usize,
+    failed_samples: usize,
+    corrected_samples: usize,
+    slow_samples: usize,
+    expensive_samples: usize,
+    issue_samples: usize,
+    section_chars: Vec<usize>,
+    final_prompt_chars: Vec<usize>,
+    total_request_chars: Vec<usize>,
+    latencies: Vec<i64>,
+    costs: Vec<f64>,
+    total_tokens: Vec<i64>,
+    holdout_candidates: Vec<PromptOptimizationHoldoutCandidate>,
+}
+
+fn prompt_optimization_section_slug(section: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+    for ch in section.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch.to_ascii_lowercase());
+            pending_separator = false;
+        } else {
+            pending_separator = true;
+        }
+    }
+    if slug.is_empty() {
+        "prompt-section".to_string()
+    } else {
+        slug
+    }
+}
+
+fn prompt_optimization_section_label(section: &str) -> String {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in section.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return "Prompt Section".to_string();
+    }
+    words
+        .into_iter()
+        .map(|word| {
+            let mut chars = word.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut titled = String::new();
+            titled.push(first.to_ascii_uppercase());
+            titled.extend(chars);
+            titled
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn compute_percentile_f64(mut values: Vec<f64>, percentile: f64) -> Option<f64> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.total_cmp(right));
+    let pct = percentile.clamp(0.0, 1.0);
+    let idx = (((values.len() as f64) * pct).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len().saturating_sub(1));
+    Some(round4(values[idx]))
+}
+
+fn prompt_optimization_section_coverage(section_chars: usize, total_chars: usize) -> Option<f64> {
+    if section_chars == 0 || total_chars == 0 {
+        return None;
+    }
+    Some(section_chars as f64 / total_chars as f64)
+}
+
+fn prompt_optimization_section_sample_support(section_samples: usize, total_samples: usize) -> f64 {
+    if section_samples == 0 || total_samples == 0 {
+        return 0.0;
+    }
+    (section_samples as f64 / total_samples as f64).clamp(0.0, 1.0)
+}
+
+fn prompt_optimization_estimated_saved_tokens(chars: usize) -> usize {
+    ((chars as f64) / 4.0).ceil() as usize
+}
+
+fn prompt_optimization_estimated_saved_cost(
+    section_chars: usize,
+    total_request_chars: usize,
+    cost_usd: Option<f64>,
+) -> Option<f64> {
+    let cost_usd = cost_usd.filter(|value| value.is_finite() && *value > 0.0)?;
+    if section_chars == 0 || total_request_chars == 0 {
+        return None;
+    }
+    Some(round4(
+        cost_usd * (section_chars as f64 / total_request_chars as f64).clamp(0.0, 1.0),
+    ))
+}
+
+fn prompt_optimization_min_section_samples(total_samples: usize) -> usize {
+    if total_samples == 0 {
+        return 0;
+    }
+    (total_samples as f64).sqrt().ceil() as usize
+}
+
+fn prompt_optimization_min_section_chars(summary: &PromptTelemetrySummary) -> usize {
+    let prompt_scaled = ((summary.p95_final_prompt_chars as f64) * 0.025).round() as usize;
+    prompt_scaled.clamp(600, 2_500)
+}
+
+fn prompt_optimization_section_score(
+    summary: &PromptTelemetrySummary,
+    section: &PromptTelemetrySectionSummary,
+) -> f64 {
+    let coverage =
+        prompt_optimization_section_coverage(section.p95_chars, summary.p95_final_prompt_chars)
+            .unwrap_or(0.0);
+    let support = prompt_optimization_section_sample_support(section.samples, summary.sample_count);
+    let size_score = (section.p95_chars as f64 / 1_000.0).min(12.0);
+    let coverage_score = (coverage * 100.0).min(30.0);
+    let support_score = support * 10.0;
+    let request_pressure_score =
+        (summary.p95_estimated_total_request_chars as f64 / 50_000.0).min(3.0);
+    round4(
+        (size_score * 0.45)
+            + (coverage_score * 0.30)
+            + (support_score * 0.20)
+            + (request_pressure_score * 0.05),
+    )
+}
+
+fn prompt_optimization_section_risk(
+    summary: &PromptTelemetrySummary,
+    section: &PromptTelemetrySectionSummary,
+) -> &'static str {
+    let coverage =
+        prompt_optimization_section_coverage(section.p95_chars, summary.p95_final_prompt_chars)
+            .unwrap_or(0.0);
+    let mut coverages = summary
+        .top_sections
+        .iter()
+        .filter_map(|item| {
+            prompt_optimization_section_coverage(item.p95_chars, summary.p95_final_prompt_chars)
+        })
+        .collect::<Vec<_>>();
+    let section_sizes = summary
+        .top_sections
+        .iter()
+        .map(|item| item.p95_chars)
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    let median_coverage = compute_percentile_f64(coverages.clone(), 0.50).unwrap_or(coverage);
+    let upper_coverage =
+        compute_percentile_f64(std::mem::take(&mut coverages), 0.75).unwrap_or(median_coverage);
+    let median_size = compute_percentile_usize(section_sizes.clone(), 0.50);
+    let upper_size = compute_percentile_usize(section_sizes, 0.75);
+    let rest_of_prompt = summary
+        .p95_final_prompt_chars
+        .saturating_sub(section.p95_chars);
+    let dominates_prompt = section.p95_chars > rest_of_prompt;
+    let has_distribution_spread = upper_coverage > median_coverage || upper_size > median_size;
+    let is_upper_prompt_section =
+        has_distribution_spread && (coverage >= upper_coverage || section.p95_chars >= upper_size);
+    if dominates_prompt || is_upper_prompt_section {
+        "high"
+    } else if coverage >= median_coverage || (median_size > 0 && section.p95_chars >= median_size) {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn prompt_optimization_sample_from_prompt_telemetry(
+    prompt_telemetry: &serde_json::Map<String, serde_json::Value>,
+    trace_id: Option<String>,
+    run_id: Option<String>,
+    success: bool,
+    corrected: bool,
+    latency_ms: Option<i64>,
+    cost_usd: Option<f64>,
+    total_tokens: Option<i64>,
+) -> Option<PromptOptimizationTelemetrySample> {
+    let final_prompt_chars =
+        prompt_telemetry_usize(prompt_telemetry.get("final_system_prompt_chars"))?;
+    let estimated_total_request_chars =
+        prompt_telemetry_usize(prompt_telemetry.get("estimated_total_request_chars"))
+            .unwrap_or(final_prompt_chars);
+    let sections = prompt_telemetry
+        .get("sections")
+        .and_then(|value| value.as_object())
+        .map(|sections| {
+            sections
+                .iter()
+                .filter_map(|(section, value)| {
+                    let section = section.trim();
+                    if section.is_empty() {
+                        return None;
+                    }
+                    prompt_telemetry_usize(Some(value))
+                        .filter(|chars| *chars > 0)
+                        .map(|chars| (section.to_string(), chars))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if sections.is_empty() {
+        return None;
+    }
+    Some(PromptOptimizationTelemetrySample {
+        trace_id,
+        run_id,
+        success,
+        corrected,
+        final_prompt_chars,
+        estimated_total_request_chars,
+        latency_ms: latency_ms.filter(|value| *value >= 0),
+        cost_usd: cost_usd.filter(|value| value.is_finite() && *value >= 0.0),
+        total_tokens: total_tokens.filter(|value| *value >= 0),
+        sections,
+    })
+}
+
+fn prompt_optimization_samples_from_trace(
+    trace: &crate::storage::ExecutionTraceSummaryRow,
+    success: bool,
+) -> Vec<PromptOptimizationTelemetrySample> {
+    prompt_telemetry_samples_from_trace(trace)
+        .into_iter()
+        .filter_map(|prompt_telemetry| {
+            prompt_optimization_sample_from_prompt_telemetry(
+                &prompt_telemetry,
+                Some(trace.id.clone()),
+                None,
+                success,
+                false,
+                trace.duration_ms.map(i64::from),
+                Some(trace.cost_usd),
+                Some(i64::from(trace.total_tokens)),
+            )
+        })
+        .collect()
+}
+
+fn prompt_optimization_sample_outcome(
+    sample: &PromptOptimizationTelemetrySample,
+    slow: bool,
+    expensive: bool,
+) -> String {
+    if !sample.success {
+        "failed".to_string()
+    } else if sample.corrected {
+        "corrected".to_string()
+    } else if slow {
+        "slow".to_string()
+    } else if expensive {
+        "expensive".to_string()
+    } else {
+        "nominal".to_string()
+    }
+}
+
+fn prompt_optimization_holdout_severity(
+    sample: &PromptOptimizationTelemetrySample,
+    section_chars: usize,
+    slow: bool,
+    expensive: bool,
+) -> f64 {
+    let mut severity = 0.0;
+    if !sample.success {
+        severity += 5.0;
+    }
+    if sample.corrected {
+        severity += 4.0;
+    }
+    if slow {
+        severity += 2.5;
+    }
+    if expensive {
+        severity += 2.0;
+    }
+    severity += (section_chars as f64 / 1_000.0).min(4.0);
+    severity += sample
+        .latency_ms
+        .map(|value| (value as f64 / 5_000.0).min(3.0))
+        .unwrap_or(0.0);
+    severity += sample
+        .cost_usd
+        .map(|value| (value / 0.02).min(3.0))
+        .unwrap_or(0.0);
+    severity
+}
+
+fn prompt_optimization_bucket_score(
+    bucket: &PromptOptimizationOpportunityBucket,
+    p95_chars: usize,
+    p95_total_request_chars: usize,
+    p95_latency_ms: Option<i64>,
+    p95_cost_usd: Option<f64>,
+) -> f64 {
+    let issue_rate = if bucket.samples == 0 {
+        0.0
+    } else {
+        bucket.issue_samples as f64 / bucket.samples as f64
+    };
+    let size_score = (p95_chars as f64 / 1_000.0).min(12.0);
+    let request_score = (p95_total_request_chars as f64 / 50_000.0).min(4.0);
+    let outcome_score = issue_rate * 12.0;
+    let failure_score = ((bucket.failed_samples + bucket.corrected_samples) as f64
+        / bucket.samples.max(1) as f64)
+        * 10.0;
+    let latency_score = p95_latency_ms
+        .map(|value| (value as f64 / 5_000.0).min(4.0))
+        .unwrap_or(0.0);
+    let cost_score = p95_cost_usd
+        .map(|value| (value / 0.02).min(4.0))
+        .unwrap_or(0.0);
+    round4(
+        (size_score * 0.25)
+            + (request_score * 0.10)
+            + (outcome_score * 0.35)
+            + (failure_score * 0.15)
+            + (latency_score * 0.10)
+            + (cost_score * 0.05),
+    )
+}
+
+fn prompt_optimization_wilson_lower_bound(issue_samples: usize, samples: usize) -> f64 {
+    if samples == 0 || issue_samples == 0 {
+        return 0.0;
+    }
+    let n = samples as f64;
+    let p = (issue_samples.min(samples) as f64) / n;
+    let z = 1.96_f64;
+    let z2 = z * z;
+    let denominator = 1.0 + z2 / n;
+    let center = p + z2 / (2.0 * n);
+    let margin = z * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt();
+    round4(((center - margin) / denominator).clamp(0.0, 1.0))
+}
+
+fn prompt_optimization_sample_confidence_score(samples: usize, target_samples: usize) -> f64 {
+    if samples == 0 || target_samples == 0 {
+        return 0.0;
+    }
+    round4((samples as f64 / target_samples as f64).clamp(0.0, 1.0))
+}
+
+fn prompt_optimization_observability_score(bucket: &PromptOptimizationOpportunityBucket) -> f64 {
+    if bucket.samples == 0 {
+        return 0.0;
+    }
+    let latency_score = (bucket.latencies.len() as f64 / bucket.samples as f64).clamp(0.0, 1.0);
+    let cost_score = (bucket.costs.len() as f64 / bucket.samples as f64).clamp(0.0, 1.0);
+    let token_score = (bucket.total_tokens.len() as f64 / bucket.samples as f64).clamp(0.0, 1.0);
+    let holdout_score = (bucket.holdout_candidates.len() as f64
+        / bucket.issue_samples.max(1) as f64)
+        .clamp(0.0, 1.0);
+    round4((latency_score + cost_score + token_score + holdout_score) / 4.0)
+}
+
+fn prompt_optimization_confidence_sample_target(
+    total_samples: usize,
+    bucket_samples: usize,
+    section_coverage: f64,
+    issue_rate: f64,
+    quality_issue_rate: f64,
+    observability_score: f64,
+) -> usize {
+    let total = total_samples.max(bucket_samples).max(1);
+    let support = (bucket_samples as f64 / total as f64).clamp(0.0, 1.0);
+    let signal_strength = ((section_coverage.clamp(0.0, 1.0)
+        + support
+        + issue_rate.clamp(0.0, 1.0)
+        + quality_issue_rate.clamp(0.0, 1.0)
+        + observability_score.clamp(0.0, 1.0))
+        / 5.0)
+        .max(1.0 / total as f64);
+    let floor = (total as f64).sqrt().ceil() as usize;
+    let target = (floor as f64 / signal_strength.sqrt()).ceil() as usize;
+    target.clamp(floor.max(1), total.max(floor).max(1))
+}
+
+fn prompt_optimization_risk_confidence_score(
+    samples: usize,
+    target_samples: usize,
+    observability_score: f64,
+    issue_confidence_lower_bound: f64,
+) -> f64 {
+    round4(
+        (prompt_optimization_sample_confidence_score(samples, target_samples) * 0.50)
+            + (observability_score.clamp(0.0, 1.0) * 0.30)
+            + (issue_confidence_lower_bound.clamp(0.0, 1.0) * 0.20),
+    )
+}
+
+fn prompt_optimization_profile_for_section<'a>(
+    profiles: &'a [PromptOptimizationOpportunityProfile],
+    section: &str,
+) -> Option<&'a PromptOptimizationOpportunityProfile> {
+    profiles.iter().find(|profile| profile.section == section)
+}
+
+fn prompt_optimization_profile_risk(
+    base_risk: &str,
+    profile: &PromptOptimizationOpportunityProfile,
+) -> &'static str {
+    let confident_quality_risk =
+        profile.quality_confidence_lower_bound >= 0.12 && profile.risk_confidence_score >= 0.60;
+    let confident_broad_issue_risk =
+        profile.issue_confidence_lower_bound >= 0.60 && profile.risk_confidence_score >= 0.70;
+    if base_risk == "high" || confident_quality_risk || confident_broad_issue_risk {
+        "high"
+    } else if base_risk == "medium"
+        || (profile.issue_confidence_lower_bound >= 0.25 && profile.risk_confidence_score >= 0.35)
+        || (profile.slow_samples > 0 || profile.expensive_samples > 0)
+    {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+pub(super) fn aggregate_prompt_optimization_opportunity_profiles(
+    runs: &[crate::storage::experience_run::Model],
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
+) -> Vec<PromptOptimizationOpportunityProfile> {
+    let trace_by_id = traces
+        .iter()
+        .map(|trace| (trace.id.as_str(), trace))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut samples = Vec::new();
+    let mut experience_prompt_trace_ids = std::collections::HashSet::new();
+
+    for run in runs {
+        let Some(prompt_telemetry) = run
+            .metadata
+            .get("prompt_telemetry")
+            .and_then(|value| value.as_object())
+        else {
+            continue;
+        };
+        let trace = run
+            .trace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|trace_id| {
+                experience_prompt_trace_ids.insert(trace_id.to_string());
+                trace_by_id.get(trace_id).copied()
+            });
+        if let Some(sample) = prompt_optimization_sample_from_prompt_telemetry(
+            prompt_telemetry,
+            run.trace_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            Some(run.id.clone()),
+            run.success_state != "failed" && run.correction_state != "corrected",
+            run.correction_state == "corrected",
+            trace.and_then(|trace| trace.duration_ms.map(i64::from)),
+            trace.map(|trace| trace.cost_usd),
+            trace.map(|trace| i64::from(trace.total_tokens)),
+        ) {
+            samples.push(sample);
+        }
+    }
+
+    for trace in traces {
+        if experience_prompt_trace_ids.contains(trace.id.as_str()) {
+            continue;
+        }
+        let success = !trace_summary_has_error_step(trace);
+        samples.extend(prompt_optimization_samples_from_trace(trace, success));
+    }
+
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let latency_values = samples
+        .iter()
+        .filter_map(|sample| sample.latency_ms)
+        .collect::<Vec<_>>();
+    let cost_values = samples
+        .iter()
+        .filter_map(|sample| sample.cost_usd)
+        .collect::<Vec<_>>();
+    let request_values = samples
+        .iter()
+        .map(|sample| sample.estimated_total_request_chars)
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    let slow_threshold = (latency_values.len() >= 4)
+        .then(|| compute_percentile_i64(latency_values.clone(), 0.75))
+        .flatten();
+    let expensive_cost_threshold = (cost_values.len() >= 4)
+        .then(|| compute_percentile_f64(cost_values.clone(), 0.75))
+        .flatten();
+    let expensive_request_threshold = if request_values.len() >= 4 {
+        Some(compute_percentile_usize(request_values, 0.75))
+    } else {
+        None
+    };
+
+    let mut buckets = BTreeMap::<String, PromptOptimizationOpportunityBucket>::new();
+    for sample in &samples {
+        let slow = slow_threshold
+            .zip(sample.latency_ms)
+            .is_some_and(|(threshold, latency)| latency >= threshold);
+        let expensive_by_cost = expensive_cost_threshold
+            .zip(sample.cost_usd)
+            .is_some_and(|(threshold, cost)| cost >= threshold);
+        let expensive_by_request = expensive_request_threshold
+            .is_some_and(|threshold| sample.estimated_total_request_chars >= threshold);
+        let expensive = expensive_by_cost || expensive_by_request;
+        let issue = !sample.success || sample.corrected || slow || expensive;
+        for (section, section_chars) in &sample.sections {
+            let bucket = buckets.entry(section.clone()).or_insert_with(|| {
+                PromptOptimizationOpportunityBucket {
+                    section: section.clone(),
+                    ..PromptOptimizationOpportunityBucket::default()
+                }
+            });
+            bucket.samples = bucket.samples.saturating_add(1);
+            if !sample.success {
+                bucket.failed_samples = bucket.failed_samples.saturating_add(1);
+            }
+            if sample.corrected {
+                bucket.corrected_samples = bucket.corrected_samples.saturating_add(1);
+            }
+            if slow {
+                bucket.slow_samples = bucket.slow_samples.saturating_add(1);
+            }
+            if expensive {
+                bucket.expensive_samples = bucket.expensive_samples.saturating_add(1);
+            }
+            if issue {
+                bucket.issue_samples = bucket.issue_samples.saturating_add(1);
+            }
+            bucket.section_chars.push(*section_chars);
+            bucket.final_prompt_chars.push(sample.final_prompt_chars);
+            bucket
+                .total_request_chars
+                .push(sample.estimated_total_request_chars);
+            if let Some(latency_ms) = sample.latency_ms {
+                bucket.latencies.push(latency_ms);
+            }
+            if let Some(cost_usd) = sample.cost_usd {
+                bucket.costs.push(cost_usd);
+            }
+            if let Some(total_tokens) = sample.total_tokens {
+                bucket.total_tokens.push(total_tokens);
+            }
+            if issue {
+                bucket
+                    .holdout_candidates
+                    .push(PromptOptimizationHoldoutCandidate {
+                        case: PromptOptimizationHoldoutCase {
+                            trace_id: sample.trace_id.clone(),
+                            run_id: sample.run_id.clone(),
+                            outcome: prompt_optimization_sample_outcome(sample, slow, expensive),
+                            section_chars: *section_chars,
+                            final_prompt_chars: sample.final_prompt_chars,
+                            estimated_total_request_chars: sample.estimated_total_request_chars,
+                            latency_ms: sample.latency_ms,
+                            cost_usd: sample.cost_usd.map(round4),
+                            total_tokens: sample.total_tokens,
+                        },
+                        severity: prompt_optimization_holdout_severity(
+                            sample,
+                            *section_chars,
+                            slow,
+                            expensive,
+                        ),
+                    });
+            }
+        }
+    }
+
+    let mut profiles = buckets
+        .into_values()
+        .filter_map(|mut bucket| {
+            if bucket.samples == 0 || bucket.section.trim().is_empty() {
+                return None;
+            }
+            let p95_chars = compute_percentile_usize(bucket.section_chars.clone(), 0.95);
+            let p95_final_prompt_chars =
+                compute_percentile_usize(bucket.final_prompt_chars.clone(), 0.95);
+            let p95_total_request_chars =
+                compute_percentile_usize(bucket.total_request_chars.clone(), 0.95);
+            let p95_latency_ms = compute_p95(bucket.latencies.clone());
+            let p95_cost_usd = compute_percentile_f64(bucket.costs.clone(), 0.95);
+            let p95_total_tokens = compute_p95(bucket.total_tokens.clone());
+            let issue_rate = round4(bucket.issue_samples as f64 / bucket.samples.max(1) as f64);
+            let quality_issue_samples = bucket
+                .failed_samples
+                .saturating_add(bucket.corrected_samples);
+            let quality_issue_rate =
+                round4(quality_issue_samples as f64 / bucket.samples.max(1) as f64);
+            let issue_confidence_lower_bound =
+                prompt_optimization_wilson_lower_bound(bucket.issue_samples, bucket.samples);
+            let quality_confidence_lower_bound =
+                prompt_optimization_wilson_lower_bound(quality_issue_samples, bucket.samples);
+            let observability_score = prompt_optimization_observability_score(&bucket);
+            let section_coverage =
+                prompt_optimization_section_coverage(p95_chars, p95_final_prompt_chars)
+                    .unwrap_or(0.0);
+            let confidence_sample_target = prompt_optimization_confidence_sample_target(
+                samples.len(),
+                bucket.samples,
+                section_coverage,
+                issue_rate,
+                quality_issue_rate,
+                observability_score,
+            );
+            let sample_confidence_score = prompt_optimization_sample_confidence_score(
+                bucket.samples,
+                confidence_sample_target,
+            );
+            let risk_confidence_score = prompt_optimization_risk_confidence_score(
+                bucket.samples,
+                confidence_sample_target,
+                observability_score,
+                issue_confidence_lower_bound,
+            );
+            let estimated_saved_tokens_p95 = prompt_optimization_estimated_saved_tokens(p95_chars);
+            let estimated_saved_cost_usd_p95 = prompt_optimization_estimated_saved_cost(
+                p95_chars,
+                p95_total_request_chars,
+                p95_cost_usd,
+            );
+            bucket.holdout_candidates.sort_by(|left, right| {
+                right
+                    .severity
+                    .total_cmp(&left.severity)
+                    .then_with(|| {
+                        left.case
+                            .trace_id
+                            .as_deref()
+                            .unwrap_or_default()
+                            .cmp(right.case.trace_id.as_deref().unwrap_or_default())
+                    })
+                    .then_with(|| {
+                        left.case
+                            .run_id
+                            .as_deref()
+                            .unwrap_or_default()
+                            .cmp(right.case.run_id.as_deref().unwrap_or_default())
+                    })
+            });
+            let opportunity_score = prompt_optimization_bucket_score(
+                &bucket,
+                p95_chars,
+                p95_total_request_chars,
+                p95_latency_ms,
+                p95_cost_usd,
+            );
+            let holdout_cases = bucket
+                .holdout_candidates
+                .into_iter()
+                .take(PROMPT_OPTIMIZATION_HOLDOUT_LIMIT)
+                .map(|candidate| candidate.case)
+                .collect::<Vec<_>>();
+            Some(PromptOptimizationOpportunityProfile {
+                section: bucket.section.clone(),
+                label: prompt_optimization_section_label(&bucket.section),
+                samples: bucket.samples,
+                failed_samples: bucket.failed_samples,
+                corrected_samples: bucket.corrected_samples,
+                slow_samples: bucket.slow_samples,
+                expensive_samples: bucket.expensive_samples,
+                issue_samples: bucket.issue_samples,
+                issue_rate,
+                quality_issue_rate,
+                issue_confidence_lower_bound,
+                quality_confidence_lower_bound,
+                observability_score,
+                confidence_sample_target,
+                sample_confidence_score,
+                risk_confidence_score,
+                p50_chars: compute_percentile_usize(bucket.section_chars, 0.50),
+                p95_chars,
+                p95_final_prompt_chars,
+                p95_total_request_chars,
+                p95_latency_ms,
+                p95_cost_usd,
+                p95_total_tokens,
+                estimated_saved_tokens_p95,
+                estimated_saved_cost_usd_p95,
+                opportunity_score,
+                holdout_cases,
+            })
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_by(|left, right| {
+        right
+            .opportunity_score
+            .total_cmp(&left.opportunity_score)
+            .then_with(|| right.samples.cmp(&left.samples))
+            .then_with(|| left.section.cmp(&right.section))
+    });
+    profiles.truncate(PROMPT_OPTIMIZATION_PROFILE_LIMIT);
+    profiles
+}
+
+fn build_prompt_optimization_section_draft(
+    summary: &PromptTelemetrySummary,
+    section: &PromptTelemetrySectionSummary,
+    profile: Option<&PromptOptimizationOpportunityProfile>,
+) -> Option<PromptOptimizationOpportunityDraft> {
+    let raw_section = section.section.trim();
+    if raw_section.is_empty() || section.p95_chars == 0 {
+        return None;
+    }
+    if section.samples < prompt_optimization_min_section_samples(summary.sample_count) {
+        return None;
+    }
+    let min_chars = prompt_optimization_min_section_chars(summary);
+    if section.p95_chars < min_chars {
+        return None;
+    }
+    let coverage =
+        prompt_optimization_section_coverage(section.p95_chars, summary.p95_final_prompt_chars)
+            .unwrap_or(0.0);
+    if coverage < 0.025 && section.p95_chars < min_chars.saturating_mul(2) {
+        return None;
+    }
+
+    let slug = prompt_optimization_section_slug(raw_section);
+    let label = prompt_optimization_section_label(raw_section);
+    let support = prompt_optimization_section_sample_support(section.samples, summary.sample_count);
+    let mut impact_estimate = vec![
+        format!(
+            "Could reduce up to {} from eligible prompt paths before broader prompt changes.",
+            format_char_count(section.p95_chars)
+        ),
+        format!(
+            "Measured across {} section sample{} out of {} prompt-telemetry sample{}.",
+            section.samples,
+            if section.samples == 1 { "" } else { "s" },
+            summary.sample_count,
+            if summary.sample_count == 1 { "" } else { "s" }
+        ),
+    ];
+    if let Some(line) =
+        prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
+    {
+        impact_estimate.push(line);
+    }
+    if summary.p95_estimated_total_request_chars > 0 {
+        impact_estimate.push(format!(
+            "Largest recent requests reach {} at p95.",
+            format_char_count(summary.p95_estimated_total_request_chars)
+        ));
+    }
+    if let Some(profile) = profile {
+        if profile.estimated_saved_tokens_p95 > 0 {
+            impact_estimate.push(format!(
+                "Estimated p95 prompt-token reduction is about {} tokens before GEPA validation.",
+                profile.estimated_saved_tokens_p95
+            ));
+        }
+        if let Some(cost) = profile.estimated_saved_cost_usd_p95 {
+            impact_estimate.push(format!(
+                "Estimated p95 prompt-cost reduction is about ${:.4} before GEPA validation.",
+                cost
+            ));
+        }
+        if let Some(latency) = profile.p95_latency_ms {
+            impact_estimate.push(format!(
+                "Related user samples reached {} ms p95 latency.",
+                latency
+            ));
+        }
+    }
+
+    let base_risk = prompt_optimization_section_risk(summary, section);
+    let risk_level = profile
+        .map(|profile| prompt_optimization_profile_risk(base_risk, profile))
+        .unwrap_or(base_risk)
+        .to_string();
+    let mut evidence = vec![
+        format!(
+            "Observed {} prompt-telemetry samples.",
+            summary.sample_count
+        ),
+        format!(
+            "Section '{}' reaches {} at p95 across {} sampled turn{}.",
+            raw_section,
+            format_char_count(section.p95_chars),
+            section.samples,
+            if section.samples == 1 { "" } else { "s" }
+        ),
+        format!(
+            "Section support is about {:.1}% of sampled turns.",
+            support * 100.0
+        ),
+        format!(
+            "p95 final prompt size is {}.",
+            format_char_count(summary.p95_final_prompt_chars)
+        ),
+    ];
+    if let Some(profile) = profile {
+        evidence.push(format!(
+            "Outcome profile: {:.1}% of matching samples were failed, corrected, slow, or expensive.",
+            profile.issue_rate * 100.0
+        ));
+        evidence.push(format!(
+            "Holdout set contains {} user-specific case{} for GEPA validation.",
+            profile.holdout_cases.len(),
+            if profile.holdout_cases.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    let mut expected_benefit = vec![
+        "Lower prompt tokens and latency on turns where this section can be represented more compactly.".to_string(),
+        "Keeps the change reviewable because GEPA produces a tested prompt/profile candidate before deployment.".to_string(),
+    ];
+    if profile.is_some_and(|profile| profile.issue_rate > 0.0) {
+        expected_benefit.push(
+            "Ranks this work higher because the user's recent slow, costly, corrected, or failed samples are concentrated here."
+                .to_string(),
+        );
+    }
+    let caveats = vec![
+        "If the section carries critical context, over-compression can reduce answer quality.".to_string(),
+        "The candidate must prove quality in background tests and canary monitoring before deployment.".to_string(),
+    ];
+    let score = prompt_optimization_section_score(summary, section)
+        + profile
+            .map(|profile| profile.opportunity_score * 1.5)
+            .unwrap_or_default();
+    Some(PromptOptimizationOpportunityDraft {
+        id: format!("prompt-opt-section-{}", slug),
+        title: format!("Reduce {} prompt weight", label),
+        proposal_summary: format!(
+            "Prompt telemetry shows the {} section is a large part of recent prompts. Evolve can ask GEPA to find a smaller representation and test it before rollout.",
+            label
+        ),
+        evidence,
+        expected_benefit,
+        caveats,
+        risk_level,
+        target_scope: "prompt_profile".to_string(),
+        change_preview: EvolutionChangePreview {
+            before: vec![
+                format!(
+                    "{} reaches {} at p95 in recent prompt telemetry.",
+                    label,
+                    format_char_count(section.p95_chars)
+                ),
+                format!(
+                    "Recent final prompts reach {} at p95.",
+                    format_char_count(summary.p95_final_prompt_chars)
+                ),
+            ],
+            after: vec![
+                format!(
+                    "Ask GEPA to produce a smaller representation for {} while preserving task-relevant detail.",
+                    label
+                ),
+                "Use background tests and canary monitoring before any stable prompt/profile deployment.".to_string(),
+            ],
+            impact_estimate,
+        },
+        opportunity: profile.cloned(),
+        score,
+    })
 }
 
 fn push_prompt_telemetry_sample(
@@ -1229,6 +2191,236 @@ fn prompt_telemetry_samples_from_trace(
             }
         })
         .collect()
+}
+
+#[derive(Default)]
+struct ArkDistillContextSample {
+    tool_name: String,
+    action: Option<String>,
+    original_chars: usize,
+    distilled_chars: usize,
+    saved_chars: usize,
+    estimated_original_tokens: usize,
+    estimated_distilled_tokens: usize,
+    estimated_saved_tokens: usize,
+    estimated_prompt_cost_saved_usd: Option<f64>,
+}
+
+fn arkdistill_telemetry_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn arkdistill_telemetry_f64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<f64> {
+    object
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|value| value as f64))
+                .or_else(|| value.as_u64().map(|value| value as f64))
+        })
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn arkdistill_context_sample_from_telemetry(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<ArkDistillContextSample> {
+    let original_chars = prompt_telemetry_usize(object.get("original_chars")).unwrap_or_default();
+    let distilled_chars = prompt_telemetry_usize(object.get("distilled_chars")).unwrap_or_default();
+    let saved_chars = prompt_telemetry_usize(object.get("saved_chars"))
+        .unwrap_or_else(|| original_chars.saturating_sub(distilled_chars));
+    let estimated_original_tokens = prompt_telemetry_usize(object.get("estimated_original_tokens"))
+        .unwrap_or_else(|| original_chars.div_ceil(4));
+    let estimated_distilled_tokens =
+        prompt_telemetry_usize(object.get("estimated_distilled_tokens"))
+            .unwrap_or_else(|| distilled_chars.div_ceil(4));
+    let estimated_saved_tokens = prompt_telemetry_usize(object.get("estimated_saved_tokens"))
+        .unwrap_or_else(|| estimated_original_tokens.saturating_sub(estimated_distilled_tokens));
+    if original_chars == 0 && saved_chars == 0 && estimated_saved_tokens == 0 {
+        return None;
+    }
+    Some(ArkDistillContextSample {
+        tool_name: arkdistill_telemetry_string(object, "primitive")
+            .or_else(|| arkdistill_telemetry_string(object, "tool_name"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        action: arkdistill_telemetry_string(object, "action"),
+        original_chars,
+        distilled_chars,
+        saved_chars,
+        estimated_original_tokens,
+        estimated_distilled_tokens,
+        estimated_saved_tokens,
+        estimated_prompt_cost_saved_usd: arkdistill_telemetry_f64(
+            object,
+            "estimated_prompt_cost_saved_usd",
+        ),
+    })
+}
+
+fn arkdistill_context_samples_from_trace(
+    trace: &crate::storage::ExecutionTraceSummaryRow,
+) -> Vec<ArkDistillContextSample> {
+    let steps = serde_json::from_str::<Vec<crate::core::ExecutionStep>>(&trace.steps_json)
+        .unwrap_or_default();
+    steps
+        .into_iter()
+        .filter_map(|step| {
+            let data = step.data?;
+            let value = serde_json::from_str::<serde_json::Value>(&data).ok()?;
+            let object = value.as_object()?;
+            let trace_kind = object
+                .get("trace_kind")
+                .and_then(|value| value.as_str())
+                .map(str::trim);
+            if trace_kind == Some("arkdistill_telemetry") {
+                arkdistill_context_sample_from_telemetry(object)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn arkdistill_context_confidence_sample_target(
+    samples: usize,
+    savings_ratios: &[f64],
+    tool_bucket_count: usize,
+) -> usize {
+    if samples == 0 {
+        return 0;
+    }
+    let mean = if savings_ratios.is_empty() {
+        0.0
+    } else {
+        savings_ratios.iter().sum::<f64>() / savings_ratios.len() as f64
+    };
+    let variance = if savings_ratios.is_empty() {
+        0.0
+    } else {
+        savings_ratios
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / savings_ratios.len() as f64
+    };
+    let variability = if mean > 0.0 {
+        (variance.sqrt() / mean).clamp(0.0, samples as f64)
+    } else {
+        1.0
+    };
+    let tool_diversity = if tool_bucket_count == 0 {
+        0.0
+    } else {
+        (tool_bucket_count as f64 / samples as f64).clamp(0.0, 1.0)
+    };
+    samples.saturating_add(
+        ((samples as f64).sqrt() * (1.0 + variability + tool_diversity)).ceil() as usize,
+    )
+}
+
+pub(super) fn aggregate_arkdistill_context_summary_with_traces(
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
+) -> ArkDistillContextSummary {
+    #[derive(Default)]
+    struct ToolBucket {
+        sample_count: usize,
+        saved_chars: usize,
+        estimated_saved_tokens: usize,
+    }
+
+    let mut summary = ArkDistillContextSummary::default();
+    let mut cost_sum = 0.0f64;
+    let mut has_cost = false;
+    let mut savings_ratios = Vec::new();
+    let mut tool_buckets: BTreeMap<(String, Option<String>), ToolBucket> = BTreeMap::new();
+
+    for sample in traces
+        .iter()
+        .flat_map(arkdistill_context_samples_from_trace)
+    {
+        summary.sample_count = summary.sample_count.saturating_add(1);
+        summary.original_chars = summary.original_chars.saturating_add(sample.original_chars);
+        summary.distilled_chars = summary
+            .distilled_chars
+            .saturating_add(sample.distilled_chars);
+        summary.saved_chars = summary.saved_chars.saturating_add(sample.saved_chars);
+        summary.estimated_original_tokens = summary
+            .estimated_original_tokens
+            .saturating_add(sample.estimated_original_tokens);
+        summary.estimated_distilled_tokens = summary
+            .estimated_distilled_tokens
+            .saturating_add(sample.estimated_distilled_tokens);
+        summary.estimated_saved_tokens = summary
+            .estimated_saved_tokens
+            .saturating_add(sample.estimated_saved_tokens);
+        if sample.original_chars > 0 {
+            savings_ratios
+                .push((sample.saved_chars as f64 / sample.original_chars as f64).clamp(0.0, 1.0));
+        }
+        if let Some(cost) = sample.estimated_prompt_cost_saved_usd {
+            has_cost = true;
+            cost_sum += cost;
+        }
+        let bucket = tool_buckets
+            .entry((sample.tool_name, sample.action))
+            .or_default();
+        bucket.sample_count = bucket.sample_count.saturating_add(1);
+        bucket.saved_chars = bucket.saved_chars.saturating_add(sample.saved_chars);
+        bucket.estimated_saved_tokens = bucket
+            .estimated_saved_tokens
+            .saturating_add(sample.estimated_saved_tokens);
+    }
+
+    summary.savings_percent = if summary.original_chars > 0 {
+        round2(summary.saved_chars as f64 / summary.original_chars as f64 * 100.0)
+    } else {
+        0.0
+    };
+    summary.estimated_prompt_cost_saved_usd = has_cost.then(|| round4(cost_sum));
+    summary.confidence_sample_target = arkdistill_context_confidence_sample_target(
+        summary.sample_count,
+        &savings_ratios,
+        tool_buckets.len(),
+    );
+    summary.sample_confidence_score = prompt_optimization_sample_confidence_score(
+        summary.sample_count,
+        summary.confidence_sample_target,
+    );
+    summary.top_tools = tool_buckets
+        .into_iter()
+        .map(
+            |((tool_name, action), bucket)| ArkDistillContextToolSummary {
+                tool_name,
+                action,
+                sample_count: bucket.sample_count,
+                saved_chars: bucket.saved_chars,
+                estimated_saved_tokens: bucket.estimated_saved_tokens,
+            },
+        )
+        .collect::<Vec<_>>();
+    summary.top_tools.sort_by(|left, right| {
+        right
+            .estimated_saved_tokens
+            .cmp(&left.estimated_saved_tokens)
+            .then(right.saved_chars.cmp(&left.saved_chars))
+            .then(left.tool_name.cmp(&right.tool_name))
+    });
+    summary.top_tools.truncate(6);
+    summary
 }
 
 fn trace_summary_has_error_step(trace: &crate::storage::ExecutionTraceSummaryRow) -> bool {
@@ -1395,6 +2587,83 @@ async fn current_prompt_telemetry_sample_count(storage: &crate::storage::Storage
     aggregate_prompt_telemetry_summary_with_traces(&runs, &traces).sample_count
 }
 
+fn prompt_optimization_gepa_context_from_profile(
+    profile: &PromptOptimizationOpportunityProfile,
+) -> serde_json::Value {
+    serde_json::json!({
+        "section": profile.section,
+        "label": profile.label,
+        "samples": profile.samples,
+        "outcome": {
+            "failed_samples": profile.failed_samples,
+            "corrected_samples": profile.corrected_samples,
+            "slow_samples": profile.slow_samples,
+            "expensive_samples": profile.expensive_samples,
+            "issue_samples": profile.issue_samples,
+            "issue_rate": profile.issue_rate,
+            "quality_issue_rate": profile.quality_issue_rate,
+        },
+        "confidence": {
+            "issue_confidence_lower_bound": profile.issue_confidence_lower_bound,
+            "quality_confidence_lower_bound": profile.quality_confidence_lower_bound,
+            "observability_score": profile.observability_score,
+            "confidence_sample_target": profile.confidence_sample_target,
+            "sample_confidence_score": profile.sample_confidence_score,
+            "risk_confidence_score": profile.risk_confidence_score,
+        },
+        "prompt_weight": {
+            "p50_chars": profile.p50_chars,
+            "p95_chars": profile.p95_chars,
+            "p95_final_prompt_chars": profile.p95_final_prompt_chars,
+            "p95_total_request_chars": profile.p95_total_request_chars,
+            "estimated_saved_tokens_p95": profile.estimated_saved_tokens_p95,
+            "estimated_saved_cost_usd_p95": profile.estimated_saved_cost_usd_p95,
+        },
+        "runtime": {
+            "p95_latency_ms": profile.p95_latency_ms,
+            "p95_cost_usd": profile.p95_cost_usd,
+            "p95_total_tokens": profile.p95_total_tokens,
+        },
+        "opportunity_score": profile.opportunity_score,
+        "holdout_cases": profile.holdout_cases,
+    })
+}
+
+fn prompt_optimization_gepa_context_for_profiles(
+    proposal_id: &str,
+    profiles: &[PromptOptimizationOpportunityProfile],
+) -> Option<serde_json::Value> {
+    let proposal_id = proposal_id.trim();
+    if proposal_id.is_empty() {
+        return None;
+    }
+    profiles
+        .iter()
+        .find(|profile| {
+            format!(
+                "prompt-opt-section-{}",
+                prompt_optimization_section_slug(&profile.section)
+            ) == proposal_id
+        })
+        .map(prompt_optimization_gepa_context_from_profile)
+}
+
+async fn load_prompt_optimization_gepa_context(
+    storage: &crate::storage::Storage,
+    proposal_id: &str,
+) -> Option<serde_json::Value> {
+    let runs = storage
+        .list_recent_experience_runs_any_scope(EVOLUTION_DEV_DEFAULT_LIMIT)
+        .await
+        .unwrap_or_default();
+    let traces = storage
+        .list_execution_trace_summaries(None, EVOLUTION_DEV_DEFAULT_LIMIT, 0)
+        .await
+        .unwrap_or_default();
+    let profiles = aggregate_prompt_optimization_opportunity_profiles(&runs, &traces);
+    prompt_optimization_gepa_context_for_profiles(proposal_id, &profiles)
+}
+
 async fn update_prompt_optimization_lifecycle(
     storage: &crate::storage::Storage,
     proposal_id: &str,
@@ -1427,7 +2696,7 @@ async fn update_prompt_optimization_lifecycle(
 }
 
 fn gepa_job_proposal_id(item: &serde_json::Value) -> Option<&str> {
-    let job = item.get("job")?;
+    let job = item.get("job").unwrap_or(item);
     job.get("metadata")
         .and_then(|metadata| metadata.get("proposal_id"))
         .and_then(|value| value.as_str())
@@ -1439,18 +2708,192 @@ fn gepa_queue_item_for_proposal<'a>(
     gepa_queue: &'a serde_json::Value,
     proposal_id: &str,
 ) -> Option<(&'static str, &'a serde_json::Value)> {
+    let mut active_match = None;
+    let mut terminal_match = None;
     for status in ["running", "pending", "completed", "failed"] {
         let Some(items) = gepa_queue.get(status).and_then(|value| value.as_array()) else {
             continue;
         };
-        if let Some(item) = items
-            .iter()
-            .find(|item| gepa_job_proposal_id(item) == Some(proposal_id))
-        {
-            return Some((status, item));
+        for item in items {
+            if gepa_job_proposal_id(item) != Some(proposal_id) {
+                continue;
+            }
+            if gepa_queue_item_is_active_work(status, item) {
+                active_match = gepa_newer_queue_item(active_match, status, item);
+            } else {
+                terminal_match = gepa_newer_queue_item(terminal_match, status, item);
+            }
         }
     }
-    None
+    active_match.or(terminal_match)
+}
+
+pub(super) fn gepa_active_queue_item<'a>(
+    gepa_queue: &'a serde_json::Value,
+) -> Option<(&'static str, &'a serde_json::Value)> {
+    let mut active_match = None;
+    for status in ["running", "pending"] {
+        let Some(items) = gepa_queue.get(status).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for item in items {
+            if gepa_queue_item_is_active_work(status, item) {
+                active_match = gepa_newer_queue_item(active_match, status, item);
+            }
+        }
+    }
+    active_match
+}
+
+pub(super) fn gepa_active_queue_item_proposal_id(item: &serde_json::Value) -> Option<String> {
+    gepa_job_proposal_id(item).map(str::to_string)
+}
+
+fn gepa_newer_queue_item<'a>(
+    current: Option<(&'static str, &'a serde_json::Value)>,
+    status: &'static str,
+    item: &'a serde_json::Value,
+) -> Option<(&'static str, &'a serde_json::Value)> {
+    let Some((_, current_item)) = current else {
+        return Some((status, item));
+    };
+    match (
+        gepa_queue_item_timestamp(item),
+        gepa_queue_item_timestamp(current_item),
+    ) {
+        (Some(next), Some(current)) if next > current => Some((status, item)),
+        (Some(_), None) => Some((status, item)),
+        _ => current,
+    }
+}
+
+fn gepa_queue_item_timestamp(item: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let job = item.get("job").unwrap_or(item);
+    [
+        item.get("recorded_at"),
+        item.get("finished_at"),
+        item.get("updated_at"),
+        item.get("created_at"),
+        job.get("finished_at"),
+        job.get("started_at"),
+        job.get("updated_at"),
+        job.get("created_at"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .filter_map(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    .map(|value| value.with_timezone(&chrono::Utc))
+    .next()
+}
+
+fn gepa_queue_item_effective_status(queue_status: &str, item: &serde_json::Value) -> String {
+    item.get("result")
+        .and_then(|result| result.get("status"))
+        .or_else(|| item.get("status"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(queue_status)
+        .to_string()
+}
+
+fn gepa_queue_item_reason(item: &serde_json::Value) -> Option<String> {
+    let job = item.get("job").unwrap_or(item);
+    let result = item.get("result");
+    result
+        .and_then(|result| result.get("error"))
+        .or_else(|| result.and_then(|result| result.get("stderr_tail")))
+        .or_else(|| result.and_then(|result| result.get("message")))
+        .or_else(|| item.get("error"))
+        .or_else(|| item.get("stderr_tail"))
+        .or_else(|| item.get("message"))
+        .or_else(|| job.get("last_error"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn gepa_queue_item_prompt_candidate_rejection_reason(item: &serde_json::Value) -> Option<String> {
+    let results = item
+        .get("result")
+        .and_then(|result| result.get("import_result"))
+        .and_then(|import_result| import_result.get("results"))
+        .and_then(|value| value.as_array())?;
+    let mut saw_prompt_result = false;
+    let mut gate_reason = None;
+
+    for result in results {
+        let Some(obj) = result.as_object() else {
+            continue;
+        };
+        let target_key_matches = obj
+            .get("target_key")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| {
+                value.trim() == crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_KEY
+            });
+        let mode_matches = obj
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.trim() == "gepa_import_prompt");
+        if !target_key_matches && !mode_matches {
+            continue;
+        }
+
+        saw_prompt_result = true;
+        let promoted = obj
+            .get("promoted")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let promotion_applied = obj
+            .get("promotion_applied")
+            .or_else(|| obj.get("runtime_promotion_applied"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let promotion_mode = obj
+            .get("promotion_mode")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        let deployable_mode = matches!(
+            promotion_mode,
+            "canary" | "baseline" | "pending_user_acceptance"
+        );
+
+        if promoted || promotion_applied || deployable_mode {
+            return None;
+        }
+        if gate_reason.is_none() {
+            gate_reason = promotion_gate_summary_from_result(obj);
+        }
+    }
+
+    if !saw_prompt_result {
+        return None;
+    }
+    gate_reason
+        .or_else(|| Some("Candidate was not promoted by the offline evaluation gate.".to_string()))
+}
+
+fn prompt_background_status_from_gepa_status(status: &str) -> String {
+    match status {
+        "running" => "running_background_test".to_string(),
+        "pending" => "queued_for_background_test".to_string(),
+        "completed" => "background_test_completed".to_string(),
+        "failed" | "timed_out" | "blocked" | "error" => "blocked".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(super) fn gepa_queue_item_is_active_work(queue_status: &str, item: &serde_json::Value) -> bool {
+    matches!(
+        gepa_queue_item_effective_status(queue_status, item).as_str(),
+        "pending" | "running"
+    )
 }
 
 fn prompt_metric_for_version<'a>(
@@ -1563,9 +3006,51 @@ fn update_prompt_lifecycle_monitoring(
         rollback_available && enough_samples && (quality_regressed || latency_regressed);
 }
 
-fn build_prompt_optimization_lifecycle(
+fn prompt_optimization_status_waits_on_gepa_job(status: &str) -> bool {
+    matches!(
+        status,
+        "queued_for_background_test" | "running_background_test" | "background_test_completed"
+    )
+}
+
+fn prompt_optimization_lifecycle_required_samples(
+    stored_required_samples: usize,
+    opportunity: Option<&PromptOptimizationOpportunityProfile>,
+) -> usize {
+    let opportunity_target = opportunity
+        .map(|profile| profile.confidence_sample_target)
+        .filter(|target| *target > 0)
+        .unwrap_or_default();
+    prompt_optimization_lifecycle_required_samples_from_target(
+        stored_required_samples,
+        opportunity_target,
+    )
+}
+
+fn prompt_optimization_lifecycle_required_samples_from_target(
+    stored_required_samples: usize,
+    opportunity_target: usize,
+) -> usize {
+    stored_required_samples
+        .max(opportunity_target)
+        .max(GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS)
+}
+
+fn prompt_optimization_context_confidence_sample_target(
+    opportunity_context: Option<&serde_json::Value>,
+) -> usize {
+    opportunity_context
+        .and_then(|context| context.get("confidence"))
+        .and_then(|confidence| confidence.get("confidence_sample_target"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value.min(20_000) as usize)
+        .unwrap_or_default()
+}
+
+pub(super) fn build_prompt_optimization_lifecycle(
     proposal_id: &str,
     review_entry: Option<&PromptOptimizationReviewEntry>,
+    opportunity: Option<&PromptOptimizationOpportunityProfile>,
     summary: &PromptTelemetrySummary,
     prompt_metrics: &[PromptEvolutionMetric],
     gepa_queue: &serde_json::Value,
@@ -1579,9 +3064,8 @@ fn build_prompt_optimization_lifecycle(
     let mut lifecycle = review_entry
         .map(|entry| entry.lifecycle.clone())
         .unwrap_or_default();
-    if lifecycle.required_samples == 0 {
-        lifecycle.required_samples = GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS;
-    }
+    lifecycle.required_samples =
+        prompt_optimization_lifecycle_required_samples(lifecycle.required_samples, opportunity);
     lifecycle.sample_count = summary
         .sample_count
         .saturating_sub(lifecycle.sample_baseline);
@@ -1627,9 +3111,11 @@ fn build_prompt_optimization_lifecycle(
         return lifecycle;
     }
 
-    if let Some((queue_status, item)) = gepa_queue_item_for_proposal(gepa_queue, proposal_id) {
+    let matching_queue_item = gepa_queue_item_for_proposal(gepa_queue, proposal_id);
+    if let Some((queue_status, item)) = matching_queue_item {
         let job = item.get("job").unwrap_or(item);
-        lifecycle.job_status = Some(queue_status.to_string());
+        let effective_status = gepa_queue_item_effective_status(queue_status, item);
+        lifecycle.job_status = Some(effective_status.clone());
         lifecycle.queued_job_id = job
             .get("job_id")
             .and_then(|value| value.as_str())
@@ -1640,25 +3126,45 @@ fn build_prompt_optimization_lifecycle(
             .and_then(|value| value.as_str())
             .map(str::to_string)
             .or_else(|| lifecycle.queued_at.clone());
-        lifecycle.reason = job
-            .get("last_error")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-            .or_else(|| lifecycle.reason.clone());
-        lifecycle.status = match queue_status {
-            "running" => "running_background_test".to_string(),
-            "pending" => "queued_for_background_test".to_string(),
-            "failed" => "blocked".to_string(),
-            "completed" => "background_test_completed".to_string(),
-            other => other.to_string(),
-        };
+        lifecycle.reason = gepa_queue_item_reason(item).or_else(|| lifecycle.reason.clone());
+        lifecycle.status = prompt_background_status_from_gepa_status(&effective_status);
+        if effective_status == "completed" {
+            if let Some(reason) = gepa_queue_item_prompt_candidate_rejection_reason(item) {
+                lifecycle.status = "candidate_rejected".to_string();
+                lifecycle.reason = Some(reason);
+            }
+        }
+    }
+
+    if matching_queue_item.is_none() {
+        if let Some((queue_status, item)) = gepa_active_queue_item(gepa_queue) {
+            let effective_status = gepa_queue_item_effective_status(queue_status, item);
+            lifecycle.status = "blocked".to_string();
+            lifecycle.job_status = Some("blocked_by_active_gepa_work".to_string());
+            lifecycle.reason = Some(match gepa_active_queue_item_proposal_id(item) {
+                Some(active_proposal) => format!(
+                    "Another Evolve optimization is already {} for proposal '{}'. Pause before starting another background test; running multiple prompt changes together can make results hard to attribute and can affect AgentArk stability.",
+                    effective_status, active_proposal
+                ),
+                None => format!(
+                    "Another GEPA background job is already {}. Pause before starting another background test; running multiple prompt changes together can make results hard to attribute and can affect AgentArk stability.",
+                    effective_status
+                ),
+            });
+        } else if lifecycle.job_status.as_deref() == Some("blocked_by_active_gepa_work") {
+            lifecycle.status = "approved_waiting_for_more_examples".to_string();
+            lifecycle.job_status = None;
+            lifecycle.reason = Some(
+                "Previous GEPA background work has cleared; this background test can run now."
+                    .to_string(),
+            );
+        }
     }
 
     if let Some(canary) = prompt_canary_state.filter(|state| state.enabled) {
-        let has_matching_completed_job = gepa_queue_item_for_proposal(gepa_queue, proposal_id)
-            .is_some_and(|(status, _)| {
-                status == "completed" || status == "running" || status == "pending"
-            });
+        let has_matching_completed_job = matching_queue_item.is_some_and(|(status, _)| {
+            status == "completed" || status == "running" || status == "pending"
+        });
         if has_matching_completed_job {
             lifecycle.status = "testing".to_string();
             lifecycle.live_surface = Some("prompt".to_string());
@@ -1677,6 +3183,15 @@ fn build_prompt_optimization_lifecycle(
                     .map(|reason| format!("{} Stopping this test is recommended.", reason));
             }
         }
+    } else if matching_queue_item.is_none()
+        && prompt_optimization_status_waits_on_gepa_job(lifecycle.status.trim())
+    {
+        lifecycle.status = "blocked".to_string();
+        lifecycle.job_status = None;
+        lifecycle.reason = Some(
+            "The background optimization job is no longer in the GEPA queue. Run the background test again from this row."
+                .to_string(),
+        );
     }
 
     lifecycle
@@ -2021,6 +3536,7 @@ pub(super) fn build_prompt_optimization_proposal(
     risk_level: &str,
     target_scope: &str,
     change_preview: EvolutionChangePreview,
+    opportunity: Option<PromptOptimizationOpportunityProfile>,
 ) -> PromptOptimizationProposal {
     let review_entry = review_state.get(id);
     let review_status = review_entry
@@ -2032,6 +3548,7 @@ pub(super) fn build_prompt_optimization_proposal(
     let lifecycle = build_prompt_optimization_lifecycle(
         id,
         review_entry,
+        opportunity.as_ref(),
         summary,
         prompt_metrics,
         gepa_queue,
@@ -2053,289 +3570,67 @@ pub(super) fn build_prompt_optimization_proposal(
         reversible: true,
         lifecycle,
         change_preview,
+        opportunity,
     }
 }
 
 pub(super) fn build_prompt_optimization_opportunities(
     summary: &PromptTelemetrySummary,
+    opportunity_profiles: &[PromptOptimizationOpportunityProfile],
     prompt_metrics: &[PromptEvolutionMetric],
     review_state: &PromptOptimizationReviewState,
     gepa_queue: &serde_json::Value,
     prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
     prompt_rollback_available: bool,
 ) -> Vec<PromptOptimizationProposal> {
-    if summary.sample_count < 6 {
+    if summary.sample_count == 0 {
         return Vec::new();
     }
 
-    let mut proposals = Vec::new();
+    let mut drafts = summary
+        .top_sections
+        .iter()
+        .filter_map(|section| {
+            build_prompt_optimization_section_draft(
+                summary,
+                section,
+                prompt_optimization_profile_for_section(opportunity_profiles, &section.section),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    if let Some(section) = prompt_telemetry_section_summary(summary, "runtime_access_summary")
-        .filter(|section| section.p95_chars >= 900)
-    {
-        let mut impact_estimate = vec![
-            format!(
-                "Could remove up to {} from eligible prompts before any broader prompt changes are needed.",
-                format_char_count(section.p95_chars)
-            ),
-            format!(
-                "Measured across {} sampled turn{}.",
-                section.samples,
-                if section.samples == 1 { "" } else { "s" }
-            ),
-        ];
-        if let Some(line) =
-            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
-        {
-            impact_estimate.push(line);
-        }
-        proposals.push(build_prompt_optimization_proposal(
-            review_state,
-            summary,
-            prompt_metrics,
-            gepa_queue,
-            prompt_canary_state,
-            prompt_rollback_available,
-            "prompt-opt-runtime-summary-compact",
-            "Shorten setup instructions on simple chats",
-            "Your agent reads a block of setup instructions every turn. On simple chats it doesn't really need them. Skipping it there makes those replies faster and cheaper.",
-            vec![
-                format!("Observed {} prompt-telemetry samples.", summary.sample_count),
-                format!(
-                    "p95 runtime access summary size is {} chars.",
-                    section.p95_chars
-                ),
-                format!(
-                    "p95 final prompt size is {} chars.",
-                    summary.p95_final_prompt_chars
-                ),
-            ],
-            vec![
-                "Faster, cheaper replies on everyday chats.".to_string(),
-                "Keeps the change reviewable because it targets prompt/profile configuration rather than runtime code.".to_string(),
-            ],
-            vec![
-                "If we shorten too aggressively, your agent may get confused on turns that do need the setup details.".to_string(),
-                "This should only ship behind manual review, canarying, and a reversible prompt/profile change.".to_string(),
-            ],
-            "low",
-            "prompt_profile",
-            EvolutionChangePreview {
-                before: vec![
-                    format!(
-                        "Full runtime-access prose reaches {} at p95 on recent turns.",
-                        format_char_count(section.p95_chars)
-                    ),
-                    format!(
-                        "Overall final prompt size reaches {} at p95.",
-                        format_char_count(summary.p95_final_prompt_chars)
-                    ),
-                ],
-                after: vec![
-                    "Offer a compact runtime-access profile on turns that do not depend on the full environment prose.".to_string(),
-                    "Keep the full runtime-access profile on environment-dependent turns.".to_string(),
-                ],
-                impact_estimate,
-            },
-        ));
-    }
+    drafts.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
 
-    let action_catalog_section = prompt_telemetry_section_summary(summary, "action_catalog")
-        .filter(|section| section.p95_chars >= 2500 || summary.p95_tool_schema_chars >= 12_000);
-    if let Some(section) = action_catalog_section {
-        let mut impact_estimate = vec![
-            format!(
-                "Up to {} of prompt weight is tied directly to the action catalog block at p95.",
-                format_char_count(section.p95_chars)
-            ),
-            format!(
-                "Schema-heavy turns already carry {} of serialized tool schema at p95.",
-                format_char_count(summary.p95_tool_schema_chars)
-            ),
-        ];
-        if let Some(line) =
-            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
-        {
-            impact_estimate.push(line);
-        }
-        proposals.push(build_prompt_optimization_proposal(
-            review_state,
-            summary,
-            prompt_metrics,
-            gepa_queue,
-            prompt_canary_state,
-            prompt_rollback_available,
-            "prompt-opt-action-catalog-compact",
-            "Simplify tool descriptions on tool-heavy chats",
-            "Your agent sees a long technical description of every tool it can use. When many tools are available, that adds up. A shorter version speeds things up without removing any tools.",
-            vec![
-                format!("p95 action catalog size is {} chars.", section.p95_chars),
-                format!(
-                    "p95 serialized tool schema size is {} chars.",
-                    summary.p95_tool_schema_chars
-                ),
-                format!("Average exposed tool count is {:.2}.", summary.avg_tool_count),
-            ],
-            vec![
-                "Faster replies when your agent has many tools available.".to_string(),
-                "Creates a controlled path for later canary tests instead of runtime self-modification.".to_string(),
-            ],
-            vec![
-                "Shorter tool descriptions can occasionally make your agent pick a slightly wrong tool on rare actions.".to_string(),
-                "Any change must preserve exact action availability and stay manually reviewable.".to_string(),
-            ],
-            "medium",
-            "prompt_profile",
-            EvolutionChangePreview {
-                before: vec![
-                    format!(
-                        "The action catalog prompt section reaches {} at p95.",
-                        format_char_count(section.p95_chars)
-                    ),
-                    format!(
-                        "Recent turns serialize {} of tool schema at p95 across {:.2} exposed tools on average.",
-                        format_char_count(summary.p95_tool_schema_chars),
-                        summary.avg_tool_count
-                    ),
-                ],
-                after: vec![
-                    "Introduce an explicit compact tool-detail mode for the largest schema-heavy turns.".to_string(),
-                    "Keep the full tool set available while shortening parameter detail where a compact profile is sufficient.".to_string(),
-                ],
-                impact_estimate,
-            },
-        ));
-    }
-
-    if let Some(section) = prompt_telemetry_section_summary(summary, "deployed_app_hint")
-        .filter(|section| section.p95_chars >= 700)
-    {
-        let mut impact_estimate = vec![
-            format!(
-                "Could remove up to {} from non-app turns by scoping this hint more tightly.",
-                format_char_count(section.p95_chars)
-            ),
-            format!(
-                "Measured across {} sampled turn{} with prompt telemetry.",
-                summary.sample_count,
-                if summary.sample_count == 1 { "" } else { "s" }
-            ),
-        ];
-        if let Some(line) =
-            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
-        {
-            impact_estimate.push(line);
-        }
-        proposals.push(build_prompt_optimization_proposal(
-            review_state,
-            summary,
-            prompt_metrics,
-            gepa_queue,
-            prompt_canary_state,
-            prompt_rollback_available,
-            "prompt-opt-deployed-app-scope",
-            "Only mention your deployed apps when the chat is about apps",
-            "Your agent gets a list of your deployed apps on every turn, even when the chat has nothing to do with apps. Sharing that list only on app-related chats makes other replies faster.",
-            vec![
-                format!("p95 deployed app hint size is {} chars.", section.p95_chars),
-                format!("Observed {} samples with prompt telemetry.", summary.sample_count),
-            ],
-            vec![
-                "Replies stay fast as you deploy more apps.".to_string(),
-                "Keeps the decision transparent because the scope rule would be reviewed explicitly.".to_string(),
-            ],
-            vec![
-                "On short follow-up questions, your agent might momentarily forget which apps you have.".to_string(),
-                "This should remain a reviewed prompt/profile policy, not a self-editing runtime rule.".to_string(),
-            ],
-            "medium",
-            "prompt_profile",
-            EvolutionChangePreview {
-                before: vec![
-                    format!(
-                        "Deployed-app hints contribute {} at p95 even when the turn is not strongly app-focused.",
-                        format_char_count(section.p95_chars)
-                    ),
-                    format!(
-                        "Recent final prompts reach {} at p95.",
-                        format_char_count(summary.p95_final_prompt_chars)
-                    ),
-                ],
-                after: vec![
-                    "Inject deployed-app inventory hints only on turns that are clearly app-focused.".to_string(),
-                    "Keep the broader inventory available for app-related requests and follow-ups.".to_string(),
-                ],
-                impact_estimate,
-            },
-        ));
-    }
-
-    if let Some(section) = prompt_telemetry_section_summary(summary, "document_excerpts")
-        .filter(|section| section.p95_chars >= 1500)
-    {
-        let mut impact_estimate = vec![
-            format!(
-                "Could remove up to {} from mixed-context turns that do not need the full excerpt set.",
-                format_char_count(section.p95_chars)
-            ),
-            format!(
-                "The largest recent requests reach {} at p95.",
-                format_char_count(summary.p95_estimated_total_request_chars)
-            ),
-        ];
-        if let Some(line) =
-            prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
-        {
-            impact_estimate.push(line);
-        }
-        proposals.push(build_prompt_optimization_proposal(
-            review_state,
-            summary,
-            prompt_metrics,
-            gepa_queue,
-            prompt_canary_state,
-            prompt_rollback_available,
-            "prompt-opt-document-context-guard",
-            "Trim long document quotes when the chat drifts off-topic",
-            "When you share documents, your agent pastes big excerpts into every reply — even when the chat drifts to other topics. Trimming them on non-document turns speeds things up without affecting document-focused work.",
-            vec![
-                format!("p95 document excerpt size is {} chars.", section.p95_chars),
-                format!(
-                    "p95 estimated total request size is {} chars.",
-                    summary.p95_estimated_total_request_chars
-                ),
-            ],
-            vec![
-                "Faster replies on chats where documents aren't the main topic.".to_string(),
-                "Creates evidence-backed guardrails before any future compaction policy is considered.".to_string(),
-            ],
-            vec![
-                "On chats that still quietly rely on your documents, your agent might lose track of details.".to_string(),
-                "Document-centric turns should stay protected, with human review before any rollout.".to_string(),
-            ],
-            "high",
-            "prompt_profile",
-            EvolutionChangePreview {
-                before: vec![
-                    format!(
-                        "Document excerpts contribute {} at p95 on recent turns.",
-                        format_char_count(section.p95_chars)
-                    ),
-                    format!(
-                        "Estimated total request size reaches {} at p95.",
-                        format_char_count(summary.p95_estimated_total_request_chars)
-                    ),
-                ],
-                after: vec![
-                    "Offer a compact document-context profile when the turn is not primarily document-driven.".to_string(),
-                    "Keep document-centric turns on the full excerpt profile.".to_string(),
-                ],
-                impact_estimate,
-            },
-        ));
-    }
-
-    proposals
+    drafts
+        .into_iter()
+        .take(5)
+        .map(|draft| {
+            build_prompt_optimization_proposal(
+                review_state,
+                summary,
+                prompt_metrics,
+                gepa_queue,
+                prompt_canary_state,
+                prompt_rollback_available,
+                &draft.id,
+                &draft.title,
+                &draft.proposal_summary,
+                draft.evidence,
+                draft.expected_benefit,
+                draft.caveats,
+                &draft.risk_level,
+                &draft.target_scope,
+                draft.change_preview,
+                draft.opportunity,
+            )
+        })
+        .collect()
 }
 
 pub(super) fn normalize_evolution_dev_limit(limit: Option<u64>) -> u64 {
@@ -3549,6 +4844,12 @@ pub(super) async fn build_evolution_dev_response(
         &recent_experience_run_rows,
         &recent_trace_rows,
     );
+    let arkdistill_context_summary =
+        aggregate_arkdistill_context_summary_with_traces(&recent_trace_rows);
+    let prompt_optimization_profiles = aggregate_prompt_optimization_opportunity_profiles(
+        &recent_experience_run_rows,
+        &recent_trace_rows,
+    );
     let prompt_metrics = aggregate_prompt_metrics(
         &recent_experience_run_rows,
         &prompt_tool_logs,
@@ -3579,6 +4880,7 @@ pub(super) async fn build_evolution_dev_response(
         };
     let prompt_optimization_opportunities = build_prompt_optimization_opportunities(
         &prompt_telemetry_summary,
+        &prompt_optimization_profiles,
         &prompt_metrics,
         &prompt_optimization_review_state,
         &gepa_queue_for_lifecycle,
@@ -3699,6 +5001,7 @@ pub(super) async fn build_evolution_dev_response(
         recent_experience_runs,
         prompt_canary_safety_events,
         prompt_telemetry_summary,
+        arkdistill_context_summary,
         prompt_optimization_opportunities,
     }
 }
@@ -4454,6 +5757,81 @@ fn classify_gepa_auto_readiness_blocker(
     None
 }
 
+fn humanize_machine_reason_code(code: &str) -> String {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower_or_digit = false;
+    for ch in code.trim().chars() {
+        if ch == '_' || ch == '-' || ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            previous_lower_or_digit = false;
+            continue;
+        }
+        if ch.is_uppercase() && previous_lower_or_digit && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        previous_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return "Unknown readiness blocker".to_string();
+    }
+
+    words
+        .into_iter()
+        .enumerate()
+        .map(|(idx, word)| {
+            let lower = word.to_ascii_lowercase();
+            let rendered = match lower.as_str() {
+                "api" => "API".to_string(),
+                "gepa" => "GEPA".to_string(),
+                _ if idx == 0 => {
+                    let mut chars = lower.chars();
+                    match chars.next() {
+                        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                        None => lower,
+                    }
+                }
+                _ => lower,
+            };
+            rendered
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn gepa_auto_readiness_blocker_message(blocker: &str) -> String {
+    match blocker {
+        "learning_paused" => {
+            "Background optimization cannot start yet. Evolve is paused, so AgentArk will wait until Evolve is resumed.".to_string()
+        }
+        "gepa_disabled" => {
+            "Background optimization cannot start yet. The GEPA background optimizer is disabled in settings.".to_string()
+        }
+        "budget_paused" => {
+            "Background optimization cannot start yet. The daily spending limit for background optimization is paused or exhausted, so AgentArk will wait instead of spending more budget.".to_string()
+        }
+        "runtime_not_ready" => {
+            "Background optimization cannot start yet. The optimizer runtime is not ready; finish the Python/GEPA setup, then retry.".to_string()
+        }
+        "model_not_ready" => {
+            "Background optimization cannot start yet. The model or provider key is not ready; finish model setup, then retry.".to_string()
+        }
+        "model_or_runtime_not_ready" => {
+            "Background optimization cannot start yet. Model or optimizer setup is incomplete; finish setup, then retry.".to_string()
+        }
+        other => format!(
+            "Background optimization cannot start yet. {}.",
+            humanize_machine_reason_code(other)
+        ),
+    }
+}
+
 async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
     let agent = {
         let agent = state.agent.read().await;
@@ -4591,31 +5969,48 @@ async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-async fn gepa_auto_loop(state: AppState) {
-    tokio::time::sleep(std::time::Duration::from_secs(GEPA_AUTO_INITIAL_DELAY_SECS)).await;
+async fn gepa_auto_loop(state: AppState, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    if !sleep_or_http_shutdown(
+        std::time::Duration::from_secs(GEPA_AUTO_INITIAL_DELAY_SECS),
+        &mut shutdown_rx,
+    )
+    .await
+    {
+        return;
+    }
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(GEPA_AUTO_POLL_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        interval.tick().await;
-        if let Err(error) = run_gepa_auto_tick(&state).await {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            _ = interval.tick() => {}
+        }
+        let result = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            result = run_gepa_auto_tick(&state) => result,
+        };
+        if let Err(error) = result {
             tracing::warn!("GEPA auto-run scheduler tick failed: {}", error);
         }
     }
 }
 
-pub(super) fn spawn_gepa_auto_loop(state: AppState) {
+pub(super) fn spawn_gepa_auto_loop(
+    state: AppState,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if GEPA_AUTO_LOOP_STARTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return;
+        return None;
     }
-    crate::spawn_logged!(
+    Some(crate::spawn_logged!(
         "src/channels/http/evolution_control.rs:gepa_auto_loop",
         async move {
-            gepa_auto_loop(state).await;
+            gepa_auto_loop(state, shutdown_rx).await;
         }
-    );
+    ))
 }
 
 async fn run_guided_routing_optimization(
@@ -4831,6 +6226,7 @@ pub(super) async fn run_evolution_dev_action(
                     "apply_promotion": false,
                     "import_after_run": true,
                 }),
+                activity_label: None,
             };
             let raw = match agent
                 .handle_self_evolve_tool_call(&call, &trace_ref, None)
@@ -5038,6 +6434,28 @@ pub(super) async fn run_evolution_dev_action(
                     )
                         .into_response();
                 }
+                match stable_deployment_cadence_pause_message(&storage).await {
+                    Ok(Some(message)) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse { error: message }),
+                        )
+                            .into_response();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to evaluate stable deployment cadence: {}",
+                                    error
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
                 let replay_gate =
                     match crate::core::self_evolve::replay_gate::evaluate_candidate_replay_gate(
                         &storage, &candidate,
@@ -5086,6 +6504,14 @@ pub(super) async fn run_evolution_dev_action(
                                 .into_response();
                         }
                     };
+                record_evolve_stable_deployment(
+                    &storage,
+                    "tool_strategy",
+                    "manual_promote_candidate",
+                    Some(candidate.id.clone()),
+                    Some(promoted_version.clone()),
+                )
+                .await;
                 format!(
                     "Tool-strategy candidate '{}' promoted to baseline.",
                     promoted_version
@@ -5106,6 +6532,28 @@ pub(super) async fn run_evolution_dev_action(
                             .into_response();
                     }
                 };
+                match stable_deployment_cadence_pause_message(&storage).await {
+                    Ok(Some(message)) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse { error: message }),
+                        )
+                            .into_response();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to evaluate stable deployment cadence: {}",
+                                    error
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
                 if let Err(e) = storage
                     .set(
                         crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
@@ -5123,6 +6571,7 @@ pub(super) async fn run_evolution_dev_action(
                 }
                 if let Some(mut canary) = load_evolution_canary_state(&storage).await {
                     canary.enabled = false;
+                    let promoted_version = canary.candidate_version.clone();
                     canary.baseline_version = canary.candidate_version.clone();
                     if let Ok(bytes) = serde_json::to_vec(&canary) {
                         let _ = storage
@@ -5132,6 +6581,23 @@ pub(super) async fn run_evolution_dev_action(
                             )
                             .await;
                     }
+                    record_evolve_stable_deployment(
+                        &storage,
+                        "routing_policy",
+                        "manual_promote_candidate",
+                        None,
+                        Some(promoted_version),
+                    )
+                    .await;
+                } else {
+                    record_evolve_stable_deployment(
+                        &storage,
+                        "routing_policy",
+                        "manual_promote_candidate",
+                        None,
+                        None,
+                    )
+                    .await;
                 }
                 "Candidate policy promoted to baseline.".to_string()
             }
@@ -5960,6 +7426,10 @@ pub(super) async fn run_evolution_dev_action(
                 )
                     .into_response();
             };
+            let _manual_gepa_queue_guard = GEPA_MANUAL_QUEUE_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await;
             let sample_baseline = current_prompt_telemetry_sample_count(&storage).await;
             let project_root = resolve_project_root();
             let gepa_queue = match crate::core::self_evolve::gepa_bridge::queue_status_snapshot(
@@ -5971,7 +7441,8 @@ pub(super) async fn run_evolution_dev_action(
                 Ok(value) => value,
                 Err(_) => serde_json::Value::Null,
             };
-            let existing_job = gepa_queue_item_for_proposal(&gepa_queue, proposal_id);
+            let existing_job = gepa_queue_item_for_proposal(&gepa_queue, proposal_id)
+                .filter(|(job_status, item)| gepa_queue_item_is_active_work(job_status, item));
             let now = chrono::Utc::now().to_rfc3339();
             let mut message = format!(
                 "Recorded approval for prompt optimization proposal '{}'.",
@@ -5979,23 +7450,21 @@ pub(super) async fn run_evolution_dev_action(
             );
             let lifecycle_status: String;
             let lifecycle_reason: Option<String>;
+            let mut lifecycle_job_status: Option<String> = None;
             let mut queued_job_path: Option<String> = None;
             let mut queued_job_id: Option<String> = None;
             let mut queued_at: Option<String> = None;
+            let mut opportunity_required_samples = 0usize;
 
             if let Some((job_status, item)) = existing_job {
                 let job = item.get("job").unwrap_or(item);
-                lifecycle_status = match job_status {
-                    "running" => "running_background_test".to_string(),
-                    "pending" => "queued_for_background_test".to_string(),
-                    "completed" => "background_test_completed".to_string(),
-                    "failed" => "blocked".to_string(),
-                    other => other.to_string(),
-                };
+                let effective_status = gepa_queue_item_effective_status(job_status, item);
+                lifecycle_status = prompt_background_status_from_gepa_status(&effective_status);
                 lifecycle_reason = Some(format!(
                     "A background optimization job for this proposal is already {}.",
-                    job_status
+                    effective_status
                 ));
+                lifecycle_job_status = Some(effective_status.clone());
                 queued_job_id = job
                     .get("job_id")
                     .and_then(|value| value.as_str())
@@ -6005,6 +7474,31 @@ pub(super) async fn run_evolution_dev_action(
                     .and_then(|value| value.as_str())
                     .map(str::to_string);
                 message.push_str(" Existing background work is already attached to this row.");
+            } else if let Some((job_status, item)) = gepa_active_queue_item(&gepa_queue) {
+                let job = item.get("job").unwrap_or(item);
+                let effective_status = gepa_queue_item_effective_status(job_status, item);
+                let active_proposal = gepa_active_queue_item_proposal_id(item);
+                let active_job_id = job
+                    .get("job_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("active GEPA job");
+                lifecycle_status = "blocked".to_string();
+                lifecycle_job_status = Some("blocked_by_active_gepa_work".to_string());
+                lifecycle_reason = Some(match active_proposal {
+                    Some(active_proposal) => format!(
+                        "Another Evolve optimization is already {} for proposal '{}'. Pause before starting another background test; running multiple prompt changes together can make results hard to attribute and can affect AgentArk stability.",
+                        effective_status, active_proposal
+                    ),
+                    None => format!(
+                        "Another GEPA background job ({}) is already {}. Pause before starting another background test; running multiple prompt changes together can make results hard to attribute and can affect AgentArk stability.",
+                        active_job_id, effective_status
+                    ),
+                });
+                message.push_str(
+                    " Another GEPA background job is already active; pause before starting another optimization.",
+                );
             } else {
                 let readiness = crate::core::self_evolve::gepa_bridge::check_gepa_readiness(
                     &storage,
@@ -6015,10 +7509,7 @@ pub(super) async fn run_evolution_dev_action(
                 .await;
                 if let Some(blocker) = classify_gepa_auto_readiness_blocker(&readiness) {
                     lifecycle_status = "blocked".to_string();
-                    lifecycle_reason = Some(format!(
-                        "Background optimization cannot start yet: {}.",
-                        blocker
-                    ));
+                    lifecycle_reason = Some(gepa_auto_readiness_blocker_message(blocker));
                     message.push_str(
                         " Background optimization is blocked until Evolve readiness is fixed.",
                     );
@@ -6031,11 +7522,18 @@ pub(super) async fn run_evolution_dev_action(
                         "Approved Evolve prompt optimization proposal '{}'. Generate reversible prompt/profile candidates for this approved optimization, keep safety and task success ahead of latency or token savings, and if a candidate passes evaluation import it as a limited canary rather than a stable deployment.",
                         proposal_id
                     );
+                    let opportunity_context =
+                        load_prompt_optimization_gepa_context(&storage, proposal_id).await;
+                    opportunity_required_samples =
+                        prompt_optimization_context_confidence_sample_target(
+                            opportunity_context.as_ref(),
+                        );
                     match agent
                         .queue_gepa_prompt_optimization_run(
                             proposal_id,
                             &request,
                             GEPA_AUTO_QUIET_WINDOW_SECS,
+                            opportunity_context,
                         )
                         .await
                     {
@@ -6045,6 +7543,7 @@ pub(super) async fn run_evolution_dev_action(
                                 "Background optimization queued and will run when AgentArk is idle."
                                     .to_string(),
                             );
+                            lifecycle_job_status = Some("pending".to_string());
                             queued_job_path = Some(path);
                             queued_at = Some(now.clone());
                             message.push_str(
@@ -6070,6 +7569,8 @@ pub(super) async fn run_evolution_dev_action(
                 lifecycle_reason,
                 |lifecycle| {
                     lifecycle.status = lifecycle_status;
+                    lifecycle.job_status =
+                        lifecycle_job_status.or_else(|| lifecycle.job_status.clone());
                     lifecycle.approved_at = lifecycle.approved_at.clone().or(Some(now.clone()));
                     lifecycle.queued_at = queued_at.or_else(|| lifecycle.queued_at.clone());
                     lifecycle.queued_job_id =
@@ -6082,7 +7583,11 @@ pub(super) async fn run_evolution_dev_action(
                         lifecycle.sample_baseline
                     };
                     lifecycle.sample_count = 0;
-                    lifecycle.required_samples = GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS;
+                    lifecycle.required_samples =
+                        prompt_optimization_lifecycle_required_samples_from_target(
+                            lifecycle.required_samples,
+                            opportunity_required_samples,
+                        );
                     lifecycle.rollback_available = false;
                 },
             )
@@ -6213,8 +7718,45 @@ pub(super) async fn run_evolution_dev_action(
                 }
                 Err(_) => None,
             };
+            match stable_deployment_cadence_pause_message(&storage).await {
+                Ok(Some(message)) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse { error: message }),
+                    )
+                        .into_response();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!(
+                                "Failed to evaluate stable deployment cadence: {}",
+                                error
+                            ),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
             match promote_prompt_canary_to_baseline(&storage, surface).await {
                 Ok(message) => {
+                    record_evolve_stable_deployment(
+                        &storage,
+                        surface,
+                        "manual_promote_prompt_canary",
+                        request
+                            .proposal_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                        canary_before_promotion
+                            .as_ref()
+                            .map(|canary| canary.candidate_version.clone()),
+                    )
+                    .await;
                     if let Some(proposal_id) = request
                         .proposal_id
                         .as_deref()
@@ -6431,6 +7973,7 @@ pub(super) async fn run_evolution_dev_action(
             "last_result": dev.last_result.clone(),
             "prompt_canary_safety_events": dev.prompt_canary_safety_events.clone(),
             "prompt_telemetry_summary": dev.prompt_telemetry_summary.clone(),
+            "arkdistill_context_summary": dev.arkdistill_context_summary.clone(),
             "prompt_fragment_metrics": serde_json::to_value(&dev.prompt_fragment_metrics)
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
             "prompt_fragment_canary_state": dev.prompt_fragment_canary_state.clone(),
@@ -6511,6 +8054,18 @@ mod tests {
         assert_eq!(
             classify_gepa_auto_readiness_blocker(&runtime_blocked),
             Some("runtime_not_ready")
+        );
+    }
+
+    #[test]
+    fn gepa_auto_readiness_blocker_message_is_clear_for_people() {
+        assert_eq!(
+            gepa_auto_readiness_blocker_message("budget_paused"),
+            "Background optimization cannot start yet. The daily spending limit for background optimization is paused or exhausted, so AgentArk will wait instead of spending more budget."
+        );
+        assert_eq!(
+            gepa_auto_readiness_blocker_message("provider_api_key_missing"),
+            "Background optimization cannot start yet. Provider API key missing."
         );
     }
 }

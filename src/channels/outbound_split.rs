@@ -238,11 +238,9 @@ mod tests {
 
         assert!(chunks.len() > 2);
         assert!(chunks[0].starts_with("[1/"));
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.chars().count() <= PUSH_NOTIFICATION_MAX_CHARS)
-        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= PUSH_NOTIFICATION_MAX_CHARS));
     }
 
     #[test]

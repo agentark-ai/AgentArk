@@ -1,0 +1,393 @@
+/* Shared MUI component polish and interaction affordances. */
+
+/* Global MUI Chip overrides - futuristic holographic look */
+
+/* Base chip reset - all chips get the sci-fi treatment */
+.MuiChip-root {
+  font-family: var(--font-sans) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+  border-radius: 999px !important;
+  backdrop-filter: blur(6px) !important;
+  transition: box-shadow 180ms ease, border-color 180ms ease !important;
+}
+.MuiChip-sizeSmall {
+  font-size: 0.62rem !important;
+  height: 20px !important;
+  padding: 0 6px !important;
+}
+.MuiChip-sizeMedium {
+  font-size: 0.7rem !important;
+}
+
+/* SUCCESS (AgentArk green) */
+.MuiChip-colorSuccess.MuiChip-filled,
+.MuiChip-colorSuccess.MuiChip-outlined {
+  background: var(--ui-rgba-137-215-171-100) !important;
+  color: #b8f0cb !important;
+  border: 1px solid var(--ui-rgba-137-215-171-180) !important;
+  box-shadow: none !important;
+}
+.MuiChip-colorSuccess:hover {
+  box-shadow: none !important;
+}
+
+/* WARNING (amber-orange) */
+.MuiChip-colorWarning.MuiChip-filled,
+.MuiChip-colorWarning.MuiChip-outlined {
+  background: var(--ui-rgba-255-191-130-100) !important;
+  color: #ffd3ad !important;
+  border: 1px solid var(--ui-rgba-255-191-130-180) !important;
+  box-shadow: none !important;
+}
+.MuiChip-colorWarning:hover {
+  box-shadow: none !important;
+}
+
+/* ERROR (red-pink) */
+.MuiChip-colorError.MuiChip-filled,
+.MuiChip-colorError.MuiChip-outlined {
+  background: var(--ui-rgba-255-155-155-100) !important;
+  color: #ffc0c0 !important;
+  border: 1px solid var(--ui-rgba-255-155-155-180) !important;
+  box-shadow: none !important;
+}
+.MuiChip-colorError:hover {
+  box-shadow: none !important;
+}
+
+/* INFO (AgentArk green) */
+.MuiChip-colorInfo.MuiChip-filled,
+.MuiChip-colorInfo.MuiChip-outlined {
+  background: var(--ui-rgba-54-168-255-120) !important;
+  color: #fff8ed !important;
+  border: 1px solid var(--ui-rgba-54-168-255-200) !important;
+  box-shadow: none !important;
+}
+.MuiChip-colorInfo:hover {
+  box-shadow: none !important;
+}
+
+/* PRIMARY (neutral) */
+.MuiChip-colorPrimary.MuiChip-filled,
+.MuiChip-colorPrimary.MuiChip-outlined {
+  background: var(--ui-rgba-255-255-255-080) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+  border: 1px solid var(--ui-rgba-255-255-255-160) !important;
+  box-shadow: none !important;
+}
+
+/* DEFAULT (ghost / neutral) */
+.MuiChip-colorDefault.MuiChip-filled,
+.MuiChip-colorDefault.MuiChip-outlined {
+  background: var(--ui-rgba-255-255-255-040) !important;
+  color: var(--ui-rgba-205-208-214-740) !important;
+  border: 1px solid var(--ui-rgba-255-255-255-100) !important;
+  box-shadow: none !important;
+}
+
+/* Uncolored outlined (variant="outlined" with no color prop) */
+.MuiChip-outlined:not([class*="MuiChip-color"]) {
+  background: var(--ui-rgba-255-255-255-030) !important;
+  color: var(--ui-rgba-205-208-214-740) !important;
+  border: 1px solid var(--ui-rgba-255-255-255-100) !important;
+}
+
+/* Settings Advanced page - grouped cards */
+
+.adv-group {
+  border: 1px solid var(--ui-rgba-255-255-255-080);
+  border-radius: 8px;
+  background:
+    linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880));
+  box-shadow: inset 0 0 0 1px var(--ui-rgba-255-255-255-030);
+  padding: 14px 15px;
+  transition: border-color 0.18s, background 0.18s;
+}
+.adv-group:hover {
+  border-color: var(--ui-rgba-255-255-255-120);
+}
+
+.adv-group-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--ui-rgba-255-255-255-060);
+}
+.adv-group-header-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  flex-shrink: 0;
+  background: var(--ui-rgba-255-255-255-040);
+  border: 1px solid var(--ui-rgba-255-255-255-080);
+  color: var(--ui-rgba-244-245-247-820);
+}
+.adv-group-header-title {
+  font-size: 0.9rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--ui-rgba-244-245-247-950);
+}
+.adv-group-header-sub {
+  margin-top: 3px;
+  font-size: 0.78rem;
+  line-height: 1.46;
+  color: var(--ui-rgba-187-191-199-740);
+  letter-spacing: 0;
+}
+
+/* Row inside advanced group - horizontal control row */
+.adv-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--ui-rgba-255-255-255-025);
+  border: 1px solid var(--ui-rgba-255-255-255-060);
+  transition: background 0.18s, border-color 0.18s;
+}
+.adv-row:hover {
+  background: var(--ui-rgba-255-255-255-040);
+  border-color: var(--ui-rgba-255-255-255-100);
+}
+.adv-row + .adv-row {
+  margin-top: 8px;
+}
+
+/* Skill toggle pill in auto-approve grid */
+.adv-skill-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: var(--ui-rgba-255-255-255-025);
+  border: 1px solid var(--ui-rgba-255-255-255-060);
+  transition: background 0.18s, border-color 0.22s, box-shadow 0.22s;
+  cursor: pointer;
+}
+.adv-skill-pill:hover {
+  background: var(--ui-rgba-255-255-255-040);
+  border-color: var(--ui-rgba-255-255-255-100);
+}
+.adv-skill-pill.active {
+  background: var(--ui-rgba-255-255-255-050);
+  border-color: var(--ui-rgba-255-255-255-140);
+  box-shadow: inset 0 0 0 1px var(--ui-rgba-255-255-255-030);
+}
+.adv-skill-pill .MuiSwitch-root {
+  margin-right: -6px;
+}
+
+/* Banner at top of Advanced */
+.adv-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at top left, rgba(120, 242, 176, 0.045), transparent 34%),
+    var(--ui-rgba-255-255-255-030);
+  border: 1px solid rgba(120, 242, 176, 0.14);
+  color: var(--ui-rgba-218-232-255-920);
+  font-size: 0.8rem;
+  letter-spacing: 0;
+  font-family: var(--font-mono);
+}
+.adv-banner-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+/* API Key card special styling */
+.adv-key-field {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0;
+}
+
+/* Design System Enhancements - Glow, Transitions, Polish */
+
+/* Global smooth transitions on interactive elements */
+.MuiButton-root,
+.MuiChip-root,
+.MuiIconButton-root,
+.MuiTab-root,
+.MuiSwitch-root {
+  transition: all 0.2s ease !important;
+}
+
+/* Button glow on hover */
+.MuiButton-contained:hover {
+  box-shadow: var(--button-shadow-hover) !important;
+}
+.MuiButton-contained:active {
+  transform: translateY(0) scale(0.98);
+}
+.MuiButton-outlined:hover {
+  box-shadow: var(--button-shadow) !important;
+}
+
+/* Card hover glow */
+.list-shell {
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
+}
+.list-shell[role="button"]:hover,
+.list-shell.is-interactive:hover {
+  border-color: var(--ui-rgba-255-255-255-120);
+}
+
+/* Metadata / stat box glow on hover */
+.metadata-box {
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.metadata-box[role="button"]:hover,
+.metadata-box.is-interactive:hover {
+  border-color: var(--ui-rgba-255-255-255-120);
+}
+
+/* Table row hover glow */
+.table-shell .MuiTableRow-root:hover {
+  background: var(--ui-rgba-255-255-255-030) !important;
+}
+
+/* Focus ring for keyboard navigation */
+.MuiButton-root:focus-visible,
+.MuiIconButton-root:focus-visible,
+.MuiTab-root:focus-visible {
+  outline: none !important;
+  box-shadow: var(--button-focus-ring) !important;
+}
+
+/* Input focus glow */
+.MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-color: var(--cyan) !important;
+  box-shadow: 0 0 0 2px var(--ui-rgba-57-208-255-120), 0 0 8px var(--ui-rgba-57-208-255-150);
+}
+
+/* Chip hover glow */
+.MuiChip-root:hover {
+  box-shadow: 0 0 6px var(--ui-rgba-57-208-255-120);
+}
+.MuiChip-colorSuccess:hover {
+  box-shadow: 0 0 6px var(--green-glow);
+}
+.MuiChip-colorError:hover {
+  box-shadow: 0 0 6px var(--red-glow);
+}
+.MuiChip-colorWarning:hover {
+  box-shadow: 0 0 6px var(--ui-rgba-255-159-67-250);
+}
+
+/* Terminal console glow border */
+.term-shell {
+  transition: border-color 0.3s ease;
+}
+.term-shell:hover {
+  border-color: var(--ui-rgba-118-152-190-180);
+}
+
+/* Use JetBrains Mono for all monospace contexts */
+.term-body,
+.term-text,
+.code-viewer-pre,
+.adv-key-field,
+.MuiTableCell-root code {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace !important;
+}
+
+/* Status dot pulse animation */
+.MuiChip-colorSuccess .MuiChip-icon,
+.status-dot-online {
+  animation: pulse-glow 2.5s ease-in-out infinite;
+}
+
+/* Smooth dialog entrance */
+.MuiDialog-paper {
+  animation: dialogEnter 0.2s ease-out !important;
+}
+@keyframes dialogEnter {
+  from { opacity: 0; transform: scale(0.96) translateY(8px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Smooth accordion expand */
+.MuiAccordionDetails-root {
+  animation: accordionExpand 0.2s ease-out;
+}
+@keyframes accordionExpand {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Tab indicator glow */
+.MuiTabs-indicator {
+  box-shadow: 0 0 8px var(--ui-rgba-57-208-255-300);
+}
+
+/* Alert subtle glow matching severity */
+.MuiAlert-standard.MuiAlert-colorInfo {
+  border: 1px solid var(--ui-rgba-57-208-255-150) !important;
+}
+.MuiAlert-standard.MuiAlert-colorSuccess {
+  border: 1px solid var(--ui-rgba-74-210-157-150) !important;
+}
+.MuiAlert-standard.MuiAlert-colorWarning {
+  border: 1px solid var(--ui-rgba-255-159-67-150) !important;
+}
+.MuiAlert-standard.MuiAlert-colorError {
+  border: 1px solid var(--ui-rgba-255-107-107-150) !important;
+}
+
+/* Sidebar nav item active glow */
+.sidebar-item-active,
+.MuiListItemButton-root.Mui-selected {
+  border-left: 2px solid var(--ui-rgba-57-208-255-720) !important;
+  background: var(--ui-rgba-57-208-255-045) !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ui-rgba-255-255-255-180);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ui-rgba-255-255-255-280);
+}
+
+/* Plan checklist fade-in */
+.plan-checklist {
+  animation: planFadeIn 0.4s ease-out;
+}
+@keyframes planFadeIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

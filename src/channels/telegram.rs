@@ -1,5 +1,5 @@
 //! Telegram bot channel
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ParseMode};
@@ -472,7 +472,10 @@ async fn register_commands(bot: &Bot) {
 }
 
 /// Start the Telegram bot
-pub async fn serve(agent: SharedAgent) -> Result<()> {
+pub async fn serve(
+    agent: SharedAgent,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let config = {
         let agent = agent.read().await;
         agent.config.telegram.clone()
@@ -510,7 +513,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
 
     let agent_clone = agent.clone();
 
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
+    let bot_loop = teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let agent = agent_clone.clone();
         async move {
             let user_id = msg.from.as_ref().map(|u| u.id.0);
@@ -714,12 +717,15 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     }
 
                     // Show "typing..." indicator while processing
-                    let _ = bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await;
+                    let _ = bot
+                        .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                        .await;
 
                     // Keep typing indicator alive in background (Telegram typing expires after ~5s)
                     let typing_bot = bot.clone();
                     let typing_chat_id = chat_id;
-                    let typing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let typing_done =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let typing_flag = typing_done.clone();
                     crate::spawn_logged!("src/channels/telegram.rs:705", async move {
                         loop {
@@ -727,7 +733,12 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                             if typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            let _ = typing_bot.send_chat_action(typing_chat_id, teloxide::types::ChatAction::Typing).await;
+                            let _ = typing_bot
+                                .send_chat_action(
+                                    typing_chat_id,
+                                    teloxide::types::ChatAction::Typing,
+                                )
+                                .await;
                         }
                     });
 
@@ -735,14 +746,14 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     let conversation_id = format!("telegram:{}", chat_id.0);
                     let (response, _trace_ref) = {
                         let trace_ref = agent.read().await.last_trace.clone();
-                        let response = process_telegram_prompt(&agent, text, &conversation_id).await;
+                        let response =
+                            process_telegram_prompt(&agent, text, &conversation_id).await;
                         (response, trace_ref)
                     };
                     typing_done.store(true, std::sync::atomic::Ordering::Relaxed);
 
                     let chunks = super::outbound_split::split_for_provider_safe_channel(
-                        "telegram",
-                        &response,
+                        "telegram", &response,
                     );
                     for chunk in chunks {
                         bot.send_message(chat_id, markdown_to_telegram_html(&chunk))
@@ -753,8 +764,14 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
             }
             Ok(())
         }
-    })
-    .await;
+    });
+
+    tokio::select! {
+        _ = shutdown_rx.changed() => {
+            tracing::info!("Telegram bot shutdown signal received");
+        }
+        _ = bot_loop => {}
+    }
 
     Ok(())
 }

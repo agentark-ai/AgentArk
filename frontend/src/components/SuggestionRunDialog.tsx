@@ -1,5 +1,6 @@
 import CloseIcon from "@mui/icons-material/Close";
 import { Alert, Box, Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle, IconButton, Stack, Typography } from "@mui/material";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -141,7 +142,7 @@ export function SuggestionRunDialog({
               <Chip
                 size="small"
                 color={run?.status === "completed" ? "success" : run?.status === "error" ? "error" : "warning"}
-                label={run?.status || "running"}
+                label={humanizeStatusLabel(run?.status || "running")}
               />
               {run?.traceId ? <Chip size="small" variant="outlined" label={`Trace ${run.traceId}`} /> : null}
               {run?.startedAt ? <Chip size="small" variant="outlined" label={`Started ${humanTs(run.startedAt).label}`} /> : null}
@@ -184,9 +185,9 @@ export function SuggestionRunDialog({
                                 flexWrap: "wrap",
                                 alignItems: "center"
                               }}>
-                              <Chip size="small" color={suggestionKindColor(kind)} label={kind} />
-                              {status ? <Chip size="small" variant="outlined" color={suggestionOutcomeStatusColor(status)} label={status} /> : null}
-                              {toBool(outcome.primary) ? <Chip size="small" variant="outlined" label="primary" /> : null}
+                              <Chip size="small" color={suggestionKindColor(kind)} label={humanizeMachineLabel(kind, "Artifact")} />
+                              {status ? <Chip size="small" variant="outlined" color={suggestionOutcomeStatusColor(status)} label={humanizeStatusLabel(status)} /> : null}
+                              {toBool(outcome.primary) ? <Chip size="small" variant="outlined" label="Primary" /> : null}
                             </Stack>
                             <Stack direction="row" spacing={1}>
                               {view ? (
@@ -255,7 +256,11 @@ export function SuggestionRunDialog({
                                 alignItems: "center",
                                 flexWrap: "wrap"
                               }}>
-                              <Chip size="small" color={getTraceStepColor(str(stepRecord.type || stepRecord.step_type, "step"))} label={str(stepRecord.type || stepRecord.step_type, "step")} />
+                              <Chip
+                                size="small"
+                                color={getTraceStepColor(str(stepRecord.type || stepRecord.step_type, "step"))}
+                                label={humanizeMachineLabel(str(stepRecord.type || stepRecord.step_type, "step"))}
+                              />
                               <Typography variant="caption" sx={{
                                 color: "text.secondary"
                               }}>{str(stepRecord.time)}</Typography>

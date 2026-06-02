@@ -19,7 +19,10 @@ pub mod expense;
 pub mod experience_edge;
 pub mod experience_item;
 pub mod experience_run;
+pub mod knowledge_entity;
 pub mod knowledge_item;
+pub mod knowledge_relation;
+pub mod knowledge_relation_evidence;
 pub mod kv_store;
 pub mod learning_candidate;
 pub mod llm_usage;
@@ -44,3 +47,7 @@ pub mod tool_attempt;
 pub mod user_data_item;
 pub mod user_preference;
 pub mod watcher;
+pub mod webhook_event;
+pub mod webhook_source;
+
+pub(crate) const PGVECTOR_EMBEDDING_DIM: u32 = crate::actions::ACTION_CATALOG_EMBEDDING_DIM as u32;

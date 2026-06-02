@@ -2,11 +2,17 @@
 //! Mirrors the Gmail OAuth pattern for token management.
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const CALENDAR_SECRET_KEY: &str = "calendar_tokens";
 const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+static OAUTH_REFRESH_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CalendarTokens {
@@ -21,6 +27,29 @@ struct TokenResponse {
     expires_in: i64,
     #[serde(default)]
     refresh_token: Option<String>,
+}
+
+fn oauth_refresh_lock_key(config_dir: &Path, source: &str) -> String {
+    let config_dir = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    format!(
+        "{}:{}",
+        source.trim().to_ascii_lowercase(),
+        config_dir.display()
+    )
+}
+
+async fn oauth_refresh_guard(config_dir: &Path, source: &str) -> OwnedMutexGuard<()> {
+    let key = oauth_refresh_lock_key(config_dir, source);
+    let lock = {
+        let mut locks = OAUTH_REFRESH_LOCKS.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
 }
 
 fn get_oauth_client(config_dir: &Path) -> Result<(String, String)> {
@@ -88,9 +117,11 @@ async fn save_tokens(config_dir: &Path, tokens: &CalendarTokens) -> Result<()> {
 }
 
 pub(crate) async fn ensure_access_token(config_dir: &Path) -> Result<String> {
+    let guard = oauth_refresh_guard(config_dir, "calendar").await;
     let mut tokens = match load_tokens(config_dir).await {
         Ok(tokens) => tokens,
         Err(_) => {
+            drop(guard);
             return crate::actions::google_workspace::ensure_access_token_for_bundles(
                 config_dir,
                 &["calendar"],
@@ -462,5 +493,21 @@ pub async fn calendar_free(config_dir: &Path, arguments: &serde_json::Value) -> 
             min_duration,
             slots.join("\n")
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oauth_refresh_lock_key;
+    use std::path::Path;
+
+    #[test]
+    fn calendar_refresh_lock_key_is_scoped_to_legacy_calendar_source() {
+        let key = oauth_refresh_lock_key(Path::new("C:/agentark/config"), "calendar");
+        assert!(key.contains("calendar"));
+        assert_ne!(
+            key,
+            oauth_refresh_lock_key(Path::new("C:/agentark/config"), "gmail")
+        );
     }
 }

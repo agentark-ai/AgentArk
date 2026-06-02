@@ -304,6 +304,7 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         recorded_user_message_id: None,
         attachments_present: false,
         attachments: Vec::new(),
+        execution_profile: None,
         arkorbit_context: None,
         browser_profile_context: None,
         recent_actionable_artifacts: Vec::new(),
@@ -403,16 +404,31 @@ pub async fn run() -> Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| default_filter.parse().expect("Invalid log filter"))
     };
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(HumanReadableLocalLogTime)
-                .with_target(false)
-                .with_thread_ids(false)
-                .with_thread_names(false),
-        )
-        .init();
+    let json_logs = !std::io::stderr().is_terminal();
+    if json_logs {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_timer(HumanReadableLocalLogTime)
+                    .with_target(false)
+                    .with_thread_ids(false)
+                    .with_thread_names(false),
+            )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_timer(HumanReadableLocalLogTime)
+                    .with_target(false)
+                    .with_thread_ids(false)
+                    .with_thread_names(false),
+            )
+            .init();
+    }
 
     // Determine directories
     let dirs = branding::project_dirs().expect("Failed to determine project directories");
@@ -1748,8 +1764,9 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
     #[cfg(feature = "telegram")]
     let telegram_handle = {
         let agent = agent.clone();
+        let shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/lib.rs:1666", async move {
-            if let Err(e) = channels::telegram::serve(agent).await {
+            if let Err(e) = channels::telegram::serve(agent, shutdown).await {
                 tracing::error!("Telegram bot error: {}", e);
             }
         })
@@ -1819,14 +1836,14 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLI_SETTINGS_URL, CLI_SETUP_COMMAND, CLI_SETUP_PROMPT, CliChatReadiness,
         cli_chat_readiness, cli_chat_request_hints, render_cli_chat_onboarding_message,
-        should_launch_cli_setup,
+        should_launch_cli_setup, CliChatReadiness, CLI_SETTINGS_URL, CLI_SETUP_COMMAND,
+        CLI_SETUP_PROMPT,
     };
-    use crate::core::LlmProvider;
     use crate::core::config::{
         AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
     };
+    use crate::core::LlmProvider;
 
     #[test]
     fn cli_chat_readiness_treats_default_config_as_unconfigured() {

@@ -23,12 +23,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { isBackgroundSessionVisibleInUi } from "../lib/backgroundSessions";
 import { formatUiDateTime, formatUiRelativeDateTimeMeta } from "../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 import {
   metricValues,
   readRuntimeMetricHistory,
   RUNTIME_METRIC_HISTORY_EVENT,
   type RuntimeMetricSample,
 } from "../lib/runtimeMetricHistory";
+import { buildCumulativeSavedTokenSparkValues } from "./overviewArkDistillSpark";
 import { useUiStore } from "../store/uiStore";
 import { ActivityFeed } from "./ActivityFeed";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
@@ -55,6 +57,7 @@ import type {
   AutonomyActionExecutionResponse,
   BackgroundSessionSummary,
   BriefingResponse,
+  LlmAnalyticsResponse,
   RecommendedAction,
   Task,
   TraceSummary,
@@ -148,7 +151,7 @@ function automationKindLabel(kind: string): string {
   if (normalized === "watcher") return "Watcher";
   if (normalized === "app") return "App";
   if (normalized === "integration") return "Integration";
-  return kind || "Automation";
+  return humanizeMachineLabel(kind, "Automation");
 }
 
 function automationStatusColor(status: string): "success" | "warning" | "error" | "default" | "info" {
@@ -212,6 +215,18 @@ function formatCompactPercent(value: unknown): string {
   return next == null ? "-" : `${Math.round(next)}%`;
 }
 
+function formatCompactNumber(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return Math.round(value).toLocaleString();
+}
+
+function formatSmallCurrency(value?: number | null): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "pricing n/a";
+  return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
+}
+
 function sparklinePoints(values: number[], width = 132, height = 30): string {
   const step = Math.max(1, Math.ceil(values.length / 120));
   const compactValues = values.length > 120 ? values.filter((_, index) => index % step === 0).slice(-120) : values;
@@ -232,6 +247,32 @@ function MetricSparkline({ values }: { values: number[] }) {
   const points = sparklinePoints(values);
   return (
     <svg className="nw-metric-spark" viewBox="0 0 132 30" preserveAspectRatio="none" aria-hidden="true">
+      <polyline points={points} />
+    </svg>
+  );
+}
+
+function ArkDistillSpark({ values }: { values: number[] }) {
+  if (values.length < 2) {
+    return (
+      <svg
+        className="nw-focus-spark nw-focus-spark--empty"
+        viewBox="0 0 200 40"
+        preserveAspectRatio="none"
+        aria-hidden="true"
+      >
+        <line x1="0" y1="20" x2="200" y2="20" />
+      </svg>
+    );
+  }
+  const points = sparklinePoints(values, 200, 40);
+  return (
+    <svg
+      className="nw-focus-spark"
+      viewBox="0 0 200 40"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
       <polyline points={points} />
     </svg>
   );
@@ -459,6 +500,12 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
     queryFn: () => api.rawGet("/settings/evolution"),
     refetchInterval: autoRefresh ? 60_000 : false,
     staleTime: 45_000,
+  });
+  const arkDistillAnalyticsQ = useQuery({
+    queryKey: ["mission-control-llm-analytics-30d"],
+    queryFn: () => api.getLlmAnalytics({ range: "30d", bucket: "day" }),
+    refetchInterval: autoRefresh ? 120_000 : false,
+    staleTime: 60_000,
   });
   const suggestionTraceId = (suggestionRun?.traceId || "").trim();
   const suggestionTraceQ = useQuery({
@@ -865,13 +912,71 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
         : `${failingSources.join(", ")} failed to load. Retrying automatically.`;
   const showActiveSessionsPanel = activeBackgroundSessions.length > 0;
   const showActivityFeed = traces.length > 0;
+  const arkDistillAnalytics = arkDistillAnalyticsQ.data as LlmAnalyticsResponse | undefined;
+  const arkDistillTotals = arkDistillAnalytics?.arkdistill?.totals;
+  const arkDistillHasData = Boolean(
+    arkDistillTotals &&
+      ((finiteNumber(arkDistillTotals.result_count) ?? 0) > 0 ||
+        (finiteNumber(arkDistillTotals.estimated_saved_tokens) ?? 0) > 0 ||
+        (finiteNumber(arkDistillTotals.saved_chars) ?? 0) > 0)
+  );
+  const arkDistillSavingsPercent = arkDistillHasData
+    ? typeof arkDistillTotals?.savings_percent === "number"
+      ? arkDistillTotals.savings_percent
+      : (finiteNumber(arkDistillTotals?.average_reduction_ratio) ?? 0) * 100
+    : null;
+  const arkDistillSavedTokens = finiteNumber(arkDistillTotals?.estimated_saved_tokens) ?? 0;
+  const arkDistillSavedCostLabel = formatSmallCurrency(
+    arkDistillTotals?.estimated_prompt_cost_saved_usd
+  );
+  const arkDistillSeries = arkDistillAnalytics?.arkdistill?.series ?? [];
+  const arkDistillSparkValues = buildCumulativeSavedTokenSparkValues(
+    arkDistillSeries,
+    {
+      start: arkDistillAnalytics?.range?.since,
+      end: arkDistillAnalytics?.range?.until,
+      bucket: arkDistillAnalytics?.range?.bucket,
+    }
+  );
+  const arkDistillShowSpark =
+    arkDistillHasData && arkDistillSparkValues.length >= 2;
+  const arkDistillFocusBody = (
+    <div className="nw-focus-metric">
+      {arkDistillHasData && arkDistillSavingsPercent != null ? (
+        <>
+          <div className="nw-focus-metric-value">
+            {arkDistillSavingsPercent.toFixed(1)}%
+          </div>
+          <div className="nw-focus-metric-detail">
+            {formatCompactNumber(arkDistillSavedTokens)} tokens · {arkDistillSavedCostLabel}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="nw-focus-metric-value nw-focus-metric-value--waiting">
+            Waiting for data
+          </div>
+          <div className="nw-focus-metric-detail">
+            ArkDistill savings appear after distilled tool results land.
+          </div>
+        </>
+      )}
+      <div className="nw-focus-spark-shell">
+        <ArkDistillSpark values={arkDistillShowSpark ? arkDistillSparkValues : []} />
+        <div className="nw-focus-spark-caption">
+          <span>30d ago</span>
+          <span>now</span>
+        </div>
+      </div>
+    </div>
+  );
+  const focusTitle = "ArkDistill Saved";
 
-  const activeObjective = currentTask?.trim()
-    ? currentTask.trim()
+  const focusState: FocusState = arkDistillAnalyticsQ.error
+    ? "issue"
     : agentPaused
-      ? "Background help is paused. Scheduled reminders still fire while proactive work stays paused."
-      : "No focus is pinned yet. Start with a question, a reminder, or your next daily brief.";
-  const focusState: FocusState = currentTask?.trim() ? "active" : agentPaused ? "paused" : "ready";
+      ? "paused"
+      : "ready";
   const missionPlanSteps = useMemo(() => {
     const recommended = (briefingQ.data?.recommended_actions || briefingQ.data?.recommended_skills || [])[0];
     return [
@@ -980,7 +1085,11 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
 
           <div className="nw-dashboard-main nw-dashboard-main--mission mission-grid">
             <aside className="nw-dashboard-stack nw-dashboard-stack--left left-stack" aria-label="Mission objective and plan">
-              <FocusCard state={focusState} body={activeObjective} />
+              <FocusCard
+                state={focusState}
+                title={focusTitle}
+                body={arkDistillFocusBody}
+              />
               <NeuralPanel title="Autonomous Plan" tag={currentTask ? "RUNNING" : "READY"} tagTone={currentTask ? "cyan" : "good"}>
                 <div className="nw-plan-list">
                   {missionPlanSteps.map((step, index) => (
@@ -997,6 +1106,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
               <SuggestedStepCard
                 prompts={heroPrompts}
                 briefing={briefingQ.data}
+                recentRuns={traces}
+                onOpenActivity={() => setActivityOpen(true)}
                 onGoChat={() => navigateToView("chat")}
                 onRunBriefing={() => runBriefingMutation.mutate()}
                 onExecuteAction={handleExecuteSuggestedAction}
@@ -1132,7 +1243,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                             border: "1px solid var(--ui-rgba-255-255-255-080)",
                           }}
                         >
-                          <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
+                          <Chip size="small" label={humanizeStatusLabel(session.status)} color={automationStatusColor(session.status)} />
                           <Box sx={{ minWidth: 0, flex: 1 }}>
                             <Typography variant="body2" noWrap sx={{ fontWeight: 600 }} title={session.title}>
                               {session.title}
@@ -1271,7 +1382,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                         alignItems: "center",
                         flexShrink: 0
                       }}>
-                      <Chip size="small" label={item.status || "-"} color={automationStatusColor(item.status || "")} />
+                      <Chip size="small" label={humanizeStatusLabel(item.status, "-")} color={automationStatusColor(item.status || "")} />
                       {item.url ? (
                         <Button
                           size="small"
@@ -1485,13 +1596,13 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                 />
                 {latestDailyBriefNotification ? <Chip size="small" color="info" label="Prior in-app record" /> : null}
                 {latestDailyBriefTrace ? (
-                  <Chip size="small" color={automationStatusColor(latestDailyBriefTrace.status)} label={`Trace: ${latestDailyBriefTrace.status || "recorded"}`} />
+                  <Chip size="small" color={automationStatusColor(latestDailyBriefTrace.status)} label={`Trace: ${humanizeStatusLabel(latestDailyBriefTrace.status || "recorded")}`} />
                 ) : null}
                 {latestDailyBriefAutomationRun ? (
                   <Chip
                     size="small"
                     color={automationStatusColor(latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "")}
-                    label={`Automation: ${latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "recorded"}`}
+                    label={`Automation: ${humanizeStatusLabel(latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "recorded")}`}
                   />
                 ) : null}
               </Stack>

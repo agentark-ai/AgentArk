@@ -22,13 +22,16 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
+import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import Grid2 from "@mui/material/Grid";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
+import { humanizeMachineLabel } from "../../lib/displayLabels";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
   asRecord,
+  canSaveUserData,
   errMessage,
   num,
   pickRecords,
@@ -49,6 +52,7 @@ type MemoryCategoryKey =
   | "assistantPreferences"
   | "workPreferences"
   | "domainMemory"
+  | "ephemeralMemory"
   | "otherMemory"
   | "preferences"
   | "userData"
@@ -252,11 +256,13 @@ export default function MemoryPage({
   const [editTarget, setEditTarget] = useState<EditMemoryTarget | null>(null);
   const [editValue, setEditValue] = useState("");
   const [memoryTab, setMemoryTab] = useState(0);
+  const [userDataDialogOpen, setUserDataDialogOpen] = useState(false);
   const [memoryPages, setMemoryPages] = useState<Record<MemoryCategoryKey, number>>({
     facts: 0,
     assistantPreferences: 0,
     workPreferences: 0,
     domainMemory: 0,
+    ephemeralMemory: 0,
     otherMemory: 0,
     preferences: 0,
     userData: 0,
@@ -286,6 +292,7 @@ export default function MemoryPage({
       queryClient.invalidateQueries({ queryKey: ["memory-assistant-preferences"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-work-preferences"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-domain-memory"] }),
+      queryClient.invalidateQueries({ queryKey: ["memory-ephemeral-context"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-other-memory"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-preferences"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-user-data"] }),
@@ -338,6 +345,20 @@ export default function MemoryPage({
       api.rawGet(
         `/memory/facts?category=project_domain_memory&limit=${MEMORY_PAGE_SIZE}&offset=${
           memoryPages.domainMemory * MEMORY_PAGE_SIZE
+        }`,
+      ),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+  const ephemeralMemoryQ = useQuery({
+    queryKey: [
+      "memory-ephemeral-context",
+      memoryPages.ephemeralMemory,
+      MEMORY_PAGE_SIZE,
+    ],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/facts?category=ephemeral_context&limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.ephemeralMemory * MEMORY_PAGE_SIZE
         }`,
       ),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
@@ -452,6 +473,7 @@ export default function MemoryPage({
   const assistantPreferences = pickRecords(assistantPreferencesQ.data, "facts");
   const workPreferences = pickRecords(workPreferencesQ.data, "facts");
   const domainMemory = pickRecords(domainMemoryQ.data, "facts");
+  const ephemeralMemory = pickRecords(ephemeralMemoryQ.data, "facts");
   const otherMemory = pickRecords(otherMemoryQ.data, "facts");
   const preferences = pickRecords(preferencesQ.data, "preferences");
   const userDataItems = pickRecords(userDataQ.data, "items");
@@ -468,6 +490,10 @@ export default function MemoryPage({
   const domainMemoryTotal = num(
     asRecord(domainMemoryQ.data).total,
     num(stats.project_domain_memory, domainMemory.length),
+  );
+  const ephemeralMemoryTotal = num(
+    asRecord(ephemeralMemoryQ.data).total,
+    num(stats.ephemeral_context, ephemeralMemory.length),
   );
   const otherMemoryTotal = num(
     asRecord(otherMemoryQ.data).total,
@@ -501,6 +527,7 @@ export default function MemoryPage({
         ["assistantPreferences", assistantPreferencesTotal],
         ["workPreferences", workPreferencesTotal],
         ["domainMemory", domainMemoryTotal],
+        ["ephemeralMemory", ephemeralMemoryTotal],
         ["otherMemory", otherMemoryTotal],
         ["preferences", preferencesTotal],
         ["userData", userDataTotal],
@@ -517,6 +544,7 @@ export default function MemoryPage({
   }, [
     assistantPreferencesTotal,
     domainMemoryTotal,
+    ephemeralMemoryTotal,
     factsTotal,
     knowledgeTotal,
     otherMemoryTotal,
@@ -567,6 +595,43 @@ export default function MemoryPage({
     deleteUserDataMutation.isPending ||
     deleteKnowledgeMutation.isPending;
   const editBusy = updateLearnedMemoryMutation.isPending;
+  const userDataCanSave = canSaveUserData(
+    dataKind,
+    dataTitle,
+    createUserDataMutation.isPending,
+  );
+  const resetUserDataForm = () => {
+    setDataKind("note");
+    setDataTitle("");
+    setDataContent("");
+    setDataUrl("");
+  };
+  const openUserDataDialog = () => {
+    setError(null);
+    resetUserDataForm();
+    setUserDataDialogOpen(true);
+  };
+  const closeUserDataDialog = () => {
+    if (createUserDataMutation.isPending) return;
+    setUserDataDialogOpen(false);
+    resetUserDataForm();
+  };
+  const saveUserData = async () => {
+    if (!userDataCanSave) return;
+    setError(null);
+    try {
+      await createUserDataMutation.mutateAsync({
+        kind: dataKind.trim(),
+        title: dataTitle.trim(),
+        content: dataContent.trim(),
+        url: dataUrl.trim() || undefined,
+      });
+      setUserDataDialogOpen(false);
+      resetUserDataForm();
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  };
   const openMemoryEdit = (item: JsonRecord) => {
     const id = str(item.id, "").trim();
     if (!id) return;
@@ -804,10 +869,11 @@ export default function MemoryPage({
             <Tab value={1} label={`Assistant (${assistantPreferencesTotal})`} />
             <Tab value={2} label={`Work Prefs (${workPreferencesTotal})`} />
             <Tab value={3} label={`Domain (${domainMemoryTotal})`} />
-            <Tab value={4} label={`Other (${otherMemoryTotal})`} />
-            <Tab value={5} label={`Preferences (${preferencesTotal})`} />
-            <Tab value={6} label={`User Data (${userDataTotal})`} />
-            <Tab value={7} label={`Knowledge (${knowledgeTotal})`} />
+            <Tab value={4} label={`Temporary (${ephemeralMemoryTotal})`} />
+            <Tab value={5} label={`Other (${otherMemoryTotal})`} />
+            <Tab value={6} label={`Preferences (${preferencesTotal})`} />
+            <Tab value={7} label={`User Data (${userDataTotal})`} />
+            <Tab value={8} label={`Knowledge (${knowledgeTotal})`} />
           </Tabs>
         </Stack>
       </Box>
@@ -974,6 +1040,16 @@ export default function MemoryPage({
         : null}
       {memoryTab === 4
         ? renderLearnedMemoryTable(
+            "Temporary Context",
+            ephemeralMemory,
+            ephemeralMemoryTotal,
+            "ephemeralMemory",
+            ephemeralMemoryQ.error,
+            "No temporary context yet.",
+          )
+        : null}
+      {memoryTab === 5
+        ? renderLearnedMemoryTable(
             "Other Memory",
             otherMemory,
             otherMemoryTotal,
@@ -982,7 +1058,7 @@ export default function MemoryPage({
             "No uncategorized memory yet.",
           )
         : null}
-      {memoryTab === 5 ? (
+      {memoryTab === 6 ? (
         <Stack spacing={2}>
           <Box className="list-shell">
             <Typography
@@ -1170,96 +1246,27 @@ export default function MemoryPage({
           </Box>
         </Stack>
       ) : null}
-      {memoryTab === 6 ? (
+      {memoryTab === 7 ? (
         <Stack spacing={2}>
           <Box className="list-shell">
-            <Typography
-              variant="h6"
+            <Stack
+              direction="row"
+              spacing={1}
               sx={{
+                alignItems: "center",
+                justifyContent: "flex-end",
                 mb: 1,
               }}
             >
-              Add User Data
-            </Typography>
-            <Grid2 container spacing={1}>
-              <Grid2 size={{ xs: 12, md: 3 }}>
-                <TextField
-                  fullWidth
-                  size="small"
-                  label="Kind"
-                  placeholder="note | link | file"
-                  value={dataKind}
-                  onChange={(e) => setDataKind(e.target.value)}
-                />
-              </Grid2>
-              <Grid2 size={{ xs: 12, md: 5 }}>
-                <TextField
-                  fullWidth
-                  size="small"
-                  label="Title"
-                  placeholder="Quarterly roadmap doc"
-                  value={dataTitle}
-                  onChange={(e) => setDataTitle(e.target.value)}
-                />
-              </Grid2>
-              <Grid2 size={{ xs: 12, md: 4 }}>
-                <TextField
-                  fullWidth
-                  size="small"
-                  label="URL (optional)"
-                  placeholder="https://..."
-                  value={dataUrl}
-                  onChange={(e) => setDataUrl(e.target.value)}
-                />
-              </Grid2>
-              <Grid2 size={{ xs: 12 }}>
-                <TextField
-                  fullWidth
-                  size="small"
-                  multiline
-                  minRows={3}
-                  label="Content"
-                  placeholder="Summary or notes"
-                  value={dataContent}
-                  onChange={(e) => setDataContent(e.target.value)}
-                />
-              </Grid2>
-              <Grid2
-                size={{ xs: 12 }}
-                sx={{ display: "flex", justifyContent: "flex-end" }}
+              <Button
+                variant="contained"
+                size="small"
+                startIcon={<AddRoundedIcon fontSize="small" />}
+                onClick={openUserDataDialog}
               >
-                <Button
-                  variant="contained"
-                  disabled={
-                    createUserDataMutation.isPending ||
-                    !dataKind.trim() ||
-                    !dataTitle.trim()
-                  }
-                  onClick={async () => {
-                    setError(null);
-                    try {
-                      await createUserDataMutation.mutateAsync({
-                        kind: dataKind.trim(),
-                        title: dataTitle.trim(),
-                        content: dataContent.trim(),
-                        url: dataUrl.trim() || undefined,
-                      });
-                      setDataKind("note");
-                      setDataTitle("");
-                      setDataContent("");
-                      setDataUrl("");
-                    } catch (e) {
-                      setError(errMessage(e));
-                    }
-                  }}
-                >
-                  Save User Data
-                </Button>
-              </Grid2>
-            </Grid2>
-          </Box>
-
-          <Box className="list-shell">
+                Add User Data
+              </Button>
+            </Stack>
             {/* "User Data" h6 header removed — chip says it. */}
             {userDataQ.error ? (
               <Alert severity="error">{errMessage(userDataQ.error)}</Alert>
@@ -1293,7 +1300,7 @@ export default function MemoryPage({
                         const url = str(item.url, "");
                         return (
                           <TableRow key={id}>
-                            <TableCell>{str(item.kind, "-")}</TableCell>
+                            <TableCell>{humanizeMachineLabel(str(item.kind, ""), "-")}</TableCell>
                             <TableCell sx={{ maxWidth: 220 }}>
                               <Typography
                                 variant="body2"
@@ -1383,7 +1390,7 @@ export default function MemoryPage({
           </Box>
         </Stack>
       ) : null}
-      {memoryTab === 7 ? (
+      {memoryTab === 8 ? (
         <Stack spacing={2}>
           <Box className="list-shell">
             <Typography
@@ -1657,6 +1664,7 @@ export default function MemoryPage({
       assistantPreferencesQ.error ||
       workPreferencesQ.error ||
       domainMemoryQ.error ||
+      ephemeralMemoryQ.error ||
       otherMemoryQ.error ||
       preferencesQ.error ||
       userDataQ.error ||
@@ -1672,6 +1680,7 @@ export default function MemoryPage({
                 assistantPreferencesQ.error ||
                 workPreferencesQ.error ||
                 domainMemoryQ.error ||
+                ephemeralMemoryQ.error ||
                 otherMemoryQ.error ||
                 preferencesQ.error ||
                 userDataQ.error ||
@@ -1681,6 +1690,132 @@ export default function MemoryPage({
             )}
         </Alert>
       ) : null}
+      <Dialog
+        open={userDataDialogOpen}
+        onClose={closeUserDataDialog}
+        maxWidth="sm"
+        fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              background: "rgba(14, 14, 16, 0.96)",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              borderRadius: 2,
+              backdropFilter: "blur(8px)",
+              backgroundImage: "none",
+            },
+          },
+        }}
+      >
+        <DialogTitle
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 1,
+            pb: 1.5,
+            pt: 2,
+            px: 2.5,
+            borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
+          }}
+        >
+          <AddRoundedIcon fontSize="small" />
+          <Typography sx={{ fontSize: "1rem", fontWeight: 600 }}>
+            Add User Data
+          </Typography>
+        </DialogTitle>
+        <DialogContent sx={{ px: 2.5, pt: 3, pb: 2 }}>
+          <Stack spacing={1.25}>
+            {createUserDataMutation.error ? (
+              <Alert severity="error">
+                {errMessage(createUserDataMutation.error)}
+              </Alert>
+            ) : null}
+            <Grid2 container spacing={1}>
+              <Grid2 size={{ xs: 12, sm: 4 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Kind"
+                  placeholder="note | link | file"
+                  value={dataKind}
+                  onChange={(e) => setDataKind(e.target.value)}
+                  disabled={createUserDataMutation.isPending}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12, sm: 8 }}>
+                <TextField
+                  autoFocus
+                  fullWidth
+                  size="small"
+                  label="Title"
+                  placeholder="Quarterly roadmap doc"
+                  value={dataTitle}
+                  onChange={(e) => setDataTitle(e.target.value)}
+                  disabled={createUserDataMutation.isPending}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="URL (optional)"
+                  placeholder="https://..."
+                  value={dataUrl}
+                  onChange={(e) => setDataUrl(e.target.value)}
+                  disabled={createUserDataMutation.isPending}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12 }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  multiline
+                  minRows={4}
+                  label="Content"
+                  placeholder="Summary or notes"
+                  value={dataContent}
+                  onChange={(e) => setDataContent(e.target.value)}
+                  disabled={createUserDataMutation.isPending}
+                />
+              </Grid2>
+            </Grid2>
+          </Stack>
+        </DialogContent>
+        <DialogActions
+          sx={{
+            px: 2.5,
+            py: 1.5,
+            borderTop: "1px solid rgba(255, 255, 255, 0.06)",
+            gap: 1,
+          }}
+        >
+          <Button
+            disabled={createUserDataMutation.isPending}
+            onClick={closeUserDataDialog}
+            size="small"
+            sx={{
+              textTransform: "none",
+              fontSize: "0.78rem",
+              color: "rgba(220, 220, 220, 0.75)",
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            size="small"
+            disabled={!userDataCanSave}
+            onClick={() => void saveUserData()}
+            sx={{
+              textTransform: "none",
+              fontSize: "0.78rem",
+              fontWeight: 600,
+            }}
+          >
+            Save User Data
+          </Button>
+        </DialogActions>
+      </Dialog>
       <Dialog
         open={selectedFact != null}
         onClose={() => setSelectedFact(null)}

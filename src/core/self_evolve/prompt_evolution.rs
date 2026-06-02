@@ -1695,6 +1695,7 @@ fn benchmark_agent_result_to_runtime(
                     id: format!("tool-{}-{}", index, tool_idx),
                     name: name.clone(),
                     arguments: serde_json::json!({}),
+                    activity_label: None,
                 })
                 .collect(),
             reasoning: None,
@@ -2428,6 +2429,7 @@ mod tests {
                 id: "tool-1".to_string(),
                 name: "file_write".to_string(),
                 arguments: serde_json::json!({}),
+                activity_label: None,
             }],
             reasoning: None,
             usage: None,
@@ -2454,6 +2456,7 @@ mod tests {
                 id: "tool-1".to_string(),
                 name: "research".to_string(),
                 arguments: serde_json::json!({}),
+                activity_label: None,
             }],
             reasoning: None,
             usage: None,

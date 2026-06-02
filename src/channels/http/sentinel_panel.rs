@@ -18,6 +18,8 @@ const SENTINEL_PROPOSAL_RECREATE_HOURS: i64 = 24;
 const IN_APP_EXECUTION_SCAN_LIMIT: u64 = 48;
 const IN_APP_STALE_RUN_MINUTES: i64 = 15;
 const SENTINEL_PROPOSAL_SEMANTIC_DEDUP_TIMEOUT_SECS: u64 = 8;
+const CHAT_INTENT_SOURCE_KIND: &str = "chat_intent";
+const CHAT_INTENT_DERIVED_FROM: &str = "autonomy_chat_suggestion";
 const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 5] = [
     ("reflection_pass", "Reflection pass"),
     ("experience_consolidation", "Experience consolidation"),
@@ -696,7 +698,22 @@ fn sentinel_observation_is_control_plane_artifact(observation: &SentinelObservat
         || text_contains_direct_chat_approval_submit_text(&observation.detail))
 }
 
+fn sentinel_proposal_is_derived_chat_intent(proposal: &SentinelProposal) -> bool {
+    proposal.source_kind == CHAT_INTENT_SOURCE_KIND
+        && proposal.proposal_kind == "chat_suggestion_accept"
+        && proposal.chat_suggestion_id.is_some()
+        && proposal
+            .metadata
+            .get("derived_from")
+            .and_then(|value| value.as_str())
+            .map(|value| value == CHAT_INTENT_DERIVED_FROM)
+            .unwrap_or(false)
+}
+
 fn sentinel_proposal_is_chat_continuation_artifact(proposal: &SentinelProposal) -> bool {
+    if sentinel_proposal_is_derived_chat_intent(proposal) {
+        return false;
+    }
     proposal.proposal_kind == "chat_suggestion_accept"
         || proposal.source_kind == "chat_suggestion"
         || proposal.chat_suggestion_id.is_some()
@@ -935,12 +952,39 @@ struct SentinelCandidateBatch {
     chat_suggestions: usize,
 }
 
+impl SentinelCandidateBatch {
+    fn extend(&mut self, other: SentinelCandidateBatch) {
+        self.connected_services = self.connected_services.max(other.connected_services);
+        self.important_service_events += other.important_service_events;
+        self.in_app_events += other.in_app_events;
+        self.chat_suggestions += other.chat_suggestions;
+        self.observations.extend(other.observations);
+        self.proposals.extend(other.proposals);
+    }
+}
+
 fn is_current_in_app_observation(observation: &SentinelObservation) -> bool {
     observation.source_kind == "execution_run"
 }
 
 fn is_current_in_app_proposal(proposal: &SentinelProposal) -> bool {
     proposal.source_kind == "execution_run"
+}
+
+fn is_current_chat_intent_observation(observation: &SentinelObservation) -> bool {
+    observation.source_kind == CHAT_INTENT_SOURCE_KIND
+}
+
+fn is_current_chat_intent_proposal(proposal: &SentinelProposal) -> bool {
+    sentinel_proposal_is_derived_chat_intent(proposal)
+}
+
+fn is_current_reconciled_observation(observation: &SentinelObservation) -> bool {
+    is_current_in_app_observation(observation) || is_current_chat_intent_observation(observation)
+}
+
+fn is_current_reconciled_proposal(proposal: &SentinelProposal) -> bool {
+    is_current_in_app_proposal(proposal) || is_current_chat_intent_proposal(proposal)
 }
 
 fn reconcile_sentinel_candidates(
@@ -951,33 +995,33 @@ fn reconcile_sentinel_candidates(
     prune_missing_in_app: bool,
 ) -> (usize, usize, Vec<String>) {
     if prune_missing_in_app {
-        let current_in_app_observation_fingerprints = candidate_batch
+        let current_observation_fingerprints = candidate_batch
             .observations
             .iter()
-            .filter(|observation| is_current_in_app_observation(observation))
+            .filter(|observation| is_current_reconciled_observation(observation))
             .map(|observation| observation.fingerprint.clone())
             .collect::<std::collections::HashSet<_>>();
-        let current_in_app_proposal_fingerprints = candidate_batch
+        let current_proposal_fingerprints = candidate_batch
             .proposals
             .iter()
-            .filter(|proposal| is_current_in_app_proposal(proposal))
+            .filter(|proposal| is_current_reconciled_proposal(proposal))
             .map(|proposal| proposal.fingerprint.clone())
             .collect::<std::collections::HashSet<_>>();
 
         observations.retain(|observation| {
-            if !is_current_in_app_observation(observation) {
+            if !is_current_reconciled_observation(observation) {
                 return true;
             }
-            current_in_app_observation_fingerprints.contains(&observation.fingerprint)
+            current_observation_fingerprints.contains(&observation.fingerprint)
         });
         proposals.retain(|proposal| {
-            if !is_current_in_app_proposal(proposal) {
+            if !is_current_reconciled_proposal(proposal) {
                 return true;
             }
             if !matches!(proposal.status.as_str(), "open" | "snoozed") {
                 return true;
             }
-            current_in_app_proposal_fingerprints.contains(&proposal.fingerprint)
+            current_proposal_fingerprints.contains(&proposal.fingerprint)
         });
     }
 
@@ -1854,6 +1898,187 @@ async fn build_in_app_candidates(
     batch
 }
 
+fn chat_suggestion_is_open(suggestion: &super::autonomy_support::ChatAutomationSuggestion) -> bool {
+    suggestion.status.trim().eq_ignore_ascii_case("open")
+}
+
+fn chat_suggestion_tags(
+    suggestion: &super::autonomy_support::ChatAutomationSuggestion,
+) -> Vec<String> {
+    let mut tags = vec![
+        "derived_from_chat".to_string(),
+        "operational_intent".to_string(),
+    ];
+    let intent_kind = suggestion.kind.trim().to_ascii_lowercase();
+    if !intent_kind.is_empty() {
+        tags.push(intent_kind);
+    }
+    tags
+}
+
+fn chat_suggestion_priority(confidence: f32, threshold: f32) -> u8 {
+    let confidence = confidence.clamp(0.0, 1.0);
+    let threshold = threshold.clamp(0.0, 1.0);
+    if confidence >= threshold.max(0.9) {
+        5
+    } else if confidence >= threshold {
+        4
+    } else {
+        3
+    }
+}
+
+fn build_chat_suggestion_sentinel_launch_prompt(
+    suggestion: &super::autonomy_support::ChatAutomationSuggestion,
+) -> String {
+    let focus = suggestion
+        .goal_detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| suggestion.goal_title.trim());
+    format!(
+        "A Sentinel-derived operational intent was accepted.\n\
+Intent kind: {}\n\
+Title: {}\n\
+Detail: {}\n\
+Rationale: {}\n\
+Requested outcome: {}\n\n\
+Execute the concrete durable outcome represented by this intent. If required inputs are missing, \
+ask for the missing input clearly. Return a concise final outcome after actual work is done.",
+        compact_for_prompt(&suggestion.kind, 80),
+        compact_for_prompt(&suggestion.title, 180),
+        compact_for_prompt(&suggestion.detail, 420),
+        compact_for_prompt(&suggestion.rationale, 360),
+        compact_for_prompt(focus, 520),
+    )
+}
+
+fn chat_suggestion_metadata(
+    suggestion: &super::autonomy_support::ChatAutomationSuggestion,
+    tags: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "derived_from": CHAT_INTENT_DERIVED_FROM,
+        "raw_chat_visible": false,
+        "suggestion_id": suggestion.id,
+        "intent_kind": suggestion.kind,
+        "tags": tags,
+        "conversation_id": suggestion.conversation_id,
+        "conversation_channel": suggestion.conversation_channel,
+        "source_message_id": suggestion.source_message_id,
+        "goal_title": suggestion.goal_title,
+        "goal_detail": suggestion.goal_detail,
+    })
+}
+
+fn build_chat_suggestion_candidates_from_suggestions(
+    suggestions: &[super::autonomy_support::ChatAutomationSuggestion],
+    settings: &AutonomySettings,
+    readiness_policy: &crate::core::ReadinessPolicy,
+    now: &str,
+) -> SentinelCandidateBatch {
+    let mut batch = SentinelCandidateBatch::default();
+    let threshold = settings.sentinel.confidence_threshold.clamp(0.0, 1.0);
+
+    for suggestion in suggestions {
+        if !chat_suggestion_is_open(suggestion) {
+            continue;
+        }
+        let confidence = suggestion.confidence.clamp(0.0, 1.0);
+        if confidence < threshold {
+            continue;
+        }
+        let tags = chat_suggestion_tags(suggestion);
+        let priority = chat_suggestion_priority(confidence, threshold);
+        let metadata = chat_suggestion_metadata(suggestion, &tags);
+        let source_label = "Derived chat intent".to_string();
+        let fingerprint = normalize_fingerprint(&[
+            CHAT_INTENT_SOURCE_KIND,
+            suggestion.id.as_str(),
+            suggestion.fingerprint.as_str(),
+        ]);
+        batch.observations.push(SentinelObservation {
+            id: String::new(),
+            fingerprint: fingerprint.clone(),
+            kind: "chat_intent_signal".to_string(),
+            title: suggestion.title.clone(),
+            detail: suggestion.detail.clone(),
+            source_kind: CHAT_INTENT_SOURCE_KIND.to_string(),
+            source_id: Some(suggestion.id.clone()),
+            source_label: Some(source_label.clone()),
+            confidence,
+            priority,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            metadata: metadata.clone(),
+        });
+
+        let action = super::recommendation(
+            &suggestion.title,
+            &suggestion.detail,
+            "chat_prompt",
+            serde_json::json!({
+                "prompt": build_chat_suggestion_sentinel_launch_prompt(suggestion),
+                "conversation_id": suggestion.conversation_id,
+                "suggestion_id": suggestion.id,
+                "sentinel_signal_kind": CHAT_INTENT_SOURCE_KIND,
+            }),
+            &settings.trust_policy,
+            readiness_policy,
+        );
+        let proposal_id = uuid::Uuid::new_v4().to_string();
+        batch.proposals.push(SentinelProposal {
+            id: proposal_id.clone(),
+            fingerprint: normalize_fingerprint(&[
+                "proposal",
+                CHAT_INTENT_SOURCE_KIND,
+                suggestion.id.as_str(),
+                suggestion.fingerprint.as_str(),
+            ]),
+            proposal_kind: "chat_suggestion_accept".to_string(),
+            status: "open".to_string(),
+            title: action.title.clone(),
+            detail: suggestion.detail.clone(),
+            rationale: suggestion.rationale.clone(),
+            source_kind: CHAT_INTENT_SOURCE_KIND.to_string(),
+            source_id: Some(suggestion.id.clone()),
+            source_label: Some(source_label),
+            confidence,
+            priority,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            snoozed_until: None,
+            approved_at: None,
+            dismissed_at: None,
+            trace_id: None,
+            run_status: None,
+            last_run_summary: None,
+            action: Some(decorate_action_for_sentinel(
+                &action,
+                &proposal_id,
+                CHAT_INTENT_SOURCE_KIND,
+                Some(&suggestion.id),
+            )),
+            chat_suggestion_id: Some(suggestion.id.clone()),
+            metadata,
+        });
+        batch.chat_suggestions += 1;
+    }
+
+    batch
+}
+
+async fn build_chat_suggestion_candidates(
+    storage: &crate::storage::Storage,
+    settings: &AutonomySettings,
+    readiness_policy: &crate::core::ReadinessPolicy,
+    now: &str,
+) -> SentinelCandidateBatch {
+    let suggestions = super::autonomy_support::load_chat_suggestions(storage).await;
+    build_chat_suggestion_candidates_from_suggestions(&suggestions, settings, readiness_policy, now)
+}
+
 fn build_integration_prompt(
     item: &crate::core::integration_sync::IntegrationSyncFeedItem,
 ) -> String {
@@ -1989,10 +2214,13 @@ async fn build_candidates(
 
     if settings.sentinel.watch_in_app {
         let in_app_batch = build_in_app_candidates(storage, settings, chrono::Utc::now()).await;
-        batch.in_app_events = in_app_batch.in_app_events;
-        batch.chat_suggestions = in_app_batch.chat_suggestions;
-        batch.observations.extend(in_app_batch.observations);
-        batch.proposals.extend(in_app_batch.proposals);
+        batch.extend(in_app_batch);
+    }
+
+    if settings.sentinel.watch_in_app && settings.sentinel.infer_new_automations {
+        let chat_batch =
+            build_chat_suggestion_candidates(storage, settings, &readiness_policy, &now).await;
+        batch.extend(chat_batch);
     }
 
     batch.observations.sort_by(|a, b| {
@@ -2549,7 +2777,18 @@ pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response
         && !settings.agent_paused
         && !settings.autonomy_mode.eq_ignore_ascii_case("off")
     {
-        let in_app_batch = build_in_app_candidates(&storage, &settings, now).await;
+        let readiness_policy = crate::core::readiness::load_readiness_policy(&storage).await;
+        let mut in_app_batch = build_in_app_candidates(&storage, &settings, now).await;
+        if settings.sentinel.infer_new_automations {
+            let chat_batch = build_chat_suggestion_candidates(
+                &storage,
+                &settings,
+                &readiness_policy,
+                &now.to_rfc3339(),
+            )
+            .await;
+            in_app_batch.extend(chat_batch);
+        }
         let _ = reconcile_sentinel_candidates(
             &mut observations,
             &mut proposals,
@@ -2600,7 +2839,16 @@ pub(super) async fn get_sentinel_feed(State(state): State<AppState>) -> Response
             .iter()
             .filter(|item| item.source_kind == "execution_run")
             .count(),
-        chat_suggestions: 0,
+        chat_suggestions: proposals
+            .iter()
+            .filter(|proposal| sentinel_proposal_is_derived_chat_intent(proposal))
+            .filter(|proposal| {
+                matches!(
+                    proposal.status.as_str(),
+                    "open" | "running" | "queued_for_approval" | "snoozed"
+                )
+            })
+            .count(),
         recent_runs,
         auto_mode_enabled: settings.autonomy_mode.eq_ignore_ascii_case("auto"),
     };
@@ -2895,6 +3143,48 @@ mod tests {
         }
     }
 
+    fn chat_suggestion(
+        id: &str,
+        kind: &str,
+        status: &str,
+        confidence: f32,
+    ) -> super::super::autonomy_support::ChatAutomationSuggestion {
+        super::super::autonomy_support::ChatAutomationSuggestion {
+            id: id.to_string(),
+            status: status.to_string(),
+            kind: kind.to_string(),
+            title: "Prepare reliable notification workflow".to_string(),
+            detail: "Create an approval-gated follow-up for the requested notification."
+                .to_string(),
+            rationale: "The conversation contains a concrete durable action that can be reviewed."
+                .to_string(),
+            confidence,
+            created_at: "2026-05-11T00:00:00Z".to_string(),
+            updated_at: "2026-05-11T00:00:00Z".to_string(),
+            conversation_id: format!("conversation-{id}"),
+            conversation_title: "Notification planning".to_string(),
+            conversation_channel: "web".to_string(),
+            source_message_id: format!("message-{id}"),
+            source_snippet: "raw user chat should not be present in Sentinel".to_string(),
+            fingerprint: format!("fingerprint-{id}"),
+            goal_title: "Notification workflow".to_string(),
+            goal_detail: Some("Prepare the durable notification follow-up.".to_string()),
+            accepted_goal_id: None,
+            dismissed_at: None,
+            accepted_at: None,
+            accepted_trace_id: None,
+            run_status: None,
+            last_run_error: None,
+            last_run_started_at: None,
+            last_run_completed_at: None,
+            accepted_outcomes: Vec::new(),
+            resolution_checked_at: None,
+            resolution_check_signature: None,
+            resolved_at: None,
+            resolution_summary: None,
+        }
+    }
+
     #[test]
     fn prune_removes_chat_continuation_artifacts_from_sentinel() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-11T00:01:00Z")
@@ -2908,6 +3198,62 @@ mod tests {
         let retained = prune_proposals(vec![continuation], now);
 
         assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_derived_chat_intent_proposals() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-11T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut derived = proposal("derived-intent", "open", 4, 0.91);
+        derived.proposal_kind = "chat_suggestion_accept".to_string();
+        derived.source_kind = "chat_intent".to_string();
+        derived.chat_suggestion_id = Some("suggestion-1".to_string());
+        derived.metadata = serde_json::json!({
+            "derived_from": "autonomy_chat_suggestion",
+            "raw_chat_visible": false,
+            "tags": ["derived_from_chat", "task"]
+        });
+
+        let retained = prune_proposals(vec![derived], now);
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].source_kind, "chat_intent");
+    }
+
+    #[test]
+    fn chat_suggestion_candidates_hide_raw_source_snippet() {
+        let settings = AutonomySettings::default();
+        let readiness_policy = crate::core::ReadinessPolicy::default();
+        let suggestion = chat_suggestion("suggestion-1", "task", "open", 0.94);
+
+        let batch = build_chat_suggestion_candidates_from_suggestions(
+            &[suggestion],
+            &settings,
+            &readiness_policy,
+            "2026-05-11T00:01:00Z",
+        );
+
+        assert_eq!(batch.chat_suggestions, 1);
+        assert_eq!(batch.observations.len(), 1);
+        assert_eq!(batch.proposals.len(), 1);
+        assert_eq!(batch.proposals[0].source_kind, "chat_intent");
+        assert_eq!(
+            batch.proposals[0].chat_suggestion_id.as_deref(),
+            Some("suggestion-1")
+        );
+        assert!(batch.proposals[0].metadata.get("source_snippet").is_none());
+        assert!(batch.observations[0]
+            .metadata
+            .get("source_snippet")
+            .is_none());
+        let payload = batch.proposals[0]
+            .action
+            .as_ref()
+            .map(|action| action.payload.clone())
+            .unwrap_or_default();
+        let payload_text = serde_json::to_string(&payload).unwrap_or_default();
+        assert!(!payload_text.contains("raw user chat"));
     }
 
     #[test]

@@ -1,0 +1,588 @@
+/* AgentArk chat empty-state polish.
+   Scoped to the landing surface and kept on the native black / green / amber skin. */
+
+.chat-thread-empty {
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-empty-state {
+  width: min(100%, 1460px) !important;
+  max-width: 1460px !important;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  gap: clamp(14px, 2.4vh, 24px) !important;
+  padding: clamp(20px, 4vh, 52px) clamp(16px, 4vw, 48px) clamp(34px, 6vh, 72px) !important;
+  position: relative;
+  isolation: isolate;
+}
+
+.chat-empty-state::before {
+  content: "";
+  position: absolute;
+  inset: -12% -18% 0;
+  z-index: -2;
+  pointer-events: none;
+  background:
+    radial-gradient(58% 42% at 50% 6%, rgba(120, 242, 176, 0.12), transparent 70%),
+    radial-gradient(44% 34% at 78% 28%, rgba(255, 190, 99, 0.08), transparent 72%),
+    radial-gradient(42% 32% at 18% 36%, rgba(120, 242, 176, 0.07), transparent 74%);
+}
+
+.chat-empty-state::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.5;
+  background-image:
+    linear-gradient(rgba(120, 242, 176, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(120, 242, 176, 0.026) 1px, transparent 1px);
+  background-size: 48px 48px;
+  -webkit-mask-image: radial-gradient(78% 64% at 50% 24%, #000 24%, transparent 80%);
+  mask-image: radial-gradient(78% 64% at 50% 24%, #000 24%, transparent 80%);
+}
+
+.chat-empty-state .chat-empty-brand {
+  flex-direction: column !important;
+  gap: clamp(12px, 1.6vh, 18px) !important;
+  position: relative;
+}
+
+.chat-empty-state .chat-empty-brand::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: clamp(230px, 27vw, 340px);
+  height: clamp(230px, 27vw, 340px);
+  transform: translate(-50%, -58%);
+  z-index: -1;
+  pointer-events: none;
+  border-radius: 50%;
+  border: 1px solid rgba(120, 242, 176, 0.12);
+  -webkit-mask-image: radial-gradient(closest-side, transparent 60%, #000 62%, #000 71%, transparent 73%);
+  mask-image: radial-gradient(closest-side, transparent 60%, #000 62%, #000 71%, transparent 73%);
+}
+
+.chat-empty-state .chat-empty-logo {
+  width: clamp(58px, 5.4vw, 74px) !important;
+  height: clamp(58px, 5.4vw, 74px) !important;
+  border-radius: clamp(16px, 1.6vw, 20px) !important;
+  box-shadow:
+    0 0 0 1px rgba(120, 242, 176, 0.18),
+    0 18px 50px rgba(0, 0, 0, 0.34),
+    0 0 44px rgba(120, 242, 176, 0.11) !important;
+}
+
+.chat-empty-state .chat-empty-title {
+  max-width: none !important;
+  font-size: clamp(2rem, 3.8vw, 2.95rem) !important;
+  font-weight: 700 !important;
+  line-height: 1.05 !important;
+  letter-spacing: 0 !important;
+  color: var(--text-primary) !important;
+  background: none !important;
+  -webkit-text-fill-color: currentColor !important;
+}
+
+.chat-empty-subtitle {
+  margin: clamp(-4px, -0.4vh, -2px) 0 0 !important;
+  font-size: clamp(0.86rem, 1.05vw, 1rem);
+  font-weight: 500;
+  letter-spacing: 0;
+  color: rgba(226, 218, 208, 0.72);
+}
+
+.chat-empty-composer-wrap {
+  width: min(100%, 860px) !important;
+  margin: clamp(4px, 1.2vh, 14px) auto 0 !important;
+}
+
+.chat-empty-state .chat-composer-shell.chat-composer-shell-centered {
+  min-height: clamp(66px, 7.6vh, 92px) !important;
+  padding: clamp(12px, 1.15vw, 16px) clamp(13px, 1.3vw, 18px) clamp(12px, 1.15vw, 16px)
+    clamp(16px, 1.6vw, 22px) !important;
+  border-radius: clamp(16px, 1.6vw, 22px) !important;
+  align-items: start !important;
+  border: 1px solid rgba(120, 242, 176, 0.24) !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
+    rgba(9, 9, 10, 0.72) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 24px 60px rgba(0, 0, 0, 0.45) !important;
+  backdrop-filter: blur(14px) saturate(112%);
+  -webkit-backdrop-filter: blur(14px) saturate(112%);
+  transition: box-shadow 200ms ease, border-color 200ms ease;
+}
+
+.chat-empty-state .chat-composer-shell.chat-composer-shell-centered:focus-within {
+  border-color: rgba(120, 242, 176, 0.38) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 0 0 3px rgba(120, 242, 176, 0.14),
+    0 26px 70px rgba(0, 0, 0, 0.5) !important;
+}
+
+.chat-empty-state .chat-composer-textarea {
+  font-size: clamp(0.95rem, 1.15vw, 1.05rem) !important;
+  line-height: 1.55 !important;
+}
+
+.chat-empty-state .chat-composer-tool-btn.MuiIconButton-root,
+.chat-empty-state .chat-composer-tool-btn.MuiButton-root {
+  width: 34px !important;
+  height: 34px !important;
+  min-width: 34px !important;
+  min-height: 34px !important;
+  border-radius: 10px !important;
+}
+
+.chat-empty-state .chat-composer-send-btn {
+  width: 42px !important;
+  height: 42px !important;
+  box-shadow:
+    0 0 0 1px rgba(120, 242, 176, 0.34),
+    0 0 22px rgba(120, 242, 176, 0.22),
+    0 10px 26px rgba(0, 0, 0, 0.4) !important;
+}
+
+.chat-empty-state .chat-composer-send-btn:hover {
+  transform: translateY(-1px) scale(1.04) !important;
+  box-shadow:
+    0 0 0 1px rgba(120, 242, 176, 0.48),
+    0 0 30px rgba(120, 242, 176, 0.32),
+    0 12px 30px rgba(0, 0, 0, 0.46) !important;
+}
+
+.chat-empty-state .chat-starter-shell {
+  width: min(100%, 1240px) !important;
+  margin-top: 0;
+  padding: clamp(6px, 0.8vw, 10px) 0 0 !important;
+  gap: clamp(12px, 1.2vw, 16px) !important;
+  border-radius: 8px !important;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.chat-empty-state .chat-starter-tabs-head {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  gap: clamp(8px, 1vw, 12px) !important;
+  padding: 0 !important;
+}
+
+.chat-empty-state .chat-starter-caption {
+  display: grid;
+  grid-template-columns: minmax(64px, 1fr) auto minmax(64px, 1fr);
+  align-items: center;
+  gap: 18px;
+  width: min(100%, 320px);
+  font-size: 0.62rem !important;
+  letter-spacing: 0.24em !important;
+  color: rgba(226, 218, 208, 0.64) !important;
+  align-self: center !important;
+  text-align: center;
+}
+
+.chat-empty-state .chat-starter-caption::before,
+.chat-empty-state .chat-starter-caption::after {
+  content: "";
+  display: block;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(120, 242, 176, 0.28), transparent);
+}
+
+/* Tab strip: minimal terminal-style nav. Text-only, thin teal underline on selected.
+   No per-tab boxes, no clip-path, no inset shadows — just labels in a row. */
+.chat-empty-state .chat-starter-tabs.MuiTabs-root {
+  width: 100%;
+  max-width: 100%;
+  min-height: 0 !important;
+  overflow: visible;
+  padding-inline: 0;
+  box-sizing: border-box;
+}
+
+.chat-empty-state .chat-starter-tabs .MuiTabs-scroller {
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
+  overflow: visible !important;
+}
+
+.chat-empty-state .chat-starter-tabs .MuiTabs-scrollButtons,
+.chat-empty-state .chat-starter-tabs .MuiTabs-indicator {
+  display: none !important;
+}
+
+.chat-empty-state .chat-starter-tabs .MuiTabs-flexContainer,
+.chat-empty-state .chat-starter-tabs .MuiTabs-list {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  justify-content: center !important;
+  align-items: center !important;
+  width: 100%;
+  max-width: 100%;
+  gap: clamp(14px, 1.4vw, 22px) !important;
+  box-sizing: border-box;
+}
+
+.chat-empty-state .chat-starter-tabs .MuiTab-root {
+  flex: 0 0 auto !important;
+  min-width: 0 !important;
+  width: auto !important;
+  max-width: none !important;
+  min-height: 22px !important;
+  height: 22px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 0 !important;
+  border-radius: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  color: rgba(196, 205, 218, 0.6) !important;
+  font-size: 0.74rem !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.02em !important;
+  text-transform: none !important;
+  box-shadow: none !important;
+  clip-path: none !important;
+  position: relative;
+  transition: color 160ms ease !important;
+}
+
+/* Icon: hidden — labels alone read cleaner at this density */
+.chat-empty-state .chat-starter-tabs .MuiTab-root .MuiTab-iconWrapper {
+  display: none !important;
+}
+
+.chat-empty-state .chat-starter-tabs .MuiTab-root:hover {
+  color: rgba(238, 244, 248, 0.92) !important;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+/* Selected: brighter text + a thin teal underline 3px below the baseline */
+.chat-empty-state .chat-starter-tabs .MuiTab-root.Mui-selected {
+  color: rgba(186, 247, 228, 0.98) !important;
+  font-weight: 600 !important;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
+.chat-empty-state .chat-starter-tabs .MuiTab-root.Mui-selected::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -7px;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(120, 242, 176, 0.85) 30%,
+    rgba(120, 242, 176, 0.85) 70%,
+    transparent 100%
+  );
+  box-shadow: 0 0 8px rgba(120, 242, 176, 0.45);
+}
+
+.chat-empty-state .chat-starter-card[data-category="build"],
+.chat-empty-state .chat-starter-card[data-category="watch"],
+.chat-empty-state .chat-starter-card[data-category="background"],
+.chat-empty-state .chat-starter-card[data-category="swarm"],
+.chat-empty-state .chat-starter-card[data-category="browser"],
+.chat-empty-state .chat-starter-card[data-category="security"] {
+  --cat-accent: 120, 242, 176;
+}
+
+.chat-empty-state .chat-starter-card[data-category="research"],
+.chat-empty-state .chat-starter-card[data-category="advanced"] {
+  --cat-accent: 255, 190, 99;
+}
+
+.chat-empty-state .chat-starter-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  gap: 10px !important;
+  margin-top: 0 !important;
+  align-items: stretch;
+}
+
+.chat-empty-state .chat-starter-grid-expanded {
+  grid-template-columns: repeat(auto-fit, minmax(244px, 1fr)) !important;
+}
+
+.chat-empty-state .chat-starter-card {
+  min-height: 114px !important;
+  border-radius: 8px !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.024), rgba(255, 255, 255, 0.006)),
+    rgba(255, 255, 255, 0.018) !important;
+}
+
+.chat-empty-state .chat-starter-card-body {
+  min-height: 114px !important;
+  display: grid !important;
+  grid-template-columns: 38px minmax(0, 1fr) 24px;
+  align-items: center !important;
+  gap: 12px !important;
+  padding: 14px !important;
+}
+
+.chat-empty-state .chat-starter-card-icon {
+  width: 38px !important;
+  height: 38px !important;
+  border-radius: 8px !important;
+  position: relative;
+}
+
+.chat-empty-state .chat-starter-card-icon::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  z-index: -1;
+  border-radius: 14px;
+  background: radial-gradient(
+    closest-side,
+    rgba(var(--cat-accent, 120, 242, 176), 0.24),
+    transparent 76%
+  );
+  opacity: 0.34;
+  filter: blur(4px);
+  transition: opacity 180ms ease;
+}
+
+.chat-empty-state .chat-starter-card:hover .chat-starter-card-icon::after {
+  opacity: 0.62;
+}
+
+.chat-empty-state .chat-starter-card-main {
+  gap: 5px !important;
+  padding-right: 0 !important;
+}
+
+.chat-empty-state .chat-starter-card-meta {
+  min-height: 15px;
+}
+
+.chat-empty-state .chat-starter-card-title {
+  font-size: 0.9rem !important;
+  line-height: 1.25 !important;
+}
+
+.chat-empty-state .chat-starter-card-copy {
+  display: -webkit-box;
+  overflow: hidden;
+  line-height: 1.42 !important;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.chat-empty-state .chat-starter-card:hover {
+  border-color: rgba(var(--cat-accent, 120, 242, 176), 0.34) !important;
+}
+
+.chat-empty-state .chat-starter-card-go {
+  position: static !important;
+  justify-self: end;
+  align-self: center;
+  width: 24px !important;
+  height: 24px !important;
+  border-radius: 999px !important;
+}
+
+.chat-empty-state .chat-starter-advanced {
+  margin-top: 0 !important;
+  gap: 10px !important;
+}
+
+.chat-empty-state .chat-starter-advanced-bar {
+  display: grid !important;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "icon title toggle"
+    "icon copy toggle";
+  align-items: center !important;
+  column-gap: 12px !important;
+  row-gap: 2px !important;
+  padding: 12px 14px !important;
+  border-radius: 8px !important;
+  text-align: left;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0)),
+    rgba(10, 12, 10, 0.4) !important;
+}
+
+.chat-empty-state .chat-starter-advanced-icon {
+  grid-area: icon;
+  width: 30px !important;
+  height: 30px !important;
+  border-radius: 8px !important;
+}
+
+.chat-empty-state .chat-starter-advanced-bar .chat-starter-section-title {
+  grid-area: title;
+  justify-self: stretch;
+  margin: 0 !important;
+  text-align: left;
+}
+
+.chat-empty-state .chat-starter-advanced-bar .chat-starter-section-copy {
+  grid-area: copy;
+  justify-self: stretch;
+  margin: 0 !important;
+  min-width: 0;
+  text-align: left;
+}
+
+.chat-empty-state .chat-starter-advanced-bar .chat-starter-toggle {
+  grid-area: toggle;
+  justify-self: end;
+  margin-left: 0 !important;
+  min-height: 30px !important;
+  padding: 0 6px !important;
+  white-space: nowrap;
+}
+
+@media (max-width: 980px) {
+  .chat-empty-state .chat-starter-tabs .MuiTab-root {
+    flex-basis: clamp(90px, 18vw, 112px) !important;
+    width: clamp(90px, 18vw, 112px) !important;
+    max-width: clamp(90px, 18vw, 112px) !important;
+    min-width: clamp(90px, 18vw, 112px) !important;
+  }
+
+  .chat-empty-state .chat-starter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+@media (max-width: 880px) {
+  .chat-empty-state .chat-starter-tabs .MuiTabs-flexContainer,
+  .chat-empty-state .chat-starter-tabs .MuiTabs-list {
+    justify-content: center !important;
+  }
+  .chat-empty-state .chat-starter-tabs.MuiTabs-root {
+    max-width: none;
+  }
+  .chat-empty-state .chat-starter-caption {
+    align-self: center !important;
+    text-align: center;
+  }
+}
+
+@media (max-width: 640px) {
+  .chat-empty-state {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding-right: 12px !important;
+    padding-left: 12px !important;
+  }
+  .chat-empty-state .chat-composer-shell.chat-composer-shell-centered {
+    min-height: 62px !important;
+    border-radius: 16px !important;
+  }
+  .chat-empty-state .chat-starter-shell {
+    width: min(100%, calc(100svw - 56px)) !important;
+    max-width: min(100%, calc(100svw - 56px)) !important;
+    box-sizing: border-box;
+    overflow: visible;
+    padding: 10px 0 0 !important;
+    gap: 12px !important;
+  }
+  .chat-empty-state .chat-starter-grid,
+  .chat-empty-state .chat-starter-grid-expanded {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .chat-empty-state .chat-starter-tabs .MuiTab-root {
+    flex: 0 0 104px !important;
+    max-width: 104px !important;
+    min-width: 104px !important;
+    min-height: 42px !important;
+    height: 42px !important;
+    padding: 0 10px !important;
+    font-size: 0.72rem !important;
+  }
+  .chat-empty-state .chat-starter-tabs.MuiTabs-root {
+    max-width: 100%;
+    overflow: hidden;
+  }
+  .chat-empty-state .chat-starter-tabs .MuiTabs-scroller {
+    overflow-x: auto !important;
+    scrollbar-width: none;
+  }
+  .chat-empty-state .chat-starter-tabs .MuiTabs-scroller::-webkit-scrollbar {
+    display: none;
+  }
+  .chat-empty-state .chat-starter-tabs .MuiTabs-flexContainer,
+  .chat-empty-state .chat-starter-tabs .MuiTabs-list {
+    flex-wrap: nowrap !important;
+    justify-content: flex-start !important;
+    width: max-content;
+    min-width: 100%;
+    gap: 10px !important;
+  }
+  .chat-empty-state .chat-starter-tabs .MuiTab-root .MuiTab-iconWrapper {
+    width: 15px;
+    height: 15px;
+    flex-basis: 15px;
+  }
+  .chat-empty-state .chat-starter-tabs .MuiTab-root .MuiTab-iconWrapper svg {
+    width: 15px;
+    height: 15px;
+  }
+  .chat-empty-state .chat-starter-card,
+  .chat-empty-state .chat-starter-card-body {
+    min-height: 104px !important;
+  }
+  .chat-empty-state .chat-starter-card-body {
+    grid-template-columns: 34px minmax(0, 1fr);
+    padding: 12px !important;
+  }
+  .chat-empty-state .chat-starter-card-go {
+    display: none !important;
+  }
+  .chat-empty-state .chat-starter-card-copy,
+  .chat-empty-state .chat-starter-advanced-bar .chat-starter-section-copy {
+    display: block;
+    max-width: calc(100vw - 128px);
+  }
+  .chat-empty-state .chat-starter-card-icon {
+    width: 34px !important;
+    height: 34px !important;
+  }
+  .chat-empty-state .chat-starter-advanced-bar {
+    grid-template-columns: 30px minmax(0, 1fr);
+    grid-template-areas:
+      "icon title"
+      "copy copy"
+      "toggle toggle";
+    align-items: start !important;
+  }
+  .chat-empty-state .chat-starter-advanced-bar .chat-starter-toggle {
+    justify-self: start;
+    padding-left: 0 !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-empty-state .chat-starter-card,
+  .chat-empty-state .chat-composer-send-btn,
+  .chat-empty-state .chat-starter-card-icon::after {
+    transition: none !important;
+  }
+}

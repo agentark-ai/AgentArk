@@ -6,6 +6,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { api } from "../api/client";
 import { PRODUCT_CATEGORY } from "../brand";
+import { humanizeStatusLabel } from "../lib/displayLabels";
 import type { BrowserHandoffStatus } from "../types";
 import { isProfileBrowserSession } from "./browserHandoffMode";
 
@@ -48,6 +49,17 @@ function statusTone(status: string): "success" | "warning" | "error" | "info" | 
     default:
       return "default";
   }
+}
+
+function isTerminalBrowserStatus(status?: string | null): boolean {
+  const normalized = String(status || "").trim().toLowerCase();
+  return (
+    normalized === "completed" ||
+    normalized === "failed" ||
+    normalized === "interrupted" ||
+    normalized === "cancelled" ||
+    normalized === "canceled"
+  );
 }
 
 export function BrowserHandoffPage({ sessionId, onBack, onBackToBrowser }: BrowserHandoffPageProps) {
@@ -123,7 +135,9 @@ export function BrowserHandoffPage({ sessionId, onBack, onBackToBrowser }: Brows
   const backAction = profileBrowserSession && onBackToBrowser ? onBackToBrowser : onBack;
   const backLabel = profileBrowserSession ? "Back to Browser" : "Back to chat";
   const pageTitle = profileBrowserSession ? "Saved browser profile" : "Browser handoff";
-  const statusLabel = profileBrowserSession ? "browser open" : status?.status.replace(/_/g, " ");
+  const statusLabel = profileBrowserSession
+    ? "Browser open"
+    : humanizeStatusLabel(status?.status, "");
   const handoffErrorMessage = useMemo(() => {
     const raw = String((statusQ.error as Error)?.message || "Could not load browser handoff state.").trim();
     if (/\b404\b|not found/i.test(raw)) {
@@ -135,12 +149,15 @@ export function BrowserHandoffPage({ sessionId, onBack, onBackToBrowser }: Brows
     typeof window !== "undefined" &&
     window.location.protocol === "https:" &&
     !isLocalHost(window.location.hostname || "");
+  const terminalSession = isTerminalBrowserStatus(status?.status);
   const liveBrowserLocked = Boolean(liveUrl && !remoteMixedContentRisk && !operatorHasControl);
   const liveViewLockMessage =
     status?.can_claim
       ? "Claim live browser to take control. Until then this session stays read-only."
       : "AgentArk currently holds this browser. This session stays read-only until control is handed back to you.";
-  const liveViewHeight = "max(640px, min(1080px, calc((100vw - 48px) * 9 / 16)))";
+  const liveViewHeight = profileBrowserSession
+    ? "clamp(420px, calc(100dvh - 208px), 1080px)"
+    : "max(640px, min(1080px, calc((100vw - 48px) * 9 / 16)))";
 
   return (
     <Box
@@ -262,7 +279,7 @@ export function BrowserHandoffPage({ sessionId, onBack, onBackToBrowser }: Brows
                   </Button>
                 </>
               )}
-              {!profileBrowserSession && liveUrl ? (
+              {!terminalSession && liveUrl && !remoteMixedContentRisk ? (
                 operatorHasControl ? (
                   <Button variant="text" endIcon={<OpenInNewRoundedIcon />} href={liveUrl} target="_blank" rel="noreferrer" disabled={controlsLocked}>
                     Open live view
@@ -279,7 +296,12 @@ export function BrowserHandoffPage({ sessionId, onBack, onBackToBrowser }: Brows
               <Alert severity="warning">This handoff page is open over HTTPS, but the live browser stream is local HTTP. Open AgentArk on the same machine running Docker to take over the browser directly.</Alert>
             ) : null}
             {liveBrowserLocked ? <Alert severity="info">{liveViewLockMessage}</Alert> : null}
-            {!liveUrl && !remoteMixedContentRisk ? (
+            {terminalSession ? (
+              <Alert severity={status?.status === "failed" ? "error" : "info"}>
+                This browser run has ended. There is no live browser surface to claim or open.
+              </Alert>
+            ) : null}
+            {!terminalSession && !liveUrl && !remoteMixedContentRisk ? (
               <Alert severity="info">The live browser surface is not available yet. Keep this page open while AgentArk finishes wiring the handoff. The controls and live view refresh automatically.</Alert>
             ) : null}
 
@@ -293,7 +315,7 @@ export function BrowserHandoffPage({ sessionId, onBack, onBackToBrowser }: Brows
                   borderRadius: 2,
                   overflow: "hidden",
                   height: liveViewHeight,
-                  minHeight: { xs: 440, md: 640 },
+                  minHeight: profileBrowserSession ? { xs: 340, md: 420 } : { xs: 440, md: 640 },
                   background: "var(--surface-bg)",
                   boxShadow: "var(--surface-shadow-soft)",
                 }}
@@ -355,7 +377,7 @@ export function BrowserHandoffPage({ sessionId, onBack, onBackToBrowser }: Brows
               </Box>
             ) : null}
 
-            {!profileBrowserSession ? (
+            {!profileBrowserSession && !terminalSession ? (
               <TextField
                 label="What changed while you had control?"
                 value={note}

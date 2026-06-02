@@ -26,3 +26,4 @@ frontend/dist/
 frontend/node_modules/
 frontend/*.tsbuildinfo
 bridges/**/node_modules/
+bridges/voice-bridge/

@@ -158,6 +158,10 @@ verify_gepa_optimizer_runtime() {
     return 1
 }
 
+pull_runtime_images() {
+    ${COMPOSE} pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
+}
+
 if command -v docker >/dev/null 2>&1; then
     echo -e "${GREEN}[1/4] Docker found.${NC}"
 else
@@ -228,7 +232,7 @@ warn_if_port_in_use "${POSTGRES_PORT}" "Postgres"
 warn_if_port_in_use "8990" "AgentArk Web UI"
 
 echo -e "${GREEN}[4/4] Starting AgentArk...${NC}"
-${COMPOSE} pull
+pull_runtime_images
 ${COMPOSE} up -d
 verify_lightpanda_runtime
 verify_gepa_optimizer_runtime

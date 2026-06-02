@@ -12,7 +12,7 @@ mod sandbox;
 pub mod toolsets;
 mod transaction;
 
-pub use sandbox::{ActionSandbox, SandboxMode};
+pub use sandbox::SandboxMode;
 pub use transaction::TransactionManager;
 
 use anyhow::{Context, Result};
@@ -295,7 +295,6 @@ fn channel_target(argument_key: &str, default_target: &str) -> crate::actions::A
 /// The action runtime that manages execution
 pub struct ActionRuntime {
     config: RuntimeConfig,
-    sandbox: ActionSandbox,
     /// Transactions wrapped in Mutex for concurrent access
     transactions: tokio::sync::Mutex<TransactionManager>,
     /// Actions wrapped in RwLock for concurrent access
@@ -685,6 +684,8 @@ pub struct CustomApiBinding {
     pub parameters: Vec<crate::custom_apis::CustomApiParameter>,
     #[serde(default)]
     pub body_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,7 +841,11 @@ fn runtime_content_type_mime(value: &str) -> Option<String> {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if mime.contains('/') { Some(mime) } else { None }
+    if mime.contains('/') {
+        Some(mime)
+    } else {
+        None
+    }
 }
 
 fn runtime_mime_is_textual(value: &str) -> bool {
@@ -2214,24 +2219,45 @@ impl ActionRuntime {
         self.actions_dir.parent().unwrap_or(&self.actions_dir)
     }
 
+    fn default_workspace_root_for_data_dir(data_dir: &Path) -> PathBuf {
+        data_dir.join("workspace")
+    }
+
+    fn workspace_root_from_config(data_dir: &Path, configured: Option<&str>) -> PathBuf {
+        let fallback = Self::default_workspace_root_for_data_dir(data_dir);
+        let Some(configured) = configured
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return fallback;
+        };
+
+        let candidate = {
+            let path = PathBuf::from(configured);
+            if path.is_absolute() {
+                path
+            } else {
+                data_dir.join(path)
+            }
+        };
+
+        if data_dir_looks_like_source_checkout(&candidate) {
+            fallback
+        } else {
+            candidate
+        }
+    }
+
     fn settings_manager(&self) -> Result<SecureConfigManager> {
         SecureConfigManager::new_with_data_dir(&self.config_dir, Some(self.data_dir()))
     }
 
     fn workspace_root(&self) -> PathBuf {
-        let configured = std::env::var("AGENTARK_WORKSPACE_ROOT")
+        let configured = std::env::var("AGENTARK_FILE_WORKSPACE_ROOT")
             .ok()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        let fallback = std::env::current_dir()
-            .ok()
-            .unwrap_or_else(|| self.data_dir().to_path_buf());
-        match configured {
-            Some(path) if path.is_absolute() => path,
-            Some(path) => fallback.join(path),
-            None => fallback,
-        }
+            .filter(|value| !value.is_empty());
+        Self::workspace_root_from_config(self.data_dir(), configured.as_deref())
     }
 
     fn action_source_label(source: &ActionSource) -> &'static str {
@@ -3860,12 +3886,10 @@ impl ActionRuntime {
         let snapshot_dir = data_dir.join(&config.snapshot_dir);
         std::fs::create_dir_all(&snapshot_dir)?;
 
-        let sandbox = ActionSandbox::new(&config)?;
         let transactions = TransactionManager::new(snapshot_dir);
 
         let runtime = Self {
             config,
-            sandbox,
             transactions: tokio::sync::Mutex::new(transactions),
             actions: tokio::sync::RwLock::new(HashMap::new()),
             disabled_actions: tokio::sync::RwLock::new(disabled_actions),
@@ -4146,7 +4170,7 @@ Optional inputs:
         // File operations
         self.register_builtin_action(ActionDef {
             name: "file_read".to_string(),
-            description: "Read a single file from the workspace or data directory. Text files return UTF-8 content. Binary or non-UTF-8 files return a ResourceRef so the framework can save, pass to code_execute, or refer to the bytes later without converting them to text. The path must resolve inside the configured workspace and data directories; absolute paths outside those roots are rejected. Credential-looking files such as runtime env files, .env files, private keys, and credential JSON files are refused; use the secure credential store instead.".to_string(),
+            description: "Read a single file from the data-owned workspace, data directory, or other explicitly allowed runtime roots. Text files return UTF-8 content. Binary or non-UTF-8 files return a ResourceRef so the framework can save, pass to code_execute, or refer to the bytes later without converting them to text. Credential-looking files such as runtime env files, .env files, private keys, and credential JSON files are refused; use the secure credential store instead.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4165,7 +4189,7 @@ Optional inputs:
 
         self.register_builtin_action(ActionDef {
             name: "file_write".to_string(),
-            description: "Author or overwrite a single file in the workspace or data directory. Provide text with content, raw bytes with content_base64, copy an existing allowed file with source_path, or copy any ResourceRef returned by a prior tool with source_resource. Use source_resource when a fetch/browser/http tool produced payload.kind=resource so binary artifacts are saved exactly instead of being converted to text. Parent directories are created if they do not already exist. For generated multi-file services or browser apps, write each file under one workspace directory, then register the staged directory with service_manage using source_dir and source_paths so the runnable service is assembled from those files.".to_string(),
+            description: "Author or overwrite a single file in the data-owned workspace or data directory. Relative paths and /workspace-style paths are isolated from the product source checkout. Provide text with content, raw bytes with content_base64, copy an existing allowed file with source_path, or copy any ResourceRef returned by a prior tool with source_resource. Use source_resource when a fetch/browser/http tool produced payload.kind=resource so binary artifacts are saved exactly instead of being converted to text. Parent directories are created if they do not already exist. For generated multi-file services or browser apps, write each file under one data-owned workspace subdirectory, then register the staged directory with service_manage or app_deploy using source_dir so the runnable service is assembled from those files.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4205,7 +4229,7 @@ Optional inputs:
 
         self.register_builtin_action(ActionDef {
             name: "file_delete".to_string(),
-            description: "Delete a single managed workspace/data file. Paths must resolve inside allowed roots; directories and credential-looking files are refused. A missing file returns a terminal not_found result instead of failing so callers can answer without retry loops.".to_string(),
+            description: "Delete a single managed workspace/data file. Writable paths must resolve inside data-owned or config/action roots; directories and credential-looking files are refused. A missing file returns a terminal not_found result instead of failing so callers can answer without retry loops.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4225,7 +4249,7 @@ Optional inputs:
 
         self.register_builtin_action(ActionDef {
             name: "file_search".to_string(),
-            description: "Search workspace and data-root files without shell access. Use to inspect repositories, generated app sources, local documents, logs, and artifacts before deciding what to read or modify. Supports filename search, content search, include/exclude globs, context lines, limits, and a root restricted to allowed workspace/data paths. Credential-looking files are skipped. For app follow-up work, use this with ark_inspect when needed to locate the deployed or staged source, then use file_patch for small verified edits.".to_string(),
+            description: "Search workspace and data-root files without shell access. Use to inspect generated app sources, local documents, logs, artifacts, and explicitly allowed repositories before deciding what to read or modify. Supports filename search, content search, include/exclude globs, context lines, limits, and a root restricted to allowed workspace/data paths. Credential-looking files are skipped. For app follow-up work, use this with ark_inspect when needed to locate the deployed or staged source, then use file_patch for small verified edits.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4473,13 +4497,15 @@ Optional inputs:
 
         self.register_builtin_action(ActionDef {
             name: "page_fetch".to_string(),
-            description: "Fetch a single user-provided public URL and return a typed payload for the current workflow. Readable pages and documents return text; binary or non-text resources return ResourceRefs so they can be saved or reused exactly. Uses a built-in fetch ladder and reports degenerate/empty content as a recoverable failure instead of pretending the page was read.".to_string(),
+            description: "Fetch a single user-provided public URL and return a typed payload for the current workflow. Readable pages and documents return text by default; set as_resource=true when later file, document, skill, app, ingestion, or follow-up steps need the exact fetched bytes as a ResourceRef. Binary or non-text resources return ResourceRefs automatically. Uses a built-in fetch ladder and reports degenerate/empty content as a recoverable failure instead of pretending the page was read.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "Public HTTP or HTTPS URL to fetch." },
-                    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 50000, "description": "Maximum readable characters to return. Defaults to 12000." }
+                    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 50000, "description": "Maximum readable characters to return. Defaults to 12000." },
+                    "as_resource": { "type": "boolean", "description": "Return exact response bytes as a managed ResourceRef instead of clipped readable text." },
+                    "suggested_name": { "type": "string", "description": "Optional safe filename hint for the managed ResourceRef when as_resource=true." }
                 },
                 "required": ["url"],
                 "additionalProperties": false
@@ -4502,7 +4528,7 @@ Optional inputs:
 
         self.register_builtin_action(ActionDef {
             name: "http_request".to_string(),
-            description: "Execute a direct public HTTP request and return a structured, redacted response summary. Use when the requested outcome is the actual one-off API operation described by the user or by instructions already read in the workflow. Use save_to to write raw response bytes to a chosen path; otherwise binary or non-text bodies are auto-persisted as ResourceRefs. When a JSON response contains values that must persist for later steps, use persist_response to write selected response fields to durable runtime files without exposing sensitive values in chat or model-visible tool output.".to_string(),
+            description: "Execute a direct public HTTP request and return a structured, redacted response summary. Use when the requested outcome is the actual one-off API operation described by the user or by instructions already read in the workflow. Use as_resource=true to return raw response bytes as a ResourceRef without choosing a save_to path; use save_to only when a concrete workspace/data path is needed. Binary or non-text bodies are auto-persisted as ResourceRefs. When a JSON response contains values that must persist for later steps, use persist_response to write selected response fields to durable runtime files without exposing sensitive values in chat or model-visible tool output.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4514,18 +4540,21 @@ Optional inputs:
                     "body": { "description": "Optional JSON request body for methods that accept a body." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300, "description": "Request timeout in seconds. Defaults to 30." },
                     "save_to": { "type": "string", "description": "Optional workspace/data file path where the raw response body bytes should be written exactly as returned." },
+                    "as_resource": { "type": "boolean", "description": "Return exact response bytes as a managed ResourceRef without requiring a caller-chosen path." },
+                    "suggested_name": { "type": "string", "description": "Optional safe filename hint for the managed ResourceRef when as_resource=true or auto-persisting a non-text response." },
                     "persist_response": {
                         "type": "array",
-                        "description": "Optional response fields to persist durably after a successful response. Each item extracts a JSON path from the response body and writes it to target_path. Use this instead of code_execute when returned credentials or config must survive later turns.",
+                        "description": "Optional response fields to persist durably after a successful response. Each item extracts a JSON path from the response body and writes it to target_path or encrypted secret_key before response redaction. Use this instead of code_exec when returned credentials or config must survive later turns.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "response_path": { "type": "string", "description": "Dot path into the JSON response body, such as agentId or data.token." },
                                 "target_path": { "type": "string", "description": "Durable runtime file path. Use ~/relative paths for runtime-home files." },
+                                "secret_key": { "type": "string", "description": "Encrypted custom-secret key for the extracted response value. Use for returned credentials/tokens that must persist without appearing in model-visible output." },
                                 "format": { "type": "string", "enum": ["text", "json"], "description": "How to serialize the extracted value. Defaults to text." },
                                 "sensitive": { "type": "boolean", "description": "Whether the value is sensitive. Sensitive values are written but never returned in tool output." }
                             },
-                            "required": ["response_path", "target_path"],
+                            "required": ["response_path"],
                             "additionalProperties": false
                         }
                     }
@@ -4690,7 +4719,7 @@ Optional inputs:
         // Shell commands (requires approval by default)
         self.register_builtin_action(ActionDef {
             name: "shell".to_string(),
-            description: "Run a single shell command in AgentArk's configured command executor and return combined stdout/stderr plus exit status. Use it as a general terminal primitive for diagnostics, repo setup, build commands, small scripted transformations, or process-oriented work. The executor may be isolated, so durable artifacts should be written through file tools or registered as managed services when they must remain available after the turn. Use background=true for long-running command work that should outlive the current turn.".to_string(),
+            description: "Run a single shell command in AgentArk's configured command executor and return combined stdout/stderr plus exit status. Use it as a general terminal primitive for diagnostics, repo setup, build commands, small scripted transformations, or process-oriented work. For ordered diagnostics, run a compact non-interactive script or call shell repeatedly as evidence is discovered; checking versions, installed tools, logs, build output, and test output is expected repair work, not a reason to regenerate an app. The executor may be isolated, so durable artifacts should be written through file tools or registered as managed services when they must remain available after the turn. Use background=true for long-running command work that should outlive the current turn.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -5177,11 +5206,12 @@ Optional inputs:
 
         self.register_builtin_action(ActionDef {
             name: "capability_acquire".to_string(),
-            description: "Scaffold a reusable capability when the needed capability does not already exist. HTTP/API capabilities are saved as custom API integrations so they appear in Settings > Integrations and register generated API actions. Do not create user skills for API integrations; use skill import/create only when the user is explicitly working with a skill source. Do not use this for extension-pack integrations or connector installs; use the extension_pack_* actions for those.".to_string(),
+            description: "Scaffold a reusable capability when the needed capability does not already exist. HTTP/API capabilities are saved as custom API integrations so they appear in Settings > Integrations and register generated API actions. Prefer this for official HTTP, REST, and GraphQL provider APIs when no built-in or extension-pack integration is available, even if a community MCP wrapper exists. Do not create user skills for API integrations; use skill import/create only when the user is explicitly working with a skill source. Do not use this for extension-pack integrations or connector installs; use the extension_pack_* actions for those.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "id": { "type": "string", "description": "Stable capability/integration id. If omitted, it is derived from name." },
                     "name": { "type": "string", "description": "Action name to create in kebab-case" },
                     "description": { "type": "string", "description": "What the new capability should do" },
                     "kind": { "type": "string", "enum": ["rest_api", "oauth_api", "openapi", "web_automation"], "description": "Scaffold mode" },
@@ -5189,14 +5219,15 @@ Optional inputs:
                     "method": { "type": "string", "enum": ["get", "post", "put", "patch", "delete"], "description": "Primary HTTP method" },
                     "path": { "type": "string", "description": "Primary path or endpoint path" },
                     "required_inputs": { "type": "array", "items": { "type": "string" }, "description": "Runtime inputs the generated action should require" },
-                    "auth_type": { "type": "string", "enum": ["none", "bearer", "api_key_header", "api_key_query", "oauth2", "basic"], "description": "Primary auth strategy" },
+                    "auth_type": { "type": "string", "enum": ["none", "bearer", "api_key_header", "api_key_query", "oauth2", "basic"], "description": "Primary auth strategy. Use api_key_header plus auth_header_name=Authorization for API keys sent directly in the Authorization header; use bearer only when the provider requires a Bearer-prefixed token." },
                     "auth_mode": { "type": "string", "enum": ["none", "bearer", "api_key_header", "api_key_query", "oauth2", "basic"], "description": "Alias for auth_type when updating from a saved custom API record." },
                     "auth_secret_name": { "type": "string", "description": "Optional provider credential label from docs. Custom API integrations store credentials under the integration connection; users do not need to know or enter an internal secret storage key." },
-                    "auth_header_name": { "type": "string", "description": "Header name for api_key_header auth" },
+                    "auth_header_name": { "type": "string", "description": "Header name for api_key_header auth, such as Authorization when docs show Authorization: <API_KEY> without a Bearer prefix." },
                     "auth_header": { "type": "string", "description": "Alias for auth_header_name when updating from a saved custom API record." },
                     "auth_name": { "type": "string", "description": "Stored auth parameter/header name from a saved custom API record." },
                     "default_headers": { "type": "object", "description": "Static default headers" },
                     "default_query": { "type": "object", "description": "Static default query params" },
+                    "body": { "description": "Optional default JSON request body for the generated operation. Safe read operations can store this body so later calls do not need to reconstruct it." },
                     "body_template": { "description": "Optional request body template" },
                     "read_only": { "type": "boolean", "description": "Whether the generated operation only retrieves data and must not perform external writes. GraphQL read operations are validated at execution time." },
                     "pagination": { "type": "object", "description": "connector_request pagination configuration" },
@@ -5568,7 +5599,7 @@ Optional inputs:
         // Code execution sandbox
         self.register_builtin_action(ActionDef {
             name: "code_execute".to_string(),
-            description: "Dominant execution primitive for tasks that require computation, scripting, live debugging, file generation, dependency bootstrap, network retrieval, data processing, validation, or iterative repair when no auth-bound shortcut is clearly required. Write a small program, run it, inspect stdout/stderr/exit status/generated files, and iterate on concrete errors. Use direct integration actions for OAuth-held services or guarded product capabilities, but otherwise prefer this over narrow catalog actions. Supports Python, JavaScript/TypeScript, Bash, notebooks, compiled languages, dependency installation, uploaded files at /data/<filename>, optional env vars, generated output files, and explicit network egress when the task needs live connectivity.".to_string(),
+            description: "Dominant execution primitive for tasks that require computation, scripting, live debugging, file generation, dependency bootstrap, network retrieval, data processing, validation, or iterative repair when no auth-bound shortcut is clearly required. Write a small program, run it, inspect stdout/stderr/exit status/generated files, and iterate on concrete errors. For app or repo repairs, ordered probes such as version checks, installed-package checks, logs, builds, and tests are supported and should guide the smallest patch/restart/redeploy needed. Use direct integration actions for OAuth-held services or guarded product capabilities, but otherwise prefer this over narrow catalog actions. Supports Python, JavaScript/TypeScript, Bash, notebooks, compiled languages, dependency installation, uploaded files at /data/<filename>, optional env vars, generated output files, and explicit network egress when the task needs live connectivity.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -6182,7 +6213,7 @@ Optional inputs:
 
         self.register_builtin_action(ActionDef {
             name: "mcp_server_manage".to_string(),
-            description: "Create, update, delete, refresh, list, or inspect AgentArk MCP server configurations. Use when the requested integration is an MCP server for AgentArk itself. Save non-secret transport/auth configuration immediately; store supplied secrets encrypted, or return a credential-needed status when the server requires a token/password that was not provided.".to_string(),
+            description: "Create, update, delete, refresh, list, or inspect AgentArk MCP server configurations. Use only when the requested integration substrate is explicitly an MCP server for AgentArk itself, such as a provider MCP endpoint, stdio command, or MCP server configuration. Do not use this as the default installer for providers with official HTTP, REST, or GraphQL APIs; use custom API or extension-pack setup for those. Save non-secret transport/auth configuration immediately; store supplied secrets encrypted, or return a credential-needed status when the server requires a token/password that was not provided.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -6613,6 +6644,39 @@ Optional inputs:
         }).await;
 
         self.register_builtin_action(ActionDef {
+            name: "custom_messaging_channel_manage".to_string(),
+            description: "Delete, enable, disable, or test an existing reusable custom messaging channel. Use only to manage the saved AgentArk channel record, not to send an ordinary notification.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Saved custom messaging channel id." },
+                    "operation": { "type": "string", "enum": ["delete", "enable", "disable", "test"] }
+                },
+                "required": ["id", "operation"],
+                "additionalProperties": false
+            }),
+            capabilities: vec!["integration_admin".to_string(), "notify".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: ActionAuthorization {
+                risk_level: ActionRiskLevel::High,
+                requires_auth: true,
+                rate_limit: Some(crate::actions::ActionRateLimit {
+                    max_calls: 5,
+                    window_seconds: 300,
+                }),
+                human_approval: crate::actions::ActionHumanApproval { required: true },
+                outbound: crate::actions::ActionEgressPolicy {
+                    outbound_write: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }).await;
+
+        self.register_builtin_action(ActionDef {
             name: "extension_pack_set_enabled".to_string(),
             description: "Enable or disable an installed extension pack so its registered actions can be used by the agent.".to_string(),
             version: "1.0.0".to_string(),
@@ -6623,6 +6687,31 @@ Optional inputs:
                     "enabled": { "type": "boolean" }
                 },
                 "required": ["pack_id", "enabled"]
+            }),
+            capabilities: vec![
+                "integration_admin".to_string(),
+                "extension_pack_lifecycle".to_string(),
+            ],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "extension_pack_delete".to_string(),
+            description: "Delete an installed non-bundled extension pack and optionally remove its saved connections and auth profiles. Bundled AgentArk packs can be disabled but not deleted.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pack_id": { "type": "string" },
+                    "remove_connections": {
+                        "type": "boolean",
+                        "description": "Remove saved connections and owned auth profiles for this pack. Default true."
+                    }
+                },
+                "required": ["pack_id"]
             }),
             capabilities: vec![
                 "integration_admin".to_string(),
@@ -7354,6 +7443,49 @@ Optional inputs:
         }
 
         self.register_builtin_action(ActionDef {
+            name: "browser_profile_manage".to_string(),
+            description: "Manage saved browser login profiles as durable AgentArk resources. Supports listing available profiles, resolving a selector, launching a profile for login repair, closing and saving live profile sessions, and creating, updating, or deleting profile records. Browser tasks can then reuse these profiles through browser_auto profile/profile_id fields.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["create", "read", "update", "delete", "list", "status", "launch", "close", "resolve"],
+                        "description": "Browser profile resource operation."
+                    },
+                    "id": { "type": "string", "description": "Exact browser profile id." },
+                    "profile_id": { "type": "string", "description": "Exact browser profile id." },
+                    "profile": { "type": "string", "description": "Browser profile selector by id, name, target, tag, or semantic description." },
+                    "query": { "type": "string", "description": "Browser profile selector for read/resolve/status." },
+                    "name": { "type": "string", "description": "Profile display name for create/update." },
+                    "description": { "type": "string", "description": "Profile description for create/update." },
+                    "browser": { "type": "string", "description": "Browser engine preference, such as chrome." },
+                    "managed": { "type": "boolean", "description": "Whether the profile is an AgentArk-managed sandbox profile." },
+                    "enabled": { "type": "boolean", "description": "Whether the profile can be selected for browser tasks." },
+                    "target_kind": { "type": "string", "enum": ["sandbox", "host", "remote_cdp"], "description": "Profile storage/control target." },
+                    "target_endpoint": { "type": "string", "description": "Remote browser endpoint when target_kind is remote_cdp." },
+                    "target_profile_path": { "type": "string", "description": "Host profile path when explicitly configured." },
+                    "target_workspace": { "type": "string", "description": "Optional workspace/scope label for the profile." },
+                    "login_state": { "type": "string", "enum": ["unknown", "logged_out", "logged_in", "needs_mfa", "expired", "error"], "description": "Known login state for the profile." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Profile tags for semantic selection." },
+                    "metadata": { "type": "object", "description": "Non-sensitive browser profile metadata." }
+                },
+                "required": ["operation"],
+                "additionalProperties": false
+            }),
+            capabilities: vec![
+                "browser".to_string(),
+                "browser_profile".to_string(),
+                "capability_inventory".to_string(),
+            ],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        }).await;
+
+        self.register_builtin_action(ActionDef {
             name: "browser_auto".to_string(),
             description: "Start a managed background browser session for website interaction. Use when the task is high-level live web work such as going to a site, logging in, filling a form, or handing off MFA/CAPTCHA steps to the user. For explicit step-by-step browser control, use browser_navigate, browser_snapshot, browser_click, browser_type, browser_scroll, browser_press, browser_back, browser_screenshot, and browser_console.".to_string(),
             version: "1.0.0".to_string(),
@@ -7375,7 +7507,11 @@ Optional inputs:
                 },
                 "required": ["action"]
             }),
-            capabilities: vec!["network".to_string()],
+            capabilities: vec![
+                "network".to_string(),
+                "browser".to_string(),
+                "browser_profile".to_string(),
+            ],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -7708,7 +7844,7 @@ Optional inputs:
         // app-specific lifecycle compatibility actions.
         self.register_builtin_action(ActionDef {
             name: "service_manage".to_string(),
-            description: "Create, update, inspect, restart, stop, or delete a managed local service. Use this for durable browser-runnable apps, dashboards, games, tools, repo deployments, local services, and other outputs that must remain available after the turn. Stage source files with file_write/file_patch first when useful, then call operation=create/update with source_dir and source_paths, files, or repo_url. Use schedule_task for independent future/recurring work; put refresh timers that belong to the delivered UI inside the service itself. This is the generic service primitive; legacy app_* lifecycle actions are compatibility surfaces.".to_string(),
+            description: "Create, update, inspect, restart, stop, or delete a managed local service. Use this for durable browser-runnable apps, dashboards, games, tools, repo deployments, local services, and other outputs that must remain available after the turn. Stage source files with file_write/file_patch first when useful, then call operation=create/update with source_dir, files, or repo_url; include source_paths only when deploying a deliberate subset of source_dir. Use update/patch for the active app in the conversation; use duplicate_policy=create_new or allow_duplicate=true only when a separate new app is intentionally requested. Deploy completion is registration/startup evidence, not proof that browser JavaScript, client-side fetches, or the full requested workflow worked. Use schedule_task for independent future/recurring work; put refresh timers that belong to the delivered UI inside the service itself. This is the generic service primitive; legacy app_* lifecycle actions are compatibility surfaces.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -7743,7 +7879,7 @@ Optional inputs:
                     "source_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Relative paths under source_dir to include."
+                        "description": "Optional relative paths under source_dir to include when only a subset should be published."
                     },
                     "files": {
                         "type": "object",
@@ -7841,7 +7977,7 @@ Optional inputs:
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
             description: format!(
-                "Deploy a web app or server and return a live URL. Supports generated files, files staged in the workspace, line-level patches to an existing app, explicit file deletes, OR a repository source. Use when the intended outcome is a managed browser-usable or hosted artifact, such as building a dashboard, creating a tool, making a website, building an app, or deploying/running a repo locally for the user. External publishing is explicit: deploy_target defaults to local; set deploy_target=\"vercel_direct\" only when the selected app deployment layer is Vercel direct API publishing, or deploy_target=\"vercel_git\" only when the selected layer is Git-backed Vercel. If the requested timing/cadence describes how the generated artifact refreshes, polls, auto-updates, backfills, or presents live data, implement that behavior inside the artifact rather than creating an AgentArk schedule or watcher. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep generated bundles lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs: secret credentials, authenticated server-side API access, durable jobs that must continue with no browser open, durable server-side state/databases, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs that the browser/app proxy cannot safely call. {inline_report_boundary} For generated multi-file apps, prefer staging each file with `file_write` under one workspace directory, then call app_deploy with `source_dir` and `source_paths`; this gives the user per-file progress and avoids one giant deploy payload. For edits to a known existing app, prefer `mode=\"patch\"` with `app_id` and `file_patches` unified diffs for small line changes, plus `delete_paths` for removed files; use full `files` only for files that must be replaced completely. After a deployed app has a defect or requested change, inspect existing deployed/workspace files with `ark_inspect` or `file_search` as appropriate, apply small source edits with `file_patch`, then redeploy with app_deploy or restart with app_restart when the hosted artifact needs refresh. For small file-based apps, you may instead provide a `files` object containing every local file needed by the page: if HTML/CSS references a local stylesheet, script, image, font, manifest, or media asset, include that file too. The delivered app must implement the requested workflow and controls; do not substitute a placeholder, mock-only screen, or decorative shell when the user asked for working behavior. Static browser apps should omit package manifests, server files, `entry_command`, and `start_command` unless a real runtime is needed. Local asset paths must be app-relative, not root-relative. For generated static apps that read public APIs, prefer app-relative {} helpers over third-party CORS proxy services. The app-scoped `__agentark/http/fetch?url=...` helper performs same-origin public GET/HEAD requests for public hosts referenced by the deployed app source; it is not for private networks or secrets. Authenticated API apps are supported, but do not embed credentials in browser JavaScript or static files. Build a dynamic backend/proxy when an API needs secret headers/tokens, declare the needed keys in `required_inputs`/`required_secrets`, read them from process env at runtime, and use `config` only for non-sensitive values such as base URLs. AgentArk's own model/provider credentials are not inherited by generated apps; app credentials must be supplied intentionally through the secure credential store. When modifying a known deployed app, provide its stable `app_id`; otherwise a new deployment is created unless duplicate detection finds a matching app to reuse or replace. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, provide `entry_command` or `start_command` only when the app needs a long-lived server/runtime; a start command makes the app dynamic unless `runtime_required=false` is explicitly supplied. Generated dynamic bundles may be Python, Node/TypeScript, Rust, or another direct-command stack when the files include complete project configuration plus appropriate lifecycle commands. Dynamic app runtimes persist their app directory and lifecycle commands, can install dependencies with network access before startup (`pip`, `npm`, `cargo`, etc.), can run an optional `stop_command` as a graceful stop hook, and restart from saved metadata. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided; use `runtime_image` for specialized toolchains not present in the default runner. Deployment is local by default. Content visibility or audience requirements inside the app are not the same as external network exposure; set expose_public only when the deployment target itself is external/public internet exposure. Local app deployments stay local and access guard defaults to off unless the user explicitly enables local App Guard or supplies a local access password. Public exposure does not change the local URL or local guard setting; the public app surface is protected by App Guard and AgentArk generates a public access password if one is not supplied. After deployment, direct the user to the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls. Declare required inputs via required_inputs and mark each item sensitive=true/false.",
+                "Deploy a web app or server and return a live URL. Supports generated files, files staged in the data-owned workspace, line-level patches to an existing app, explicit file deletes, OR a repository source. Use when the intended outcome is a managed browser-usable or hosted artifact, such as building a dashboard, creating a tool, making a website, building an app, or deploying/running a repo locally for the user. External publishing is explicit: deploy_target defaults to local; set deploy_target=\"vercel_direct\" only when the selected app deployment layer is Vercel direct API publishing, or deploy_target=\"vercel_git\" only when the selected layer is Git-backed Vercel. If the requested timing/cadence describes how the generated artifact refreshes, polls, auto-updates, backfills, or presents live data, implement that behavior inside the artifact rather than creating an AgentArk schedule or watcher. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep generated bundles lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs: secret credentials, authenticated server-side API access, durable jobs that must continue with no browser open, durable server-side state/databases, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs that the browser/app proxy cannot safely call. {inline_report_boundary} For generated multi-file apps, prefer staging each file with `file_write` under one data-owned workspace subdirectory, then call app_deploy with `source_dir`; include `source_paths` only when intentionally deploying a subset. This gives the user per-file progress and avoids one giant deploy payload. For follow-up defects, runtime errors, or requested changes to a known existing app, inspect the existing deployment status/logs/source first, run targeted diagnostic commands when status/logs/source are insufficient, then choose the smallest sufficient operation: app_restart for runtime-only recovery, mode=\"patch\" with app_id and file_patches for localized source changes, or full files/source replacement only when the required change is broad. Keep the existing app_id unless the user intentionally wants another deployment; do not regenerate a full app, re-emit unrelated files, or reinstall dependencies when a targeted patch/restart resolves the underlying issue. For small file-based apps, you may instead provide a `files` object containing every local file needed by the page: if HTML/CSS references a local stylesheet, script, image, font, manifest, or media asset, include that file too. The delivered app must implement the requested workflow and controls; do not substitute a placeholder, mock-only screen, weaker implementation, or decorative shell when the user asked for working behavior or stated implementation preferences. Include request_context and acceptance_criteria so deploy review can validate the delivered app against the requested semantic contract without relying on exact user phrasing. Static browser apps should omit package manifests, server files, `entry_command`, and `start_command` unless a real runtime is needed. Local asset paths must be app-relative, not root-relative. For generated static apps that read public APIs, prefer app-relative {} helpers over third-party CORS proxy services. The app-scoped `__agentark/http/fetch?url=...` helper performs same-origin public GET/HEAD requests for public hosts referenced by the deployed app source; it is not for private networks or secrets. Authenticated API apps are supported, but do not embed credentials in browser JavaScript or static files. Build a dynamic backend/proxy when an API needs secret headers/tokens, declare the needed keys in `required_inputs`/`required_secrets`, read them from process env at runtime, and use `config` only for non-sensitive values such as base URLs. AgentArk's own model/provider credentials are not inherited by generated apps; app credentials must be supplied intentionally through the secure credential store. When modifying a known deployed app, provide its stable `app_id`; otherwise a new deployment is created unless duplicate detection finds a matching app to reuse or replace. Use allow_duplicate=true or duplicate_policy=create_new only when a separate new deployment is intentionally requested. The returned deploy result confirms registration/startup scope only; do not claim browser JavaScript, client-side fetches, or end-to-end workflow validation unless a separate browser/runtime check was run and passed. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, provide `entry_command` or `start_command` only when the app needs a long-lived server/runtime; a start command makes the app dynamic unless `runtime_required=false` is explicitly supplied. Generated dynamic bundles may be Python, Node/TypeScript, Rust, or another direct-command stack when the files include complete project configuration plus appropriate lifecycle commands. Dynamic app runtimes persist their app directory and lifecycle commands, can install dependencies with network access before startup (`pip`, `npm`, `cargo`, etc.), can run optional multi-step direct setup commands separated by &&, can run an optional `stop_command` as a graceful stop hook, and restart from saved metadata. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided; use `runtime_image` for specialized toolchains not present in the default runner. Deployment is local by default. Content visibility or audience requirements inside the app are not the same as external network exposure; set expose_public only when the deployment target itself is external/public internet exposure. Local app deployments stay local and access guard defaults to off unless the user explicitly enables local App Guard or supplies a local access password. Public exposure does not change the local URL or local guard setting; the public app surface is protected by App Guard and AgentArk generates a public access password if one is not supplied. After deployment, direct the user to the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls. Declare required inputs via required_inputs and mark each item sensitive=true/false.",
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME,
@@ -7860,7 +7996,7 @@ Optional inputs:
                         "type": "string",
                         "enum": ["replace", "patch"],
                         "default": "replace",
-                        "description": "replace creates or replaces the declared app bundle and removes stale managed files. patch requires app_id and applies only file_patches, complete changed files in files/source_paths, and delete_paths while preserving all other managed files."
+                        "description": "replace creates or replaces the declared app bundle and removes stale managed files. patch requires app_id and applies only file_patches, complete changed files in files or resolved source_dir contents, and delete_paths while preserving all other managed files."
                     },
                     "files": {
                         "type": "object",
@@ -7881,16 +8017,16 @@ Optional inputs:
                     "delete_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "App-relative files to remove from the existing app bundle. Use with mode='patch' for deletions; replace mode also removes stale managed files not declared in files/source_paths."
+                        "description": "App-relative files to remove from the existing app bundle. Use with mode='patch' for deletions; replace mode also removes stale managed files not declared in files or resolved source_dir contents."
                     },
                     "source_dir": {
                         "type": "string",
-                        "description": "Optional workspace/data directory already populated with app files via file_write. When supplied with source_paths, app_deploy reads those staged files instead of receiving a large files object."
+                        "description": "Optional data-owned workspace/data directory already populated with app files via file_write. If source_paths is omitted, app_deploy discovers deployable files under this directory instead of receiving a large files object."
                     },
                     "source_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "App-relative file paths under source_dir to include in the bundle, such as [\"index.html\", \"style.css\", \"src/App.tsx\"]. Required when using source_dir without files."
+                        "description": "Optional app-relative file paths under source_dir to include when only a subset should be published, such as [\"index.html\", \"style.css\", \"src/App.tsx\"]."
                     },
                     "repo_url": {
                         "type": "string",
@@ -7945,6 +8081,15 @@ Optional inputs:
                         "description": "Optional Vercel projectSettings.outputDirectory for source-based deployments."
                     },
                     "title": { "type": "string", "description": "App name/title (default: App)" },
+                    "request_context": {
+                        "type": "string",
+                        "description": "Semantic summary of the user-requested app outcome, including explicit implementation preferences or constraints. Used for deploy acceptance review; do not use this as a trigger phrase."
+                    },
+                    "acceptance_criteria": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Concrete requested capabilities, workflows, data/persistence requirements, runtime/integration constraints, and user preferences that the deployed app must satisfy."
+                    },
                     "entry_command": {
                         "type": "string",
                         "description": "Command to start the server process (omit for static HTML apps). Supplying this makes the app a persistent dynamic runtime unless runtime_required=false is explicitly set. Use {PORT} placeholder or PORT env var for the port. Python apps auto-activate their venv. Examples: 'python3 app.py', 'node server.js', 'npm run start', 'uvicorn app:app --host 0.0.0.0 --port {PORT}', 'cargo run'"
@@ -7955,7 +8100,7 @@ Optional inputs:
                     },
                     "install_command": {
                         "type": "string",
-                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt - a venv is auto-created. Each app runs in its own persistent isolated environment (Python venv, local node_modules, or stack-specific build cache), and dynamic runtime dependency installs may use network access. Examples: 'pip install -r requirements.txt', 'npm install', 'cargo fetch'"
+                        "description": "One or more direct setup commands to run before starting (optional). Separate multiple direct setup steps with &&; each step is parsed and executed separately without a shell, so shell snippets, pipes, redirection, and shell interpreters are rejected. Omit for Python apps with requirements.txt - a venv is auto-created. Each app runs in its own persistent isolated environment (Python venv, local node_modules, or stack-specific build cache), and dynamic runtime dependency installs may use network access. Examples: 'pip install -r requirements.txt', 'npm install && npm run build', 'cargo fetch'"
                     },
                     "stop_command": {
                         "type": "string",
@@ -10541,9 +10686,11 @@ Optional inputs:
             }
         }
 
+        let body_argument = arguments.get("body").or(binding.default_body.as_ref());
+
         if binding.read_only
             && Self::custom_api_binding_supports_graphql_body(&binding)
-            && arguments.get("body").is_some_and(|body| {
+            && body_argument.is_some_and(|body| {
                 !crate::custom_apis::custom_api_body_is_read_only_graphql_query(body)
             })
         {
@@ -10676,8 +10823,8 @@ Optional inputs:
             }
         };
 
-        if binding.body_required || arguments.get("body").is_some() {
-            let body = arguments.get("body").cloned().ok_or_else(|| {
+        if binding.body_required || body_argument.is_some() {
+            let body = body_argument.cloned().ok_or_else(|| {
                 anyhow::anyhow!("This endpoint requires a JSON body under the 'body' field")
             })?;
             if binding.read_only
@@ -10719,12 +10866,38 @@ Optional inputs:
         let rendered = crate::security::redact_secret_input(&rendered).text;
         let rendered = crate::security::sanitize_untrusted_output("custom_api", &rendered);
         if !status.is_success() {
+            if matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                if let Some(storage) = self.storage() {
+                    let _ = crate::custom_apis::record_custom_api_runtime_health(
+                        &storage,
+                        &binding.api_id,
+                        false,
+                        format!(
+                            "Custom API '{}' returned HTTP {}.",
+                            binding.operation_name, status
+                        ),
+                    )
+                    .await;
+                }
+            }
             return Err(anyhow::anyhow!(
                 "Custom API '{}' returned HTTP {}:\n{}",
                 binding.operation_name,
                 status,
                 rendered
             ));
+        }
+        if let Some(storage) = self.storage() {
+            let _ = crate::custom_apis::record_custom_api_runtime_health(
+                &storage,
+                &binding.api_id,
+                true,
+                format!("Custom API '{}' succeeded.", binding.operation_name),
+            )
+            .await;
         }
         if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
             if let Some(storage) = self.storage() {
@@ -11403,6 +11576,9 @@ Optional inputs:
         arguments: &serde_json::Value,
     ) -> Result<String> {
         match action_name {
+            "app_deploy" => anyhow::bail!(
+                "app_deploy requires the agent app-host execution context; call it through the agent tool executor so app registry, streaming, and validation are available"
+            ),
             "file_read" => {
                 let path = arguments["path"]
                     .as_str()
@@ -11944,10 +12120,15 @@ Optional inputs:
                 self.execute_custom_messaging_channel_upsert(arguments)
                     .await
             }
+            "custom_messaging_channel_manage" => {
+                self.execute_custom_messaging_channel_manage(arguments)
+                    .await
+            }
             "extension_pack_connect" => self.execute_extension_pack_connect(arguments).await,
             "extension_pack_set_enabled" => {
                 self.execute_extension_pack_set_enabled(arguments).await
             }
+            "extension_pack_delete" => self.execute_extension_pack_delete(arguments).await,
             "extension_pack_runtime_install" => {
                 self.execute_extension_pack_runtime_install(arguments).await
             }
@@ -13062,6 +13243,59 @@ print(result["text"])
             .join(" ")
     }
 
+    fn stored_google_token_has_refresh_token(&self, key: &str) -> bool {
+        self.settings_manager()
+            .ok()
+            .and_then(|manager| manager.get_custom_secret(key).ok().flatten())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| {
+                value
+                    .get("refresh_token")
+                    .and_then(|token| token.as_str())
+                    .map(|token| !token.trim().is_empty())
+            })
+            .unwrap_or(false)
+    }
+
+    fn google_workspace_granted_bundle_for_runtime(&self, bundle: &str) -> bool {
+        if !crate::integrations::effective_integration_enabled(&self.config_dir, "google_workspace")
+        {
+            return false;
+        }
+        crate::actions::google_workspace::granted_bundles(&self.config_dir)
+            .map(|bundles| bundles.iter().any(|granted| granted == bundle))
+            .unwrap_or(false)
+    }
+
+    fn google_workspace_connected_for_runtime(&self) -> bool {
+        if !crate::integrations::effective_integration_enabled(&self.config_dir, "google_workspace")
+        {
+            return false;
+        }
+        crate::actions::google_workspace::granted_bundles(&self.config_dir)
+            .map(|bundles| !bundles.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn action_backed_integration_connected(&self, integration_id: &str) -> bool {
+        match integration_id {
+            "gmail" => {
+                (crate::integrations::effective_integration_enabled(&self.config_dir, "gmail")
+                    && self.stored_google_token_has_refresh_token("gmail_tokens"))
+                    || self.google_workspace_granted_bundle_for_runtime("gmail")
+            }
+            "google_calendar" => {
+                (crate::integrations::effective_integration_enabled(
+                    &self.config_dir,
+                    "google_calendar",
+                ) && self.stored_google_token_has_refresh_token("calendar_tokens"))
+                    || self.google_workspace_granted_bundle_for_runtime("calendar")
+            }
+            "google_workspace" => self.google_workspace_connected_for_runtime(),
+            _ => true,
+        }
+    }
+
     async fn action_backed_builtin_integrations(&self) -> BTreeMap<String, serde_json::Value> {
         let enabled_actions = self.list_enabled_actions().await.unwrap_or_default();
         let mut by_integration: BTreeMap<
@@ -13145,19 +13379,27 @@ print(result["text"])
                     &self.config_dir,
                     &integration_id,
                 );
+                let connected = self.action_backed_integration_connected(&integration_id);
+                let status = if connected {
+                    "connected"
+                } else if enabled {
+                    "needs_auth"
+                } else {
+                    "disabled"
+                };
                 let display_name = Self::display_name_from_integration_id(&integration_id);
                 (
                     integration_id.clone(),
                     serde_json::json!({
                         "id": integration_id.clone(),
                         "name": display_name,
-                        "description": "Connected action-backed integration surface discovered from the enabled runtime action catalog.",
+                        "description": "Action-backed integration surface discovered from the runtime action catalog.",
                         "icon": "",
                         "capabilities": capability_values,
-                        "status": "connected",
-                        "status_label": "connected",
+                        "status": status,
+                        "status_label": status,
                         "enabled_for_agent": enabled,
-                        "connected": true,
+                        "connected": connected,
                         "action_backed": true,
                         "available_actions": action_names,
                         "available_action_summaries": action_summaries,
@@ -13200,7 +13442,6 @@ print(result["text"])
             row_object.insert("connected".to_string(), serde_json::json!(true));
             row_object.insert("status".to_string(), serde_json::json!("connected"));
             row_object.insert("status_label".to_string(), serde_json::json!("connected"));
-            row_object.insert("enabled_for_agent".to_string(), serde_json::json!(true));
         }
     }
 
@@ -13617,9 +13858,12 @@ print(result["text"])
             if only_connected && !connected {
                 continue;
             }
+            let capability_contract =
+                crate::custom_apis::capability_contract(&api.config, api.secret_configured);
             let mut value = serde_json::to_value(api).unwrap_or_default();
             if let Some(object) = value.as_object_mut() {
                 object.insert("connected".to_string(), serde_json::json!(connected));
+                object.insert("capability_contract".to_string(), capability_contract);
             }
             rows.push(value);
         }
@@ -13655,11 +13899,45 @@ print(result["text"])
         api.config.enabled && api.action_count > 0 && auth_ready
     }
 
+    fn custom_api_view_matches_selector(
+        api: &crate::custom_apis::CustomApiView,
+        selector: &str,
+    ) -> bool {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return false;
+        }
+        if api.config.id.eq_ignore_ascii_case(selector)
+            || api.config.name.eq_ignore_ascii_case(selector)
+        {
+            return true;
+        }
+        let canonical_selector = Self::normalize_generated_action_name(selector);
+        !canonical_selector.is_empty()
+            && [
+                api.config.id.as_str(),
+                api.config.name.as_str(),
+                api.config.description.as_str(),
+            ]
+            .iter()
+            .any(|candidate| Self::normalize_generated_action_name(candidate) == canonical_selector)
+    }
+
     fn custom_api_operation_allows_read_request(
         operation: &crate::custom_apis::CustomApiOperation,
         body: Option<&serde_json::Value>,
     ) -> bool {
         if operation.draft.read_only {
+            if let Some(body) = body {
+                if crate::custom_apis::custom_api_operation_supports_graphql_body(
+                    &operation.draft.method,
+                    &operation.draft.path,
+                    &operation.draft.default_headers,
+                    operation.draft.body_required || operation.draft.default_body.is_some(),
+                ) {
+                    return crate::custom_apis::custom_api_body_is_read_only_graphql_query(body);
+                }
+            }
             return true;
         }
         let Some(body) = body else {
@@ -13671,6 +13949,96 @@ print(result["text"])
             &operation.draft.default_headers,
             true,
         ) && crate::custom_apis::custom_api_body_is_read_only_graphql_query(body)
+    }
+
+    fn custom_api_operation_matches_selector(
+        operation: &crate::custom_apis::CustomApiOperation,
+        selector: &str,
+    ) -> bool {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return false;
+        }
+        let endpoint_label = format!("{} {}", operation.draft.method, operation.draft.path);
+        let candidates = [
+            operation.action_name.as_str(),
+            operation.draft.id.as_str(),
+            operation.draft.name.as_str(),
+            endpoint_label.as_str(),
+        ];
+        if candidates
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(selector))
+        {
+            return true;
+        }
+        let canonical_selector = Self::normalize_generated_action_name(selector);
+        !canonical_selector.is_empty()
+            && candidates.iter().any(|candidate| {
+                Self::normalize_generated_action_name(candidate) == canonical_selector
+            })
+    }
+
+    fn select_custom_api_read_operation<'a>(
+        operations: impl IntoIterator<Item = &'a crate::custom_apis::CustomApiOperation>,
+        selector: Option<&str>,
+        explicit_request_body: Option<&serde_json::Value>,
+        has_explicit_body: bool,
+    ) -> Option<(&'a crate::custom_apis::CustomApiOperation, &'static str)> {
+        let enabled = operations
+            .into_iter()
+            .filter(|operation| operation.draft.enabled)
+            .collect::<Vec<_>>();
+
+        if let Some(selector) = selector {
+            if let Some(operation) = enabled
+                .iter()
+                .copied()
+                .find(|operation| Self::custom_api_operation_matches_selector(operation, selector))
+            {
+                return Some((operation, "selector_match"));
+            }
+
+            let mut compatible = enabled.iter().copied().filter(|operation| {
+                let request_body = explicit_request_body.or(operation.draft.default_body.as_ref());
+                Self::custom_api_operation_allows_read_request(operation, request_body)
+            });
+            let first = compatible.next()?;
+            if compatible.next().is_none() {
+                return Some((first, "single_compatible_operation"));
+            }
+            return None;
+        }
+
+        let mut compatible = enabled.iter().copied().filter(|operation| {
+            let request_body = explicit_request_body.or(operation.draft.default_body.as_ref());
+            Self::custom_api_operation_allows_read_request(operation, request_body)
+        });
+        let first = compatible.next()?;
+        if compatible.next().is_none() {
+            return Some((first, "single_compatible_operation"));
+        }
+
+        if !has_explicit_body {
+            return None;
+        }
+
+        enabled
+            .iter()
+            .copied()
+            .find(|operation| {
+                let request_body = explicit_request_body.or(operation.draft.default_body.as_ref());
+                Self::custom_api_operation_allows_read_request(operation, request_body)
+                    && (operation.draft.body_required
+                        || operation.draft.parameters.iter().any(|parameter| {
+                            matches!(
+                                parameter.location,
+                                crate::custom_apis::CustomApiParameterLocation::Body
+                            )
+                        })
+                        || !operation.draft.read_only)
+            })
+            .map(|operation| (operation, "body_compatible_operation"))
     }
 
     async fn webhook_sources_inventory(
@@ -15117,12 +15485,10 @@ print(result["text"])
         );
         section_counts.insert(
             "extension_packs_installed".to_string(),
-            serde_json::json!(
-                packs
-                    .as_ref()
-                    .map(|packs| packs.installed.len())
-                    .unwrap_or_default()
-            ),
+            serde_json::json!(packs
+                .as_ref()
+                .map(|packs| packs.installed.len())
+                .unwrap_or_default()),
         );
         section_counts.insert(
             "plugins".to_string(),
@@ -18338,6 +18704,125 @@ print(result["text"])
         }))?)
     }
 
+    async fn execute_custom_messaging_channel_manage(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let storage = self.runtime_storage()?;
+        let id = Self::capability_string_argument(arguments, "id")
+            .or_else(|| Self::capability_string_argument(arguments, "channel_id"))
+            .ok_or_else(|| anyhow::anyhow!("custom_messaging_channel_manage requires id"))?;
+        let operation = Self::capability_string_argument(arguments, "operation")
+            .map(|value| value.to_ascii_lowercase())
+            .ok_or_else(|| anyhow::anyhow!("custom_messaging_channel_manage requires operation"))?;
+
+        match operation.as_str() {
+            "delete" => {
+                crate::custom_messaging_channels::delete_custom_messaging_channel(
+                    &storage,
+                    &self.config_dir,
+                    self.data_dir(),
+                    &id,
+                )
+                .await?;
+                self.record_security_event(
+                    "custom_messaging_channel_delete",
+                    "medium",
+                    format!(
+                        "Custom messaging channel deleted by runtime action. channel_id={}",
+                        id
+                    ),
+                    Some(format!(
+                        "actor=runtime_action;source_kind=custom_channel;channel_id={}",
+                        id
+                    )),
+                )
+                .await;
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "deleted",
+                    "integration_type": "custom_messaging_channel",
+                    "id": id,
+                }))?)
+            }
+            "test" => {
+                let result = crate::custom_messaging_channels::test_custom_messaging_channel(
+                    &storage,
+                    &self.config_dir,
+                    self.data_dir(),
+                    &id,
+                )
+                .await?;
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "status": if result.ok { "ok" } else { "error" },
+                    "integration_type": "custom_messaging_channel",
+                    "id": id,
+                    "test": result,
+                }))?)
+            }
+            "enable" | "disable" => {
+                let Some(existing) =
+                    crate::custom_messaging_channels::get_custom_messaging_channel_config(
+                        &storage, &id,
+                    )
+                    .await?
+                else {
+                    anyhow::bail!("Custom messaging channel '{}' was not found", id);
+                };
+                let enabled = operation == "enable";
+                let view = crate::custom_messaging_channels::upsert_custom_messaging_channel(
+                    &storage,
+                    &self.config_dir,
+                    self.data_dir(),
+                    crate::custom_messaging_channels::CustomMessagingChannelUpsertRequest {
+                        id: Some(existing.id.clone()),
+                        name: existing.name.clone(),
+                        description: Some(existing.description.clone()),
+                        enabled: Some(enabled),
+                        docs_url: existing.docs_url.clone(),
+                        send: existing.send.clone(),
+                        auth_manifest: existing.auth_manifest.clone(),
+                        auth_profile_id: existing.auth_profile_id.clone(),
+                        credential_fields: Vec::new(),
+                        clear_secrets: None,
+                    },
+                    Some(&existing.id),
+                )
+                .await?;
+                let config_id = view.config.id.clone();
+                let runtime_channel_id = view.runtime_channel_id.clone();
+                let configured = view.configured;
+                self.record_security_event(
+                    if enabled {
+                        "custom_messaging_channel_enable"
+                    } else {
+                        "custom_messaging_channel_disable"
+                    },
+                    "medium",
+                    format!(
+                        "Custom messaging channel {} by runtime action. channel_id={}",
+                        operation, view.id
+                    ),
+                    Some(format!(
+                        "actor=runtime_action;source_kind=custom_channel;channel_id={}",
+                        view.id
+                    )),
+                )
+                .await;
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "status": if enabled { "enabled" } else { "disabled" },
+                    "integration_type": "custom_messaging_channel",
+                    "id": config_id,
+                    "channel_id": runtime_channel_id,
+                    "configured": configured,
+                }))?)
+            }
+            _ => anyhow::bail!(
+                "Unsupported custom messaging channel management operation '{}'",
+                operation
+            ),
+        }
+    }
+
     async fn execute_extension_pack_connect(
         &self,
         arguments: &serde_json::Value,
@@ -18494,6 +18979,33 @@ print(result["text"])
         };
         self.sync_extension_pack_runtime_actions().await?;
         Ok(serde_json::to_string_pretty(&pack)?)
+    }
+
+    async fn execute_extension_pack_delete(&self, arguments: &serde_json::Value) -> Result<String> {
+        let pack_id = arguments
+            .get("pack_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing pack_id"))?;
+        let remove_connections = arguments
+            .get("remove_connections")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let registry = self
+            .extension_pack_registry
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Extension-pack registry not available"))?;
+        {
+            let mut guard = registry.write().await;
+            guard.delete_pack(pack_id, remove_connections).await?
+        };
+        self.sync_extension_pack_runtime_actions().await?;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": "deleted",
+            "pack_id": pack_id,
+            "remove_connections": remove_connections,
+        }))?)
     }
 
     async fn execute_extension_pack_runtime_install(
@@ -19013,16 +19525,11 @@ print(result["text"])
         let id = Self::capability_string_argument(arguments, "id")
             .or_else(|| Self::capability_string_argument(arguments, "query"))
             .ok_or_else(|| anyhow::anyhow!("custom_api_request requires a saved custom API id"))?;
-        let normalized_id = Self::normalize_generated_action_name(&id);
         let apis = crate::custom_apis::list_custom_apis(storage, &self.config_dir, self.data_dir())
             .await?;
         let api = apis
             .into_iter()
-            .find(|item| {
-                item.config.id == normalized_id
-                    || item.config.id.eq_ignore_ascii_case(&id)
-                    || item.config.name.eq_ignore_ascii_case(&id)
-            })
+            .find(|item| Self::custom_api_view_matches_selector(item, &id))
             .ok_or_else(|| anyhow::anyhow!("Saved custom API '{}' was not found", id))?;
         if !Self::custom_api_view_is_callable(&api) {
             anyhow::bail!(
@@ -19034,70 +19541,34 @@ print(result["text"])
         let selector = Self::capability_string_argument(arguments, "operation")
             .or_else(|| Self::capability_string_argument(arguments, "operation_id"))
             .or_else(|| Self::capability_string_argument(arguments, "action_name"));
-        let request_body = arguments
+        let explicit_request_body = arguments
             .get("arguments")
             .and_then(|value| value.get("body"))
             .or_else(|| arguments.get("body"));
-        let has_body = request_body.is_some();
-        let operation = api
-            .config
-            .operations
-            .iter()
-            .filter(|operation| operation.draft.enabled)
-            .find(|operation| {
-                selector.as_deref().is_some_and(|selector| {
-                    operation.action_name.eq_ignore_ascii_case(selector)
-                        || operation.draft.id.eq_ignore_ascii_case(selector)
-                        || operation.draft.name.eq_ignore_ascii_case(selector)
-                        || format!("{} {}", operation.draft.method, operation.draft.path)
-                            .eq_ignore_ascii_case(selector)
-                })
-            })
-            .or_else(|| {
-                if selector.is_some() {
-                    return None;
-                }
-                let mut enabled = api
-                    .config
-                    .operations
-                    .iter()
-                    .filter(|operation| {
-                        operation.draft.enabled
-                            && Self::custom_api_operation_allows_read_request(
-                                operation,
-                                request_body,
-                            )
-                    });
-                let first = enabled.next()?;
-                if enabled.next().is_none() {
-                    Some(first)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                if !has_body || selector.is_some() {
-                    return None;
-                }
-                api.config.operations.iter().find(|operation| {
-                    operation.draft.enabled
-                        && Self::custom_api_operation_allows_read_request(operation, request_body)
-                        && (operation.draft.body_required
-                            || operation.draft.parameters.iter().any(|parameter| {
-                                matches!(
-                                    parameter.location,
-                                    crate::custom_apis::CustomApiParameterLocation::Body
-                                )
-                            })
-                            || !operation.draft.read_only)
-                })
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No matching read-only operation was found for saved custom API '{}'. Provide an operation id or inspect the integration first.",
-                    api.config.id
-                )
-            })?;
+        let has_explicit_body = explicit_request_body.is_some();
+        let (operation, selection_reason) = match Self::select_custom_api_read_operation(
+            api.config.operations.iter(),
+            selector.as_deref(),
+            explicit_request_body,
+            has_explicit_body,
+        ) {
+            Some(selection) => selection,
+            None => {
+                return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "needs_operation",
+                    "integration_type": "custom_api",
+                    "custom_api_id": api.config.id,
+                    "reason": if selector.is_some() { "operation_not_found" } else { "operation_required" },
+                    "message": "Choose one saved read-only operation for this custom API request.",
+                    "capability_contract": crate::custom_apis::capability_contract(&api.config, api.secret_configured),
+                    "available_operations": api.config.operations.iter()
+                        .filter(|operation| operation.draft.enabled)
+                        .map(crate::custom_apis::operation_contract)
+                        .collect::<Vec<_>>(),
+                }))?);
+            }
+        };
+        let request_body = explicit_request_body.or(operation.draft.default_body.as_ref());
         if !Self::custom_api_operation_allows_read_request(operation, request_body) {
             anyhow::bail!(
                 "Saved custom API operation '{}' is not read-only for the supplied request; use its generated action with the normal approval path.",
@@ -19107,6 +19578,7 @@ print(result["text"])
         let api_id = api.config.id.clone();
         let operation_id = operation.draft.id.clone();
         let action_name = operation.action_name.clone();
+        let requested_operation = selector.clone();
 
         let action_arguments = if let Some(object) = arguments
             .get("arguments")
@@ -19134,6 +19606,20 @@ print(result["text"])
             }
             serde_json::Value::Object(object)
         };
+        let missing_inputs =
+            crate::custom_apis::operation_missing_required_inputs(operation, &action_arguments);
+        if !missing_inputs.is_empty() {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "status": "needs_arguments",
+                "integration_type": "custom_api",
+                "custom_api_id": api_id,
+                "operation": operation_id,
+                "action_name": action_name,
+                "missing_inputs": missing_inputs,
+                "operation_contract": crate::custom_apis::operation_contract(operation),
+                "message": "This saved operation requires additional non-secret request arguments before it can run.",
+            }))?);
+        }
         let output = Box::pin(self.execute_action_with_context(
             &action_name,
             &action_arguments,
@@ -19154,8 +19640,10 @@ print(result["text"])
             "status": "completed",
             "integration_type": "custom_api",
             "custom_api_id": api_id,
+            "requested_operation": requested_operation,
             "operation": operation_id,
             "action_name": action_name,
+            "operation_selection": selection_reason,
             "result": output,
         }))?)
     }
@@ -19308,6 +19796,7 @@ print(result["text"])
                 "required_inputs",
                 "read_only",
                 "body_required",
+                "body",
                 "body_template",
                 "parameters",
                 "response_notes",
@@ -19383,6 +19872,20 @@ print(result["text"])
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default()
+    }
+
+    fn normalized_default_body_value(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    serde_json::from_str(trimmed).unwrap_or_else(|_| serde_json::Value::String(raw))
+                } else {
+                    serde_json::Value::String(raw)
+                }
+            }
+            other => other,
+        }
     }
 
     fn capability_endpoint_parts(
@@ -19550,10 +20053,14 @@ print(result["text"])
                 parameters.append(&mut operation_parameters);
             }
         }
-        let has_body_template = arguments
-            .get("body_template")
-            .or_else(|| operation_object.and_then(|object| object.get("body_template")))
-            .is_some_and(|value| !value.is_null());
+        let default_body = operation_object
+            .and_then(|object| object.get("body").cloned())
+            .or_else(|| arguments.get("body").cloned())
+            .or_else(|| operation_object.and_then(|object| object.get("body_template").cloned()))
+            .or_else(|| arguments.get("body_template").cloned())
+            .map(Self::normalized_default_body_value)
+            .filter(|value| !value.is_null());
+        let has_body_template = default_body.is_some();
         let graphql_body_endpoint = crate::custom_apis::custom_api_operation_supports_graphql_body(
             &method,
             &path,
@@ -19561,7 +20068,10 @@ print(result["text"])
             body_required || has_body_template || method == "POST",
         );
         if requested_read_only.is_none() && graphql_body_endpoint {
-            read_only = true;
+            read_only = default_body
+                .as_ref()
+                .map(crate::custom_apis::custom_api_body_is_read_only_graphql_query)
+                .unwrap_or(true);
         }
         if method != "GET" && method != "DELETE" {
             body_required = body_required || has_body_template || graphql_body_endpoint;
@@ -19610,6 +20120,7 @@ print(result["text"])
                 default_query,
                 parameters,
                 body_required,
+                default_body,
             },
             default_headers,
         ))
@@ -20351,6 +20862,16 @@ print(result["text"])
         let parsed_url = self.validate_http_get_url(raw_url).await?;
         let expected_mime = runtime_url_expected_mime(&parsed_url);
         let expected_non_text_resource = runtime_url_expects_non_text_resource(&parsed_url);
+        let as_resource = arguments
+            .get("as_resource")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let suggested_name = arguments
+            .get("suggested_name")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let max_chars = arguments
             .get("max_chars")
             .and_then(|value| value.as_u64())
@@ -20392,7 +20913,8 @@ print(result["text"])
                                     "error": "unexpected_content_type",
                                 }));
                             } else {
-                                if expected_non_text_resource
+                                if as_resource
+                                    || expected_non_text_resource
                                     || runtime_response_body_is_probably_binary(
                                         &content_type,
                                         bytes.as_ref(),
@@ -20404,15 +20926,17 @@ print(result["text"])
                                                 mime: Some(content_type.clone())
                                                     .filter(|value| !value.trim().is_empty()),
                                                 body: bytes.as_ref().to_vec(),
-                                                suggested_name: runtime_url_suggested_filename(
-                                                    &parsed_url,
+                                                suggested_name: suggested_name.clone().or_else(
+                                                    || runtime_url_suggested_filename(&parsed_url),
                                                 ),
                                             },
                                             PersistHints {
                                                 mime: Some(content_type.clone())
                                                     .filter(|value| !value.trim().is_empty()),
+                                                suggested_name: suggested_name.clone(),
                                                 source_action: Some("page_fetch".to_string()),
-                                                force_resource: expected_non_text_resource,
+                                                force_resource: as_resource
+                                                    || expected_non_text_resource,
                                                 ..PersistHints::default()
                                             },
                                         )
@@ -20484,6 +21008,22 @@ print(result["text"])
                 "engine": "direct_http",
                 "error": runtime_truncate_chars(&error.to_string(), 300),
             })),
+        }
+
+        if as_resource {
+            return Ok(Self::page_fetch_completion(
+                "failed",
+                "The URL was requested as an exact resource, but direct HTTP did not return reusable response bytes.",
+                parsed_url.as_str(),
+                None,
+                None,
+                serde_json::json!({
+                    "readable_chars": 0,
+                    "degenerate": true,
+                    "reason": "resource_fetch_failed",
+                }),
+                attempts,
+            ));
         }
 
         if !Self::http_get_url_is_privateish(&parsed_url) {
@@ -20599,7 +21139,10 @@ print(result["text"])
         #[derive(Debug, Deserialize)]
         struct PersistResponseField {
             response_path: String,
-            target_path: String,
+            #[serde(default)]
+            target_path: Option<String>,
+            #[serde(default)]
+            secret_key: Option<String>,
             #[serde(default)]
             format: Option<String>,
             #[serde(default)]
@@ -20637,6 +21180,16 @@ print(result["text"])
             .and_then(|value| value.as_u64())
             .unwrap_or(30)
             .clamp(1, 300);
+        let as_resource = arguments
+            .get("as_resource")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let suggested_name = arguments
+            .get("suggested_name")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
@@ -20644,9 +21197,13 @@ print(result["text"])
             .map_err(|error| anyhow::anyhow!("Failed to build HTTP client: {}", error))?;
 
         let mut request = client.request(method.clone(), url.clone());
+        let mut has_content_type_header = false;
         if let Some(headers) = arguments.get("headers").and_then(|value| value.as_object()) {
             for (key, value) in headers {
                 if let Some(value) = Self::value_to_http_string(value) {
+                    if key.eq_ignore_ascii_case("content-type") {
+                        has_content_type_header = true;
+                    }
                     request = request.header(key.as_str(), value);
                 }
             }
@@ -20662,9 +21219,37 @@ print(result["text"])
                 request = request.query(&query);
             }
         }
-        if method != reqwest::Method::GET {
+        if matches!(
+            method,
+            reqwest::Method::POST
+                | reqwest::Method::PUT
+                | reqwest::Method::PATCH
+                | reqwest::Method::DELETE
+        ) {
             if let Some(body) = arguments.get("body") {
-                request = request.json(body);
+                let body_bytes = serde_json::to_vec(body).map_err(|error| {
+                    crate::actions::structured_action_error(
+                        ActionErrorDomain::Action,
+                        ActionErrorReason::InvalidInput,
+                        format!("Invalid JSON request body: {}", error),
+                    )
+                })?;
+                if !has_content_type_header {
+                    request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
+                }
+                request = request
+                    .header(
+                        reqwest::header::CONTENT_LENGTH,
+                        body_bytes.len().to_string(),
+                    )
+                    .body(body_bytes);
+            } else if matches!(
+                method,
+                reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
+            ) {
+                request = request
+                    .header(reqwest::header::CONTENT_LENGTH, "0")
+                    .body(Vec::new());
             }
         }
 
@@ -20754,7 +21339,7 @@ print(result["text"])
         })?;
         let sensitive_response_paths = persist_specs
             .iter()
-            .filter(|spec| spec.sensitive)
+            .filter(|spec| spec.sensitive || spec.secret_key.is_some())
             .map(|spec| spec.response_path.clone())
             .collect::<Vec<_>>();
         let mut persisted = Vec::new();
@@ -20773,8 +21358,8 @@ print(result["text"])
                             ActionErrorDomain::Action,
                             ActionErrorReason::NotFound,
                             format!(
-                                "Response field '{}' was not present, so '{}' was not written.",
-                                spec.response_path, spec.target_path
+                                "Response field '{}' was not present, so the requested persistence target was not written.",
+                                spec.response_path
                             ),
                         )
                     })?;
@@ -20782,18 +21367,65 @@ print(result["text"])
                     value,
                     spec.format.as_deref().unwrap_or("text"),
                 )?;
-                let target = self.resolve_runtime_persist_path(&spec.target_path)?;
-                if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+                let has_file_target = spec
+                    .target_path
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty());
+                let has_secret_target = spec
+                    .secret_key
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty());
+                if !has_file_target && !has_secret_target {
+                    return Err(crate::actions::structured_action_error(
+                        ActionErrorDomain::Action,
+                        ActionErrorReason::InvalidInput,
+                        format!(
+                            "persist_response field '{}' requires target_path or secret_key",
+                            spec.response_path
+                        ),
+                    ));
                 }
-                tokio::fs::write(&target, content).await?;
-                Self::set_private_file_permissions(&target).await?;
-                persisted.push(serde_json::json!({
-                    "response_path": spec.response_path,
-                    "target_path": target.display().to_string(),
-                    "sensitive": spec.sensitive,
-                    "written": true,
-                }));
+                if let Some(target_path) = spec
+                    .target_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let target = self.resolve_runtime_persist_path(target_path)?;
+                    if let Some(parent) = target.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::write(&target, content.as_bytes()).await?;
+                    Self::set_private_file_permissions(&target).await?;
+                    persisted.push(serde_json::json!({
+                        "response_path": spec.response_path.clone(),
+                        "target_kind": "file",
+                        "target_path": target.display().to_string(),
+                        "sensitive": spec.sensitive,
+                        "written": true,
+                    }));
+                }
+                if let Some(secret_key) = spec
+                    .secret_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let manager = SecureConfigManager::new_with_data_dir(
+                        &self.config_dir,
+                        Some(self.data_dir()),
+                    )?;
+                    manager.set_custom_secret(secret_key, Some(content.clone()))?;
+                    persisted.push(serde_json::json!({
+                        "response_path": spec.response_path.clone(),
+                        "target_kind": "secret",
+                        "secret_key": secret_key,
+                        "sensitive": true,
+                        "written": true,
+                    }));
+                }
             }
         }
 
@@ -20814,18 +21446,21 @@ print(result["text"])
                 "content_type": content_type.as_str(),
                 "written": true,
             }))
-        } else if body_is_binary || expected_non_text_resource {
+        } else if as_resource || body_is_binary || expected_non_text_resource {
             match self
                 .persist_tool_payload_if_needed(
                     ToolPayload::Bytes {
                         mime: Some(content_type.clone()).filter(|value| !value.trim().is_empty()),
                         body: body_bytes.as_ref().to_vec(),
-                        suggested_name: runtime_url_suggested_filename(&url),
+                        suggested_name: suggested_name
+                            .clone()
+                            .or_else(|| runtime_url_suggested_filename(&url)),
                     },
                     PersistHints {
                         mime: Some(content_type.clone()).filter(|value| !value.trim().is_empty()),
+                        suggested_name: suggested_name.clone(),
                         source_action: Some("http_request".to_string()),
-                        force_resource: expected_non_text_resource,
+                        force_resource: as_resource || expected_non_text_resource,
                         ..PersistHints::default()
                     },
                 )
@@ -22482,14 +23117,15 @@ print(result["text"])
                 // Check if we have a WASM module for this action
                 let actions = self.actions.read().await;
                 if let Some(action) = actions.get(action_name) {
-                    if let Some(wasm_bytes) = &action.wasm_module {
-                        let wasm = wasm_bytes.clone();
-                        drop(actions); // Release lock before async call
-                        return self.run_wasm_module(&wasm, arguments).await;
+                    if action.wasm_module.is_some() {
+                        anyhow::bail!(
+                            "Imported WASM module execution is disabled for action '{}'",
+                            action_name
+                        );
                     }
                 }
                 drop(actions); // Release lock before async call
-                // Fall back to native
+                               // Fall back to native
                 self.execute_native(action_name, arguments).await
             }
         }
@@ -25479,26 +26115,17 @@ print(result["text"])
             );
         }
 
-        let lower = docs_text.to_ascii_lowercase();
-        if lower.contains("oauth") {
+        if let Some((auth_type, auth_header_name)) =
+            Self::derive_capability_auth_from_docs_text(docs_text)
+        {
             derived.insert(
                 "auth_type".to_string(),
-                serde_json::Value::String("oauth2".to_string()),
+                serde_json::Value::String(auth_type.to_string()),
             );
-        } else if lower.contains("bearer token") || lower.contains("authorization: bearer") {
-            derived.insert(
-                "auth_type".to_string(),
-                serde_json::Value::String("bearer".to_string()),
-            );
-        } else if lower.contains("x-api-key") || lower.contains("api key") {
-            derived.insert(
-                "auth_type".to_string(),
-                serde_json::Value::String("api_key_header".to_string()),
-            );
-            if lower.contains("x-api-key") {
+            if let Some(auth_header_name) = auth_header_name {
                 derived.insert(
                     "auth_header_name".to_string(),
-                    serde_json::Value::String("X-API-Key".to_string()),
+                    serde_json::Value::String(auth_header_name),
                 );
             }
         }
@@ -25520,6 +26147,59 @@ print(result["text"])
         } else {
             Some(derived)
         }
+    }
+
+    fn derive_capability_auth_from_docs_text(
+        docs_text: &str,
+    ) -> Option<(&'static str, Option<String>)> {
+        let authorization_re = Regex::new(r#"(?i)\bauthorization\s*:\s*([^\r\n`"']+)"#).ok()?;
+        for captures in authorization_re.captures_iter(docs_text) {
+            let Some(match_value) = captures.get(1) else {
+                continue;
+            };
+            if let Some(auth) =
+                Self::classify_capability_authorization_header_value(match_value.as_str())
+            {
+                return Some(auth);
+            }
+        }
+
+        None
+    }
+
+    fn classify_capability_authorization_header_value(
+        raw_value: &str,
+    ) -> Option<(&'static str, Option<String>)> {
+        let value = raw_value
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '<' | '>' | '{' | '}' | '"' | '\'' | '`'))
+            .trim();
+        if value.is_empty() {
+            return None;
+        }
+        let prefix = value.split_whitespace().next().unwrap_or_default();
+        if prefix.eq_ignore_ascii_case("bearer") {
+            return Some(("bearer", None));
+        }
+        if prefix.eq_ignore_ascii_case("basic") {
+            return Some(("basic", None));
+        }
+        Self::looks_like_credential_header_value(value)
+            .then(|| ("api_key_header", Some("Authorization".to_string())))
+    }
+
+    fn looks_like_credential_header_value(raw_value: &str) -> bool {
+        let value = raw_value
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '<' | '>' | '{' | '}' | '"' | '\'' | '`'))
+            .trim();
+        if value.is_empty() || value.split_whitespace().count() > 1 {
+            return false;
+        }
+        value
+            .chars()
+            .any(|ch| ch == '_' || ch == '-' || ch.is_ascii_digit())
+            || value.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
     }
 
     async fn load_capability_source_text(raw_url: &str) -> Option<String> {
@@ -26569,54 +27249,6 @@ print(result["text"])
         // Return the info, full content, and frontmatter for security evaluation
         Ok((info, content, frontmatter_text))
     }
-
-    /// Execute a WASM module with given arguments
-    async fn run_wasm_module(
-        &self,
-        wasm_bytes: &[u8],
-        arguments: &serde_json::Value,
-    ) -> Result<String> {
-        use wasmtime::*;
-
-        let engine = self.sandbox.engine();
-
-        // Create a basic store without WASI for simple modules, but enforce configured limits.
-        let mut store = self.sandbox.new_store();
-
-        // Compile the module
-        let module = Module::new(engine, wasm_bytes)?;
-
-        // Create a linker and instantiate
-        let linker = Linker::new(engine);
-        let instance = linker.instantiate(&mut store, &module)?;
-
-        // Try to find entry points
-        let result = if let Ok(run_fn) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            run_fn.call(&mut store, ())?;
-            format!(
-                "WASM execution completed successfully. Args: {}",
-                serde_json::to_string(arguments)?
-            )
-        } else if let Ok(run_fn) = instance.get_typed_func::<(), i32>(&mut store, "run") {
-            let exit_code = run_fn.call(&mut store, ())?;
-            format!("WASM execution completed with exit code: {}", exit_code)
-        } else if let Ok(run_fn) = instance.get_typed_func::<i32, i32>(&mut store, "main") {
-            let exit_code = run_fn.call(&mut store, 0)?;
-            format!("WASM execution completed with exit code: {}", exit_code)
-        } else {
-            // List available exports for debugging
-            let exports: Vec<String> = instance
-                .exports(&mut store)
-                .map(|e| e.name().to_string())
-                .collect();
-            return Err(anyhow::anyhow!(
-                "WASM module has no _start, run, or main entry point. Available exports: {:?}",
-                exports
-            ));
-        };
-
-        Ok(result)
-    }
 }
 
 pub(crate) fn load_persisted_search_config(
@@ -26951,17 +27583,13 @@ mod tests {
         let payload = parse_tool_completion_output(&output);
         let matches = payload["data"]["matches"].as_array().unwrap();
 
-        assert!(
-            matches
-                .iter()
-                .any(|item| item["match_type"].as_str() == Some("filename"))
-        );
-        assert!(
-            matches
-                .iter()
-                .any(|item| item["match_type"].as_str() == Some("content")
-                    && item["line_number"].as_u64() == Some(2))
-        );
+        assert!(matches
+            .iter()
+            .any(|item| item["match_type"].as_str() == Some("filename")));
+        assert!(matches
+            .iter()
+            .any(|item| item["match_type"].as_str() == Some("content")
+                && item["line_number"].as_u64() == Some(2)));
     }
 
     #[tokio::test]
@@ -27035,6 +27663,45 @@ mod tests {
         assert_eq!(
             payload["data"]["write"]["source_resource"]["id"].as_str(),
             Some("resource-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_sensitive_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let new_target = temp.path().join(".env");
+        let error = runtime
+            .execute_action(
+                "file_write",
+                &serde_json::json!({
+                    "path": new_target.display().to_string(),
+                    "content": "TOKEN=new\n"
+                }),
+            )
+            .await
+            .expect_err("new sensitive target should be rejected");
+        assert!(error.to_string().contains("sensitive credential file"));
+        assert!(!new_target.exists());
+
+        let existing_target = temp.path().join(".env.local");
+        std::fs::write(&existing_target, "TOKEN=old\n").unwrap();
+        let error = runtime
+            .execute_action(
+                "file_write",
+                &serde_json::json!({
+                    "path": existing_target.display().to_string(),
+                    "content": "TOKEN=new\n"
+                }),
+            )
+            .await
+            .expect_err("existing sensitive target should be rejected");
+        assert!(error.to_string().contains("sensitive credential file"));
+        assert_eq!(
+            std::fs::read_to_string(&existing_target).unwrap(),
+            "TOKEN=old\n"
         );
     }
 
@@ -27119,7 +27786,9 @@ mod tests {
             chunk_count: 1,
             file_size: payload.bytes.len() as u64,
             url: "/ui/documents".to_string(),
-            download_url: None,
+            download_url: Some(
+                "/api/outputs/00000000-0000-0000-0000-000000000000/image.png/download".to_string(),
+            ),
             duplicate_skipped: false,
             content_fingerprint: "abc123".to_string(),
             metadata_only: true,
@@ -27137,12 +27806,19 @@ mod tests {
             parsed["data"]["document"]["index_mode"].as_str(),
             Some("metadata")
         );
+        assert_eq!(
+            parsed["data"]["document"]["download_url"].as_str(),
+            Some("/api/outputs/00000000-0000-0000-0000-000000000000/image.png/download")
+        );
     }
 
     #[tokio::test]
     async fn pdf_generate_returns_managed_pdf_artifact_without_internal_path_handoff() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(config_dir.path(), data_dir.path())
+            .await
+            .unwrap();
         runtime.load_builtin_actions().await.unwrap();
 
         let output = runtime
@@ -27181,24 +27857,30 @@ mod tests {
         let resource_path = payload["data"]["payload"]["resource"]["path"]
             .as_str()
             .expect("pdf_generate should keep a private runtime resource path");
+        let resource_path = PathBuf::from(resource_path);
+        let resource_canonical = std::fs::canonicalize(&resource_path).unwrap();
+        let outputs_canonical = std::fs::canonicalize(data_dir.path().join("outputs")).unwrap();
+        let repo_canonical = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert!(
-            std::fs::read(resource_path)
-                .expect("generated PDF should be saved under the served outputs tree")
-                .starts_with(b"%PDF")
+            resource_canonical.starts_with(&outputs_canonical),
+            "generated PDF must stay under the temp runtime outputs directory"
         );
         assert!(
-            payload["data"].get("document").is_some(),
-            "pdf_generate should report its Documents registration metadata when storage is available"
+            !resource_canonical.starts_with(&repo_canonical),
+            "generated PDF test artifact must never be written under the source checkout"
         );
-        assert_eq!(
-            payload["data"]["document"]["download_url"].as_str(),
-            Some(download_url)
+        assert!(std::fs::read(&resource_canonical)
+            .expect("generated PDF should be saved under the served outputs tree")
+            .starts_with(b"%PDF"));
+        assert!(
+            payload["data"]["document"].is_null(),
+            "bare runtimes without attached storage cannot report Documents registration metadata"
         );
         assert!(
             !payload["detail"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(temp.path().to_string_lossy().as_ref()),
+                .contains(data_dir.path().to_string_lossy().as_ref()),
             "completion detail must not ask the model to chase an internal path"
         );
     }
@@ -27483,8 +28165,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_runtime_download_contract_code_execute_does_not_advertise_unwired_wasm_backend()
-     {
+    async fn generic_runtime_download_contract_code_execute_does_not_advertise_unwired_wasm_backend(
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         runtime.load_builtin_actions().await.unwrap();
@@ -27537,11 +28219,43 @@ mod tests {
             .await
             .expect_err("unwired wasm backend should not be accepted");
 
-        assert!(
-            error
-                .to_string()
-                .contains("code_execute backend 'wasm' is not wired")
+        assert!(error
+            .to_string()
+            .contains("code_execute backend 'wasm' is not wired"));
+    }
+
+    #[tokio::test]
+    async fn imported_wasm_modules_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.actions.write().await.insert(
+            "custom_wasm".to_string(),
+            LoadedAction {
+                info: ActionDef {
+                    name: "custom_wasm".to_string(),
+                    sandbox_mode: Some(SandboxMode::Wasm),
+                    ..ActionDef::default()
+                },
+                builtin_handler: None,
+                supports_background: false,
+                wasm_module: Some(vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
+                workflow_content: None,
+                cli_binding: None,
+                mcp_binding: None,
+                plugin_binding: None,
+                custom_api_binding: None,
+                extension_pack_binding: None,
+            },
         );
+
+        let error = runtime
+            .execute_action("custom_wasm", &serde_json::json!({}))
+            .await
+            .expect_err("imported wasm modules should not execute");
+
+        assert!(error
+            .to_string()
+            .contains("Imported WASM module execution is disabled"));
     }
 
     #[test]
@@ -27577,6 +28291,97 @@ mod tests {
             .and_then(|value| value.as_str());
 
         assert_eq!(save_to, Some("string"));
+    }
+
+    #[tokio::test]
+    async fn generic_runtime_download_contract_http_request_can_return_resource_without_user_path()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let action = action_def_by_name(&runtime, "http_request").await;
+
+        assert_eq!(
+            action
+                .input_schema
+                .pointer("/properties/as_resource/type")
+                .and_then(|value| value.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            action
+                .input_schema
+                .pointer("/properties/suggested_name/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_runtime_download_contract_page_fetch_can_return_resource_without_user_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let action = action_def_by_name(&runtime, "page_fetch").await;
+
+        assert_eq!(
+            action
+                .input_schema
+                .pointer("/properties/as_resource/type")
+                .and_then(|value| value.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            action
+                .input_schema
+                .pointer("/properties/suggested_name/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_request_contract_supports_encrypted_response_field_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let action = action_def_by_name(&runtime, "http_request").await;
+
+        assert_eq!(
+            action
+                .input_schema
+                .pointer("/properties/persist_response/items/properties/secret_key/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            action
+                .input_schema
+                .pointer("/properties/persist_response/items/required/0")
+                .and_then(|value| value.as_str()),
+            Some("response_path")
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_acquire_contract_supports_default_operation_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let action = action_def_by_name(&runtime, "capability_acquire").await;
+
+        assert!(action.input_schema.pointer("/properties/body").is_some());
+        assert_eq!(
+            action
+                .input_schema
+                .pointer("/properties/id/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
     }
 
     #[test]
@@ -28049,12 +28854,10 @@ mod tests {
 
         assert_eq!(action.source, ActionSource::System);
         assert!(action.capabilities.iter().any(|cap| cap == "file_read"));
-        assert!(
-            action
-                .capabilities
-                .iter()
-                .any(|cap| cap == "capability_inventory")
-        );
+        assert!(action
+            .capabilities
+            .iter()
+            .any(|cap| cap == "capability_inventory"));
     }
 
     #[tokio::test]
@@ -28065,12 +28868,10 @@ mod tests {
         let action = action_def_by_name(&runtime, "manage_actions").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert!(
-            action
-                .capabilities
-                .iter()
-                .any(|cap| cap == "skill_management")
-        );
+        assert!(action
+            .capabilities
+            .iter()
+            .any(|cap| cap == "skill_management"));
         assert_eq!(
             action.input_schema["properties"]["resource"]["enum"],
             serde_json::json!(["skill", "skill_marketplace"])
@@ -28118,11 +28919,9 @@ mod tests {
         let action = action_def_by_name(&runtime, "capability_acquire").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert!(
-            ActionRuntime::action_required_agent_permission_ids(&action)
-                .iter()
-                .any(|permission| permission == "capability_acquire")
-        );
+        assert!(ActionRuntime::action_required_agent_permission_ids(&action)
+            .iter()
+            .any(|permission| permission == "capability_acquire"));
     }
 
     #[tokio::test]
@@ -28191,16 +28990,12 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_workspace_gws_command")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_workspace_gws_skills")
-        );
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_command"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_skills"));
         assert_eq!(
             manager
                 .get_custom_secret(&integration_enabled_key("google_workspace"))
@@ -28272,19 +29067,47 @@ mod tests {
             .find(|item| item.get("id").and_then(|id| id.as_str()) == Some("google_workspace"))
             .expect("workspace action-backed surface should be visible");
 
-        assert!(
-            gmail["available_actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|action| action.as_str() == Some("gmail_scan"))
-        );
-        assert!(
-            workspace["available_actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|action| action.as_str() == Some("google_workspace_gws_command"))
+        assert!(gmail["available_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action.as_str() == Some("gmail_scan")));
+        assert!(workspace["available_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action.as_str() == Some("google_workspace_gws_command")));
+    }
+
+    #[tokio::test]
+    async fn list_integrations_does_not_report_workspace_connected_without_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+
+        let output = runtime
+            .execute_list_integrations(&serde_json::json!({
+                "query": "Google Gmail",
+                "only_connected": true,
+                "include_details": true
+            }))
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let connected_ids = value["connected_agentark_surfaces"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+            .collect::<BTreeSet<_>>();
+
+        assert!(!connected_ids.contains("gmail"));
+        assert!(!connected_ids.contains("google_workspace"));
+        assert_eq!(
+            value["connected_agentark_surfaces"]["total"]
+                .as_u64()
+                .unwrap(),
+            0
         );
     }
 
@@ -28363,13 +29186,11 @@ mod tests {
         assert_eq!(gmail["connected"], true);
         assert_eq!(gmail["enabled"], true);
         assert_eq!(gmail["connection_required"], false);
-        assert!(
-            gmail["action_names"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|action| action.as_str() == Some("gmail_scan"))
-        );
+        assert!(gmail["action_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action.as_str() == Some("gmail_scan")));
     }
 
     #[tokio::test]
@@ -28450,13 +29271,11 @@ mod tests {
             .expect("inspect should find Gmail from enabled action metadata");
 
         assert_eq!(gmail["safe_check"]["ready_for_agent"], true);
-        assert!(
-            gmail["safe_check"]["available_actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|action| action.as_str() == Some("gmail_scan"))
-        );
+        assert!(gmail["safe_check"]["available_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action.as_str() == Some("gmail_scan")));
     }
 
     #[tokio::test]
@@ -28539,12 +29358,10 @@ mod tests {
             "auth_config_satisfied"
         );
         assert_eq!(live_action["authorization"]["requires_auth"], true);
-        assert!(
-            live_action["content"]
-                .as_str()
-                .unwrap()
-                .contains("ready_for_agent_now")
-        );
+        assert!(live_action["content"]
+            .as_str()
+            .unwrap()
+            .contains("ready_for_agent_now"));
     }
 
     #[tokio::test]
@@ -28555,41 +29372,27 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "calendar_create")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_drive_search")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_docs_read")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_sheets_read")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_chat_list_spaces")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_admin_list_users")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_workspace_gws_command")
-        );
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "calendar_create"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_command"));
     }
 
     #[tokio::test]
@@ -28628,36 +29431,24 @@ mod tests {
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
         assert!(enabled.iter().any(|action| action.name == "gmail_reply"));
         assert!(enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "calendar_create")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_drive_search")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_docs_read")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_sheets_read")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_chat_list_spaces")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_admin_list_users")
-        );
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "calendar_create"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
     }
 
     #[tokio::test]
@@ -28695,32 +29486,22 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_drive_search")
-        );
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
         assert!(enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_docs_read")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_sheets_read")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_chat_list_spaces")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_admin_list_users")
-        );
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
     }
 
     #[tokio::test]
@@ -28809,6 +29590,31 @@ mod tests {
         assert!(private_ip.to_string().contains("private"));
     }
 
+    #[tokio::test]
+    async fn http_get_private_targets_require_trusted_direct_user_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        let private_url = "http://192.168.29.61:8080/snapshot";
+
+        let blocked = runtime
+            .resolve_http_get_url_for_context(private_url, &ActionAuthorizationContext::default())
+            .await
+            .unwrap_err();
+        assert!(blocked.to_string().contains("private"));
+
+        let trusted_direct_context = ActionAuthorizationContext {
+            principal: Some(ActionCallerPrincipal::local_admin("session")),
+            surface: ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            ..ActionAuthorizationContext::default()
+        };
+        let allowed = runtime
+            .resolve_http_get_url_for_context(private_url, &trusted_direct_context)
+            .await
+            .unwrap();
+        assert_eq!(allowed.as_str(), private_url);
+    }
+
     #[test]
     fn docker_unavailable_error_fails_closed() {
         let shell_error = ActionRuntime::docker_required_error("shell").to_string();
@@ -28831,10 +29637,53 @@ mod tests {
     }
 
     #[test]
+    fn workspace_root_defaults_to_data_owned_workspace() {
+        let data_dir = Path::new("/tmp/agentark-data");
+        assert_eq!(
+            ActionRuntime::workspace_root_from_config(data_dir, None),
+            data_dir.join("workspace")
+        );
+        assert_eq!(
+            ActionRuntime::workspace_root_from_config(data_dir, Some("custom-work")),
+            data_dir.join("custom-work")
+        );
+    }
+
+    #[test]
+    fn workspace_root_ignores_configured_source_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let source = temp.path().join("agentark");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        assert_eq!(
+            ActionRuntime::workspace_root_from_config(&data_dir, source.to_str()),
+            data_dir.join("workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_tools_do_not_fall_back_to_current_workspace_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let data_dir = temp.path().join("data");
+        let checkout = temp.path().join("agentark");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let target = checkout.join("generated-app").join("index.html");
+
+        let runtime = ActionRuntime::new(&config_dir, &data_dir).await.unwrap();
+        let error = runtime
+            .resolve_tool_write_path(target.to_str().unwrap())
+            .expect_err("file writes must not be allowed into the current/source checkout");
+        assert!(error.to_string().contains("outside allowed roots"));
+    }
+
+    #[test]
     fn workspace_alias_paths_remap_to_workspace_root() {
         let runtime = ActionRuntime {
             config: RuntimeConfig::default(),
-            sandbox: ActionSandbox::new(&RuntimeConfig::default()).unwrap(),
             transactions: tokio::sync::Mutex::new(TransactionManager::new(PathBuf::from(
                 "snapshots",
             ))),
@@ -28869,6 +29718,12 @@ mod tests {
         assert_eq!(
             runtime
                 .absolutize_tool_path("/workspace/demo/index.html")
+                .unwrap(),
+            workspace_root.join("demo").join("index.html")
+        );
+        assert_eq!(
+            runtime
+                .absolutize_tool_path("demo/index.html")
                 .unwrap(),
             workspace_root.join("demo").join("index.html")
         );
@@ -28948,11 +29803,9 @@ version: "1.2.3"
         let reloaded = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         reloaded.load_all_actions().await.unwrap();
         let reloaded_actions = reloaded.list_actions().await.unwrap();
-        assert!(
-            reloaded_actions
-                .iter()
-                .any(|action| action.name == "officecli")
-        );
+        assert!(reloaded_actions
+            .iter()
+            .any(|action| action.name == "officecli"));
     }
 
     #[tokio::test]
@@ -29076,13 +29929,11 @@ version: "1.2.3"
             other => panic!("unexpected transport: {other:?}"),
         }
         let secrets = manager.load_secrets().unwrap();
-        assert!(
-            secrets
-                .mcp_auth
-                .get("example-mcp")
-                .and_then(|secret| secret.token.as_ref())
-                .is_none()
-        );
+        assert!(secrets
+            .mcp_auth
+            .get("example-mcp")
+            .and_then(|secret| secret.token.as_ref())
+            .is_none());
     }
 
     #[tokio::test]
@@ -29109,11 +29960,9 @@ version: "1.2.3"
         let action = action_def_by_name(&runtime, "vision_ocr").await;
 
         assert!(action.capabilities.contains(&"vision_ocr".to_string()));
-        assert!(
-            !action
-                .capabilities
-                .contains(&"image_generation".to_string())
-        );
+        assert!(!action
+            .capabilities
+            .contains(&"image_generation".to_string()));
         assert!(action.authorization.access.integration_ids.is_empty());
     }
 
@@ -29171,11 +30020,9 @@ version: "1.2.3"
 
         assert_eq!(candidates[0].model, "primary-model");
         assert_eq!(candidates[0].provider_label(), "openrouter");
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.model == "legacy-model")
-        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.model == "legacy-model"));
     }
 
     #[test]
@@ -29285,31 +30132,34 @@ version: "1.2.3"
         let background_session_manage =
             action_def_by_name(&runtime, "background_session_manage").await;
 
-        assert!(
-            app_deploy
-                .description
-                .contains("implement that behavior inside the artifact")
-        );
-        assert!(
-            schedule_task
-                .description
-                .contains("cadence that belongs inside a generated app")
-        );
-        assert!(
-            watch
-                .description
-                .contains("inside a generated app, dashboard, page, or tool's own UI")
-        );
-        assert!(
-            background_session_manage
-                .description
-                .contains("durable AgentArk background session")
-        );
-        assert!(
-            background_session_manage
-                .description
-                .contains("not app-internal refresh/poll cadence")
-        );
+        assert!(app_deploy
+            .description
+            .contains("implement that behavior inside the artifact"));
+        assert!(schedule_task
+            .description
+            .contains("cadence that belongs inside a generated app"));
+        assert!(watch
+            .description
+            .contains("inside a generated app, dashboard, page, or tool's own UI"));
+        assert!(background_session_manage
+            .description
+            .contains("durable AgentArk background session"));
+        assert!(background_session_manage
+            .description
+            .contains("not app-internal refresh/poll cadence"));
+    }
+
+    #[tokio::test]
+    async fn app_deploy_schema_exposes_acceptance_contract_fields() {
+        let runtime = runtime_for_authorization_tests().await;
+        let app_deploy = action_def_by_name(&runtime, "app_deploy").await;
+        let properties = app_deploy.input_schema["properties"]
+            .as_object()
+            .expect("app_deploy schema properties should be an object");
+
+        assert!(properties.contains_key("request_context"));
+        assert!(properties.contains_key("acceptance_criteria"));
+        assert!(app_deploy.description.contains("acceptance"));
     }
 
     fn trusted_chat_context(
@@ -29357,12 +30207,10 @@ version: "1.2.3"
     async fn lan_discover_allows_trusted_chat_without_approval() {
         let runtime = runtime_for_authorization_tests().await;
         let action = action_def_by_name(&runtime, "lan_discover").await;
-        assert!(
-            action
-                .capabilities
-                .iter()
-                .any(|cap| cap == "local_network_discovery")
-        );
+        assert!(action
+            .capabilities
+            .iter()
+            .any(|cap| cap == "local_network_discovery"));
 
         let decision = runtime
             .authorize_action_invocation(
@@ -29747,14 +30595,12 @@ version: "1.2.3"
         let mut context = trusted_chat_context("test-sensitive-notify-send", false);
         context.direct_user_intent = false;
 
-        assert!(
-            notify
-                .authorization
-                .access
-                .channel_targets
-                .iter()
-                .any(|target| target.argument_key == "delivery_channel")
-        );
+        assert!(notify
+            .authorization
+            .access
+            .channel_targets
+            .iter()
+            .any(|target| target.argument_key == "delivery_channel"));
 
         let read_decision = runtime
             .authorize_action_invocation(
@@ -30013,6 +30859,62 @@ version: "1.2.3"
     }
 
     #[test]
+    fn capability_acquire_graphql_operation_preserves_default_read_body() {
+        let (_, operation, _) = ActionRuntime::capability_operation_draft(
+            &serde_json::json!({
+                "base_url": "https://api.example.com",
+                "operation": {
+                    "id": "viewer",
+                    "method": "post",
+                    "path": "/graphql",
+                    "body": {
+                        "query": "query Viewer { viewer { id } }"
+                    }
+                }
+            }),
+            "graph-api",
+            "Query a GraphQL API",
+        )
+        .expect("GraphQL capability draft should be created");
+
+        assert!(operation.read_only);
+        assert!(operation.body_required);
+        assert_eq!(
+            operation
+                .default_body
+                .as_ref()
+                .and_then(|body| body.get("query"))
+                .and_then(|query| query.as_str()),
+            Some("query Viewer { viewer { id } }")
+        );
+    }
+
+    #[test]
+    fn capability_acquire_graphql_body_template_string_is_stored_as_json_body() {
+        let (_, operation, _) = ActionRuntime::capability_operation_draft(
+            &serde_json::json!({
+                "base_url": "https://api.example.com",
+                "method": "post",
+                "path": "/graphql",
+                "body_template": "{\"query\":\"query Viewer { viewer { id } }\"}"
+            }),
+            "graph-api",
+            "Query a GraphQL API",
+        )
+        .expect("GraphQL capability draft should be created");
+
+        assert!(operation.read_only);
+        assert_eq!(
+            operation
+                .default_body
+                .as_ref()
+                .and_then(|body| body.get("query"))
+                .and_then(|query| query.as_str()),
+            Some("query Viewer { viewer { id } }")
+        );
+    }
+
+    #[test]
     fn capability_acquire_auth_fields_preserve_existing_auth_when_omitted() {
         let (auth_mode, auth_header, auth_name, auth_username) =
             ActionRuntime::capability_auth_fields(&serde_json::json!({}));
@@ -30057,6 +30959,42 @@ version: "1.2.3"
         assert!(auth_header.is_none());
         assert_eq!(auth_name.as_deref(), Some("Authorization"));
         assert!(auth_username.is_none());
+    }
+
+    #[test]
+    fn capability_docs_text_prefers_explicit_api_key_header_over_oauth_mentions() {
+        let derived = ActionRuntime::derive_capability_from_docs_text(
+            "The API supports personal API keys and OAuth2 authentication.\n\
+             To authenticate API key requests, pass the API key with header: Authorization: <API_KEY>.\n\
+             OAuth access tokens use Authorization: Bearer <ACCESS_TOKEN>.",
+            Some("https://developer.example.com/docs/graphql"),
+        )
+        .expect("docs text should derive auth metadata");
+
+        assert_eq!(
+            derived.get("auth_type").and_then(|value| value.as_str()),
+            Some("api_key_header")
+        );
+        assert_eq!(
+            derived
+                .get("auth_header_name")
+                .and_then(|value| value.as_str()),
+            Some("Authorization")
+        );
+    }
+
+    #[test]
+    fn capability_docs_text_keeps_explicit_bearer_token_auth() {
+        let derived = ActionRuntime::derive_capability_from_docs_text(
+            "Authenticate API calls with an access token in the header Authorization: Bearer <ACCESS_TOKEN>.",
+            Some("https://developer.example.com/docs"),
+        )
+        .expect("docs text should derive auth metadata");
+
+        assert_eq!(
+            derived.get("auth_type").and_then(|value| value.as_str()),
+            Some("bearer")
+        );
     }
 
     #[test]
@@ -30152,11 +31090,53 @@ version: "1.2.3"
             },
             secret_configured: true,
             action_count: 1,
+            capability_contract: serde_json::json!({}),
             test_action_name: None,
         };
 
         assert!(!ActionRuntime::custom_api_view_is_connected(&view));
         assert!(ActionRuntime::custom_api_view_is_callable(&view));
+    }
+
+    #[test]
+    fn custom_api_view_selector_uses_canonical_identifier_matching() {
+        let view = crate::custom_apis::CustomApiView {
+            config: crate::custom_apis::CustomApiConfig {
+                id: "provider-api".to_string(),
+                name: "Provider API".to_string(),
+                description: String::new(),
+                base_url: "https://api.example.com".to_string(),
+                enabled: true,
+                auth_mode: crate::custom_apis::CustomApiAuthMode::None,
+                auth_profile_id: None,
+                auth_header: None,
+                auth_name: None,
+                auth_username: None,
+                created_at: "2026-05-23T00:00:00Z".to_string(),
+                updated_at: "2026-05-23T00:00:00Z".to_string(),
+                last_tested_at: None,
+                last_test_outcome: None,
+                last_test_message: None,
+                operations: Vec::new(),
+            },
+            secret_configured: false,
+            action_count: 1,
+            capability_contract: serde_json::json!({}),
+            test_action_name: None,
+        };
+
+        assert!(ActionRuntime::custom_api_view_matches_selector(
+            &view,
+            "provider_api"
+        ));
+        assert!(ActionRuntime::custom_api_view_matches_selector(
+            &view,
+            "Provider API"
+        ));
+        assert!(!ActionRuntime::custom_api_view_matches_selector(
+            &view,
+            "other_api"
+        ));
     }
 
     #[test]
@@ -30174,6 +31154,7 @@ version: "1.2.3"
                 default_query: BTreeMap::new(),
                 parameters: Vec::new(),
                 body_required: false,
+                default_body: None,
             },
             action_name: "api__graph_api__post-graphql".to_string(),
         };
@@ -30192,6 +31173,108 @@ version: "1.2.3"
         ));
         assert!(!ActionRuntime::custom_api_operation_allows_read_request(
             &operation, None
+        ));
+    }
+
+    #[test]
+    fn custom_api_operation_selector_uses_canonical_identifier_matching() {
+        let operation = crate::custom_apis::CustomApiOperation {
+            draft: crate::custom_apis::CustomApiOperationDraft {
+                id: "issues-list".to_string(),
+                name: "Issues List".to_string(),
+                method: "POST".to_string(),
+                path: "/graphql".to_string(),
+                description: String::new(),
+                read_only: true,
+                enabled: true,
+                default_headers: BTreeMap::new(),
+                default_query: BTreeMap::new(),
+                parameters: Vec::new(),
+                body_required: true,
+                default_body: Some(serde_json::json!({
+                    "query": "query { issues { nodes { id title } } }"
+                })),
+            },
+            action_name: "api__linear__issues-list".to_string(),
+        };
+
+        assert!(ActionRuntime::custom_api_operation_matches_selector(
+            &operation,
+            "issues_list"
+        ));
+        assert!(ActionRuntime::custom_api_operation_matches_selector(
+            &operation,
+            "Issues List"
+        ));
+        assert!(ActionRuntime::custom_api_operation_matches_selector(
+            &operation,
+            "POST /graphql"
+        ));
+        assert!(!ActionRuntime::custom_api_operation_matches_selector(
+            &operation,
+            "teams_list"
+        ));
+    }
+
+    #[test]
+    fn custom_api_request_selector_miss_uses_single_safe_compatible_operation() {
+        let operation = crate::custom_apis::CustomApiOperation {
+            draft: crate::custom_apis::CustomApiOperationDraft {
+                id: "post-graphql".to_string(),
+                name: "POST /graphql".to_string(),
+                method: "POST".to_string(),
+                path: "/graphql".to_string(),
+                description: String::new(),
+                read_only: true,
+                enabled: true,
+                default_headers: BTreeMap::new(),
+                default_query: BTreeMap::new(),
+                parameters: Vec::new(),
+                body_required: true,
+                default_body: Some(serde_json::json!({
+                    "query": "query { viewer { id } }"
+                })),
+            },
+            action_name: "api__provider__post-graphql".to_string(),
+        };
+
+        let selected = ActionRuntime::select_custom_api_read_operation(
+            [&operation],
+            Some("viewer_query_alias"),
+            None,
+            false,
+        )
+        .expect("one safe compatible operation should be selected");
+
+        assert_eq!(selected.0.draft.id, "post-graphql");
+        assert_eq!(selected.1, "single_compatible_operation");
+    }
+
+    #[test]
+    fn read_only_graphql_operation_with_mutation_default_body_is_not_callable_as_read() {
+        let operation = crate::custom_apis::CustomApiOperation {
+            draft: crate::custom_apis::CustomApiOperationDraft {
+                id: "post-graphql".to_string(),
+                name: "POST /graphql".to_string(),
+                method: "POST".to_string(),
+                path: "/graphql".to_string(),
+                description: String::new(),
+                read_only: true,
+                enabled: true,
+                default_headers: BTreeMap::new(),
+                default_query: BTreeMap::new(),
+                parameters: Vec::new(),
+                body_required: true,
+                default_body: Some(serde_json::json!({
+                    "query": "mutation Create { createThing { id } }"
+                })),
+            },
+            action_name: "api__graph_api__post-graphql".to_string(),
+        };
+
+        assert!(!ActionRuntime::custom_api_operation_allows_read_request(
+            &operation,
+            operation.draft.default_body.as_ref()
         ));
     }
 
@@ -30223,6 +31306,7 @@ version: "1.2.3"
                 schema_type: Some("object".to_string()),
             }],
             body_required: true,
+            default_body: None,
         };
 
         let error = runtime
@@ -30237,11 +31321,9 @@ version: "1.2.3"
             .await
             .expect_err("read-only GraphQL mutation should be rejected");
 
-        assert!(
-            error
-                .to_string()
-                .contains("Read-only GraphQL custom API actions only accept GraphQL query")
-        );
+        assert!(error
+            .to_string()
+            .contains("Read-only GraphQL custom API actions only accept GraphQL query"));
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{sleep, Duration, Instant};
 
 const MAX_RATE_LIMIT_RETRIES: usize = 3;
 const MAX_RATE_LIMIT_TOTAL_DELAY: Duration = Duration::from_secs(30);

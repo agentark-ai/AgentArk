@@ -1,14 +1,13 @@
 use super::*;
-use anyhow::{anyhow, Context, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::{anyhow, Result};
+use chrono::TimeZone;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-const WEBHOOK_SOURCES_KEY: &str = "webhooks:sources:v1";
-const WEBHOOK_EVENTS_KEY: &str = "webhooks:events:v1";
 const WEBHOOK_SECRET_PREFIX: &str = "webhook_source_secret:";
-const WEBHOOK_EVENT_HISTORY_LIMIT: usize = 200;
 const WEBHOOK_DEFAULT_DEDUPE_WINDOW_SECS: u64 = 15 * 60;
+const WEBHOOK_DEFAULT_SIGNATURE_TIMESTAMP_TOLERANCE_SECS: u64 = 5 * 60;
 const WEBHOOK_EXCERPT_MAX_CHARS: usize = 1200;
 const WEBHOOK_SUMMARY_MAX_CHARS: usize = 320;
 const WEBHOOK_PROMPT_EXCERPT_MAX_CHARS: usize = 2000;
@@ -21,6 +20,14 @@ pub(super) enum WebhookAuthMode {
     None,
     BearerToken,
     HmacSha256,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WebhookSignaturePayloadMode {
+    Body,
+    TimestampDotBody,
+    SlackV0,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -68,6 +75,12 @@ pub(super) struct WebhookSource {
     pub event_header: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_timestamp_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_timestamp_tolerance_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_payload_mode: Option<WebhookSignaturePayloadMode>,
     #[serde(default)]
     pub allow_duplicate: bool,
     #[serde(default)]
@@ -159,6 +172,12 @@ pub(super) struct WebhookSourceUpsertRequest {
     #[serde(default)]
     pub secret_header: Option<String>,
     #[serde(default)]
+    pub signature_timestamp_header: Option<String>,
+    #[serde(default)]
+    pub signature_timestamp_tolerance_secs: Option<u64>,
+    #[serde(default)]
+    pub signature_payload_mode: Option<WebhookSignaturePayloadMode>,
+    #[serde(default)]
     pub secret: Option<String>,
     #[serde(default)]
     pub clear_secret: Option<bool>,
@@ -227,12 +246,95 @@ struct PluginWebhookDispatch<'a> {
 }
 
 struct RouteEventInput<'a> {
-    source_index: usize,
     source: &'a WebhookSource,
     headers: &'a HeaderMap,
     raw_body: &'a str,
     payload: Option<&'a serde_json::Value>,
     test_event: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct WebhookDispatchJob {
+    source: WebhookSource,
+    event: NormalizedWebhookEvent,
+    event_record_id: String,
+    received_at: String,
+    test_event: bool,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct WebhookDispatchHandle {
+    sender: Option<tokio::sync::mpsc::Sender<WebhookDispatchJob>>,
+}
+
+enum WebhookDispatchEnqueue {
+    Enqueued,
+    Disabled(WebhookDispatchJob),
+    Full(WebhookDispatchJob),
+    Closed(WebhookDispatchJob),
+}
+
+impl WebhookDispatchHandle {
+    #[cfg(test)]
+    pub(super) fn disabled() -> Self {
+        Self { sender: None }
+    }
+
+    fn new(sender: tokio::sync::mpsc::Sender<WebhookDispatchJob>) -> Self {
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    fn enqueue(&self, job: WebhookDispatchJob) -> WebhookDispatchEnqueue {
+        let Some(sender) = &self.sender else {
+            return WebhookDispatchEnqueue::Disabled(job);
+        };
+        match sender.try_send(job) {
+            Ok(()) => WebhookDispatchEnqueue::Enqueued,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                WebhookDispatchEnqueue::Full(job)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+                WebhookDispatchEnqueue::Closed(job)
+            }
+        }
+    }
+}
+
+pub(super) fn webhook_dispatch_channel(
+    capacity: usize,
+) -> (
+    WebhookDispatchHandle,
+    tokio::sync::mpsc::Receiver<WebhookDispatchJob>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity.max(1));
+    (WebhookDispatchHandle::new(sender), receiver)
+}
+
+pub(super) fn spawn_webhook_dispatch_worker(
+    state: AppState,
+    mut receiver: tokio::sync::mpsc::Receiver<WebhookDispatchJob>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    crate::spawn_logged!(
+        "src/channels/http/webhooks.rs:webhook-dispatch-worker",
+        async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    maybe_job = receiver.recv() => {
+                        let Some(job) = maybe_job else {
+                            break;
+                        };
+                        if let Err(error) = process_webhook_dispatch_job(&state, job).await {
+                            tracing::warn!("Queued webhook dispatch failed: {}", error);
+                        }
+                    }
+                }
+            }
+        }
+    )
 }
 
 fn now_rfc3339() -> String {
@@ -243,42 +345,23 @@ fn webhook_secret_key(source_id: &str) -> String {
     format!("{}{}", WEBHOOK_SECRET_PREFIX, source_id.trim())
 }
 
-async fn load_json<T>(storage: &crate::storage::Storage, key: &str) -> Result<T>
-where
-    T: DeserializeOwned + Default,
-{
-    let Some(bytes) = storage.get_encrypted(key).await? else {
-        return Ok(T::default());
-    };
-    serde_json::from_slice::<T>(&bytes)
-        .with_context(|| format!("failed to decode webhook payload for {}", key))
-}
-
-async fn save_json<T>(storage: &crate::storage::Storage, key: &str, value: &T) -> Result<()>
-where
-    T: Serialize + ?Sized,
-{
-    let bytes = serde_json::to_vec(value).with_context(|| format!("failed to encode {}", key))?;
-    storage.set_encrypted(key, &bytes).await
-}
-
 async fn load_sources(storage: &crate::storage::Storage) -> Result<Vec<WebhookSource>> {
-    load_json(storage, WEBHOOK_SOURCES_KEY).await
+    Ok(storage
+        .list_webhook_sources()
+        .await?
+        .into_iter()
+        .map(webhook_source_from_model)
+        .collect())
 }
 
-async fn save_sources(storage: &crate::storage::Storage, sources: &[WebhookSource]) -> Result<()> {
-    save_json(storage, WEBHOOK_SOURCES_KEY, sources).await
-}
-
-async fn load_events(storage: &crate::storage::Storage) -> Result<Vec<WebhookEventRecord>> {
-    load_json(storage, WEBHOOK_EVENTS_KEY).await
-}
-
-async fn save_events(
+async fn load_source(
     storage: &crate::storage::Storage,
-    events: &[WebhookEventRecord],
-) -> Result<()> {
-    save_json(storage, WEBHOOK_EVENTS_KEY, events).await
+    source_id: &str,
+) -> Result<Option<WebhookSource>> {
+    Ok(storage
+        .get_webhook_source(source_id)
+        .await?
+        .map(webhook_source_from_model))
 }
 
 fn present_source(source: &WebhookSource, secret_configured: bool) -> WebhookSourceResponse {
@@ -286,6 +369,106 @@ fn present_source(source: &WebhookSource, secret_configured: bool) -> WebhookSou
         source: source.clone(),
         ingest_path: format!("/webhook/inbound/{}", source.id),
         secret_configured,
+    }
+}
+
+fn enum_storage_value<T>(value: T) -> String
+where
+    T: Serialize,
+{
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_default()
+}
+
+fn enum_from_storage<T>(value: &str) -> T
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    serde_json::from_value(serde_json::Value::String(value.to_string())).unwrap_or_default()
+}
+
+fn optional_enum_from_storage<T>(value: Option<String>) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    value.and_then(|value| serde_json::from_value(serde_json::Value::String(value)).ok())
+}
+
+fn optional_secs_from_i64(value: Option<i64>) -> Option<u64> {
+    value.and_then(|secs| u64::try_from(secs).ok())
+}
+
+fn webhook_source_model_from_source(
+    source: WebhookSource,
+) -> crate::storage::webhook_source::Model {
+    crate::storage::webhook_source::Model {
+        id: source.id,
+        name: source.name,
+        provider: source.provider,
+        description: source.description,
+        enabled: source.enabled,
+        auth_mode: enum_storage_value(source.auth_mode),
+        match_mode: enum_storage_value(source.match_mode),
+        instruction: source.instruction,
+        event_header: source.event_header,
+        secret_header: source.secret_header,
+        signature_timestamp_header: source.signature_timestamp_header,
+        signature_timestamp_tolerance_secs: source
+            .signature_timestamp_tolerance_secs
+            .and_then(|secs| i64::try_from(secs).ok()),
+        signature_payload_mode: source.signature_payload_mode.map(enum_storage_value),
+        allow_duplicate: source.allow_duplicate,
+        require_approval: source.require_approval,
+        dedupe_window_secs: i64::try_from(source.dedupe_window_secs)
+            .unwrap_or(WEBHOOK_DEFAULT_DEDUPE_WINDOW_SECS as i64),
+        notify_on_queued: source.notify_on_queued,
+        notify_on_success: source.notify_on_success,
+        notify_on_failure: source.notify_on_failure,
+        output_target: enum_storage_value(source.output_target),
+        output_channel: source.output_channel,
+        conversation_id: source.conversation_id,
+        created_at: source.created_at,
+        updated_at: source.updated_at,
+        last_received_at: source.last_received_at,
+        last_outcome: source.last_outcome,
+        last_task_id: source.last_task_id,
+    }
+}
+
+fn webhook_source_from_model(model: crate::storage::webhook_source::Model) -> WebhookSource {
+    WebhookSource {
+        id: model.id,
+        name: model.name,
+        provider: model.provider,
+        description: model.description,
+        enabled: model.enabled,
+        auth_mode: enum_from_storage(&model.auth_mode),
+        match_mode: enum_from_storage(&model.match_mode),
+        instruction: model.instruction,
+        event_header: model.event_header,
+        secret_header: model.secret_header,
+        signature_timestamp_header: model.signature_timestamp_header,
+        signature_timestamp_tolerance_secs: optional_secs_from_i64(
+            model.signature_timestamp_tolerance_secs,
+        ),
+        signature_payload_mode: optional_enum_from_storage(model.signature_payload_mode),
+        allow_duplicate: model.allow_duplicate,
+        require_approval: model.require_approval,
+        dedupe_window_secs: u64::try_from(model.dedupe_window_secs)
+            .unwrap_or(WEBHOOK_DEFAULT_DEDUPE_WINDOW_SECS),
+        notify_on_queued: model.notify_on_queued,
+        notify_on_success: model.notify_on_success,
+        notify_on_failure: model.notify_on_failure,
+        output_target: enum_from_storage(&model.output_target),
+        output_channel: model.output_channel,
+        conversation_id: model.conversation_id,
+        created_at: model.created_at,
+        updated_at: model.updated_at,
+        last_received_at: model.last_received_at,
+        last_outcome: model.last_outcome,
+        last_task_id: model.last_task_id,
     }
 }
 
@@ -427,7 +610,7 @@ fn source_report_target(source: &WebhookSource) -> Option<String> {
 
 fn default_auth_mode_for_provider(provider: &str) -> WebhookAuthMode {
     match provider {
-        "github" => WebhookAuthMode::HmacSha256,
+        "github" | "slack" | "stripe" => WebhookAuthMode::HmacSha256,
         "gitlab" => WebhookAuthMode::HeaderToken,
         _ => WebhookAuthMode::HeaderToken,
     }
@@ -451,12 +634,43 @@ fn default_secret_header_for_provider(
         WebhookAuthMode::BearerToken => Some("Authorization".to_string()),
         WebhookAuthMode::HmacSha256 => Some(match provider {
             "github" => "X-Hub-Signature-256".to_string(),
+            "slack" => "X-Slack-Signature".to_string(),
+            "stripe" => "Stripe-Signature".to_string(),
             _ => crate::branding::WEBHOOK_SIGNATURE_HEADER.to_string(),
         }),
         WebhookAuthMode::HeaderToken => Some(match provider {
             "gitlab" => "X-Gitlab-Token".to_string(),
             _ => crate::branding::WEBHOOK_SECRET_HEADER.to_string(),
         }),
+    }
+}
+
+fn default_signature_timestamp_header_for_provider(
+    provider: &str,
+    auth_mode: WebhookAuthMode,
+) -> Option<String> {
+    if !matches!(auth_mode, WebhookAuthMode::HmacSha256) {
+        return None;
+    }
+    match provider {
+        "slack" => Some("X-Slack-Request-Timestamp".to_string()),
+        _ => None,
+    }
+}
+
+fn default_signature_payload_mode_for_provider(
+    provider: &str,
+    auth_mode: WebhookAuthMode,
+    timestamp_header: Option<&str>,
+) -> Option<WebhookSignaturePayloadMode> {
+    if !matches!(auth_mode, WebhookAuthMode::HmacSha256) {
+        return None;
+    }
+    match provider {
+        "slack" => Some(WebhookSignaturePayloadMode::SlackV0),
+        "stripe" => Some(WebhookSignaturePayloadMode::TimestampDotBody),
+        _ if timestamp_header.is_some() => Some(WebhookSignaturePayloadMode::TimestampDotBody),
+        _ => None,
     }
 }
 
@@ -515,33 +729,113 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn hmac_sha256_hex(secret: &str, data: &[u8]) -> String {
-    const BLOCK_SIZE: usize = 64;
-    let mut key = secret.as_bytes().to_vec();
-    if key.len() > BLOCK_SIZE {
-        let mut hasher = Sha256::new();
-        hasher.update(&key);
-        key = hasher.finalize().to_vec();
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    hex::encode(ring::hmac::sign(&key, data).as_ref())
+}
+
+fn parse_signature_pairs(header: &str, key: &str) -> Vec<String> {
+    header
+        .split(',')
+        .filter_map(|part| {
+            let (left, right) = part.trim().split_once('=')?;
+            if left.trim() == key {
+                Some(right.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn signature_candidates_for_provider(provider: &str, provided: &str) -> Vec<String> {
+    let trimmed = provided.trim();
+    let candidates = match provider {
+        "stripe" => parse_signature_pairs(trimmed, "v1"),
+        _ => Vec::new(),
+    };
+    if !candidates.is_empty() {
+        return candidates;
     }
-    if key.len() < BLOCK_SIZE {
-        key.resize(BLOCK_SIZE, 0);
+    vec![trimmed
+        .strip_prefix("sha256=")
+        .or_else(|| trimmed.strip_prefix("v0="))
+        .unwrap_or(trimmed)
+        .to_string()]
+}
+
+fn stripe_signature_timestamp(provided: &str) -> Option<String> {
+    parse_signature_pairs(provided, "t").into_iter().next()
+}
+
+fn parse_webhook_signature_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Webhook signature timestamp is empty");
+    }
+    if let Ok(raw) = trimmed.parse::<i64>() {
+        let timestamp = if raw.unsigned_abs() >= 1_000_000_000_000 {
+            chrono::Utc.timestamp_millis_opt(raw).single()
+        } else {
+            chrono::Utc.timestamp_opt(raw, 0).single()
+        };
+        return timestamp.ok_or_else(|| anyhow!("Webhook signature timestamp is invalid"));
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| anyhow!("Webhook signature timestamp is invalid"))
+}
+
+fn validate_webhook_signature_timestamp(timestamp: &str, tolerance_secs: u64) -> Result<()> {
+    let parsed = parse_webhook_signature_timestamp(timestamp)?;
+    let age = chrono::Utc::now()
+        .signed_duration_since(parsed)
+        .num_seconds()
+        .unsigned_abs();
+    if age > tolerance_secs.max(1) {
+        anyhow::bail!("Webhook signature timestamp is outside the allowed freshness window");
+    }
+    Ok(())
+}
+
+fn signature_timestamp_for_source(
+    source: &WebhookSource,
+    headers: &HeaderMap,
+    provided_signature: &str,
+) -> Result<Option<String>> {
+    if source.provider == "stripe" {
+        return stripe_signature_timestamp(provided_signature)
+            .ok_or_else(|| anyhow!("Missing Stripe signature timestamp"))
+            .map(Some);
     }
 
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for (idx, byte) in key.iter().enumerate() {
-        ipad[idx] ^= byte;
-        opad[idx] ^= byte;
+    let timestamp_header = source.signature_timestamp_header.clone().or_else(|| {
+        default_signature_timestamp_header_for_provider(&source.provider, source.auth_mode)
+    });
+    match timestamp_header {
+        Some(header_name) => header_text(headers, &header_name)
+            .ok_or_else(|| anyhow!("Missing {} header", header_name))
+            .map(Some),
+        None => Ok(None),
     }
+}
 
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_hash);
-    hex::encode(outer.finalize())
+fn signed_hmac_payload(
+    mode: WebhookSignaturePayloadMode,
+    raw_body: &str,
+    timestamp: Option<&str>,
+) -> Result<String> {
+    match mode {
+        WebhookSignaturePayloadMode::Body => Ok(raw_body.to_string()),
+        WebhookSignaturePayloadMode::TimestampDotBody => {
+            let timestamp = timestamp.ok_or_else(|| anyhow!("Missing webhook timestamp"))?;
+            Ok(format!("{}.{}", timestamp.trim(), raw_body))
+        }
+        WebhookSignaturePayloadMode::SlackV0 => {
+            let timestamp = timestamp.ok_or_else(|| anyhow!("Missing Slack request timestamp"))?;
+            Ok(format!("v0:{}:{}", timestamp.trim(), raw_body))
+        }
+    }
 }
 
 fn json_path_value<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
@@ -989,12 +1283,30 @@ fn verify_source_secret(
                 .ok_or_else(|| anyhow!("Signature header is not configured"))?;
             let provided = header_text(headers, &header_name)
                 .ok_or_else(|| anyhow!("Missing {} header", header_name))?;
-            let expected = hmac_sha256_hex(&secret, raw_body.as_bytes());
-            let provided_trimmed = provided.trim();
-            let provided_without_prefix = provided_trimmed
-                .strip_prefix("sha256=")
-                .unwrap_or(provided_trimmed);
-            if constant_time_eq(expected.as_bytes(), provided_without_prefix.as_bytes()) {
+            let timestamp = signature_timestamp_for_source(source, headers, &provided)?;
+            if let Some(timestamp) = timestamp.as_deref() {
+                let tolerance_secs = source
+                    .signature_timestamp_tolerance_secs
+                    .unwrap_or(WEBHOOK_DEFAULT_SIGNATURE_TIMESTAMP_TOLERANCE_SECS);
+                validate_webhook_signature_timestamp(timestamp, tolerance_secs)?;
+            }
+            let payload_mode = source
+                .signature_payload_mode
+                .or_else(|| {
+                    default_signature_payload_mode_for_provider(
+                        &source.provider,
+                        source.auth_mode,
+                        source.signature_timestamp_header.as_deref(),
+                    )
+                })
+                .unwrap_or(WebhookSignaturePayloadMode::Body);
+            let signed_payload = signed_hmac_payload(payload_mode, raw_body, timestamp.as_deref())?;
+            let expected = hmac_sha256_hex(&secret, signed_payload.as_bytes());
+            let candidates = signature_candidates_for_provider(&source.provider, &provided);
+            if candidates
+                .iter()
+                .any(|candidate| constant_time_eq(expected.as_bytes(), candidate.as_bytes()))
+            {
                 Ok(())
             } else {
                 Err(anyhow!("Invalid HMAC signature"))
@@ -1005,6 +1317,7 @@ fn verify_source_secret(
 
 fn source_status_message(source: &WebhookSource, outcome: &str) -> String {
     match outcome {
+        "accepted" => "Matched event and accepted it for background dispatch.".to_string(),
         "queued" => "Matched event and queued autonomous work.".to_string(),
         "duplicate" => "Ignored duplicate delivery inside dedupe window.".to_string(),
         "ignored" => match source.match_mode {
@@ -1140,179 +1453,160 @@ async fn emit_plugin_webhook_event_best_effort(
     }
 }
 
-async fn append_event(storage: &crate::storage::Storage, record: WebhookEventRecord) -> Result<()> {
-    let mut events = load_events(storage).await?;
-    events.insert(0, record);
-    if events.len() > WEBHOOK_EVENT_HISTORY_LIMIT {
-        events.truncate(WEBHOOK_EVENT_HISTORY_LIMIT);
-    }
-    save_events(storage, &events).await
+fn webhook_payload_hash(raw_body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_body.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
-fn duplicate_seen_recently(
-    events: &[WebhookEventRecord],
-    source: &WebhookSource,
+fn webhook_dedupe_idempotency_key(
+    dedupe_key: &str,
+    received_at: &str,
+    dedupe_window_secs: u64,
+) -> String {
+    let window_secs = i64::try_from(dedupe_window_secs.max(1))
+        .unwrap_or(i64::MAX)
+        .max(1);
+    let timestamp = chrono::DateTime::parse_from_rfc3339(received_at)
+        .map(|value| value.timestamp())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+    let bucket = timestamp.div_euclid(window_secs);
+    format!("dedupe:{}:{}", dedupe_key, bucket)
+}
+
+fn webhook_replay_idempotency_key(
     event: &NormalizedWebhookEvent,
-) -> bool {
-    let now = chrono::Utc::now();
-    events.iter().any(|entry| {
-        if entry.source_id != source.id || entry.dedupe_key != event.dedupe_key {
-            return false;
-        }
-        chrono::DateTime::parse_from_rfc3339(&entry.received_at)
-            .ok()
-            .map(|ts| {
-                now.signed_duration_since(ts.with_timezone(&chrono::Utc))
-                    <= chrono::Duration::seconds(source.dedupe_window_secs as i64)
-            })
-            .unwrap_or(false)
-    })
+    received_at: &str,
+    dedupe_window_secs: u64,
+) -> String {
+    if event
+        .event_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        format!("delivery:{}", event.dedupe_key)
+    } else {
+        webhook_dedupe_idempotency_key(&event.dedupe_key, received_at, dedupe_window_secs)
+    }
+}
+
+fn webhook_event_model_from_record(
+    record: WebhookEventRecord,
+    idempotency_key: String,
+    payload_hash: String,
+) -> crate::storage::webhook_event::Model {
+    let updated_at = record.received_at.clone();
+    crate::storage::webhook_event::Model {
+        id: record.id,
+        source_id: record.source_id,
+        source_name: record.source_name,
+        provider: record.provider,
+        received_at: record.received_at,
+        updated_at,
+        event_type: record.event_type,
+        status: record.status,
+        subject: record.subject,
+        outcome: record.outcome,
+        matched: record.matched,
+        queued: record.queued,
+        message: record.message,
+        event_id: record.event_id,
+        dedupe_key: record.dedupe_key,
+        idempotency_key,
+        payload_hash,
+        event_url: record.event_url,
+        payload_excerpt: record.payload_excerpt,
+        task_id: record.task_id,
+        conversation_id: record.conversation_id,
+        severity: record.severity,
+        test_event: record.test_event,
+    }
+}
+
+fn webhook_event_record_from_model(
+    model: crate::storage::webhook_event::Model,
+) -> WebhookEventRecord {
+    WebhookEventRecord {
+        id: model.id,
+        source_id: model.source_id,
+        source_name: model.source_name,
+        provider: model.provider,
+        received_at: model.received_at,
+        event_type: model.event_type,
+        status: model.status,
+        subject: model.subject,
+        outcome: model.outcome,
+        matched: model.matched,
+        queued: model.queued,
+        message: model.message,
+        event_id: model.event_id,
+        dedupe_key: model.dedupe_key,
+        event_url: model.event_url,
+        payload_excerpt: model.payload_excerpt,
+        task_id: model.task_id,
+        conversation_id: model.conversation_id,
+        severity: model.severity,
+        test_event: model.test_event,
+    }
+}
+
+async fn append_event(storage: &crate::storage::Storage, record: WebhookEventRecord) -> Result<()> {
+    let idempotency_key = format!("event:{}:{}", record.dedupe_key, record.id);
+    let payload_hash = record
+        .payload_excerpt
+        .as_deref()
+        .map(webhook_payload_hash)
+        .unwrap_or_else(|| webhook_payload_hash(""));
+    storage
+        .insert_webhook_event(webhook_event_model_from_record(
+            record,
+            idempotency_key,
+            payload_hash,
+        ))
+        .await
 }
 
 async fn persist_source_runtime_state(
     storage: &crate::storage::Storage,
-    sources: &mut [WebhookSource],
-    index: usize,
+    source_id: &str,
     received_at: &str,
     outcome: &str,
     task_id: Option<String>,
 ) -> Result<()> {
-    if let Some(source) = sources.get_mut(index) {
-        source.last_received_at = Some(received_at.to_string());
-        source.last_outcome = Some(outcome.to_string());
-        source.last_task_id = task_id;
-        source.updated_at = received_at.to_string();
-    }
-    save_sources(storage, sources).await
+    storage
+        .update_webhook_source_runtime_state(source_id, received_at, outcome, task_id.as_deref())
+        .await?;
+    Ok(())
 }
 
-async fn route_event(
+async fn process_webhook_dispatch_job(state: &AppState, job: WebhookDispatchJob) -> Result<()> {
+    let storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
+    dispatch_matched_event(
+        state,
+        &storage,
+        &job.source,
+        &job.event,
+        &job.event_record_id,
+        &job.received_at,
+        job.test_event,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn dispatch_matched_event(
     state: &AppState,
     storage: &crate::storage::Storage,
-    sources: &mut [WebhookSource],
-    input: RouteEventInput<'_>,
+    source: &WebhookSource,
+    event: &NormalizedWebhookEvent,
+    event_record_id: &str,
+    received_at: &str,
+    test_event: bool,
 ) -> Result<serde_json::Value> {
-    let received_at = now_rfc3339();
-    let source = input.source;
-    let source_index = input.source_index;
-    let event = normalize_event(source, input.headers, input.raw_body, input.payload);
-    let events = load_events(storage).await?;
-    if duplicate_seen_recently(&events, source, &event) {
-        let record = WebhookEventRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            provider: source.provider.clone(),
-            received_at: received_at.clone(),
-            event_type: event.event_type.clone(),
-            status: event.status.clone(),
-            subject: event.subject.clone(),
-            outcome: "duplicate".to_string(),
-            matched: false,
-            queued: false,
-            message: Some(source_status_message(source, "duplicate")),
-            event_id: event.event_id.clone(),
-            dedupe_key: event.dedupe_key.clone(),
-            event_url: event.event_url.clone(),
-            payload_excerpt: Some(event.payload_excerpt.clone()),
-            task_id: None,
-            conversation_id: Some(source.conversation_id.clone()),
-            severity: event.severity.clone(),
-            test_event: input.test_event,
-        };
-        append_event(storage, record).await?;
-        persist_source_runtime_state(
-            storage,
-            sources,
-            source_index,
-            &received_at,
-            "duplicate",
-            None,
-        )
-        .await?;
-        emit_plugin_webhook_event_best_effort(
-            state,
-            PluginWebhookDispatch {
-                source,
-                event: &event,
-                outcome: "duplicate",
-                matched: false,
-                queued: false,
-                task_id: None,
-                message: Some(&source_status_message(source, "duplicate")),
-                test_event: input.test_event,
-            },
-        )
-        .await;
-        return Ok(serde_json::json!({
-            "status": "ok",
-            "queued": false,
-            "duplicate": true,
-            "matched": false,
-            "message": source_status_message(source, "duplicate"),
-            "conversation_id": source.conversation_id.clone(),
-        }));
-    }
-
-    let (matched, match_message) = matches_rule(source, &event);
-    if !matched {
-        let record = WebhookEventRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            provider: source.provider.clone(),
-            received_at: received_at.clone(),
-            event_type: event.event_type.clone(),
-            status: event.status.clone(),
-            subject: event.subject.clone(),
-            outcome: "ignored".to_string(),
-            matched: false,
-            queued: false,
-            message: Some(match_message.clone()),
-            event_id: event.event_id.clone(),
-            dedupe_key: event.dedupe_key.clone(),
-            event_url: event.event_url.clone(),
-            payload_excerpt: Some(event.payload_excerpt.clone()),
-            task_id: None,
-            conversation_id: Some(source.conversation_id.clone()),
-            severity: event.severity.clone(),
-            test_event: input.test_event,
-        };
-        append_event(storage, record).await?;
-        persist_source_runtime_state(
-            storage,
-            sources,
-            source_index,
-            &received_at,
-            "ignored",
-            None,
-        )
-        .await?;
-        emit_plugin_webhook_event_best_effort(
-            state,
-            PluginWebhookDispatch {
-                source,
-                event: &event,
-                outcome: "ignored",
-                matched: false,
-                queued: false,
-                task_id: None,
-                message: Some(&match_message),
-                test_event: input.test_event,
-            },
-        )
-        .await;
-        return Ok(serde_json::json!({
-            "status": "ok",
-            "queued": false,
-            "duplicate": false,
-            "matched": false,
-            "message": match_message,
-            "conversation_id": source.conversation_id.clone(),
-        }));
-    }
-
-    let prompt = build_webhook_prompt(source, &event);
+    let prompt = build_webhook_prompt(source, event);
     let mut autonomy_payload = serde_json::Map::new();
     autonomy_payload.insert("prompt".to_string(), serde_json::Value::String(prompt));
     autonomy_payload.insert(
@@ -1348,7 +1642,7 @@ async fn route_event(
                 "notify_on_failure": source.notify_on_failure,
                 "output_target": source.output_target,
                 "output_channel": source.output_channel.clone(),
-                "test_event": input.test_event,
+                "test_event": test_event,
             }
         }
     });
@@ -1388,34 +1682,21 @@ async fn route_event(
         Ok((task_id, reused_existing, removed_duplicates)) => {
             spawn_autonomy_analysis_tick(state.agent.clone(), "webhook_event");
             let task_id_str = task_id.to_string();
-            let record = WebhookEventRecord {
-                id: uuid::Uuid::new_v4().to_string(),
-                source_id: source.id.clone(),
-                source_name: source.name.clone(),
-                provider: source.provider.clone(),
-                received_at: received_at.clone(),
-                event_type: event.event_type.clone(),
-                status: event.status.clone(),
-                subject: event.subject.clone(),
-                outcome: "queued".to_string(),
-                matched: true,
-                queued: true,
-                message: Some(source_status_message(source, "queued")),
-                event_id: event.event_id.clone(),
-                dedupe_key: event.dedupe_key.clone(),
-                event_url: event.event_url.clone(),
-                payload_excerpt: Some(event.payload_excerpt.clone()),
-                task_id: Some(task_id_str.clone()),
-                conversation_id: Some(source.conversation_id.clone()),
-                severity: event.severity.clone(),
-                test_event: input.test_event,
-            };
-            append_event(storage, record).await?;
+            let queued_message = source_status_message(source, "queued");
+            storage
+                .update_webhook_event_outcome(
+                    event_record_id,
+                    "queued",
+                    true,
+                    true,
+                    Some(&task_id_str),
+                    Some(&queued_message),
+                )
+                .await?;
             persist_source_runtime_state(
                 storage,
-                sources,
-                source_index,
-                &received_at,
+                &source.id,
+                received_at,
                 "queued",
                 Some(task_id_str.clone()),
             )
@@ -1423,7 +1704,7 @@ async fn route_event(
             if source.notify_on_queued {
                 let notify_body = webhook_queue_notification_body(
                     source,
-                    &event,
+                    event,
                     &task_id_str,
                     reused_existing,
                     removed_duplicates,
@@ -1434,7 +1715,7 @@ async fn route_event(
                     .emit_notification_forced(
                         &format!("Webhook queued: {}", source.name),
                         &notify_body,
-                        queued_notification_level(&event),
+                        queued_notification_level(event),
                         "webhook",
                     )
                     .await;
@@ -1443,13 +1724,13 @@ async fn route_event(
                 state,
                 PluginWebhookDispatch {
                     source,
-                    event: &event,
+                    event,
                     outcome: "queued",
                     matched: true,
                     queued: true,
                     task_id: Some(&task_id_str),
-                    message: Some(&source_status_message(source, "queued")),
-                    test_event: input.test_event,
+                    message: Some(&queued_message),
+                    test_event,
                 },
             )
             .await;
@@ -1458,7 +1739,7 @@ async fn route_event(
                 "queued": true,
                 "duplicate": false,
                 "matched": true,
-                "message": source_status_message(source, "queued"),
+                "message": queued_message,
                 "task_id": task_id_str,
                 "reused_existing": reused_existing,
                 "removed_duplicates": removed_duplicates,
@@ -1466,40 +1747,20 @@ async fn route_event(
             }))
         }
         Err(error) => {
-            let record = WebhookEventRecord {
-                id: uuid::Uuid::new_v4().to_string(),
-                source_id: source.id.clone(),
-                source_name: source.name.clone(),
-                provider: source.provider.clone(),
-                received_at: received_at.clone(),
-                event_type: event.event_type.clone(),
-                status: event.status.clone(),
-                subject: event.subject.clone(),
-                outcome: "error".to_string(),
-                matched: true,
-                queued: false,
-                message: Some(error.to_string()),
-                event_id: event.event_id.clone(),
-                dedupe_key: event.dedupe_key.clone(),
-                event_url: event.event_url.clone(),
-                payload_excerpt: Some(event.payload_excerpt.clone()),
-                task_id: None,
-                conversation_id: Some(source.conversation_id.clone()),
-                severity: event.severity.clone(),
-                test_event: input.test_event,
-            };
-            append_event(storage, record).await?;
-            persist_source_runtime_state(
-                storage,
-                sources,
-                source_index,
-                &received_at,
-                "error",
-                None,
-            )
-            .await?;
+            let error_message = error.to_string();
+            storage
+                .update_webhook_event_outcome(
+                    event_record_id,
+                    "error",
+                    true,
+                    false,
+                    None,
+                    Some(&error_message),
+                )
+                .await?;
+            persist_source_runtime_state(storage, &source.id, received_at, "error", None).await?;
             if source.notify_on_failure {
-                let notify_body = webhook_dispatch_failure_body(source, &event, &error.to_string());
+                let notify_body = webhook_dispatch_failure_body(source, event, &error_message);
                 let agent = state.agent.read().await;
                 agent
                     .emit_notification_forced(
@@ -1514,19 +1775,225 @@ async fn route_event(
                 state,
                 PluginWebhookDispatch {
                     source,
-                    event: &event,
+                    event,
                     outcome: "error",
                     matched: true,
                     queued: false,
                     task_id: None,
-                    message: Some(&error.to_string()),
-                    test_event: input.test_event,
+                    message: Some(&error_message),
+                    test_event,
                 },
             )
             .await;
             Err(error)
         }
     }
+}
+
+async fn route_event(
+    state: &AppState,
+    storage: &crate::storage::Storage,
+    input: RouteEventInput<'_>,
+) -> Result<(StatusCode, serde_json::Value)> {
+    let received_at = now_rfc3339();
+    let source = input.source;
+    let event = normalize_event(source, input.headers, input.raw_body, input.payload);
+    let event_record_id = uuid::Uuid::new_v4().to_string();
+    let inserted = storage
+        .reserve_webhook_event_once(
+            webhook_event_model_from_record(
+                WebhookEventRecord {
+                    id: event_record_id.clone(),
+                    source_id: source.id.clone(),
+                    source_name: source.name.clone(),
+                    provider: source.provider.clone(),
+                    received_at: received_at.clone(),
+                    event_type: event.event_type.clone(),
+                    status: event.status.clone(),
+                    subject: event.subject.clone(),
+                    outcome: "received".to_string(),
+                    matched: false,
+                    queued: false,
+                    message: None,
+                    event_id: event.event_id.clone(),
+                    dedupe_key: event.dedupe_key.clone(),
+                    event_url: event.event_url.clone(),
+                    payload_excerpt: Some(event.payload_excerpt.clone()),
+                    task_id: None,
+                    conversation_id: Some(source.conversation_id.clone()),
+                    severity: event.severity.clone(),
+                    test_event: input.test_event,
+                },
+                webhook_replay_idempotency_key(&event, &received_at, source.dedupe_window_secs),
+                webhook_payload_hash(input.raw_body),
+            ),
+            source.dedupe_window_secs,
+        )
+        .await?;
+    if !inserted {
+        let duplicate_message = source_status_message(source, "duplicate");
+        persist_source_runtime_state(storage, &source.id, &received_at, "duplicate", None).await?;
+        emit_plugin_webhook_event_best_effort(
+            state,
+            PluginWebhookDispatch {
+                source,
+                event: &event,
+                outcome: "duplicate",
+                matched: false,
+                queued: false,
+                task_id: None,
+                message: Some(&duplicate_message),
+                test_event: input.test_event,
+            },
+        )
+        .await;
+        return Ok((
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "ok",
+                "queued": false,
+                "duplicate": true,
+                "matched": false,
+                "message": duplicate_message,
+                "conversation_id": source.conversation_id.clone(),
+            }),
+        ));
+    }
+
+    let (matched, match_message) = matches_rule(source, &event);
+    if !matched {
+        storage
+            .update_webhook_event_outcome(
+                &event_record_id,
+                "ignored",
+                false,
+                false,
+                None,
+                Some(&match_message),
+            )
+            .await?;
+        persist_source_runtime_state(storage, &source.id, &received_at, "ignored", None).await?;
+        emit_plugin_webhook_event_best_effort(
+            state,
+            PluginWebhookDispatch {
+                source,
+                event: &event,
+                outcome: "ignored",
+                matched: false,
+                queued: false,
+                task_id: None,
+                message: Some(&match_message),
+                test_event: input.test_event,
+            },
+        )
+        .await;
+        return Ok((
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "ok",
+                "queued": false,
+                "duplicate": false,
+                "matched": false,
+                "message": match_message,
+                "conversation_id": source.conversation_id.clone(),
+            }),
+        ));
+    }
+
+    if !input.test_event {
+        let job = WebhookDispatchJob {
+            source: source.clone(),
+            event: event.clone(),
+            event_record_id: event_record_id.clone(),
+            received_at: received_at.clone(),
+            test_event: false,
+        };
+        match state.webhook_dispatcher.enqueue(job) {
+            WebhookDispatchEnqueue::Enqueued => {
+                let accepted_message = source_status_message(source, "accepted");
+                storage
+                    .update_webhook_event_outcome(
+                        &event_record_id,
+                        "accepted",
+                        true,
+                        true,
+                        None,
+                        Some(&accepted_message),
+                    )
+                    .await?;
+                persist_source_runtime_state(storage, &source.id, &received_at, "accepted", None)
+                    .await?;
+                return Ok((
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "status": "ok",
+                        "queued": true,
+                        "duplicate": false,
+                        "matched": true,
+                        "message": accepted_message,
+                        "conversation_id": source.conversation_id.clone(),
+                    }),
+                ));
+            }
+            WebhookDispatchEnqueue::Full(job) => {
+                let message = "Webhook dispatch queue is full; retry later.";
+                storage
+                    .update_webhook_event_outcome(
+                        &event_record_id,
+                        "backpressure",
+                        true,
+                        false,
+                        None,
+                        Some(message),
+                    )
+                    .await?;
+                persist_source_runtime_state(
+                    storage,
+                    &source.id,
+                    &received_at,
+                    "backpressure",
+                    None,
+                )
+                .await?;
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "status": "busy",
+                        "queued": false,
+                        "duplicate": false,
+                        "matched": true,
+                        "message": message,
+                        "conversation_id": job.source.conversation_id,
+                    }),
+                ));
+            }
+            WebhookDispatchEnqueue::Closed(job) | WebhookDispatchEnqueue::Disabled(job) => {
+                return dispatch_matched_event(
+                    state,
+                    storage,
+                    &job.source,
+                    &job.event,
+                    &job.event_record_id,
+                    &job.received_at,
+                    job.test_event,
+                )
+                .await
+                .map(|value| (StatusCode::OK, value));
+            }
+        }
+    }
+
+    dispatch_matched_event(
+        state,
+        storage,
+        source,
+        &event,
+        &event_record_id,
+        &received_at,
+        input.test_event,
+    )
+    .await
+    .map(|value| (StatusCode::OK, value))
 }
 
 pub(super) async fn list_webhook_sources(State(state): State<AppState>) -> Response {
@@ -1615,19 +2082,55 @@ async fn upsert_source_internal(
             agent.data_dir.clone(),
         )
     };
-    let mut sources = load_sources(&storage).await?;
-    let existing_index = sources.iter().position(|source| source.id == id);
-    if source_id.is_some() && existing_index.is_none() {
+    let existing_source = load_source(&storage, &id).await?;
+    if source_id.is_some() && existing_source.is_none() {
         anyhow::bail!("Webhook source not found");
     }
-    if source_id.is_none() && existing_index.is_some() {
+    if source_id.is_none() && existing_source.is_some() {
         anyhow::bail!("A webhook source with that id already exists");
     }
-    let existing_source = existing_index.and_then(|index| sources.get(index).cloned());
+    let signature_timestamp_header =
+        sanitize_header_name(request.signature_timestamp_header.as_deref())
+            .or_else(|| {
+                if request.signature_timestamp_header.is_none() {
+                    existing_source
+                        .as_ref()
+                        .and_then(|source| source.signature_timestamp_header.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| default_signature_timestamp_header_for_provider(&provider, auth_mode));
+    let signature_timestamp_tolerance_secs = request
+        .signature_timestamp_tolerance_secs
+        .or_else(|| {
+            existing_source
+                .as_ref()
+                .and_then(|source| source.signature_timestamp_tolerance_secs)
+        })
+        .or_else(|| {
+            signature_timestamp_header
+                .as_ref()
+                .map(|_| WEBHOOK_DEFAULT_SIGNATURE_TIMESTAMP_TOLERANCE_SECS)
+        })
+        .map(|secs| secs.clamp(30, 24 * 60 * 60));
+    let signature_payload_mode = request
+        .signature_payload_mode
+        .or_else(|| {
+            existing_source
+                .as_ref()
+                .and_then(|source| source.signature_payload_mode)
+        })
+        .or_else(|| {
+            default_signature_payload_mode_for_provider(
+                &provider,
+                auth_mode,
+                signature_timestamp_header.as_deref(),
+            )
+        });
 
     let (conversation_id, created_at, last_received_at, last_outcome, last_task_id) =
-        if let Some(index) = existing_index {
-            let existing = &sources[index];
+        if let Some(existing) = existing_source.as_ref() {
             (
                 existing.conversation_id.clone(),
                 existing.created_at.clone(),
@@ -1710,6 +2213,9 @@ async fn upsert_source_internal(
         instruction,
         event_header,
         secret_header,
+        signature_timestamp_header,
+        signature_timestamp_tolerance_secs,
+        signature_payload_mode,
         allow_duplicate: request.allow_duplicate.unwrap_or(false),
         require_approval: request.require_approval.unwrap_or(false),
         dedupe_window_secs: request
@@ -1749,12 +2255,9 @@ async fn upsert_source_internal(
         anyhow::bail!("This auth mode requires a secret. Save one or switch auth mode to none.");
     }
 
-    if let Some(index) = existing_index {
-        sources[index] = source.clone();
-    } else {
-        sources.push(source.clone());
-    }
-    save_sources(&storage, &sources).await?;
+    storage
+        .upsert_webhook_source(webhook_source_model_from_source(source.clone()))
+        .await?;
 
     Ok(present_source(&source, secret_configured))
 }
@@ -1811,8 +2314,17 @@ pub(super) async fn delete_webhook_source(
             agent.data_dir.clone(),
         )
     };
-    let mut sources = match load_sources(&storage).await {
-        Ok(sources) => sources,
+    match storage.delete_webhook_source(&id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Webhook source not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1822,26 +2334,6 @@ pub(super) async fn delete_webhook_source(
             )
                 .into_response();
         }
-    };
-    let before = sources.len();
-    sources.retain(|source| source.id != id);
-    if before == sources.len() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Webhook source not found".to_string(),
-            }),
-        )
-            .into_response();
-    }
-    if let Err(error) = save_sources(&storage, &sources).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: error.to_string(),
-            }),
-        )
-            .into_response();
     }
     if let Ok(manager) =
         crate::core::config::SecureConfigManager::new_with_data_dir(&config_dir, Some(&data_dir))
@@ -1849,6 +2341,13 @@ pub(super) async fn delete_webhook_source(
         let _ = manager.set_custom_secret(&webhook_secret_key(&id), None);
     }
     Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+async fn source_for_delivery(
+    storage: &crate::storage::Storage,
+    source_id: &str,
+) -> Result<Option<WebhookSource>> {
+    load_source(storage, source_id).await
 }
 
 pub(super) async fn list_webhook_events(
@@ -1859,20 +2358,18 @@ pub(super) async fn list_webhook_events(
         let agent = state.agent.read().await;
         agent.storage.clone()
     };
-    match load_events(&storage).await {
-        Ok(mut events) => {
-            if let Some(source_id) = query
-                .source_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                events.retain(|event| event.source_id == source_id);
-            }
-            let limit = query.limit.unwrap_or(40).clamp(1, 200);
-            if events.len() > limit {
-                events.truncate(limit);
-            }
+    let source_id = query
+        .source_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let limit = query.limit.unwrap_or(40).clamp(1, 200);
+    match storage.list_webhook_events(source_id, limit as u64).await {
+        Ok(rows) => {
+            let events = rows
+                .into_iter()
+                .map(webhook_event_record_from_model)
+                .collect::<Vec<_>>();
             Json(serde_json::json!({
                 "events": events,
                 "count": events.len(),
@@ -1903,8 +2400,9 @@ pub(super) async fn handle_inbound_webhook(
             agent.data_dir.clone(),
         )
     };
-    let mut sources = match load_sources(&storage).await {
-        Ok(sources) => sources,
+    let source = match source_for_delivery(&storage, &source_id).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1915,10 +2413,6 @@ pub(super) async fn handle_inbound_webhook(
                 .into_response();
         }
     };
-    let Some(source_index) = sources.iter().position(|source| source.id == source_id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let source = sources[source_index].clone();
     if !source.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -1962,15 +2456,9 @@ pub(super) async fn handle_inbound_webhook(
             test_event: false,
         };
         let _ = append_event(&storage, record).await;
-        let _ = persist_source_runtime_state(
-            &storage,
-            &mut sources,
-            source_index,
-            &received_at,
-            "auth_failed",
-            None,
-        )
-        .await;
+        let _ =
+            persist_source_runtime_state(&storage, &source.id, &received_at, "auth_failed", None)
+                .await;
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -1983,9 +2471,7 @@ pub(super) async fn handle_inbound_webhook(
     match route_event(
         &state,
         &storage,
-        &mut sources,
         RouteEventInput {
-            source_index,
             source: &source,
             headers: &headers,
             raw_body: &raw_body,
@@ -1995,7 +2481,7 @@ pub(super) async fn handle_inbound_webhook(
     )
     .await
     {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Ok((status, result)) => (status, Json(result)).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -2015,8 +2501,17 @@ pub(super) async fn test_webhook_source(
         let agent = state.agent.read().await;
         agent.storage.clone()
     };
-    let mut sources = match load_sources(&storage).await {
-        Ok(sources) => sources,
+    let source = match load_source(&storage, &source_id).await {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Webhook source not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2027,16 +2522,6 @@ pub(super) async fn test_webhook_source(
                 .into_response();
         }
     };
-    let Some(source_index) = sources.iter().position(|source| source.id == source_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Webhook source not found".to_string(),
-            }),
-        )
-            .into_response();
-    };
-    let source = sources[source_index].clone();
     let payload = request.payload.unwrap_or_else(|| {
         serde_json::json!({
             "event": request.event_type.unwrap_or_else(|| "workflow_run".to_string()),
@@ -2051,9 +2536,7 @@ pub(super) async fn test_webhook_source(
     match route_event(
         &state,
         &storage,
-        &mut sources,
         RouteEventInput {
-            source_index,
             source: &source,
             headers: &headers,
             raw_body: &raw_body,
@@ -2063,7 +2546,7 @@ pub(super) async fn test_webhook_source(
     )
     .await
     {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Ok((status, result)) => (status, Json(result)).into_response(),
         Err(error) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2079,7 +2562,7 @@ mod tests {
     use super::*;
     use crate::core::Agent;
     use axum::body::{to_bytes, Body};
-    use axum::http::{header, Request};
+    use axum::http::{header, HeaderMap, Request};
     use axum::routing::{get, post};
     use tower::ServiceExt;
 
@@ -2144,6 +2627,8 @@ mod tests {
                 public_app_bind_addr: None,
                 public_app_base_url: None,
                 release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
+                voice_sessions: Arc::new(RwLock::new(crate::core::VoiceSessionRegistry::default())),
+                webhook_dispatcher: WebhookDispatchHandle::disabled(),
             },
             config_dir,
             data_dir,
@@ -2290,6 +2775,161 @@ mod tests {
             .expect("authenticated public webhooks are allowed");
         validate_public_webhook_auth_mode(WebhookAuthMode::None, false)
             .expect("local-only no-auth webhooks are allowed");
+    }
+
+    #[test]
+    fn webhook_dedupe_idempotency_key_is_stable_inside_window() {
+        let first = webhook_dedupe_idempotency_key("delivery-1", "2026-05-28T00:00:01Z", 900);
+        let second = webhook_dedupe_idempotency_key("delivery-1", "2026-05-28T00:14:59Z", 900);
+        let next = webhook_dedupe_idempotency_key("delivery-1", "2026-05-28T00:15:00Z", 900);
+
+        assert_eq!(first, second);
+        assert_ne!(first, next);
+    }
+
+    fn test_webhook_source(
+        provider: &str,
+        auth_mode: WebhookAuthMode,
+        secret_header: &str,
+    ) -> WebhookSource {
+        WebhookSource {
+            id: format!("{}-source", provider),
+            name: format!("{} Source", provider),
+            provider: provider.to_string(),
+            description: None,
+            enabled: true,
+            auth_mode,
+            match_mode: WebhookMatchMode::All,
+            instruction: "Handle this event.".to_string(),
+            event_header: None,
+            secret_header: Some(secret_header.to_string()),
+            signature_timestamp_header: None,
+            signature_timestamp_tolerance_secs: None,
+            signature_payload_mode: None,
+            allow_duplicate: false,
+            require_approval: false,
+            dedupe_window_secs: 900,
+            notify_on_queued: false,
+            notify_on_success: true,
+            notify_on_failure: true,
+            output_target: WebhookOutputTarget::None,
+            output_channel: None,
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            last_received_at: None,
+            last_outcome: None,
+            last_task_id: None,
+        }
+    }
+
+    fn save_test_webhook_secret(
+        config_dir: &std::path::Path,
+        data_dir: &std::path::Path,
+        source_id: &str,
+        secret: &str,
+    ) {
+        let manager =
+            crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))
+                .unwrap();
+        manager
+            .set_custom_secret(&webhook_secret_key(source_id), Some(secret.to_string()))
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_delivery_id_replay_key_is_durable_across_windows() {
+        let delivery_event = NormalizedWebhookEvent {
+            event_type: "push".to_string(),
+            status: None,
+            subject: "repo".to_string(),
+            event_id: Some("delivery-123".to_string()),
+            event_url: None,
+            summary: "push".to_string(),
+            payload_excerpt: "{}".to_string(),
+            dedupe_key: "dedupe-key".to_string(),
+            severity: None,
+            is_failure: false,
+            is_change: true,
+        };
+        let first = webhook_replay_idempotency_key(&delivery_event, "2026-05-28T00:00:01Z", 900);
+        let later = webhook_replay_idempotency_key(&delivery_event, "2026-05-29T00:00:01Z", 900);
+
+        assert_eq!(first, later);
+
+        let mut body_only_event = delivery_event.clone();
+        body_only_event.event_id = None;
+        let first_window =
+            webhook_replay_idempotency_key(&body_only_event, "2026-05-28T00:00:01Z", 900);
+        let next_window =
+            webhook_replay_idempotency_key(&body_only_event, "2026-05-28T00:15:00Z", 900);
+
+        assert_ne!(first_window, next_window);
+    }
+
+    #[test]
+    fn github_hmac_does_not_require_generic_timestamp_header() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let secret = "github-secret";
+        let raw_body = r#"{"zen":"Approachable is better than simple."}"#;
+        let source =
+            test_webhook_source("github", WebhookAuthMode::HmacSha256, "X-Hub-Signature-256");
+        save_test_webhook_secret(config_dir.path(), data_dir.path(), &source.id, secret);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            format!("sha256={}", hmac_sha256_hex(secret, raw_body.as_bytes()))
+                .parse()
+                .unwrap(),
+        );
+
+        verify_source_secret(
+            config_dir.path(),
+            data_dir.path(),
+            &source,
+            &headers,
+            raw_body,
+        )
+        .expect("GitHub HMAC webhooks should not require a timestamp header");
+    }
+
+    #[test]
+    fn slack_hmac_rejects_stale_timestamp() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let secret = "slack-secret";
+        let raw_body = r#"{"type":"event_callback"}"#;
+        let mut source =
+            test_webhook_source("slack", WebhookAuthMode::HmacSha256, "X-Slack-Signature");
+        source.signature_timestamp_header = Some("X-Slack-Request-Timestamp".to_string());
+        source.signature_timestamp_tolerance_secs = Some(300);
+        source.signature_payload_mode = Some(WebhookSignaturePayloadMode::SlackV0);
+        save_test_webhook_secret(config_dir.path(), data_dir.path(), &source.id, secret);
+
+        let old_timestamp = (chrono::Utc::now() - chrono::Duration::minutes(10))
+            .timestamp()
+            .to_string();
+        let signed_payload = format!("v0:{}:{}", old_timestamp, raw_body);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Slack-Request-Timestamp", old_timestamp.parse().unwrap());
+        headers.insert(
+            "X-Slack-Signature",
+            format!("v0={}", hmac_sha256_hex(secret, signed_payload.as_bytes()))
+                .parse()
+                .unwrap(),
+        );
+
+        let error = verify_source_secret(
+            config_dir.path(),
+            data_dir.path(),
+            &source,
+            &headers,
+            raw_body,
+        )
+        .expect_err("stale Slack timestamp should be rejected");
+        assert!(error.to_string().contains("timestamp"));
     }
 
     #[cfg_attr(

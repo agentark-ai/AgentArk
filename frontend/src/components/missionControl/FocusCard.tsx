@@ -1,10 +1,12 @@
+import type { ReactNode } from "react";
 import { NeuralPanel, type NeuralPanelTagTone } from "./NeuralPanel";
 
 export type FocusState = "ready" | "active" | "paused" | "issue";
 
 export type FocusCardProps = {
   state: FocusState;
-  body: string;
+  body: ReactNode;
+  title?: string;
 };
 
 const STATE_TAG: Record<FocusState, { label: string; tone: NeuralPanelTagTone }> = {
@@ -14,10 +16,10 @@ const STATE_TAG: Record<FocusState, { label: string; tone: NeuralPanelTagTone }>
   issue: { label: "NEEDS REVIEW", tone: "crit" },
 };
 
-export function FocusCard({ state, body }: FocusCardProps) {
+export function FocusCard({ state, body, title = "Current Objective" }: FocusCardProps) {
   const { label, tone } = STATE_TAG[state];
   return (
-    <NeuralPanel title="Current Objective" tag={label} tagTone={tone} className="nw-panel--focus">
+    <NeuralPanel title={title} tag={label} tagTone={tone} className="nw-panel--focus">
       <div className="nw-panel-muted">{body}</div>
     </NeuralPanel>
   );

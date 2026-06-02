@@ -207,6 +207,7 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
 - If the file-stream protocol is active, emit complete service files as `<file path="relative/path.ext">...</file>` blocks and let AgentArk synthesize the service-management action. Do not emit lifecycle JSON, agent_tool_calls JSON, markdown fences around file blocks, or native tool calls in that response.
 - When updating a recent deployed app, preserve the active app identity, original requirements, current deployed files, and working behavior unless the user asks to replace or recreate it. Apply the requested add/remove/change directly and keep unrelated app scope unchanged.
 - Deploy locally by default. Content visibility or audience requirements inside the app are not the same as external network exposure.
+- Treat deploy completion as registration/startup evidence, not proof that browser JavaScript, client-side fetches, or the full requested workflow worked. Do not claim runtime/browser validation unless you actually ran a browser/runtime check and observed passing evidence; otherwise say the app was deployed and any background quality check is advisory/pending.
 - After managed-service edits, restart or validate through the available service action before claiming completion when that action is in scope.
 - After deployment, nudge the user to the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls."#,
             ),

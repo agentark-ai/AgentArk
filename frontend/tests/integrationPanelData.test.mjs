@@ -30,7 +30,7 @@ execFileSync(
 );
 writeFileSync(path.join(outDir, "package.json"), JSON.stringify({ type: "module" }));
 
-const { asRecord } = await import(
+const { asRecord, integrationHubPanelForCardSource } = await import(
   pathToFileURL(path.join(outDir, "integrationPanelData.js")).toString()
 );
 
@@ -48,4 +48,13 @@ test("returns existing records without cloning", () => {
   const value = { settings: { slack: { policy: "open" } } };
 
   assert.equal(asRecord(value), value);
+});
+
+test("routes custom hub cards to dialog panels", () => {
+  assert.equal(integrationHubPanelForCardSource("custom_api"), "custom_apis");
+  assert.equal(integrationHubPanelForCardSource("webhook"), "webhooks");
+  assert.equal(integrationHubPanelForCardSource("plugin"), "plugins");
+  assert.equal(integrationHubPanelForCardSource("extension_pack"), "extension_packs");
+  assert.equal(integrationHubPanelForCardSource("custom_messaging_channel"), "custom_messaging_channels");
+  assert.equal(integrationHubPanelForCardSource("builtin_integration"), null);
 });

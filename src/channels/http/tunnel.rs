@@ -718,13 +718,24 @@ fn tunnel_https_url_matches_provider(provider: TunnelProviderKind, url: &str) ->
     let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
     match provider {
         TunnelProviderKind::Cloudflare => {
-            host.ends_with(".trycloudflare.com") || host.ends_with(".cfargotunnel.com")
+            let is_tunnel_host =
+                host.ends_with(".trycloudflare.com") || host.ends_with(".cfargotunnel.com");
+            is_tunnel_host && logged_url_is_origin_only(&parsed)
         }
         TunnelProviderKind::Ngrok => host.contains("ngrok"),
         TunnelProviderKind::TailscalePrivate => host.ends_with(".ts.net"),
         TunnelProviderKind::TailscaleFunnel => host.ends_with(".ts.net"),
         TunnelProviderKind::Bore => true,
     }
+}
+
+fn logged_url_is_origin_only(url: &reqwest::Url) -> bool {
+    url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.path().trim_matches('/').is_empty()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 fn extract_bore_url(line: &str, server: &str) -> Option<String> {
@@ -2743,4 +2754,35 @@ pub(super) async fn wait_for_tunnel_url(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloudflare_log_parser_ignores_quick_tunnel_api_failure_url() {
+        let line = r#"failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"#;
+
+        assert_eq!(
+            extract_tunnel_url_from_log(TunnelProviderKind::Cloudflare, line, None),
+            None
+        );
+    }
+
+    #[test]
+    fn cloudflare_log_parser_accepts_quick_tunnel_origin_url() {
+        let line =
+            "2026-05-30T08:58:29Z INF +--------------------------------------------------------------------------------------------+";
+        let url = "https://points-picking-thereafter-versions.trycloudflare.com";
+
+        assert_eq!(
+            extract_tunnel_url_from_log(
+                TunnelProviderKind::Cloudflare,
+                &format!("{} {}", line, url),
+                None
+            ),
+            Some(url.to_string())
+        );
+    }
 }

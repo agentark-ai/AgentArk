@@ -3,7 +3,7 @@
 //! to control a headless browser for web automation tasks.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -46,11 +46,10 @@ impl BrowserSessionCreateOptions {
             target_endpoint: profile.target_endpoint.clone(),
             target_profile_path: profile.target_profile_path.clone(),
             target_workspace: profile.target_workspace.clone(),
-            managed: metadata_bool(metadata, "managed")
-                .or(Some(!matches!(
-                    profile.target_kind,
-                    crate::core::BrowserProfileTargetKind::Host
-                ))),
+            managed: metadata_bool(metadata, "managed").or(Some(!matches!(
+                profile.target_kind,
+                crate::core::BrowserProfileTargetKind::Host
+            ))),
             manual_login: None,
         }
     }
@@ -107,6 +106,10 @@ pub struct BrowserSidecarSessionState {
     pub profile_id: Option<String>,
     #[serde(default)]
     pub profile_name: Option<String>,
+    #[serde(default)]
+    pub download_dir: Option<String>,
+    #[serde(default)]
+    pub downloads: Vec<BrowserDownloadArtifact>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +128,28 @@ pub struct PageContent {
     pub elements: Vec<PageElement>,
     #[serde(default)]
     pub diagnostics: Vec<PageDiagnostic>,
+    #[serde(default)]
+    pub downloads: Vec<BrowserDownloadArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserDownloadArtifact {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub downloaded_at: String,
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,7 +290,7 @@ impl BrowserIntegration {
     pub fn new() -> Self {
         let bridge_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3100".to_string());
-        tracing::debug!("BrowserIntegration initialized: bridge_url={}", bridge_url);
+        tracing::trace!("BrowserIntegration initialized: bridge_url={}", bridge_url);
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(35))
@@ -303,9 +328,13 @@ impl BrowserIntegration {
         &self,
         options: &BrowserSessionCreateOptions,
     ) -> Result<String> {
-        tracing::info!("Creating browser session via sidecar");
+        tracing::trace!("Creating browser session via sidecar");
         let mut body = serde_json::json!({ "mode": "interactive" });
-        if options.profile_id.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        if options
+            .profile_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             body["profile"] = serde_json::json!({
                 "id": options.profile_id.as_deref().unwrap_or_default(),
                 "name": options.profile_name.as_deref().unwrap_or_default(),
@@ -318,16 +347,27 @@ impl BrowserIntegration {
                 "manual_login": options.manual_login,
             });
         }
-        let resp: SessionResponse = self
+        let response = self
             .client
             .post(format!("{}/session", self.bridge_url))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
-        tracing::info!(
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "browser session create failed with HTTP {}{}",
+                status,
+                if body.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", body.trim())
+                }
+            );
+        }
+        let resp: SessionResponse = response.json().await?;
+        tracing::trace!(
             "Browser session created: sidecar_id={}",
             &resp.session_id[..resp.session_id.len().min(8)]
         );
@@ -539,7 +579,7 @@ impl BrowserIntegration {
 
     /// Close a browser session
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
-        tracing::info!(
+        tracing::trace!(
             "Closing browser session: session={}",
             &session_id[..session_id.len().min(8)]
         );
@@ -548,7 +588,7 @@ impl BrowserIntegration {
             .send()
             .await?
             .error_for_status()?;
-        tracing::info!(
+        tracing::trace!(
             "Browser session closed: session={}",
             &session_id[..session_id.len().min(8)]
         );
@@ -583,7 +623,7 @@ impl BrowserIntegration {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false);
-        tracing::debug!(
+        tracing::trace!(
             "Playwright sidecar health check: available={}, url={}",
             result,
             self.bridge_url

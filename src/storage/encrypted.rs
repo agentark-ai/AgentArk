@@ -5,10 +5,10 @@
 //! are encrypted with AES-256-GCM before storage and decrypted on retrieval.
 //! Non-content fields (timestamps, IDs, metadata) remain in plaintext for querying.
 
-use super::Storage;
 use super::entities::{approval_log, execution_trace, message};
+use super::Storage;
 use crate::crypto::KeyManager;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 #[cfg(test)]
 use sea_orm::entity::prelude::PgVector;
@@ -188,7 +188,11 @@ impl EncryptedStorage {
         match self.storage.get(key).await? {
             Some(encrypted) => match key_manager.decrypt(&encrypted) {
                 Ok(decrypted) => Ok(Some(decrypted)),
-                Err(_) => Ok(Some(encrypted)), // Legacy unencrypted data
+                Err(error) => Err(anyhow!(
+                    "Failed to decrypt encrypted KV value '{}': {}",
+                    key,
+                    error
+                )),
             },
             None => Ok(None),
         }

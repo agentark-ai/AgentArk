@@ -5,8 +5,8 @@ use std::path::Path;
 use anyhow::Result;
 use sea_orm::entity::prelude::PgVector;
 
-use crate::core::EmbeddingClient;
 use crate::core::document_search::normalized_embedding_similarity;
+use crate::core::EmbeddingClient;
 
 use super::intent_classifier::{
     InboundAdvisorySignal, InboundClassificationDecision, InboundMemoryCaptureSignal, IntentVerdict,

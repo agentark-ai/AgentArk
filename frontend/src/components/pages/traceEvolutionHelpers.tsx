@@ -12,6 +12,7 @@ import {
 import { humanTs } from "./workspaceUiBits";
 import { humanizeStatusLabel } from "./workspaceCore";
 import { formatUiDateOnly, formatUiTime } from "../../lib/dateFormat";
+import { humanizeMachineLabel } from "../../lib/displayLabels";
 
 export function formatTraceDuration(durationMs: unknown): string {
   const ms = num(durationMs, -1);
@@ -812,7 +813,7 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
       traceKind === "self_evolve.manual_action.result" ||
       traceKind === "self_evolve.manual_action.request"
     ) {
-      const action = str(data.action, "").trim().replace(/_/g, " ");
+      const action = humanizeMachineLabel(str(data.action, ""), "");
       const canaryState = asRecord(data.canary_state);
       chips.push(action || "Manual action");
       if (Object.keys(canaryState).length > 0) {
@@ -864,7 +865,7 @@ export function syncRunTriggerLabel(trigger: string): string {
   const normalized = trigger.trim().toLowerCase();
   if (normalized === "manual") return "Manual";
   if (normalized === "background") return "Background";
-  return normalized ? normalized.replace(/_/g, " ") : "Unknown";
+  return humanizeMachineLabel(normalized, "Unknown");
 }
 
 export type TraceRange = "1h" | "6h" | "24h" | "7d" | "14d" | "30d";
@@ -935,10 +936,7 @@ export function bucketizeTraceItems<T>(
 
 export function traceSecurityEventTypeLabel(eventType: string): string {
   const normalized = (eventType || "").trim().toLowerCase();
-  if (!normalized) return "Unknown";
-  return normalized
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (m) => m.toUpperCase());
+  return humanizeMachineLabel(normalized, "Unknown");
 }
 
 

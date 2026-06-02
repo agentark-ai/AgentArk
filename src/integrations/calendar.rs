@@ -4,7 +4,7 @@
 
 use super::oauth::{OAuthClient, OAuthConfig, OAuthTokens, TokenStorage};
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ impl GoogleCalendarConnector {
             oauth_config: None,
             tokens: Arc::new(RwLock::new(None)),
             token_storage: None,
-            http: reqwest::Client::new(),
+            http: crate::core::net::default_outgoing_http_client(),
             oauth_client: OAuthClient::new(),
         }
     }
@@ -88,7 +88,7 @@ impl GoogleCalendarConnector {
 
         // Save tokens
         if let Some(ref storage) = self.token_storage {
-            storage.save(Self::SERVICE_ID, &tokens)?;
+            storage.save_async(Self::SERVICE_ID, &tokens).await?;
         }
 
         *self.tokens.write().await = Some(tokens);
@@ -98,7 +98,7 @@ impl GoogleCalendarConnector {
     /// Disconnect (revoke tokens)
     pub async fn disconnect(&self) -> Result<()> {
         if let Some(ref storage) = self.token_storage {
-            storage.delete(Self::SERVICE_ID)?;
+            storage.delete_async(Self::SERVICE_ID).await?;
         }
         *self.tokens.write().await = None;
         Ok(())
@@ -126,7 +126,7 @@ impl GoogleCalendarConnector {
 
                 // Save refreshed tokens
                 if let Some(ref storage) = self.token_storage {
-                    storage.save(Self::SERVICE_ID, &new_tokens)?;
+                    storage.save_async(Self::SERVICE_ID, &new_tokens).await?;
                 }
 
                 *tokens = new_tokens;

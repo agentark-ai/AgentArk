@@ -68,6 +68,11 @@ type VercelPublishTarget = {
   mode: "vercel_direct" | "vercel_git";
 };
 
+type AppEnvTarget = {
+  id: string;
+  title: string;
+};
+
 type VercelProjectMode = "auto" | "existing" | "create";
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -116,6 +121,13 @@ function stringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
     .map((item) => str(item, "").trim())
+    .filter((item) => item.length > 0);
+}
+
+function parseEnvDeleteList(value: string): string[] {
+  return (value || "")
+    .split(/[\n,]/)
+    .map((item) => item.trim())
     .filter((item) => item.length > 0);
 }
 
@@ -422,6 +434,12 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
   const [vercelProduction, setVercelProduction] = useState(false);
   const [vercelBusy, setVercelBusy] = useState(false);
   const [vercelError, setVercelError] = useState<string | null>(null);
+  const [envTarget, setEnvTarget] = useState<AppEnvTarget | null>(null);
+  const [envText, setEnvText] = useState("");
+  const [envDeleteText, setEnvDeleteText] = useState("");
+  const [envReplace, setEnvReplace] = useState(false);
+  const [envBusy, setEnvBusy] = useState(false);
+  const [envError, setEnvError] = useState<string | null>(null);
 
   const opMutation = useMutation({
     mutationFn: ({
@@ -462,6 +480,13 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
       });
       await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
     },
+  });
+
+  const appEnvQ = useQuery({
+    queryKey: ["apps-manager-env", envTarget?.id || ""],
+    queryFn: () =>
+      api.rawGet(`/api/apps/${encodeURIComponent(envTarget?.id || "")}/env`),
+    enabled: !!envTarget?.id,
   });
 
   const appsPayload = asRecord(appsQ.data);
@@ -647,6 +672,55 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
       setDeleteError(errMessage(error));
     } finally {
       setDeleteBusy(false);
+    }
+  };
+
+  const openEnvDialog = (appItem: JsonRecord) => {
+    const id = str(appItem.id, "");
+    setEnvTarget({
+      id,
+      title: str(appItem.title, id) || id,
+    });
+    setEnvText("");
+    setEnvDeleteText("");
+    setEnvReplace(false);
+    setEnvError(null);
+  };
+
+  const saveAppEnv = async (restart: boolean) => {
+    if (!envTarget || envBusy) return;
+    setEnvBusy(true);
+    setEnvError(null);
+    setAppsActionError(null);
+    setAppsActionSuccess(null);
+    setAppsRestartNotice(null);
+    try {
+      await api.rawPut(`/api/apps/${encodeURIComponent(envTarget.id)}/env`, {
+        env_text: envText,
+        delete: parseEnvDeleteList(envDeleteText),
+        replace: envReplace,
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["apps-manager-env", envTarget.id],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
+      if (restart) {
+        await api.rawPost(`/api/apps/${encodeURIComponent(envTarget.id)}/restart`, {});
+        await refreshAppState();
+        setAppsRestartNotice(
+          "App restart in progress. Give it up to 10 seconds. This card will disappear automatically.",
+        );
+        setEnvTarget(null);
+      } else {
+        setAppsActionSuccess("Environment saved. Restart the app for changes to take effect.");
+      }
+      setEnvText("");
+      setEnvDeleteText("");
+      setEnvReplace(false);
+    } catch (error) {
+      setEnvError(errMessage(error));
+    } finally {
+      setEnvBusy(false);
     }
   };
 
@@ -1159,6 +1233,11 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                         }),
                     },
                     {
+                      label: "Environment",
+                      disabled: appsActionBusy != null || isRestoring,
+                      onClick: () => openEnvDialog(appItem),
+                    },
+                    {
                       label: !isEnabled
                         ? "Start App"
                         : isStaticApp
@@ -1556,6 +1635,137 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                 </DialogContent>
                 <DialogActions>
                   <Button onClick={() => setQualityTarget(null)}>Close</Button>
+                </DialogActions>
+              </Dialog>
+            );
+          })()
+        : null}
+      {envTarget
+        ? (() => {
+            const envData = asRecord(appEnvQ.data);
+            const configured = pickRecords(envData, "keys")
+              .map((item) => str(item.key, ""))
+              .filter((item) => item.length > 0);
+            const requiredEnv = stringList(envData.required_env);
+            const missingEnv = stringList(envData.missing_env);
+            return (
+              <Dialog
+                open
+                onClose={() => {
+                  if (envBusy) return;
+                  setEnvTarget(null);
+                  setEnvError(null);
+                }}
+                aria-labelledby="app-env-dialog-title"
+                maxWidth="sm"
+                fullWidth
+              >
+                <DialogTitle id="app-env-dialog-title">
+                  Environment
+                </DialogTitle>
+                <DialogContent>
+                  <Stack spacing={1.5} sx={{ mt: 1 }}>
+                    <DialogContentText>
+                      Values are stored encrypted for {envTarget.title} and
+                      injected into the app runtime on start or restart. Secret
+                      values are never shown after saving.
+                    </DialogContentText>
+                    {envError ? <Alert severity="error">{envError}</Alert> : null}
+                    {appEnvQ.error ? (
+                      <Alert severity="error">{errMessage(appEnvQ.error)}</Alert>
+                    ) : null}
+                    {appEnvQ.isLoading ? (
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                        <CircularProgress size={16} />
+                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                          Loading environment keys...
+                        </Typography>
+                      </Box>
+                    ) : null}
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+                      {configured.length > 0 ? (
+                        configured.map((key) => (
+                          <Chip key={key} size="small" label={key} />
+                        ))
+                      ) : (
+                        <Chip size="small" variant="outlined" label="No saved keys" />
+                      )}
+                    </Stack>
+                    {requiredEnv.length > 0 ? (
+                      <Box>
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                          Required by app
+                        </Typography>
+                        <Stack
+                          direction="row"
+                          spacing={0.75}
+                          useFlexGap
+                          sx={{ mt: 0.75, flexWrap: "wrap" }}
+                        >
+                          {requiredEnv.map((key) => (
+                            <Chip
+                              key={key}
+                              size="small"
+                              color={missingEnv.includes(key) ? "warning" : "success"}
+                              variant={missingEnv.includes(key) ? "outlined" : "filled"}
+                              label={key}
+                            />
+                          ))}
+                        </Stack>
+                      </Box>
+                    ) : null}
+                    <TextField
+                      label="Paste .env entries"
+                      value={envText}
+                      onChange={(event) => setEnvText(event.target.value)}
+                      placeholder={"API_KEY=...\nBASE_URL=https://example.com"}
+                      minRows={5}
+                      multiline
+                      fullWidth
+                      autoComplete="off"
+                    />
+                    <TextField
+                      label="Delete keys"
+                      value={envDeleteText}
+                      onChange={(event) => setEnvDeleteText(event.target.value)}
+                      placeholder="KEY_TO_REMOVE, OLD_TOKEN"
+                      size="small"
+                      fullWidth
+                    />
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={envReplace}
+                          onChange={(event) => setEnvReplace(event.target.checked)}
+                        />
+                      }
+                      label="Replace all saved app environment keys"
+                    />
+                  </Stack>
+                </DialogContent>
+                <DialogActions>
+                  <Button
+                    onClick={() => {
+                      setEnvTarget(null);
+                      setEnvError(null);
+                    }}
+                    disabled={envBusy}
+                  >
+                    Close
+                  </Button>
+                  <Button
+                    onClick={() => void saveAppEnv(false)}
+                    disabled={envBusy}
+                  >
+                    Save
+                  </Button>
+                  <Button
+                    variant="contained"
+                    onClick={() => void saveAppEnv(true)}
+                    disabled={envBusy}
+                  >
+                    Save & Restart
+                  </Button>
                 </DialogActions>
               </Dialog>
             );

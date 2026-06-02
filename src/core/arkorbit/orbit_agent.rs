@@ -1128,7 +1128,7 @@ pub async fn stream_orbit_chat_turn(
         .await?
         .ok_or_else(|| anyhow!("ArkOrbit: orbit '{}' not found", orbit_id))?;
     let surface_kind = OrbitChatSurfaceKind::from_orbit(&orbit);
-    let chat_session_id = service.ensure_orbit_chat_session(&orbit_id)?;
+    let chat_session_id = service.ensure_orbit_chat_session_async(&orbit_id).await?;
     let initial_system_prompt = render_orbit_system_prompt(surface_kind);
     let initial_user_context = render_initial_turn_message(
         &service,
@@ -1145,8 +1145,8 @@ pub async fn stream_orbit_chat_turn(
         &initial_user_context,
         &initial_actions,
     );
-    compact_orbit_history_if_needed(&service, &orbit_id, &chat_session_id, history_budget)?;
-    let history = load_history(&service, &orbit_id)?;
+    compact_orbit_history_if_needed(&service, &orbit_id, &chat_session_id, history_budget).await?;
+    let history = load_history(&service, &orbit_id).await?;
     let security_decision = if surface_kind.is_constrained_canvas_runtime() {
         tracing::info!(
             target: "arkorbit.chat.security",
@@ -1162,9 +1162,9 @@ pub async fn stream_orbit_chat_turn(
             .await;
         run_orbit_inbound_security_guard(&llm, surface_kind, &user_message, &history).await
     };
-    append_message(&service, &orbit_id, &chat_session_id, "user", &user_message)?;
+    append_message(&service, &orbit_id, &chat_session_id, "user", &user_message).await?;
     let mut assistant_draft =
-        AssistantMessageDraft::create(&service, &orbit_id, &chat_session_id, "")?;
+        AssistantMessageDraft::create(&service, &orbit_id, &chat_session_id, "").await?;
     if let Err(error) = continue_orbit_chat_turn(
         &service,
         &llm,
@@ -1187,7 +1187,7 @@ pub async fn stream_orbit_chat_turn(
         );
         let message = orbit_chat_turn_failure_message();
         let persisted = combine_visible_content(&assistant_draft.message.content, &message);
-        if let Err(persist_error) = assistant_draft.persist_failed_content(&persisted) {
+        if let Err(persist_error) = assistant_draft.persist_failed_content(&persisted).await {
             tracing::warn!(
                 target: "arkorbit.chat",
                 error = %persist_error,
@@ -1341,7 +1341,7 @@ async fn continue_orbit_chat_turn(
         if outcome.reads.is_empty() {
             break;
         }
-        let satisfied_reads = satisfy_reads(service, orbit_id, &outcome.reads, event_tx)?;
+        let satisfied_reads = satisfy_reads(service, orbit_id, &outcome.reads, event_tx).await?;
         let added_reads = merge_read_context(&mut read_context, satisfied_reads);
         if read_round == READ_ROUND_LIMIT {
             reached_read_limit_with_pending_reads = true;
@@ -1501,11 +1501,15 @@ async fn continue_orbit_chat_turn(
     }
 
     if terminal_error {
-        assistant_draft.persist_failed_content(assistant_visible.trim())?;
+        assistant_draft
+            .persist_failed_content(assistant_visible.trim())
+            .await?;
     } else {
-        assistant_draft.persist_content(assistant_visible.trim())?;
+        assistant_draft
+            .persist_content(assistant_visible.trim())
+            .await?;
     }
-    assistant_draft.persist_usage(&usage)?;
+    assistant_draft.persist_usage(&usage).await?;
     if !usage.is_empty() {
         let _ = event_tx.send(OrbitAgentEvent::Usage(usage)).await;
     }
@@ -1529,8 +1533,8 @@ async fn finish_orbit_immediate_reply(
     } else {
         reply
     };
-    assistant_draft.persist_content(reply)?;
-    assistant_draft.persist_usage(&usage)?;
+    assistant_draft.persist_content(reply).await?;
+    assistant_draft.persist_usage(&usage).await?;
     let _ = event_tx
         .send(OrbitAgentEvent::Token(reply.to_string()))
         .await;
@@ -1759,7 +1763,8 @@ async fn run_single_stream(
             let message = user_visible_orbit_operation_error(&error);
             append_visible_line(&mut assistant_visible, &message);
             assistant_draft
-                .persist_content(&combine_visible_content(persist_prefix, &assistant_visible))?;
+                .persist_content(&combine_visible_content(persist_prefix, &assistant_visible))
+                .await?;
             let _ = event_tx.send(OrbitAgentEvent::Error(message)).await;
         }
     } else if !saw_stream_token && !response.content.is_empty() {
@@ -1963,7 +1968,7 @@ fn validate_custom_widget_module_write_content(path: &str, content: &str) -> Res
     Ok(())
 }
 
-fn reject_existing_module_write_if_needed(
+async fn reject_existing_module_write_if_needed(
     service: &ArkOrbitService,
     orbit_id: &str,
     path: &str,
@@ -1971,7 +1976,11 @@ fn reject_existing_module_write_if_needed(
     if !is_widget_module_index_path(path) {
         return Ok(());
     }
-    if service.read_orbit_file_text(orbit_id, path).is_ok() {
+    if service
+        .read_orbit_file_text_async(orbit_id, path)
+        .await
+        .is_ok()
+    {
         return Err(anyhow!(
             "{} Read the current file and use an edit operation with the smallest exact find/replace snippet for {}.",
             EXISTING_MODULE_WRITE_REJECTION_HINT,
@@ -2049,7 +2058,9 @@ async fn emit_visible_text(
         return Ok(());
     }
     assistant_visible.push_str(text);
-    assistant_draft.persist_content(&combine_visible_content(persist_prefix, assistant_visible))?;
+    assistant_draft
+        .persist_content(&combine_visible_content(persist_prefix, assistant_visible))
+        .await?;
     let _ = event_tx
         .send(OrbitAgentEvent::Token(text.to_string()))
         .await;
@@ -2154,11 +2165,12 @@ async fn apply_orbit_operation_payloads(
                     validate_writable_orbit_path(&path)?;
                     validate_custom_widget_module_write_content(&path, &content)?;
                     validate_widget_registry_content(&path, &content)?;
-                    reject_existing_module_write_if_needed(service, &target_orbit_id, &path)?;
+                    reject_existing_module_write_if_needed(service, &target_orbit_id, &path)
+                        .await?;
                     let touched_widget_module = widget_module_from_orbit_path(&path).is_some();
                     if touched_widget_module && registry_before_payload.is_none() {
                         registry_before_payload =
-                            Some(read_widget_registry_widgets(service, orbit_id)?);
+                            Some(read_widget_registry_widgets(service, orbit_id).await?);
                     }
                     emit_status(
                         event_tx,
@@ -2173,18 +2185,22 @@ async fn apply_orbit_operation_payloads(
                         format!("Writing {} ({}).", path, format_byte_count(bytes)),
                     )
                     .await?;
-                    service.write_orbit_file(&target_orbit_id, &path, &content)?;
-                    upsert_widget_registry_for_module(service, &target_orbit_id, &path)?;
+                    service
+                        .write_orbit_file(&target_orbit_id, &path, &content)
+                        .await?;
+                    upsert_widget_registry_for_module(service, &target_orbit_id, &path).await?;
                     if touched_widget_module {
                         touched_widget_modules.push(path.clone());
                     }
                     concrete_operations = concrete_operations.saturating_add(1);
                     let line = format_file_update_line(OrbitFileOperation::Wrote, &path);
                     append_visible_line(assistant_visible, &line);
-                    assistant_draft.persist_content(&combine_visible_content(
-                        persist_prefix,
-                        assistant_visible,
-                    ))?;
+                    assistant_draft
+                        .persist_content(&combine_visible_content(
+                            persist_prefix,
+                            assistant_visible,
+                        ))
+                        .await?;
                     *writes += 1;
                     let _ = event_tx
                         .send(OrbitAgentEvent::FileWritten {
@@ -2223,7 +2239,9 @@ async fn apply_orbit_operation_payloads(
                         "Saving the canvas update...".to_string(),
                     )
                     .await?;
-                    let current = service.read_orbit_file_text(&target_orbit_id, &path)?;
+                    let current = service
+                        .read_orbit_file_text_async(&target_orbit_id, &path)
+                        .await?;
                     let Some(updated) = apply_surgical_edit(&current, &find, &replace) else {
                         if !allow_read_operations {
                             return Err(anyhow!(
@@ -2253,7 +2271,7 @@ async fn apply_orbit_operation_payloads(
                     let touched_widget_module = widget_module_from_orbit_path(&path).is_some();
                     if touched_widget_module && registry_before_payload.is_none() {
                         registry_before_payload =
-                            Some(read_widget_registry_widgets(service, orbit_id)?);
+                            Some(read_widget_registry_widgets(service, orbit_id).await?);
                     }
                     let bytes = updated.len();
                     emit_status(
@@ -2262,18 +2280,22 @@ async fn apply_orbit_operation_payloads(
                         format!("Writing {} ({}).", path, format_byte_count(bytes)),
                     )
                     .await?;
-                    service.write_orbit_file(&target_orbit_id, &path, &updated)?;
-                    upsert_widget_registry_for_module(service, &target_orbit_id, &path)?;
+                    service
+                        .write_orbit_file(&target_orbit_id, &path, &updated)
+                        .await?;
+                    upsert_widget_registry_for_module(service, &target_orbit_id, &path).await?;
                     if touched_widget_module {
                         touched_widget_modules.push(path.clone());
                     }
                     concrete_operations = concrete_operations.saturating_add(1);
                     let line = format_file_update_line(OrbitFileOperation::Edited, &path);
                     append_visible_line(assistant_visible, &line);
-                    assistant_draft.persist_content(&combine_visible_content(
-                        persist_prefix,
-                        assistant_visible,
-                    ))?;
+                    assistant_draft
+                        .persist_content(&combine_visible_content(
+                            persist_prefix,
+                            assistant_visible,
+                        ))
+                        .await?;
                     *writes += 1;
                     let _ = event_tx
                         .send(OrbitAgentEvent::FileWritten {
@@ -2290,14 +2312,11 @@ async fn apply_orbit_operation_payloads(
         }
         if !touched_widget_modules.is_empty() {
             if let Some(registry_before_payload) = registry_before_payload.as_deref() {
-                restore_missing_widget_registry_entries(
-                    service,
-                    orbit_id,
-                    registry_before_payload,
-                )?;
+                restore_missing_widget_registry_entries(service, orbit_id, registry_before_payload)
+                    .await?;
             }
             for path in touched_widget_modules {
-                upsert_widget_registry_for_module(service, orbit_id, &path)?;
+                upsert_widget_registry_for_module(service, orbit_id, &path).await?;
             }
         }
         if *writes > writes_before_payload {
@@ -2561,6 +2580,7 @@ fn orbit_payload_from_json_text(text: &str) -> Option<serde_json::Value> {
             id: "fallback_json".to_string(),
             name: name.to_string(),
             arguments,
+            activity_label: None,
         };
         if let Some(payload) = orbit_payload_from_tool_call(&synthetic) {
             return Some(payload);
@@ -2685,7 +2705,7 @@ fn trim_one_outer_newline(value: &str) -> &str {
         .unwrap_or(without_leading)
 }
 
-fn satisfy_reads(
+async fn satisfy_reads(
     service: &ArkOrbitService,
     _selected_orbit_id: &str,
     reads: &[OrbitReadRequest],
@@ -2693,7 +2713,10 @@ fn satisfy_reads(
 ) -> Result<Vec<(OrbitReadRequest, String)>> {
     let mut out = Vec::new();
     for request in reads {
-        let body = match service.read_orbit_file_text(&request.orbit_id, &request.path) {
+        let body = match service
+            .read_orbit_file_text_async(&request.orbit_id, &request.path)
+            .await
+        {
             Ok(body) => body,
             Err(error) => {
                 let message = format!("Could not read {}: {}", request.path, error);
@@ -3235,11 +3258,14 @@ fn collapse_duplicate_widget_registry_entries(widgets: &mut Vec<serde_json::Valu
     removed
 }
 
-fn read_widget_registry_widgets(
+async fn read_widget_registry_widgets(
     service: &ArkOrbitService,
     orbit_id: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    let raw = match service.read_orbit_file_text(orbit_id, "data/widgets.json") {
+    let raw = match service
+        .read_orbit_file_text_async(orbit_id, "data/widgets.json")
+        .await
+    {
         Ok(raw) => raw,
         Err(_) => return Ok(Vec::new()),
     };
@@ -3271,7 +3297,7 @@ fn merge_missing_widget_registry_entries(
     widgets.len() != original_len || removed_duplicates > 0
 }
 
-fn restore_missing_widget_registry_entries(
+async fn restore_missing_widget_registry_entries(
     service: &ArkOrbitService,
     orbit_id: &str,
     previous: &[serde_json::Value],
@@ -3279,18 +3305,20 @@ fn restore_missing_widget_registry_entries(
     if previous.is_empty() {
         return Ok(());
     }
-    let mut widgets = read_widget_registry_widgets(service, orbit_id)?;
+    let mut widgets = read_widget_registry_widgets(service, orbit_id).await?;
     if !merge_missing_widget_registry_entries(&mut widgets, previous) {
         return Ok(());
     }
-    service.write_orbit_file(
-        orbit_id,
-        "data/widgets.json",
-        &serde_json::to_string_pretty(&widgets)?,
-    )
+    service
+        .write_orbit_file(
+            orbit_id,
+            "data/widgets.json",
+            &serde_json::to_string_pretty(&widgets)?,
+        )
+        .await
 }
 
-fn upsert_widget_registry_for_module(
+async fn upsert_widget_registry_for_module(
     service: &ArkOrbitService,
     orbit_id: &str,
     path: &str,
@@ -3299,7 +3327,7 @@ fn upsert_widget_registry_for_module(
         return Ok(());
     };
 
-    let mut widgets = read_widget_registry_widgets(service, orbit_id)?;
+    let mut widgets = read_widget_registry_widgets(service, orbit_id).await?;
 
     let exact_module_registered = widgets.iter().any(|widget| {
         widget
@@ -3313,11 +3341,13 @@ fn upsert_widget_registry_for_module(
         if removed_duplicates == 0 {
             return Ok(());
         }
-        return service.write_orbit_file(
-            orbit_id,
-            "data/widgets.json",
-            &serde_json::to_string_pretty(&widgets)?,
-        );
+        return service
+            .write_orbit_file(
+                orbit_id,
+                "data/widgets.json",
+                &serde_json::to_string_pretty(&widgets)?,
+            )
+            .await;
     }
 
     let title = title_from_module(&module);
@@ -3348,11 +3378,13 @@ fn upsert_widget_registry_for_module(
         }));
     }
     collapse_duplicate_widget_registry_entries(&mut widgets);
-    service.write_orbit_file(
-        orbit_id,
-        "data/widgets.json",
-        &serde_json::to_string_pretty(&widgets)?,
-    )
+    service
+        .write_orbit_file(
+            orbit_id,
+            "data/widgets.json",
+            &serde_json::to_string_pretty(&widgets)?,
+        )
+        .await
 }
 
 fn title_from_module(module: &str) -> String {
@@ -3401,8 +3433,11 @@ fn orbit_file_is_prompt_visible(path: &str) -> bool {
     orbit_file_is_user_artifact_path(path)
 }
 
-fn render_widget_registry_context(service: &ArkOrbitService, orbit_id: &str) -> String {
-    match service.read_orbit_file_text(orbit_id, "data/widgets.json") {
+async fn render_widget_registry_context(service: &ArkOrbitService, orbit_id: &str) -> String {
+    match service
+        .read_orbit_file_text_async(orbit_id, "data/widgets.json")
+        .await
+    {
         Ok(raw) if raw.trim().is_empty() => "(empty)".to_string(),
         Ok(raw) if raw.len() <= 12 * 1024 => raw,
         Ok(_) => "(data/widgets.json is large; read it only if exact layout details are needed)"
@@ -3411,8 +3446,11 @@ fn render_widget_registry_context(service: &ArkOrbitService, orbit_id: &str) -> 
     }
 }
 
-fn widget_registry_value(service: &ArkOrbitService, orbit_id: &str) -> serde_json::Value {
-    match service.read_orbit_file_text(orbit_id, "data/widgets.json") {
+async fn widget_registry_value(service: &ArkOrbitService, orbit_id: &str) -> serde_json::Value {
+    match service
+        .read_orbit_file_text_async(orbit_id, "data/widgets.json")
+        .await
+    {
         Ok(raw) if raw.trim().is_empty() => serde_json::json!({
             "state": "empty",
             "visible_widgets": [],
@@ -3523,12 +3561,12 @@ fn orbit_file_inventory_value(files: &[OrbitFileEntry]) -> serde_json::Value {
     })
 }
 
-fn orbit_inventory_entry_value(
+async fn orbit_inventory_entry_value(
     service: &ArkOrbitService,
     orbit: &Orbit,
     selected_orbit_id: &str,
 ) -> serde_json::Value {
-    let files_value = match service.list_orbit_files(&orbit.id) {
+    let files_value = match service.list_orbit_files_async(&orbit.id).await {
         Ok(files) => orbit_file_inventory_value(&files),
         Err(error) => serde_json::json!({
             "error": error.to_string(),
@@ -3543,7 +3581,7 @@ fn orbit_inventory_entry_value(
         "selected": orbit.id == selected_orbit_id,
         "created_at": orbit.created_at,
         "updated_at": orbit.updated_at,
-        "visible_widget_registry": widget_registry_value(service, &orbit.id),
+        "visible_widget_registry": widget_registry_value(service, &orbit.id).await,
         "file_inventory": files_value,
     })
 }
@@ -3561,11 +3599,10 @@ async fn render_workspace_inventory_context(
             .then_with(|| left.created_at.cmp(&right.created_at))
     });
     let total_orbits = orbits.len();
-    let entries = orbits
-        .iter()
-        .take(MAX_WORKSPACE_ORBIT_SNAPSHOTS)
-        .map(|orbit| orbit_inventory_entry_value(service, orbit, &selected_orbit.id))
-        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    for orbit in orbits.iter().take(MAX_WORKSPACE_ORBIT_SNAPSHOTS) {
+        entries.push(orbit_inventory_entry_value(service, orbit, &selected_orbit.id).await);
+    }
     let payload = serde_json::json!({
         "inventory_semantics": "current state rebuilt from persisted orbit manifests and files for this request; artifacts absent from this inventory are not currently present",
         "selected_surface_kind": OrbitChatSurfaceKind::from_orbit(selected_orbit).as_prompt_label(),
@@ -3588,9 +3625,9 @@ async fn render_initial_turn_message(
         .get_orbit(orbit_id)
         .await?
         .ok_or_else(|| anyhow!("ArkOrbit: orbit '{}' not found", orbit_id))?;
-    let files = service.list_orbit_files(orbit_id)?;
+    let files = service.list_orbit_files_async(orbit_id).await?;
     let file_tree = render_orbit_file_tree(&files);
-    let widget_registry = render_widget_registry_context(service, orbit_id);
+    let widget_registry = render_widget_registry_context(service, orbit_id).await;
     let instructions = orbit.agent_instructions.clone().unwrap_or_default();
     let orbit_color = orbit.color.clone().unwrap_or_default();
     let surface_kind = OrbitChatSurfaceKind::from_orbit(&orbit);
@@ -3789,32 +3826,42 @@ Execution rules:\n\
     )
 }
 
-fn messages_path(service: &ArkOrbitService, orbit_id: &str) -> Result<std::path::PathBuf> {
-    Ok(service.orbit_dir(orbit_id)?.join("messages.jsonl"))
+async fn messages_path(service: &ArkOrbitService, orbit_id: &str) -> Result<std::path::PathBuf> {
+    Ok(service
+        .orbit_dir_async(orbit_id)
+        .await?
+        .join("messages.jsonl"))
 }
 
-fn history_summary_path(service: &ArkOrbitService, orbit_id: &str) -> Result<std::path::PathBuf> {
+async fn history_summary_path(
+    service: &ArkOrbitService,
+    orbit_id: &str,
+) -> Result<std::path::PathBuf> {
     Ok(service
-        .orbit_dir(orbit_id)?
+        .orbit_dir_async(orbit_id)
+        .await?
         .join("data")
         .join("chat-summary.md"))
 }
 
-fn append_message(
+async fn append_message(
     service: &ArkOrbitService,
     orbit_id: &str,
     session_id: &str,
     role: &str,
     content: &str,
 ) -> Result<OrbitChatMessage> {
-    if !service.orbit_chat_session_matches(orbit_id, session_id)? {
+    if !service
+        .orbit_chat_session_matches_async(orbit_id, session_id)
+        .await?
+    {
         return Err(anyhow!(
             "Orbit chat was reset before this message could be saved"
         ));
     }
-    let path = messages_path(service, orbit_id)?;
+    let path = messages_path(service, orbit_id).await?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
     let message = OrbitChatMessage {
         id: Uuid::new_v4().to_string(),
@@ -3834,12 +3881,13 @@ fn append_message(
     };
     let mut line = serde_json::to_string(&message)?;
     line.push('\n');
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?;
-    file.write_all(line.as_bytes())?;
+        .open(path)
+        .await?;
+    file.write_all(line.as_bytes()).await?;
     Ok(message)
 }
 
@@ -3853,14 +3901,14 @@ struct AssistantMessageDraft {
 }
 
 impl AssistantMessageDraft {
-    fn create(
+    async fn create(
         service: &ArkOrbitService,
         orbit_id: &str,
         session_id: &str,
         content: &str,
     ) -> Result<Self> {
-        let path = messages_path(service, orbit_id)?;
-        let message = append_message(service, orbit_id, session_id, "assistant", content)?;
+        let path = messages_path(service, orbit_id).await?;
+        let message = append_message(service, orbit_id, session_id, "assistant", content).await?;
         Self {
             service: service.clone(),
             orbit_id: orbit_id.to_string(),
@@ -3873,48 +3921,52 @@ impl AssistantMessageDraft {
             has_visible_content: false,
         }
         .persist_initial_status()
+        .await
     }
 
-    fn persist_initial_status(self) -> Result<Self> {
-        rewrite_message_by_id(&self.path, &self.message)?;
+    async fn persist_initial_status(self) -> Result<Self> {
+        rewrite_message_by_id(&self.path, &self.message).await?;
         Ok(self)
     }
 
-    fn session_is_current(&self) -> Result<bool> {
+    async fn session_is_current(&self) -> Result<bool> {
         self.service
-            .orbit_chat_session_matches(&self.orbit_id, &self.session_id)
+            .orbit_chat_session_matches_async(&self.orbit_id, &self.session_id)
+            .await
     }
 
-    fn persist_status_if_empty(&mut self, content: &str) -> Result<()> {
+    async fn persist_status_if_empty(&mut self, content: &str) -> Result<()> {
         if self.has_visible_content {
             return Ok(());
         }
-        if !self.session_is_current()? {
+        if !self.session_is_current().await? {
             return Ok(());
         }
         let activity = content.trim();
         self.message.activity = (!activity.is_empty()).then(|| activity.to_string());
         self.message.status = Some(OrbitChatMessageStatus::Running);
-        rewrite_message_by_id(&self.path, &self.message)
+        rewrite_message_by_id(&self.path, &self.message).await
     }
 
-    fn persist_content(&mut self, content: &str) -> Result<()> {
+    async fn persist_content(&mut self, content: &str) -> Result<()> {
         self.persist_content_internal(
             content,
             !content.trim().is_empty(),
             OrbitChatMessageStatus::Completed,
         )
+        .await
     }
 
-    fn persist_failed_content(&mut self, content: &str) -> Result<()> {
+    async fn persist_failed_content(&mut self, content: &str) -> Result<()> {
         self.persist_content_internal(content, true, OrbitChatMessageStatus::Failed)
+            .await
     }
 
-    fn persist_usage(&mut self, usage: &OrbitChatUsage) -> Result<()> {
+    async fn persist_usage(&mut self, usage: &OrbitChatUsage) -> Result<()> {
         if usage.is_empty() {
             return Ok(());
         }
-        if !self.session_is_current()? {
+        if !self.session_is_current().await? {
             return Ok(());
         }
         self.message.model = usage.model.clone();
@@ -3927,16 +3979,16 @@ impl AssistantMessageDraft {
                 .then_some(usage.estimated);
         self.message.duration_ms = usage.duration_ms;
         self.message.time_to_first_token_ms = usage.time_to_first_token_ms;
-        rewrite_message_by_id(&self.path, &self.message)
+        rewrite_message_by_id(&self.path, &self.message).await
     }
 
-    fn persist_content_internal(
+    async fn persist_content_internal(
         &mut self,
         content: &str,
         visible: bool,
         status: OrbitChatMessageStatus,
     ) -> Result<()> {
-        if !self.session_is_current()? {
+        if !self.session_is_current().await? {
             return Ok(());
         }
         self.message.content = content.to_string();
@@ -3945,7 +3997,7 @@ impl AssistantMessageDraft {
         if visible {
             self.has_visible_content = true;
         }
-        rewrite_message_by_id(&self.path, &self.message)
+        rewrite_message_by_id(&self.path, &self.message).await
     }
 }
 
@@ -3954,13 +4006,16 @@ async fn emit_status(
     assistant_draft: &mut AssistantMessageDraft,
     message: String,
 ) -> Result<()> {
-    assistant_draft.persist_status_if_empty(&message)?;
+    assistant_draft.persist_status_if_empty(&message).await?;
     let _ = event_tx.send(OrbitAgentEvent::Status { message }).await;
     Ok(())
 }
 
-fn rewrite_message_by_id(path: &std::path::Path, replacement: &OrbitChatMessage) -> Result<()> {
-    let raw = match std::fs::read_to_string(path) {
+async fn rewrite_message_by_id(
+    path: &std::path::Path,
+    replacement: &OrbitChatMessage,
+) -> Result<()> {
+    let raw = match tokio::fs::read_to_string(path).await {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
@@ -3986,7 +4041,7 @@ fn rewrite_message_by_id(path: &std::path::Path, replacement: &OrbitChatMessage)
     }
     let mut next = lines.join("\n");
     next.push('\n');
-    std::fs::write(path, next)?;
+    tokio::fs::write(path, next).await?;
     Ok(())
 }
 
@@ -4060,8 +4115,10 @@ fn truncate_point_tokens(value: &str, max_tokens: usize) -> String {
     context_budget::truncate_point_tokens(value, max_tokens)
 }
 
-fn read_orbit_chat_messages_from_path(path: &std::path::Path) -> Result<Vec<OrbitChatMessage>> {
-    let raw = match std::fs::read_to_string(path) {
+async fn read_orbit_chat_messages_from_path(
+    path: &std::path::Path,
+) -> Result<Vec<OrbitChatMessage>> {
+    let raw = match tokio::fs::read_to_string(path).await {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
@@ -4083,19 +4140,22 @@ fn read_orbit_chat_messages_from_path(path: &std::path::Path) -> Result<Vec<Orbi
     Ok(messages)
 }
 
-fn compact_orbit_history_if_needed(
+async fn compact_orbit_history_if_needed(
     service: &ArkOrbitService,
     orbit_id: &str,
     session_id: &str,
     budget: OrbitHistoryBudget,
 ) -> Result<()> {
-    if !service.orbit_chat_session_matches(orbit_id, session_id)? {
+    if !service
+        .orbit_chat_session_matches_async(orbit_id, session_id)
+        .await?
+    {
         return Ok(());
     }
-    let path = messages_path(service, orbit_id)?;
-    let messages = read_orbit_chat_messages_from_path(&path)?;
-    let summary_path = history_summary_path(service, orbit_id)?;
-    let previous_summary = match std::fs::read_to_string(&summary_path) {
+    let path = messages_path(service, orbit_id).await?;
+    let messages = read_orbit_chat_messages_from_path(&path).await?;
+    let summary_path = history_summary_path(service, orbit_id).await?;
+    let previous_summary = match tokio::fs::read_to_string(&summary_path).await {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
@@ -4104,23 +4164,29 @@ fn compact_orbit_history_if_needed(
     else {
         return Ok(());
     };
-    if !service.orbit_chat_session_matches(orbit_id, session_id)? {
+    if !service
+        .orbit_chat_session_matches_async(orbit_id, session_id)
+        .await?
+    {
         return Ok(());
     }
     if let Some(parent) = summary_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    std::fs::write(summary_path, plan.summary)?;
+    tokio::fs::write(summary_path, plan.summary).await?;
 
     let mut out = String::new();
     for message in &plan.recent_messages {
         out.push_str(&serde_json::to_string(message)?);
         out.push('\n');
     }
-    if !service.orbit_chat_session_matches(orbit_id, session_id)? {
+    if !service
+        .orbit_chat_session_matches_async(orbit_id, session_id)
+        .await?
+    {
         return Ok(());
     }
-    std::fs::write(path, out)?;
+    tokio::fs::write(path, out).await?;
     Ok(())
 }
 
@@ -4198,12 +4264,15 @@ fn render_compacted_history_summary(
     truncate_to_token_budget(&out, max_summary_tokens)
 }
 
-fn load_history(service: &ArkOrbitService, orbit_id: &str) -> Result<Vec<ConversationMessage>> {
-    let path = messages_path(service, orbit_id)?;
-    let parsed_messages = read_orbit_chat_messages_from_path(&path)?;
+async fn load_history(
+    service: &ArkOrbitService,
+    orbit_id: &str,
+) -> Result<Vec<ConversationMessage>> {
+    let path = messages_path(service, orbit_id).await?;
+    let parsed_messages = read_orbit_chat_messages_from_path(&path).await?;
     let mut messages = Vec::new();
-    let summary_path = history_summary_path(service, orbit_id)?;
-    if let Ok(summary) = std::fs::read_to_string(summary_path) {
+    let summary_path = history_summary_path(service, orbit_id).await?;
+    if let Ok(summary) = tokio::fs::read_to_string(summary_path).await {
         let summary = summary.trim();
         if !summary.is_empty() {
             messages.push(ConversationMessage {
@@ -4270,6 +4339,7 @@ mod tests {
                 "path": "mod/a/index.js",
                 "content": "export function render() {}"
             }),
+            activity_label: None,
         };
         let payload = orbit_payload_from_tool_call(&call).expect("payload");
         let parsed = parse_orbit_tool_arguments(&payload).expect("arguments");

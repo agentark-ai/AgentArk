@@ -715,7 +715,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{OnboardSummary, build_onboard_steps};
+    use super::{build_onboard_steps, OnboardSummary};
 
     #[test]
     fn onboard_checklist_reports_missing_chat_model_first() {

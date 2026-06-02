@@ -28,6 +28,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 import type { IntegrationItem } from "../types";
 
 type JsonRecord = Record<string, unknown>;
@@ -673,14 +674,14 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
                   <TableCell>{str(event.source_name)}</TableCell>
                   <TableCell>
                     <Stack spacing={0.2}>
-                      <Typography variant="body2">{str(event.event_type, "webhook")}</Typography>
+                      <Typography variant="body2">{humanizeMachineLabel(str(event.event_type, "webhook"))}</Typography>
                       <Typography variant="caption" sx={{
                         color: "text.secondary"
                       }}>{str(event.subject)}</Typography>
                     </Stack>
                   </TableCell>
                   <TableCell>
-                    <Chip size="small" label={str(event.outcome)} color={str(event.outcome) === "queued" ? "success" : str(event.outcome) === "auth_failed" ? "error" : "default"} />
+                    <Chip size="small" label={humanizeStatusLabel(str(event.outcome))} color={str(event.outcome) === "queued" ? "success" : str(event.outcome) === "auth_failed" ? "error" : "default"} />
                   </TableCell>
                   <TableCell>
                     <Stack spacing={0.2}>

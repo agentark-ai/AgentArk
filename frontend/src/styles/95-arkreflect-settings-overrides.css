@@ -1,0 +1,1079 @@
+/* ArkReflect, global surface overrides, Settings palette, and Orbit canvas pass. */
+
+/* ============================================================
+   Reflect - sci-fi visual layer
+   ============================================================ */
+
+.arkreflect-status,
+.arkreflect-narrative,
+.arkreflect-panorama,
+.arkreflect-grid-pane,
+.arkreflect-motion-panel,
+.arkreflect-tab-strip {
+  position: relative;
+  overflow: visible;
+}
+
+.arkreflect-motion-panel {
+  animation: arkreflect-panel-in 420ms ease-out both;
+  transform-origin: 50% 16px;
+}
+
+.arkreflect-tab-strip {
+  animation: arkreflect-panel-in 320ms ease-out both;
+}
+
+@keyframes arkreflect-panel-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+    filter: saturate(0.88);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: saturate(1);
+  }
+}
+
+.arkreflect-live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green-glow);
+  box-shadow: 0 0 0 2px var(--ui-rgba-57-208-255-040), 0 0 10px var(--green-glow);
+  animation: arkreflect-live-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes arkreflect-live-pulse {
+  0%, 100% {
+    transform: scale(0.82);
+    opacity: 0.58;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.arkreflect-status::before,
+.arkreflect-narrative::before,
+.arkreflect-panorama::before,
+.arkreflect-grid-pane::before,
+.arkreflect-motion-panel::before,
+.arkreflect-status::after,
+.arkreflect-narrative::after,
+.arkreflect-panorama::after,
+.arkreflect-grid-pane::after,
+.arkreflect-motion-panel::after {
+  content: "";
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  pointer-events: none;
+  border-color: var(--cyan-glow);
+  transition: border-color 220ms ease, width 220ms ease, height 220ms ease;
+  z-index: 4;
+}
+
+.arkreflect-status::before,
+.arkreflect-narrative::before,
+.arkreflect-panorama::before,
+.arkreflect-grid-pane::before,
+.arkreflect-motion-panel::before {
+  top: -1px;
+  left: -1px;
+  border-top: 1px solid;
+  border-left: 1px solid;
+}
+
+.arkreflect-status::after,
+.arkreflect-narrative::after,
+.arkreflect-panorama::after,
+.arkreflect-grid-pane::after,
+.arkreflect-motion-panel::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 1px solid;
+  border-right: 1px solid;
+}
+
+.arkreflect-status:hover::before,
+.arkreflect-status:hover::after,
+.arkreflect-narrative:hover::before,
+.arkreflect-narrative:hover::after,
+.arkreflect-panorama:hover::before,
+.arkreflect-panorama:hover::after,
+.arkreflect-grid-pane:hover::before,
+.arkreflect-grid-pane:hover::after,
+.arkreflect-motion-panel:hover::before,
+.arkreflect-motion-panel:hover::after {
+  border-color: var(--green-glow);
+  width: 24px;
+  height: 24px;
+}
+
+.arkreflect-section-eyebrow {
+  display: inline-block;
+  font-family: var(--font-display);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--green-glow);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.arkreflect-section-eyebrow::before { content: "[ "; opacity: 0.55 }
+.arkreflect-section-eyebrow::after  { content: " ]"; opacity: 0.55 }
+
+.arkreflect-status {
+  background:
+    linear-gradient(90deg, var(--ui-rgba-57-208-255-040), transparent 70%),
+    linear-gradient(180deg, rgba(7, 13, 18, 0.95), rgba(5, 9, 12, 0.92)) !important;
+}
+
+.arkreflect-narrative {
+  background:
+    radial-gradient(circle at 0% 0%, var(--ui-rgba-57-208-255-040), transparent 55%),
+    linear-gradient(180deg, rgba(7, 13, 18, 0.92), rgba(5, 9, 12, 0.96)) !important;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34) !important;
+}
+
+.arkreflect-narrative .MuiTypography-h6 {
+  font-family: var(--font-display);
+  letter-spacing: 0.005em;
+}
+
+.arkreflect-narrative-line {
+  font-family: var(--font-display) !important;
+  line-height: 1.7 !important;
+  font-size: 0.94rem !important;
+  color: rgba(237, 247, 244, 0.84) !important;
+  letter-spacing: 0.005em;
+  font-variant-numeric: tabular-nums;
+}
+
+.arkreflect-narrative-line strong {
+  color: var(--cyan-glow);
+  font-weight: 700;
+}
+
+.arkreflect-panorama {
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 40%, rgba(36, 60, 78, 0.32), transparent 70%),
+    linear-gradient(180deg, rgba(6, 11, 16, 0.97), rgba(4, 8, 12, 0.97)) !important;
+  box-shadow:
+    0 22px 60px rgba(0, 0, 0, 0.5),
+    inset 0 0 120px rgba(0, 0, 0, 0.55) !important;
+  overflow: hidden !important;
+  min-height: 480px;
+}
+
+.arkreflect-panorama-backdrop {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse 60% 40% at 30% 35%, rgba(120, 242, 176, 0.10), transparent 70%),
+    radial-gradient(ellipse 55% 38% at 72% 65%, rgba(70, 160, 150, 0.09), transparent 70%);
+  animation: arkreflect-backdrop-drift 24s ease-in-out infinite alternate;
+}
+
+.arkreflect-panorama-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    repeating-linear-gradient(0deg, transparent, transparent 31px, rgba(130, 170, 160, 0.055) 31px, rgba(130, 170, 160, 0.055) 32px),
+    repeating-linear-gradient(90deg, transparent, transparent 31px, rgba(130, 170, 160, 0.055) 31px, rgba(130, 170, 160, 0.055) 32px),
+    repeating-linear-gradient(0deg, transparent, transparent 127px, rgba(130, 170, 160, 0.13) 127px, rgba(130, 170, 160, 0.13) 128px),
+    repeating-linear-gradient(90deg, transparent, transparent 127px, rgba(130, 170, 160, 0.13) 127px, rgba(130, 170, 160, 0.13) 128px);
+  opacity: 0.6;
+  mask-image: radial-gradient(ellipse 70% 80% at center, #000 40%, transparent 95%);
+  -webkit-mask-image: radial-gradient(ellipse 70% 80% at center, #000 40%, transparent 95%);
+}
+
+@keyframes arkreflect-backdrop-drift {
+  0%   { transform: translate(0, 0); opacity: 0.7 }
+  100% { transform: translate(14px, -8px); opacity: 1 }
+}
+
+.arkreflect-panorama-canvas {
+  position: relative;
+  z-index: 2;
+}
+
+.arkreflect-panorama-canvas::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(180, 220, 240, 0.025) 2px,
+    rgba(180, 220, 240, 0.025) 3px
+  );
+  mix-blend-mode: screen;
+}
+
+.arkreflect-panorama-canvas::after {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  pointer-events: none;
+  z-index: 3;
+  border: 1px solid rgba(130, 170, 160, 0.12);
+  border-radius: 2px;
+  background:
+    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top left / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top left / 1px 18px no-repeat,
+    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top right / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top right / 1px 18px no-repeat,
+    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom left / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom left / 1px 18px no-repeat,
+    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom right / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom right / 1px 18px no-repeat;
+}
+
+.arkreflect-panorama-empty {
+  position: relative;
+  z-index: 2;
+}
+
+.arkreflect-pill.MuiChip-root {
+  background: var(--ui-rgba-57-208-255-040) !important;
+  border: 1px solid var(--ui-rgba-57-208-255-150) !important;
+  color: var(--cyan-glow) !important;
+  font-family: var(--font-display);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  height: 28px;
+  border-radius: 6px !important;
+  position: relative;
+  transition: border-color 200ms ease, background 200ms ease, box-shadow 200ms ease;
+}
+
+.arkreflect-pill.MuiChip-root::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  width: 6px;
+  height: 6px;
+  border-top: 1px solid var(--cyan-glow);
+  border-left: 1px solid var(--cyan-glow);
+  pointer-events: none;
+  transition: width 200ms ease, height 200ms ease, border-color 200ms ease;
+}
+
+.arkreflect-pill.MuiChip-root::after {
+  content: "";
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 6px;
+  height: 6px;
+  border-bottom: 1px solid var(--cyan-glow);
+  border-right: 1px solid var(--cyan-glow);
+  pointer-events: none;
+  transition: width 200ms ease, height 200ms ease, border-color 200ms ease;
+}
+
+.arkreflect-pill.MuiChip-root:hover {
+  border-color: var(--green-glow) !important;
+  box-shadow:
+    0 0 0 1px var(--ui-rgba-57-208-255-080),
+    0 0 14px var(--ui-rgba-57-208-255-150);
+}
+
+.arkreflect-pill.MuiChip-root:hover::before,
+.arkreflect-pill.MuiChip-root:hover::after {
+  border-color: var(--green-glow);
+  width: 9px;
+  height: 9px;
+}
+
+.arkreflect-pill.MuiChip-root .MuiChip-icon {
+  color: var(--green-glow) !important;
+}
+
+.arkreflect-grid-pane {
+  background:
+    linear-gradient(180deg, rgba(7, 13, 18, 0.9), rgba(5, 9, 12, 0.95)) !important;
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.3) !important;
+}
+
+.arkreflect-status .MuiTypography-root,
+.arkreflect-pill.MuiChip-root,
+.arkreflect-section-subtitle,
+.arkreflect-narrative-line {
+  font-variant-numeric: tabular-nums;
+}
+
+.arkreflect-status .MuiLinearProgress-root {
+  background: var(--ui-rgba-57-208-255-040) !important;
+}
+.arkreflect-status .MuiLinearProgress-bar {
+  background:
+    linear-gradient(90deg, var(--cyan-glow), var(--green-glow), var(--cyan-glow)) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .arkreflect-motion-panel,
+  .arkreflect-tab-strip,
+  .arkreflect-live-dot,
+  .arkreflect-panorama-backdrop {
+    animation: none !important;
+  }
+}
+
+/* ============================================================
+   ArkCore unified page skin
+   Visual-only normalization across ArkCore pages. Keep page
+   behavior local; make shared surfaces, tabs, chips, and panels
+   read as one product system.
+   ============================================================ */
+
+:root {
+  --arkcore-page-bg: rgba(10, 10, 10, 0.54);
+  --arkcore-panel-bg:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.008)),
+    rgba(10, 10, 10, 0.58);
+  --arkcore-panel-bg-strong:
+    radial-gradient(ellipse at 18% 0%, rgba(120, 242, 176, 0.035), transparent 40%),
+    linear-gradient(180deg, rgba(22, 22, 24, 0.72), rgba(9, 9, 10, 0.66));
+  --arkcore-panel-border: rgba(255, 255, 255, 0.055);
+  --arkcore-panel-border-hover: rgba(120, 242, 176, 0.14);
+  --arkcore-panel-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
+  --arkcore-muted-text: rgba(226, 218, 208, 0.68);
+  --arkcore-faint-text: rgba(226, 218, 208, 0.46);
+  --arkcore-accent: rgba(120, 242, 176, 0.86);
+}
+
+.workspace-page-shell {
+  gap: 10px !important;
+}
+
+.workspace-page-hero-shell,
+.settings-page-header.workspace-page-hero-shell,
+.list-shell,
+.metadata-box,
+.micro-surface,
+.action-row,
+.accordion-shell,
+.diagnostics-stat-card,
+.diagnostics-chart-card,
+.diagnostics-content-card,
+.settings-inline-card,
+.mission-panel,
+.mission-side-panel,
+.mission-metric-card,
+.attention-card,
+.welcome-hero-card,
+.arkreflect-status,
+.arkreflect-panorama,
+.arkreflect-grid-pane,
+.arkreflect-motion-panel,
+.arkreflect-tab-strip,
+.arkpulse-page-shell .list-shell,
+.arkorbit-canvas-wrap,
+.arkorbit-frame-pane,
+.arkorbit-chat-flyout,
+.orbit-home-panel,
+.orbit-files-panel {
+  border: 1px solid var(--arkcore-panel-border) !important;
+  border-radius: 10px !important;
+  background: var(--arkcore-panel-bg) !important;
+  box-shadow: var(--arkcore-panel-shadow) !important;
+  backdrop-filter: blur(12px) saturate(1.03) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(1.03) !important;
+}
+
+.workspace-page-hero-shell,
+.settings-page-header.workspace-page-hero-shell,
+.arkreflect-tab-strip,
+.arkorbit-header {
+  background: var(--arkcore-panel-bg-strong) !important;
+}
+
+.list-shell:hover,
+.metadata-box[role="button"]:hover,
+.metadata-box.is-interactive:hover,
+.action-row:hover,
+.accordion-shell:hover,
+.settings-inline-card:hover,
+.mission-panel:hover,
+.attention-card:hover,
+.arkreflect-motion-panel:hover,
+.arkorbit-canvas-wrap:hover,
+.arkorbit-frame-pane:hover {
+  border-color: var(--arkcore-panel-border-hover) !important;
+}
+
+.workspace-page-kicker,
+.micro-surface-kicker,
+.settings-inline-card-kicker,
+.mission-metric-card__label,
+.stat-strip-label,
+.arkreflect-pill.MuiChip-root,
+.arkorbit-subtitle,
+.arkpulse-page-shell .MuiTypography-caption {
+  color: var(--arkcore-faint-text) !important;
+  font-family: var(--font-mono) !important;
+  letter-spacing: 0 !important;
+  text-transform: uppercase;
+}
+
+.workspace-page-title,
+.micro-surface-title,
+.settings-inline-card-title,
+.mission-metric-card__value,
+.stat-strip-value,
+.arkorbit-title {
+  color: var(--text-primary) !important;
+  letter-spacing: 0 !important;
+}
+
+.workspace-page-copy,
+.micro-surface-copy,
+.settings-inline-card-description,
+.mission-metric-card__detail,
+.mission-card-copy,
+.mission-detail-clamp,
+.stat-strip-helper,
+.arkorbit-subtitle {
+  color: var(--arkcore-muted-text) !important;
+}
+
+.stat-strip {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)) !important;
+  gap: 1px !important;
+  padding: 0 !important;
+  overflow: hidden;
+}
+
+.stat-strip-item {
+  min-height: 78px;
+  border: 0 !important;
+  border-right: 1px solid var(--arkcore-panel-border) !important;
+  border-top: 0 !important;
+  background: rgba(255, 255, 255, 0.018) !important;
+}
+
+.stat-strip-item:last-child {
+  border-right: 0 !important;
+}
+
+.workspace-page-subnav-shell,
+.arkreflect-tab-strip {
+  padding: 5px !important;
+}
+
+.workspace-page-subnav-tabs .MuiTab-root,
+.MuiTab-root,
+.arkreflect-tab-strip .MuiButton-root {
+  min-height: 34px !important;
+  border-radius: 7px !important;
+  text-transform: none !important;
+  font-size: 0.82rem !important;
+  font-weight: 600 !important;
+}
+
+.workspace-page-subnav-tabs .Mui-selected,
+.MuiTab-root.Mui-selected,
+.arkreflect-tab-strip .MuiButton-contained,
+.arkreflect-motion-panel > .MuiButton-contained {
+  background: rgba(120, 242, 176, 0.11) !important;
+  color: var(--text-primary) !important;
+  border-color: rgba(120, 242, 176, 0.18) !important;
+  box-shadow: none !important;
+}
+
+.arkreflect-status::before,
+.arkreflect-status::after,
+.arkreflect-narrative::before,
+.arkreflect-narrative::after,
+.arkreflect-panorama::before,
+.arkreflect-panorama::after,
+.arkreflect-grid-pane::before,
+.arkreflect-grid-pane::after,
+.arkreflect-motion-panel::before,
+.arkreflect-motion-panel::after,
+.arkreflect-pill.MuiChip-root::before,
+.arkreflect-pill.MuiChip-root::after,
+.arkorbit-shell::before,
+.arkorbit-canvas-wrap::before,
+.arkorbit-canvas-wrap::after,
+.arkorbit-chat-flyout::before,
+.arkorbit-chat-flyout::after,
+.arkorbit-toolbar-icon.MuiIconButton-root::before,
+.arkorbit-toolbar-icon.MuiIconButton-root::after,
+.arkorbit-new-button.MuiButton-root::before,
+.arkorbit-new-button.MuiButton-root::after,
+.arkorbit-orbit-menu-button.MuiButton-root::before,
+.arkorbit-orbit-menu-button.MuiButton-root::after {
+  content: none !important;
+  display: none !important;
+}
+
+.arkreflect-motion-panel,
+.arkreflect-tab-strip,
+.arkreflect-panorama-backdrop {
+  animation: none !important;
+}
+
+.arkreflect-panorama {
+  min-height: 430px !important;
+  overflow: hidden !important;
+}
+
+.arkreflect-pill.MuiChip-root {
+  height: 26px !important;
+  border-radius: 999px !important;
+  background: rgba(255, 255, 255, 0.035) !important;
+  border-color: var(--arkcore-panel-border) !important;
+  color: var(--arkcore-muted-text) !important;
+  box-shadow: none !important;
+}
+
+.arkreflect-memory-graph {
+  border-color: rgba(101, 139, 255, 0.2) !important;
+  background:
+    radial-gradient(ellipse 78% 54% at 48% 46%, rgba(24, 246, 224, 0.14), transparent 42%),
+    radial-gradient(ellipse 44% 30% at 14% 36%, rgba(255, 187, 57, 0.09), transparent 68%),
+    radial-gradient(ellipse 48% 34% at 86% 70%, rgba(98, 168, 255, 0.11), transparent 70%),
+    linear-gradient(180deg, rgba(4, 14, 27, 0.92), rgba(2, 8, 16, 0.96)) !important;
+  box-shadow:
+    0 24px 70px rgba(0, 0, 0, 0.38),
+    inset 0 0 120px rgba(3, 8, 18, 0.82),
+    inset 0 0 0 1px rgba(112, 170, 255, 0.08) !important;
+}
+
+.arkreflect-memory-graph .arkreflect-panorama-backdrop {
+  background:
+    radial-gradient(circle at 18% 28%, rgba(255, 210, 82, 0.08), transparent 17%),
+    radial-gradient(circle at 74% 30%, rgba(54, 245, 184, 0.08), transparent 18%),
+    radial-gradient(circle at 78% 78%, rgba(98, 168, 255, 0.1), transparent 22%),
+    linear-gradient(rgba(140, 178, 255, 0.038) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(140, 178, 255, 0.038) 1px, transparent 1px);
+  background-size: auto, auto, auto, 34px 34px, 34px 34px;
+  opacity: 1;
+}
+
+.arkreflect-memory-graph .arkreflect-panorama-grid {
+  background-image: radial-gradient(rgba(150, 190, 255, 0.22) 1px, transparent 1px);
+  background-size: 18px 18px;
+  opacity: 0.35;
+  mask-image: radial-gradient(ellipse 76% 68% at 50% 48%, #000 36%, transparent 96%);
+  -webkit-mask-image: radial-gradient(ellipse 76% 68% at 50% 48%, #000 36%, transparent 96%);
+}
+
+.arkreflect-memory-graph-head {
+  padding-bottom: 4px;
+}
+
+.arkreflect-memory-legend {
+  min-height: 32px;
+  padding: 8px 4px 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.arkreflect-memory-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  color: rgba(218, 230, 246, 0.68);
+}
+
+.arkreflect-memory-legend-item > div:first-child {
+  width: 12px;
+  height: 12px;
+  border-radius: 4px;
+  box-shadow: 0 0 12px currentColor;
+}
+
+.arkreflect-memory-legend-line {
+  width: 28px !important;
+  height: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.arkreflect-memory-legend-line.is-strong {
+  border-top: 2px solid rgba(226, 232, 240, 0.7);
+}
+
+.arkreflect-memory-legend-line.is-weak {
+  border-top: 1px dashed rgba(226, 232, 240, 0.46);
+}
+
+.arkreflect-theme-panel {
+  border-color: rgba(101, 139, 255, 0.18) !important;
+  background:
+    radial-gradient(ellipse 78% 44% at 18% 0%, rgba(139, 92, 246, 0.12), transparent 58%),
+    linear-gradient(180deg, rgba(5, 15, 29, 0.92), rgba(3, 10, 19, 0.94)) !important;
+  overflow: hidden !important;
+}
+
+.arkreflect-theme-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.72rem;
+  margin-top: 1rem;
+  max-height: 536px;
+  overflow: auto;
+  padding-right: 0.22rem;
+}
+
+.arkreflect-theme-card {
+  display: grid;
+  grid-template-columns: 42px 54px minmax(0, 1fr) 56px;
+  gap: 0.82rem;
+  align-items: center;
+  min-height: 74px;
+  padding: 0.78rem 0.88rem;
+  border: 1px solid;
+  border-radius: 8px;
+}
+
+.arkreflect-theme-rank {
+  font-family: var(--font-mono) !important;
+  font-size: 1.05rem !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  text-align: center;
+}
+
+.arkreflect-theme-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border: 1px solid;
+  border-radius: 50%;
+}
+
+.arkreflect-theme-title {
+  color: rgba(248, 252, 255, 0.98) !important;
+  font-size: 0.86rem !important;
+  font-weight: 820 !important;
+  line-height: 1.22 !important;
+  letter-spacing: 0 !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.arkreflect-theme-meta,
+.arkreflect-theme-detail {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72rem !important;
+  line-height: 1.35 !important;
+}
+
+.arkreflect-theme-meta {
+  margin-top: 0.26rem !important;
+  color: rgba(190, 204, 228, 0.72) !important;
+}
+
+.arkreflect-theme-detail {
+  margin-top: 0.1rem !important;
+  color: rgba(190, 204, 228, 0.58) !important;
+}
+
+.arkreflect-theme-score {
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.arkreflect-theme-score > .MuiTypography-root {
+  color: rgba(248, 252, 255, 0.96);
+  font-family: var(--font-mono);
+  font-size: 1.05rem;
+  font-weight: 850;
+}
+
+.arkreflect-theme-pager.MuiIconButton-root {
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.8);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.arkreflect-theme-pager.MuiIconButton-root:hover {
+  border-color: rgba(120, 242, 176, 0.24);
+  background: rgba(120, 242, 176, 0.08);
+}
+
+@media (max-width: 720px) {
+  .arkreflect-theme-list {
+    max-height: none;
+  }
+
+  .arkreflect-theme-card {
+    grid-template-columns: 34px 42px minmax(0, 1fr);
+    gap: 0.62rem;
+  }
+
+  .arkreflect-theme-score {
+    grid-column: 3;
+    align-items: flex-start;
+  }
+}
+
+.arkorbit-shell {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
+.arkorbit-header {
+  border: 1px solid var(--arkcore-panel-border) !important;
+  border-radius: 10px !important;
+  padding: 8px 10px !important;
+  box-shadow: var(--arkcore-panel-shadow) !important;
+}
+
+.arkorbit-canvas-wrap {
+  background: var(--arkcore-page-bg) !important;
+}
+
+.arkorbit-toolbar-icon.MuiIconButton-root,
+.arkorbit-new-button.MuiButton-root,
+.arkorbit-orbit-menu-button.MuiButton-root,
+.arkorbit-switcher-chip,
+.arkorbit-chat-bubble.MuiIconButton-root,
+.arkorbit-chat-drag-handle.MuiIconButton-root {
+  border-radius: 8px !important;
+  border-color: var(--arkcore-panel-border) !important;
+  background: rgba(255, 255, 255, 0.03) !important;
+  box-shadow: none !important;
+}
+
+.arkorbit-switcher-chip-active,
+.arkorbit-toolbar-icon.MuiIconButton-root:hover,
+.arkorbit-new-button.MuiButton-root:hover,
+.arkorbit-orbit-menu-button.MuiButton-root:hover,
+.arkorbit-chat-bubble.MuiIconButton-root:hover,
+.arkorbit-chat-drag-handle.MuiIconButton-root:hover {
+  border-color: var(--arkcore-panel-border-hover) !important;
+  background: rgba(120, 242, 176, 0.075) !important;
+}
+
+.arkpulse-inline-result.MuiAlert-root {
+  border-radius: 10px !important;
+  border-color: var(--arkcore-panel-border) !important;
+  background: var(--arkcore-panel-bg) !important;
+}
+
+.mission-panel--hero,
+.welcome-hero-card {
+  min-height: auto;
+}
+
+.welcome-hero-typewriter-stage,
+.welcome-hero-command-deck,
+.mission-sparkline-shell {
+  border-color: var(--arkcore-panel-border) !important;
+  background: rgba(255, 255, 255, 0.024) !important;
+  box-shadow: none !important;
+}
+
+.MuiAlert-root {
+  border-radius: 10px !important;
+}
+
+.notification-popover-paper.MuiPaper-root {
+  background: #111317 !important;
+  background-image: none !important;
+  border: 1px solid #2a3038 !important;
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.55) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  color: #f3f6f8 !important;
+  opacity: 1 !important;
+}
+
+.notification-popover-paper .MuiList-root {
+  background: #0f1115 !important;
+}
+
+.notification-popover-paper .MuiListItemButton-root {
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+/* Orbit canvas must read as space even when no widgets are mounted. This
+   sits after the shared ArkCore panel overrides so the full canvas is not
+   flattened into a blank black/panel surface. */
+.arkorbit-canvas-wrap {
+  background-color: #02040a !important;
+  background-image:
+    radial-gradient(circle at 14% 18%, rgba(95, 215, 255, 0.16) 0 1px, transparent 2px),
+    radial-gradient(circle at 32% 68%, rgba(120, 242, 176, 0.14) 0 1px, transparent 2px),
+    radial-gradient(circle at 76% 24%, rgba(177, 132, 255, 0.16) 0 1px, transparent 2px),
+    radial-gradient(circle at 86% 72%, rgba(255, 214, 132, 0.12) 0 1px, transparent 2px),
+    radial-gradient(circle at 18% 30%, rgba(54, 245, 184, 0.11), transparent 30%),
+    radial-gradient(circle at 74% 18%, rgba(77, 151, 255, 0.12), transparent 28%),
+    radial-gradient(ellipse at 52% 92%, rgba(120, 242, 176, 0.08), transparent 42%),
+    linear-gradient(135deg, rgba(8, 14, 24, 0.98), rgba(3, 5, 11, 0.99) 48%, rgba(2, 4, 10, 1)) !important;
+  background-size:
+    180px 180px,
+    240px 240px,
+    300px 300px,
+    220px 220px,
+    auto,
+    auto,
+    auto,
+    auto !important;
+  background-position:
+    0 0,
+    42px 76px,
+    128px 20px,
+    18px 132px,
+    center,
+    center,
+    center,
+    center !important;
+}
+
+.arkorbit-frame-pane,
+.orbit-frame-shell,
+.orbit-frame-canvas {
+  background: transparent !important;
+}
+
+.orbit-frame-canvas::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(rgba(54, 245, 184, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(54, 245, 184, 0.026) 1px, transparent 1px);
+  background-size: 56px 56px, 56px 56px;
+  mask-image: radial-gradient(circle at 50% 44%, black 0, black 38%, transparent 75%);
+  opacity: 0.55;
+}
+
+/* Settings uses the AgentArk mascot palette: purple surfaces, cyan controls,
+   and amber only for caution states. */
+.MuiDialog-paper:has(.settings-shell-layout),
+.settings-shell-layout {
+  --settings-accent-text: rgba(103, 232, 249, 0.92);
+  --settings-accent-strong: rgba(167, 139, 250, 0.9);
+  --settings-accent-border: rgba(103, 232, 249, 0.2);
+  --settings-accent-border-strong: rgba(167, 139, 250, 0.34);
+  --settings-accent-bg: rgba(124, 58, 237, 0.14);
+  --settings-accent-bg-hover: rgba(0, 212, 255, 0.12);
+  --settings-accent-bg-soft: rgba(124, 58, 237, 0.07);
+  --settings-accent-glow: rgba(0, 212, 255, 0.18);
+  --settings-caution-text: rgba(253, 230, 138, 0.9);
+  --settings-caution-border: rgba(245, 158, 11, 0.3);
+  --settings-caution-bg: rgba(245, 158, 11, 0.08);
+}
+
+.settings-shell-layout .settings-nav-group-label,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-group-label,
+.settings-shell-layout .settings-section-kicker,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-section-kicker,
+.settings-shell-layout .settings-inline-card-kicker,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-inline-card-kicker,
+.settings-shell-layout .workspace-page-kicker,
+.MuiDialog-paper:has(.settings-shell-layout) .workspace-page-kicker,
+.settings-shell-layout .security-basics-kicker {
+  color: var(--settings-accent-text) !important;
+}
+
+.settings-shell-layout .settings-nav-btn:hover:not(.active),
+.settings-shell-layout .settings-nav-btn.active,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn:hover:not(.active),
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active,
+.settings-shell-layout .MuiTab-root.Mui-selected {
+  background:
+    radial-gradient(circle at left center, var(--settings-accent-bg), transparent 72%),
+    linear-gradient(90deg, rgba(124, 58, 237, 0.16), rgba(0, 212, 255, 0.055)) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+}
+
+.settings-shell-layout .settings-nav-btn.active,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active {
+  box-shadow:
+    inset 2px 0 0 var(--settings-accent-text),
+    0 0 18px rgba(124, 58, 237, 0.12) !important;
+}
+
+.settings-shell-layout .settings-nav-btn.active::before,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active::before {
+  background: linear-gradient(180deg, var(--settings-accent-text), var(--settings-accent-strong)) !important;
+}
+
+.settings-shell-layout .MuiTabs-indicator {
+  background-color: var(--settings-accent-strong) !important;
+  box-shadow: 0 0 10px var(--settings-accent-border) !important;
+}
+
+.settings-shell-layout .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled),
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled) {
+  border-color: var(--settings-accent-border-strong) !important;
+  background:
+    linear-gradient(180deg, rgba(0, 212, 255, 0.16), rgba(124, 58, 237, 0.16)),
+    var(--ui-rgba-255-255-255-020) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+  box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.08), 0 12px 26px var(--ui-rgba-0-0-0-300) !important;
+}
+
+.settings-shell-layout .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled):hover,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled):hover {
+  border-color: var(--settings-accent-strong) !important;
+  background:
+    linear-gradient(180deg, rgba(0, 212, 255, 0.2), rgba(124, 58, 237, 0.18)),
+    var(--ui-rgba-255-255-255-035) !important;
+}
+
+.settings-shell-layout .MuiButton-outlined:not(.MuiButton-colorError):hover,
+.settings-shell-layout .MuiButton-text:not(.MuiButton-colorError):hover,
+.settings-shell-layout .settings-page-shell [role="button"]:hover,
+.settings-shell-layout .settings-page-shell .MuiCard-root:hover,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-outlined:not(.MuiButton-colorError):hover,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-text:not(.MuiButton-colorError):hover,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-page-shell [role="button"]:hover,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-page-shell .MuiCard-root:hover {
+  border-color: var(--settings-accent-border) !important;
+  background:
+    linear-gradient(180deg, rgba(124, 58, 237, 0.075), var(--ui-rgba-255-255-255-010)),
+    var(--ui-rgba-13-14-17-580) !important;
+}
+
+.settings-shell-layout .MuiCheckbox-root.Mui-checked,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiCheckbox-root.Mui-checked,
+.settings-shell-layout .MuiRadio-root.Mui-checked,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiRadio-root.Mui-checked,
+.settings-shell-layout .MuiSwitch-switchBase.Mui-checked,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiSwitch-switchBase.Mui-checked,
+.settings-shell-layout .MuiSvgIcon-root.MuiSvgIcon-colorPrimary {
+  color: var(--settings-accent-text) !important;
+}
+
+.settings-shell-layout .MuiSwitch-switchBase.Mui-checked .MuiSwitch-thumb,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiSwitch-switchBase.Mui-checked .MuiSwitch-thumb {
+  background-color: var(--settings-accent-text) !important;
+  box-shadow: 0 0 10px var(--settings-accent-glow) !important;
+}
+
+.settings-shell-layout .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track {
+  background-color: var(--settings-accent-text) !important;
+  border-color: var(--settings-accent-border) !important;
+  opacity: 0.34 !important;
+}
+
+.settings-shell-layout .MuiChip-colorSuccess.MuiChip-filled,
+.settings-shell-layout .MuiChip-colorSuccess.MuiChip-outlined,
+.settings-shell-layout .MuiChip-colorPrimary.MuiChip-filled,
+.settings-shell-layout .MuiChip-colorPrimary.MuiChip-outlined,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorSuccess.MuiChip-filled,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorSuccess.MuiChip-outlined,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorPrimary.MuiChip-filled,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorPrimary.MuiChip-outlined {
+  border-color: var(--settings-accent-border) !important;
+  background:
+    linear-gradient(90deg, rgba(124, 58, 237, 0.14), rgba(0, 212, 255, 0.075)) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+  box-shadow: none !important;
+}
+
+.settings-shell-layout .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline,
+.settings-shell-layout .MuiInputBase-root.Mui-focused .MuiOutlinedInput-notchedOutline,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiInputBase-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-color: var(--settings-accent-border-strong) !important;
+}
+
+.settings-shell-layout .settings-inline-card.tone-warning {
+  border-color: var(--settings-caution-border) !important;
+  background:
+    radial-gradient(circle at top left, var(--settings-caution-bg), transparent 38%),
+    radial-gradient(circle at 92% 0%, rgba(124, 58, 237, 0.09), transparent 34%),
+    linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
+}
+
+.settings-shell-layout .settings-inline-card.tone-warning .settings-inline-card-kicker,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-inline-card.tone-warning .settings-inline-card-kicker {
+  color: var(--settings-caution-text) !important;
+}
+
+.settings-shell-layout .settings-inline-card.tone-info,
+.settings-shell-layout .security-basics-panel,
+.settings-shell-layout .adv-group {
+  border-color: rgba(167, 139, 250, 0.16) !important;
+  background:
+    radial-gradient(circle at top left, rgba(124, 58, 237, 0.09), transparent 38%),
+    radial-gradient(circle at 88% 0%, rgba(0, 212, 255, 0.045), transparent 34%),
+    linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
+}
+
+.settings-shell-layout .adv-group:hover {
+  border-color: rgba(103, 232, 249, 0.2) !important;
+}
+
+.settings-shell-layout .adv-group-header {
+  border-bottom-color: rgba(103, 232, 249, 0.1) !important;
+}
+
+.settings-shell-layout .adv-group-header-icon {
+  border-color: rgba(167, 139, 250, 0.2) !important;
+  background:
+    radial-gradient(circle at 50% 22%, rgba(103, 232, 249, 0.12), transparent 54%),
+    rgba(124, 58, 237, 0.1) !important;
+  color: rgba(216, 180, 254, 0.9) !important;
+}
+
+.settings-shell-layout .adv-row,
+.settings-shell-layout .adv-skill-pill {
+  border-color: rgba(255, 255, 255, 0.07) !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.01)),
+    rgba(10, 10, 12, 0.44) !important;
+}
+
+.settings-shell-layout .adv-row:hover,
+.settings-shell-layout .adv-skill-pill:hover,
+.settings-shell-layout .adv-skill-pill.active {
+  border-color: rgba(103, 232, 249, 0.16) !important;
+  background:
+    linear-gradient(180deg, rgba(124, 58, 237, 0.07), rgba(0, 212, 255, 0.035)),
+    rgba(10, 10, 12, 0.5) !important;
+}
+
+.settings-shell-layout .companion-step-index {
+  border-color: var(--settings-accent-border) !important;
+  background: var(--settings-accent-bg) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+}
+
+.settings-shell-layout .companion-connect-card {
+  border-color: var(--settings-accent-border) !important;
+  background:
+    radial-gradient(circle at top left, var(--settings-accent-bg-soft), transparent 42%),
+    var(--ui-rgba-255-255-255-020) !important;
+}
+
+.settings-shell-layout .companion-connect-url {
+  color: var(--settings-accent-text) !important;
+}

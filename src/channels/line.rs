@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use crate::core::Agent;
 use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
+use crate::core::Agent;
 
 type SharedAgent = Arc<RwLock<Agent>>;
 

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-use super::{InternalServiceKind, load_internal_service_token_from_default_config_dir};
+use super::{load_internal_service_token_from_default_config_dir, InternalServiceKind};
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceClientConfig {

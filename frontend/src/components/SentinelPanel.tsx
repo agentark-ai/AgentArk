@@ -17,6 +17,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { formatUiRelativeDateTimeMeta } from "../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { WorkspacePageHeader, WorkspacePageShell } from "./WorkspacePage";
 import type {
@@ -124,6 +125,7 @@ function sourceKindLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return "AgentArk";
   if (normalized === "in_app_activity") return "Inside AgentArk";
+  if (normalized === "chat_intent") return "Derived intent";
   if (normalized === "integration" || normalized === "connected_service" || normalized === "service_event") return "Connected source";
   if (normalized === "chat") return "Chat";
   if (normalized === "observation") return "System signal";
@@ -140,10 +142,7 @@ function backgroundTone(status: string): "success" | "warning" | "error" | "defa
 }
 
 function humanizeBackgroundKey(key: string): string {
-  return key
-    .split("_")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+  return humanizeMachineLabel(key, "");
 }
 
 function compactText(value: string, maxChars = 120): string {
@@ -156,6 +155,24 @@ function compactText(value: string, maxChars = 120): string {
 
 function proposalMetadata(proposal: SentinelProposal): JsonRecord {
   return asRecord(proposal.metadata);
+}
+
+function proposalIsDerivedChatIntent(proposal: SentinelProposal): boolean {
+  const metadata = proposalMetadata(proposal);
+  return (
+    proposal.source_kind === "chat_intent" &&
+    proposal.proposal_kind === "chat_suggestion_accept" &&
+    str(metadata.derived_from, "") === "autonomy_chat_suggestion"
+  );
+}
+
+function proposalTags(proposal: SentinelProposal): string[] {
+  const tags = proposalMetadata(proposal).tags;
+  if (!Array.isArray(tags)) return [];
+  return tags
+    .map((tag) => (typeof tag === "string" ? tag.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 4);
 }
 
 function proposalClarificationChoices(proposal: SentinelProposal): SentinelClarificationChoice[] {
@@ -207,10 +224,12 @@ function proposalLooksLikeRouterNoise(proposal: SentinelProposal): boolean {
 function proposalIsUserActionable(proposal: SentinelProposal): boolean {
   const status = str(proposal.status, "").toLowerCase();
   if (status !== "open" && status !== "queued_for_approval") return false;
+  const derivedChatIntent = proposalIsDerivedChatIntent(proposal);
   if (
-    proposal.proposal_kind === "chat_suggestion_accept" ||
-    proposal.source_kind === "chat_suggestion" ||
-    proposalChatSuggestionId(proposal)
+    !derivedChatIntent &&
+    (proposal.proposal_kind === "chat_suggestion_accept" ||
+      proposal.source_kind === "chat_suggestion" ||
+      proposalChatSuggestionId(proposal))
   ) {
     return false;
   }
@@ -220,6 +239,7 @@ function proposalIsUserActionable(proposal: SentinelProposal): boolean {
   const choices = proposalClarificationChoices(proposal);
   if (choices.length > 0) return true;
   if (!proposalHasRunnableAction(proposal)) return false;
+  if (derivedChatIntent) return true;
   if (proposal.source_kind !== "execution_run") return true;
 
   if (typeof metadata.user_actionable === "boolean") return metadata.user_actionable;
@@ -445,6 +465,8 @@ export function SentinelPanel({
   const lastScanLabel = scan?.last_completed_at ? humanTs(scan.last_completed_at).label : "Waiting for the first check";
   const connectedServicesCount = num(stats?.connected_services, 0);
   const inAppEventCount = num(stats?.in_app_events, 0);
+  const chatIntentCount = num(stats?.chat_suggestions, 0);
+  const inAppSignalCount = inAppEventCount + chatIntentCount;
   const sentinelHeroHeadline =
     settingsQ.data?.agent_paused
       ? "Sentinel is paused."
@@ -455,16 +477,16 @@ export function SentinelPanel({
           : "No background signals need review.";
   const sentinelHeroDetail =
     settingsQ.data?.agent_paused
-      ? "Turn autonomy back on to resume connected-source and background-run checks."
+      ? "Turn autonomy back on to resume connected-source, derived-intent, and background-run checks."
       : currentAutonomyMode === "off"
-        ? "Sentinel is not scanning connected sources or detached background work while this mode is off."
-        : connectedServicesCount === 0 && inAppEventCount === 0
-          ? "Connect services or start background work; Sentinel will show only signals that are not already attached to an active chat."
+        ? "Sentinel is not scanning connected sources, derived intents, or detached background work while this mode is off."
+        : connectedServicesCount === 0 && inAppSignalCount === 0
+          ? "Connect services, create durable chat intents, or start background work; Sentinel will show operational signals that need review."
           : connectedServicesCount === 0
-            ? `Sentinel found ${inAppEventCount} detached background signal${inAppEventCount === 1 ? "" : "s"}. Connected sources will appear here after setup.`
+            ? `Sentinel found ${inAppSignalCount} in-app operational signal${inAppSignalCount === 1 ? "" : "s"}: ${chatIntentCount} derived intent${chatIntentCount === 1 ? "" : "s"} and ${inAppEventCount} detached run${inAppEventCount === 1 ? "" : "s"}.`
           : currentAutonomyMode === "auto"
-            ? `Sentinel is checking ${connectedServicesCount} connected source${connectedServicesCount === 1 ? "" : "s"} plus detached background work.`
-            : `Sentinel is checking ${connectedServicesCount} connected source${connectedServicesCount === 1 ? "" : "s"} and will ask before acting.`;
+            ? `Sentinel is checking ${connectedServicesCount} connected source${connectedServicesCount === 1 ? "" : "s"} plus derived intents and detached background work.`
+            : `Sentinel is checking ${connectedServicesCount} connected source${connectedServicesCount === 1 ? "" : "s"}, derived intents, and detached background work; it will ask before acting.`;
   const heroStats = [
     {
       label: "Signals",
@@ -482,13 +504,14 @@ export function SentinelPanel({
       helper: `${stats?.connected_services ?? 0} source${(stats?.connected_services ?? 0) === 1 ? "" : "s"} active`
     },
     {
-      label: "Background runs",
-      value: String(stats?.in_app_events ?? 0),
-      helper: `${stats?.recent_runs ?? 0} recent run${(stats?.recent_runs ?? 0) === 1 ? "" : "s"} checked`
+      label: "In-app signals",
+      value: String(inAppSignalCount),
+      helper: `${chatIntentCount} derived intent${chatIntentCount === 1 ? "" : "s"}, ${stats?.recent_runs ?? 0} run${(stats?.recent_runs ?? 0) === 1 ? "" : "s"} checked`
     }
   ];
   async function runProposal(proposal: SentinelProposal) {
     const linkedSuggestionId = proposalChatSuggestionId(proposal);
+    const derivedChatIntent = proposalIsDerivedChatIntent(proposal);
     const actionKind = str(proposal.action?.action_kind, "").trim();
     const actionPayload = asRecord(proposal.action?.payload);
     const actionPrompt = str(actionPayload.prompt, "").trim();
@@ -501,9 +524,12 @@ export function SentinelPanel({
         message: actionPrompt,
         conversationId: str(actionPayload.conversation_id, proposalConversationId(proposal)).trim() || undefined,
         source: "sentinel",
+        acceptedSuggestionId: linkedSuggestionId || undefined,
         sentinelProposalId: proposal.id,
       });
-      void dismissMutation.mutateAsync(proposal.id).catch(() => undefined);
+      if (!derivedChatIntent) {
+        void dismissMutation.mutateAsync(proposal.id).catch(() => undefined);
+      }
       setSelectedProposalId((current) => current === proposal.id ? "" : current);
       setSuccess("Opening this Sentinel signal in Chat.");
       navigateToView("chat");
@@ -670,13 +696,14 @@ export function SentinelPanel({
                   <Typography variant="body2" sx={{
                     color: "text.secondary"
                   }}>
-                    No connected-source or detached background signals need review.
+                    No connected-source, derived-intent, or detached background signals need review.
                   </Typography>
                 ) : (
                   <Stack spacing={1}>
                     {pagedOpenProposalGroups.map((group) => {
                       const proposal = group.proposal;
                       const choices = proposalClarificationChoices(proposal);
+                      const tags = proposalTags(proposal);
                       return (
                         <ButtonBase
                           key={group.key}
@@ -710,6 +737,9 @@ export function SentinelPanel({
                                 {choices.length > 0 ? (
                                   <Chip size="small" color="info" variant="outlined" label={`${choices.length} choices`} />
                                 ) : null}
+                                {tags.slice(0, 2).map((tag) => (
+                                  <Chip key={`${proposal.id}-${tag}`} size="small" variant="outlined" label={humanizeBackgroundKey(tag)} />
+                                ))}
                               </Stack>
                               <Typography variant="caption" sx={{ color: "text.secondary", flexShrink: 0 }}>
                                 {humanTs(proposal.updated_at).label}
@@ -779,6 +809,9 @@ export function SentinelPanel({
                     <Chip size="small" variant="outlined" label={`${selectedProposalGroup.proposals.length} grouped`} />
                   ) : null}
                   <Chip size="small" variant="outlined" label={`Updated ${humanTs(selectedProposal.updated_at).label}`} />
+                  {proposalTags(selectedProposal).map((tag) => (
+                    <Chip key={`${selectedProposal.id}-${tag}`} size="small" variant="outlined" label={humanizeBackgroundKey(tag)} />
+                  ))}
                 </Stack>
               </Stack>
             </DialogTitle>
@@ -837,16 +870,16 @@ export function SentinelPanel({
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>Proposal ID</Typography>
                     <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>{selectedProposal.id}</Typography>
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>Kind</Typography>
-                    <Typography variant="body2">{selectedProposal.proposal_kind || "-"}</Typography>
+                    <Typography variant="body2">{humanizeMachineLabel(selectedProposal.proposal_kind, "-")}</Typography>
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>Source</Typography>
                     <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>
                       {sourceKindLabel(selectedProposal.source_kind)}
                       {selectedProposal.source_id ? ` (${selectedProposal.source_id})` : ""}
                     </Typography>
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>Status</Typography>
-                    <Typography variant="body2">{selectedProposal.status || "-"}</Typography>
+                    <Typography variant="body2">{humanizeStatusLabel(selectedProposal.status, "-")}</Typography>
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>Run status</Typography>
-                    <Typography variant="body2">{selectedProposal.run_status || "-"}</Typography>
+                    <Typography variant="body2">{humanizeStatusLabel(selectedProposal.run_status, "-")}</Typography>
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>Priority</Typography>
                     <Typography variant="body2">{selectedProposal.priority ?? "-"}</Typography>
                     <Typography variant="caption" sx={{ color: "text.secondary" }}>Confidence</Typography>

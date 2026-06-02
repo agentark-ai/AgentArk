@@ -40,6 +40,12 @@ pub(super) struct ChatRawSecretSubmitRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(super) struct ApiKeyPasswordRequest {
+    #[serde(default)]
+    master_password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct ChatReuseModelCredentialRequest {
     #[serde(default)]
     conversation_id: Option<String>,
@@ -592,19 +598,23 @@ pub(super) fn require_master_password_for_secrets(
     password: Option<&str>,
 ) -> std::result::Result<(), String> {
     let master_mgr = crate::crypto::master::MasterPasswordManager::new(config_dir, data_dir);
-    let custom_master_password_set =
-        master_mgr.is_password_set() && !master_mgr.is_bootstrap_password_active().unwrap_or(false);
-    if !custom_master_password_set {
+    let bootstrap_active = master_mgr.is_bootstrap_password_active().unwrap_or(false);
+    let install_managed_active = master_mgr
+        .is_install_managed_password_active()
+        .unwrap_or(false);
+    let password_reauth_required =
+        master_mgr.is_password_set() && !bootstrap_active && !install_managed_active;
+    if !password_reauth_required {
         return Ok(());
     }
     let supplied = password.unwrap_or("").trim();
     if supplied.is_empty() {
-        return Err("Master password is required.".to_string());
+        return Err("Custom master password is required.".to_string());
     }
     master_mgr
         .unlock(supplied)
         .map(|_| ())
-        .map_err(|_| "Master password is incorrect.".to_string())
+        .map_err(|_| "Custom master password is incorrect.".to_string())
 }
 
 pub(super) async fn chat_secret_prompt_block_message(
@@ -1065,51 +1075,171 @@ pub(super) async fn delete_settings_secret(
         .into_response()
 }
 
-/// Get the HTTP API key (masked + full for copying)
-pub(super) async fn get_api_key_endpoint(State(state): State<AppState>) -> impl IntoResponse {
-    match auth::sync_http_api_key_state(&state, true).await {
-        Ok((Some(info), rotated)) => {
-            let now = auth::unix_now_ts();
-            let remaining_seconds = (info.expires_at - now).max(0);
-            Json(serde_json::json!({
-                "set": true,
-                "masked": auth::mask_api_key_value(&info.key),
-                "key": info.key,
-                "issued_at_unix": info.issued_at,
-                "expires_at_unix": info.expires_at,
-                "ttl_seconds": crate::core::config::HTTP_API_KEY_TTL_SECS,
-                "remaining_seconds": remaining_seconds,
-                "rotated": rotated,
-            }))
-            .into_response()
-        }
-        Ok((None, _)) => Json(serde_json::json!({
+fn api_key_metadata_payload(
+    info: Option<&crate::core::config::HttpApiKeyInfo>,
+    rotated: bool,
+    include_key: bool,
+) -> serde_json::Value {
+    let Some(info) = info else {
+        let mut payload = serde_json::json!({
             "set": false,
             "masked": null,
-            "key": null,
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "set": false,
-                "masked": null,
-                "key": null,
-                "error": e,
-            })),
-        )
-            .into_response(),
+            "issued_at_unix": null,
+            "expires_at_unix": null,
+            "ttl_seconds": crate::core::config::HTTP_API_KEY_TTL_SECS,
+            "remaining_seconds": null,
+            "rotated": rotated,
+        });
+        if include_key {
+            payload["key"] = serde_json::Value::Null;
+        }
+        return payload;
+    };
+
+    let now = auth::unix_now_ts();
+    let remaining_seconds = (info.expires_at - now).max(0);
+    let mut payload = serde_json::json!({
+        "set": true,
+        "masked": auth::mask_api_key_value(&info.key),
+        "issued_at_unix": info.issued_at,
+        "expires_at_unix": info.expires_at,
+        "ttl_seconds": crate::core::config::HTTP_API_KEY_TTL_SECS,
+        "remaining_seconds": remaining_seconds,
+        "rotated": rotated,
+    });
+    if include_key {
+        payload["key"] = serde_json::Value::String(info.key.clone());
+    }
+    payload
+}
+
+fn api_key_master_password_gate_required(
+    config_dir: &FsPath,
+    data_dir: &FsPath,
+) -> std::result::Result<bool, String> {
+    let master_mgr = crate::crypto::master::MasterPasswordManager::new(config_dir, data_dir);
+    if !master_mgr.is_password_set() {
+        return Ok(false);
+    }
+
+    let bootstrap_active = master_mgr
+        .is_bootstrap_password_active()
+        .map_err(|error| format!("Failed to read master password state: {}", error))?;
+    let install_managed_active = master_mgr
+        .is_install_managed_password_active()
+        .map_err(|error| format!("Failed to read master password state: {}", error))?;
+
+    Ok(!bootstrap_active && !install_managed_active)
+}
+
+fn attach_api_key_gate_metadata(
+    payload: &mut serde_json::Value,
+    config_dir: &FsPath,
+    data_dir: &FsPath,
+) -> std::result::Result<(), String> {
+    let required = api_key_master_password_gate_required(config_dir, data_dir)?;
+    payload["password_gate_required"] = serde_json::Value::Bool(required);
+    Ok(())
+}
+
+fn require_api_key_password_gate(
+    config_dir: &FsPath,
+    data_dir: &FsPath,
+    password: Option<&str>,
+) -> Option<Response> {
+    match api_key_master_password_gate_required(config_dir, data_dir) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(msg) => {
+            return Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: msg }),
+                )
+                    .into_response(),
+            );
+        }
+    }
+
+    require_master_password_for_secrets(config_dir, data_dir, password)
+        .err()
+        .map(|msg| (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: msg })).into_response())
+}
+
+/// Get HTTP API key metadata without exposing the plaintext key.
+pub(super) async fn get_api_key_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir.clone())
+    };
+    match auth::sync_http_api_key_state(&state, true).await {
+        Ok((info, rotated)) => {
+            let mut payload = api_key_metadata_payload(info.as_ref(), rotated, false);
+            if let Err(error) = attach_api_key_gate_metadata(&mut payload, &config_dir, &data_dir) {
+                payload["password_gate_error"] = serde_json::Value::String(error);
+            }
+            Json(payload).into_response()
+        }
+        Err(e) => {
+            let mut payload = api_key_metadata_payload(None, false, false);
+            payload["error"] = serde_json::Value::String(e);
+            if let Err(error) = attach_api_key_gate_metadata(&mut payload, &config_dir, &data_dir) {
+                payload["password_gate_error"] = serde_json::Value::String(error);
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(payload)).into_response()
+        }
+    }
+}
+
+/// Reveal the current HTTP API key after a custom master-password gate, when configured.
+pub(super) async fn reveal_api_key_endpoint(
+    State(state): State<AppState>,
+    Json(request): Json<ApiKeyPasswordRequest>,
+) -> impl IntoResponse {
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir.clone())
+    };
+    if let Some(response) =
+        require_api_key_password_gate(&config_dir, &data_dir, request.master_password.as_deref())
+    {
+        return response;
+    }
+
+    match auth::sync_http_api_key_state(&state, true).await {
+        Ok((info, rotated)) => {
+            let mut payload = api_key_metadata_payload(info.as_ref(), rotated, true);
+            if let Err(error) = attach_api_key_gate_metadata(&mut payload, &config_dir, &data_dir) {
+                payload["password_gate_error"] = serde_json::Value::String(error);
+            }
+            Json(payload).into_response()
+        }
+        Err(e) => {
+            let mut payload = api_key_metadata_payload(None, false, false);
+            payload["error"] = serde_json::Value::String(e);
+            if let Err(error) = attach_api_key_gate_metadata(&mut payload, &config_dir, &data_dir) {
+                payload["password_gate_error"] = serde_json::Value::String(error);
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(payload)).into_response()
+        }
     }
 }
 
 /// Regenerate the HTTP API key
 pub(super) async fn regenerate_api_key_endpoint(
     State(state): State<AppState>,
+    Json(request): Json<ApiKeyPasswordRequest>,
 ) -> impl IntoResponse {
     let (config_dir, data_dir) = {
         let agent = state.agent.read().await;
         (agent.config_dir.clone(), agent.data_dir.clone())
     };
+    if let Some(response) =
+        require_api_key_password_gate(&config_dir, &data_dir, request.master_password.as_deref())
+    {
+        return response;
+    }
+
     let secure_config =
         crate::core::config::SecureConfigManager::new_with_data_dir(&config_dir, Some(&data_dir));
     match secure_config.and_then(|sc| sc.regenerate_api_key_info()) {
@@ -1126,19 +1256,12 @@ pub(super) async fn regenerate_api_key_endpoint(
                 let mut agent = state.agent.write().await;
                 agent.api_key = Some(info.key.clone());
             }
-            let now = auth::unix_now_ts();
-            let remaining_seconds = (info.expires_at - now).max(0);
-            Json(serde_json::json!({
-                "ok": true,
-                "masked": auth::mask_api_key_value(&info.key),
-                "key": info.key,
-                "issued_at_unix": info.issued_at,
-                "expires_at_unix": info.expires_at,
-                "ttl_seconds": crate::core::config::HTTP_API_KEY_TTL_SECS,
-                "remaining_seconds": remaining_seconds,
-                "rotated": true,
-            }))
-            .into_response()
+            let mut payload = api_key_metadata_payload(Some(&info), true, true);
+            if let Err(error) = attach_api_key_gate_metadata(&mut payload, &config_dir, &data_dir) {
+                payload["password_gate_error"] = serde_json::Value::String(error);
+            }
+            payload["ok"] = serde_json::Value::Bool(true);
+            Json(payload).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1148,5 +1271,173 @@ pub(super) async fn regenerate_api_key_endpoint(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_metadata_payload_excludes_full_key_unless_requested() {
+        let info = crate::core::config::HttpApiKeyInfo {
+            key: "ak_full_secret_value".to_string(),
+            issued_at: auth::unix_now_ts() - 10,
+            expires_at: auth::unix_now_ts() + 60,
+        };
+
+        let masked = api_key_metadata_payload(Some(&info), false, false);
+        assert_eq!(
+            masked.get("set").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            masked.get("masked").and_then(|value| value.as_str()),
+            Some(auth::mask_api_key_value(&info.key).as_str())
+        );
+        assert!(masked.get("key").is_none());
+
+        let revealed = api_key_metadata_payload(Some(&info), false, true);
+        assert_eq!(
+            revealed.get("key").and_then(|value| value.as_str()),
+            Some(info.key.as_str())
+        );
+    }
+
+    #[test]
+    fn api_key_metadata_payload_includes_unset_metadata_without_key() {
+        let payload = api_key_metadata_payload(None, false, false);
+
+        assert_eq!(
+            payload.get("set").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(payload.get("key").is_none());
+        assert!(payload.get("issued_at_unix").is_some());
+        assert!(payload.get("expires_at_unix").is_some());
+        assert!(payload.get("ttl_seconds").is_some());
+        assert!(payload.get("remaining_seconds").is_some());
+        assert_eq!(
+            payload.get("rotated").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn api_key_password_gate_tracks_current_custom_password_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("config");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let manager = crate::crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
+
+        assert_eq!(
+            api_key_master_password_gate_required(&config_dir, &data_dir).expect("no password"),
+            false
+        );
+        assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());
+
+        let prepared = manager
+            .prepare_install_managed_password("install-managed-secret")
+            .expect("install managed password");
+        manager
+            .commit_prepared_password(prepared)
+            .expect("commit install managed password");
+        assert_eq!(
+            api_key_master_password_gate_required(&config_dir, &data_dir)
+                .expect("install managed password"),
+            false
+        );
+        assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());
+
+        let prepared = manager
+            .prepare_password("human-master-password")
+            .expect("custom password");
+        manager
+            .commit_prepared_password(prepared)
+            .expect("commit custom password");
+
+        assert_eq!(
+            api_key_master_password_gate_required(&config_dir, &data_dir).expect("custom password"),
+            true
+        );
+        assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_err());
+        assert!(require_master_password_for_secrets(
+            &config_dir,
+            &data_dir,
+            Some("human-master-password")
+        )
+        .is_ok());
+
+        assert!(require_api_key_password_gate(&config_dir, &data_dir, None).is_some());
+        assert!(require_api_key_password_gate(
+            &config_dir,
+            &data_dir,
+            Some("wrong-human-password")
+        )
+        .is_some());
+        assert!(require_api_key_password_gate(
+            &config_dir,
+            &data_dir,
+            Some("human-master-password")
+        )
+        .is_none());
+
+        let changed = manager
+            .prepare_password("new-human-master-password")
+            .expect("changed custom password");
+        manager
+            .commit_prepared_password(changed)
+            .expect("commit changed custom password");
+        assert!(require_api_key_password_gate(
+            &config_dir,
+            &data_dir,
+            Some("human-master-password")
+        )
+        .is_some());
+        assert!(require_master_password_for_secrets(
+            &config_dir,
+            &data_dir,
+            Some("human-master-password")
+        )
+        .is_err());
+        assert!(require_api_key_password_gate(
+            &config_dir,
+            &data_dir,
+            Some("new-human-master-password")
+        )
+        .is_none());
+        assert!(require_master_password_for_secrets(
+            &config_dir,
+            &data_dir,
+            Some("new-human-master-password")
+        )
+        .is_ok());
+
+        manager
+            .commit_password_removal()
+            .expect("remove custom password");
+        assert_eq!(
+            api_key_master_password_gate_required(&config_dir, &data_dir)
+                .expect("removed password"),
+            false
+        );
+        assert!(require_api_key_password_gate(&config_dir, &data_dir, None).is_none());
+        assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());
+
+        let install_managed = manager
+            .prepare_install_managed_password("replacement-install-secret")
+            .expect("replacement install-managed password");
+        manager
+            .commit_prepared_password(install_managed)
+            .expect("commit replacement install-managed password");
+        assert_eq!(
+            api_key_master_password_gate_required(&config_dir, &data_dir)
+                .expect("replacement install-managed password"),
+            false
+        );
+        assert!(require_api_key_password_gate(&config_dir, &data_dir, None).is_none());
+        assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());
     }
 }

@@ -72,6 +72,7 @@ use super::{
     PlanStepStatus, PlanSubstep, PromptMemory, RequestState,
 };
 
+pub(crate) mod ark_distill;
 mod automation_helpers;
 mod background_sessions;
 mod chat_approvals;
@@ -962,42 +963,23 @@ fn enrich_supervisor_outcome_with_model_failures(outcome: &mut crate::core::User
 }
 
 fn response_indicates_pending_execution(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    let Some(payload) = parse_response_status_payload(text) else {
         return false;
-    }
-    let promise_markers = [
-        "i'll ",
-        "i will ",
-        "let me ",
-        "now i need to ",
-        "next i ",
-        "the next step",
-    ];
-    let action_markers = [
-        "inspect", "read", "write", "update", "edit", "fix", "patch", "test", "verify", "deploy",
-        "redeploy", "restart", "validate",
-    ];
-    promise_markers.iter().any(|marker| lower.contains(marker))
-        && action_markers.iter().any(|marker| lower.contains(marker))
+    };
+    structured_status_from_response_payload(&payload).is_some_and(|status| {
+        matches!(
+            status.as_str(),
+            "accepted" | "routing" | "model_selection" | "planning" | "tool_dispatch" | "synthesis"
+        )
+    })
 }
 
 fn response_indicates_permission_requirement(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    let Some(payload) = parse_response_status_payload(text) else {
         return false;
-    }
-    [
-        "blocked by saved user rule",
-        "blocked by safety policy",
-        "explicit approval",
-        "requires approval",
-        "approval required",
-        "awaiting approval",
-        "before any side-effecting action",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    };
+    structured_status_from_response_payload(&payload)
+        .is_some_and(|status| matches!(status.as_str(), "needs_permission" | "approval_required"))
 }
 
 fn response_contains_browser_handoff_reference(text: &str) -> bool {
@@ -1033,20 +1015,11 @@ fn response_indicates_credentials_requirement(text: &str) -> bool {
     if let Some(payload) = parse_workflow_missing_inputs_marker(trimmed) {
         return !payload.sensitive_missing.is_empty();
     }
-    let Ok(payload) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+    let Some(payload) = parse_response_status_payload(trimmed) else {
         return false;
     };
-    if payload
-        .get("status")
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("needs_credentials"))
-    {
-        return true;
-    }
-    if payload
-        .pointer("/user_outcome/request_state")
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("needs_credentials"))
+    if structured_status_from_response_payload(&payload)
+        .is_some_and(|status| status == "needs_credentials")
     {
         return true;
     }
@@ -1065,18 +1038,66 @@ fn response_indicates_credentials_requirement(text: &str) -> bool {
 }
 
 fn response_indicates_integration_requirement(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    let Some(payload) = parse_response_status_payload(text) else {
         return false;
+    };
+    structured_status_from_response_payload(&payload)
+        .is_some_and(|status| matches!(status.as_str(), "needs_integration"))
+        || payload
+            .get("required_integrations")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.iter().any(structured_value_has_visible_content))
+}
+
+fn parse_response_status_payload(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || response_contains_browser_handoff_reference(trimmed) {
+        return None;
     }
-    lower.contains("needs auth")
-        || lower.contains("not configured")
-        || lower.contains("integration is disabled")
-        || lower.contains("connect an integration")
-        || (lower.contains("integration")
-            && ["connect", "configure", "enable", "setup", "set up"]
-                .iter()
-                .any(|marker| lower.contains(marker)))
+    serde_json::from_str::<serde_json::Value>(trimmed).ok()
+}
+
+fn structured_status_from_response_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            payload
+                .pointer("/user_outcome/request_state")
+                .and_then(|value| value.as_str())
+        })
+        .map(normalize_status_token)
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_status_token(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_separator = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_separator = false;
+        } else if !last_separator && !out.is_empty() {
+            out.push('_');
+            last_separator = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+fn structured_value_has_visible_content(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Array(items) => items.iter().any(structured_value_has_visible_content),
+        serde_json::Value::Object(object) => {
+            object.values().any(structured_value_has_visible_content)
+        }
+    }
 }
 
 fn tool_batch_indicates_permission_requirement(batch: &tool_execution::ToolExecutionBatch) -> bool {
@@ -1141,14 +1162,8 @@ fn tool_batch_has_successful_persistent_artifact(
             authorization: Default::default(),
         };
         let metadata = inferred_action.action_metadata();
-        let content_lower = output.content.to_ascii_lowercase();
         matches!(metadata.role, ActionRole::Orchestration)
-            || (matches!(metadata.integration_class, ActionIntegrationClass::App)
-                && matches!(metadata.side_effect_level, ActionSideEffectLevel::Write)
-                && (content_lower.contains("http://")
-                    || content_lower.contains("https://")
-                    || content_lower.contains("access_url")
-                    || content_lower.contains("open app")))
+            || matches!(metadata.side_effect_level, ActionSideEffectLevel::Write)
     })
 }
 
@@ -1185,6 +1200,20 @@ pub struct ProcessedMessage {
     trace_steps: Vec<crate::core::ExecutionStep>,
     turn_records: Vec<AgentTurnRecord>,
     turn_plan: Option<crate::core::ExecutionPlan>,
+}
+
+impl ProcessedMessage {
+    /// Total provider/LLM latency for this run in milliseconds: the sum of each
+    /// model turn's call latency. Model-call steps carry their latency in
+    /// `duration_ms`; every other step contributes 0, so this is pure model wait
+    /// time (excludes tool execution and framework overhead).
+    pub fn model_latency_ms(&self) -> u64 {
+        self.trace_steps
+            .iter()
+            .filter_map(|step| step.duration_ms)
+            .filter(|ms| *ms > 0)
+            .sum()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1591,6 +1620,7 @@ pub struct RequestExecutionHints {
     pub recorded_user_message_id: Option<String>,
     pub attachments_present: bool,
     pub attachments: Vec<ChatAttachmentHint>,
+    pub execution_profile: Option<serde_json::Value>,
     pub arkorbit_context: Option<serde_json::Value>,
     pub browser_profile_context: Option<serde_json::Value>,
     pub recent_actionable_artifacts: Vec<serde_json::Value>,

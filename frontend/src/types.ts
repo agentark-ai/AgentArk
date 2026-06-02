@@ -35,6 +35,24 @@ export type RuntimeHealth = {
   sampled_at: string;
 };
 
+export type SettingsApiKeyMetadata = {
+  set?: boolean;
+  masked?: string | null;
+  issued_at_unix?: number;
+  expires_at_unix?: number;
+  ttl_seconds?: number;
+  remaining_seconds?: number;
+  rotated?: boolean;
+  password_gate_required?: boolean;
+  password_gate_error?: string;
+  error?: string;
+};
+
+export type SettingsApiKeySecretResponse = SettingsApiKeyMetadata & {
+  key: string;
+  ok?: boolean;
+};
+
 export type Task = {
   id: string;
   description: string;
@@ -531,6 +549,44 @@ export type LlmAnalyticsBreakdownRow = {
   cost_usd?: number | null;
 };
 
+export type ArkDistillAnalyticsTotals = {
+  result_count: number;
+  original_chars: number;
+  distilled_chars: number;
+  saved_chars: number;
+  estimated_original_tokens: number;
+  estimated_distilled_tokens: number;
+  estimated_saved_tokens: number;
+  estimated_prompt_cost_saved_usd?: number | null;
+  average_reduction_ratio: number;
+  savings_percent: number;
+};
+
+export type ArkDistillAnalyticsPoint = {
+  bucket_start: string;
+  result_count: number;
+  original_chars: number;
+  distilled_chars: number;
+  saved_chars: number;
+  estimated_saved_tokens: number;
+  estimated_prompt_cost_saved_usd?: number | null;
+};
+
+export type ArkDistillToolSavingsRow = {
+  tool_name: string;
+  action?: string | null;
+  result_count: number;
+  saved_chars: number;
+  estimated_saved_tokens: number;
+  estimated_prompt_cost_saved_usd?: number | null;
+};
+
+export type ArkDistillAnalyticsSummary = {
+  totals: ArkDistillAnalyticsTotals;
+  series: ArkDistillAnalyticsPoint[];
+  by_tool: ArkDistillToolSavingsRow[];
+};
+
 export type LlmAnalyticsResponse = {
   range: {
     since: string;
@@ -544,6 +600,7 @@ export type LlmAnalyticsResponse = {
   by_model: LlmAnalyticsBreakdownRow[];
   by_channel: LlmAnalyticsBreakdownRow[];
   by_purpose: LlmAnalyticsBreakdownRow[];
+  arkdistill?: ArkDistillAnalyticsSummary;
 };
 
 export type IntegrationConfigField = {

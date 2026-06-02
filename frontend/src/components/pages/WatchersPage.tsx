@@ -23,6 +23,7 @@ import {
   formatUiDateTimeMeta,
   formatUiRelativeDateTimeMeta,
 } from "../../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../../lib/displayLabels";
 import {
   isBackgroundSessionVisibleInUi,
   isStandaloneBackgroundWorkTask,
@@ -116,9 +117,7 @@ function dotColor(raw: unknown): string {
 }
 
 function statusLabel(raw: unknown): string {
-  const value = str(raw, "").trim();
-  if (!value) return "-";
-  return value.replace(/_/g, " ").replace(/\b\w/g, (match) => match.toUpperCase());
+  return humanizeStatusLabel(str(raw, ""));
 }
 
 function statusColor(
@@ -153,19 +152,17 @@ function watcherConditionSummary(raw: unknown): string {
   const description = str(condition.description, "").trim();
   if (description) return description;
   const kind = str(condition.type, "").trim();
-  if (kind) return kind.replace(/_/g, " ");
+  if (kind) return humanizeMachineLabel(kind);
   const entries = Object.entries(condition);
   if (entries.length === 0) return "-";
-  return entries[0][0].replace(/_/g, " ");
+  return humanizeMachineLabel(entries[0][0]);
 }
 
 function notificationChannelLabel(raw: unknown): string {
   const value = str(raw, "").trim().toLowerCase();
   if (!value || value === "in_app" || value === "web") return "In-app";
   if (value === "preferred") return "Preferred";
-  return value
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (match) => match.toUpperCase());
+  return humanizeMachineLabel(value);
 }
 
 function taskStatusValue(task: Task | null | undefined): string {
@@ -180,7 +177,7 @@ function taskStatusLabel(task: Task | null | undefined): string {
   }
   if (value.includes("inprogress") || value.includes("in_progress")) return "Running";
   if (value.includes("expired")) return "Needs approval";
-  return value.replace(/_/g, " ").replace(/\b\w/g, (match) => match.toUpperCase());
+  return humanizeStatusLabel(value);
 }
 
 function taskStatusColor(
@@ -248,7 +245,7 @@ function workBadgeForSession(
 }
 
 function taskMetaLine(task: Task): string {
-  const parts = [str(task.action, "").trim() || "task"];
+  const parts = [humanizeMachineLabel(str(task.action, ""), "Task")];
   if (str(task.cron, "").trim()) parts.push(`cron ${str(task.cron, "")}`);
   if (str(task.scheduled_for, "").trim()) {
     parts.push(`scheduled ${formatTimestampForHumans(str(task.scheduled_for, "")).label}`);
@@ -264,7 +261,7 @@ function watcherMetaLine(watcher: JsonRecord): string {
   const lastStatus = watcherLatestStatusLine(watcher);
   const notification = watcherNotificationLine(watcher);
   const mode = toBool(watcher.repeat_on_match) ? "repeats on match" : "stops after match";
-  return `${str(watcher.poll_action, "poller")} - every ${interval} - ${mode} - last poll ${lastPoll} - last status ${lastStatus} - notify ${notificationChannelLabel(
+  return `${humanizeMachineLabel(str(watcher.poll_action, ""), "Poller")} - every ${interval} - ${mode} - last poll ${lastPoll} - last status ${lastStatus} - notify ${notificationChannelLabel(
     watcher.notify_channel,
   )}${notification ? ` - ${notification}` : ""}`;
 }
@@ -275,7 +272,7 @@ function compactWatcherMetaLine(watcher: JsonRecord): string {
     ? formatTimestampForHumans(str(watcher.last_poll_at, "")).label
     : "not run";
   const mode = toBool(watcher.repeat_on_match) ? "repeats" : "stops";
-  return `${str(watcher.poll_action, "poller")} - ${interval} - ${mode} - last ${lastPoll}`;
+  return `${humanizeMachineLabel(str(watcher.poll_action, ""), "Poller")} - ${interval} - ${mode} - last ${lastPoll}`;
 }
 
 function watcherActionLabel(watcher: unknown): string {
@@ -560,7 +557,7 @@ function BackgroundWorkChildRow({
             size="small"
             color={rowStatusColor}
             variant="outlined"
-            label={status}
+            label={statusLabel(status)}
             sx={{ height: 22 }}
           />
         </Stack>
@@ -1704,7 +1701,13 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
           <Stack spacing={1.5}>
             <Stack spacing={0.75}>
               {[
-                { label: "Action", value: str(selectedWatcher?.poll_action, "-") },
+                {
+                  label: "Action",
+                  value: humanizeMachineLabel(
+                    str(selectedWatcher?.poll_action, ""),
+                    "-",
+                  ),
+                },
                 {
                   label: "Interval",
                   value: toBool(selectedWatcher?.history_only)
@@ -1804,7 +1807,7 @@ export default function WatchersPage({ autoRefresh }: WatchersPageProps) {
                   On trigger
                 </Typography>
                 <Typography variant="body2" sx={{ mt: 0.25, lineHeight: 1.5 }}>
-                  {str(selectedWatcher?.on_trigger, "-")}
+                  {humanizeMachineLabel(str(selectedWatcher?.on_trigger, ""), "-")}
                 </Typography>
               </Box>
             ) : null}

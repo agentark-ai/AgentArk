@@ -208,7 +208,9 @@ pub(super) async fn security_status(State(state): State<AppState>) -> Response {
         .is_install_managed_password_active()
         .unwrap_or(false);
     let internal_service_tokens =
-        crate::clients::describe_internal_service_tokens(&config_dir).unwrap_or_default();
+        crate::clients::describe_internal_service_tokens_async(&config_dir)
+            .await
+            .unwrap_or_default();
     let internal_service_rotation_supported = !internal_service_tokens
         .iter()
         .any(|item| item.managed_by_env);

@@ -31,7 +31,6 @@ import {
 import Grid2 from "@mui/material/Grid";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
-import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import EditRoundedIcon from "@mui/icons-material/EditRounded";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
@@ -41,6 +40,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeMachineLabel } from "../lib/displayLabels";
 import type {
   CustomMessagingChannel,
   IntegrationAuthManifestField,
@@ -51,6 +51,7 @@ import type {
   IntegrationSyncStatus
 } from "../types";
 import { ExtensionPacksPanel } from "./ExtensionPacksPanel";
+import { GoogleWorkspaceSetupGuide } from "./GoogleWorkspaceSetupGuide";
 import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
 import { IntegrationRoutingPanel } from "./IntegrationRoutingPanel";
 import { PluginSdkPanel } from "./PluginSdkPanel";
@@ -58,9 +59,12 @@ import { WebhooksPanel } from "./WebhooksPanel";
 import {
   asRecord,
   asRecords,
+  integrationHubPanelForCardSource,
   isRecord,
   str,
   toBool,
+  type IntegrationHubCardSource,
+  type IntegrationHubPanel,
   type JsonRecord
 } from "./integrationPanelData";
 
@@ -605,7 +609,7 @@ function gatewayChannelDetail(channel: GatewayChannelDescriptor | null, fallback
     parts.push(`${channel.route_count} route${channel.route_count === 1 ? "" : "s"}`);
   }
   if (str(channel.delivery_mode, "").trim()) {
-    parts.push(str(channel.delivery_mode, "").replace(/_/g, " "));
+    parts.push(humanizeMachineLabel(str(channel.delivery_mode, "")));
   }
   return parts.join(" | ");
 }
@@ -960,6 +964,7 @@ export function IntegrationsPanel({
   const [sshTestConnName, setSshTestConnName] = useState("");
   const [sshTestOutput, setSshTestOutput] = useState("");
   const [expandedSection, setExpandedSection] = useState<string | false>("connected");
+  const [hubPanelDialog, setHubPanelDialog] = useState<IntegrationHubPanel | null>(null);
   const [hubSearch, setHubSearch] = useState("");
   const [hubFilter, setHubFilter] = useState<IntegrationHubFilter>("all");
   const [sshKeyError, setSshKeyError] = useState<string | null>(null);
@@ -2029,6 +2034,16 @@ export function IntegrationsPanel({
     }
   }
 
+  function openHubPanelDialog(panel: IntegrationHubPanel) {
+    setExpandedSection(false);
+    setHubPanelDialog(panel);
+  }
+
+  function openHubPanelForSource(source: IntegrationHubCardSource) {
+    const panel = integrationHubPanelForCardSource(source);
+    if (panel) openHubPanelDialog(panel);
+  }
+
   function openCustomMessagingCredentials(channel: CustomMessagingChannel) {
     const nextValues = Object.fromEntries(
       customMessagingCredentialFields(channel).map((field) => [field.key, ""])
@@ -2661,6 +2676,7 @@ export function IntegrationsPanel({
     name: string;
     detail: string;
     kind: string;
+    source: IntegrationHubCardSource;
     category: IntegrationHubCategory;
     status: IntegrationHubStatus;
     statusLabel?: string;
@@ -2671,7 +2687,6 @@ export function IntegrationsPanel({
   };
 
   const customMessagingCards: IntegrationHubCard[] = customMessagingChannels.map((channel) => {
-    const fields = customMessagingCredentialFields(channel);
     const ready = !!channel.configured;
     const needsCredentials = !!channel.requires_auth && !ready;
     return {
@@ -2679,17 +2694,14 @@ export function IntegrationsPanel({
       name: channel.name || channel.id,
       detail: channel.description || channel.runtime_channel_id || "User-added messaging delivery channel.",
       kind: "Custom channel",
+      source: "custom_messaging_channel",
       category: "chat",
       status: ready ? "connected" : needsCredentials ? "attention" : "off",
       statusLabel: ready ? "Enabled" : needsCredentials ? "Needs credentials" : "Disabled",
-      actionLabel: fields.length > 0 ? "Credentials" : "Test",
+      actionLabel: "Manage",
       iconName: channel.name || channel.id,
       tags: ["User-added", channel.runtime_channel_id].filter(Boolean),
-      onClick: fields.length > 0
-        ? () => openCustomMessagingCredentials(channel)
-        : () => {
-            if (ready) testCustomMessagingChannelMutation.mutate(channel.id);
-          }
+      onClick: () => openHubPanelForSource("custom_messaging_channel")
     };
   });
 
@@ -2699,6 +2711,7 @@ export function IntegrationsPanel({
       name: "Email Delivery",
       detail: emailConnectionDetail,
       kind: "Channel",
+      source: "email_channel",
       category: "productivity",
       status: emailDeliveryReady ? "connected" : "off",
       statusLabel: emailDeliveryReady ? "Enabled" : "Disabled",
@@ -2714,6 +2727,7 @@ export function IntegrationsPanel({
         name: setup.name,
         detail: setup.detail,
         kind: "Channel",
+        source: "messaging_channel",
         category: integrationHubCategory(setup.id, setup.name),
         status:
           displayState === "ready"
@@ -2756,6 +2770,7 @@ export function IntegrationsPanel({
         name: integration.name,
         detail: integrationCardCopy(integration),
         kind: "Built-in",
+        source: "builtin_integration",
         category: integrationHubCategory(integration.id, integration.name),
         status,
         statusLabel:
@@ -2794,6 +2809,7 @@ export function IntegrationsPanel({
         name: str(item.name, id),
         detail: str(item.description, "Imported external API available as agent actions."),
         kind: "Custom API",
+        source: "custom_api",
         category: "tools",
         status: enabled ? "connected" : "off",
         statusLabel: enabled ? "Enabled" : "Disabled",
@@ -2803,7 +2819,7 @@ export function IntegrationsPanel({
           "User-added",
           operationCount > 0 ? `${operationCount} operation${operationCount === 1 ? "" : "s"}` : "API"
         ],
-        onClick: () => setExpandedSection("hub_custom_apis")
+        onClick: () => openHubPanelForSource("custom_api")
       };
     }),
     ...webhookSources.map((item): IntegrationHubCard => {
@@ -2814,13 +2830,14 @@ export function IntegrationsPanel({
         name: str(item.name, id),
         detail: str(item.description, "Inbound event source that can trigger AgentArk workflows."),
         kind: "Webhook",
+        source: "webhook",
         category: "platform",
         status: enabled ? "connected" : "off",
         statusLabel: enabled ? "Enabled" : "Disabled",
         actionLabel: "Manage",
         iconName: "Webhook",
         tags: ["Events"],
-        onClick: () => setExpandedSection("hub_webhooks")
+        onClick: () => openHubPanelForSource("webhook")
       };
     }),
     ...pluginSummaries.map((item): IntegrationHubCard => {
@@ -2831,13 +2848,14 @@ export function IntegrationsPanel({
         name: str(item.name, id),
         detail: str(item.description, "External plugin endpoint and event subscription."),
         kind: "Plugin",
+        source: "plugin",
         category: "platform",
         status: enabled ? "connected" : "off",
         statusLabel: enabled ? "Enabled" : "Disabled",
         actionLabel: "Manage",
         iconName: "Plugin",
         tags: ["SDK"],
-        onClick: () => setExpandedSection("hub_plugins")
+        onClick: () => openHubPanelForSource("plugin")
       };
     }),
     {
@@ -2845,13 +2863,14 @@ export function IntegrationsPanel({
       name: "Extension Packs",
       detail: "Manifest-based integrations and channel packs installed from external sources.",
       kind: "Pack-based",
+      source: "extension_pack",
       category: "platform",
       status: "info",
       statusLabel: "Available",
       actionLabel: "Manage",
       iconName: "Extension",
       tags: ["Integrations", "Channels"],
-      onClick: () => setExpandedSection("hub_extension_packs")
+      onClick: () => openHubPanelForSource("extension_pack")
     }
   ];
 
@@ -3059,6 +3078,171 @@ export function IntegrationsPanel({
         </Box>
       </Grid2>
     );
+  };
+
+  const hubPanelDialogTitle = (panel: IntegrationHubPanel | null): string => {
+    switch (panel) {
+      case "custom_apis":
+        return "Custom API Builder";
+      case "webhooks":
+        return "Webhooks";
+      case "extension_packs":
+        return "Extension Packs";
+      case "plugins":
+        return "Plugin SDK";
+      case "custom_messaging_channels":
+        return "Custom Messaging Channels";
+      default:
+        return "Manage Integration";
+    }
+  };
+
+  const renderCustomMessagingChannelsManagement = () => (
+    <Stack spacing={1.25}>
+      {customMessagingChannelsQ.error ? (
+        <Alert severity="error">
+          Failed to load custom messaging channels: {asErrorMessage(customMessagingChannelsQ.error)}
+        </Alert>
+      ) : customMessagingChannelsQ.isLoading ? (
+        <Typography variant="body2" sx={{ color: "text.secondary" }}>Loading custom channels...</Typography>
+      ) : customMessagingChannels.length === 0 ? (
+        <Alert severity="info">
+          Ask AgentArk in chat to add a messaging channel from provider docs, a webhook, or an internal notification API.
+        </Alert>
+      ) : (
+        <Grid2 container spacing={1.25} sx={{ alignItems: "stretch" }}>
+          {customMessagingChannels.map((channel) => {
+            const fields = customMessagingCredentialFields(channel);
+            const ready = !!channel.configured;
+            const accent = integrationCardAccent(ready ? "enabled" : "disabled");
+            return (
+              <Grid2 key={channel.id} size={{ xs: 12, md: 6 }} sx={{ display: "flex" }}>
+                <Box
+                  sx={{
+                    width: "100%",
+                    p: 1.5,
+                    borderRadius: "8px",
+                    border: `1px solid ${accent.border}`,
+                    background: accent.background
+                  }}
+                >
+                  <Stack spacing={1}>
+                    <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center" }}>
+                      <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", minWidth: 0 }}>
+                        <ChannelIcon name={channel.name || channel.id} size={22} />
+                        <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
+                          {channel.name || channel.id}
+                        </Typography>
+                      </Stack>
+                      <Chip
+                        size="small"
+                        label={ready ? "Ready" : channel.requires_auth ? "Needs credentials" : "Disabled"}
+                        variant="outlined"
+                        sx={{ height: 20, fontSize: "0.68rem", fontWeight: 700, borderColor: accent.chipBorder, color: accent.chipColor }}
+                      />
+                    </Stack>
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "text.secondary",
+                        lineHeight: 1.45,
+                        display: "-webkit-box",
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: "vertical",
+                        overflow: "hidden"
+                      }}
+                    >
+                      {channel.description || channel.runtime_channel_id}
+                    </Typography>
+                    {channel.last_test_message ? (
+                      <Typography variant="caption" sx={{ color: "text.secondary" }} noWrap>
+                        Last test: {channel.last_test_message}
+                      </Typography>
+                    ) : null}
+                    <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
+                      <Chip
+                        size="small"
+                        label={channel.runtime_channel_id}
+                        variant="outlined"
+                        sx={{ height: 20, fontSize: "0.68rem", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}
+                      />
+                      {channel.docs_url ? (
+                        <Button
+                          size="small"
+                          variant="text"
+                          sx={connectorCardActionButtonSx}
+                          onClick={() => window.open(channel.docs_url || "", "_blank", "noopener,noreferrer")}
+                        >
+                          Docs
+                        </Button>
+                      ) : null}
+                      {fields.length > 0 ? (
+                        <Button
+                          size="small"
+                          variant={ready ? "outlined" : "contained"}
+                          sx={connectorCardActionButtonSx}
+                          onClick={() => openCustomMessagingCredentials(channel)}
+                        >
+                          Credentials
+                        </Button>
+                      ) : null}
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        sx={connectorCardActionButtonSx}
+                        disabled={!ready || testCustomMessagingChannelMutation.isPending}
+                        onClick={() => testCustomMessagingChannelMutation.mutate(channel.id)}
+                      >
+                        Test
+                      </Button>
+                      <CardActionsMenu
+                        ariaLabel={`${channel.name || channel.id} options`}
+                        actions={[
+                          {
+                            label: "Delete",
+                            tone: "error",
+                            disabled: deleteCustomMessagingChannelMutation.isPending,
+                            onClick: () => {
+                              if (!window.confirm(`Delete custom messaging channel '${channel.name || channel.id}'?`)) return;
+                              deleteCustomMessagingChannelMutation.mutate(channel.id);
+                            }
+                          }
+                        ]}
+                      />
+                    </Stack>
+                  </Stack>
+                </Box>
+              </Grid2>
+            );
+          })}
+        </Grid2>
+      )}
+    </Stack>
+  );
+
+  const renderHubPanelDialogContent = () => {
+    switch (hubPanelDialog) {
+      case "custom_apis":
+        return (
+          <IntegrationQuickstartPanel
+            integrations={[]}
+            autoRefresh={autoRefresh}
+            embedded
+            onConfigureIntegration={() => {}}
+            mode="custom-apis-only"
+          />
+        );
+      case "webhooks":
+        return <WebhooksPanel autoRefresh={autoRefresh} />;
+      case "extension_packs":
+        return <ExtensionPacksPanel mode="integrations" autoRefresh={autoRefresh} />;
+      case "plugins":
+        return <PluginSdkPanel autoRefresh={autoRefresh} embedded />;
+      case "custom_messaging_channels":
+        return renderCustomMessagingChannelsManagement();
+      default:
+        return null;
+    }
   };
 
   const persistChannelSettings = async (form: ChannelSettingsForm) => {
@@ -4302,7 +4486,7 @@ export function IntegrationsPanel({
                     Integration Hub
                   </Typography>
                   <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                    Messaging channels, built-in connectors, custom APIs, webhooks, plugins, and extension packs in one place.
+                    Install anything — connectors, MCP servers, custom APIs, webhooks, plugins, packs, and channels in one place. No vendor catalog limit. No third-party gateway: integration tokens and API calls stay between your machine and the upstream service.
                   </Typography>
                 </Box>
                 <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
@@ -4948,7 +5132,7 @@ export function IntegrationsPanel({
                             color: "text.secondary",
                             textTransform: "capitalize"
                           }}>
-                          {item.kind.replace(/_/g, " ")}
+                          {humanizeMachineLabel(item.kind)}
                         </Typography>
                       </TableCell>
                       <TableCell>
@@ -4975,7 +5159,7 @@ export function IntegrationsPanel({
                             color: "text.secondary",
                             textTransform: "capitalize"
                           }}>
-                          {item.outcome.replace(/_/g, " ")}
+                          {humanizeMachineLabel(item.outcome)}
                         </Typography>
                       </TableCell>
                     </TableRow>
@@ -6261,6 +6445,22 @@ export function IntegrationsPanel({
           )}
         </Box>
       ) : null}
+      <Dialog
+        open={!!hubPanelDialog}
+        onClose={() => setHubPanelDialog(null)}
+        maxWidth="lg"
+        fullWidth
+      >
+        <DialogTitle>{hubPanelDialogTitle(hubPanelDialog)}</DialogTitle>
+        <DialogContent dividers sx={{ px: { xs: 2, md: 3 }, py: 2 }}>
+          {renderHubPanelDialogContent()}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setHubPanelDialog(null)} size="small" sx={dialogActionButtonSx}>
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
       <Dialog
         open={!!customMessagingCredentialTarget}
         onClose={() => {
@@ -7806,13 +8006,13 @@ export function IntegrationsPanel({
                 }}
               >
                 <Stack
-                  direction="row"
+                  direction={{ xs: "column", sm: "row" }}
                   spacing={1}
                   sx={{
-                    alignItems: "center",
+                    alignItems: { xs: "stretch", sm: "center" },
                     justifyContent: "space-between"
                   }}>
-                  <Box>
+                  <Box sx={{ minWidth: 0 }}>
                     <Typography variant="subtitle2">Google OAuth setup</Typography>
                     <Typography variant="caption" sx={{
                       color: "text.secondary"
@@ -7820,19 +8020,15 @@ export function IntegrationsPanel({
                       Add the Google OAuth client here, then AgentArk will open the Google consent screen in your browser.
                     </Typography>
                   </Box>
-                  <IconButton
+                  <Button
                     size="small"
-                    onClick={() => setGoogleWorkspaceHelpOpen((open) => !open)}
-                    aria-label="How to get Google OAuth client credentials"
+                    variant="outlined"
+                    onClick={() => setGoogleWorkspaceHelpOpen(true)}
+                    sx={{ flex: "0 0 auto", textTransform: "none" }}
                   >
-                    <InfoOutlinedIcon fontSize="small" />
-                  </IconButton>
+                    Open setup guide →
+                  </Button>
                 </Stack>
-                {googleWorkspaceHelpOpen ? (
-                  <Alert severity="info" sx={{ mt: 1.25 }}>
-                    Create or open a Google Cloud project, configure the OAuth consent screen, add yourself as a test user if the app is still in testing, then create an OAuth client and copy its client ID and client secret. Add the redirect URI <strong>http://localhost:8990/oauth/callback</strong>, and enable the Google APIs you want AgentArk to use such as Gmail API, Google Calendar API, Drive API, Docs API, Sheets API, Google Chat API, and Admin SDK. Google's official setup guide is at <strong>developers.google.com/accounts/docs/OAuth2Login</strong>.
-                  </Alert>
-                ) : null}
               </Box>
             ) : null}
             {(!activeHasSavedConfig || editingConnected)
@@ -8039,7 +8235,7 @@ export function IntegrationsPanel({
                                 Feed type
                               </Typography>
                               <Typography variant="body2" sx={{ textTransform: "capitalize" }}>
-                                {activeSyncStatus.sync_kind.replace(/_/g, " ")}
+                                {humanizeMachineLabel(activeSyncStatus.sync_kind)}
                               </Typography>
                             </Grid2>
                           </Grid2>
@@ -8616,6 +8812,10 @@ export function IntegrationsPanel({
         </DialogActions>
       </Dialog>
       ) : null}
+      <GoogleWorkspaceSetupGuide
+        open={googleWorkspaceHelpOpen}
+        onClose={() => setGoogleWorkspaceHelpOpen(false)}
+      />
     </Stack>
   );
 }

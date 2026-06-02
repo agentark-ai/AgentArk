@@ -2876,7 +2876,7 @@ pub(super) async fn resume_chat_task_stream(
     };
     let resume_request_body = request.map(|Json(body)| body).unwrap_or_default();
 
-    let (resume_request, resumed_task, previous_task, status_json, arguments_json, plan_override) = {
+    let (resume_request, resumed_task, previous_task, status_json, arguments_json) = {
         let mut tasks = state.tasks.write().await;
         let Some(task) = tasks.get_mut(uuid) else {
             return (
@@ -2933,9 +2933,21 @@ pub(super) async fn resume_chat_task_stream(
             } else {
                 None
             },
-            effective_plan_override,
         )
     };
+
+    if let Some(response) = reject_if_chat_conversation_stream_active(
+        &state,
+        Some(resume_request.conversation_id.as_str()),
+    )
+    .await
+    {
+        let mut tasks = state.tasks.write().await;
+        if let Some(task) = tasks.get_mut(uuid) {
+            *task = previous_task;
+        }
+        return response;
+    }
 
     let save_result = {
         let agent = state.agent.read().await;
@@ -2974,7 +2986,6 @@ pub(super) async fn resume_chat_task_stream(
             user_message_already_recorded: true,
             recorded_user_message_id: None,
             deep_research: resume_request.deep_research,
-            plan_confirmation_mode: None,
             attachments_present: false,
             attachments: Vec::new(),
             arkorbit_context: None,
@@ -2987,11 +2998,11 @@ pub(super) async fn resume_chat_task_stream(
                 description: resumed_task.description.clone(),
                 work_type: resume_request.work_type,
                 user_message_already_recorded: true,
-                plan_override,
                 execution_profile: resume_request.execution_profile,
             })),
         },
     )
+    .await
 }
 
 /// Retry a failed or cancelled task.

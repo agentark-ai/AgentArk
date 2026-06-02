@@ -2,12 +2,18 @@
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const GMAIL_SECRET_KEY: &str = "gmail_tokens";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1";
+static OAUTH_REFRESH_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GmailTokens {
@@ -22,6 +28,29 @@ struct TokenResponse {
     expires_in: i64,
     #[serde(default)]
     refresh_token: Option<String>,
+}
+
+fn oauth_refresh_lock_key(config_dir: &Path, source: &str) -> String {
+    let config_dir = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    format!(
+        "{}:{}",
+        source.trim().to_ascii_lowercase(),
+        config_dir.display()
+    )
+}
+
+async fn oauth_refresh_guard(config_dir: &Path, source: &str) -> OwnedMutexGuard<()> {
+    let key = oauth_refresh_lock_key(config_dir, source);
+    let lock = {
+        let mut locks = OAUTH_REFRESH_LOCKS.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
 }
 
 fn get_oauth_client_with_config(config_dir: &Path) -> Result<(String, String)> {
@@ -77,6 +106,7 @@ async fn save_tokens(config_dir: &Path, tokens: &GmailTokens) -> Result<()> {
 }
 
 pub(crate) async fn ensure_legacy_access_token(config_dir: &Path) -> Result<String> {
+    let _guard = oauth_refresh_guard(config_dir, "gmail").await;
     let mut tokens = load_tokens(config_dir).await?;
     let now = chrono::Utc::now().timestamp();
 
@@ -695,7 +725,8 @@ pub async fn gmail_reply(config_dir: &Path, args: &serde_json::Value) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_scan_mode, GmailScanArgs, GmailScanMode};
+    use super::{effective_scan_mode, oauth_refresh_lock_key, GmailScanArgs, GmailScanMode};
+    use std::path::Path;
 
     #[test]
     fn gmail_scan_auto_mode_uses_recent_when_only_max_results_is_set() {
@@ -736,5 +767,15 @@ mod tests {
             max_results: None,
         };
         assert_eq!(effective_scan_mode(&args), GmailScanMode::Triage);
+    }
+
+    #[test]
+    fn gmail_refresh_lock_key_is_scoped_to_legacy_gmail_source() {
+        let key = oauth_refresh_lock_key(Path::new("C:/agentark/config"), "gmail");
+        assert!(key.contains("gmail"));
+        assert_ne!(
+            key,
+            oauth_refresh_lock_key(Path::new("C:/agentark/config"), "calendar")
+        );
     }
 }

@@ -28,7 +28,7 @@ import {
 import Grid2 from "@mui/material/Grid";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import ReactECharts from "echarts-for-react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
@@ -77,8 +77,6 @@ import {
   percentageLabel,
   promptCanaryActionSummary,
   promptCanaryReviewEvidence,
-  promptProposalScopeLabel,
-  promptOptimizationReviewEvidence,
   ratioPercent,
   skillEvolutionActionLabel,
   skillEvolutionAlertSeverity,
@@ -95,7 +93,6 @@ import {
   formatTimestampForHumans,
   promptCanarySafetyStatusColor,
   promptProposalRiskColor,
-  promptProposalStatusColor,
 } from "./settingsPageHelpers";
 
 type ReadinessDialogState = {
@@ -134,6 +131,8 @@ function promptProposalLifecycleLabel(status: string): string {
       return "Running";
     case "background_test_completed":
       return "Candidate ready";
+    case "candidate_rejected":
+      return "Not promoted";
     case "testing":
       return "Testing";
     case "test_regression":
@@ -160,11 +159,12 @@ function promptProposalLifecycleStep(status: string): number {
     case "suggested":
       return 0;
     case "approved_waiting_for_more_examples":
-    case "queued_for_background_test":
-    case "running_background_test":
     case "blocked":
       return 1;
+    case "queued_for_background_test":
+    case "running_background_test":
     case "background_test_completed":
+    case "candidate_rejected":
       return 2;
     case "testing":
     case "test_regression":
@@ -184,7 +184,7 @@ function promptProposalLifecycleColor(status: string) {
   if (status === "testing" || status === "queued_for_background_test" || status === "running_background_test") {
     return "warning" as const;
   }
-  if (status === "blocked" || status === "rolled_back" || status === "dismissed" || status === "test_regression" || status === "rollback_suggested") {
+  if (status === "blocked" || status === "candidate_rejected" || status === "rolled_back" || status === "dismissed" || status === "test_regression" || status === "rollback_suggested") {
     return "error" as const;
   }
   return "default" as const;
@@ -223,7 +223,64 @@ function recordList(value: unknown): JsonRecord[] {
     .filter((item) => Object.keys(item).length > 0);
 }
 
+function formatMachineReasonCode(value: string): string {
+  const normalized = value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_\s-]+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return "";
+  return normalized
+    .split(" ")
+    .filter(Boolean)
+    .map((word, idx) => {
+      if (word === "api") return "API";
+      if (word === "gepa") return "GEPA";
+      if (idx === 0) return `${word.charAt(0).toUpperCase()}${word.slice(1)}`;
+      return word;
+    })
+    .join(" ");
+}
+
+function promptLifecycleBlockerMessage(reason: string): string | null {
+  switch (reason.trim()) {
+    case "learning_paused":
+      return "Background optimization cannot start yet. Evolve is paused, so AgentArk will wait until Evolve is resumed.";
+    case "gepa_disabled":
+      return "Background optimization cannot start yet. The GEPA background optimizer is disabled in settings.";
+    case "model_or_runtime_not_ready":
+      return "Background optimization cannot start yet. Model or optimizer setup is incomplete; finish setup, then retry.";
+    case "runtime_not_ready":
+      return "Background optimization cannot start yet. The optimizer runtime is not ready; finish the Python/GEPA setup, then retry.";
+    case "model_not_ready":
+      return "Background optimization cannot start yet. The model or provider key is not ready; finish model setup, then retry.";
+    case "budget_paused":
+      return "Background optimization cannot start yet. The daily spending limit for background optimization is paused or exhausted, so AgentArk will wait instead of spending more budget.";
+    case "work_already_scheduled":
+      return "Another background optimization is already scheduled. Wait for it to finish before starting another one.";
+    default:
+      return null;
+  }
+}
+
+function formatPromptLifecycleReason(reason: string): string {
+  const raw = reason.trim();
+  if (!raw) return "";
+  const codeOnly = raw.match(/^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)+$/i)?.[0] ?? "";
+  const trailingCode =
+    raw.match(/(?:^|:\s*|\s+)([a-z][a-z0-9]*(?:[_-][a-z0-9]+)+)\.?$/i)?.[1] ?? "";
+  const blockerMessage = promptLifecycleBlockerMessage(codeOnly || trailingCode);
+  if (blockerMessage) return blockerMessage;
+  return raw
+    .replace(/`?([a-z][a-z0-9]*(?:[_-][a-z0-9]+)+)`?/gi, (_match, token: string) =>
+      formatMachineReasonCode(token),
+    )
+    .replace(/\s+\./g, ".");
+}
+
 function backgroundImprovementReason(reason: string) {
+  const blockerMessage = promptLifecycleBlockerMessage(reason);
+  if (blockerMessage) return blockerMessage;
   switch (reason) {
     case "learning_paused":
       return "Evolve is paused.";
@@ -286,7 +343,20 @@ type ExperimentMetricSummary = {
   value: string;
   helper: string;
   tone?: "default" | "good" | "warn" | "info";
+  /** Big numeric portion rendered large + tabular. When absent, `value` is shown muted. */
+  accent?: string;
+  /** Small dim unit suffix after `accent` (e.g. "tokens", "chars"). */
+  unit?: string;
+  /** 0..1 ratio rendered as a thin gauge bar under the value (e.g. confidence). */
+  progress?: number | null;
 };
+
+type PromptDetailTab =
+  | "proposal"
+  | "background"
+  | "candidate"
+  | "deployment"
+  | "monitoring";
 
 function EvolutionLifecycle({
   steps,
@@ -423,6 +493,608 @@ function formatSampleCount(value: number | null): string {
 function formatPercentRatio(value: number | null, digits = 1): string {
   if (value == null) return "-";
   return percentageLabel(value, digits) || "-";
+}
+
+function formatApproxMoney(value: number | null): string {
+  if (value == null) return "-";
+  if (Math.abs(value) < 0.0001) return "$0.0000";
+  return `$${value.toFixed(4)}`;
+}
+
+function formatEstimatedTokenSavings(value: number | null): string {
+  if (value == null || value <= 0) return "Pending";
+  return `~${Math.round(value).toLocaleString()} tokens`;
+}
+
+function promptOptimizationRankLabel(index: number): string {
+  return index === 0 ? "Top opportunity" : `Priority #${index + 1}`;
+}
+
+function promptOptimizationShareLabel(opportunity: JsonRecord): string {
+  const sectionChars = finiteNumber(opportunity.p95_chars);
+  const finalChars = finiteNumber(opportunity.p95_final_prompt_chars);
+  if (sectionChars == null || finalChars == null || finalChars <= 0) return "-";
+  return formatPercentRatio(Math.min(1, sectionChars / finalChars), 0);
+}
+
+function promptOptimizationFootprintValues(opportunity: JsonRecord) {
+  const sectionChars = Math.max(0, finiteNumber(opportunity.p95_chars) ?? 0);
+  const finalChars = Math.max(
+    sectionChars,
+    finiteNumber(opportunity.p95_final_prompt_chars) ?? sectionChars,
+  );
+  const restChars = Math.max(0, finalChars - sectionChars);
+  const share = finalChars > 0 ? Math.min(1, sectionChars / finalChars) : 0;
+  return {
+    sectionChars,
+    restChars,
+    finalChars,
+    sharePercent: Math.round(share * 100),
+  };
+}
+
+function formatSignedPointDelta(value: number | null): string {
+  if (value == null) return "Waiting for data";
+  const points = value * 100;
+  const sign = points > 0 ? "+" : "";
+  return `${sign}${points.toFixed(1)} pts`;
+}
+
+function promptProposalOutcome(lifecycle: JsonRecord): {
+  label: string;
+  helper: string;
+  tone: "default" | "good" | "warn" | "info";
+} {
+  const baselineSuccess = finiteNumber(lifecycle.baseline_success_rate);
+  const candidateSuccess = finiteNumber(lifecycle.candidate_success_rate);
+  const baselineError = finiteNumber(lifecycle.baseline_error_rate);
+  const candidateError = finiteNumber(lifecycle.candidate_error_rate);
+  if (toBool(lifecycle.rollback_recommended)) {
+    return {
+      label: "Needs attention",
+      helper: "Monitoring found a rollback signal.",
+      tone: "warn",
+    };
+  }
+  if (baselineSuccess != null && candidateSuccess != null) {
+    const delta = candidateSuccess - baselineSuccess;
+    if (delta >= 0.01) {
+      return {
+        label: "Improving",
+        helper: `${formatSignedPointDelta(delta)} success versus stable.`,
+        tone: "good",
+      };
+    }
+    if (delta <= -0.01) {
+      return {
+        label: "Regressing",
+        helper: `${formatSignedPointDelta(delta)} success versus stable.`,
+        tone: "warn",
+      };
+    }
+  }
+  if (baselineError != null && candidateError != null) {
+    const delta = candidateError - baselineError;
+    if (delta <= -0.01) {
+      return {
+        label: "Improving",
+        helper: `${formatSignedPointDelta(-delta)} fewer errors.`,
+        tone: "good",
+      };
+    }
+    if (delta >= 0.01) {
+      return {
+        label: "Regressing",
+        helper: `${formatSignedPointDelta(delta)} more errors.`,
+        tone: "warn",
+      };
+    }
+  }
+  return {
+    label: "Measuring",
+    helper: "Waiting for enough before/after production samples.",
+    tone: "info",
+  };
+}
+
+function promptLifecycleTimeRows(lifecycle: JsonRecord): { label: string; value: string }[] {
+  return [
+    { label: "Approved", value: str(lifecycle.approved_at, "") },
+    { label: "Queued", value: str(lifecycle.queued_at, "") },
+    { label: "Deployed", value: str(lifecycle.deployed_at, "") },
+  ]
+    .filter((row) => row.value.trim())
+    .map((row) => ({
+      ...row,
+      value: formatTimestampForHumans(row.value).label,
+    }));
+}
+
+function promptMetricCards(lifecycle: JsonRecord): ExperimentMetricSummary[] {
+  const baselineSuccess = finiteNumber(lifecycle.baseline_success_rate);
+  const candidateSuccess = finiteNumber(lifecycle.candidate_success_rate);
+  const successDelta =
+    baselineSuccess != null && candidateSuccess != null
+      ? candidateSuccess - baselineSuccess
+      : null;
+  const baselineError = finiteNumber(lifecycle.baseline_error_rate);
+  const candidateError = finiteNumber(lifecycle.candidate_error_rate);
+  const errorDelta =
+    baselineError != null && candidateError != null
+      ? candidateError - baselineError
+      : null;
+  const baselineLatency = finiteNumber(lifecycle.baseline_p95_latency_ms);
+  const candidateLatency = finiteNumber(lifecycle.candidate_p95_latency_ms);
+  const latencyDelta =
+    baselineLatency != null && candidateLatency != null
+      ? candidateLatency - baselineLatency
+      : null;
+  return [
+    {
+      label: "Outcome",
+      value: promptProposalOutcome(lifecycle).label,
+      helper: promptProposalOutcome(lifecycle).helper,
+      tone: promptProposalOutcome(lifecycle).tone,
+    },
+    {
+      label: "Success",
+      value: formatPercentRatio(candidateSuccess),
+      helper:
+        successDelta == null
+          ? `Stable ${formatPercentRatio(baselineSuccess)}`
+          : `${formatSignedPointDelta(successDelta)} vs stable`,
+      tone:
+        successDelta == null ? "info" : successDelta >= 0 ? "good" : "warn",
+    },
+    {
+      label: "Errors",
+      value: formatPercentRatio(candidateError),
+      helper:
+        errorDelta == null
+          ? `Stable ${formatPercentRatio(baselineError)}`
+          : `${formatSignedPointDelta(errorDelta)} vs stable`,
+      tone:
+        errorDelta == null ? "info" : errorDelta <= 0 ? "good" : "warn",
+    },
+    {
+      label: "p95 latency",
+      value:
+        candidateLatency == null
+          ? "-"
+          : `${Math.round(candidateLatency).toLocaleString()} ms`,
+      helper:
+        latencyDelta == null
+          ? baselineLatency == null
+            ? "Stable -"
+            : `Stable ${Math.round(baselineLatency).toLocaleString()} ms`
+          : `${latencyDelta > 0 ? "+" : ""}${Math.round(latencyDelta).toLocaleString()} ms vs stable`,
+      tone:
+        latencyDelta == null ? "info" : latencyDelta <= 0 ? "good" : "warn",
+    },
+  ];
+}
+
+function promptLifecycleSamplesOption(
+  samples: number,
+  requiredSamples: number,
+  status: string,
+) {
+  const required = requiredSamples || samples || 1;
+  return {
+    backgroundColor: "transparent",
+    grid: { left: 34, right: 12, top: 18, bottom: 26, containLabel: true },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(14, 18, 14, 0.96)",
+      borderColor: "rgba(120, 242, 176, 0.24)",
+      textStyle: { color: "#fff8ed" },
+    },
+    xAxis: {
+      type: "category",
+      data: ["Collected", "Needed"],
+      axisLabel: { color: "#c8d8c9" },
+      axisLine: { lineStyle: { color: "rgba(130,170,160,0.22)" } },
+    },
+    yAxis: {
+      type: "value",
+      axisLabel: { color: "#c8d8c9" },
+      splitLine: { lineStyle: { color: "rgba(130,170,160,0.12)" } },
+    },
+    series: [
+      {
+        type: "bar",
+        data: [samples, required],
+        itemStyle: {
+          color: status === "blocked" ? "#fb7185" : "#78f2b0",
+          borderRadius: [4, 4, 0, 0],
+        },
+      },
+    ],
+  };
+}
+
+function promptMonitoringChartOption(lifecycle: JsonRecord) {
+  const labels = ["Success", "Tool success", "Error rate"];
+  const stable = [
+    ratioPercent(lifecycle.baseline_success_rate),
+    ratioPercent(lifecycle.baseline_tool_success_rate),
+    ratioPercent(lifecycle.baseline_error_rate),
+  ];
+  const candidate = [
+    ratioPercent(lifecycle.candidate_success_rate),
+    ratioPercent(lifecycle.candidate_tool_success_rate),
+    ratioPercent(lifecycle.candidate_error_rate),
+  ];
+  return {
+    backgroundColor: "transparent",
+    grid: { left: 40, right: 14, top: 34, bottom: 30, containLabel: true },
+    legend: { top: 0, textStyle: { color: "#d8d0c4", fontSize: 11 } },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(14, 18, 14, 0.96)",
+      borderColor: "rgba(120, 242, 176, 0.24)",
+      textStyle: { color: "#fff8ed" },
+      valueFormatter: (value: number) => `${Number(value).toFixed(1)}%`,
+    },
+    xAxis: {
+      type: "category",
+      data: labels,
+      axisLabel: { color: "#c8d8c9" },
+    },
+    yAxis: {
+      type: "value",
+      max: 100,
+      axisLabel: { color: "#c8d8c9", formatter: "{value}%" },
+      splitLine: { lineStyle: { color: "rgba(130,170,160,0.12)" } },
+    },
+    series: [
+      {
+        name: "Stable",
+        type: "bar",
+        data: stable,
+        itemStyle: { color: "rgba(148, 163, 184, 0.72)", borderRadius: [4, 4, 0, 0] },
+      },
+      {
+        name: "Candidate",
+        type: "bar",
+        data: candidate,
+        itemStyle: { color: "#14f195", borderRadius: [4, 4, 0, 0] },
+      },
+    ],
+  };
+}
+
+function promptOptimizationRowMetrics(opportunity: JsonRecord): ExperimentMetricSummary[] {
+  const savedTokens = finiteNumber(opportunity.estimated_saved_tokens_p95);
+  const savedCost = finiteNumber(opportunity.estimated_saved_cost_usd_p95);
+  const p95Chars = finiteNumber(opportunity.p95_chars);
+  const samples = finiteNumber(opportunity.samples);
+  const issueRate = finiteNumber(opportunity.issue_rate);
+  const confidenceTarget = finiteNumber(opportunity.confidence_sample_target);
+  const sampleConfidence = finiteNumber(opportunity.sample_confidence_score);
+  const evidenceParts = [
+    formatSampleCount(samples),
+    confidenceTarget == null
+      ? ""
+      : `target ${Math.round(confidenceTarget).toLocaleString()}`,
+    issueRate == null ? "" : `${formatPercentRatio(issueRate)} issue`,
+  ].filter((part) => part.trim());
+  const hasSavedTokens = savedTokens != null && savedTokens > 0;
+  return [
+    {
+      label: "Estimated p95 savings",
+      value: formatEstimatedTokenSavings(savedTokens),
+      helper:
+        savedCost == null
+          ? "Before GEPA validation"
+          : `${formatApproxMoney(savedCost)} p95 cost estimate`,
+      tone: "good",
+      accent: hasSavedTokens ? `~${Math.round(savedTokens!).toLocaleString()}` : undefined,
+      unit: hasSavedTokens ? "tokens" : undefined,
+    },
+    {
+      label: "Prompt weight",
+      value: p95Chars == null ? "Not measured" : `${Math.round(p95Chars).toLocaleString()} chars`,
+      helper: "Section size at p95",
+      tone: "info",
+      accent: p95Chars == null ? undefined : Math.round(p95Chars).toLocaleString(),
+      unit: p95Chars == null ? undefined : "chars",
+    },
+    {
+      label: "Evidence confidence",
+      value: sampleConfidence == null ? formatSampleCount(samples) : formatPercentRatio(sampleConfidence),
+      helper: evidenceParts.length > 0 ? evidenceParts.join(", ") : "Matched telemetry",
+      tone: sampleConfidence != null && sampleConfidence >= 1 ? "good" : "info",
+      accent: sampleConfidence == null ? undefined : formatPercentRatio(sampleConfidence),
+      progress: sampleConfidence == null ? null : Math.max(0, Math.min(1, sampleConfidence)),
+    },
+  ];
+}
+
+/**
+ * Futuristic-but-clean stat tile: micro uppercase label, a large tabular value
+ * (with a dimmed unit), an optional thin confidence gauge, and a muted helper.
+ * Deliberately borderless — column separation comes from an optional left
+ * hairline divider, not an underline rule per value. AgentArk palette only.
+ */
+function EvolveStat({
+  label,
+  value,
+  helper,
+  tone = "default",
+  accent,
+  unit,
+  progress,
+  divider = false,
+}: {
+  label: string;
+  value: string;
+  helper?: string;
+  tone?: "default" | "good" | "warn" | "info";
+  accent?: string;
+  unit?: string;
+  progress?: number | null;
+  divider?: boolean;
+}) {
+  const valueColor =
+    tone === "good"
+      ? "#aef7cf"
+      : tone === "warn"
+        ? "#ffe0b0"
+        : tone === "info"
+          ? "#eaf4ff"
+          : "#e8f4ff";
+  const gaugeColor =
+    tone === "warn" ? "#ffbe63" : tone === "info" ? "#9cc0ff" : "#14f195";
+  const pct =
+    progress == null ? null : Math.round(Math.max(0, Math.min(1, progress)) * 100);
+  return (
+    <Box
+      sx={{
+        flex: "1 1 0",
+        minWidth: 92,
+        pl: divider ? { xs: 0, md: 2 } : 0,
+        borderLeft: divider
+          ? { xs: "none", md: "1px solid var(--ui-rgba-145-170-205-120)" }
+          : "none",
+      }}
+    >
+      <Typography
+        variant="caption"
+        sx={{
+          color: "var(--text-faint)",
+          display: "block",
+          fontFamily: "var(--font-mono)",
+          fontSize: "0.55rem",
+          letterSpacing: 0.14,
+          textTransform: "uppercase",
+          lineHeight: 1.1,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {label}
+      </Typography>
+      <Box
+        sx={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 0.5,
+          mt: 0.55,
+          minWidth: 0,
+        }}
+      >
+        {accent ? (
+          <>
+            <Box
+              component="span"
+              sx={{
+                fontFamily: "var(--font-mono)",
+                fontWeight: 700,
+                fontSize: "1.2rem",
+                lineHeight: 1,
+                color: valueColor,
+                fontVariantNumeric: "tabular-nums",
+                textShadow: `0 0 18px ${valueColor}2e`,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {accent}
+            </Box>
+            {unit ? (
+              <Box
+                component="span"
+                sx={{
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "0.66rem",
+                  letterSpacing: 0.06,
+                  color: "var(--text-faint)",
+                  textTransform: "uppercase",
+                  flex: "0 0 auto",
+                }}
+              >
+                {unit}
+              </Box>
+            ) : null}
+          </>
+        ) : (
+          <Box
+            component="span"
+            sx={{
+              fontFamily: "var(--font-mono)",
+              fontSize: "0.9rem",
+              fontWeight: 500,
+              color: "var(--text-secondary)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {value}
+          </Box>
+        )}
+      </Box>
+      {pct != null ? (
+        <Box
+          sx={{
+            mt: 0.7,
+            height: 3,
+            maxWidth: 132,
+            borderRadius: 999,
+            background: "var(--ui-rgba-255-255-255-080)",
+            overflow: "hidden",
+          }}
+        >
+          <Box
+            sx={{
+              height: "100%",
+              width: `${pct}%`,
+              borderRadius: 999,
+              background: `linear-gradient(90deg, ${gaugeColor}59, ${gaugeColor})`,
+              boxShadow: `0 0 8px ${gaugeColor}5e`,
+            }}
+          />
+        </Box>
+      ) : null}
+      {helper ? (
+        <Typography
+          variant="caption"
+          sx={{
+            color: "var(--text-secondary)",
+            display: "block",
+            lineHeight: 1.25,
+            fontSize: "0.58rem",
+            mt: 0.55,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {helper}
+        </Typography>
+      ) : null}
+    </Box>
+  );
+}
+
+function promptOpportunityIssueChartOption(opportunity: JsonRecord) {
+  const labels = ["Failed", "Corrected", "Slow", "Expensive"];
+  const values = [
+    num(opportunity.failed_samples, 0),
+    num(opportunity.corrected_samples, 0),
+    num(opportunity.slow_samples, 0),
+    num(opportunity.expensive_samples, 0),
+  ];
+  return {
+    backgroundColor: "transparent",
+    grid: { left: 30, right: 10, top: 12, bottom: 24, containLabel: true },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(14, 18, 14, 0.96)",
+      borderColor: "rgba(120, 242, 176, 0.24)",
+      textStyle: { color: "#fff8ed" },
+    },
+    xAxis: {
+      type: "category",
+      data: labels,
+      axisLabel: { color: "#c8d8c9", fontSize: 10 },
+      axisLine: { lineStyle: { color: "rgba(130,170,160,0.22)" } },
+    },
+    yAxis: {
+      type: "value",
+      axisLabel: { color: "#c8d8c9", fontSize: 10 },
+      splitLine: { lineStyle: { color: "rgba(130,170,160,0.12)" } },
+    },
+    series: [
+      {
+        type: "bar",
+        data: values,
+        itemStyle: { color: "#14f195", borderRadius: [4, 4, 0, 0] },
+      },
+    ],
+  };
+}
+
+function promptHoldoutLatencyChartOption(cases: JsonRecord[]) {
+  const visibleCases = cases.slice(0, 5);
+  const labels = visibleCases.map((_caseRow, idx) => `S${idx + 1}`);
+  const values = visibleCases.map((caseRow) =>
+    Math.max(0, finiteNumber(caseRow.latency_ms) ?? 0),
+  );
+  return {
+    backgroundColor: "transparent",
+    grid: { left: 40, right: 10, top: 12, bottom: 24, containLabel: true },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(14, 18, 14, 0.96)",
+      borderColor: "rgba(120, 242, 176, 0.24)",
+      textStyle: { color: "#fff8ed" },
+      formatter: (items: Array<{ dataIndex: number; value: number }>) => {
+        const first = items[0];
+        const caseRow = visibleCases[first?.dataIndex ?? 0] ?? {};
+        const label = humanizeStatusLabel(str(caseRow.outcome, "sample"));
+        const latency = Math.round(Number(first?.value ?? 0)).toLocaleString();
+        return `${label}<br/>${latency} ms`;
+      },
+    },
+    xAxis: {
+      type: "category",
+      data: labels,
+      axisLabel: { color: "#c8d8c9" },
+      axisLine: { lineStyle: { color: "rgba(130,170,160,0.22)" } },
+    },
+    yAxis: {
+      type: "value",
+      axisLabel: {
+        color: "#c8d8c9",
+        fontSize: 10,
+        formatter: (value: number) => `${Math.round(value / 1000)}k`,
+      },
+      splitLine: { lineStyle: { color: "rgba(130,170,160,0.12)" } },
+    },
+    series: [
+      {
+        type: "bar",
+        data: values,
+        itemStyle: {
+          color: (params: { dataIndex: number }) => {
+            const outcome = str(
+              visibleCases[params.dataIndex]?.outcome,
+              "",
+            ).toLowerCase();
+            if (outcome.includes("expensive")) return "#fbbf24";
+            if (outcome.includes("slow")) return "#60a5fa";
+            if (outcome.includes("failed")) return "#fb7185";
+            if (outcome.includes("corrected")) return "#a78bfa";
+            return "#14f195";
+          },
+          borderRadius: [4, 4, 0, 0],
+        },
+      },
+    ],
+  };
+}
+
+function promptHoldoutCaseLabel(row: JsonRecord): string {
+  const traceId = str(row.trace_id, "").trim();
+  const runId = str(row.run_id, "").trim();
+  return traceId || runId || "Sample";
+}
+
+function PromptDetailSection({
+  tab,
+  active,
+  children,
+}: {
+  tab: PromptDetailTab;
+  active: PromptDetailTab;
+  children: ReactNode;
+}) {
+  if (tab !== active) return null;
+  return <Stack spacing={1.25}>{children}</Stack>;
 }
 
 function ResultSummaryCard({
@@ -711,6 +1383,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<EvolutionPageTab>("review");
   const [showSuperseded, setShowSuperseded] = useState(false);
+  const PROMPT_REVIEW_PAGE_SIZE = 6;
+  const [promptReviewPage, setPromptReviewPage] = useState(0);
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(
     getDeveloperModeEnabled,
   );
@@ -721,6 +1395,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const [technicalDialogProposalId, setTechnicalDialogProposalId] = useState<
     string | null
   >(null);
+  const [promptDetailTab, setPromptDetailTab] =
+    useState<PromptDetailTab>("proposal");
   const [readinessDialog, setReadinessDialog] =
     useState<ReadinessDialogState | null>(null);
   // Default-closed so novice users see the narrative hero first. The
@@ -921,6 +1597,73 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     evolutionDev,
     "prompt_optimization_opportunities",
   );
+  const arkdistillContextSummary = asRecord(
+    evolutionDev.arkdistill_context_summary,
+  );
+  const arkdistillContextSamples = finiteNumber(
+    arkdistillContextSummary.sample_count,
+  );
+  const arkdistillContextTopTools = pickRecords(
+    arkdistillContextSummary,
+    "top_tools",
+  );
+  const arkdistillTopTool = arkdistillContextTopTools[0] ?? {};
+  const arkdistillTopToolLabel = [
+    str(arkdistillTopTool.tool_name, ""),
+    str(arkdistillTopTool.action, ""),
+  ]
+    .filter((part) => part.trim())
+    .join(" / ");
+  const arkdistillSavedTokens = finiteNumber(
+    arkdistillContextSummary.estimated_saved_tokens,
+  );
+  const arkdistillCompressionRatio =
+    finiteNumber(arkdistillContextSummary.savings_percent) == null
+      ? null
+      : finiteNumber(arkdistillContextSummary.savings_percent)! / 100;
+  const arkdistillEvidenceScore = finiteNumber(
+    arkdistillContextSummary.sample_confidence_score,
+  );
+  const arkdistillContextStats: ExperimentMetricSummary[] = [
+    {
+      label: "Saved",
+      value: formatEstimatedTokenSavings(arkdistillSavedTokens),
+      helper: `${Math.round(num(arkdistillContextSummary.saved_chars, 0)).toLocaleString()} chars`,
+      tone: "good",
+      accent:
+        arkdistillSavedTokens != null && arkdistillSavedTokens > 0
+          ? `~${Math.round(arkdistillSavedTokens).toLocaleString()}`
+          : undefined,
+      unit:
+        arkdistillSavedTokens != null && arkdistillSavedTokens > 0 ? "tokens" : undefined,
+    },
+    {
+      label: "Compression",
+      value: formatPercentRatio(arkdistillCompressionRatio),
+      helper: "Observed reduction",
+      tone: "good",
+      accent:
+        arkdistillCompressionRatio == null
+          ? undefined
+          : formatPercentRatio(arkdistillCompressionRatio),
+    },
+    {
+      label: "Evidence",
+      value: formatPercentRatio(arkdistillEvidenceScore),
+      helper: `${formatSampleCount(arkdistillContextSamples)}${
+        arkdistillTopToolLabel ? `, top ${arkdistillTopToolLabel}` : ""
+      }`,
+      tone: "good",
+      accent:
+        arkdistillEvidenceScore == null
+          ? undefined
+          : formatPercentRatio(arkdistillEvidenceScore),
+      progress:
+        arkdistillEvidenceScore == null
+          ? null
+          : Math.max(0, Math.min(1, arkdistillEvidenceScore)),
+    },
+  ];
   const learningCandidates = pickRecords(evolutionDev, "learning_candidates");
   const learningPatterns = pickRecords(evolutionDev, "learning_patterns");
   const learningItems = pickRecords(evolutionDev, "learning_items");
@@ -1501,8 +2244,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 : "Evolve is watching completed work and will ask before it changes behavior.";
   const reviewLifecycleSteps = [
     "Suggested",
-    "Saved for follow-up",
-    "More examples",
+    "Approved",
+    "Background test",
     "Live test",
     "Stable change",
   ];
@@ -2022,7 +2765,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     color={learningEvidenceStatusColor(
                                       card.status,
                                     )}
-                                    label={card.status}
+                                    label={humanizeStatusLabel(card.status)}
                                   />
                                 </TableCell>
                                 <TableCell>
@@ -2081,7 +2824,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       >
         <DialogTitle sx={{ pb: 0.5, display: "flex", alignItems: "center", gap: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
           <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>Observed pattern</Typography>
-          {selectedPatternCard ? <Chip size="small" color={learningEvidenceStatusColor(selectedPatternCard.status)} label={selectedPatternCard.status} /> : null}
+          {selectedPatternCard ? <Chip size="small" color={learningEvidenceStatusColor(selectedPatternCard.status)} label={humanizeStatusLabel(selectedPatternCard.status)} /> : null}
         </DialogTitle>
         <DialogContent>
           {selectedPatternCard ? (
@@ -2474,7 +3217,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                             color={skillEvolutionChipColor(
                               str(row.impact_status, "improved"),
                             )}
-                            label={str(row.impact_status, "improved")}
+                            label={humanizeStatusLabel(str(row.impact_status, "improved"))}
                           />
                         </Stack>
                         <Typography
@@ -2672,7 +3415,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                               color={skillEvolutionChipColor(
                                 str(row.impact_status, "pending"),
                               )}
-                              label={str(row.impact_status, "pending")}
+                              label={humanizeStatusLabel(str(row.impact_status, "pending"))}
                             />
                           </Stack>
                           <Typography
@@ -3299,6 +4042,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 >
                   Improvements Evolve drafted from recent runs. Each one
                   waits on your decision before AgentArk behavior changes.
+                  Ranked by estimated savings and recent slow, costly,
+                  corrected, or failed samples.
                 </Typography>
               </Box>
               <FormControlLabel
@@ -3324,6 +4069,62 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 }}
               />
             </Stack>
+            {arkdistillContextSamples != null && arkdistillContextSamples > 0 ? (
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: {
+                    xs: "1fr",
+                    md: "minmax(220px, 1.2fr) repeat(3, minmax(120px, 0.7fr))",
+                  },
+                  gap: 1,
+                  alignItems: "center",
+                  borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+                  borderBottom: "1px solid var(--ui-rgba-145-170-205-120)",
+                  py: 1,
+                  mb: 1.25,
+                }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "var(--text-faint)",
+                      display: "block",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.62rem",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    ArkDistill context savings
+                  </Typography>
+                  <Typography
+                    variant="body2"
+                    sx={{
+                      color: "var(--text-secondary)",
+                      fontSize: "0.75rem",
+                      lineHeight: 1.35,
+                    }}
+                  >
+                    Tool-result context is being reduced before later prompts.
+                    Prompt-section proposals below stay separate.
+                  </Typography>
+                </Box>
+                {arkdistillContextStats.map((metric, metricIdx) => (
+                  <EvolveStat
+                    key={`arkdistill-context-${metric.label}`}
+                    label={metric.label}
+                    value={metric.value}
+                    helper={metric.helper}
+                    tone={metric.tone}
+                    accent={metric.accent}
+                    unit={metric.unit}
+                    progress={metric.progress}
+                    divider={metricIdx > 0}
+                  />
+                ))}
+              </Box>
+            ) : null}
             {detailLoading ? (
               <Stack
                 direction="row"
@@ -3356,8 +4157,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   color: "text.secondary",
                 }}
               >
-                Nothing is waiting on you right now. Suggestions saved for
-                follow-up are not deployed, so there is nothing to roll back.
+                Nothing is waiting on you right now. Approved suggestions still
+                in background testing are not deployed, so there is nothing to
+                roll back.
               </Typography>
             ) : (
               <Stack spacing={1.5}>
@@ -3583,72 +4385,107 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     </Stack>
                   </Box>
                 ) : null}
-                {visiblePromptOptimizationOpportunities.length > 0 ? (
+                {visiblePromptOptimizationOpportunities.length > 0
+                  ? (() => {
+                      const pageCount = Math.max(
+                        1,
+                        Math.ceil(
+                          visiblePromptOptimizationOpportunities.length /
+                            PROMPT_REVIEW_PAGE_SIZE,
+                        ),
+                      );
+                      const page = Math.min(promptReviewPage, pageCount - 1);
+                      return (
                   <Box>
                     {/* Removed "Suggestions before behavior changes" header.
                         The chip strip already says "Needs review (N)" — a
                         section sub-header below it was redundant. */}
                     <Stack spacing={1}>
-                      {visiblePromptOptimizationOpportunities.map((row, idx) => {
+                      {visiblePromptOptimizationOpportunities
+                        .slice(
+                          page * PROMPT_REVIEW_PAGE_SIZE,
+                          page * PROMPT_REVIEW_PAGE_SIZE + PROMPT_REVIEW_PAGE_SIZE,
+                        )
+                        .map((row, pageIdx) => {
+                        const idx = pageIdx + page * PROMPT_REVIEW_PAGE_SIZE;
                         const proposalId = str(row.id, "");
-                        const reviewStatus = str(row.review_status, "open");
+                        const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
                         const lifecycle = promptProposalLifecycle(row);
                         const lifecycleStatus = promptProposalLifecycleStatus(row);
                         const lifecycleLabel = promptProposalLifecycleLabel(lifecycleStatus);
                         const lifecycleReason = str(lifecycle.reason, "");
+                        const formattedLifecycleReason = formatPromptLifecycleReason(lifecycleReason);
+                        const reasonAccent =
+                          lifecycleStatus === "candidate_rejected" ? "#78f2b0" : "#ffbe63";
                         const lifecycleSamples = num(lifecycle.sample_count, 0);
                         const lifecycleRequiredSamples = num(lifecycle.required_samples, 0);
                         const monitoringSummary = stringList(lifecycle.monitoring_summary);
                         const monitoringRegressions = stringList(lifecycle.monitoring_regressions);
                         const rollbackRecommended = toBool(lifecycle.rollback_recommended);
-                        const lifecycleSamplePct =
-                          lifecycleRequiredSamples > 0
-                            ? Math.min(100, (lifecycleSamples / lifecycleRequiredSamples) * 100)
-                            : 0;
-                        const lifecycleChartOption = {
-                          backgroundColor: "transparent",
-                          grid: { left: 28, right: 16, top: 18, bottom: 26 },
-                          xAxis: {
-                            type: "category",
-                            data: ["Collected", "Required"],
-                            axisLabel: { color: "#c8d8c9" },
-                            axisLine: { lineStyle: { color: "rgba(130,170,160,0.22)" } },
-                          },
-                          yAxis: {
-                            type: "value",
-                            axisLabel: { color: "#c8d8c9" },
-                            splitLine: { lineStyle: { color: "rgba(130,170,160,0.12)" } },
-                          },
-                          series: [
-                            {
-                              type: "bar",
-                              data: [
-                                lifecycleSamples,
-                                lifecycleRequiredSamples || lifecycleSamples,
-                              ],
-                              itemStyle: { color: "#78f2b0", borderRadius: [4, 4, 0, 0] },
-                            },
-                          ],
-                        };
+                        const lifecycleChartOption = promptLifecycleSamplesOption(
+                          lifecycleSamples,
+                          lifecycleRequiredSamples,
+                          lifecycleStatus,
+                        );
+                        const monitoringChartOption = promptMonitoringChartOption(lifecycle);
+                        const metricCards = promptMetricCards(lifecycle);
+                        const outcome = promptProposalOutcome(lifecycle);
+                        // "Measuring" is the no-data fallback of the outcome badge.
+                        // Only surface it as a header tag when the proposal is
+                        // actually in an active before/after test — otherwise a
+                        // never-approved "Needs decision" row misleadingly reads as
+                        // "Measuring" when nothing is being measured for it.
+                        const lifecycleIsActivelyMeasuring =
+                          lifecycleStatus === "running_background_test" ||
+                          lifecycleStatus === "testing";
+                        const showOutcomeTag =
+                          outcome.label.trim().length > 0 &&
+                          (outcome.label !== "Measuring" || lifecycleIsActivelyMeasuring);
+                        const lifecycleTimes = promptLifecycleTimeRows(lifecycle);
                         const riskLevel = str(row.risk_level, "default");
+                        const riskRail =
+                          riskLevel === "high"
+                            ? "#ff9b9b"
+                            : riskLevel === "medium"
+                              ? "#ffbe63"
+                              : "#78f2b0";
                         const evidence = stringList(row.evidence);
                         const expectedBenefit = stringList(row.expected_benefit);
                         const caveats = stringList(row.caveats);
-                        const targetScope = promptProposalScopeLabel(
-                          str(row.target_scope, "prompt_profile"),
-                        );
+                        const opportunity = asRecord(row.opportunity);
+                        const opportunityChartOption = promptOpportunityIssueChartOption(opportunity);
+                        const rowRankLabel = promptOptimizationRankLabel(idx);
+                        const rowMetrics = promptOptimizationRowMetrics(opportunity);
+                        const holdoutCases = pickRecords(opportunity, "holdout_cases");
+                        const footprint = promptOptimizationFootprintValues(opportunity);
+                        const holdoutLatencyChartOption = promptHoldoutLatencyChartOption(holdoutCases);
+                        const promptShare = promptOptimizationShareLabel(opportunity);
+                        const changePreview = asRecord(row.change_preview);
+                        const previewBefore = stringList(changePreview.before);
+                        const previewAfter = stringList(changePreview.after);
+                        const impactEstimate = stringList(changePreview.impact_estimate);
                         const collapsedExplanation =
                           str(row.summary, "").trim() ||
                           expectedBenefit[0] ||
                           evidence[0] ||
                           "Evolve found a possible improvement from recent completed work. Nothing changes unless you approve it.";
-                        const reviewedAt = str(row.reviewed_at, "");
-                        const reviewEvidence =
-                          promptOptimizationReviewEvidence(row);
-                        const canApprove =
-                          !!proposalId &&
-                          reviewStatus !== "approved" &&
-                          reviewStatus !== "rejected";
+                        const isPromptProposalApproved = reviewStatus === "approved";
+                        const isPromptProposalDismissed = reviewStatus === "rejected";
+                        const canApprove = !!proposalId && !isPromptProposalApproved;
+                        const canDismiss =
+                          !!proposalId && !isPromptProposalApproved && !isPromptProposalDismissed;
+                        const decisionValue = isPromptProposalDismissed
+                          ? "Dismissed"
+                          : canApprove
+                            ? "Needs approval"
+                            : lifecycleLabel;
+                        const decisionHelper = isPromptProposalDismissed
+                          ? "Shown under past decisions; you can approve it later."
+                          : canApprove
+                            ? "Nothing changes until you approve it."
+                            : lifecycleStatus === "candidate_rejected"
+                              ? "Candidate was not promoted by the background evaluation gates."
+                            : "State is tracked through the lifecycle.";
                         const canManagePromptCanary =
                           !!proposalId &&
                           str(lifecycle.live_surface, "") === "prompt" &&
@@ -3656,70 +4493,156 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                             lifecycleStatus === "test_regression" ||
                             lifecycleStatus === "deployed" ||
                             lifecycleStatus === "rollback_suggested");
+                        const hasEnoughLifecycleSamples =
+                          lifecycleRequiredSamples <= 0 ||
+                          lifecycleSamples >= lifecycleRequiredSamples;
+                        const blockedByTerminalGepaJob =
+                          lifecycleStatus === "blocked" &&
+                          str(lifecycle.job_status, "").trim().toLowerCase() === "blocked";
+                        const blockedByActiveGepaWork =
+                          lifecycleStatus === "blocked" &&
+                          str(lifecycle.job_status, "").trim().toLowerCase() ===
+                            "blocked_by_active_gepa_work";
+                        const canRunPromptBackgroundTest =
+                          !!proposalId &&
+                          reviewStatus === "approved" &&
+                          hasEnoughLifecycleSamples &&
+                          lifecycleStatus === "approved_waiting_for_more_examples";
+                        const canRetryPromptBackgroundTest =
+                          !!proposalId &&
+                          reviewStatus === "approved" &&
+                          hasEnoughLifecycleSamples &&
+                          (lifecycleStatus === "blocked" ||
+                            lifecycleStatus === "candidate_rejected") &&
+                          !blockedByTerminalGepaJob &&
+                          !blockedByActiveGepaWork;
+                        const openPromptProposalDialog = () => {
+                          if (!proposalId) return;
+                          setPromptDetailTab(
+                            canManagePromptCanary || lifecycleStatus === "deployed"
+                              ? "deployment"
+                              : canRunPromptBackgroundTest || canRetryPromptBackgroundTest
+                                ? "background"
+                                : lifecycleStatus === "candidate_rejected"
+                                  ? "candidate"
+                                : "proposal",
+                          );
+                          setTechnicalDialogProposalId(proposalId);
+                        };
                         return (
-                          <Accordion
-                            disableGutters
+                          <Box
                             key={`prompt-proposal-${proposalId || idx}`}
-                            sx={{
-                              border: "1px solid var(--ui-rgba-145-170-205-120)",
-                              borderLeft: "3px solid rgba(20, 241, 149, 0.72)",
-                              borderRadius: 1,
-                              bgcolor: "rgba(8, 14, 24, 0.28)",
-                              "&::before": { display: "none" },
-                              "&.Mui-expanded": { my: 0 },
-                            }}
                           >
-                            <AccordionSummary
-                              expandIcon={<ExpandMoreIcon sx={{ color: "text.secondary" }} />}
-                              sx={{
-                                px: 1.75,
-                                py: 0.25,
-                                "& .MuiAccordionSummary-content": {
-                                  alignItems: "flex-start",
-                                  gap: 1.25,
-                                  my: 1,
-                                  minWidth: 0,
+                            <Box
+                              component="button"
+                              type="button"
+                              onClick={openPromptProposalDialog}
+                            sx={{
+                                width: "100%",
+                                border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                borderLeft: `3px solid ${riskRail}`,
+                                borderRadius: 1.5,
+                                background:
+                                  "linear-gradient(135deg, rgba(16, 24, 32, 0.55), rgba(8, 12, 18, 0.32))",
+                                boxShadow: `inset 3px 0 16px -7px ${riskRail}`,
+                                px: 1.9,
+                                py: 1.4,
+                                appearance: "none",
+                                color: "inherit",
+                                fontFamily: "inherit",
+                                textAlign: "left",
+                                cursor: proposalId ? "pointer" : "default",
+                                display: "flex",
+                                flexDirection: { xs: "column", md: "row" },
+                                alignItems: { xs: "stretch", md: "flex-start" },
+                                gap: 1.5,
+                                transition:
+                                  "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease",
+                                "&:hover": {
+                                  background: proposalId
+                                    ? "linear-gradient(135deg, rgba(22, 32, 42, 0.66), rgba(11, 17, 25, 0.42))"
+                                    : "linear-gradient(135deg, rgba(16, 24, 32, 0.55), rgba(8, 12, 18, 0.32))",
+                                  borderColor: "rgba(120, 242, 176, 0.28)",
+                                  boxShadow: proposalId
+                                    ? `inset 3px 0 16px -7px ${riskRail}, 0 10px 34px -20px rgba(20, 241, 149, 0.5)`
+                                    : `inset 3px 0 16px -7px ${riskRail}`,
                                 },
-                                "& .MuiAccordionSummary-expandIconWrapper": {
-                                  alignSelf: "center",
+                                "&:focus-visible": {
+                                  outline: "2px solid rgba(120, 242, 176, 0.8)",
+                                  outlineOffset: 2,
                                 },
                               }}
                             >
                               <Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0.35 }}>
-                                <Stack
-                                  direction="row"
-                                  spacing={1}
-                                  sx={{ alignItems: "baseline", minWidth: 0 }}
+                                <Box
+                                  sx={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 0.85,
+                                    minWidth: 0,
+                                    flexWrap: "wrap",
+                                  }}
                                 >
-                                  <Typography
-                                    variant="caption"
+                                  <Box
+                                    component="span"
+                                    sx={{
+                                      color: idx === 0 ? "#78f2b0" : "var(--text-faint)",
+                                      fontFamily: "var(--font-mono)",
+                                      fontSize: "0.6rem",
+                                      fontWeight: idx === 0 ? 700 : 500,
+                                      textTransform: "uppercase",
+                                      letterSpacing: 0.12,
+                                      lineHeight: 1.2,
+                                      whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    {rowRankLabel}
+                                  </Box>
+                                  <Box
+                                    component="span"
+                                    sx={{ color: "var(--text-faint)", fontSize: "0.6rem", opacity: 0.7 }}
+                                  >
+                                    ·
+                                  </Box>
+                                  <Box
+                                    component="span"
                                     sx={{
                                       color: "var(--text-faint)",
                                       fontFamily: "var(--font-mono)",
-                                      fontSize: "0.62rem",
+                                      fontSize: "0.6rem",
                                       textTransform: "uppercase",
-                                      letterSpacing: 0.08,
-                                      flex: "0 0 auto",
+                                      letterSpacing: 0.1,
                                       lineHeight: 1.2,
+                                      whiteSpace: "nowrap",
                                     }}
                                   >
                                     {lifecycleLabel}
-                                  </Typography>
-                                  <Typography
-                                    variant="caption"
-                                    sx={{
-                                      color: "var(--text-secondary)",
-                                      fontFamily: "var(--font-mono)",
-                                      fontSize: "0.62rem",
-                                      textTransform: "uppercase",
-                                      letterSpacing: 0.08,
-                                      flex: "0 0 auto",
-                                      lineHeight: 1.2,
-                                    }}
-                                  >
-                                    {targetScope} | {promptProposalSampleLabel(lifecycle)}
-                                  </Typography>
-                                </Stack>
+                                  </Box>
+                                  {showOutcomeTag ? (
+                                    <>
+                                      <Box
+                                        component="span"
+                                        sx={{ color: "var(--text-faint)", fontSize: "0.6rem", opacity: 0.7 }}
+                                      >
+                                        ·
+                                      </Box>
+                                      <Box
+                                        component="span"
+                                        sx={{
+                                          color: "var(--text-secondary)",
+                                          fontFamily: "var(--font-mono)",
+                                          fontSize: "0.6rem",
+                                          textTransform: "uppercase",
+                                          letterSpacing: 0.1,
+                                          lineHeight: 1.2,
+                                          whiteSpace: "nowrap",
+                                        }}
+                                      >
+                                        {outcome.label}
+                                      </Box>
+                                    </>
+                                  ) : null}
+                                </Box>
                                 <Typography
                                   variant="subtitle2"
                                   sx={{
@@ -3745,30 +4668,46 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     whiteSpace: "nowrap",
                                   }}
                                 >
-                                  Why it is here: {collapsedExplanation}
+                                  {expectedBenefit[0] || collapsedExplanation}
                                 </Typography>
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "var(--text-dim)",
-                                    fontSize: "0.72rem",
-                                  }}
-                                >
-                                  {lifecycleReason ||
-                                    (rollbackRecommended
-                                      ? "Monitoring found a regression; rollback is recommended."
-                                      : "") ||
-                                    (canApprove
-                                      ? "Nothing changes until you approve this."
-                                      : "Approved work stays attached here while it is sampled, tested, deployed, or rolled back.")}
-                                </Typography>
+                                {lifecycleStatus === "blocked" || rollbackRecommended ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: rollbackRecommended ? "#fbbf24" : "var(--text-dim)",
+                                      fontSize: "0.72rem",
+                                    }}
+                                  >
+                                    {formattedLifecycleReason ||
+                                      "Monitoring found a regression; rollback is recommended."}
+                                  </Typography>
+                                ) : null}
                               </Box>
-                              <Chip
-                                size="small"
-                                color={promptProposalLifecycleColor(lifecycleStatus)}
-                                label={lifecycleLabel}
-                                sx={{ flex: "0 0 auto", alignSelf: "center" }}
-                              />
+                              <Box
+                                sx={{
+                                  display: "flex",
+                                  alignItems: "flex-start",
+                                  flexWrap: { xs: "wrap", md: "nowrap" },
+                                  gap: { xs: 1.75, md: 0 },
+                                  width: { xs: "100%", md: "min(46%, 540px)" },
+                                  flex: { md: "0 0 min(46%, 540px)" },
+                                  alignSelf: "center",
+                                }}
+                              >
+                                {rowMetrics.map((metric, metricIdx) => (
+                                  <EvolveStat
+                                    key={`${proposalId}-row-metric-${metric.label}`}
+                                    label={metric.label}
+                                    value={metric.value}
+                                    helper={metric.helper}
+                                    tone={metric.tone}
+                                    accent={metric.accent}
+                                    unit={metric.unit}
+                                    progress={metric.progress}
+                                    divider={metricIdx > 0}
+                                  />
+                                ))}
+                              </Box>
                               {/* Inline risk indicator — coloured dot + label,
                                   no chip background. Reads as part of the row,
                                   not as a clickable element. */}
@@ -3776,22 +4715,20 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                 sx={{
                                   display: "flex",
                                   alignItems: "center",
-                                  gap: 0.6,
+                                  gap: 0.65,
                                   flex: "0 0 auto",
+                                  alignSelf: "center",
                                   pr: 1,
                                 }}
                               >
                                 <Box
                                   sx={{
-                                    width: 8,
-                                    height: 8,
+                                    width: 7,
+                                    height: 7,
                                     borderRadius: "50%",
-                                    background:
-                                      riskLevel === "high"
-                                        ? "#ff9b9b"
-                                        : riskLevel === "medium"
-                                          ? "#ffbe63"
-                                          : "#78f2b0",
+                                    background: riskRail,
+                                    boxShadow: `0 0 8px ${riskRail}`,
+                                    flex: "0 0 auto",
                                   }}
                                 />
                                 <Typography
@@ -3799,152 +4736,278 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                   sx={{
                                     color: "var(--text-secondary)",
                                     fontFamily: "var(--font-mono)",
-                                    fontSize: "0.7rem",
-                                    letterSpacing: 0.4,
+                                    fontSize: "0.62rem",
+                                    letterSpacing: 0.18,
                                     textTransform: "uppercase",
+                                    whiteSpace: "nowrap",
                                   }}
                                 >
                                   {`${riskLevel || "unknown"} risk`}
                                 </Typography>
                               </Box>
-                            </AccordionSummary>
-                            <AccordionDetails sx={{ pt: 0, px: 1.5, pb: 1.5 }}>
-                              <Stack spacing={1.2}>
-                                {/* The two "Current state" / "Rollback" info
-                                    boxes that used to sit here duplicated the
-                                    lifecycle progress bar below. Dropped them.
-                                    The progress bar IS the state, and rollback
-                                    isn't relevant until a live test exists. */}
-                                <EvolutionLifecycle
-                                  steps={reviewLifecycleSteps}
-                                  activeIndex={promptProposalLifecycleStep(lifecycleStatus)}
-                                />
-                                {!canApprove ? (
-                                  <Box>
-                                    <Typography
-                                      variant="caption"
-                                      sx={{ color: "text.secondary", display: "block", mb: 0.35 }}
-                                    >
-                                      Sampling progress
-                                    </Typography>
-                                    <Box
-                                      sx={{
-                                        height: 7,
-                                        borderRadius: 999,
-                                        overflow: "hidden",
-                                        bgcolor: "rgba(130,170,160,0.16)",
-                                      }}
-                                    >
-                                      <Box
-                                        sx={{
-                                          width: `${lifecycleSamplePct}%`,
-                                          height: "100%",
-                                          bgcolor:
-                                            lifecycleStatus === "blocked"
-                                              ? "#fb7185"
-                                              : "#78f2b0",
-                                        }}
-                                      />
-                                    </Box>
-                                    <Typography
-                                      variant="caption"
-                                      sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
-                                    >
-                                      {promptProposalSampleLabel(lifecycle)}
-                                    </Typography>
-                                  </Box>
-                                ) : null}
-                                <Typography variant="body2">
-                                  {str(row.summary, "Evolve found a reviewable prompt improvement.")}
-                                </Typography>
-                                {expectedBenefit[0] ? (
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    <strong style={{ color: "var(--text-primary)" }}>Benefit:</strong>{" "}
-                                    {expectedBenefit[0]}
-                                  </Typography>
-                                ) : null}
-                                {caveats[0] ? (
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    <strong style={{ color: "var(--text-primary)" }}>Watch out:</strong>{" "}
-                                    {caveats[0]}
-                                  </Typography>
-                                ) : null}
-                                {reviewedAt ? (
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Reviewed {formatTimestampForHumans(reviewedAt).label}
-                                  </Typography>
-                                ) : null}
-                                <Stack
-                                  direction="row"
-                                  spacing={0.75}
-                                  sx={{ justifyContent: "flex-end", flexWrap: "wrap", pt: 0.5 }}
-                                >
-                                  <Button
-                                    size="small"
-                                    variant="text"
-                                    onClick={() => setTechnicalDialogProposalId(proposalId)}
-                                  >
-                                    Review details
-                                  </Button>
-                                  <Button
-                                    size="small"
-                                    color="inherit"
-                                    disabled={runEvolutionActionMutation.isPending || !canApprove}
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action: "reject_prompt_optimization_proposal",
-                                          candidate_id: proposalId,
-                                        },
-                                        "Suggestion dismissed. AgentArk behavior has not changed.",
-                                      )
-                                    }
-                                  >
-                                    Dismiss
-                                  </Button>
-                                  <Button
-                                    size="small"
-                                    variant="contained"
-                                    disabled={runEvolutionActionMutation.isPending || !canApprove}
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action: "approve_prompt_optimization_proposal",
-                                          candidate_id: proposalId,
-                                        },
-                                        "Saved for follow-up. Background optimization is now attached to this row.",
-                                      )
-                                    }
-                                  >
-                                    Save for follow-up
-                                  </Button>
-                                  {!canApprove && canManagePromptCanary ? (
-                                    <Button
-                                      size="small"
-                                      variant="contained"
-                                      color={lifecycleStatus === "deployed" ? "inherit" : "primary"}
-                                      onClick={() => setTechnicalDialogProposalId(proposalId)}
-                                    >
-                                      {lifecycleStatus === "deployed"
-                                        ? "Manage deployed"
-                                        : lifecycleStatus === "rollback_suggested"
-                                          ? "Review rollback"
-                                        : "Open test"}
-                                    </Button>
-                                  ) : null}
-                                </Stack>
-                              </Stack>
-                            </AccordionDetails>
+                              <Box
+                                aria-hidden
+                                sx={{
+                                  flex: "0 0 auto",
+                                  alignSelf: "center",
+                                  color: "var(--text-faint)",
+                                  fontFamily: "var(--font-mono)",
+                                  fontSize: "1.1rem",
+                                  lineHeight: 1,
+                                  pr: 0.5,
+                                }}
+                              >
+                                ›
+                              </Box>
+                            </Box>
                             <Dialog
                               open={technicalDialogProposalId === proposalId}
                               onClose={() => setTechnicalDialogProposalId(null)}
-                              maxWidth="md"
+                              maxWidth="lg"
                               fullWidth
                             >
-                              <DialogTitle>{str(row.title, "Evolve change")}</DialogTitle>
+                              <DialogTitle>
+                                <Stack spacing={0.6}>
+                                  <Stack
+                                    direction={{ xs: "column", md: "row" }}
+                                    spacing={1}
+                                    sx={{
+                                      alignItems: { xs: "flex-start", md: "center" },
+                                      justifyContent: "space-between",
+                                    }}
+                                  >
+                                    <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 750 }}>
+                                      {str(row.title, "Evolve change")}
+                                    </Typography>
+                                    <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap" }}>
+                                      <Chip
+                                        size="small"
+                                        color={promptProposalLifecycleColor(lifecycleStatus)}
+                                        label={lifecycleLabel}
+                                      />
+                                      <Chip
+                                        size="small"
+                                        color={promptProposalRiskColor(riskLevel)}
+                                        label={`${riskLevel || "unknown"} risk`}
+                                      />
+                                    </Stack>
+                                  </Stack>
+                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                    {collapsedExplanation}
+                                  </Typography>
+                                </Stack>
+                              </DialogTitle>
                               <DialogContent>
-                                <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
-                                <Stack spacing={1.25} sx={{ mt: 2 }}>
+                                <Box sx={{ borderBottom: 1, borderColor: "divider", mt: 2, mb: 1.5 }}>
+                                  <Tabs
+                                    value={promptDetailTab}
+                                    onChange={(_event, next) => setPromptDetailTab(next as PromptDetailTab)}
+                                    variant="scrollable"
+                                    allowScrollButtonsMobile
+                                  >
+                                    <Tab value="proposal" label="Proposal" />
+                                    <Tab value="background" label="Background Test" />
+                                    <Tab value="candidate" label="Candidate" />
+                                    <Tab value="deployment" label="Deployment" />
+                                    <Tab value="monitoring" label="Monitoring" />
+                                  </Tabs>
+                                </Box>
+                                <PromptDetailSection tab="proposal" active={promptDetailTab}>
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: { xs: "1fr", md: "repeat(3, minmax(0, 1fr))" },
+                                      gap: 0.75,
+                                    }}
+                                  >
+                                    <ResultSummaryCard
+                                      label="Estimated p95 savings"
+                                      value={formatEstimatedTokenSavings(
+                                        finiteNumber(opportunity.estimated_saved_tokens_p95),
+                                      )}
+                                      helper={
+                                        finiteNumber(opportunity.estimated_saved_cost_usd_p95) == null
+                                          ? "Before GEPA validation"
+                                          : `${formatApproxMoney(finiteNumber(opportunity.estimated_saved_cost_usd_p95))} p95 cost estimate`
+                                      }
+                                      tone="good"
+                                    />
+                                    <ResultSummaryCard
+                                      label="Prompt footprint"
+                                      value={promptShare}
+                                      helper={
+                                        finiteNumber(opportunity.p95_chars) == null
+                                          ? "Waiting for section telemetry."
+                                          : `${Math.round(num(opportunity.p95_chars, 0)).toLocaleString()} chars at p95`
+                                      }
+                                      tone={promptShare === "-" ? "info" : "warn"}
+                                    />
+                                    <ResultSummaryCard
+                                      label="Decision"
+                                      value={decisionValue}
+                                      helper={decisionHelper}
+                                      tone={canApprove && !isPromptProposalDismissed ? "warn" : "info"}
+                                    />
+                                  </Box>
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: {
+                                        xs: "1fr",
+                                        lg: "0.8fr 1fr 1fr",
+                                      },
+                                      gap: 1,
+                                    }}
+                                  >
+                                    <Box
+                                      sx={{
+                                        minWidth: 0,
+                                        border: "1px solid rgba(145, 170, 205, 0.16)",
+                                        borderRadius: 1,
+                                        p: 1.1,
+                                        bgcolor: "rgba(148, 163, 184, 0.04)",
+                                      }}
+                                    >
+                                      <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 0.5 }}>
+                                        Prompt footprint
+                                      </Typography>
+                                      <Typography
+                                        variant="body2"
+                                        sx={{ color: "text.secondary", mb: 0.75 }}
+                                      >
+                                        Target section is {promptShare} of the p95 prompt.
+                                      </Typography>
+                                      <Box
+                                        sx={{
+                                          height: 10,
+                                          borderRadius: 999,
+                                          overflow: "hidden",
+                                          bgcolor: "rgba(148, 163, 184, 0.24)",
+                                          display: "flex",
+                                        }}
+                                      >
+                                        <Box
+                                          sx={{
+                                            width: `${footprint.sharePercent}%`,
+                                            bgcolor: "#14f195",
+                                          }}
+                                        />
+                                      </Box>
+                                      <Stack spacing={0.55} sx={{ mt: 1 }}>
+                                        <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between" }}>
+                                          <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                            Target section
+                                          </Typography>
+                                          <Typography variant="caption" sx={{ color: "#e8f4ff", fontWeight: 700 }}>
+                                            {Math.round(footprint.sectionChars).toLocaleString()} chars
+                                          </Typography>
+                                        </Stack>
+                                        <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between" }}>
+                                          <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                            Rest of prompt
+                                          </Typography>
+                                          <Typography variant="caption" sx={{ color: "#e8f4ff", fontWeight: 700 }}>
+                                            {Math.round(footprint.restChars).toLocaleString()} chars
+                                          </Typography>
+                                        </Stack>
+                                      </Stack>
+                                    </Box>
+                                    <Box
+                                      sx={{
+                                        minWidth: 0,
+                                        border: "1px solid rgba(145, 170, 205, 0.16)",
+                                        borderRadius: 1,
+                                        p: 1,
+                                        bgcolor: "rgba(148, 163, 184, 0.04)",
+                                      }}
+                                    >
+                                      <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 0.5 }}>
+                                        Issue concentration
+                                      </Typography>
+                                      <ReactECharts
+                                        option={opportunityChartOption}
+                                        style={{ height: 160, width: "100%" }}
+                                      />
+                                    </Box>
+                                    <Box
+                                      sx={{
+                                        minWidth: 0,
+                                        border: "1px solid rgba(145, 170, 205, 0.16)",
+                                        borderRadius: 1,
+                                        p: 1,
+                                        bgcolor: "rgba(148, 163, 184, 0.04)",
+                                      }}
+                                    >
+                                      <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 0.5 }}>
+                                        Validation samples
+                                      </Typography>
+                                      {holdoutCases.length > 0 ? (
+                                        <ReactECharts
+                                          option={holdoutLatencyChartOption}
+                                          style={{ height: 160, width: "100%" }}
+                                        />
+                                      ) : (
+                                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                          Waiting for enough outcome-heavy samples to build a validation set.
+                                        </Typography>
+                                      )}
+                                    </Box>
+                                  </Box>
+                                  <Accordion
+                                    disableGutters
+                                    sx={{
+                                      border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                      borderRadius: 1,
+                                      bgcolor: "rgba(8, 14, 24, 0.24)",
+                                      "&::before": { display: "none" },
+                                    }}
+                                  >
+                                    <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                                      <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 650 }}>
+                                        Evidence details
+                                      </Typography>
+                                    </AccordionSummary>
+                                    <AccordionDetails sx={{ pt: 0 }}>
+                                      <Box
+                                        sx={{
+                                          display: "grid",
+                                          gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                          gap: 1,
+                                        }}
+                                      >
+                                        {[
+                                          ["What Evolve saw", evidence],
+                                          ["Why this may help", expectedBenefit],
+                                          ["What GEPA will try", previewAfter],
+                                          ["Checks before rollout", caveats],
+                                        ].map(([label, lines]) => {
+                                          const detailLines = Array.isArray(lines)
+                                            ? lines
+                                            : [];
+                                          return detailLines.length > 0 ? (
+                                            <Box key={`${proposalId}-details-${label}`}>
+                                              <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.35 }}>
+                                                {label}
+                                              </Typography>
+                                              <Stack spacing={0.35}>
+                                                {detailLines.slice(0, 4).map((line, lineIdx) => (
+                                                  <Typography
+                                                    key={`${proposalId}-detail-${label}-${lineIdx}`}
+                                                    variant="caption"
+                                                    sx={{ color: "#fff8ed", display: "block" }}
+                                                  >
+                                                    - {line}
+                                                  </Typography>
+                                                ))}
+                                              </Stack>
+                                            </Box>
+                                          ) : null;
+                                        })}
+                                      </Box>
+                                    </AccordionDetails>
+                                  </Accordion>
+                                </PromptDetailSection>
+                                <PromptDetailSection tab="background" active={promptDetailTab}>
                                   <Box
                                     sx={{
                                       display: "grid",
@@ -3952,53 +5015,254 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                       gap: 1,
                                     }}
                                   >
-                                    <Box
-                                      sx={{
-                                        p: 1,
-                                        border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                        borderRadius: 1,
-                                      }}
-                                    >
-                                      <Typography
-                                        variant="caption"
-                                        sx={{ color: "text.secondary", display: "block" }}
-                                      >
-                                        Lifecycle
+                                    <Box>
+                                      <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 0.5 }}>
+                                        Stage
                                       </Typography>
-                                      <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                                        {lifecycleLabel}
-                                      </Typography>
-                                      <Typography
-                                        variant="caption"
-                                        sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
-                                      >
-                                        {lifecycleReason || "No blocker recorded."}
-                                      </Typography>
+                                      <EvolutionLifecycle
+                                        steps={reviewLifecycleSteps}
+                                        activeIndex={promptProposalLifecycleStep(lifecycleStatus)}
+                                      />
+                                      <Box sx={{ mt: 1 }}>
+                                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                          Job: {humanizeStatusLabel(str(lifecycle.job_status, "not queued"))}
+                                        </Typography>
+                                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                          Samples: {promptProposalSampleLabel(lifecycle)}
+                                        </Typography>
+                                        {formattedLifecycleReason ? (
+                                          <Box
+                                            sx={{
+                                              mt: 1,
+                                              p: 1,
+                                              border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                              borderLeft: `3px solid ${reasonAccent}`,
+                                              borderRadius: 1,
+                                              background: "rgba(8, 14, 24, 0.36)",
+                                            }}
+                                          >
+                                            <Typography
+                                              variant="caption"
+                                              sx={{
+                                                color: reasonAccent,
+                                                display: "block",
+                                                fontFamily: "var(--font-mono)",
+                                                fontWeight: 700,
+                                                letterSpacing: 0.12,
+                                                textTransform: "uppercase",
+                                                mb: 0.35,
+                                              }}
+                                            >
+                                              Reason
+                                            </Typography>
+                                            <Typography variant="body2" sx={{ color: "#e8f4ff" }}>
+                                              {formattedLifecycleReason}
+                                            </Typography>
+                                          </Box>
+                                        ) : null}
+                                      </Box>
+                                      {lifecycleTimes.length > 0 ? (
+                                        <Stack spacing={0.35} sx={{ mt: 1 }}>
+                                          {lifecycleTimes.map((item) => (
+                                            <Typography
+                                              key={`${proposalId}-time-${item.label}`}
+                                              variant="caption"
+                                              sx={{ color: "text.secondary" }}
+                                            >
+                                              {item.label}: {item.value}
+                                            </Typography>
+                                          ))}
+                                        </Stack>
+                                      ) : null}
                                     </Box>
-                                    <Box
-                                      sx={{
-                                        p: 1,
-                                        border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                        borderRadius: 1,
-                                      }}
-                                    >
-                                      <Typography
-                                        variant="caption"
-                                        sx={{ color: "text.secondary", display: "block" }}
-                                      >
-                                        Evidence samples
-                                      </Typography>
-                                      <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                                        {promptProposalSampleLabel(lifecycle)}
-                                      </Typography>
-                                      <Typography
-                                        variant="caption"
-                                        sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
-                                      >
-                                        Job: {str(lifecycle.job_status, "not queued")}
-                                      </Typography>
-                                    </Box>
+                                    <ReactECharts
+                                      option={lifecycleChartOption}
+                                      style={{ height: 220, width: "100%" }}
+                                    />
                                   </Box>
+                                </PromptDetailSection>
+                                <PromptDetailSection tab="candidate" active={promptDetailTab}>
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: { xs: "1fr", md: "repeat(3, minmax(0, 1fr))" },
+                                      gap: 0.75,
+                                    }}
+                                  >
+                                    <ResultSummaryCard
+                                      label="Context reduction"
+                                      value={
+                                        finiteNumber(opportunity.estimated_saved_tokens_p95) == null
+                                          ? impactEstimate[0]
+                                            ? "Estimated"
+                                            : "Not measured yet"
+                                          : `${Math.round(num(opportunity.estimated_saved_tokens_p95, 0)).toLocaleString()} tokens`
+                                      }
+                                      helper={impactEstimate[0] || "Needs structured token/context delta from GEPA run output."}
+                                      tone={finiteNumber(opportunity.estimated_saved_tokens_p95) != null || impactEstimate[0] ? "good" : "info"}
+                                    />
+                                    <ResultSummaryCard
+                                      label="Cost impact"
+                                      value={formatApproxMoney(finiteNumber(opportunity.estimated_saved_cost_usd_p95))}
+                                      helper={
+                                        finiteNumber(opportunity.p95_cost_usd) == null
+                                          ? "Waiting for cost-bearing samples."
+                                          : `Matching samples reached ${formatApproxMoney(finiteNumber(opportunity.p95_cost_usd))} p95 cost.`
+                                      }
+                                      tone={finiteNumber(opportunity.estimated_saved_cost_usd_p95) != null ? "good" : "info"}
+                                    />
+                                    <ResultSummaryCard
+                                      label="Safety posture"
+                                      value={toBool(row.reversible) ? "Reversible" : "Needs care"}
+                                      helper="Prompt/profile changes stay reviewable and rollbackable."
+                                      tone={toBool(row.reversible) ? "good" : "warn"}
+                                    />
+                                  </Box>
+                                  {(previewBefore.length > 0 || previewAfter.length > 0) ? (
+                                    <Box
+                                      sx={{
+                                        display: "grid",
+                                        gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                        gap: 1,
+                                      }}
+                                    >
+                                      <Box>
+                                        <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 0.5 }}>
+                                          Before
+                                        </Typography>
+                                        <Stack spacing={0.5}>
+                                          {previewBefore.map((line, lineIdx) => (
+                                            <Typography
+                                              key={`${proposalId}-before-${lineIdx}`}
+                                              variant="body2"
+                                              sx={{ color: "text.secondary" }}
+                                            >
+                                              {line}
+                                            </Typography>
+                                          ))}
+                                        </Stack>
+                                      </Box>
+                                      <Box>
+                                        <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 0.5 }}>
+                                          Candidate direction
+                                        </Typography>
+                                        <Stack spacing={0.5}>
+                                          {previewAfter.map((line, lineIdx) => (
+                                            <Typography
+                                              key={`${proposalId}-after-${lineIdx}`}
+                                              variant="body2"
+                                              sx={{ color: "text.secondary" }}
+                                            >
+                                              {line}
+                                            </Typography>
+                                          ))}
+                                        </Stack>
+                                      </Box>
+                                    </Box>
+                                  ) : null}
+                                  {impactEstimate.length > 0 ? (
+                                    <Box>
+                                      <Typography variant="subtitle2" sx={{ color: "#e8f4ff", mb: 0.5 }}>
+                                        Estimated impact
+                                      </Typography>
+                                      <Stack spacing={0.5}>
+                                        {impactEstimate.map((line, lineIdx) => (
+                                          <Typography
+                                            key={`${proposalId}-impact-${lineIdx}`}
+                                            variant="body2"
+                                            sx={{ color: "text.secondary" }}
+                                          >
+                                            {line}
+                                          </Typography>
+                                        ))}
+                                      </Stack>
+                                    </Box>
+                                  ) : null}
+                                </PromptDetailSection>
+                                <PromptDetailSection tab="deployment" active={promptDetailTab}>
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: { xs: "1fr", md: "repeat(3, minmax(0, 1fr))" },
+                                      gap: 0.75,
+                                    }}
+                                  >
+                                    <ResultSummaryCard
+                                      label="Live state"
+                                      value={lifecycleLabel}
+                                      helper={str(lifecycle.live_surface, "") ? `Surface: ${str(lifecycle.live_surface, "")}` : "Not live yet."}
+                                      tone={canManagePromptCanary ? "good" : "info"}
+                                    />
+                                    <ResultSummaryCard
+                                      label="Rollout"
+                                      value={finiteNumber(lifecycle.rollout_percent) == null ? "-" : `${num(lifecycle.rollout_percent, 0)}%`}
+                                      helper="Canary rollout share for live prompt tests."
+                                      tone="info"
+                                    />
+                                    <ResultSummaryCard
+                                      label="Rollback"
+                                      value={toBool(lifecycle.rollback_available) ? "Available" : "Not available"}
+                                      helper={rollbackRecommended ? "Rollback is recommended." : "Rollback appears here after stable deployment."}
+                                      tone={rollbackRecommended ? "warn" : "info"}
+                                    />
+                                  </Box>
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                      gap: 1,
+                                    }}
+                                  >
+                                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                      Stable: {str(lifecycle.baseline_version, "-")}
+                                    </Typography>
+                                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                      Candidate: {str(lifecycle.candidate_version, "-")}
+                                    </Typography>
+                                  </Box>
+                                  {(lifecycleStatus === "blocked" ||
+                                    lifecycleStatus === "candidate_rejected") &&
+                                  formattedLifecycleReason ? (
+                                    <Alert
+                                      severity={lifecycleStatus === "candidate_rejected" ? "info" : "warning"}
+                                      sx={{ borderRadius: 1 }}
+                                    >
+                                      <Typography variant="body2" sx={{ fontWeight: 650, mb: 0.35 }}>
+                                        {lifecycleStatus === "candidate_rejected"
+                                          ? "Candidate was not promoted"
+                                          : "Block reason"}
+                                      </Typography>
+                                      <Typography variant="body2">
+                                        {formattedLifecycleReason}
+                                      </Typography>
+                                    </Alert>
+                                  ) : null}
+                                </PromptDetailSection>
+                                <PromptDetailSection tab="monitoring" active={promptDetailTab}>
+                                  <Box
+                                    sx={{
+                                      display: "grid",
+                                      gridTemplateColumns: {
+                                        xs: "1fr 1fr",
+                                        md: "repeat(4, minmax(0, 1fr))",
+                                      },
+                                      gap: 0.75,
+                                    }}
+                                  >
+                                    {metricCards.map((metric) => (
+                                      <ResultSummaryCard
+                                        key={`${proposalId}-metric-${metric.label}`}
+                                        label={metric.label}
+                                        value={metric.value}
+                                        helper={metric.helper}
+                                        tone={metric.tone}
+                                      />
+                                    ))}
+                                  </Box>
+                                  <ReactECharts
+                                    option={monitoringChartOption}
+                                    style={{ height: 240, width: "100%" }}
+                                  />
                                   {monitoringRegressions.length > 0 ? (
                                     <Alert
                                       severity={rollbackRecommended ? "error" : "warning"}
@@ -4030,188 +5294,44 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                       </Stack>
                                     </Alert>
                                   ) : null}
-                                  <Box
-                                    sx={{
-                                      display: "grid",
-                                      gridTemplateColumns: {
-                                        xs: "1fr 1fr",
-                                        md: "repeat(4, minmax(0, 1fr))",
-                                      },
-                                      gap: 0.75,
-                                    }}
-                                  >
-                                    {[
-                                      {
-                                        label: "Baseline success",
-                                        value: formatPercentRatio(
-                                          finiteNumber(lifecycle.baseline_success_rate),
-                                        ),
-                                        helper: `${num(lifecycle.baseline_samples, 0).toLocaleString()} samples`,
-                                      },
-                                      {
-                                        label: "Candidate success",
-                                        value: formatPercentRatio(
-                                          finiteNumber(lifecycle.candidate_success_rate),
-                                        ),
-                                        helper: `${num(lifecycle.candidate_samples, 0).toLocaleString()} samples`,
-                                      },
-                                      {
-                                        label: "Tool success",
-                                        value: formatPercentRatio(
-                                          finiteNumber(lifecycle.candidate_tool_success_rate),
-                                        ),
-                                        helper: `Stable ${formatPercentRatio(finiteNumber(lifecycle.baseline_tool_success_rate))}`,
-                                      },
-                                      {
-                                        label: "p95 latency",
-                                        value: finiteNumber(lifecycle.candidate_p95_latency_ms) == null
-                                          ? "-"
-                                          : `${Math.round(num(lifecycle.candidate_p95_latency_ms, 0)).toLocaleString()} ms`,
-                                        helper: finiteNumber(lifecycle.baseline_p95_latency_ms) == null
-                                          ? "Stable -"
-                                          : `Stable ${Math.round(num(lifecycle.baseline_p95_latency_ms, 0)).toLocaleString()} ms`,
-                                      },
-                                    ].map((metric) => (
-                                      <Box
-                                        key={`${proposalId}-monitoring-${metric.label}`}
-                                        sx={{
-                                          minWidth: 0,
-                                          p: 1,
-                                          border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                          borderRadius: 1,
-                                          bgcolor: "rgba(8, 14, 24, 0.38)",
-                                        }}
-                                      >
-                                        <Typography
-                                          variant="caption"
-                                          sx={{
-                                            color: "text.secondary",
-                                            display: "block",
-                                            lineHeight: 1.35,
-                                          }}
-                                        >
-                                          {metric.label}
-                                        </Typography>
-                                        <Typography
-                                          variant="body2"
-                                          sx={{
-                                            color: "#e8f4ff",
-                                            fontWeight: 700,
-                                            mt: 0.2,
-                                            wordBreak: "break-word",
-                                          }}
-                                        >
-                                          {metric.value}
-                                        </Typography>
-                                        <Typography
-                                          variant="caption"
-                                          sx={{
-                                            color: "text.secondary",
-                                            display: "block",
-                                            mt: 0.25,
-                                            lineHeight: 1.4,
-                                          }}
-                                        >
-                                          {metric.helper}
-                                        </Typography>
-                                      </Box>
-                                    ))}
-                                  </Box>
-                                  <ReactECharts
-                                    option={lifecycleChartOption}
-                                    style={{ height: 180, width: "100%" }}
-                                  />
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ color: "text.secondary" }}
-                                  >
-                                    Target area: {targetScope}
-                                  </Typography>
-                                  {str(lifecycle.baseline_version, "") ||
-                                  str(lifecycle.candidate_version, "") ? (
-                                    <Box
-                                      sx={{
-                                        display: "grid",
-                                        gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
-                                        gap: 1,
-                                      }}
-                                    >
-                                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                        Stable: {str(lifecycle.baseline_version, "-")}
-                                      </Typography>
-                                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                        Candidate: {str(lifecycle.candidate_version, "-")}
-                                      </Typography>
-                                    </Box>
-                                  ) : null}
-                                  {evidence.length > 0 ? (
-                                    <Box>
-                                      <Typography
-                                        variant="body2"
-                                        sx={{
-                                          color: "text.secondary",
-                                          mb: 0.5,
-                                          fontWeight: 600,
-                                        }}
-                                      >
-                                        Evidence
-                                      </Typography>
-                                      <Stack spacing={0.5}>
-                                        {evidence.map((line, lineIdx) => (
-                                          <Typography
-                                            key={`${proposalId}-evidence-${lineIdx}`}
-                                            variant="body2"
-                                            sx={{ color: "text.secondary" }}
-                                          >
-                                            {line}
-                                          </Typography>
-                                        ))}
-                                      </Stack>
-                                    </Box>
-                                  ) : null}
-                                  {expectedBenefit.length > 1 ? (
-                                    <Box>
-                                      <Typography
-                                        variant="body2"
-                                        sx={{
-                                          color: "text.secondary",
-                                          mb: 0.5,
-                                          fontWeight: 600,
-                                        }}
-                                      >
-                                        More expected benefits
-                                      </Typography>
-                                      <Stack spacing={0.5}>
-                                        {expectedBenefit.slice(1).map((line, lineIdx) => (
-                                          <Typography
-                                            key={`${proposalId}-benefit-${lineIdx}`}
-                                            variant="body2"
-                                            sx={{ color: "text.secondary" }}
-                                          >
-                                            {line}
-                                          </Typography>
-                                        ))}
-                                      </Stack>
-                                    </Box>
-                                  ) : null}
-                                  {caveats.length > 1 ? (
-                                    <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                                      <Stack spacing={0.5}>
-                                        {caveats.slice(1).map((line, lineIdx) => (
-                                          <Typography
-                                            key={`${proposalId}-caveat-${lineIdx}`}
-                                            variant="body2"
-                                            sx={{ display: "block" }}
-                                          >
-                                            {line}
-                                          </Typography>
-                                        ))}
-                                      </Stack>
-                                    </Alert>
-                                  ) : null}
-                                </Stack>
+                                </PromptDetailSection>
                               </DialogContent>
                               <DialogActions>
+                                {canDismiss ? (
+                                  <Button
+                                    color="inherit"
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "reject_prompt_optimization_proposal",
+                                          candidate_id: proposalId,
+                                        },
+                                        "Suggestion dismissed. AgentArk behavior has not changed.",
+                                        "Dismiss this suggestion? It will move to past decisions, and you can still approve it later from Show past decisions.",
+                                      )
+                                    }
+                                  >
+                                    Dismiss
+                                  </Button>
+                                ) : null}
+                                {canApprove ? (
+                                  <Button
+                                    variant="contained"
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "approve_prompt_optimization_proposal",
+                                          candidate_id: proposalId,
+                                        },
+                                        "Approved for the next stage. Background optimization is now attached to this row.",
+                                      )
+                                    }
+                                  >
+                                    Approve next stage
+                                  </Button>
+                                ) : null}
                                 {canManagePromptCanary &&
                                 (lifecycleStatus === "testing" ||
                                   lifecycleStatus === "test_regression") ? (
@@ -4276,6 +5396,25 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     Roll back
                                   </Button>
                                 ) : null}
+                                {canRunPromptBackgroundTest || canRetryPromptBackgroundTest ? (
+                                  <Button
+                                    variant="contained"
+                                    disabled={runEvolutionActionMutation.isPending}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "approve_prompt_optimization_proposal",
+                                          candidate_id: proposalId,
+                                        },
+                                        "Background test queued.",
+                                      )
+                                    }
+                                  >
+                                    {canRetryPromptBackgroundTest
+                                      ? "Retry background test"
+                                      : "Run background test"}
+                                  </Button>
+                                ) : null}
                                 <Button
                                   onClick={() =>
                                     setTechnicalDialogProposalId(null)
@@ -4285,12 +5424,129 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                 </Button>
                               </DialogActions>
                             </Dialog>
-                          </Accordion>
+                          </Box>
                         );
                       })}
                     </Stack>
+                    {pageCount > 1 ? (
+                      <Box
+                        sx={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 2,
+                          mt: 1.5,
+                          pt: 1,
+                          borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+                        }}
+                      >
+                        <Typography
+                          sx={{
+                            fontFamily: "var(--font-mono)",
+                            fontSize: "0.66rem",
+                            color: "var(--text-faint)",
+                            letterSpacing: 0.04,
+                          }}
+                        >
+                          {`Showing ${page * PROMPT_REVIEW_PAGE_SIZE + 1}–${Math.min(
+                            (page + 1) * PROMPT_REVIEW_PAGE_SIZE,
+                            visiblePromptOptimizationOpportunities.length,
+                          )} of ${visiblePromptOptimizationOpportunities.length} proposals`}
+                        </Typography>
+                        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                          <Button
+                            size="small"
+                            variant="text"
+                            disabled={page <= 0}
+                            onClick={() =>
+                              setPromptReviewPage((p) => Math.max(0, p - 1))
+                            }
+                            sx={{
+                              minWidth: 28,
+                              height: 28,
+                              px: 0.75,
+                              borderRadius: "7px",
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "0.95rem",
+                              color: "var(--text-faint)",
+                              border: "1px solid transparent",
+                              "&:hover": {
+                                borderColor: "var(--ui-rgba-145-170-205-120)",
+                                color: "#78f2b0",
+                              },
+                              "&.Mui-disabled": { opacity: 0.35 },
+                            }}
+                            aria-label="Previous page"
+                          >
+                            ‹
+                          </Button>
+                          {Array.from({ length: pageCount }).map((_unused, i) => (
+                            <Button
+                              key={`prompt-review-page-${i}`}
+                              size="small"
+                              variant="text"
+                              onClick={() => setPromptReviewPage(i)}
+                              sx={{
+                                minWidth: 30,
+                                height: 28,
+                                px: 0.75,
+                                borderRadius: "7px",
+                                fontFamily: "var(--font-mono)",
+                                fontSize: "0.72rem",
+                                color: i === page ? "#78f2b0" : "var(--text-secondary)",
+                                border:
+                                  i === page
+                                    ? "1px solid rgba(120, 242, 176, 0.4)"
+                                    : "1px solid transparent",
+                                background:
+                                  i === page ? "rgba(120, 242, 176, 0.08)" : "transparent",
+                                "&:hover": {
+                                  borderColor:
+                                    i === page
+                                      ? "rgba(120, 242, 176, 0.4)"
+                                      : "var(--ui-rgba-145-170-205-120)",
+                                  color: i === page ? "#78f2b0" : "var(--text-primary)",
+                                },
+                              }}
+                            >
+                              {i + 1}
+                            </Button>
+                          ))}
+                          <Button
+                            size="small"
+                            variant="text"
+                            disabled={page >= pageCount - 1}
+                            onClick={() =>
+                              setPromptReviewPage((p) =>
+                                Math.min(pageCount - 1, p + 1),
+                              )
+                            }
+                            sx={{
+                              minWidth: 28,
+                              height: 28,
+                              px: 0.75,
+                              borderRadius: "7px",
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "0.95rem",
+                              color: "var(--text-faint)",
+                              border: "1px solid transparent",
+                              "&:hover": {
+                                borderColor: "var(--ui-rgba-145-170-205-120)",
+                                color: "#78f2b0",
+                              },
+                              "&.Mui-disabled": { opacity: 0.35 },
+                            }}
+                            aria-label="Next page"
+                          >
+                            ›
+                          </Button>
+                        </Box>
+                      </Box>
+                    ) : null}
                   </Box>
-                ) : null}
+                      );
+                    })()
+                  : null}
                 {skillReviewItems.length > 0 ? (
                   <Box>
                     <Typography

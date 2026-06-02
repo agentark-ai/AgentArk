@@ -1,5 +1,6 @@
 import { Box, Button, Card, CardContent, Chip, Collapse, Stack, Typography } from "@mui/material";
 import { useState } from "react";
+import { humanizeStatusLabel } from "../lib/displayLabels";
 import type { TraceSummary } from "../types";
 import { formatChannelSource } from "./channelLabels";
 
@@ -53,7 +54,7 @@ function statusLabel(status: string): string {
   if (normalized.includes("completed") || normalized.includes("done") || normalized.includes("success")) return "done";
   if (normalized.includes("fail") || normalized.includes("error")) return "failed";
   if (normalized.includes("running") || normalized.includes("progress")) return "running";
-  return status || "done";
+  return humanizeStatusLabel(status, "Done");
 }
 
 export function ActivityFeed({ traces, onViewAll }: Props) {

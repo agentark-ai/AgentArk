@@ -1,7 +1,7 @@
 //! Home Assistant integration.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ impl HomeAssistantConnector {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| crate::core::net::build_outgoing_http_client(15)),
             config_dir,
         }
     }

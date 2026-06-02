@@ -1328,7 +1328,7 @@ export default function TasksPage({ autoRefresh }: TasksPageProps) {
                       taskKind(selectedTask as Task | null | undefined) ===
                       "reminder"
                         ? `Type: ${taskKindLabel(selectedTask as Task | null | undefined)}`
-                        : `Action: ${str(selectedTask?.action, "-")}`
+                        : `Action: ${taskActionDisplay(selectedTask as Task | null | undefined)}`
                     }
                     sx={{
                       borderColor: "var(--ui-rgba-255-255-255-140)",

@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+pub mod deployment_cadence;
 pub mod gepa_bridge;
 pub mod policy_evolution;
 pub mod promotion_gate;

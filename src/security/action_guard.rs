@@ -6,7 +6,7 @@
 //! 3. **Permission Model** — Capability declarations with risk-based enforcement
 //! 4. **Injection Detection** — Prompt manipulation scanning in skill markdown files
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use regex::Regex;
@@ -1344,11 +1344,9 @@ mod tests {
             .collect();
 
         assert!(!credential_findings.is_empty());
-        assert!(
-            credential_findings
-                .iter()
-                .all(|finding| finding.is_contextual_import_signal())
-        );
+        assert!(credential_findings
+            .iter()
+            .all(|finding| finding.is_contextual_import_signal()));
         assert_eq!(result.threat_level, ThreatLevel::Clean);
     }
 
@@ -1368,12 +1366,10 @@ mod tests {
         assert_eq!(result.threat_level, ThreatLevel::Clean);
 
         let bare_tilde = guard.analyze_content("# Note\n\nUse ~ as a shorthand marker.\n");
-        assert!(
-            !bare_tilde
-                .findings
-                .iter()
-                .any(|finding| matches!(finding.category, FindingCategory::FileSystemEscape))
-        );
+        assert!(!bare_tilde
+            .findings
+            .iter()
+            .any(|finding| matches!(finding.category, FindingCategory::FileSystemEscape)));
     }
 
     #[test]
@@ -1395,11 +1391,9 @@ mod tests {
             .await;
         assert!(result.detected);
         assert!(result.should_block);
-        assert!(
-            result
-                .matched_patterns
-                .contains(&"semantic-review-unavailable".to_string())
-        );
+        assert!(result
+            .matched_patterns
+            .contains(&"semantic-review-unavailable".to_string()));
     }
 
     #[test]
@@ -1438,16 +1432,12 @@ mod tests {
         };
         let result = guard.semantic_review_result_from_policy(review);
         assert!(result.should_block);
-        assert!(
-            result
-                .matched_patterns
-                .contains(&"unknown-high-risk".to_string())
-        );
-        assert!(
-            result
-                .matched_patterns
-                .contains(&"policy:block-unknown-high-risk".to_string())
-        );
+        assert!(result
+            .matched_patterns
+            .contains(&"unknown-high-risk".to_string()));
+        assert!(result
+            .matched_patterns
+            .contains(&"policy:block-unknown-high-risk".to_string()));
     }
 
     #[test]

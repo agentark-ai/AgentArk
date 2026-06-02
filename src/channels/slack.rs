@@ -2,7 +2,7 @@
 //!
 //! This module is intentionally self-contained so it can be wired into the
 //! channel tree later without changing shared glue files.
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::core::Agent;
 use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
+use crate::core::Agent;
 use crate::storage::Storage;
 
 type SharedAgent = Arc<RwLock<Agent>>;

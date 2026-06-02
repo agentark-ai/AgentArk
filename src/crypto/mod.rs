@@ -58,9 +58,12 @@ impl KeyManager {
         OsRng.fill_bytes(&mut generated);
 
         match atomic_write_file_if_absent(keyfile_path, &generated)? {
-            true => Ok(Self {
-                key: Zeroizing::new(generated),
-            }),
+            true => {
+                harden_keyfile_permissions(keyfile_path)?;
+                Ok(Self {
+                    key: Zeroizing::new(generated),
+                })
+            }
             false => Self::load_existing_keyfile(keyfile_path),
         }
     }
@@ -71,6 +74,7 @@ impl KeyManager {
                 Ok(key_data) if key_data.len() == KEY_LEN => {
                     let mut key = [0u8; KEY_LEN];
                     key.copy_from_slice(&key_data);
+                    harden_keyfile_permissions(keyfile_path)?;
                     return Ok(Self {
                         key: Zeroizing::new(key),
                     });
@@ -284,6 +288,45 @@ pub(crate) fn atomic_write_file_if_absent(path: &Path, contents: &[u8]) -> Resul
         }
         Err(error) => Err(anyhow!("Failed to atomically create {:?}: {}", path, error)),
     }
+}
+
+#[cfg(unix)]
+fn harden_keyfile_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn harden_keyfile_permissions(path: &Path) -> Result<()> {
+    let principal = std::env::var("USERDOMAIN")
+        .ok()
+        .zip(std::env::var("USERNAME").ok())
+        .map(|(domain, user)| format!("{domain}\\{user}"))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Unable to determine current Windows user for keyfile ACL"))?;
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{principal}:(F)"))
+        .arg("*S-1-5-18:(F)")
+        .arg("*S-1-5-32-544:(F)")
+        .status()
+        .map_err(|error| anyhow!("Failed to run icacls for keyfile ACL: {}", error))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "Failed to restrict Windows ACL on keyfile {:?}: icacls exited with {}",
+            path,
+            status
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn harden_keyfile_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

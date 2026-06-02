@@ -65,12 +65,20 @@ async fn build_test_state() -> (AppState, TempDir, TempDir) {
         public_app_bind_addr: None,
         public_app_base_url: None,
         release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
+        voice_sessions: Arc::new(RwLock::new(crate::core::VoiceSessionRegistry::default())),
+        webhook_dispatcher: webhooks::WebhookDispatchHandle::disabled(),
     };
     (state, config_dir, data_dir)
 }
 
 fn loopback_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45678)
+}
+
+#[test]
+fn browser_session_cleanup_cadence_runs_inside_idle_reaper_window() {
+    assert!(BROWSER_SESSION_CLEANUP_STARTUP_DELAY <= BROWSER_SESSION_CLEANUP_INTERVAL);
+    assert!(BROWSER_SESSION_CLEANUP_INTERVAL <= Duration::from_secs(5 * 60));
 }
 
 #[test]
@@ -235,6 +243,7 @@ async fn app_guard_page_uses_post_form() {
     .unwrap();
 
     assert!(body.contains(r#"<form method="POST" action="/apps/guarded/">"#));
+    assert!(body.contains(r#"<img class="mascot-logo" src="/logo.svg" alt="AgentArk mascot">"#));
     assert!(!body.contains(r#"<form method="GET""#));
 }
 
@@ -828,6 +837,56 @@ async fn chat_quick_path_controls_notifications_without_live_server() {
     ignore = "requires explicit isolated Postgres test database"
 )]
 #[tokio::test]
+async fn chat_stream_rejects_overlapping_active_conversation_run() {
+    let (state, _config_dir, _data_dir) = build_test_state().await;
+    create_test_conversation_with_user_message(&state, "conv-active", "start work").await;
+    let (sender, _rx) = tokio::sync::watch::channel(false);
+    try_register_chat_conversation_cancellation_sender(
+        &state,
+        "conv-active",
+        "run-existing",
+        sender.clone(),
+    )
+    .await
+    .expect("active run should register");
+
+    let router = Router::new()
+        .route("/chat/stream", post(chat_stream))
+        .with_state(state.clone());
+    let body = serde_json::json!({
+        "message": "status please",
+        "channel": "web",
+        "conversation_id": "conv-active",
+        "deep_research": false,
+        "execution_mode": serde_json::Value::Null,
+        "attachments_present": false
+    });
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/chat/stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8990))));
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let payload = response_json(response).await;
+    assert_eq!(payload["active_run_id"].as_str(), Some("run-existing"));
+    assert_eq!(
+        active_chat_conversation_request_id(&state, "conv-active").await,
+        Some("run-existing".to_string())
+    );
+    assert!(!*sender.borrow());
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires explicit isolated Postgres test database"
+)]
+#[tokio::test]
 async fn chat_stream_quick_path_stores_secret_without_live_server() {
     let (state, config_dir, data_dir) = build_test_state().await;
     let router = Router::new()
@@ -1285,6 +1344,8 @@ fn normalize_stream_event_for_sse_preserves_model_tool_start_payload() {
                 "arguments": {
                     "query": "agent memory systems comparison"
                 },
+                "activity_label": "Research agent memory systems",
+                "display_label": "Research agent memory systems",
                 "intent_summary": "Starting research with query: agent memory systems comparison."
             })),
         },
@@ -1313,6 +1374,14 @@ fn normalize_stream_event_for_sse_preserves_model_tool_start_payload() {
     assert_eq!(
         payload.get("intent_summary").and_then(|v| v.as_str()),
         Some("Starting research with query: agent memory systems comparison.")
+    );
+    assert_eq!(
+        payload.get("activity_label").and_then(|v| v.as_str()),
+        Some("Research agent memory systems")
+    );
+    assert_eq!(
+        payload.get("display_label").and_then(|v| v.as_str()),
+        Some("Research agent memory systems")
     );
 }
 
@@ -1485,6 +1554,33 @@ fn summarize_stream_tool_activity_content_unwraps_nested_raw_payloads() {
 }
 
 #[test]
+fn summarize_stream_tool_activity_content_shows_nested_result_payload() {
+    let content = serde_json::json!({
+        "kind": "model_tool_result",
+        "ok": true,
+        "summary": "Returned structured data: kind, ok, result_preview, summary.",
+        "result_preview": {
+            "items": [
+                {
+                    "title": "Linear API authentication",
+                    "url": "https://developers.linear.app/docs/graphql/working-with-the-graphql-api"
+                }
+            ],
+            "access_token": "secret-token-value-12345",
+            "owner_email": "person@example.com"
+        }
+    })
+    .to_string();
+
+    let summary = summarize_stream_tool_activity_content(&content);
+
+    assert!(summary.contains("Linear API authentication"));
+    assert!(!summary.contains("Returned structured data"));
+    assert!(!summary.contains("secret-token-value"));
+    assert!(!summary.contains("person@example.com"));
+}
+
+#[test]
 fn normalize_stream_event_for_sse_preserves_draft_file_progress_payload() {
     let (event, next_state) = normalize_stream_event_for_sse(
         crate::core::StreamEvent::ToolProgress {
@@ -1640,7 +1736,6 @@ fn chat_stream_worker_request_marks_pre_persisted_user_message() {
             conversation_id: None,
             deep_research: false,
             execution_profile: None,
-            plan_confirmation_mode: None,
             execution_mode: None,
             attachments_present: false,
             attachments: Vec::new(),
@@ -3282,6 +3377,112 @@ fn test_operational_log(
     }
 }
 
+fn test_prompt_trace(
+    id: &str,
+    duration_ms: i32,
+    total_tokens: i32,
+    cost_usd: f64,
+    success: bool,
+    final_prompt_chars: usize,
+    estimated_total_request_chars: usize,
+    sections: serde_json::Value,
+) -> crate::storage::ExecutionTraceSummaryRow {
+    let mut steps = vec![crate::core::ExecutionStep {
+        icon: "Activity".to_string(),
+        title: "Prompt telemetry".to_string(),
+        detail: "Recorded prompt telemetry".to_string(),
+        step_type: "info".to_string(),
+        data: Some(
+            serde_json::json!({
+                "trace_kind": "prompt_telemetry",
+                "final_system_prompt_chars": final_prompt_chars,
+                "tool_schema_chars": 4_200,
+                "estimated_total_request_chars": estimated_total_request_chars,
+                "tool_count": 8,
+                "sections": sections,
+            })
+            .to_string(),
+        ),
+        timestamp: chrono::Utc::now(),
+        duration_ms: Some(duration_ms.max(0) as u64),
+    }];
+    if !success {
+        steps.push(crate::core::ExecutionStep {
+            icon: "Alert".to_string(),
+            title: "Execution failed".to_string(),
+            detail: "Structured failure signal".to_string(),
+            step_type: "error".to_string(),
+            data: None,
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    crate::storage::ExecutionTraceSummaryRow {
+        id: id.to_string(),
+        message: format!("trace {id}"),
+        channel: "chat".to_string(),
+        started_at: Some("2026-01-01T00:00:00Z".to_string()),
+        completed_at: Some("2026-01-01T00:00:10Z".to_string()),
+        duration_ms: Some(duration_ms),
+        step_count: steps.len() as i32,
+        steps_json: serde_json::to_string(&steps).unwrap(),
+        model: Some("agent_turn_loop".to_string()),
+        total_tokens,
+        cost_usd,
+        complexity: Some("agent_turn_loop".to_string()),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
+fn test_arkdistill_trace(
+    id: &str,
+    primitive: &str,
+    action: &str,
+    original_chars: usize,
+    distilled_chars: usize,
+    saved_tokens: usize,
+) -> crate::storage::ExecutionTraceSummaryRow {
+    let saved_chars = original_chars.saturating_sub(distilled_chars);
+    let steps = vec![crate::core::ExecutionStep {
+        icon: "[distill]".to_string(),
+        title: "ArkDistill Context Savings".to_string(),
+        detail: "Recorded ArkDistill context savings".to_string(),
+        step_type: "info".to_string(),
+        data: Some(
+            serde_json::json!({
+                "trace_kind": "arkdistill_telemetry",
+                "primitive": primitive,
+                "action": action,
+                "original_chars": original_chars,
+                "distilled_chars": distilled_chars,
+                "saved_chars": saved_chars,
+                "estimated_original_tokens": original_chars.div_ceil(4),
+                "estimated_distilled_tokens": distilled_chars.div_ceil(4),
+                "estimated_saved_tokens": saved_tokens,
+                "estimated_prompt_cost_saved_usd": 0.001,
+            })
+            .to_string(),
+        ),
+        timestamp: chrono::Utc::now(),
+        duration_ms: Some(0),
+    }];
+    crate::storage::ExecutionTraceSummaryRow {
+        id: id.to_string(),
+        message: format!("trace {id}"),
+        channel: "chat".to_string(),
+        started_at: Some("2026-01-01T00:00:00Z".to_string()),
+        completed_at: Some("2026-01-01T00:00:10Z".to_string()),
+        duration_ms: Some(1000),
+        step_count: steps.len() as i32,
+        steps_json: serde_json::to_string(&steps).unwrap(),
+        model: Some("agent_turn_loop".to_string()),
+        total_tokens: 1000,
+        cost_usd: 0.01,
+        complexity: Some("agent_turn_loop".to_string()),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
 #[test]
 fn aggregate_policy_version_metrics_uses_current_policy_for_unversioned_logs() {
     let rows = vec![
@@ -3545,13 +3746,13 @@ fn build_prompt_insights_surfaces_end_to_end_regressions() {
 #[test]
 fn build_prompt_optimization_opportunities_include_change_preview() {
     let summary = PromptTelemetrySummary {
-        sample_count: 8,
+        sample_count: 12,
         p95_final_prompt_chars: 31_862,
         p95_tool_schema_chars: 59_986,
         p95_estimated_total_request_chars: 93_042,
         top_sections: vec![PromptTelemetrySectionSummary {
             section: "runtime_access_summary".to_string(),
-            samples: 8,
+            samples: 12,
             avg_chars: 1_640.0,
             p50_chars: 1_540,
             p95_chars: 1_962,
@@ -3562,6 +3763,7 @@ fn build_prompt_optimization_opportunities_include_change_preview() {
     let proposals = build_prompt_optimization_opportunities(
         &summary,
         &[],
+        &[],
         &PromptOptimizationReviewState::new(),
         &serde_json::json!({}),
         None,
@@ -3569,8 +3771,8 @@ fn build_prompt_optimization_opportunities_include_change_preview() {
     );
     let proposal = proposals
         .iter()
-        .find(|item| item.id == "prompt-opt-runtime-summary-compact")
-        .expect("runtime summary proposal should exist");
+        .find(|item| item.id == "prompt-opt-section-runtime-access-summary")
+        .expect("runtime access telemetry section proposal should exist");
 
     assert!(proposal
         .change_preview
@@ -3581,12 +3783,764 @@ fn build_prompt_optimization_opportunities_include_change_preview() {
         .change_preview
         .after
         .iter()
-        .any(|line| line.contains("compact runtime-access profile")));
+        .any(|line| line.contains("smaller representation")));
     assert!(proposal
         .change_preview
         .impact_estimate
         .iter()
         .any(|line| line.contains("6.2%")));
+}
+
+#[test]
+fn build_prompt_optimization_opportunities_surface_arbitrary_large_prompt_sections() {
+    let summary = PromptTelemetrySummary {
+        sample_count: 12,
+        p95_final_prompt_chars: 42_000,
+        p95_tool_schema_chars: 8_400,
+        p95_estimated_total_request_chars: 71_000,
+        top_sections: vec![PromptTelemetrySectionSummary {
+            section: "custom_integration_context".to_string(),
+            samples: 10,
+            avg_chars: 2_700.0,
+            p50_chars: 2_500,
+            p95_chars: 3_800,
+        }],
+        ..PromptTelemetrySummary::default()
+    };
+
+    let proposals = build_prompt_optimization_opportunities(
+        &summary,
+        &[],
+        &[],
+        &PromptOptimizationReviewState::new(),
+        &serde_json::json!({}),
+        None,
+        false,
+    );
+
+    let proposal = proposals
+        .iter()
+        .find(|item| item.id == "prompt-opt-section-custom-integration-context")
+        .expect("large arbitrary prompt section should surface as an optimization opportunity");
+
+    assert!(proposal.title.contains("Custom Integration Context"));
+    assert!(proposal
+        .evidence
+        .iter()
+        .any(|line| line.contains("custom_integration_context")));
+    assert!(proposal
+        .change_preview
+        .impact_estimate
+        .iter()
+        .any(|line| line.contains("9.0%")));
+}
+
+#[test]
+fn prompt_optimization_opportunities_prioritize_outcome_heavy_user_sections() {
+    let traces = vec![
+        test_prompt_trace(
+            "trace-slow-fail",
+            9_200,
+            16_000,
+            0.034,
+            false,
+            30_000,
+            55_000,
+            serde_json::json!({
+                "custom_integration_context": 2_700,
+            }),
+        ),
+        test_prompt_trace(
+            "trace-slow-ok",
+            8_800,
+            15_000,
+            0.031,
+            true,
+            29_000,
+            53_000,
+            serde_json::json!({
+                "custom_integration_context": 2_600,
+            }),
+        ),
+        test_prompt_trace(
+            "trace-expensive-ok",
+            7_500,
+            14_000,
+            0.029,
+            true,
+            28_000,
+            51_000,
+            serde_json::json!({
+                "custom_integration_context": 2_500,
+            }),
+        ),
+        test_prompt_trace(
+            "trace-large-healthy-a",
+            900,
+            5_000,
+            0.006,
+            true,
+            31_000,
+            42_000,
+            serde_json::json!({
+                "large_reference_block": 4_900,
+            }),
+        ),
+        test_prompt_trace(
+            "trace-large-healthy-b",
+            850,
+            5_100,
+            0.006,
+            true,
+            31_500,
+            43_000,
+            serde_json::json!({
+                "large_reference_block": 5_000,
+            }),
+        ),
+        test_prompt_trace(
+            "trace-large-healthy-c",
+            820,
+            5_200,
+            0.006,
+            true,
+            32_000,
+            44_000,
+            serde_json::json!({
+                "large_reference_block": 5_100,
+            }),
+        ),
+    ];
+    let summary = aggregate_prompt_telemetry_summary_with_traces(&[], &traces);
+    let profiles = aggregate_prompt_optimization_opportunity_profiles(&[], &traces);
+
+    let proposals = build_prompt_optimization_opportunities(
+        &summary,
+        &profiles,
+        &[],
+        &PromptOptimizationReviewState::new(),
+        &serde_json::json!({}),
+        None,
+        false,
+    );
+
+    let first = proposals
+        .first()
+        .expect("outcome-heavy proposal should exist");
+    assert_eq!(first.id, "prompt-opt-section-custom-integration-context");
+    let opportunity = first
+        .opportunity
+        .as_ref()
+        .expect("proposal should expose opportunity metrics");
+    assert_eq!(opportunity.section, "custom_integration_context");
+    assert!(opportunity.failed_samples > 0);
+    assert!(opportunity.slow_samples > 0);
+    assert!(opportunity.expensive_samples > 0);
+    assert!(opportunity.estimated_saved_tokens_p95 > 0);
+    assert!(opportunity
+        .holdout_cases
+        .iter()
+        .any(|case| case.trace_id.as_deref() == Some("trace-slow-fail")));
+}
+
+#[test]
+fn aggregate_arkdistill_context_summary_uses_trace_telemetry() {
+    let traces = vec![
+        test_arkdistill_trace("distill-a", "fetch", "page_fetch", 12_000, 3_000, 2_250),
+        test_arkdistill_trace("distill-b", "fetch", "page_fetch", 8_000, 4_000, 1_000),
+        test_arkdistill_trace(
+            "distill-c",
+            "browser",
+            "browser_snapshot",
+            5_000,
+            4_000,
+            250,
+        ),
+    ];
+
+    let summary = aggregate_arkdistill_context_summary_with_traces(&traces);
+
+    assert_eq!(summary.sample_count, 3);
+    assert_eq!(summary.original_chars, 25_000);
+    assert_eq!(summary.distilled_chars, 11_000);
+    assert_eq!(summary.saved_chars, 14_000);
+    assert_eq!(summary.estimated_saved_tokens, 3_500);
+    assert!(summary.savings_percent > 50.0);
+    assert!(summary.confidence_sample_target >= summary.sample_count);
+    assert!(summary.sample_confidence_score > 0.0);
+    assert_eq!(summary.top_tools[0].tool_name, "fetch");
+    assert_eq!(summary.top_tools[0].estimated_saved_tokens, 3_250);
+}
+
+#[test]
+fn prompt_optimization_risk_is_not_inflated_by_issue_rate_alone() {
+    let summary = PromptTelemetrySummary {
+        sample_count: 16,
+        p95_final_prompt_chars: 22_625,
+        p95_tool_schema_chars: 8_400,
+        p95_estimated_total_request_chars: 71_000,
+        top_sections: vec![
+            PromptTelemetrySectionSummary {
+                section: "action_catalog".to_string(),
+                samples: 16,
+                avg_chars: 20_900.0,
+                p50_chars: 20_700,
+                p95_chars: 21_502,
+            },
+            PromptTelemetrySectionSummary {
+                section: "spine_runtime_active_primary_response_profile".to_string(),
+                samples: 16,
+                avg_chars: 3_400.0,
+                p50_chars: 3_350,
+                p95_chars: 3_570,
+            },
+        ],
+        ..PromptTelemetrySummary::default()
+    };
+    let profiles = summary
+        .top_sections
+        .iter()
+        .map(|section| PromptOptimizationOpportunityProfile {
+            section: section.section.clone(),
+            label: section.section.clone(),
+            samples: 16,
+            slow_samples: 8,
+            expensive_samples: 9,
+            issue_rate: 0.6875,
+            p50_chars: section.p50_chars,
+            p95_chars: section.p95_chars,
+            p95_final_prompt_chars: summary.p95_final_prompt_chars,
+            p95_total_request_chars: summary.p95_estimated_total_request_chars,
+            estimated_saved_tokens_p95: section.p95_chars.div_ceil(4),
+            opportunity_score: 10.0,
+            ..PromptOptimizationOpportunityProfile::default()
+        })
+        .collect::<Vec<_>>();
+
+    let proposals = build_prompt_optimization_opportunities(
+        &summary,
+        &profiles,
+        &[],
+        &PromptOptimizationReviewState::new(),
+        &serde_json::json!({}),
+        None,
+        false,
+    );
+
+    let action_catalog = proposals
+        .iter()
+        .find(|proposal| proposal.id == "prompt-opt-section-action-catalog")
+        .expect("dominant action catalog section should surface");
+    let response_profile = proposals
+        .iter()
+        .find(|proposal| {
+            proposal.id == "prompt-opt-section-spine-runtime-active-primary-response-profile"
+        })
+        .expect("moderate response profile section should surface");
+
+    assert_eq!(action_catalog.risk_level, "high");
+    assert_eq!(response_profile.risk_level, "medium");
+}
+
+#[test]
+fn prompt_optimization_opportunity_profiles_are_bounded_and_outcome_aware() {
+    let traces = (0..14)
+        .map(|idx| {
+            test_prompt_trace(
+                &format!("trace-profile-{idx}"),
+                1_000 + (idx as i32 * 250),
+                6_000 + (idx * 400),
+                0.004 + (idx as f64 * 0.001),
+                idx % 5 != 0,
+                25_000,
+                36_000usize + ((idx as usize) * 800),
+                serde_json::json!({
+                    "arbitrary_user_surface": 1_900 + (idx * 70),
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let profiles = aggregate_prompt_optimization_opportunity_profiles(&[], &traces);
+    let profile = profiles
+        .iter()
+        .find(|item| item.section == "arbitrary_user_surface")
+        .expect("arbitrary telemetry section should have a profile");
+
+    assert_eq!(profile.samples, 14);
+    assert_eq!(profile.failed_samples, 3);
+    assert!(profile.p95_latency_ms.unwrap_or_default() > 3_000);
+    assert!(profile.p95_cost_usd.unwrap_or_default() > 0.01);
+    assert!(profile.holdout_cases.len() <= 8);
+    assert!(profile.issue_rate > 0.0);
+}
+
+#[test]
+fn approved_prompt_optimization_uses_opportunity_confidence_target() {
+    let mut review_state = PromptOptimizationReviewState::new();
+    review_state.insert(
+        "prompt-opt-section-action-catalog".to_string(),
+        PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            reviewed_at: Some("2026-06-02T14:12:00Z".to_string()),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "queued_for_background_test".to_string(),
+                sample_baseline: 20,
+                ..PromptOptimizationLifecycleState::default()
+            },
+        },
+    );
+    let summary = PromptTelemetrySummary {
+        sample_count: 186,
+        ..PromptTelemetrySummary::default()
+    };
+    let opportunity = PromptOptimizationOpportunityProfile {
+        section: "action_catalog".to_string(),
+        label: "Action Catalog".to_string(),
+        samples: 166,
+        confidence_sample_target: 64,
+        ..PromptOptimizationOpportunityProfile::default()
+    };
+
+    let proposal = build_prompt_optimization_proposal(
+        &review_state,
+        &summary,
+        &[],
+        &serde_json::json!({
+            "pending": [],
+            "running": [],
+            "completed": [],
+            "failed": [],
+        }),
+        None,
+        false,
+        "prompt-opt-section-action-catalog",
+        "Reduce Action Catalog prompt weight",
+        "Prompt telemetry shows Action Catalog can be tested.",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "high",
+        "prompt_profile",
+        EvolutionChangePreview::default(),
+        Some(opportunity),
+    );
+
+    assert_eq!(proposal.lifecycle.sample_count, 166);
+    assert_eq!(proposal.lifecycle.required_samples, 64);
+}
+
+#[test]
+fn approved_prompt_optimization_with_missing_gepa_job_is_not_shown_as_queued() {
+    let mut review_state = PromptOptimizationReviewState::new();
+    review_state.insert(
+        "prompt-opt-runtime-summary-compact".to_string(),
+        PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            reviewed_at: Some("2026-05-23T05:54:03Z".to_string()),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "queued_for_background_test".to_string(),
+                reason: Some(
+                    "Background optimization queued and will run when AgentArk is idle."
+                        .to_string(),
+                ),
+                queued_job_path: Some(
+                    "./.agentark/self_evolve/gepa/pending/gepa-job-old.json".to_string(),
+                ),
+                sample_baseline: 20,
+                required_samples: 6,
+                ..PromptOptimizationLifecycleState::default()
+            },
+        },
+    );
+    let summary = PromptTelemetrySummary {
+        sample_count: 186,
+        ..PromptTelemetrySummary::default()
+    };
+
+    let lifecycle = build_prompt_optimization_lifecycle(
+        "prompt-opt-runtime-summary-compact",
+        review_state.get("prompt-opt-runtime-summary-compact"),
+        None,
+        &summary,
+        &[],
+        &serde_json::json!({
+            "pending": [],
+            "running": [],
+            "completed": [],
+            "failed": [],
+        }),
+        None,
+        false,
+    );
+
+    assert_eq!(lifecycle.status, "blocked");
+    assert_eq!(lifecycle.sample_count, 166);
+    assert!(lifecycle.job_status.is_none());
+    assert!(lifecycle
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("no longer in the GEPA queue"));
+}
+
+#[test]
+fn completed_gepa_job_with_blocked_result_is_not_candidate_ready() {
+    let mut review_state = PromptOptimizationReviewState::new();
+    review_state.insert(
+        "prompt-opt-runtime-summary-compact".to_string(),
+        PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            reviewed_at: Some("2026-05-27T11:56:21Z".to_string()),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "running_background_test".to_string(),
+                sample_baseline: 20,
+                required_samples: 6,
+                ..PromptOptimizationLifecycleState::default()
+            },
+        },
+    );
+    let summary = PromptTelemetrySummary {
+        sample_count: 204,
+        ..PromptTelemetrySummary::default()
+    };
+
+    let lifecycle = build_prompt_optimization_lifecycle(
+        "prompt-opt-runtime-summary-compact",
+        review_state.get("prompt-opt-runtime-summary-compact"),
+        None,
+        &summary,
+        &[],
+        &serde_json::json!({
+            "pending": [],
+            "running": [],
+            "completed": [{
+                "status": "completed",
+                "job": {
+                    "job_id": "gepa-job-1",
+                    "metadata": {
+                        "proposal_id": "prompt-opt-runtime-summary-compact"
+                    },
+                    "last_error": "Exactly one of max_metric_calls, max_full_evals, auto must be set."
+                },
+                "result": {
+                    "status": "blocked",
+                    "error": "GEPA daily run limit has been reached."
+                }
+            }],
+            "failed": [],
+        }),
+        None,
+        false,
+    );
+
+    assert_eq!(lifecycle.status, "blocked");
+    assert_eq!(lifecycle.job_status.as_deref(), Some("blocked"));
+    assert_eq!(
+        lifecycle.reason.as_deref(),
+        Some("GEPA daily run limit has been reached.")
+    );
+    assert_eq!(lifecycle.sample_count, 184);
+}
+
+#[test]
+fn completed_gepa_job_with_rejected_prompt_import_is_not_candidate_ready() {
+    let mut review_state = PromptOptimizationReviewState::new();
+    review_state.insert(
+        "prompt-opt-runtime-summary-compact".to_string(),
+        PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            reviewed_at: Some("2026-06-01T18:44:31Z".to_string()),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "running_background_test".to_string(),
+                sample_baseline: 20,
+                required_samples: 6,
+                ..PromptOptimizationLifecycleState::default()
+            },
+        },
+    );
+    let summary = PromptTelemetrySummary {
+        sample_count: 204,
+        ..PromptTelemetrySummary::default()
+    };
+
+    let lifecycle = build_prompt_optimization_lifecycle(
+        "prompt-opt-runtime-summary-compact",
+        review_state.get("prompt-opt-runtime-summary-compact"),
+        None,
+        &summary,
+        &[],
+        &serde_json::json!({
+            "pending": [],
+            "running": [],
+            "completed": [{
+                "status": "completed",
+                "recorded_at": "2026-06-01T18:53:34Z",
+                "job": {
+                    "job_id": "gepa-job-1",
+                    "metadata": {
+                        "proposal_id": "prompt-opt-runtime-summary-compact"
+                    }
+                },
+                "result": {
+                    "status": "completed",
+                    "import_result": {
+                        "results": [{
+                            "mode": "gepa_import_prompt",
+                            "target_key": "prompt_bundle_profile_v1",
+                            "promoted": false,
+                            "promotion_applied": false,
+                            "promotion_mode": "none",
+                            "promotion_gate_summary": "Not promoted: score improvement was below the promotion threshold."
+                        }]
+                    }
+                }
+            }],
+            "failed": [],
+        }),
+        None,
+        false,
+    );
+
+    assert_eq!(lifecycle.status, "candidate_rejected");
+    assert_eq!(lifecycle.job_status.as_deref(), Some("completed"));
+    assert_eq!(
+        lifecycle.reason.as_deref(),
+        Some("Not promoted: score improvement was below the promotion threshold.")
+    );
+}
+
+#[test]
+fn completed_gepa_job_with_live_prompt_canary_is_shown_as_live_test() {
+    let mut review_state = PromptOptimizationReviewState::new();
+    review_state.insert(
+        "prompt-opt-runtime-summary-compact".to_string(),
+        PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            reviewed_at: Some("2026-06-01T18:44:31Z".to_string()),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "running_background_test".to_string(),
+                sample_baseline: 20,
+                required_samples: 6,
+                ..PromptOptimizationLifecycleState::default()
+            },
+        },
+    );
+    let summary = PromptTelemetrySummary {
+        sample_count: 204,
+        ..PromptTelemetrySummary::default()
+    };
+    let canary_state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+        enabled: true,
+        baseline_version: "prompt-v1".to_string(),
+        candidate_version: "prompt-v2".to_string(),
+        rollout_percent: 15,
+        min_samples_per_version: 64,
+        ..crate::core::self_evolve::strategy_runtime::CanaryRolloutState::default()
+    };
+
+    let lifecycle = build_prompt_optimization_lifecycle(
+        "prompt-opt-runtime-summary-compact",
+        review_state.get("prompt-opt-runtime-summary-compact"),
+        None,
+        &summary,
+        &[],
+        &serde_json::json!({
+            "pending": [],
+            "running": [],
+            "completed": [{
+                "status": "completed",
+                "recorded_at": "2026-06-01T18:53:34Z",
+                "job": {
+                    "job_id": "gepa-job-1",
+                    "metadata": {
+                        "proposal_id": "prompt-opt-runtime-summary-compact"
+                    }
+                },
+                "result": {
+                    "status": "completed",
+                    "import_result": {
+                        "results": [{
+                            "mode": "gepa_import_prompt",
+                            "target_key": "prompt_bundle_profile_v1",
+                            "promotion_mode": "canary",
+                            "promotion_applied": true
+                        }]
+                    }
+                }
+            }],
+            "failed": [],
+        }),
+        Some(&canary_state),
+        true,
+    );
+
+    assert_eq!(lifecycle.status, "testing");
+    assert_eq!(lifecycle.job_status.as_deref(), Some("completed"));
+    assert_eq!(lifecycle.live_surface.as_deref(), Some("prompt"));
+    assert_eq!(lifecycle.rollout_percent, Some(15));
+    assert_eq!(lifecycle.baseline_version.as_deref(), Some("prompt-v1"));
+    assert_eq!(lifecycle.candidate_version.as_deref(), Some("prompt-v2"));
+    assert_eq!(lifecycle.required_samples, 64);
+    assert!(!lifecycle.rollback_available);
+}
+
+#[test]
+fn prompt_optimization_lifecycle_uses_latest_terminal_gepa_job() {
+    let mut review_state = PromptOptimizationReviewState::new();
+    review_state.insert(
+        "prompt-opt-runtime-summary-compact".to_string(),
+        PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            reviewed_at: Some("2026-05-29T17:05:30Z".to_string()),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "running_background_test".to_string(),
+                sample_baseline: 20,
+                required_samples: 6,
+                ..PromptOptimizationLifecycleState::default()
+            },
+        },
+    );
+    let summary = PromptTelemetrySummary {
+        sample_count: 204,
+        ..PromptTelemetrySummary::default()
+    };
+
+    let lifecycle = build_prompt_optimization_lifecycle(
+        "prompt-opt-runtime-summary-compact",
+        review_state.get("prompt-opt-runtime-summary-compact"),
+        None,
+        &summary,
+        &[],
+        &serde_json::json!({
+            "pending": [],
+            "running": [],
+            "completed": [{
+                "status": "completed",
+                "recorded_at": "2026-05-28T17:51:05Z",
+                "job": {
+                    "job_id": "gepa-job-old",
+                    "created_at": "2026-05-28T17:39:31Z",
+                    "finished_at": "2026-05-28T17:51:05Z",
+                    "metadata": {
+                        "proposal_id": "prompt-opt-runtime-summary-compact"
+                    }
+                },
+                "result": {
+                    "status": "blocked",
+                    "error": "GEPA daily run limit has been reached."
+                }
+            }],
+            "failed": [{
+                "status": "failed",
+                "recorded_at": "2026-05-29T17:08:40Z",
+                "stderr_tail": "Expected to find output fields in the LM response: [candidate_jsonl]",
+                "job": {
+                    "job_id": "gepa-job-new",
+                    "created_at": "2026-05-29T17:05:30Z",
+                    "finished_at": "2026-05-29T17:08:40Z",
+                    "metadata": {
+                        "proposal_id": "prompt-opt-runtime-summary-compact"
+                    }
+                }
+            }],
+        }),
+        None,
+        false,
+    );
+
+    assert_eq!(lifecycle.status, "blocked");
+    assert_eq!(lifecycle.job_status.as_deref(), Some("failed"));
+    assert_eq!(lifecycle.queued_job_id.as_deref(), Some("gepa-job-new"));
+    assert!(lifecycle
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Expected to find output fields"));
+}
+
+#[test]
+fn terminal_gepa_jobs_do_not_suppress_prompt_optimization_retry() {
+    let blocked_completed = serde_json::json!({
+        "status": "completed",
+        "result": {
+            "status": "blocked",
+            "error": "GEPA daily run limit has been reached."
+        }
+    });
+    let failed = serde_json::json!({
+        "status": "failed",
+        "result": {
+            "status": "failed",
+            "error": "GEPA optimizer failed."
+        }
+    });
+    let pending = serde_json::json!({
+        "status": "pending"
+    });
+
+    assert!(!gepa_queue_item_is_active_work(
+        "completed",
+        &blocked_completed
+    ));
+    assert!(!gepa_queue_item_is_active_work("failed", &failed));
+    assert!(gepa_queue_item_is_active_work("pending", &pending));
+}
+
+#[test]
+fn active_gepa_work_blocks_parallel_prompt_optimization_queueing() {
+    let queue = serde_json::json!({
+        "pending": [{
+            "status": "pending",
+            "job_id": "gepa-job-pending",
+            "metadata": {
+                "proposal_id": "prompt-opt-section-runtime-access-summary"
+            },
+            "created_at": "2026-05-30T10:00:00Z"
+        }],
+        "running": [],
+        "completed": [{
+            "status": "completed",
+            "job": {
+                "job_id": "gepa-job-completed",
+                "metadata": {
+                    "proposal_id": "prompt-opt-section-action-catalog"
+                }
+            }
+        }],
+        "failed": []
+    });
+
+    let active = gepa_active_queue_item(&queue)
+        .expect("pending prompt optimization should count as active GEPA work");
+
+    assert_eq!(active.0, "pending");
+    assert_eq!(
+        gepa_active_queue_item_proposal_id(active.1).as_deref(),
+        Some("prompt-opt-section-runtime-access-summary")
+    );
+}
+
+#[test]
+fn gepa_project_root_prefers_data_root_over_source_checkout_workspace() {
+    let app_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let workspace_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(workspace_dir.path().join("src")).unwrap();
+    std::fs::write(
+        workspace_dir.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\n",
+    )
+    .unwrap();
+
+    let root = crate::core::self_evolve::gepa_bridge::resolve_gepa_project_root_from(
+        app_dir.path(),
+        Some(app_dir.path()),
+        Some(workspace_dir.path().to_str().unwrap()),
+        Some(data_dir.path().to_str().unwrap()),
+    );
+
+    assert_eq!(root, data_dir.path());
 }
 
 #[test]
@@ -3869,6 +4823,112 @@ fn analytics_openrouter_estimate_skips_generic_openai_compatible_rows() {
     assert_eq!(
         estimate_cost_usd("openai-compatible", "openai/gpt-4", 2, 3, &prices),
         None
+    );
+}
+
+#[test]
+fn arkdistill_analytics_summarizes_context_and_cost_savings() {
+    let rows = vec![crate::storage::entities::operational_log::Model {
+        id: "arkdistill-1".to_string(),
+        created_at: "2026-05-28T10:00:00Z".to_string(),
+        trace_id: None,
+        conversation_id: None,
+        channel: "chat".to_string(),
+        event_type: crate::core::ARKDISTILL_EVENT_TYPE.to_string(),
+        success: true,
+        outcome: "distilled".to_string(),
+        tool_name: Some("fetch".to_string()),
+        latency_ms: None,
+        arguments: None,
+        payload: Some(
+            serde_json::json!({
+                "primitive": "fetch",
+                "action": "page_fetch",
+                "original_chars": 12000,
+                "distilled_chars": 3000,
+                "estimated_saved_tokens": 2250,
+                "estimated_prompt_cost_saved_usd": 0.0045,
+                "profile_id": "builtin"
+            })
+            .to_string(),
+        ),
+        strategy_version: None,
+        policy_version: None,
+        prompt_version: None,
+        model_slot: None,
+    }];
+
+    let summary = summarize_arkdistill_logs(&rows);
+
+    assert_eq!(summary.totals.result_count, 1);
+    assert_eq!(summary.totals.original_chars, 12000);
+    assert_eq!(summary.totals.distilled_chars, 3000);
+    assert_eq!(summary.totals.estimated_saved_tokens, 2250);
+    assert_eq!(summary.totals.savings_percent, 75.0);
+    assert_eq!(summary.totals.estimated_prompt_cost_saved_usd, Some(0.0045));
+    assert_eq!(summary.by_tool[0].tool_name, "fetch");
+}
+
+#[test]
+fn arkdistill_analytics_estimates_missing_cost_from_model_slot_pricing() {
+    let rows = vec![crate::storage::entities::operational_log::Model {
+        id: "arkdistill-1".to_string(),
+        created_at: "2026-05-28T10:00:00Z".to_string(),
+        trace_id: None,
+        conversation_id: None,
+        channel: "chat".to_string(),
+        event_type: crate::core::ARKDISTILL_EVENT_TYPE.to_string(),
+        success: true,
+        outcome: "distilled".to_string(),
+        tool_name: Some("fetch".to_string()),
+        latency_ms: None,
+        arguments: None,
+        payload: Some(
+            serde_json::json!({
+                "primitive": "fetch",
+                "action": "page_fetch",
+                "original_chars": 12000,
+                "distilled_chars": 3000,
+                "estimated_saved_tokens": 2250,
+                "profile_id": "builtin"
+            })
+            .to_string(),
+        ),
+        strategy_version: None,
+        policy_version: None,
+        prompt_version: None,
+        model_slot: Some("primary".to_string()),
+    }];
+    let mut prices = HashMap::new();
+    prices.insert(
+        "openai/gpt-4".to_string(),
+        OpenRouterModelPricing {
+            prompt_per_token: 0.000002,
+            completion_per_token: 0.000004,
+            request_per_request: 0.0,
+        },
+    );
+    let mut model_slots = HashMap::new();
+    model_slots.insert(
+        "primary".to_string(),
+        ArkDistillModelPricingContext {
+            provider: "openrouter".to_string(),
+            model: "openai/gpt-4".to_string(),
+        },
+    );
+    let pricing = ArkDistillPricingContext {
+        model_slots,
+        default_model: None,
+        openrouter_prices: prices,
+    };
+
+    let summary =
+        summarize_arkdistill_logs_window_with_pricing(&rows, None, None, "hour", &pricing);
+
+    assert_eq!(summary.totals.estimated_prompt_cost_saved_usd, Some(0.0045));
+    assert_eq!(
+        summary.by_tool[0].estimated_prompt_cost_saved_usd,
+        Some(0.0045)
     );
 }
 

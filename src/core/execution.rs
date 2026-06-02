@@ -882,15 +882,15 @@ pub async fn execute_supervised_transport_chat_stream_with_policy(
     actions: &[ActionDef],
     timeout_ms: Option<u64>,
     token_tx: tokio::sync::mpsc::Sender<crate::core::agent::StreamEvent>,
-    app_delivery_stream: bool,
+    long_running_stream: bool,
     policy: &crate::security::ModelPrivacyConfig,
     allow_sensitive_context: bool,
 ) -> Result<LlmResponse> {
     let history: Vec<crate::core::agent::ConversationMessage> = Vec::new();
     let response = if let Some(timeout_ms) = timeout_ms.filter(|value| *value > 0) {
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
-            if app_delivery_stream {
-                llm.chat_with_history_stream_for_app_delivery(
+            if long_running_stream {
+                llm.chat_with_history_stream_for_long_running_tool(
                     system_prompt,
                     user_message,
                     &history,
@@ -929,8 +929,8 @@ pub async fn execute_supervised_transport_chat_stream_with_policy(
                 ));
             }
         }
-    } else if app_delivery_stream {
-        llm.chat_with_history_stream_for_app_delivery(
+    } else if long_running_stream {
+        llm.chat_with_history_stream_for_long_running_tool(
             system_prompt,
             user_message,
             &history,

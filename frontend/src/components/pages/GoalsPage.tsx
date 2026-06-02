@@ -29,6 +29,7 @@ import {
   formatUiDateOnly,
   formatUiRelativeDateTimeMeta,
 } from "../../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../../lib/displayLabels";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
   type JsonRecord,
@@ -410,7 +411,7 @@ export default function GoalsPage({ autoRefresh }: GoalsPageProps) {
                                   color: "text.secondary",
                                 }}
                               >
-                                {str(g.status)}
+                                {humanizeStatusLabel(str(g.status, ""))}
                                 {str(g.due_date)
                                   ? ` | due ${formatUiDateOnly(str(g.due_date), { fallback: str(g.due_date) })}`
                                   : ""}
@@ -575,7 +576,7 @@ export default function GoalsPage({ autoRefresh }: GoalsPageProps) {
                                 color: "text.secondary",
                               }}
                             >
-                              {str(it.action)} |{" "}
+                              {humanizeMachineLabel(str(it.action, ""))} |{" "}
                               <span title={humanTs(str(it.created_at)).tip}>
                                 {humanTs(str(it.created_at)).label}
                               </span>
@@ -583,7 +584,7 @@ export default function GoalsPage({ autoRefresh }: GoalsPageProps) {
                           </Stack>
                           <Chip
                             size="small"
-                            label={status || "Unknown"}
+                            label={humanizeStatusLabel(status, "Unknown")}
                             color={statusColor as any}
                           />
                         </Stack>

@@ -118,7 +118,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-      start_period: 1s
+      start_period: 30s
     # Hard cap so the whole AgentArk stack stays inside a 4 GB / 2.4-core
     # budget (~10% of a 24-core host). Postgres gets the heaviest share
     # after control because it carries every write the agent loop emits.
@@ -163,7 +163,7 @@ services:
         volume:
           nocopy: true
       - agentark-secrets:/run/secrets:ro
-      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,7 +177,9 @@ services:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
+      - AGENTARK_DATA_DOCKER_VOLUME=${AGENTARK_DATA_DOCKER_VOLUME:-agentark-data}
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - AGENTARK_FILE_WORKSPACE_ROOT=${AGENTARK_FILE_WORKSPACE_ROOT:-/app/data/workspace}
       # DB URL is assembled at runtime by docker-entrypoint.sh from the password file
       # written by the Postgres service into the agentark-secrets volume.
       - AGENTARK_POSTGRES_PASSWORD_FILE=/run/secrets/pg_pw
@@ -185,7 +187,7 @@ services:
       - AGENTARK_POSTGRES_PORT=5432
       - AGENTARK_POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
       - AGENTARK_POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
-      - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
+      - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-32}
       - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
       - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
       - AGENTARK_DB_IDLE_TIMEOUT_SECS=${AGENTARK_DB_IDLE_TIMEOUT_SECS:-300}
@@ -211,12 +213,12 @@ services:
           "CMD",
           "python3",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=1)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/readiness', timeout=1)",
         ]
       interval: 2s
       timeout: 2s
       retries: 30
-      start_period: 1s
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -270,7 +272,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-      start_period: 1s
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -305,7 +307,7 @@ services:
         volume:
           nocopy: true
       - agentark-secrets:/run/secrets:ro
-      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
@@ -316,7 +318,9 @@ services:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
+      - AGENTARK_DATA_DOCKER_VOLUME=${AGENTARK_DATA_DOCKER_VOLUME:-agentark-data}
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - AGENTARK_FILE_WORKSPACE_ROOT=${AGENTARK_FILE_WORKSPACE_ROOT:-/app/data/workspace}
       # DB URL is assembled at runtime by docker-entrypoint.sh from the password file
       # written by the Postgres service into the agentark-secrets volume.
       - AGENTARK_POSTGRES_PASSWORD_FILE=/run/secrets/pg_pw
@@ -324,7 +328,7 @@ services:
       - AGENTARK_POSTGRES_PORT=5432
       - AGENTARK_POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
       - AGENTARK_POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
-      - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
+      - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-32}
       - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
       - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
       - AGENTARK_DB_IDLE_TIMEOUT_SECS=${AGENTARK_DB_IDLE_TIMEOUT_SECS:-300}
@@ -351,7 +355,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-      start_period: 1s
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -385,13 +389,15 @@ services:
         target: /app/config
         volume:
           nocopy: true
-      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}:ro
     environment:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
+      - AGENTARK_DATA_DOCKER_VOLUME=${AGENTARK_DATA_DOCKER_VOLUME:-agentark-data}
       - AGENTARK_STACK_ROLE=workspace
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - AGENTARK_FILE_WORKSPACE_ROOT=${AGENTARK_FILE_WORKSPACE_ROOT:-/app/data/workspace}
       - AGENTARK_WORKSPACE_BIND=0.0.0.0:8992
     networks:
       - agent-network
@@ -406,7 +412,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-      start_period: 1s
+      start_period: 30s
     deploy:
       resources:
         limits:

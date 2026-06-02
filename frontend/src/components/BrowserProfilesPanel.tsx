@@ -18,6 +18,7 @@ import {
 } from "@mui/material";
 import { useMemo, useState } from "react";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeStatusLabel } from "../lib/displayLabels";
 
 export type BrowserSessionSummary = {
   id: string;
@@ -74,7 +75,7 @@ function statusLabel(status: BrowserProfile["status"]): string {
   if (value === "locked") return "Locked";
   if (value === "manual_login") return "Manual login";
   if (value === "error") return "Error";
-  return status || "Unknown";
+  return humanizeStatusLabel(status, "Unknown");
 }
 
 function statusRailClassName(status: BrowserProfile["status"]): string {
@@ -289,7 +290,7 @@ export function BrowserProfilesPanel({
                           startIcon={<PlayArrowRoundedIcon fontSize="small" />}
                           onClick={() => onLaunchProfile(profile.id)}
                         >
-                          Launch login
+                          Launch browser
                         </Button>
                       ) : null}
                       {onOpenManualLogin && profileRunning ? (

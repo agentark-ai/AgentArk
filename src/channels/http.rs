@@ -40,6 +40,7 @@ mod api_docs_control;
 mod api_types;
 mod app_serving;
 mod applications;
+mod arkdistill_analytics;
 mod arkorbit_control;
 mod arkpulse_control;
 mod auth;
@@ -87,6 +88,7 @@ mod trace;
 mod tunnel;
 mod tunnel_auth;
 mod ui_control;
+mod voice_control;
 pub(crate) mod webhooks;
 
 pub(crate) use analytics_control::estimate_cost_from_pricing_cache;
@@ -102,6 +104,7 @@ use analytics_control::*;
 use api_docs_control::*;
 use api_types::*;
 use app_serving::*;
+use arkdistill_analytics::*;
 use arkpulse_control::*;
 use automation_control::*;
 use autonomy_control::*;
@@ -127,6 +130,7 @@ use server_utils::*;
 use settings_control::*;
 use swarm_control::*;
 use ui_control::*;
+use voice_control::*;
 
 use crate::channels::{
     discord::DiscordChannelConfig, google_chat::GoogleChatChannelConfig,
@@ -167,6 +171,7 @@ const SERVER_BUSY_TRACE_WINDOW_SECS: i64 = 20 * 60;
 const SERVER_BUSY_TASK_WINDOW_SECS: i64 = 20 * 60;
 const MAX_CHAT_MESSAGE_BYTES: usize = 100_000;
 const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_UPLOAD_BODY_BYTES: usize = 100 * 1024 * 1024;
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONFIG_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const UI_SESSION_TTL_SECS: i64 = 24 * 60 * 60;
@@ -175,13 +180,21 @@ const RELEASE_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60
 const RELEASE_UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const AUTONOMY_ANALYSIS_TICK_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTONOMY_REACTIVE_TICK_TIMEOUT: Duration = Duration::from_secs(10);
-const SSE_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(30 * 60);
+const SSE_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
+const BROWSER_SESSION_CLEANUP_STARTUP_DELAY: Duration = Duration::from_secs(30);
+const BROWSER_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const EMBEDDED_PROCESS_RESTART_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+const EMBEDDED_PROCESS_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const WEBHOOK_DISPATCH_QUEUE_CAPACITY: usize = 256;
+const BACKGROUND_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
 const HEADER_X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const HEADER_CONTENT_SECURITY_POLICY: HeaderName =
     HeaderName::from_static("content-security-policy");
 const HEADER_STRICT_TRANSPORT_SECURITY: HeaderName =
     HeaderName::from_static("strict-transport-security");
+const HEADER_REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
+const HEADER_PERMISSIONS_POLICY: HeaderName = HeaderName::from_static("permissions-policy");
 const CACHE_CONTROL_FRONTEND_HTML: &str = "no-store";
 const CACHE_CONTROL_FRONTEND_ASSET: &str = "public, max-age=31536000, immutable";
 static MISSING_API_KEY_WARNED: AtomicBool = AtomicBool::new(false);
@@ -759,6 +772,10 @@ pub struct AppState {
     pub public_app_base_url: Option<String>,
     /// Cached release update metadata for lightweight UI polling.
     release_update_cache: Arc<RwLock<ReleaseUpdateCache>>,
+    /// Active browser voice sessions keyed by generated voice session ids.
+    pub voice_sessions: Arc<RwLock<crate::core::VoiceSessionRegistry>>,
+    /// Bounded background dispatcher for matched public webhook deliveries.
+    webhook_dispatcher: webhooks::WebhookDispatchHandle,
 }
 
 #[derive(Clone)]
@@ -807,7 +824,7 @@ fn build_workspace_client() -> Result<Option<Arc<WorkspaceClient>>> {
 
 fn shared_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(crate::core::net::default_outgoing_http_client)
 }
 
 fn cap_sse_lifetime<S>(
@@ -846,8 +863,6 @@ pub struct ChatRequest {
     pub deep_research: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_profile: Option<serde_json::Value>,
-    #[serde(default)]
-    pub plan_confirmation_mode: Option<String>,
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
@@ -906,28 +921,44 @@ async fn unregister_chat_task_cancellation(state: &AppState, task_id: &str) {
     state.chat_task_cancellations.write().await.remove(task_id);
 }
 
-async fn replace_chat_conversation_cancellation_sender(
+async fn active_chat_conversation_request_id(
     state: &AppState,
     conversation_id: &str,
-    request_id: &str,
-    sender: tokio::sync::watch::Sender<bool>,
-) -> Option<tokio::sync::watch::Sender<bool>> {
+) -> Option<String> {
     let conversation_id = conversation_id.trim();
     if conversation_id.is_empty() {
         return None;
     }
     state
         .chat_conversation_cancellations
-        .write()
+        .read()
         .await
-        .insert(
-            conversation_id.to_string(),
-            ActiveChatConversationStream {
-                request_id: request_id.to_string(),
-                sender,
-            },
-        )
-        .map(|entry| entry.sender)
+        .get(conversation_id)
+        .map(|entry| entry.request_id.clone())
+}
+
+async fn try_register_chat_conversation_cancellation_sender(
+    state: &AppState,
+    conversation_id: &str,
+    request_id: &str,
+    sender: tokio::sync::watch::Sender<bool>,
+) -> std::result::Result<(), String> {
+    let conversation_id = conversation_id.trim();
+    if conversation_id.is_empty() {
+        return Ok(());
+    }
+    let mut guard = state.chat_conversation_cancellations.write().await;
+    if let Some(active) = guard.get(conversation_id) {
+        return Err(active.request_id.clone());
+    }
+    guard.insert(
+        conversation_id.to_string(),
+        ActiveChatConversationStream {
+            request_id: request_id.to_string(),
+            sender,
+        },
+    );
+    Ok(())
 }
 
 async fn unregister_chat_conversation_cancellation(
@@ -1378,12 +1409,59 @@ fn parse_set_secret_command(message: &str) -> Option<(String, String)> {
     crate::core::secrets::parse_set_secret_command(message)
 }
 
+fn spawn_browser_session_cleanup_loop(
+    browser_sessions: crate::core::browser_session::BrowserSessionManager,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    crate::spawn_logged!(
+        "src/channels/http.rs:browser_session_cleanup_loop",
+        async move {
+            if !sleep_or_http_shutdown(BROWSER_SESSION_CLEANUP_STARTUP_DELAY, &mut shutdown_rx)
+                .await
+            {
+                return;
+            }
+
+            loop {
+                browser_sessions
+                    .cleanup_stale_or_unreachable_sessions()
+                    .await;
+                if !sleep_or_http_shutdown(BROWSER_SESSION_CLEANUP_INTERVAL, &mut shutdown_rx).await
+                {
+                    break;
+                }
+            }
+        }
+    )
+}
+
+async fn join_background_worker(name: &str, mut handle: tokio::task::JoinHandle<()>) {
+    match tokio::time::timeout(BACKGROUND_WORKER_SHUTDOWN_TIMEOUT, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("{} join failed during shutdown: {}", name, error),
+        Err(_) => {
+            tracing::warn!(
+                "{} did not stop within {}s; aborting task",
+                name,
+                BACKGROUND_WORKER_SHUTDOWN_TIMEOUT.as_secs()
+            );
+            handle.abort();
+        }
+    }
+}
+
+async fn join_optional_background_worker(name: &str, handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        join_background_worker(name, handle).await;
+    }
+}
+
 /// Start the HTTP server with authentication, CORS, and rate limiting
 pub async fn serve(
     agent: SharedAgent,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    {
+    let initial_reconcile_worker = {
         let agent_for_reconcile = agent.clone();
         crate::spawn_logged!("src/channels/http.rs:3767", async move {
             let result = tokio::time::timeout(
@@ -1404,14 +1482,14 @@ pub async fn serve(
                     OPTIONAL_BACKGROUND_JOB_TIMEOUT_SECS
                 ),
             }
-        });
-    }
+        })
+    };
 
     let tiered_rate_limiter = TieredRateLimiter::new();
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or("127.0.0.1:8990".to_string());
 
     // Spawn a background task to periodically clean up expired rate-limit entries
-    {
+    let rate_limiter_cleanup_worker = {
         let trl = tiered_rate_limiter.clone();
         let mut shutdown = shutdown_rx.clone();
         crate::spawn_logged!("src/channels/http.rs:3796", async move {
@@ -1423,12 +1501,14 @@ pub async fn serve(
                     _ = interval.tick() => trl.cleanup_all().await,
                 }
             }
-        });
-    }
+        })
+    };
 
     // Greeting generation is disabled (static defaults only).
 
     // Clone Arc handles for independent access (avoids blocking during long operations)
+    let (webhook_dispatcher, webhook_dispatch_rx) =
+        webhooks::webhook_dispatch_channel(WEBHOOK_DISPATCH_QUEUE_CAPACITY);
     let state = {
         let agent_guard = agent.read().await;
         let deployment_mode = deployment_mode_from_config(&agent_guard.config);
@@ -1526,11 +1606,50 @@ pub async fn serve(
             public_app_bind_addr,
             public_app_base_url,
             release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
+            voice_sessions: Arc::new(RwLock::new(crate::core::VoiceSessionRegistry::default())),
+            webhook_dispatcher,
         }
     };
 
-    spawn_reflect_idle_loop(state.clone());
-    spawn_gepa_auto_loop(state.clone());
+    let webhook_dispatch_worker = webhooks::spawn_webhook_dispatch_worker(
+        state.clone(),
+        webhook_dispatch_rx,
+        shutdown_rx.clone(),
+    );
+    let housekeeping_worker = {
+        let storage = { agent.read().await.storage.clone() };
+        storage.spawn_housekeeping_purge_worker(shutdown_rx.clone())
+    };
+    let browser_session_cleanup_worker = {
+        let browser_sessions = { agent.read().await.browser_sessions.clone() };
+        spawn_browser_session_cleanup_loop(browser_sessions, shutdown_rx.clone())
+    };
+    let reflect_idle_worker = spawn_reflect_idle_loop(state.clone(), shutdown_rx.clone());
+    let document_memory_idle_worker =
+        spawn_arkmemory_document_memory_idle_loop(state.clone(), shutdown_rx.clone());
+    let gepa_auto_worker = spawn_gepa_auto_loop(state.clone(), shutdown_rx.clone());
+    let mut background_workers: Vec<(&'static str, tokio::task::JoinHandle<()>)> = vec![
+        (
+            "Initial sandbox container reconciliation",
+            initial_reconcile_worker,
+        ),
+        ("Rate limiter cleanup worker", rate_limiter_cleanup_worker),
+        ("Webhook dispatch worker", webhook_dispatch_worker),
+        ("Storage housekeeping worker", housekeeping_worker),
+        (
+            "Browser session cleanup worker",
+            browser_session_cleanup_worker,
+        ),
+    ];
+    if let Some(handle) = reflect_idle_worker {
+        background_workers.push(("Reflect idle loop", handle));
+    }
+    if let Some(handle) = document_memory_idle_worker {
+        background_workers.push(("Document Memory extraction idle loop", handle));
+    }
+    if let Some(handle) = gepa_auto_worker {
+        background_workers.push(("GEPA auto loop", handle));
+    }
 
     // Public routes (no auth required)
     let public_routes = Router::new()
@@ -1551,6 +1670,7 @@ pub async fn serve(
         .route("/openapi.json", get(openapi_spec))
         .route("/ui/{*path}", get(web_ui))
         .route("/assets/{*path}", get(serve_frontend_asset))
+        .route("/fonts/{*path}", get(serve_frontend_font))
         .route("/logo.svg", get(serve_logo_svg))
         .route("/logo.png", get(serve_logo_png))
         .route("/logo.jpg", get(serve_logo_jpg))
@@ -1584,6 +1704,7 @@ pub async fn serve(
         .route("/oauth/callback", get(integrations::oauth_callback))
         .route("/companion/web", get(companion_control::companion_web))
         .route("/companion/ws", get(companion_control::companion_ws))
+        .route("/voice/sessions/{id}/stream", get(stream_voice_session))
         // Deployed apps (public - these are user-facing apps, no auth required)
         .route("/apps/{app_id}", any(serve_app_root))
         .route("/apps/{app_id}/", any(serve_app_root))
@@ -1595,6 +1716,10 @@ pub async fn serve(
         .route("/metrics", get(metrics))
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_stream))
+        .route("/voice/status", get(get_voice_status))
+        .route("/voice/sessions", post(create_voice_session))
+        .route("/voice/sessions/{id}/turn", post(submit_voice_turn))
+        .route("/voice/sessions/{id}/stop", post(stop_voice_session))
         .route(
             "/chat/tool-approvals/{id}/decision",
             post(decide_chat_tool_approval),
@@ -1994,6 +2119,7 @@ pub async fn serve(
             post(run_evolution_dev_action),
         )
         .route("/settings/api-key", get(get_api_key_endpoint))
+        .route("/settings/api-key/reveal", post(reveal_api_key_endpoint))
         .route(
             "/settings/api-key/regenerate",
             post(regenerate_api_key_endpoint),
@@ -2051,7 +2177,8 @@ pub async fn serve(
         )
         .route(
             "/extension-packs/upload",
-            post(extension_packs::upload_extension_pack),
+            post(extension_packs::upload_extension_pack)
+                .layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES)),
         )
         .route(
             "/extension-packs/scaffold",
@@ -2284,7 +2411,7 @@ pub async fn serve(
         .route("/documents/upload", post(upload_document_endpoint))
         .route(
             "/documents/upload-file",
-            post(upload_document_file_endpoint),
+            post(upload_document_file_endpoint).layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES)),
         )
         .route(
             "/documents/{id}",
@@ -2384,6 +2511,19 @@ pub async fn serve(
         )
         // Memory operations
         .route("/arkmemory/summary", get(arkmemory_summary))
+        .route("/arkmemory/graph", get(arkmemory_graph))
+        .route(
+            "/arkmemory/knowledge-graph/extract",
+            post(arkmemory_knowledge_graph_extract),
+        )
+        .route(
+            "/arkmemory/knowledge-graph/relations/{id}/confirm",
+            post(arkmemory_confirm_knowledge_relation),
+        )
+        .route(
+            "/arkmemory/knowledge-graph/relations/{id}/reject",
+            post(arkmemory_reject_knowledge_relation),
+        )
         .route(
             "/arkmemory/memories/{id}",
             post(update_memory_fact_value).delete(delete_memory_fact),
@@ -2411,6 +2551,19 @@ pub async fn serve(
         .route("/arkmemory/cleanup/apply", post(arkmemory_apply_cleanup))
         // Legacy /arkrecall route aliases retained for old browser tabs.
         .route("/arkrecall/summary", get(arkmemory_summary))
+        .route("/arkrecall/graph", get(arkmemory_graph))
+        .route(
+            "/arkrecall/knowledge-graph/extract",
+            post(arkmemory_knowledge_graph_extract),
+        )
+        .route(
+            "/arkrecall/knowledge-graph/relations/{id}/confirm",
+            post(arkmemory_confirm_knowledge_relation),
+        )
+        .route(
+            "/arkrecall/knowledge-graph/relations/{id}/reject",
+            post(arkmemory_reject_knowledge_relation),
+        )
         .route(
             "/arkrecall/memories/{id}",
             post(update_memory_fact_value).delete(delete_memory_fact),
@@ -2479,6 +2632,7 @@ pub async fn serve(
         )
         .route("/api/apps/{app_id}/stop", post(stop_app))
         .route("/api/apps/{app_id}/restart", post(restart_app))
+        .route("/api/apps/{app_id}/env", get(get_app_env).put(update_app_env))
         .route(
             "/api/apps/{app_id}/access-guard",
             post(update_app_access_guard),
@@ -2504,7 +2658,10 @@ pub async fn serve(
             get(download_output_file),
         )
         // File upload for chat attachments
-        .route("/api/upload", post(upload_chat_file))
+        .route(
+            "/api/upload",
+            post(upload_chat_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES)),
+        )
         .route("/api/uploads/{upload_id}", get(serve_upload_file))
         // Approval audit log
         .route("/approvals/log", get(get_approval_log))
@@ -2640,10 +2797,12 @@ pub async fn serve(
             tunnel_exposure_middleware,
         ))
         .layer(cors)
+        .layer(middleware::from_fn(ordinary_route_timeout_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn(request_id_and_error_middleware));
 
     let isolate_public_apps = internet_facing_apps_should_be_isolated(
         state.deployment_mode,
@@ -2666,6 +2825,7 @@ pub async fn serve(
         let public_app_routes = Router::new()
             .route("/health", get(health))
             .route("/readiness", get(readiness))
+            .route("/logo.svg", get(serve_logo_svg))
             .route("/public/proxy/raw", get(public_proxy_raw))
             .route("/apps/{app_id}", any(serve_app_root))
             .route("/apps/{app_id}/", any(serve_app_root))
@@ -2673,10 +2833,12 @@ pub async fn serve(
             .with_state(public_app_state.clone())
             .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
             .layer(middleware::from_fn(metrics_middleware))
+            .layer(middleware::from_fn(ordinary_route_timeout_middleware))
             .layer(middleware::from_fn_with_state(
                 public_app_state.clone(),
                 security_headers_middleware,
-            ));
+            ))
+            .layer(middleware::from_fn(request_id_and_error_middleware));
         let public_app_bind_addr = state
             .public_app_bind_addr
             .clone()
@@ -2775,7 +2937,7 @@ pub async fn serve(
 
     if auto_tunnel {
         let state_for_tunnel = state.clone();
-        crate::spawn_logged!("src/channels/http.rs:4874", async move {
+        let handle = crate::spawn_logged!("src/channels/http.rs:4874", async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             tracing::info!("AGENTARK_TUNNEL=true - auto-starting remote access tunnel...");
             let provider = tunnel::load_tunnel_config(&state_for_tunnel).await.provider;
@@ -2800,9 +2962,10 @@ pub async fn serve(
                 Err(e) => tracing::error!("Failed to auto-start tunnel: {}", e),
             }
         });
+        background_workers.push(("Tunnel auto-start worker", handle));
     } else {
         let state_for_tunnel = state.clone();
-        crate::spawn_logged!("src/channels/http.rs:5444", async move {
+        let handle = crate::spawn_logged!("src/channels/http.rs:5444", async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             match tunnel::auto_start_selected_app_tunnel(&state_for_tunnel).await {
                 Ok(Some(url)) => tracing::info!(
@@ -2817,12 +2980,13 @@ pub async fn serve(
                 }
             }
         });
+        background_workers.push(("App tunnel auto-restore worker", handle));
     }
 
     // Auto-start the bundled WhatsApp bridge only when Baileys + embedded mode is enabled.
     if should_manage_embedded_whatsapp_bridge(&state).await {
         let state_for_bridge = state.clone();
-        crate::spawn_logged!("src/channels/http.rs:4897", async move {
+        let handle = crate::spawn_logged!("src/channels/http.rs:4897", async move {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             tracing::info!("Auto-starting bundled WhatsApp bridge...");
             match spawn_whatsapp_bridge(state_for_bridge).await {
@@ -2830,6 +2994,7 @@ pub async fn serve(
                 Err(e) => tracing::warn!("WhatsApp bridge unavailable: {}", e),
             }
         });
+        background_workers.push(("WhatsApp bridge auto-start worker", handle));
     }
 
     schedule_enabled_mcp_server_resumes(state.agent.clone());
@@ -2840,11 +3005,17 @@ pub async fn serve(
         let state_for_tunnel = state.clone();
         let wb = wa_bridge_handle.clone();
         let state_for_bridge = state.clone();
-        crate::spawn_logged!("src/channels/http.rs:4915", async move {
+        let mut shutdown = shutdown_rx.clone();
+        let handle = crate::spawn_logged!("src/channels/http.rs:4915", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tunnel_restart_backoff = EMBEDDED_PROCESS_RESTART_INITIAL_BACKOFF;
+            let mut whatsapp_restart_backoff = EMBEDDED_PROCESS_RESTART_INITIAL_BACKOFF;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    _ = interval.tick() => {}
+                }
 
                 // Check tunnel process health
                 let needs_restart = {
@@ -2862,8 +3033,11 @@ pub async fn serve(
                                 tunnel.error = Some("Process exited, restarting...".to_string());
                                 true
                             }
-                            Ok(None) => false, // Still running
-                            Err(_) => false,   // Can't check, assume ok
+                            Ok(None) => {
+                                tunnel_restart_backoff = EMBEDDED_PROCESS_RESTART_INITIAL_BACKOFF;
+                                false
+                            }
+                            Err(_) => false, // Can't check, assume ok
                         }
                     } else {
                         false
@@ -2871,12 +3045,21 @@ pub async fn serve(
                 };
 
                 if needs_restart {
-                    // Wait a bit before restart to avoid tight loops
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    if !sleep_or_http_shutdown(tunnel_restart_backoff, &mut shutdown).await {
+                        break;
+                    }
                     tracing::info!("Sentinel: restarting tunnel...");
                     match tunnel::spawn_tunnel(&state_for_tunnel, None).await {
-                        Ok(()) => tracing::info!("Sentinel: tunnel restarted successfully"),
-                        Err(e) => tracing::error!("Sentinel: failed to restart tunnel: {}", e),
+                        Ok(()) => {
+                            tunnel_restart_backoff = EMBEDDED_PROCESS_RESTART_INITIAL_BACKOFF;
+                            tracing::info!("Sentinel: tunnel restarted successfully");
+                        }
+                        Err(e) => {
+                            tracing::error!("Sentinel: failed to restart tunnel: {}", e);
+                            tunnel_restart_backoff = tunnel_restart_backoff
+                                .saturating_mul(2)
+                                .min(EMBEDDED_PROCESS_RESTART_MAX_BACKOFF);
+                        }
                     }
                 }
 
@@ -2896,7 +3079,11 @@ pub async fn serve(
                                         Some("Process exited, restarting...".to_string());
                                     true
                                 }
-                                Ok(None) => false,
+                                Ok(None) => {
+                                    whatsapp_restart_backoff =
+                                        EMBEDDED_PROCESS_RESTART_INITIAL_BACKOFF;
+                                    false
+                                }
                                 Err(_) => false,
                             }
                         } else {
@@ -2908,14 +3095,20 @@ pub async fn serve(
                 };
 
                 if wa_needs_restart {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    if !sleep_or_http_shutdown(whatsapp_restart_backoff, &mut shutdown).await {
+                        break;
+                    }
                     tracing::info!("Sentinel: restarting WhatsApp bridge...");
                     match spawn_whatsapp_bridge(state_for_bridge.clone()).await {
                         Ok(()) => {
-                            tracing::info!("Sentinel: WhatsApp bridge restarted successfully")
+                            whatsapp_restart_backoff = EMBEDDED_PROCESS_RESTART_INITIAL_BACKOFF;
+                            tracing::info!("Sentinel: WhatsApp bridge restarted successfully");
                         }
                         Err(e) => {
-                            tracing::error!("Sentinel: failed to restart WhatsApp bridge: {}", e)
+                            tracing::error!("Sentinel: failed to restart WhatsApp bridge: {}", e);
+                            whatsapp_restart_backoff = whatsapp_restart_backoff
+                                .saturating_mul(2)
+                                .min(EMBEDDED_PROCESS_RESTART_MAX_BACKOFF);
                         }
                     }
                 }
@@ -2923,13 +3116,14 @@ pub async fn serve(
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
         });
+        background_workers.push(("Embedded process sentinel worker", handle));
     }
 
     // Chat suggestion scanner: sweep chat wishes on a controlled cadence and defer while busy.
     {
         let state_for_suggestions = state.clone();
         let mut shutdown = shutdown_rx.clone();
-        crate::spawn_logged!("src/channels/http.rs:5085", async move {
+        let handle = crate::spawn_logged!("src/channels/http.rs:5085", async move {
             let mut timeout_streak = 0u32;
             loop {
                 let storage = { state_for_suggestions.agent.read().await.storage.clone() };
@@ -3018,6 +3212,7 @@ pub async fn serve(
                 }
             }
         });
+        background_workers.push(("Chat suggestion scanner worker", handle));
     }
 
     // Check TLS configuration
@@ -3062,17 +3257,9 @@ pub async fn serve(
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
         let _ = shutdown_task.await;
-        if let Some(mut handle) = public_app_server {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!("Public app server join failed during shutdown: {}", error)
-                }
-                Err(_) => {
-                    tracing::warn!("Public app server did not stop within 10s; aborting task");
-                    handle.abort();
-                }
-            }
+        join_optional_background_worker("Public app server", public_app_server).await;
+        for (name, handle) in background_workers {
+            join_background_worker(name, handle).await;
         }
         return Ok(());
     }
@@ -3106,17 +3293,9 @@ pub async fn serve(
     })
     .await?;
 
-    if let Some(mut handle) = public_app_server {
-        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!("Public app server join failed during shutdown: {}", error)
-            }
-            Err(_) => {
-                tracing::warn!("Public app server did not stop within 10s; aborting task");
-                handle.abort();
-            }
-        }
+    join_optional_background_worker("Public app server", public_app_server).await;
+    for (name, handle) in background_workers {
+        join_background_worker(name, handle).await;
     }
 
     Ok(())

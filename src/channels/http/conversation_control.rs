@@ -457,6 +457,7 @@ pub(super) async fn get_conversation_messages(
                         "cached_prompt_tokens": cached_prompt_tokens,
                         "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
                         "duration_ms": duration_ms,
+                        "time_to_first_stream_activity_ms": time_to_first_token_ms,
                         "time_to_first_token_ms": time_to_first_token_ms,
                     });
                     if let Some(choices) = m

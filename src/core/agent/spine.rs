@@ -1,3 +1,4 @@
+use super::operational::OperationalEvent;
 use super::spine_prompt_bundle::{
     self, ALLOWED_EVOLVABLE_SPINE_FRAGMENT_IDS, SPINE_PROMPT_BUNDLE_VERSION,
 };
@@ -5,48 +6,297 @@ use super::spine_request::*;
 use super::*;
 use crate::actions::ActionAuthorization;
 use async_trait::async_trait;
-use chrono::{TimeZone, Timelike};
 use futures::future::join_all;
-use std::sync::LazyLock;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
-const PRIMITIVE_NAMES: [&str; 8] = [
+const PRIMITIVE_NAMES: [&str; 15] = [
     "search",
     "fetch",
     "browse",
     "code_exec",
     "pdf_generate",
+    "app_deploy",
+    "file_read",
+    "file_search",
+    "file_write",
+    "file_patch",
+    "file_delete",
+    "skill_manage",
     "resource_rw",
     "memory_rw",
     "delegate",
 ];
 
-const RESOURCE_RW_VALID_KINDS: [&str; 17] = [
-    "file",
-    "app_service",
-    "watcher",
-    "scheduled_task",
-    "notification",
-    "background_session",
-    "goal",
-    "dashboard",
-    "conversation",
-    "activity",
-    "integration",
-    "custom_api",
-    "custom_messaging_channel",
-    "extension_pack",
-    "mcp_server",
-    "skill",
-    "skill_marketplace",
+#[derive(Debug, Clone, Copy)]
+struct ResourceAdapterSpec {
+    kind: &'static str,
+    ops: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResourcePayloadRequirement {
+    None,
+    CustomApiAcquisitionSpec,
+    CustomMessagingChannelSpec,
+    ExtensionPackInstallTarget,
+    ExtensionPackId,
+    McpServerConfig,
+    ResourceId,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResourcePayloadTransform {
+    StripResourceFields,
+    ExtensionPack,
+    McpManage,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceActionContract {
+    kind: &'static str,
+    ops: &'static [&'static str],
+    action_name: &'static str,
+    requirement: ResourcePayloadRequirement,
+    transform: ResourcePayloadTransform,
+    selected_action_for_resolution: Option<&'static str>,
+}
+
+const RESOURCE_RW_ADAPTERS: &[ResourceAdapterSpec] = &[
+    ResourceAdapterSpec {
+        kind: "file",
+        ops: &["create", "read", "update", "delete", "list", "status"],
+    },
+    ResourceAdapterSpec {
+        kind: "app_service",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "pause", "resume", "stop",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "watcher",
+        ops: &[
+            "create",
+            "read",
+            "update",
+            "delete",
+            "list",
+            "status",
+            "pause",
+            "resume",
+            "stop",
+            "cancel",
+            "update_delivery",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "scheduled_task",
+        ops: &[
+            "create",
+            "read",
+            "update",
+            "delete",
+            "list",
+            "status",
+            "pause",
+            "resume",
+            "stop",
+            "cancel",
+            "update_delivery",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "notification",
+        ops: &["create", "update"],
+    },
+    ResourceAdapterSpec {
+        kind: "background_session",
+        ops: &[
+            "create",
+            "read",
+            "update",
+            "delete",
+            "list",
+            "status",
+            "pause",
+            "resume",
+            "stop",
+            "cancel",
+            "update_delivery",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "browser_profile",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "launch", "close", "resolve",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "goal",
+        ops: &["create", "read", "update", "delete", "list", "status"],
+    },
+    ResourceAdapterSpec {
+        kind: "dashboard",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "pause", "resume", "stop",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "conversation",
+        ops: &["read", "list"],
+    },
+    ResourceAdapterSpec {
+        kind: "activity",
+        ops: &["read", "list", "status", "refresh"],
+    },
+    ResourceAdapterSpec {
+        kind: "integration",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "install", "connect", "test",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "custom_api",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "install", "connect", "test",
+            "enable", "disable",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "custom_messaging_channel",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "enable", "disable", "test",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "extension_pack",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "install", "connect", "enable",
+            "disable", "test",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "mcp_server",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "install", "connect", "refresh",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "skill",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "install", "enable", "disable",
+            "test",
+        ],
+    },
+    ResourceAdapterSpec {
+        kind: "skill_marketplace",
+        ops: &[
+            "create", "read", "update", "delete", "list", "status", "refresh", "enable", "disable",
+        ],
+    },
+];
+
+const RESOURCE_ACTION_CONTRACTS: &[ResourceActionContract] = &[
+    ResourceActionContract {
+        kind: "custom_api",
+        ops: &["create", "update", "install", "connect"],
+        action_name: "capability_acquire",
+        requirement: ResourcePayloadRequirement::CustomApiAcquisitionSpec,
+        transform: ResourcePayloadTransform::StripResourceFields,
+        selected_action_for_resolution: Some("capability_acquire"),
+    },
+    ResourceActionContract {
+        kind: "custom_api",
+        ops: &["delete", "enable", "disable"],
+        action_name: "custom_api_manage",
+        requirement: ResourcePayloadRequirement::ResourceId,
+        transform: ResourcePayloadTransform::StripResourceFields,
+        selected_action_for_resolution: Some("custom_api_manage"),
+    },
+    ResourceActionContract {
+        kind: "custom_messaging_channel",
+        ops: &["create", "update"],
+        action_name: "custom_messaging_channel_upsert",
+        requirement: ResourcePayloadRequirement::CustomMessagingChannelSpec,
+        transform: ResourcePayloadTransform::StripResourceFields,
+        selected_action_for_resolution: Some("custom_messaging_channel_upsert"),
+    },
+    ResourceActionContract {
+        kind: "custom_messaging_channel",
+        ops: &["delete", "enable", "disable", "test"],
+        action_name: "custom_messaging_channel_manage",
+        requirement: ResourcePayloadRequirement::ResourceId,
+        transform: ResourcePayloadTransform::StripResourceFields,
+        selected_action_for_resolution: Some("custom_messaging_channel_manage"),
+    },
+    ResourceActionContract {
+        kind: "extension_pack",
+        ops: &["create", "update", "install"],
+        action_name: "extension_pack_install",
+        requirement: ResourcePayloadRequirement::ExtensionPackInstallTarget,
+        transform: ResourcePayloadTransform::ExtensionPack,
+        selected_action_for_resolution: Some("extension_pack_install"),
+    },
+    ResourceActionContract {
+        kind: "extension_pack",
+        ops: &["connect"],
+        action_name: "extension_pack_connect",
+        requirement: ResourcePayloadRequirement::ExtensionPackId,
+        transform: ResourcePayloadTransform::ExtensionPack,
+        selected_action_for_resolution: Some("extension_pack_connect"),
+    },
+    ResourceActionContract {
+        kind: "extension_pack",
+        ops: &["enable", "disable"],
+        action_name: "extension_pack_set_enabled",
+        requirement: ResourcePayloadRequirement::ExtensionPackId,
+        transform: ResourcePayloadTransform::ExtensionPack,
+        selected_action_for_resolution: Some("extension_pack_set_enabled"),
+    },
+    ResourceActionContract {
+        kind: "extension_pack",
+        ops: &["delete"],
+        action_name: "extension_pack_delete",
+        requirement: ResourcePayloadRequirement::ExtensionPackId,
+        transform: ResourcePayloadTransform::ExtensionPack,
+        selected_action_for_resolution: Some("extension_pack_delete"),
+    },
+    ResourceActionContract {
+        kind: "extension_pack",
+        ops: &["test"],
+        action_name: "extension_pack_test_connection",
+        requirement: ResourcePayloadRequirement::ExtensionPackId,
+        transform: ResourcePayloadTransform::ExtensionPack,
+        selected_action_for_resolution: Some("extension_pack_test_connection"),
+    },
+    ResourceActionContract {
+        kind: "mcp_server",
+        ops: &["create", "update", "install", "connect"],
+        action_name: "mcp_server_manage",
+        requirement: ResourcePayloadRequirement::McpServerConfig,
+        transform: ResourcePayloadTransform::McpManage,
+        selected_action_for_resolution: Some("mcp_server_manage"),
+    },
+    ResourceActionContract {
+        kind: "mcp_server",
+        ops: &["delete", "refresh"],
+        action_name: "mcp_server_manage",
+        requirement: ResourcePayloadRequirement::ResourceId,
+        transform: ResourcePayloadTransform::McpManage,
+        selected_action_for_resolution: Some("mcp_server_manage"),
+    },
+    ResourceActionContract {
+        kind: "mcp_server",
+        ops: &["list", "read", "status"],
+        action_name: "mcp_server_manage",
+        requirement: ResourcePayloadRequirement::None,
+        transform: ResourcePayloadTransform::McpManage,
+        selected_action_for_resolution: None,
+    },
 ];
 const LLM_NATIVE_IMAGE_ATTACHMENT_LIMIT: usize = 4;
 const LLM_NATIVE_IMAGE_ATTACHMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
-static NOTIFICATION_CLOCK_TIME_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(
-        r"(?i)(?:^|[^[:alnum:]_])(?:(?P<hour12>0?[1-9]|1[0-2])(?:[:.](?P<minute12>[0-5]\d))?\s*(?P<meridiem>a\.?m\.?|p\.?m\.?)|(?P<hour24>[01]?\d|2[0-3]):(?P<minute24>[0-5]\d)(?::(?P<second24>[0-5]\d))?)(?:[^[:alnum:]_]|$)",
-    )
-    .expect("valid notification clock time regex")
-});
+const SPINE_MODEL_STREAM_RETRY_ATTEMPTS_PER_CANDIDATE: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct SpineChatResponse {
@@ -56,6 +306,10 @@ pub struct SpineChatResponse {
     pub completion_tokens: usize,
     pub cache_read_tokens: usize,
     pub cache_creation_tokens: usize,
+    /// Provider response latency in milliseconds — the time the model provider
+    /// took to answer this request (request → final chunk), excluding spine
+    /// prompt-assembly and tool execution. This is the "LLM latency" the user sees.
+    pub provider_latency_ms: u64,
 }
 
 #[async_trait]
@@ -260,8 +514,22 @@ impl ToolRegistry {
                     tool_result_error(call.name.as_str(), "execution_failed", error.to_string())
                 }
             })?;
-        let mut result =
-            spine_tool_result_value_for_model(call.name.as_str(), &invocation.action_name, content);
+        let arkdistill_profile =
+            crate::core::agent::ark_distill::load_arkdistill_profile(&cx.agent.storage).await;
+        let output = spine_tool_result_output_for_model_with_profile(
+            call.name.as_str(),
+            &invocation.action_name,
+            content,
+            &arkdistill_profile,
+        );
+        log_arkdistill_tool_output(
+            cx,
+            call.name.as_str(),
+            &invocation.action_name,
+            &output.stats,
+        )
+        .await;
+        let mut result = output.value;
         remember_pending_credential_prompt_from_tool_result(cx, &mut result).await;
         Ok(result)
     }
@@ -272,25 +540,11 @@ impl ToolRegistry {
         call: &SpineToolCall,
         cx: &SpineContext,
     ) -> PrimitiveActionInvocation {
-        if call.name == "resource_rw" && invocation.action_name.eq_ignore_ascii_case("notify_user")
-        {
-            if let Some(request_text) = latest_user_message_text(&cx.request.messages) {
-                let default_timezone = {
-                    let profile = cx.agent.user_profile.read().await;
-                    profile
-                        .timezone
-                        .as_deref()
-                        .and_then(|timezone| timezone.parse::<chrono_tz::Tz>().ok())
-                };
-                if let Some(repaired) = scheduled_notification_invocation_from_direct_notification(
-                    invocation,
-                    request_text,
-                    chrono::Utc::now(),
-                    default_timezone,
-                ) {
-                    return repaired;
-                }
-            }
+        if call.name == "browse" && invocation.action_name.eq_ignore_ascii_case("browser_auto") {
+            return browser_auto_invocation_with_request_profile(
+                invocation,
+                cx.request.browser_profile_context.as_ref(),
+            );
         }
         invocation.clone()
     }
@@ -452,6 +706,13 @@ impl ToolRegistry {
             "browse" => plan_browse(&call.arguments),
             "code_exec" => plan_code_exec(&call.arguments),
             "pdf_generate" => plan_pdf_generate(&call.arguments),
+            "app_deploy" => plan_direct_action("app_deploy", &call.arguments),
+            "file_read" => plan_direct_action("file_read", &call.arguments),
+            "file_search" => plan_direct_action("file_search", &call.arguments),
+            "file_write" => plan_direct_action("file_write", &call.arguments),
+            "file_patch" => plan_direct_action("file_patch", &call.arguments),
+            "file_delete" => plan_direct_action("file_delete", &call.arguments),
+            "skill_manage" => plan_skill_manage(&call.arguments),
             "resource_rw" => plan_resource_rw(&call.arguments),
             "memory_rw" => plan_memory_rw(&call.arguments),
             "delegate" => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
@@ -569,6 +830,30 @@ async fn remember_pending_credential_prompt_from_tool_result(
                     )
                     .await;
                 remembered = !required_keys.is_empty();
+            }
+        }
+        "app_runtime_secret" => {
+            if let Some(app_id) = credential_value_text(&request, "app_id") {
+                let title = credential_value_text(&request, "display_name")
+                    .or_else(|| credential_value_text(&request, "title"))
+                    .unwrap_or_else(|| app_id.clone());
+                let required_keys = credential_value_string_array(&request, "required_keys")
+                    .or_else(|| credential_value_string_array(&request, "required_env"))
+                    .or_else(|| credential_value_string_array(&request, "missing_env"))
+                    .unwrap_or_default();
+                if !required_keys.is_empty() {
+                    cx.agent
+                        .remember_pending_secret_followup(
+                            conversation_id,
+                            PendingSecretFollowupKind::RestartApp {
+                                app_id,
+                                title,
+                                missing_env: required_keys,
+                            },
+                        )
+                        .await;
+                    remembered = true;
+                }
             }
         }
         _ => {}
@@ -765,15 +1050,6 @@ struct PrimitiveActionInvocation {
 }
 
 #[derive(Debug, Clone)]
-struct NotificationScheduleHint {
-    local_date: String,
-    local_time: String,
-    timezone_name: String,
-    timezone_abbrev: String,
-    date_label: String,
-}
-
-#[derive(Debug, Clone)]
 enum PrimitivePlan {
     Actions(Vec<PrimitiveActionInvocation>),
     Memory(MemoryPrimitiveOp),
@@ -824,16 +1100,29 @@ impl ToolResult {
         Self { ok, value }
     }
 
-    fn to_json(&self) -> String {
+    fn base_value(&self) -> serde_json::Value {
         if self.value.get("ok").is_some() || self.value.get("status").is_some() {
-            self.value.to_string()
+            let mut value = self.value.clone();
+            if let Some(object) = value.as_object_mut() {
+                object
+                    .entry("ok".to_string())
+                    .or_insert_with(|| serde_json::Value::Bool(self.ok));
+            }
+            value
         } else {
             serde_json::json!({
                 "ok": self.ok,
                 "result": self.value,
             })
-            .to_string()
         }
+    }
+
+    fn to_json(&self) -> String {
+        self.base_value().to_string()
+    }
+
+    fn to_json_for_tool(&self, call: &SpineToolCall) -> String {
+        normalize_tool_evidence_envelope(call, self).to_string()
     }
 
     fn summary(&self) -> String {
@@ -842,22 +1131,338 @@ impl ToolResult {
     }
 }
 
+fn normalize_tool_evidence_envelope(
+    call: &SpineToolCall,
+    result: &ToolResult,
+) -> serde_json::Value {
+    let base = result.base_value();
+    let mut object = base.as_object().cloned().unwrap_or_else(|| {
+        let mut object = serde_json::Map::new();
+        object.insert("ok".to_string(), serde_json::Value::Bool(result.ok));
+        object.insert("result".to_string(), base.clone());
+        object
+    });
+
+    let outcome = super::tool_responses::structured_tool_value_outcome(&serde_json::Value::Object(
+        object.clone(),
+    ));
+    let status = outcome
+        .as_ref()
+        .map(|report| match report.state {
+            super::tool_responses::StructuredToolOutcomeState::Success => "ok",
+            super::tool_responses::StructuredToolOutcomeState::Failure => "error",
+            super::tool_responses::StructuredToolOutcomeState::NeedsInput => "needs_input",
+        })
+        .unwrap_or(if result.ok { "ok" } else { "error" });
+
+    object.insert(
+        "operation".to_string(),
+        serde_json::json!({
+            "primitive": call.name.as_str(),
+            "reported_tool": first_structured_string(&serde_json::Value::Object(object.clone()), &["tool", "primitive"]),
+            "reported_operation": first_structured_string(&serde_json::Value::Object(object.clone()), &["operation", "action", "op", "kind"]),
+        }),
+    );
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(status.to_string()),
+    );
+    object.insert(
+        "user_visible_outcome".to_string(),
+        super::tool_responses::summarize_structured_tool_output_for_user(
+            &serde_json::Value::Object(object.clone()).to_string(),
+        )
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert(
+        "next_repair_hint".to_string(),
+        next_repair_hint_from_tool_value(&serde_json::Value::Object(object.clone())),
+    );
+    let (error_class, retryable) =
+        classify_tool_evidence_failure(&serde_json::Value::Object(object.clone()), result.ok);
+    object.insert("error_class".to_string(), error_class);
+    object.insert("retryable".to_string(), serde_json::Value::Bool(retryable));
+    object.insert(
+        "artifacts".to_string(),
+        tool_evidence_artifacts(call, &serde_json::Value::Object(object.clone())),
+    );
+    object.insert(
+        "capability_tags".to_string(),
+        tool_evidence_capability_tags(call, &serde_json::Value::Object(object.clone())),
+    );
+    object.insert(
+        "diagnostics".to_string(),
+        tool_evidence_diagnostics(&serde_json::Value::Object(object.clone())),
+    );
+    object.insert(
+        "logs".to_string(),
+        tool_evidence_logs(&serde_json::Value::Object(object.clone())),
+    );
+
+    serde_json::Value::Object(object)
+}
+
+fn first_structured_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    for key in keys {
+        if let Some(text) = object
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(text.to_string());
+        }
+    }
+    if let Some(nested) = object.get("result").and_then(|value| value.as_object()) {
+        for key in keys {
+            if let Some(text) = nested
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn embedded_json_object_from_string(value: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(value.trim())
+        .ok()
+        .filter(|value| value.is_object())
+}
+
+fn next_repair_hint_from_tool_value(value: &serde_json::Value) -> serde_json::Value {
+    let remediation = value.get("remediation").cloned();
+    let hint = first_structured_string(value, &["hint", "next_repair_hint"]).or_else(|| {
+        value
+            .get("message")
+            .and_then(|value| value.as_str())
+            .and_then(embedded_json_object_from_string)
+            .and_then(|embedded| first_structured_string(&embedded, &["hint", "next_repair_hint"]))
+    });
+    if remediation.is_none() && hint.is_none() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "hint": hint,
+        "remediation": remediation.unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn classify_tool_evidence_failure(
+    value: &serde_json::Value,
+    ok: bool,
+) -> (serde_json::Value, bool) {
+    if ok {
+        return (serde_json::Value::Null, false);
+    }
+    let domain = first_structured_string(value, &["domain"]);
+    let reason = first_structured_string(value, &["reason", "error"]);
+    let embedded_retryable = value
+        .get("message")
+        .and_then(|value| value.as_str())
+        .and_then(embedded_json_object_from_string)
+        .and_then(|embedded| embedded.get("retryable").and_then(|value| value.as_bool()));
+    let retryable = embedded_retryable
+        .or_else(|| value.get("retryable").and_then(|value| value.as_bool()))
+        .unwrap_or_else(|| {
+            matches!(
+                reason.as_deref(),
+                Some("timeout" | "rate_limited" | "unavailable")
+            )
+        });
+    let class = match (domain.as_deref(), reason.as_deref()) {
+        (Some("auth"), _) => "auth",
+        (_, Some("not_connected" | "permission_denied" | "approval_required")) => "access",
+        (_, Some("missing_input" | "invalid_input" | "ambiguous")) => "input",
+        (_, Some("timeout" | "rate_limited" | "unavailable")) => "transient",
+        (Some("app"), _) => "runtime",
+        (Some("search"), _) => "evidence",
+        _ => "execution",
+    };
+    (serde_json::Value::String(class.to_string()), retryable)
+}
+
+fn push_tool_evidence_capability_tag(tags: &mut Vec<String>, raw: &str) {
+    let mut normalized = String::new();
+    let mut previous_separator = false;
+    for ch in raw.trim().chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            previous_separator = false;
+        } else if !previous_separator && !normalized.is_empty() {
+            normalized.push('_');
+            previous_separator = true;
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    if !normalized.is_empty() && !tags.iter().any(|tag| tag == normalized) {
+        tags.push(normalized.to_string());
+    }
+}
+
+fn collect_tool_evidence_capability_tags(value: &serde_json::Value, tags: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in ["capability_tags", "capabilities", "tags"] {
+        match object.get(key) {
+            Some(serde_json::Value::Array(values)) => {
+                for value in values {
+                    if let Some(tag) = value.as_str() {
+                        push_tool_evidence_capability_tag(tags, tag);
+                    }
+                }
+            }
+            Some(serde_json::Value::String(value)) => {
+                push_tool_evidence_capability_tag(tags, value);
+            }
+            _ => {}
+        }
+    }
+    if let Some(result) = object.get("result") {
+        collect_tool_evidence_capability_tags(result, tags);
+    }
+}
+
+fn tool_evidence_capability_tags(
+    call: &SpineToolCall,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    let mut tags = Vec::new();
+    push_tool_evidence_capability_tag(&mut tags, call.name.as_str());
+    if let Some(kind) = call.arguments.get("kind").and_then(|value| value.as_str()) {
+        push_tool_evidence_capability_tag(&mut tags, kind);
+    }
+    collect_tool_evidence_capability_tags(value, &mut tags);
+    serde_json::Value::Array(tags.into_iter().map(serde_json::Value::String).collect())
+}
+
+fn tool_evidence_artifacts(call: &SpineToolCall, value: &serde_json::Value) -> serde_json::Value {
+    let mut artifacts = Vec::new();
+    if let Some(path) = first_structured_string(value, &["path", "file_path", "managed_file"]) {
+        artifacts.push(serde_json::json!({
+            "kind": "file",
+            "path": path,
+        }));
+    }
+    if call.name == "app_deploy" {
+        let app_id = first_structured_string(value, &["app_id", "id"]);
+        let url = first_structured_string(value, &["access_url", "url"]);
+        if app_id.is_some() || url.is_some() {
+            artifacts.push(serde_json::json!({
+                "kind": "app_service",
+                "id": app_id,
+                "url": url,
+            }));
+        }
+    }
+    serde_json::Value::Array(artifacts)
+}
+
+fn tool_evidence_diagnostics(value: &serde_json::Value) -> serde_json::Value {
+    let mut diagnostics = serde_json::Map::new();
+    for key in [
+        "message",
+        "detail",
+        "summary",
+        "error",
+        "exit_code",
+        "phase",
+        "command",
+        "cwd",
+    ] {
+        if let Some(item) = value.get(key) {
+            diagnostics.insert(key.to_string(), item.clone());
+        }
+    }
+    if let Some(message) = value.get("message").and_then(|value| value.as_str()) {
+        if let Some(embedded) = embedded_json_object_from_string(message) {
+            if let Some(object) = embedded.as_object() {
+                for key in ["phase", "command", "cwd", "exit_code", "log_tail", "hint"] {
+                    if let Some(item) = object.get(key) {
+                        diagnostics.insert(key.to_string(), item.clone());
+                    }
+                }
+            }
+        }
+    }
+    serde_json::Value::Object(diagnostics)
+}
+
+fn tool_evidence_logs(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "stdout": value.get("stdout").cloned().unwrap_or(serde_json::Value::Null),
+        "stderr": value.get("stderr").cloned().unwrap_or(serde_json::Value::Null),
+        "log_tail": value.get("log_tail").cloned().unwrap_or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.as_str())
+                .and_then(embedded_json_object_from_string)
+                .and_then(|embedded| embedded.get("log_tail").cloned())
+                .unwrap_or(serde_json::Value::Null)
+        }),
+    })
+}
+
 const SPINE_TOOL_STREAM_MAX_STRING_CHARS: usize = 900;
 const SPINE_TOOL_STREAM_MAX_ARRAY_ITEMS: usize = 12;
 const SPINE_TOOL_STREAM_MAX_OBJECT_KEYS: usize = 24;
 const SPINE_TOOL_STREAM_MAX_DEPTH: usize = 5;
 const SPINE_TOOL_STREAM_PREVIEW_ITEMS: usize = 5;
+const SPINE_TOOL_HISTORY_MAX_STRING_CHARS: usize = 240;
+const SPINE_TOOL_HISTORY_MAX_ARRAY_ITEMS: usize = 8;
+const SPINE_TOOL_HISTORY_MAX_OBJECT_KEYS: usize = 16;
+const SPINE_TOOL_HISTORY_MAX_DEPTH: usize = 4;
+const SPINE_TOOL_HISTORY_PREVIEW_ITEMS: usize = 8;
 
 fn spine_tool_start_stream_payload(call: &SpineToolCall) -> serde_json::Value {
     let arguments = sanitize_spine_tool_stream_value(&call.arguments, 0);
-    let intent_summary = spine_tool_start_intent_summary(&call.name, &arguments);
-    serde_json::json!({
+    let activity_label = call
+        .activity_label
+        .as_deref()
+        .and_then(clean_model_tool_activity_label);
+    let intent_summary = activity_label
+        .clone()
+        .unwrap_or_else(|| spine_tool_start_intent_summary(&call.name, &arguments));
+    let mut payload = serde_json::json!({
         "kind": "model_tool_call",
         "tool_call_id": call.id,
         "tool_name": call.name,
         "arguments": arguments,
         "intent_summary": intent_summary,
-    })
+    });
+    if let Some(activity_label) = activity_label {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "activity_label".to_string(),
+                serde_json::json!(activity_label),
+            );
+            obj.insert(
+                "display_label".to_string(),
+                serde_json::json!(activity_label),
+            );
+        }
+    }
+    payload
+}
+
+fn clean_model_tool_activity_label(value: &str) -> Option<String> {
+    let label = value
+        .replace(['\r', '\n', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        None
+    } else {
+        Some(safe_truncate(&label, 80))
+    }
 }
 
 fn spine_tool_result_stream_content(call: &SpineToolCall, result: &ToolResult) -> String {
@@ -875,13 +1480,177 @@ fn spine_tool_result_stream_content(call: &SpineToolCall, result: &ToolResult) -
     .to_string()
 }
 
+fn redact_spine_tool_stream_text(value: &str) -> String {
+    let secret_redacted = crate::security::redact_secret_input(value).text;
+    crate::security::redact_pii(&secret_redacted)
+}
+
+fn is_bulk_tool_argument_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "content"
+            | "raw_content"
+            | "file_content"
+            | "body"
+            | "html"
+            | "markdown"
+            | "code"
+            | "patch"
+            | "files"
+            | "file_patches"
+            | "file_payloads"
+            | "content_base64"
+            | "bytes_b64"
+    )
+}
+
+fn omitted_tool_argument_summary(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::json!({
+            "omitted": true,
+            "chars": text.chars().count(),
+        }),
+        serde_json::Value::Array(items) => serde_json::json!({
+            "omitted": true,
+            "items": items.len(),
+        }),
+        serde_json::Value::Object(map) => serde_json::json!({
+            "omitted": true,
+            "fields": map.len(),
+        }),
+        _ => serde_json::json!({
+            "omitted": true,
+        }),
+    }
+}
+
+fn sanitize_spine_tool_history_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth >= SPINE_TOOL_HISTORY_MAX_DEPTH {
+        return match value {
+            serde_json::Value::Null => serde_json::Value::Null,
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.clone(),
+            serde_json::Value::String(text) => serde_json::Value::String(safe_truncate(
+                redact_spine_tool_stream_text(text.trim()).trim(),
+                120,
+            )),
+            serde_json::Value::Array(items) => serde_json::json!({
+                "truncated": true,
+                "items": items.len(),
+            }),
+            serde_json::Value::Object(map) => serde_json::json!({
+                "truncated": true,
+                "fields": map.len(),
+            }),
+        };
+    }
+
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            value.clone()
+        }
+        serde_json::Value::String(text) => serde_json::Value::String(safe_truncate(
+            redact_spine_tool_stream_text(text.trim()).trim(),
+            SPINE_TOOL_HISTORY_MAX_STRING_CHARS,
+        )),
+        serde_json::Value::Array(items) => {
+            let mut sanitized = items
+                .iter()
+                .take(SPINE_TOOL_HISTORY_MAX_ARRAY_ITEMS)
+                .map(|item| sanitize_spine_tool_history_value(item, depth + 1))
+                .collect::<Vec<_>>();
+            if items.len() > SPINE_TOOL_HISTORY_MAX_ARRAY_ITEMS {
+                sanitized.push(serde_json::json!({
+                    "truncated_items": items.len() - SPINE_TOOL_HISTORY_MAX_ARRAY_ITEMS,
+                }));
+            }
+            serde_json::Value::Array(sanitized)
+        }
+        serde_json::Value::Object(map) => {
+            let mut sanitized = serde_json::Map::new();
+            let mut omitted = 0usize;
+            for (key, inner) in map {
+                if key.starts_with('_') {
+                    continue;
+                }
+                if sanitized.len() >= SPINE_TOOL_HISTORY_MAX_OBJECT_KEYS {
+                    omitted += 1;
+                    continue;
+                }
+                if is_sensitive_tool_call_argument_key(key) {
+                    sanitized.insert(
+                        key.clone(),
+                        serde_json::Value::String("[redacted]".to_string()),
+                    );
+                    continue;
+                }
+                if is_bulk_tool_argument_key(key) {
+                    let keep_short_string = inner
+                        .as_str()
+                        .is_some_and(|text| text.chars().count() <= 80);
+                    if !keep_short_string {
+                        sanitized.insert(key.clone(), omitted_tool_argument_summary(inner));
+                        continue;
+                    }
+                }
+                sanitized.insert(
+                    key.clone(),
+                    sanitize_spine_tool_history_value(inner, depth + 1),
+                );
+            }
+            if omitted > 0 {
+                sanitized.insert("truncated_keys".to_string(), serde_json::json!(omitted));
+            }
+            serde_json::Value::Object(sanitized)
+        }
+    }
+}
+
+fn spine_tool_call_history_context(
+    tool_calls: &[SpineToolCall],
+    tool_call_aliases: &HashMap<String, String>,
+) -> Option<String> {
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let lines = tool_calls
+        .iter()
+        .map(|call| {
+            let call_label = tool_call_aliases
+                .get(&call.id)
+                .map(String::as_str)
+                .unwrap_or("tool_call");
+            let arguments = sanitize_spine_tool_history_value(&call.arguments, 0);
+            let preview = spine_tool_stream_preview(&arguments, SPINE_TOOL_HISTORY_PREVIEW_ITEMS);
+            if preview.trim().is_empty() {
+                format!("- `{}` called `{}`.", call_label, call.name)
+            } else {
+                format!(
+                    "- `{}` called `{}` with {}.",
+                    call_label, call.name, preview
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(
+            crate::core::llm_context_sanitizer::wrap_internal_tool_context(&format!(
+                "tool_call_context:\n{}",
+                lines.join("\n")
+            )),
+        )
+    }
+}
+
 fn sanitize_spine_tool_stream_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
     if depth >= SPINE_TOOL_STREAM_MAX_DEPTH {
         return match value {
             serde_json::Value::Null => serde_json::Value::Null,
             serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.clone(),
             serde_json::Value::String(text) => {
-                serde_json::Value::String(safe_truncate(text.trim(), 160))
+                let redacted = redact_spine_tool_stream_text(text.trim());
+                serde_json::Value::String(safe_truncate(redacted.trim(), 160))
             }
             serde_json::Value::Array(items) => serde_json::json!({
                 "truncated": true,
@@ -899,7 +1668,7 @@ fn sanitize_spine_tool_stream_value(value: &serde_json::Value, depth: usize) -> 
             value.clone()
         }
         serde_json::Value::String(text) => serde_json::Value::String(safe_truncate(
-            text.trim(),
+            redact_spine_tool_stream_text(text.trim()).trim(),
             SPINE_TOOL_STREAM_MAX_STRING_CHARS,
         )),
         serde_json::Value::Array(items) => {
@@ -1059,8 +1828,9 @@ pub async fn run_spine(
     cx: &SpineContext,
 ) -> SpineResult {
     let mut messages = request.messages.clone();
-    let max_turns = request.max_turns.max(1);
+    let max_turns = completion_guarded_max_turns(request.max_turns);
     let mut completed_tool_signatures: HashMap<String, ToolProgressClass> = HashMap::new();
+    let mut completion_reprompts = 0usize;
 
     for turn in 0..max_turns {
         if request.cancel_token.is_cancelled() {
@@ -1115,59 +1885,51 @@ pub async fn run_spine(
             tool_calls_count: response.tool_calls.len(),
             cache_read_tokens: response.cache_read_tokens,
             cache_creation_tokens: response.cache_creation_tokens,
+            // True provider response latency (request → final chunk), measured
+            // inside chat_completion around the actual provider call.
+            latency_ms: response.provider_latency_ms,
         })
         .await;
 
         if response.tool_calls.is_empty() {
-            let final_text = normalize_final_response_artifact_links(&response.text, &messages);
-            if let Some(blocker) = no_progress_final_response(&messages, &final_text) {
-                messages.push(SpineMessage::Assistant {
-                    content: Some(blocker.clone()),
-                    tool_calls: Vec::new(),
-                });
-                cx.emit(SpineTraceEvent::TurnCompleted {
-                    turn,
-                    terminal_state: SpineTerminalState::Blocked,
-                    final_text_present: true,
-                })
-                .await;
-                return SpineResult::Blocked {
-                    messages,
-                    final_text: blocker,
-                    turns_used: turn + 1,
-                };
-            }
-            if incomplete_no_tool_final_response(&messages, &final_text) {
-                if turn + 1 < max_turns {
-                    messages.push(SpineMessage::User {
-                        content: incomplete_no_tool_final_response_repair_prompt(),
-                    });
+            let visible_response_text =
+                crate::core::llm_context_sanitizer::strip_internal_tool_transcript(&response.text);
+            let final_text =
+                normalize_final_response_artifact_links(&visible_response_text, &messages);
+            match next_completion_step(
+                verify_completion(server, &messages, &final_text).await,
+                completion_reprompts,
+                turn,
+                max_turns,
+            ) {
+                CompletionStep::Accept => {}
+                CompletionStep::Reprompt { prompt } => {
+                    completion_reprompts += 1;
+                    messages.push(SpineMessage::User { content: prompt });
                     continue;
                 }
-                let blocker = incomplete_no_tool_final_response_blocker(&final_text);
-                messages.push(SpineMessage::Assistant {
-                    content: Some(blocker.clone()),
-                    tool_calls: Vec::new(),
-                });
-                cx.emit(SpineTraceEvent::TurnCompleted {
-                    turn,
-                    terminal_state: SpineTerminalState::Blocked,
-                    final_text_present: true,
-                })
-                .await;
-                return SpineResult::Blocked {
-                    messages,
-                    final_text: blocker,
-                    turns_used: turn + 1,
-                };
-            }
-            if final_response_repeats_tool_call_content(&messages, &final_text)
-                && turn + 1 < max_turns
-            {
-                messages.push(SpineMessage::User {
-                    content: stale_final_response_repair_prompt(),
-                });
-                continue;
+                CompletionStep::AcceptWithCaveat { message } => {
+                    let answer = if final_text.trim().is_empty() {
+                        message
+                    } else {
+                        format!("{}\n\n{}", message, final_text)
+                    };
+                    messages.push(SpineMessage::Assistant {
+                        content: Some(answer.clone()),
+                        tool_calls: Vec::new(),
+                    });
+                    cx.emit(SpineTraceEvent::TurnCompleted {
+                        turn,
+                        terminal_state: SpineTerminalState::Completed,
+                        final_text_present: true,
+                    })
+                    .await;
+                    return SpineResult::Completed {
+                        messages,
+                        final_text: answer,
+                        turns_used: turn + 1,
+                    };
+                }
             }
             messages.push(SpineMessage::Assistant {
                 content: Some(final_text.clone()),
@@ -1186,8 +1948,13 @@ pub async fn run_spine(
             };
         }
 
+        let partial_text = response
+            .partial_text
+            .as_deref()
+            .map(crate::core::llm_context_sanitizer::strip_internal_tool_transcript)
+            .filter(|text| !text.trim().is_empty());
         messages.push(SpineMessage::Assistant {
-            content: response.partial_text.clone(),
+            content: partial_text,
             tool_calls: response.tool_calls.clone(),
         });
 
@@ -1221,70 +1988,44 @@ pub async fn run_spine(
             })
             .collect::<Vec<_>>();
 
-        let futures = prepared_calls
-            .iter()
-            .map(|(tool_call, _signature, blocked)| {
-                let tool_call = tool_call.clone();
-                let blocked = *blocked;
-                let tools = tools.clone();
-                let cx = cx.clone();
-                async move {
-                    let start_payload = spine_tool_start_stream_payload(&tool_call);
-                    if let Some(stream_tx) = cx.stream_tx.as_ref() {
-                        queue_stream_event(
-                            stream_tx,
-                            StreamEvent::ToolStart {
-                                name: tool_call.name.clone(),
-                                payload: Some(start_payload.clone()),
-                            },
-                        );
-                    }
-                    cx.emit(SpineTraceEvent::ToolStarted {
-                        tool_call_id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        arguments: start_payload.get("arguments").cloned(),
-                        intent_summary: start_payload
-                            .get("intent_summary")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                    })
-                    .await;
-                    let result = if blocked {
-                        ToolResult::from_value(
-                            false,
-                            tool_result_error_with_extra(
-                                &tool_call.name,
-                                "repeated_no_progress_tool_call",
-                                "This exact successful tool request already completed in this run. Use the previous result to continue, or call a different primitive or different arguments for remaining work.",
-                                serde_json::json!({
-                                    "hint": "Do not repeat identical completed reads, status checks, or creates inside one run."
-                                }),
-                            ),
-                        )
-                    } else {
-                        tools.dispatch(tool_call.clone(), cx.clone()).await
-                    };
-                    if let Some(stream_tx) = cx.stream_tx.as_ref() {
-                        queue_stream_event(
-                            stream_tx,
-                            StreamEvent::ToolResult {
-                                name: tool_call.name.clone(),
-                                content: spine_tool_result_stream_content(&tool_call, &result),
-                            },
-                        );
-                    }
-                    cx.emit(SpineTraceEvent::ToolCompleted {
-                        tool_call_id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        ok: result.ok,
-                        summary: result.summary(),
-                    })
-                    .await;
-                    result
-                }
+        let batches = dependency_batches_for_tool_calls(
+            &prepared_calls,
+            cx.request.conversation_id.as_deref(),
+        );
+        let mut results_by_index = vec![None; prepared_calls.len()];
+        for batch in batches {
+            let futures = batch
+                .iter()
+                .map(|idx| {
+                    let (tool_call, _signature, blocked) = &prepared_calls[*idx];
+                    execute_prepared_tool_call(
+                        tools.clone(),
+                        cx.clone(),
+                        tool_call.clone(),
+                        *blocked,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let batch_results = join_all(futures).await;
+            for (idx, result) in batch.into_iter().zip(batch_results.into_iter()) {
+                results_by_index[idx] = Some(result);
+            }
+        }
+        let results = results_by_index
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    ToolResult::from_value(
+                        false,
+                        tool_result_error(
+                            "spine",
+                            "dependency_scheduler_failed",
+                            "A scheduled tool call did not produce a result.",
+                        ),
+                    )
+                })
             })
             .collect::<Vec<_>>();
-        let results = join_all(futures).await;
 
         for ((tool_call, signature, blocked), result) in prepared_calls.iter().zip(results.iter()) {
             if result.ok && !blocked {
@@ -1298,8 +2039,28 @@ pub async fn run_spine(
             }
             messages.push(SpineMessage::Tool {
                 tool_call_id: tool_call.id.clone(),
-                content: result.to_json(),
+                content: result.to_json_for_tool(tool_call),
             });
+        }
+        if prepared_calls.iter().any(|(_, _, blocked)| !*blocked) {
+            completion_reprompts = completion_reprompts_after_tool_evidence(completion_reprompts);
+        }
+        if let Some(final_text) = failed_search_message_from_tool_results(&results) {
+            messages.push(SpineMessage::Assistant {
+                content: Some(final_text.clone()),
+                tool_calls: Vec::new(),
+            });
+            cx.emit(SpineTraceEvent::TurnCompleted {
+                turn,
+                terminal_state: SpineTerminalState::Blocked,
+                final_text_present: true,
+            })
+            .await;
+            return SpineResult::Blocked {
+                messages,
+                final_text,
+                turns_used: turn + 1,
+            };
         }
         if let Some(final_text) = needs_input_message_from_tool_results(&results) {
             messages.push(SpineMessage::Assistant {
@@ -1332,6 +2093,74 @@ pub async fn run_spine(
     }
 }
 
+async fn execute_prepared_tool_call(
+    tools: ToolRegistry,
+    cx: SpineContext,
+    tool_call: SpineToolCall,
+    blocked: bool,
+) -> ToolResult {
+    let start_payload = spine_tool_start_stream_payload(&tool_call);
+    if let Some(stream_tx) = cx.stream_tx.as_ref() {
+        queue_stream_event(
+            stream_tx,
+            StreamEvent::ToolStart {
+                name: tool_call.name.clone(),
+                payload: Some(start_payload.clone()),
+            },
+        );
+    }
+    cx.emit(SpineTraceEvent::ToolStarted {
+        tool_call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        arguments: start_payload.get("arguments").cloned(),
+        activity_label: start_payload
+            .get("activity_label")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        display_label: start_payload
+            .get("display_label")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        intent_summary: start_payload
+            .get("intent_summary")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
+    .await;
+    let result = if blocked {
+        ToolResult::from_value(
+            false,
+            tool_result_error_with_extra(
+                &tool_call.name,
+                "repeated_no_progress_tool_call",
+                "This exact successful tool request already completed in this run. Use the previous result to continue, or call a different primitive or different arguments for remaining work.",
+                serde_json::json!({
+                    "hint": "Do not repeat identical completed reads, status checks, or creates inside one run."
+                }),
+            ),
+        )
+    } else {
+        tools.dispatch(tool_call.clone(), cx.clone()).await
+    };
+    if let Some(stream_tx) = cx.stream_tx.as_ref() {
+        queue_stream_event(
+            stream_tx,
+            StreamEvent::ToolResult {
+                name: tool_call.name.clone(),
+                content: spine_tool_result_stream_content(&tool_call, &result),
+            },
+        );
+    }
+    cx.emit(SpineTraceEvent::ToolCompleted {
+        tool_call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        ok: result.ok,
+        summary: result.summary(),
+    })
+    .await;
+    result
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolProgressClass {
     ReadOnly,
@@ -1342,6 +2171,332 @@ enum ToolProgressClass {
 struct ToolProgressSignature {
     key: String,
     class: ToolProgressClass,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolDependencyProfile {
+    reads: HashSet<String>,
+    writes: HashSet<String>,
+    read_domains: HashSet<String>,
+    write_domains: HashSet<String>,
+    barrier: bool,
+}
+
+impl ToolDependencyProfile {
+    fn read(mut self, key: impl Into<String>) -> Self {
+        self.reads.insert(key.into());
+        self
+    }
+
+    fn write(mut self, key: impl Into<String>) -> Self {
+        self.writes.insert(key.into());
+        self
+    }
+
+    fn read_domain(mut self, domain: impl Into<String>) -> Self {
+        self.read_domains.insert(domain.into());
+        self
+    }
+
+    fn write_domain(mut self, domain: impl Into<String>) -> Self {
+        self.write_domains.insert(domain.into());
+        self
+    }
+
+    fn barrier() -> Self {
+        Self {
+            barrier: true,
+            ..Self::default()
+        }
+    }
+}
+
+fn dependency_batches_for_tool_calls(
+    prepared_calls: &[(SpineToolCall, Option<ToolProgressSignature>, bool)],
+    conversation_id: Option<&str>,
+) -> Vec<Vec<usize>> {
+    let profiles = prepared_calls
+        .iter()
+        .map(|(call, _, _)| tool_dependency_profile(call, conversation_id))
+        .collect::<Vec<_>>();
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut assigned_batch = vec![0usize; prepared_calls.len()];
+
+    for idx in 0..prepared_calls.len() {
+        let mut min_batch = 0usize;
+        for prev in 0..idx {
+            if tool_dependencies_conflict(&profiles[prev], &profiles[idx]) {
+                min_batch = min_batch.max(assigned_batch[prev].saturating_add(1));
+            }
+        }
+        while batches.len() <= min_batch {
+            batches.push(Vec::new());
+        }
+        assigned_batch[idx] = min_batch;
+        batches[min_batch].push(idx);
+    }
+
+    batches
+}
+
+fn tool_dependencies_conflict(left: &ToolDependencyProfile, right: &ToolDependencyProfile) -> bool {
+    if left.barrier || right.barrier {
+        return true;
+    }
+    left.writes
+        .iter()
+        .any(|key| right.reads.contains(key) || right.writes.contains(key))
+        || right
+            .writes
+            .iter()
+            .any(|key| left.reads.contains(key) || left.writes.contains(key))
+        || left.writes.iter().any(|key| {
+            resource_key_domain(key).is_some_and(|domain| right.read_domains.contains(domain))
+        })
+        || right.writes.iter().any(|key| {
+            resource_key_domain(key).is_some_and(|domain| left.read_domains.contains(domain))
+        })
+        || left.write_domains.iter().any(|domain| {
+            right.read_domains.contains(domain)
+                || right.write_domains.contains(domain)
+                || right
+                    .reads
+                    .iter()
+                    .chain(right.writes.iter())
+                    .any(|key| resource_key_domain(key) == Some(domain.as_str()))
+        })
+        || right.write_domains.iter().any(|domain| {
+            left.read_domains.contains(domain)
+                || left.write_domains.contains(domain)
+                || left
+                    .reads
+                    .iter()
+                    .chain(left.writes.iter())
+                    .any(|key| resource_key_domain(key) == Some(domain.as_str()))
+        })
+        || left
+            .read_domains
+            .iter()
+            .any(|domain| right.write_domains.contains(domain))
+        || right
+            .read_domains
+            .iter()
+            .any(|domain| left.write_domains.contains(domain))
+}
+
+fn resource_key_domain(key: &str) -> Option<&str> {
+    key.split_once(':')
+        .map(|(domain, _)| domain)
+        .filter(|domain| !domain.is_empty())
+}
+
+fn normalized_resource_part(value: &str) -> Option<String> {
+    let normalized = value
+        .trim()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.trim().is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn file_resource_key(path: &str) -> Option<String> {
+    normalized_resource_part(path).map(|path| format!("file:{}", path))
+}
+
+fn source_file_resource_key(source_dir: &str, source_path: &str) -> Option<String> {
+    let dir = normalized_resource_part(source_dir)?;
+    let path = normalized_resource_part(source_path)?;
+    Some(format!("file:{}/{}", dir, path))
+}
+
+fn resource_target_key(kind: &str, arguments: &serde_json::Value) -> Option<String> {
+    json_text(arguments, "id")
+        .or_else(|| json_text(arguments, "app_id"))
+        .or_else(|| json_text(arguments, "service_id"))
+        .or_else(|| json_text(arguments, "task_id"))
+        .or_else(|| json_text(arguments, "watcher_id"))
+        .or_else(|| json_text(arguments, "background_session_id"))
+        .or_else(|| json_text(arguments, "name"))
+        .or_else(|| json_text_path(arguments, &["content", "id"]))
+        .or_else(|| json_text_path(arguments, &["content", "app_id"]))
+        .or_else(|| json_text_path(arguments, &["content", "task_id"]))
+        .or_else(|| json_text_path(arguments, &["content", "watcher_id"]))
+        .or_else(|| json_text_path(arguments, &["content", "background_session_id"]))
+        .or_else(|| json_text_path(arguments, &["content", "name"]))
+        .or_else(|| json_text(arguments, "query"))
+        .and_then(|value| normalized_resource_part(&value))
+        .map(|target| format!("{}:{}", kind, target))
+}
+
+fn tool_dependency_profile(
+    call: &SpineToolCall,
+    conversation_id: Option<&str>,
+) -> ToolDependencyProfile {
+    match call.name.as_str() {
+        "file_read" => json_text(&call.arguments, "path")
+            .and_then(|path| file_resource_key(&path))
+            .map(|key| ToolDependencyProfile::default().read(key))
+            .unwrap_or_else(|| ToolDependencyProfile::default().read_domain("file")),
+        "file_search" => ToolDependencyProfile::default().read_domain("file"),
+        "file_write" | "file_delete" => json_text(&call.arguments, "path")
+            .and_then(|path| file_resource_key(&path))
+            .map(|key| ToolDependencyProfile::default().write(key))
+            .unwrap_or_else(|| ToolDependencyProfile::default().write_domain("file")),
+        "file_patch" => file_patch_dependency_profile(&call.arguments),
+        "app_deploy" => app_deploy_dependency_profile(&call.arguments, conversation_id),
+        "skill_manage" => skill_manage_dependency_profile(&call.arguments),
+        "resource_rw" => resource_rw_dependency_profile(&call.arguments),
+        "memory_rw" => memory_rw_dependency_profile(&call.arguments),
+        "pdf_generate" => ToolDependencyProfile::default().write_domain("document"),
+        "code_exec" | "browse" | "delegate" => ToolDependencyProfile::barrier(),
+        "fetch" => fetch_dependency_profile(&call.arguments),
+        "search" => ToolDependencyProfile::default(),
+        _ => ToolDependencyProfile::barrier(),
+    }
+}
+
+fn file_patch_dependency_profile(arguments: &serde_json::Value) -> ToolDependencyProfile {
+    let mut profile = ToolDependencyProfile::default();
+    if let Some(path) = json_text(arguments, "path").and_then(|path| file_resource_key(&path)) {
+        profile = profile.read(path.clone()).write(path);
+    }
+    if let Some(patches) = arguments.get("patches").and_then(|value| value.as_array()) {
+        for patch in patches {
+            if let Some(path) = json_text(patch, "path").and_then(|path| file_resource_key(&path)) {
+                profile = profile.read(path.clone()).write(path);
+            }
+        }
+    }
+    if profile.reads.is_empty() && profile.writes.is_empty() {
+        profile.write_domain("file")
+    } else {
+        profile
+    }
+}
+
+fn app_deploy_dependency_profile(
+    arguments: &serde_json::Value,
+    conversation_id: Option<&str>,
+) -> ToolDependencyProfile {
+    let mut profile = ToolDependencyProfile::default();
+    if let Some(source_dir) = json_text(arguments, "source_dir") {
+        if let Some(paths) = arguments
+            .get("source_paths")
+            .and_then(|value| value.as_array())
+        {
+            if paths.is_empty() {
+                profile = profile.read_domain("file");
+            } else {
+                for path in paths.iter().filter_map(|value| value.as_str()) {
+                    if let Some(key) = source_file_resource_key(&source_dir, path) {
+                        profile = profile.read(key);
+                    }
+                }
+            }
+        } else {
+            profile = profile.read_domain("file");
+        }
+    }
+
+    let app_key = json_text(arguments, "app_id")
+        .and_then(|app_id| normalized_resource_part(&app_id))
+        .map(|app_id| format!("app:{}", app_id))
+        .or_else(|| {
+            conversation_id
+                .and_then(normalized_resource_part)
+                .map(|id| format!("app:conversation:{}", id))
+        });
+    if let Some(app_key) = app_key {
+        profile.write(app_key)
+    } else {
+        profile.write_domain("app")
+    }
+}
+
+fn skill_manage_dependency_profile(arguments: &serde_json::Value) -> ToolDependencyProfile {
+    let operation = json_text(arguments, "operation")
+        .unwrap_or_else(|| "list".to_string())
+        .to_ascii_lowercase();
+    let target = resource_target_key("skill", arguments);
+    let read_only = matches!(operation.as_str(), "list" | "read" | "status");
+    match (read_only, target) {
+        (true, Some(key)) => ToolDependencyProfile::default().read(key),
+        (true, None) => ToolDependencyProfile::default().read_domain("skill"),
+        (false, Some(key)) => ToolDependencyProfile::default().write(key),
+        (false, None) => ToolDependencyProfile::default().write_domain("skill"),
+    }
+}
+
+fn resource_rw_dependency_profile(arguments: &serde_json::Value) -> ToolDependencyProfile {
+    let kind = json_text(arguments, "kind")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "resource".to_string());
+    let op = json_text(arguments, "op")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "read".to_string());
+    if kind == "file" {
+        let key = json_text_path(arguments, &["content", "path"])
+            .or_else(|| json_text(arguments, "id"))
+            .or_else(|| json_text(arguments, "query"))
+            .and_then(|path| file_resource_key(&path));
+        return if matches!(op.as_str(), "read" | "status") {
+            key.map(|key| ToolDependencyProfile::default().read(key))
+                .unwrap_or_else(|| ToolDependencyProfile::default().read_domain("file"))
+        } else if op == "list" {
+            ToolDependencyProfile::default().read_domain("file")
+        } else {
+            key.map(|key| ToolDependencyProfile::default().write(key))
+                .unwrap_or_else(|| ToolDependencyProfile::default().write_domain("file"))
+        };
+    }
+
+    let domain = if matches!(kind.as_str(), "app_service" | "dashboard") {
+        "app".to_string()
+    } else {
+        format!("resource_{}", kind)
+    };
+    let target = resource_target_key(&domain, arguments);
+    if matches!(op.as_str(), "read" | "status" | "list") {
+        target
+            .map(|key| ToolDependencyProfile::default().read(key))
+            .unwrap_or_else(|| ToolDependencyProfile::default().read_domain(domain))
+    } else {
+        target
+            .map(|key| ToolDependencyProfile::default().write(key))
+            .unwrap_or_else(|| ToolDependencyProfile::default().write_domain(domain))
+    }
+}
+
+fn memory_rw_dependency_profile(arguments: &serde_json::Value) -> ToolDependencyProfile {
+    let op = json_text(arguments, "op")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "search".to_string());
+    let key = json_text(arguments, "id")
+        .or_else(|| json_text_path(arguments, &["content", "key"]))
+        .and_then(|value| normalized_resource_part(&value))
+        .map(|value| format!("memory:{}", value));
+    if matches!(op.as_str(), "search" | "read") {
+        key.map(|key| ToolDependencyProfile::default().read(key))
+            .unwrap_or_else(|| ToolDependencyProfile::default().read_domain("memory"))
+    } else {
+        key.map(|key| ToolDependencyProfile::default().write(key))
+            .unwrap_or_else(|| ToolDependencyProfile::default().write_domain("memory"))
+    }
+}
+
+fn fetch_dependency_profile(arguments: &serde_json::Value) -> ToolDependencyProfile {
+    if json_text(arguments, "url").is_some_and(|url| url.contains("/apps/")) {
+        ToolDependencyProfile::default().read_domain("app")
+    } else {
+        ToolDependencyProfile::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1487,6 +2642,16 @@ fn tool_call_progress_signature(call: &SpineToolCall) -> Option<ToolProgressSign
         },
         "search" | "fetch" => ToolProgressClass::ReadOnly,
         "pdf_generate" => ToolProgressClass::Mutation,
+        "file_read" | "file_search" => ToolProgressClass::ReadOnly,
+        "file_write" | "file_patch" | "file_delete" | "app_deploy" => ToolProgressClass::Mutation,
+        "skill_manage" => match json_text(&call.arguments, "operation")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "list" | "read" | "status" => ToolProgressClass::ReadOnly,
+            _ => ToolProgressClass::Mutation,
+        },
         _ => return None,
     };
     let signature_args =
@@ -1497,11 +2662,111 @@ fn tool_call_progress_signature(call: &SpineToolCall) -> Option<ToolProgressSign
     })
 }
 
+/// Stable, bounded fingerprint of a JSON value for progress-dedup identity.
+/// Lets file_write/file_patch keys reflect CONTENT without bloating the key with
+/// the full payload, so a changed rewrite is distinct from an identical repeat.
+fn progress_value_fingerprint(value: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_json_string(value).as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn spine_candidate_error_is_retryable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::core::llm::LlmStreamFailure>()
+        .is_some_and(|failure| failure.retryable_model_stream_failure())
+}
+
+fn file_write_progress_material(arguments: &serde_json::Value) -> serde_json::Value {
+    let mut material = serde_json::Map::new();
+    for key in [
+        "content",
+        "content_base64",
+        "source_resource",
+        "source_path",
+        "content_type",
+        "document_visible",
+        "index_document",
+        "duplicate_policy",
+        "allow_duplicate",
+        "metadata",
+    ] {
+        if let Some(value) = arguments.get(key) {
+            material.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(material)
+}
+
+fn file_patch_progress_material(arguments: &serde_json::Value) -> serde_json::Value {
+    let mut material = serde_json::Map::new();
+    for key in ["patch", "patches", "dry_run"] {
+        if let Some(value) = arguments.get(key) {
+            material.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(material)
+}
+
 fn tool_call_progress_identity(call: &SpineToolCall) -> Option<serde_json::Value> {
     if call.name == "pdf_generate" {
         return Some(serde_json::json!({
             "title": json_text(&call.arguments, "title"),
             "filename": json_text(&call.arguments, "filename"),
+        }));
+    }
+    if call.name == "app_deploy" {
+        return Some(serde_json::json!({
+            "app_id": json_text(&call.arguments, "app_id"),
+            "title": json_text(&call.arguments, "title"),
+            "repo_url": json_text(&call.arguments, "repo_url"),
+            "repo_ref": json_text(&call.arguments, "repo_ref"),
+            "repo_subdir": json_text(&call.arguments, "repo_subdir"),
+            "source_dir": json_text(&call.arguments, "source_dir"),
+            "source_paths": call.arguments.get("source_paths").cloned(),
+            "artifact_identity": call.arguments.get("artifact_identity")
+                .or_else(|| call.arguments.pointer("/metadata/artifact_identity"))
+                .cloned(),
+        }));
+    }
+    if matches!(call.name.as_str(), "file_read" | "file_delete") {
+        // Re-reading or re-deleting the same path is genuinely no new progress.
+        return Some(serde_json::json!({
+            "path": json_text(&call.arguments, "path"),
+        }));
+    }
+    if call.name == "file_write" {
+        // Content-aware identity: a CORRECTED rewrite of the same path is real
+        // progress and must NOT be deduped as a repeated no-progress call — only
+        // an identical rewrite (same path AND same body/source options) is.
+        return Some(serde_json::json!({
+            "path": json_text(&call.arguments, "path"),
+            "material_fp": progress_value_fingerprint(&file_write_progress_material(&call.arguments)),
+        }));
+    }
+    if call.name == "file_patch" {
+        // Same principle: a different patch to the same path is real progress, so
+        // fingerprint the patch payload rather than keying on path alone.
+        return Some(serde_json::json!({
+            "path": json_text(&call.arguments, "path"),
+            "material_fp": progress_value_fingerprint(&file_patch_progress_material(&call.arguments)),
+        }));
+    }
+    if call.name == "file_search" {
+        return Some(serde_json::json!({
+            "query": json_text(&call.arguments, "query"),
+            "filename_query": json_text(&call.arguments, "filename_query"),
+            "content_query": json_text(&call.arguments, "content_query"),
+            "root": json_text(&call.arguments, "root"),
+            "globs": call.arguments.get("globs").cloned(),
+        }));
+    }
+    if call.name == "skill_manage" {
+        return Some(serde_json::json!({
+            "operation": json_text(&call.arguments, "operation"),
+            "name": json_text(&call.arguments, "name"),
+            "id": json_text(&call.arguments, "id"),
+            "url": json_text(&call.arguments, "url"),
         }));
     }
     if call.name != "resource_rw" {
@@ -1542,6 +2807,7 @@ pub struct AgentSpineLlmServer {
     stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
     trace: Arc<SpineTraceRecorder>,
     caller_kind: CallerKind,
+    long_running: bool,
 }
 
 impl AgentSpineLlmServer {
@@ -1551,6 +2817,7 @@ impl AgentSpineLlmServer {
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
         trace: Arc<SpineTraceRecorder>,
         caller_kind: CallerKind,
+        long_running: bool,
     ) -> Self {
         Self {
             agent,
@@ -1558,6 +2825,7 @@ impl AgentSpineLlmServer {
             stream_tx,
             trace,
             caller_kind,
+            long_running,
         }
     }
 
@@ -1643,35 +2911,82 @@ impl AgentSpineLlmServer {
     ) -> anyhow::Result<crate::core::llm::LlmResponse> {
         if streaming {
             if let Some(tx) = self.stream_tx.clone() {
-                candidate
-                    .client
-                    .chat_with_history_stream_for_helper_with_images(
-                        system_prompt,
-                        &prepared.user_message,
-                        &prepared.history,
-                        &[],
-                        tool_schemas,
-                        tx,
-                        image_attachments,
-                        &self.agent.config.model_privacy,
-                        false,
-                    )
-                    .await
+                if self.long_running {
+                    candidate
+                        .client
+                        .chat_with_history_stream_for_long_running_tool_with_images(
+                            system_prompt,
+                            &prepared.user_message,
+                            &prepared.history,
+                            &[],
+                            tool_schemas,
+                            tx,
+                            image_attachments,
+                            &self.agent.config.model_privacy,
+                            false,
+                        )
+                        .await
+                } else {
+                    candidate
+                        .client
+                        .chat_with_history_stream_for_helper_with_images(
+                            system_prompt,
+                            &prepared.user_message,
+                            &prepared.history,
+                            &[],
+                            tool_schemas,
+                            tx,
+                            image_attachments,
+                            &self.agent.config.model_privacy,
+                            false,
+                        )
+                        .await
+                }
             } else {
-                candidate
-                    .client
-                    .chat_with_history_for_helper_with_images(
-                        system_prompt,
-                        &prepared.user_message,
-                        &prepared.history,
-                        &[],
-                        tool_schemas,
-                        image_attachments,
-                        &self.agent.config.model_privacy,
-                        false,
-                    )
-                    .await
+                if self.long_running {
+                    candidate
+                        .client
+                        .chat_with_history_for_long_running_tool_with_images(
+                            system_prompt,
+                            &prepared.user_message,
+                            &prepared.history,
+                            &[],
+                            tool_schemas,
+                            image_attachments,
+                            &self.agent.config.model_privacy,
+                            false,
+                        )
+                        .await
+                } else {
+                    candidate
+                        .client
+                        .chat_with_history_for_helper_with_images(
+                            system_prompt,
+                            &prepared.user_message,
+                            &prepared.history,
+                            &[],
+                            tool_schemas,
+                            image_attachments,
+                            &self.agent.config.model_privacy,
+                            false,
+                        )
+                        .await
+                }
             }
+        } else if self.long_running {
+            candidate
+                .client
+                .chat_with_history_for_long_running_tool_with_images(
+                    system_prompt,
+                    &prepared.user_message,
+                    &prepared.history,
+                    &[],
+                    tool_schemas,
+                    image_attachments,
+                    &self.agent.config.model_privacy,
+                    false,
+                )
+                .await
         } else {
             candidate
                 .client
@@ -1812,101 +3127,129 @@ impl SpineLlmServer for AgentSpineLlmServer {
 
         let mut last_error: Option<String> = None;
         for (idx, candidate) in candidates.iter().take(3).enumerate() {
-            let started = std::time::Instant::now();
-            let result = self
-                .request_candidate_completion(
-                    candidate,
-                    &system_prompt,
-                    &prepared,
-                    &tool_schemas,
-                    streaming,
-                    &image_attachments,
-                )
-                .await;
-            let result = if result.is_err() && !image_attachments.is_empty() {
-                tracing::debug!(
-                    slot_id = %candidate.slot_id,
-                    "Retrying model turn without native image attachments so tool fallback can handle visuals"
-                );
-                self.request_candidate_completion(
-                    candidate,
-                    &system_prompt,
-                    &prepared,
-                    &tool_schemas,
-                    streaming,
-                    &[],
-                )
-                .await
+            let max_attempts = if streaming {
+                SPINE_MODEL_STREAM_RETRY_ATTEMPTS_PER_CANDIDATE
             } else {
-                result
+                1
             };
+            for attempt_idx in 0..max_attempts {
+                let started = std::time::Instant::now();
+                let result = self
+                    .request_candidate_completion(
+                        candidate,
+                        &system_prompt,
+                        &prepared,
+                        &tool_schemas,
+                        streaming,
+                        &image_attachments,
+                    )
+                    .await;
+                let result = if result.is_err() && !image_attachments.is_empty() {
+                    tracing::debug!(
+                        slot_id = %candidate.slot_id,
+                        attempt = attempt_idx + 1,
+                        "Retrying model turn without native image attachments so tool fallback can handle visuals"
+                    );
+                    self.request_candidate_completion(
+                        candidate,
+                        &system_prompt,
+                        &prepared,
+                        &tool_schemas,
+                        streaming,
+                        &[],
+                    )
+                    .await
+                } else {
+                    result
+                };
 
-            match result {
-                Ok(resp) => {
-                    self.agent
-                        .record_llm_usage(&self.channel, "spine_model_turn", &resp)
-                        .await;
-                    let mut attempted = Vec::new();
-                    let mut attempt_records = Vec::new();
-                    self.agent
-                        .record_model_attempt(
-                            &mut attempted,
-                            &mut attempt_records,
-                            candidate,
-                            true,
-                            None,
-                            idx > 0,
-                            started.elapsed().as_millis() as u64,
-                            None,
-                        )
-                        .await;
-                    let usage = resp.usage.clone();
-                    return Ok(SpineChatResponse {
-                        text: resp.content.clone(),
-                        partial_text: if resp.content.trim().is_empty() {
-                            None
-                        } else {
-                            Some(resp.content.clone())
-                        },
-                        tool_calls: resp
-                            .tool_calls
-                            .into_iter()
-                            .map(|call| SpineToolCall {
-                                id: call.id,
-                                name: call.name,
-                                arguments: call.arguments,
-                            })
-                            .collect(),
-                        completion_tokens: usage
-                            .as_ref()
-                            .map(|usage| usage.completion_tokens as usize)
-                            .unwrap_or_default(),
-                        cache_read_tokens: usage
-                            .as_ref()
-                            .map(|usage| usage.cached_prompt_tokens as usize)
-                            .unwrap_or_default(),
-                        cache_creation_tokens: usage
-                            .as_ref()
-                            .map(|usage| usage.cache_creation_prompt_tokens as usize)
-                            .unwrap_or_default(),
-                    });
-                }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    let mut attempted = Vec::new();
-                    let mut attempt_records = Vec::new();
-                    self.agent
-                        .record_model_attempt(
-                            &mut attempted,
-                            &mut attempt_records,
-                            candidate,
-                            false,
-                            last_error.as_deref(),
-                            idx > 0,
-                            started.elapsed().as_millis() as u64,
-                            None,
-                        )
-                        .await;
+                match result {
+                    Ok(resp) => {
+                        let provider_latency_ms = started.elapsed().as_millis() as u64;
+                        self.agent
+                            .record_llm_usage(&self.channel, "spine_model_turn", &resp)
+                            .await;
+                        let mut attempted = Vec::new();
+                        let mut attempt_records = Vec::new();
+                        self.agent
+                            .record_model_attempt(
+                                &mut attempted,
+                                &mut attempt_records,
+                                candidate,
+                                true,
+                                None,
+                                idx > 0 || attempt_idx > 0,
+                                provider_latency_ms,
+                                None,
+                            )
+                            .await;
+                        let usage = resp.usage.clone();
+                        return Ok(SpineChatResponse {
+                            provider_latency_ms,
+                            text: resp.content.clone(),
+                            partial_text: if resp.content.trim().is_empty() {
+                                None
+                            } else {
+                                Some(resp.content.clone())
+                            },
+                            tool_calls: resp
+                                .tool_calls
+                                .into_iter()
+                                .map(|call| SpineToolCall {
+                                    id: call.id,
+                                    name: call.name,
+                                    arguments: call.arguments,
+                                    activity_label: call.activity_label,
+                                })
+                                .collect(),
+                            completion_tokens: usage
+                                .as_ref()
+                                .map(|usage| usage.completion_tokens as usize)
+                                .unwrap_or_default(),
+                            cache_read_tokens: usage
+                                .as_ref()
+                                .map(|usage| usage.cached_prompt_tokens as usize)
+                                .unwrap_or_default(),
+                            cache_creation_tokens: usage
+                                .as_ref()
+                                .map(|usage| usage.cache_creation_prompt_tokens as usize)
+                                .unwrap_or_default(),
+                        });
+                    }
+                    Err(error) => {
+                        let retryable_stream_error =
+                            streaming && spine_candidate_error_is_retryable(&error);
+                        let error_text = error.to_string();
+                        last_error = Some(error_text.clone());
+                        let mut attempted = Vec::new();
+                        let mut attempt_records = Vec::new();
+                        self.agent
+                            .record_model_attempt(
+                                &mut attempted,
+                                &mut attempt_records,
+                                candidate,
+                                false,
+                                Some(&error_text),
+                                idx > 0 || attempt_idx > 0,
+                                started.elapsed().as_millis() as u64,
+                                None,
+                            )
+                            .await;
+                        if retryable_stream_error && attempt_idx + 1 < max_attempts {
+                            tracing::warn!(
+                                slot_id = %candidate.slot_id,
+                                slot_label = %candidate.slot_label,
+                                model = %candidate.client.model_name(),
+                                provider = %candidate.client.provider_name(),
+                                attempt = attempt_idx + 1,
+                                max_attempts,
+                                error = %safe_truncate(&error_text, 320),
+                                "Retrying spine model candidate after retryable stream failure"
+                            );
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -1928,6 +3271,7 @@ struct PreparedSpineMessages {
 fn prepare_spine_messages_for_llm(messages: &[SpineMessage]) -> PreparedSpineMessages {
     let mut system_parts = Vec::new();
     let mut conversational = Vec::new();
+    let mut tool_call_aliases: HashMap<String, String> = HashMap::new();
     for message in messages {
         match message {
             SpineMessage::System { content } => system_parts.push(content.clone()),
@@ -1948,15 +3292,41 @@ fn prepare_spine_messages_for_llm(messages: &[SpineMessage]) -> PreparedSpineMes
                         _timestamp: chrono::Utc::now(),
                     });
                 }
+                for call in tool_calls {
+                    if !tool_call_aliases.contains_key(&call.id) {
+                        let alias = format!("tool_call_{}", tool_call_aliases.len() + 1);
+                        tool_call_aliases.insert(call.id.clone(), alias);
+                    }
+                }
+                if let Some(tool_context) =
+                    spine_tool_call_history_context(tool_calls, &tool_call_aliases)
+                {
+                    conversational.push(ConversationMessage {
+                        role: "assistant".to_string(),
+                        content: tool_context,
+                        _timestamp: chrono::Utc::now(),
+                    });
+                }
             }
             SpineMessage::Tool {
                 tool_call_id,
                 content,
-            } => conversational.push(ConversationMessage {
-                role: "user".to_string(),
-                content: format!("Tool result for `{}`:\n{}", tool_call_id, content),
-                _timestamp: chrono::Utc::now(),
-            }),
+            } => {
+                let call_label = tool_call_aliases
+                    .get(tool_call_id)
+                    .map(String::as_str)
+                    .unwrap_or("tool_call");
+                let tool_result_context =
+                    crate::core::llm_context_sanitizer::wrap_internal_tool_context(&format!(
+                        "tool_result:\nlabel: {}\ncontent:\n{}",
+                        call_label, content
+                    ));
+                conversational.push(ConversationMessage {
+                    role: "user".to_string(),
+                    content: tool_result_context,
+                    _timestamp: chrono::Utc::now(),
+                });
+            }
         }
     }
 
@@ -2011,6 +3381,28 @@ fn structured_chat_request_context_system_message(
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
         );
     }
+    if let Some(execution_profile) = request_hints.execution_profile.as_ref() {
+        context.insert(
+            "execution_profile".to_string(),
+            bounded_json_for_spine_context(execution_profile, 4_000),
+        );
+        let depth_hint = execution_profile
+            .get("depth_hint")
+            .or_else(|| execution_profile.get("depth"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if execution_profile_requests_long_running(Some(execution_profile))
+            || depth_hint.is_some_and(|value| value.eq_ignore_ascii_case("deep"))
+        {
+            context.insert(
+                "quality_contract".to_string(),
+                serde_json::json!({
+                    "research": "For research-heavy work, gather enough source-backed evidence before synthesis. Use the search primitive with depth=\"deep\" when the visible answer requires broad, comparative, current, primary-source, or decision-grade support. Create PDF/report artifacts through explicit primitives when the user-visible deliverable requires them."
+                }),
+            );
+        }
+    }
     if let Some(arkorbit_context) = request_hints.arkorbit_context.as_ref() {
         context.insert(
             "arkorbit_context".to_string(),
@@ -2041,6 +3433,13 @@ fn structured_chat_request_context_system_message(
         serde_json::to_string_pretty(&serde_json::Value::Object(context))
             .unwrap_or_else(|_| "{}".to_string())
     ))
+}
+
+fn execution_profile_requests_long_running(profile: Option<&serde_json::Value>) -> bool {
+    profile
+        .and_then(|value| value.get("long_running"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 async fn browser_profiles_context_system_message(
@@ -2188,6 +3587,10 @@ impl Agent {
         let mut request = SpineRequest::new(CallerKind::Chat, spine_messages, channel);
         request.conversation_id = conversation_id.map(str::to_string);
         request.project_id = project_id.map(str::to_string);
+        request.execution_profile = request_hints.execution_profile.clone();
+        request.long_running =
+            execution_profile_requests_long_running(request.execution_profile.as_ref());
+        request.browser_profile_context = request_hints.browser_profile_context.clone();
         request.visual_attachments = request_hints
             .attachments
             .iter()
@@ -2229,6 +3632,7 @@ impl Agent {
             stream_tx,
             trace.clone(),
             request.caller_kind,
+            request.long_running,
         );
         let tools = ToolRegistry::new();
         let result = run_spine((*request).clone(), &server, &tools, &cx).await;
@@ -2440,6 +3844,11 @@ impl Agent {
             &task.arguments,
             ActionExecutionSurface::Automation,
         );
+        request.long_running = task
+            .arguments
+            .get("long_running")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
 
         let trace = Arc::new(SpineTraceRecorder::default());
         let request = Arc::new(request);
@@ -2450,6 +3859,7 @@ impl Agent {
             None,
             trace.clone(),
             request.caller_kind,
+            request.long_running,
         );
         let tools = ToolRegistry::new();
         match run_spine((*request).clone(), &server, &tools, &cx).await {
@@ -2535,6 +3945,11 @@ impl Agent {
             &watcher.poll_arguments,
             ActionExecutionSurface::Background,
         );
+        request.long_running = watcher
+            .poll_arguments
+            .get("long_running")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
 
         let trace = Arc::new(SpineTraceRecorder::default());
         let request = Arc::new(request);
@@ -2545,6 +3960,7 @@ impl Agent {
             None,
             trace.clone(),
             request.caller_kind,
+            request.long_running,
         );
         let tools = ToolRegistry::new();
         match run_spine((*request).clone(), &server, &tools, &cx).await {
@@ -2642,7 +4058,13 @@ fn storage_message_to_spine_message(
             content: message.content,
         },
         "assistant" => SpineMessage::Assistant {
-            content: (!message.content.trim().is_empty()).then_some(message.content),
+            content: {
+                let visible_content =
+                    crate::core::llm_context_sanitizer::strip_internal_tool_transcript(
+                        &message.content,
+                    );
+                (!visible_content.trim().is_empty()).then_some(visible_content)
+            },
             tool_calls: message
                 .tool_calls_json
                 .as_deref()
@@ -2852,6 +4274,12 @@ fn spine_trace_steps(events: &[SpineTraceEvent]) -> Vec<ExecutionStep> {
                     "info",
                     serde_json::to_string(data).ok(),
                 ),
+                SpineTraceEvent::ArkDistillTelemetry { data } => (
+                    "[distill]",
+                    "ArkDistill Context Savings",
+                    "info",
+                    serde_json::to_string(data).ok(),
+                ),
                 SpineTraceEvent::TurnStarted { .. } => (
                     "[spine]",
                     "Spine Turn Started",
@@ -2867,13 +4295,13 @@ fn spine_trace_steps(events: &[SpineTraceEvent]) -> Vec<ExecutionStep> {
                 SpineTraceEvent::ToolStarted { name, .. } => (
                     "[tool]",
                     name.as_str(),
-                    "info",
+                    "tool_start",
                     serde_json::to_string(event).ok(),
                 ),
-                SpineTraceEvent::ToolCompleted { ok, name, .. } => (
+                SpineTraceEvent::ToolCompleted { name, .. } => (
                     "[tool]",
                     name.as_str(),
-                    if *ok { "success" } else { "warning" },
+                    "tool_result",
                     serde_json::to_string(event).ok(),
                 ),
                 SpineTraceEvent::TurnCompleted { terminal_state, .. } => (
@@ -2895,6 +4323,13 @@ fn spine_trace_steps(events: &[SpineTraceEvent]) -> Vec<ExecutionStep> {
                     serde_json::to_string(event).ok(),
                 ),
             };
+            // Model-call steps carry their true provider latency; every other
+            // step has no measured duration (kept at 0).
+            let duration_ms = if let SpineTraceEvent::ModelCompleted { latency_ms, .. } = event {
+                Some(*latency_ms)
+            } else {
+                Some(0)
+            };
             ExecutionStep {
                 icon: icon.to_string(),
                 title: title.to_string(),
@@ -2902,7 +4337,7 @@ fn spine_trace_steps(events: &[SpineTraceEvent]) -> Vec<ExecutionStep> {
                 step_type: step_type.to_string(),
                 data,
                 timestamp: chrono::Utc::now(),
-                duration_ms: Some(0),
+                duration_ms,
             }
         })
         .collect()
@@ -2954,12 +4389,7 @@ fn spine_turn_records(result: &SpineResult) -> Vec<AgentTurnRecord> {
                 content,
             } => Some(AgentTurnRecord {
                 goal_id: tool_call_id.clone(),
-                outcome: if content.contains("\"ok\":true") || content.contains("\"status\":\"ok\"")
-                {
-                    AgentTurnOutcomeKind::Succeeded
-                } else {
-                    AgentTurnOutcomeKind::Abandoned
-                },
+                outcome: structured_turn_record_outcome(content),
                 action_name: tool_names_by_id
                     .get(tool_call_id)
                     .cloned()
@@ -2973,6 +4403,23 @@ fn spine_turn_records(result: &SpineResult) -> Vec<AgentTurnRecord> {
             _ => None,
         })
         .collect()
+}
+
+fn structured_turn_record_outcome(content: &str) -> AgentTurnOutcomeKind {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content.trim()) else {
+        return AgentTurnOutcomeKind::Abandoned;
+    };
+    match super::tool_responses::structured_tool_value_outcome(&value).map(|report| report.state) {
+        Some(super::tool_responses::StructuredToolOutcomeState::Success) => {
+            AgentTurnOutcomeKind::Succeeded
+        }
+        Some(super::tool_responses::StructuredToolOutcomeState::NeedsInput) => {
+            AgentTurnOutcomeKind::NeedsClarification
+        }
+        Some(super::tool_responses::StructuredToolOutcomeState::Failure) | None => {
+            AgentTurnOutcomeKind::Abandoned
+        }
+    }
 }
 
 fn build_spine_system_prompt(
@@ -3014,11 +4461,19 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
                 "properties": {
                     "url": { "type": "string" },
                     "method": { "type": "string", "enum": ["GET", "POST"], "default": "GET" },
+                    "headers": { "type": "object", "description": "Optional HTTP headers for direct URL fetches. Values may use secure placeholders accepted by the underlying HTTP primitive." },
+                    "body": { "description": "Optional JSON request body for POST-style direct HTTP calls or saved custom API operations." },
+                    "arguments": { "type": "object", "description": "Explicit saved integration/custom API operation arguments. Use when the target operation has a typed argument contract." },
                     "integration": { "type": "string", "enum": ["gmail", "calendar", "google_drive", "connector", "custom_api"], "description": "Canonical integration surface for connected reads. Use custom_api with id plus operation/body to call a saved read-only custom API action." },
                     "id": { "type": "string", "description": "Saved integration/custom API id when integration=custom_api." },
                     "operation": { "type": "string", "description": "Saved custom API operation id, action name, or operation label when integration=custom_api." },
                     "op": { "type": "string", "description": "Read operation such as read, list, query, today, free_busy." },
                     "query": { "type": "string" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
+                    "save_to": { "type": "string", "description": "Optional workspace/data file path for raw response bytes." },
+                    "as_resource": { "type": "boolean", "description": "Return the exact response bytes as a ResourceRef when later steps must reuse the fetched artifact as a file instead of clipped readable text." },
+                    "suggested_name": { "type": "string", "description": "Optional safe filename hint for an as_resource response. The runtime still chooses the managed storage location." },
+                    "persist_response": { "type": "array", "items": {}, "description": "Optional response-field persistence contract forwarded to the HTTP primitive." },
                     "content": { "type": "object" },
                     "metadata": { "type": "object" }
                 },
@@ -3038,6 +4493,7 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
                     "note": { "type": "string", "description": "User reply, choice, or handoff note to return to a waiting browser loop when action=resume_handoff." },
                     "resume_in_chat": { "type": "boolean", "description": "When action=resume_handoff, return control to chat instead of continuing the browser loop." },
                     "profile": { "type": "string", "description": "Optional saved browser profile selector by id, name, target, tag, or semantic description when the task should reuse a saved login or browser identity." },
+                    "profile_id": { "type": "string", "description": "Optional exact saved browser profile id when the task should reuse a saved login or browser identity." },
                     "expectation": { "type": "string", "description": "User-facing browser completion expectation, checkpoint, stop condition, requested question, or follow-up choice that must be preserved for the browser loop." },
                     "metadata": { "type": "object" }
                 },
@@ -3046,7 +4502,7 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
         ),
         primitive_schema(
             "code_exec",
-            "Run sandboxed computation, shell commands, tests, builds, parsers, or local analysis.",
+            "Run sandboxed computation, shell commands, tests, builds, parsers, or local analysis. Use ordered command probes or small scripts for diagnostics such as version checks, installed-package checks, logs, builds, and tests before deciding what to patch or restart.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3079,35 +4535,208 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
             }),
         ),
         primitive_schema(
-            "resource_rw",
-            "Create, read, update, delete, list, pause, resume, connect, install, refresh, test, or inspect backed durable AgentArk resources, user-visible artifacts, notifications, local activity evidence, and external integration surfaces. Use notification for user-facing notification delivery; include schedule fields when it should happen later. Use activity for recent work, recent conversations, Reflect/Sentinel signals, work patterns, attention, avoidance, recurring themes, and retrospective personal activity questions. Use managed files for saved documents, reports, runbooks, reusable workflow instructions, and source assets; they are surfaced through Documents rather than container paths. Use app_service or dashboard for browser-runnable pages, dashboards, apps, and tools. Use scheduled_task or watcher only when the durable outcome must run independently later, monitor a condition, notify outside the artifact, or follow a concrete cadence. Use integration/custom_api/custom_messaging_channel/extension_pack/mcp_server when setting up or inspecting external capabilities for AgentArk itself. If a requested kind/op is unsupported, the tool result is terminal evidence; do not loop.",
+            "app_deploy",
+            "Deploy or update a managed browser-runnable app, dashboard, page, game, tool, repo, or local service. Use this directly for generated UI/source artifacts; do not route app source through resource_rw. Include request_context and acceptance_criteria so deploy review can validate the app against the user's semantic requirements and explicit preferences, independent of exact phrasing. Prefer app_id plus mode=patch and file_patches for edits to an existing app. For multi-file or large generated apps, stage files with file_write under one workspace directory, then use source_dir; include source_paths only to deploy a deliberate subset. Use files for atomic small bundles, and repo_url for repository deploys. Duplicate deployments are not created unless allow_duplicate=true or duplicate_policy=create_new.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "op": { "type": "string", "enum": ["create", "read", "update", "delete", "list", "status", "pause", "resume", "stop", "cancel", "update_delivery", "install", "connect", "enable", "disable", "refresh", "test"] },
+                    "app_id": { "type": "string", "description": "Existing deployed app id to update in place." },
+                    "mode": { "type": "string", "enum": ["replace", "patch"], "default": "replace" },
+                    "title": { "type": "string" },
+                    "request_context": { "type": "string", "description": "Semantic summary of the user-requested app outcome, including explicit implementation preferences or constraints. Used for deploy acceptance review; do not use this as a trigger phrase." },
+                    "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "Concrete requested capabilities, workflows, data/persistence requirements, runtime/integration constraints, and user preferences that the deployed app must satisfy." },
+                    "files": { "type": "object", "description": "App-relative file path to complete file body map." },
+                    "file_patches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "patch": { "type": "string" }
+                            },
+                            "required": ["path", "patch"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "delete_paths": { "type": "array", "items": { "type": "string" } },
+                    "source_dir": { "type": "string", "description": "Workspace/data directory containing staged app files. If source_paths is omitted, deployable files under this directory are discovered automatically." },
+                    "source_paths": { "type": "array", "items": { "type": "string" }, "description": "Optional app-relative staged files to deploy when only a subset of source_dir should be published." },
+                    "repo_url": { "type": "string" },
+                    "repo_ref": { "type": "string" },
+                    "repo_subdir": { "type": "string" },
+                    "service_mode": { "type": "string", "enum": ["auto", "frontend", "backend", "fullstack"] },
+                    "deploy_target": { "type": "string", "enum": ["local", "vercel_direct", "vercel_git"], "default": "local" },
+                    "entry_command": { "type": "string" },
+                    "start_command": { "type": "string" },
+                    "install_command": { "type": "string" },
+                    "stop_command": { "type": "string" },
+                    "commands": { "type": "object" },
+                    "runtime_required": { "type": "boolean" },
+                    "runtime_reason": { "type": "string" },
+                    "runtime_image": { "type": "string" },
+                    "runtime_preference": { "type": "string", "enum": ["local", "container"] },
+                    "required_inputs": { "type": "array", "items": {} },
+                    "required_secrets": { "type": "array", "items": { "type": "string" } },
+                    "required_config": { "type": "array", "items": { "type": "string" } },
+                    "required_env": { "type": "array", "items": { "type": "string" } },
+                    "config": { "type": "object" },
+                    "runtime_actions": { "type": "array", "items": {} },
+                    "expose_public": { "type": "boolean" },
+                    "access_guard": { "type": "boolean" },
+                    "access_password": { "type": "string" },
+                    "replace_existing": { "type": "boolean" },
+                    "duplicate_policy": { "type": "string", "enum": ["reuse_existing", "create_new"], "default": "reuse_existing" },
+                    "allow_duplicate": { "type": "boolean" },
+                    "metadata": { "type": "object" },
+                    "artifact_identity": { "type": "object" }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "file_read",
+            "Read one managed workspace/data file. Use for source inspection before small edits.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "file_search",
+            "Search workspace/data files by path and content without shell access. Use to locate source files before reading or patching.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "filename_query": { "type": "string" },
+                    "content_query": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["auto", "filename", "content", "both"], "default": "auto" },
+                    "root": { "type": "string" },
+                    "globs": { "type": "array", "items": { "type": "string" } },
+                    "exclude_globs": { "type": "array", "items": { "type": "string" } },
+                    "context_lines": { "type": "integer", "minimum": 0, "maximum": 8 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "case_sensitive": { "type": "boolean" },
+                    "max_file_bytes": { "type": "integer", "minimum": 4096, "maximum": 2000000 }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "file_write",
+            "Write one workspace/data file from complete content, base64 bytes, source_path, or source_resource. Use this for files/documents/source assets and for staging generated app source before app_deploy.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "content_base64": { "type": "string" },
+                    "source_resource": {},
+                    "source_path": { "type": "string" },
+                    "content_type": { "type": "string" },
+                    "document_visible": { "type": "boolean" },
+                    "index_document": { "type": "boolean" },
+                    "duplicate_policy": { "type": "string", "enum": ["reuse_existing", "create_new"], "default": "reuse_existing" },
+                    "allow_duplicate": { "type": "boolean" },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "file_patch",
+            "Apply targeted unified diffs to existing workspace/data files. Use this for small edits instead of rewriting whole files.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "patch": { "type": "string" },
+                    "patches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "patch": { "type": "string" }
+                            },
+                            "required": ["path", "patch"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "dry_run": { "type": "boolean" }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "file_delete",
+            "Delete one managed workspace/data file. Use only when the user intends file removal.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "skill_manage",
+            "Create, update, import, install, inspect, test, enable, disable, archive, restore, or delete AgentArk skills directly. Use this for generated SKILL.md content or skill URLs; resource_rw remains for lifecycle/resource inspection only.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["create", "update", "import", "install", "delete", "list", "read", "status", "enable", "disable", "refresh", "test", "pin", "unpin", "archive", "restore"] },
+                    "name": { "type": "string" },
+                    "id": { "type": "string" },
+                    "url": { "type": "string" },
+                    "content": { "type": "string", "description": "Complete SKILL.md content." },
+                    "markdown": { "type": "string", "description": "Complete SKILL.md content." },
+                    "enabled": { "type": "boolean" },
+                    "security_confirmed": { "type": "boolean" },
+                    "arguments": { "type": "object" },
+                    "allow_duplicate": { "type": "boolean" },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["operation"],
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "resource_rw",
+            "Create, read, update, delete, list, pause, resume, connect, install, refresh, test, or inspect backed durable AgentArk resources, notifications, local activity evidence, and external integration surfaces. Use notification for user-facing notification delivery; include schedule fields when it should happen later. Use activity for recent work, recent conversations, Reflect/Sentinel signals, work patterns, attention, avoidance, recurring themes, and retrospective personal activity questions. Use app_service or dashboard only for app resource lifecycle/status/control, not generated source or app files. Use scheduled_task or watcher only when the durable outcome must run independently later, monitor a condition, notify outside the artifact, or follow a concrete cadence. Use integration/custom_api/custom_messaging_channel/extension_pack/mcp_server when setting up or inspecting external capabilities for AgentArk itself. Prefer native/bundled integrations, extension packs, or custom_api for official HTTP/REST/GraphQL provider APIs; choose mcp_server only when the requested substrate is explicitly MCP. Use direct app_deploy, file_* and skill_manage primitives for generated source/content. If a requested kind/op is unsupported, the tool result is terminal evidence; do not loop.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": resource_valid_ops() },
                     "kind": {
                         "type": "string",
-                        "enum": ["file", "app_service", "watcher", "scheduled_task", "notification", "background_session", "goal", "dashboard", "conversation", "activity", "integration", "custom_api", "custom_messaging_channel", "extension_pack", "mcp_server", "skill", "skill_marketplace"],
-                        "description": "Resource substrate selected by meaning: notification for user-facing notification delivery, immediate or scheduled; activity for recent work, conversations, Reflect/Sentinel evidence, personal activity patterns, attention, avoidance, recurring themes, and retrospective local-state insight; app_service/dashboard for browser-viewable pages, dashboards, apps, games, tools, and HTML UI artifacts; file for raw documents, runbooks, source assets, and reusable instructions; scheduled_task/watcher only for independent future execution or monitoring; integration/custom_api/custom_messaging_channel/extension_pack/mcp_server for external capabilities installed into AgentArk; skill for reusable AgentArk procedures/capabilities; skill_marketplace for sources that list installable skills."
+                        "enum": resource_valid_kinds(),
+                        "description": "Resource substrate registered by the backend resource adapter table. Choose the adapter by the requested resource semantics, then use the adapter's supported operations. Generated source/content belongs in direct authoring primitives such as app_deploy, file_write/file_patch, or skill_manage rather than resource_rw."
                     },
                     "id": {
                         "type": "string",
-                        "description": "Identifier for an existing resource. For new file creation, do not use id as the destination path; use content.path."
+                        "description": "Identifier for an existing resource. For file read/delete, use a managed workspace/data-relative path or resource id."
                     },
                     "query": { "type": "string", "description": "Semantic lookup, listing, or matching text for the target resource." },
                     "content": {
                         "type": "object",
-                        "description": "Payload for the resource. For kind=file create/update, include path as a workspace/data-relative string and one body source in the same call: content (complete file body string), content_base64, source_path, or source_resource. Do not create files with only title/description/metadata. Single-file patch updates need path plus patch; batch patch updates need patches entries with path and patch. For kind=app_service/dashboard, provide browser-runnable files with an HTML entrypoint such as index.html, a complete HTML document in content.content, or staged source_dir/source_paths so AgentArk returns a browser-accessible /apps/ URL. For kind=notification create, include message/title plus optional delivery route as delivery_channel, report_to, or channel; include cron, at, scheduled_for, or local_time/timezone when delivery should happen later. For kind=scheduled_task create/update, include task or task_id plus cron, at, scheduled_for, or local_time/timezone, optional report_to/channel, and optional action/action_arguments; for notification reminders, action_arguments.message is the reminder body. scheduled_for is the persisted one-time timestamp returned by task status/list and is equivalent to at. Use local_time/timezone when the user gave a wall-clock time without a full date. For custom_api create/update/install/connect, provide name, description, and base_url/path or openapi_url/openapi_text plus auth fields if known. For custom_messaging_channel configure a reusable non-bundled outbound channel by providing the channel name and declarative HTTP send specification; do not use it to send a one-off notification. For extension_pack provide pack_id/source_url/source_path/manifest_text/manifest for installs or pack_id plus connection fields for connect. For mcp_server provide name plus HTTP url or stdio command/args and auth type/credential metadata only when the requested substrate is explicitly MCP. For skill provide name plus complete SKILL.md markdown for create/update, url/source_url/install_url for import/install, or arguments for test. For skill_marketplace provide name/url/enabled for create/update and id/name for read/delete/refresh/enable/disable. Durable facts, preferences, and reusable knowledge that are not procedures should use memory_rw rather than skill."
+                        "description": "Payload for the selected resource adapter. Mandatory fields are enforced by registered adapter/action contracts at runtime; incomplete setup payloads route to capability resolution or inspection before mutation instead of guessing a brittle path. Do not put generated file content, generated app source, or generated SKILL.md content in resource_rw; use file_write/file_patch, app_deploy, or skill_manage directly. Durable facts, preferences, and reusable knowledge that are not procedures should use memory_rw rather than skill."
                     },
                     "metadata": {
                         "type": "object",
-                        "description": "Optional provenance, title, source URLs, refresh notes, workflow steps, or non-sensitive operational metadata. For source-grounded apps/documents, include artifact_identity with source URLs and a compact source-data fingerprint or fact set so duplicate detection can reuse existing artifacts without relying on user wording. Do not use metadata to request scheduling unless the user intent requires later autonomous execution."
+                        "description": "Optional provenance, title, source URLs, refresh notes, workflow steps, or non-sensitive operational metadata. Do not use metadata to request scheduling unless the user intent requires later autonomous execution."
                     },
                     "duplicate_policy": {
                         "type": "string",
                         "enum": ["reuse_existing", "create_new"],
                         "default": "reuse_existing",
-                        "description": "For app_service/dashboard and document-visible file writes, reuse/skip identical existing artifacts by default. Use create_new only when the user explicitly wants another duplicate copy."
+                        "description": "For resource kinds that support duplicate detection, reuse/skip identical existing artifacts by default. Use create_new only when the user explicitly wants another duplicate copy."
                     },
                     "allow_duplicate": {
                         "type": "boolean",
@@ -3174,13 +4803,17 @@ fn plan_search(arguments: &serde_json::Value) -> PrimitivePlan {
         return unsupported("search requires `query`.");
     };
     let depth = json_text(arguments, "depth").unwrap_or_else(|| "standard".to_string());
-    if depth == "deep" {
+    if depth.eq_ignore_ascii_case("deep") {
+        let mut research_args = serde_json::json!({
+            "query": query,
+            "depth": "deep",
+        });
+        if let Some(limit) = json_usize(arguments, "limit") {
+            research_args["max_sources"] = serde_json::json!(limit);
+        }
         PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
             action_name: "research".to_string(),
-            arguments: serde_json::json!({
-                "query": query,
-                "depth": "standard",
-            }),
+            arguments: research_args,
         }])
     } else {
         PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
@@ -3196,7 +4829,19 @@ fn plan_search(arguments: &serde_json::Value) -> PrimitivePlan {
 fn plan_fetch(arguments: &serde_json::Value) -> PrimitivePlan {
     if let Some(url) = json_text(arguments, "url") {
         let method = json_text(arguments, "method").unwrap_or_else(|| "GET".to_string());
-        if method.eq_ignore_ascii_case("GET") {
+        let payload = merge_content_metadata(arguments);
+        let needs_direct_http = payload.get("headers").is_some()
+            || payload.get("body").is_some()
+            || payload.get("save_to").is_some()
+            || payload
+                .get("as_resource")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            || payload.get("suggested_name").is_some()
+            || payload.get("persist_response").is_some()
+            || payload.get("timeout_secs").is_some()
+            || payload.get("query").is_some_and(|value| value.is_object());
+        if method.eq_ignore_ascii_case("GET") && !needs_direct_http {
             return PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
                 action_name: "page_fetch".to_string(),
                 arguments: serde_json::json!({ "url": url }),
@@ -3204,10 +4849,7 @@ fn plan_fetch(arguments: &serde_json::Value) -> PrimitivePlan {
         }
         return PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
             action_name: "http_request".to_string(),
-            arguments: merge_objects(
-                serde_json::json!({ "url": url, "method": method }),
-                merge_content_metadata(arguments),
-            ),
+            arguments: merge_objects(serde_json::json!({ "url": url, "method": method }), payload),
         }]);
     }
 
@@ -3291,6 +4933,12 @@ fn plan_browse(arguments: &serde_json::Value) -> PrimitivePlan {
     if let Some(profile) = json_text(arguments, "profile") {
         payload.insert("profile".to_string(), serde_json::Value::String(profile));
     }
+    if let Some(profile_id) = json_text(arguments, "profile_id") {
+        payload.insert(
+            "profile_id".to_string(),
+            serde_json::Value::String(profile_id),
+        );
+    }
     if let Some(expectation) = json_text(arguments, "expectation") {
         payload.insert(
             "expectation".to_string(),
@@ -3301,6 +4949,56 @@ fn plan_browse(arguments: &serde_json::Value) -> PrimitivePlan {
         action_name: "browser_auto".to_string(),
         arguments: serde_json::Value::Object(payload),
     }])
+}
+
+fn browser_profile_selector_from_request_context(
+    context: Option<&serde_json::Value>,
+) -> Option<(String, &'static str)> {
+    let object = context?.as_object()?;
+    for (key, field) in [("profile_id", "profile_id"), ("profile_name", "profile")] {
+        if let Some(value) = object
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some((value.to_string(), field));
+        }
+    }
+    None
+}
+
+fn browser_auto_invocation_with_request_profile(
+    invocation: &PrimitiveActionInvocation,
+    browser_profile_context: Option<&serde_json::Value>,
+) -> PrimitiveActionInvocation {
+    if !invocation.action_name.eq_ignore_ascii_case("browser_auto") {
+        return invocation.clone();
+    }
+    let action = json_text(&invocation.arguments, "action")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "start_session".to_string());
+    if action != "start_session" {
+        return invocation.clone();
+    }
+    if json_text(&invocation.arguments, "profile_id").is_some()
+        || json_text(&invocation.arguments, "profile").is_some()
+    {
+        return invocation.clone();
+    }
+    let Some((selector, field)) =
+        browser_profile_selector_from_request_context(browser_profile_context)
+    else {
+        return invocation.clone();
+    };
+    let mut arguments = invocation.arguments.clone();
+    if let Some(object) = arguments.as_object_mut() {
+        object.insert(field.to_string(), serde_json::Value::String(selector));
+    }
+    PrimitiveActionInvocation {
+        action_name: invocation.action_name.clone(),
+        arguments,
+    }
 }
 
 fn plan_code_exec(arguments: &serde_json::Value) -> PrimitivePlan {
@@ -3373,6 +5071,61 @@ fn plan_pdf_generate(arguments: &serde_json::Value) -> PrimitivePlan {
     }])
 }
 
+fn plan_direct_action(action_name: &str, arguments: &serde_json::Value) -> PrimitivePlan {
+    PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+        action_name: action_name.to_string(),
+        arguments: arguments.clone(),
+    }])
+}
+
+fn plan_skill_manage(arguments: &serde_json::Value) -> PrimitivePlan {
+    let mut payload = arguments.clone();
+    let operation = json_text(&payload, "operation")
+        .or_else(|| json_text(&payload, "op"))
+        .unwrap_or_else(|| "list".to_string());
+    if let Some(object) = payload.as_object_mut() {
+        let nested_content = object
+            .get("content")
+            .and_then(|value| value.as_object())
+            .cloned();
+        if let Some(content_object) = nested_content {
+            for (key, value) in content_object {
+                object.entry(key).or_insert(value);
+            }
+        }
+        object.insert(
+            "operation".to_string(),
+            serde_json::Value::String(operation),
+        );
+        object
+            .entry("resource".to_string())
+            .or_insert_with(|| serde_json::Value::String("skill".to_string()));
+        if !object.contains_key("content") {
+            if let Some(markdown) = object.get("markdown").cloned() {
+                object.insert("content".to_string(), markdown);
+            }
+        }
+        if !object.contains_key("name") {
+            if let Some(target) = object
+                .get("id")
+                .or_else(|| object.get("query"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            {
+                object.insert("name".to_string(), serde_json::Value::String(target));
+            }
+        }
+        object.remove("op");
+        object.remove("kind");
+    }
+    PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+        action_name: "manage_actions".to_string(),
+        arguments: payload,
+    }])
+}
+
 fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
     let op = json_text(arguments, "op")
         .map(|value| value.trim().to_ascii_lowercase())
@@ -3380,6 +5133,11 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
     let kind = json_text(arguments, "kind")
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_default();
+
+    if let Some(plan) = plan_registered_resource_action(arguments, kind.as_str(), op.as_str()) {
+        return plan;
+    }
+
     match (kind.as_str(), op.as_str()) {
         ("file", "read") | ("file", "status") => {
             let Some(path) = json_text(arguments, "id")
@@ -3420,53 +5178,37 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
             }])
         }
         ("file", "create") | ("file", "update") => {
-            let mut payload = merge_content_metadata(arguments);
-            let has_patch = payload.get("patch").is_some() || payload.get("patches").is_some();
-            if let Some(plan) = validate_file_mutation_payload(&payload, op.as_str(), has_patch) {
-                return plan;
-            }
-            if !has_patch && op == "create" && file_payload_should_deploy_as_app(&payload) {
-                return PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                    action_name: "service_manage".to_string(),
-                    arguments: app_service_payload_from_html_file_payload(&payload),
-                }]);
-            }
-            if !has_patch
-                && payload.get("document_visible").is_none()
-                && payload.get("index_document").is_none()
-            {
-                if let Some(object) = payload.as_object_mut() {
-                    object.insert(
-                        "document_visible".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-            }
-            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                action_name: if has_patch {
+            let payload = merge_content_metadata(arguments);
+            let suggested_primitive =
+                if payload.get("patch").is_some() || payload.get("patches").is_some() {
                     "file_patch"
                 } else {
                     "file_write"
-                }
-                .to_string(),
-                arguments: payload,
-            }])
+                };
+            unsupported_with_extra(
+                "resource_rw file create/update no longer accepts file authoring payloads. Use file_write or file_patch directly.",
+                serde_json::json!({
+                    "kind": kind,
+                    "op": op,
+                    "terminal_observation": true,
+                    "suggested_primitive": suggested_primitive
+                }),
+            )
         }
+        ("app_service", "create")
+        | ("app_service", "update")
+        | ("dashboard", "create")
+        | ("dashboard", "update") => unsupported_with_extra(
+            "resource_rw app_service/dashboard no longer accepts generated app source. Use app_deploy for app creation, source replacement, or patches.",
+            serde_json::json!({
+                "kind": kind,
+                "op": op,
+                "terminal_observation": true,
+                "suggested_primitive": "app_deploy"
+            }),
+        ),
         ("app_service", _) | ("dashboard", _) => {
             let payload = service_manage_payload_from_resource(arguments);
-            if matches!(op.as_str(), "create" | "update")
-                && !service_manage_payload_has_deploy_material(&payload)
-            {
-                return unsupported_with_extra(
-                    "resource_rw app_service/dashboard create/update requires deployable app content.",
-                    serde_json::json!({
-                        "kind": kind,
-                        "op": op,
-                        "field": "content.files",
-                        "hint": "Provide content.files with app-relative file names and complete file bodies, or content.content with a complete HTML document, or source_dir/source_paths for staged files."
-                    }),
-                );
-            }
             PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
                 action_name: "service_manage".to_string(),
                 arguments: payload,
@@ -3587,23 +5329,6 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
         | ("integration", "update")
         | ("integration", "install")
         | ("integration", "connect") => plan_integration_mutation(arguments, op.as_str()),
-        ("custom_api", "create")
-        | ("custom_api", "update")
-        | ("custom_api", "install")
-        | ("custom_api", "connect") => {
-            let mut payload = merge_content_metadata(arguments);
-            if let Some(object) = payload.as_object_mut() {
-                object.remove("op");
-                object.remove("kind");
-                if op != "update" {
-                    object.remove("id");
-                }
-            }
-            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                action_name: "capability_acquire".to_string(),
-                arguments: payload,
-            }])
-        }
         ("custom_api", "test") => {
             let mut payload = merge_objects(
                 serde_json::json!({ "surface": "custom_apis", "run_check": true }),
@@ -3632,38 +5357,7 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                 ),
             }])
         }
-        ("custom_api", "delete") | ("custom_api", "enable") | ("custom_api", "disable") => {
-            let mut payload = merge_content_metadata(arguments);
-            if let Some(object) = payload.as_object_mut() {
-                object.insert(
-                    "operation".to_string(),
-                    serde_json::Value::String(op.clone()),
-                );
-                object.remove("op");
-                object.remove("kind");
-            }
-            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                action_name: "custom_api_manage".to_string(),
-                arguments: payload,
-            }])
-        }
-        ("custom_api", _) => unsupported_resource_operation(
-            "custom_api",
-            op.as_str(),
-            &[
-                "create", "update", "install", "connect", "list", "read", "status", "test",
-                "delete", "enable", "disable",
-            ],
-        ),
-        ("custom_messaging_channel", "create") | ("custom_messaging_channel", "update") => {
-            match custom_messaging_channel_payload_from_resource(arguments, op.as_str()) {
-                Ok(payload) => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                    action_name: "custom_messaging_channel_upsert".to_string(),
-                    arguments: payload,
-                }]),
-                Err(plan) => plan,
-            }
-        }
+        ("custom_api", _) => unsupported_registered_resource_operation("custom_api", op.as_str()),
         ("custom_messaging_channel", "list")
         | ("custom_messaging_channel", "read")
         | ("custom_messaging_channel", "status") => {
@@ -3680,11 +5374,9 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                 ),
             }])
         }
-        ("custom_messaging_channel", _) => unsupported_resource_operation(
-            "custom_messaging_channel",
-            op.as_str(),
-            &["create", "update", "list", "read", "status"],
-        ),
+        ("custom_messaging_channel", _) => {
+            unsupported_registered_resource_operation("custom_messaging_channel", op.as_str())
+        }
         ("extension_pack", "list") | ("extension_pack", "read") | ("extension_pack", "status") => {
             PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
                 action_name: if op == "list" {
@@ -3699,53 +5391,26 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                 ),
             }])
         }
-        ("extension_pack", "create")
-        | ("extension_pack", "update")
-        | ("extension_pack", "install") => {
-            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                action_name: "extension_pack_install".to_string(),
-                arguments: merge_content_metadata(arguments),
-            }])
+        ("extension_pack", _) => {
+            unsupported_registered_resource_operation("extension_pack", op.as_str())
         }
-        ("extension_pack", "connect") => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-            action_name: "extension_pack_connect".to_string(),
-            arguments: merge_content_metadata(arguments),
-        }]),
-        ("extension_pack", "enable") | ("extension_pack", "disable") => {
-            let mut payload = merge_content_metadata(arguments);
-            if let Some(object) = payload.as_object_mut() {
-                object.insert(
-                    "enabled".to_string(),
-                    serde_json::Value::Bool(op == "enable"),
-                );
-            }
-            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                action_name: "extension_pack_set_enabled".to_string(),
-                arguments: payload,
-            }])
+        ("skill", "create") | ("skill", "update") | ("skill", "install") | ("skill", "test") => {
+            unsupported_with_extra(
+                "resource_rw skill no longer accepts skill authoring, import, install, or test payloads. Use skill_manage directly.",
+                serde_json::json!({
+                    "kind": kind,
+                    "op": op,
+                    "terminal_observation": true,
+                    "suggested_primitive": "skill_manage"
+                }),
+            )
         }
-        ("extension_pack", "test") => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-            action_name: "extension_pack_test_connection".to_string(),
-            arguments: merge_content_metadata(arguments),
-        }]),
-        ("extension_pack", _) => unsupported_resource_operation(
-            "extension_pack",
-            op.as_str(),
-            &[
-                "create", "update", "install", "connect", "list", "read", "status", "enable",
-                "disable", "test",
-            ],
-        ),
-        ("skill", "create")
-        | ("skill", "update")
-        | ("skill", "delete")
+        ("skill", "delete")
         | ("skill", "list")
         | ("skill", "read")
         | ("skill", "status")
-        | ("skill", "install")
         | ("skill", "enable")
-        | ("skill", "disable")
-        | ("skill", "test") => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+        | ("skill", "disable") => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
             action_name: "manage_actions".to_string(),
             arguments: skill_resource_payload_from_resource(arguments, op.as_str()),
         }]),
@@ -3772,24 +5437,7 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
         | ("mcp_server", "read")
         | ("mcp_server", "status")
         | ("mcp_server", "refresh") => {
-            let mut payload = merge_content_metadata(arguments);
-            if let Some(object) = payload.as_object_mut() {
-                let operation = match op.as_str() {
-                    "read" => "status",
-                    "install" | "connect" => "create",
-                    other => other,
-                };
-                object.insert(
-                    "operation".to_string(),
-                    serde_json::Value::String(operation.to_string()),
-                );
-                object.remove("op");
-                object.remove("kind");
-            }
-            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
-                action_name: "mcp_server_manage".to_string(),
-                arguments: payload,
-            }])
+            unsupported_registered_resource_operation("mcp_server", op.as_str())
         }
         ("background_session", _) => {
             match durable_work_manage_payload_from_resource(arguments, kind.as_str(), op.as_str()) {
@@ -3799,6 +5447,21 @@ fn plan_resource_rw(arguments: &serde_json::Value) -> PrimitivePlan {
                 }]),
                 Err(plan) => plan,
             }
+        }
+        ("browser_profile", "create")
+        | ("browser_profile", "read")
+        | ("browser_profile", "update")
+        | ("browser_profile", "delete")
+        | ("browser_profile", "list")
+        | ("browser_profile", "status")
+        | ("browser_profile", "launch")
+        | ("browser_profile", "close")
+        | ("browser_profile", "resolve") => {
+            let payload = browser_profile_payload_from_resource(arguments, op.as_str());
+            PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+                action_name: "browser_profile_manage".to_string(),
+                arguments: payload,
+            }])
         }
         ("conversation", "read") | ("conversation", "list") => {
             PrimitivePlan::Conversation(ConversationPrimitiveOp::Read {
@@ -3843,7 +5506,8 @@ fn unsupported_resource_adapter(
     let mut extra = serde_json::json!({
         "kind": kind,
         "op": op,
-        "valid_kinds": RESOURCE_RW_VALID_KINDS,
+        "valid_kinds": resource_valid_kinds(),
+        "supported_ops": supported_resource_ops(kind),
     });
     if resource_payload_looks_like_notification(arguments) {
         if let Some(object) = extra.as_object_mut() {
@@ -3870,6 +5534,181 @@ fn unsupported_resource_adapter(
         ),
         extra,
     )
+}
+
+fn plan_registered_resource_action(
+    arguments: &serde_json::Value,
+    kind: &str,
+    op: &str,
+) -> Option<PrimitivePlan> {
+    let contract = resource_action_contract(kind, op)?;
+    let mut payload = transform_resource_payload(arguments, contract.transform, op);
+    if !resource_payload_satisfies_requirement(&payload, contract.requirement, op) {
+        if resource_payload_looks_like_notification(arguments)
+            && contract.kind == "custom_messaging_channel"
+            && matches!(op, "create" | "update")
+        {
+            return Some(
+                match notification_payload_from_resource(arguments, "create") {
+                    Ok(action) => PrimitivePlan::Actions(vec![action]),
+                    Err(plan) => plan,
+                },
+            );
+        }
+        return Some(plan_resource_capability_resolution(
+            arguments,
+            contract.kind,
+            op,
+            contract.selected_action_for_resolution,
+            contract.requirement,
+        ));
+    }
+    if let Some(object) = payload.as_object_mut() {
+        if contract.kind == "custom_api"
+            && !matches!(op, "update" | "delete" | "enable" | "disable")
+        {
+            object.remove("id");
+        }
+        if (contract.kind == "custom_api" && matches!(op, "delete" | "enable" | "disable"))
+            || (contract.kind == "custom_messaging_channel"
+                && matches!(op, "delete" | "enable" | "disable" | "test"))
+        {
+            object.insert(
+                "operation".to_string(),
+                serde_json::Value::String(op.to_string()),
+            );
+        }
+        if contract.kind == "extension_pack" && matches!(op, "enable" | "disable") {
+            object.insert(
+                "enabled".to_string(),
+                serde_json::Value::Bool(op == "enable"),
+            );
+        }
+    }
+    Some(PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+        action_name: contract.action_name.to_string(),
+        arguments: payload,
+    }]))
+}
+
+fn resource_action_contract(kind: &str, op: &str) -> Option<&'static ResourceActionContract> {
+    RESOURCE_ACTION_CONTRACTS.iter().find(|contract| {
+        contract.kind == kind && contract.ops.iter().any(|candidate| *candidate == op)
+    })
+}
+
+fn resource_adapter_spec(kind: &str) -> Option<&'static ResourceAdapterSpec> {
+    RESOURCE_RW_ADAPTERS
+        .iter()
+        .find(|adapter| adapter.kind == kind)
+}
+
+fn resource_valid_kinds() -> Vec<&'static str> {
+    RESOURCE_RW_ADAPTERS
+        .iter()
+        .map(|adapter| adapter.kind)
+        .collect()
+}
+
+fn resource_valid_ops() -> Vec<&'static str> {
+    let mut ops = RESOURCE_RW_ADAPTERS
+        .iter()
+        .flat_map(|adapter| adapter.ops.iter().copied())
+        .collect::<Vec<_>>();
+    ops.sort_unstable();
+    ops.dedup();
+    ops
+}
+
+fn supported_resource_ops(kind: &str) -> Vec<&'static str> {
+    resource_adapter_spec(kind)
+        .map(|adapter| adapter.ops.to_vec())
+        .unwrap_or_default()
+}
+
+fn transform_resource_payload(
+    arguments: &serde_json::Value,
+    transform: ResourcePayloadTransform,
+    op: &str,
+) -> serde_json::Value {
+    match transform {
+        ResourcePayloadTransform::StripResourceFields => {
+            let mut payload = merge_content_metadata(arguments);
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("op");
+                object.remove("kind");
+            }
+            payload
+        }
+        ResourcePayloadTransform::ExtensionPack => extension_pack_payload_from_resource(arguments),
+        ResourcePayloadTransform::McpManage => {
+            let mut payload = merge_content_metadata(arguments);
+            if let Some(object) = payload.as_object_mut() {
+                let operation = match op {
+                    "read" => "status",
+                    "install" | "connect" => "create",
+                    other => other,
+                };
+                object.insert(
+                    "operation".to_string(),
+                    serde_json::Value::String(operation.to_string()),
+                );
+                object.remove("op");
+                object.remove("kind");
+            }
+            payload
+        }
+    }
+}
+
+fn resource_payload_satisfies_requirement(
+    payload: &serde_json::Value,
+    requirement: ResourcePayloadRequirement,
+    op: &str,
+) -> bool {
+    match requirement {
+        ResourcePayloadRequirement::None => true,
+        ResourcePayloadRequirement::CustomApiAcquisitionSpec => {
+            custom_api_payload_has_acquisition_spec(payload, op)
+        }
+        ResourcePayloadRequirement::CustomMessagingChannelSpec => {
+            json_text(payload, "name").is_some()
+                && payload.get("send").is_some_and(|value| value.is_object())
+        }
+        ResourcePayloadRequirement::ExtensionPackInstallTarget => {
+            extension_pack_payload_has_install_target(payload)
+        }
+        ResourcePayloadRequirement::ExtensionPackId => extension_pack_payload_has_pack_id(payload),
+        ResourcePayloadRequirement::McpServerConfig => mcp_server_payload_has_config(payload),
+        ResourcePayloadRequirement::ResourceId => json_text(payload, "id")
+            .or_else(|| json_text(payload, "pack_id"))
+            .is_some(),
+    }
+}
+
+fn mcp_server_payload_has_config(payload: &serde_json::Value) -> bool {
+    json_text(payload, "url").is_some()
+        || json_text(payload, "command").is_some()
+        || payload
+            .get("transport")
+            .is_some_and(|value| value.is_object())
+}
+
+fn resource_requirement_labels(requirement: ResourcePayloadRequirement) -> &'static [&'static str] {
+    match requirement {
+        ResourcePayloadRequirement::None => &[],
+        ResourcePayloadRequirement::CustomApiAcquisitionSpec => &[
+            "name or id",
+            "endpoint, OpenAPI, docs, operation shape, or update auth metadata",
+        ],
+        ResourcePayloadRequirement::CustomMessagingChannelSpec => &["name", "send specification"],
+        ResourcePayloadRequirement::ExtensionPackInstallTarget => {
+            &["pack id or extension-pack source/manifest"]
+        }
+        ResourcePayloadRequirement::ExtensionPackId => &["pack id"],
+        ResourcePayloadRequirement::McpServerConfig => &["transport, url, or command"],
+        ResourcePayloadRequirement::ResourceId => &["resource id"],
+    }
 }
 
 fn scheduled_task_payload_from_resource(
@@ -4024,58 +5863,6 @@ fn notification_payload_from_resource(
         action_name: "notify_user".to_string(),
         arguments: payload,
     })
-}
-
-fn custom_messaging_channel_payload_from_resource(
-    arguments: &serde_json::Value,
-    op: &str,
-) -> Result<serde_json::Value, PrimitivePlan> {
-    let mut payload = merge_content_metadata(arguments);
-    merge_top_level_resource_fields(
-        arguments,
-        &mut payload,
-        &[
-            "name",
-            "description",
-            "enabled",
-            "docs_url",
-            "send",
-            "auth_manifest",
-            "auth_profile_id",
-            "credential_fields",
-            "clear_secrets",
-        ],
-    );
-    if json_text(&payload, "name").is_none() || !payload.get("send").is_some_and(|v| v.is_object())
-    {
-        let mut extra = serde_json::json!({
-            "kind": "custom_messaging_channel",
-            "op": op,
-            "field": "content.send",
-            "hint": "Use kind=notification for delivering a user-facing notification. Use custom_messaging_channel only to configure a reusable non-bundled outbound channel."
-        });
-        if resource_payload_looks_like_notification(arguments) {
-            if let Some(object) = extra.as_object_mut() {
-                object.insert(
-                    "suggested_kind".to_string(),
-                    serde_json::Value::String("notification".to_string()),
-                );
-                object.insert(
-                    "suggested_op".to_string(),
-                    serde_json::Value::String("create".to_string()),
-                );
-            }
-        }
-        return Err(unsupported_with_extra(
-            "resource_rw custom_messaging_channel create requires a reusable channel name and declarative send specification.",
-            extra,
-        ));
-    }
-    if let Some(object) = payload.as_object_mut() {
-        object.remove("op");
-        object.remove("kind");
-    }
-    Ok(payload)
 }
 
 fn resource_payload_looks_like_notification(arguments: &serde_json::Value) -> bool {
@@ -4272,182 +6059,6 @@ fn normalize_direct_notification_payload(
     Ok(())
 }
 
-fn scheduled_notification_invocation_from_direct_notification(
-    invocation: &PrimitiveActionInvocation,
-    request_text: &str,
-    now_utc: chrono::DateTime<chrono::Utc>,
-    default_timezone: Option<chrono_tz::Tz>,
-) -> Option<PrimitiveActionInvocation> {
-    if !invocation.action_name.eq_ignore_ascii_case("notify_user")
-        || notification_payload_has_schedule(&invocation.arguments)
-    {
-        return None;
-    }
-
-    let hint = notification_schedule_hint_from_request(request_text, now_utc, default_timezone)?;
-    let message = direct_notification_body_from_arguments(&invocation.arguments)?;
-    let reminder_message = format!(
-        "⏰ Reminder: {} scheduled for {} at {} {}",
-        message, hint.date_label, hint.local_time, hint.timezone_abbrev
-    );
-    let mut arguments = serde_json::Map::new();
-    arguments.insert("task".to_string(), serde_json::Value::String(message));
-    arguments.insert(
-        "local_date".to_string(),
-        serde_json::Value::String(hint.local_date),
-    );
-    arguments.insert(
-        "local_time".to_string(),
-        serde_json::Value::String(hint.local_time),
-    );
-    arguments.insert(
-        "timezone".to_string(),
-        serde_json::Value::String(hint.timezone_name),
-    );
-    if let Some(route) = direct_notification_route_from_arguments(&invocation.arguments) {
-        arguments.insert("report_to".to_string(), serde_json::Value::String(route));
-    }
-    arguments.insert(
-        "action".to_string(),
-        serde_json::Value::String("notify_user".to_string()),
-    );
-    arguments.insert(
-        "action_arguments".to_string(),
-        serde_json::json!({
-            "message": reminder_message,
-            "source": "reminder",
-            "in_app_title": "Reminder"
-        }),
-    );
-    if let Some(allow_duplicate) = invocation.arguments.get("allow_duplicate").cloned() {
-        arguments.insert("allow_duplicate".to_string(), allow_duplicate);
-    }
-
-    Some(PrimitiveActionInvocation {
-        action_name: "schedule_task".to_string(),
-        arguments: serde_json::Value::Object(arguments),
-    })
-}
-
-fn notification_schedule_hint_from_request(
-    request_text: &str,
-    now_utc: chrono::DateTime<chrono::Utc>,
-    default_timezone: Option<chrono_tz::Tz>,
-) -> Option<NotificationScheduleHint> {
-    let local_time = NOTIFICATION_CLOCK_TIME_RE
-        .captures_iter(request_text)
-        .find_map(|captures| notification_clock_time_from_captures(&captures))?;
-    let timezone = default_timezone.unwrap_or(chrono_tz::UTC);
-    let now_local = now_utc.with_timezone(&timezone);
-    let now_local_date = now_local.date_naive();
-    let mut local_date = now_local_date;
-    let mut scheduled_local =
-        notification_resolve_local_datetime(timezone, local_date, local_time)?;
-    if scheduled_local.with_timezone(&chrono::Utc) <= now_utc {
-        local_date = now_local_date.succ_opt()?;
-        scheduled_local = notification_resolve_local_datetime(timezone, local_date, local_time)?;
-    }
-
-    Some(NotificationScheduleHint {
-        local_date: scheduled_local.date_naive().to_string(),
-        local_time: format_notification_local_time(local_time),
-        timezone_name: timezone.to_string(),
-        timezone_abbrev: scheduled_local.format("%Z").to_string(),
-        date_label: notification_schedule_date_label(now_local_date, scheduled_local.date_naive()),
-    })
-}
-
-fn notification_clock_time_from_captures(
-    captures: &regex::Captures<'_>,
-) -> Option<chrono::NaiveTime> {
-    if let (Some(hour), Some(meridiem)) = (captures.name("hour12"), captures.name("meridiem")) {
-        let mut hour = hour.as_str().parse::<u32>().ok()?;
-        let minute = captures
-            .name("minute12")
-            .map(|value| value.as_str().parse::<u32>().ok())
-            .unwrap_or(Some(0))?;
-        let meridiem = meridiem.as_str().to_ascii_lowercase();
-        if meridiem.starts_with('p') && hour != 12 {
-            hour += 12;
-        } else if meridiem.starts_with('a') && hour == 12 {
-            hour = 0;
-        }
-        return chrono::NaiveTime::from_hms_opt(hour, minute, 0);
-    }
-
-    let hour = captures.name("hour24")?.as_str().parse::<u32>().ok()?;
-    let minute = captures.name("minute24")?.as_str().parse::<u32>().ok()?;
-    let second = captures
-        .name("second24")
-        .map(|value| value.as_str().parse::<u32>().ok())
-        .unwrap_or(Some(0))?;
-    chrono::NaiveTime::from_hms_opt(hour, minute, second)
-}
-
-fn notification_resolve_local_datetime(
-    timezone: chrono_tz::Tz,
-    local_date: chrono::NaiveDate,
-    local_time: chrono::NaiveTime,
-) -> Option<chrono::DateTime<chrono_tz::Tz>> {
-    match timezone.from_local_datetime(&local_date.and_time(local_time)) {
-        chrono::LocalResult::Single(value) => Some(value),
-        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest),
-        chrono::LocalResult::None => None,
-    }
-}
-
-fn format_notification_local_time(time: chrono::NaiveTime) -> String {
-    let hour24 = time.hour();
-    let hour12 = match hour24 % 12 {
-        0 => 12,
-        value => value,
-    };
-    let meridiem = if hour24 < 12 { "AM" } else { "PM" };
-    format!("{}:{:02} {}", hour12, time.minute(), meridiem)
-}
-
-fn notification_schedule_date_label(
-    now_local_date: chrono::NaiveDate,
-    scheduled_local_date: chrono::NaiveDate,
-) -> String {
-    if scheduled_local_date == now_local_date {
-        "today".to_string()
-    } else if now_local_date
-        .succ_opt()
-        .is_some_and(|tomorrow| scheduled_local_date == tomorrow)
-    {
-        "tomorrow".to_string()
-    } else {
-        scheduled_local_date.to_string()
-    }
-}
-
-fn direct_notification_body_from_arguments(arguments: &serde_json::Value) -> Option<String> {
-    json_text(arguments, "message")
-        .or_else(|| json_text(arguments, "title"))
-        .or_else(|| json_text(arguments, "task"))
-}
-
-fn direct_notification_route_from_arguments(arguments: &serde_json::Value) -> Option<String> {
-    ["delivery_channel", "report_to", "channel", "recipient"]
-        .iter()
-        .find_map(|key| json_text(arguments, key))
-}
-
-fn latest_user_message_text(messages: &[SpineMessage]) -> Option<&str> {
-    messages.iter().rev().find_map(|message| match message {
-        SpineMessage::User { content } => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        }
-        _ => None,
-    })
-}
-
 fn merge_top_level_resource_fields(
     arguments: &serde_json::Value,
     payload: &mut serde_json::Value,
@@ -4604,6 +6215,11 @@ fn durable_work_manage_payload_from_resource(
     Ok(payload)
 }
 
+fn unsupported_registered_resource_operation(kind: &str, op: &str) -> PrimitivePlan {
+    let supported_ops = supported_resource_ops(kind);
+    unsupported_resource_operation(kind, op, &supported_ops)
+}
+
 fn unsupported_resource_operation(kind: &str, op: &str, supported_ops: &[&str]) -> PrimitivePlan {
     unsupported_with_extra(
         format!(
@@ -4727,6 +6343,8 @@ fn plan_integration_mutation(arguments: &serde_json::Value, op: &str) -> Primiti
         || payload.get("path").is_some()
         || payload.get("openapi_url").is_some()
         || payload.get("openapi_text").is_some()
+        || payload.get("docs_url").is_some()
+        || payload.get("docs_text").is_some()
     {
         return PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
             action_name: "capability_acquire".to_string(),
@@ -4734,166 +6352,224 @@ fn plan_integration_mutation(arguments: &serde_json::Value, op: &str) -> Primiti
         }]);
     }
 
-    unsupported_with_extra(
-        "resource_rw integration create/update/install/connect requires structured integration content.",
-        serde_json::json!({
-            "kind": "integration",
-            "op": op,
-            "hint": "Use a specific resource kind when the substrate is explicit: mcp_server for MCP transports, custom_api for HTTP/API operations, custom_messaging_channel for send specs, or extension_pack for pack manifests/catalog installs. For custom APIs provide base_url/path or openapi_url/openapi_text; do not infer an MCP server from a generic integration request."
-        }),
+    plan_resource_capability_resolution(
+        arguments,
+        "integration",
+        op,
+        None,
+        ResourcePayloadRequirement::None,
     )
 }
 
-fn validate_file_mutation_payload(
-    payload: &serde_json::Value,
+fn plan_resource_capability_resolution(
+    arguments: &serde_json::Value,
+    kind: &str,
     op: &str,
-    has_patch: bool,
-) -> Option<PrimitivePlan> {
-    let has_path = json_text(payload, "path").is_some();
-    let has_batch_patches = payload.get("patches").is_some();
-    let has_complete_body = file_mutation_has_complete_body(payload);
-
-    if has_batch_patches {
-        let patches = payload.get("patches").and_then(|value| value.as_array());
-        let every_patch_has_path = patches
-            .map(|items| {
-                !items.is_empty() && items.iter().all(|item| json_text(item, "path").is_some())
-            })
-            .unwrap_or(false);
-        if every_patch_has_path {
-            return None;
-        }
-        return Some(unsupported_with_extra(
-            "resource_rw file patch updates with `content.patches` require each patch entry to include `path`.",
-            serde_json::json!({
-                "kind": "file",
-                "op": op,
-                "field": "content.patches[].path",
-                "hint": "Provide a workspace/data-relative path on each patch entry."
-            }),
-        ));
+    selected_action: Option<&str>,
+    requirement: ResourcePayloadRequirement,
+) -> PrimitivePlan {
+    let requested_capability = resource_resolution_target(arguments)
+        .unwrap_or_else(|| format!("{} {}", kind.replace('_', " "), op));
+    let goal = format!(
+        "Resolve how to {} {} resource `{}` and identify the correct AgentArk capability route before mutating state.",
+        op,
+        kind.replace('_', " "),
+        requested_capability
+    );
+    let failure_output = serde_json::json!({
+        "status": "needs_capability_resolution",
+        "reason": "missing structured resource fields",
+        "kind": kind,
+        "op": op,
+        "required_fields": resource_requirement_labels(requirement),
+        "provided": resource_payload_shape(arguments),
+        "policy": "discover_or_inspect_first_then_mutate"
+    })
+    .to_string();
+    let mut payload = serde_json::json!({
+        "goal": goal,
+        "requested_capability": requested_capability,
+        "failure_output": failure_output,
+    });
+    if let (Some(action), Some(object)) = (selected_action, payload.as_object_mut()) {
+        object.insert(
+            "selected_action".to_string(),
+            serde_json::Value::String(action.to_string()),
+        );
     }
 
-    if has_path && (has_patch || has_complete_body) {
-        return None;
-    }
-
-    if has_path && !has_complete_body {
-        return Some(unsupported_with_extra(
-            "resource_rw file create/update requires a file body source.",
-            serde_json::json!({
-                "kind": "file",
-                "op": op,
-                "field": "content.content",
-                "hint": "Include one body source in the same call: content.content with the complete file body string, content.content_base64, content.source_path, or content.source_resource."
-            }),
-        ));
-    }
-
-    let field = "content.path";
-    let reason = if has_patch {
-        "resource_rw file patch updates require `content.path` for the file being patched."
-    } else {
-        "resource_rw file create/update requires `content.path` for the destination file."
-    };
-    Some(unsupported_with_extra(
-        reason,
-        serde_json::json!({
-            "kind": "file",
-            "op": op,
-            "field": field,
-            "hint": "Use a workspace/data-relative path such as reports/comparison.html."
-        }),
-    ))
+    PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+        action_name: "capability_resolve".to_string(),
+        arguments: payload,
+    }])
 }
 
-fn file_mutation_has_complete_body(payload: &serde_json::Value) -> bool {
+fn resource_resolution_target(arguments: &serde_json::Value) -> Option<String> {
+    json_text(arguments, "query")
+        .or_else(|| json_text(arguments, "id"))
+        .or_else(|| json_text_path(arguments, &["content", "name"]))
+        .or_else(|| json_text_path(arguments, &["content", "id"]))
+        .or_else(|| json_text_path(arguments, &["content", "pack_id"]))
+        .or_else(|| json_text_path(arguments, &["content", "base_url"]))
+        .or_else(|| json_text_path(arguments, &["content", "docs_url"]))
+        .or_else(|| json_text_path(arguments, &["content", "openapi_url"]))
+}
+
+fn resource_payload_shape(arguments: &serde_json::Value) -> serde_json::Value {
+    let payload = merge_content_metadata(arguments);
+    let Some(object) = payload.as_object() else {
+        return serde_json::json!({ "keys": [] });
+    };
+    let mut keys = object
+        .keys()
+        .filter(|key| key.as_str() != "op" && key.as_str() != "kind")
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    serde_json::json!({ "keys": keys })
+}
+
+fn custom_api_payload_has_acquisition_spec(payload: &serde_json::Value, op: &str) -> bool {
+    if custom_api_payload_has_endpoint_or_source(payload) {
+        return true;
+    }
+    let has_target_id = json_text(payload, "id").is_some();
+    if op == "update" && has_target_id {
+        return custom_api_payload_has_operation_detail(payload)
+            || custom_api_payload_has_auth_metadata(payload)
+            || json_text(payload, "description").is_some()
+            || json_text(payload, "name").is_some();
+    }
+    false
+}
+
+fn custom_api_payload_has_endpoint_or_source(payload: &serde_json::Value) -> bool {
     [
-        "content",
-        "content_base64",
-        "source_path",
-        "source_resource",
+        "base_url",
+        "openapi_url",
+        "openapi_text",
+        "docs_url",
+        "docs_text",
     ]
     .iter()
-    .any(|key| match payload.get(*key) {
-        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
-        Some(serde_json::Value::Object(object)) => !object.is_empty(),
-        Some(serde_json::Value::Array(items)) => !items.is_empty(),
-        Some(serde_json::Value::Number(_)) | Some(serde_json::Value::Bool(_)) => true,
-        _ => false,
-    })
+    .any(|key| json_text(payload, key).is_some())
+        || json_text(payload, "path")
+            .as_deref()
+            .is_some_and(is_absolute_http_url)
+        || payload
+            .get("operation")
+            .and_then(|value| value.as_object())
+            .is_some_and(|operation| custom_api_operation_has_endpoint_or_source(operation))
+        || payload
+            .get("operations")
+            .and_then(|value| value.as_array())
+            .is_some_and(|operations| {
+                operations.iter().any(|operation| {
+                    operation
+                        .as_object()
+                        .is_some_and(custom_api_operation_has_endpoint_or_source)
+                })
+            })
 }
 
-fn file_payload_should_deploy_as_app(payload: &serde_json::Value) -> bool {
-    if json_bool(payload, "file_only")
-        .or_else(|| json_bool(payload, "raw_file"))
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    let Some(body) = json_text(payload, "content") else {
-        return false;
-    };
-    if body.trim().is_empty() {
-        return false;
-    }
-    let media_type = json_text(payload, "content_type")
-        .or_else(|| json_text(payload, "mime"))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let path = json_text(payload, "path")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    text_looks_like_html_document(&body)
-        && (media_type.contains("html") || file_path_is_html_entry(&path))
+fn custom_api_operation_has_endpoint_or_source(
+    operation: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    [
+        "base_url",
+        "openapi_url",
+        "openapi_text",
+        "docs_url",
+        "docs_text",
+    ]
+    .iter()
+    .any(|key| {
+        operation
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    }) || operation
+        .get("url")
+        .or_else(|| operation.get("path"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(is_absolute_http_url)
 }
 
-fn app_service_payload_from_html_file_payload(payload: &serde_json::Value) -> serde_json::Value {
-    let body = json_text(payload, "content").unwrap_or_default();
-    let path = json_text(payload, "path").unwrap_or_else(|| "index.html".to_string());
-    let title = json_text(payload, "title")
-        .or_else(|| json_text(payload, "name"))
-        .or_else(|| {
-            path.rsplit('/')
-                .next()
-                .map(|name| name.trim_end_matches(".html").trim_end_matches(".htm"))
-                .filter(|name| !name.is_empty())
-                .map(ToString::to_string)
-        })
-        .unwrap_or_else(|| "Generated HTML page".to_string());
-    let mut files = serde_json::Map::new();
-    files.insert("index.html".to_string(), serde_json::Value::String(body));
+fn custom_api_payload_has_operation_detail(payload: &serde_json::Value) -> bool {
+    [
+        "path",
+        "method",
+        "operation",
+        "operations",
+        "default_headers",
+        "headers",
+        "default_query",
+        "required_inputs",
+        "read_only",
+        "body_required",
+        "body",
+        "body_template",
+        "parameters",
+        "response_notes",
+    ]
+    .iter()
+    .any(|key| payload.get(*key).is_some())
+}
 
-    let mut out = serde_json::Map::new();
-    out.insert(
-        "operation".to_string(),
-        serde_json::Value::String("create".to_string()),
-    );
-    out.insert(
-        "kind".to_string(),
-        serde_json::Value::String("static".to_string()),
-    );
-    out.insert("name".to_string(), serde_json::Value::String(title));
-    out.insert("files".to_string(), serde_json::Value::Object(files));
+fn custom_api_payload_has_auth_metadata(payload: &serde_json::Value) -> bool {
+    [
+        "auth",
+        "auth_type",
+        "auth_mode",
+        "auth_header",
+        "auth_header_name",
+        "auth_name",
+        "auth_username",
+        "auth_profile_id",
+        "clear_secret",
+    ]
+    .iter()
+    .any(|key| payload.get(*key).is_some())
+}
 
-    let mut metadata = serde_json::Map::new();
-    metadata.insert("original_path".to_string(), serde_json::Value::String(path));
-    for key in [
-        "source_url",
-        "source_fingerprint",
-        "artifact_identity",
-        "title",
-        "description",
-        "tags",
-        "category",
-        "stale_at",
-    ] {
-        if let Some(value) = payload.get(key).cloned() {
-            metadata.insert(key.to_string(), value);
+fn extension_pack_payload_from_resource(arguments: &serde_json::Value) -> serde_json::Value {
+    let mut payload = merge_content_metadata(arguments);
+    if let Some(object) = payload.as_object_mut() {
+        if !object.contains_key("pack_id") {
+            if let Some(id) = object
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            {
+                object.insert("pack_id".to_string(), serde_json::Value::String(id));
+            }
         }
+        object.remove("op");
+        object.remove("kind");
     }
-    out.insert("metadata".to_string(), serde_json::Value::Object(metadata));
-    serde_json::Value::Object(out)
+    payload
+}
+
+fn extension_pack_payload_has_pack_id(payload: &serde_json::Value) -> bool {
+    json_text(payload, "pack_id").is_some()
+}
+
+fn extension_pack_payload_has_install_target(payload: &serde_json::Value) -> bool {
+    extension_pack_payload_has_pack_id(payload)
+        || ["source_url", "source_path", "manifest_text"]
+            .iter()
+            .any(|key| json_text(payload, key).is_some())
+        || payload
+            .get("manifest")
+            .is_some_and(|value| value.is_object())
+}
+
+fn is_absolute_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 fn plan_memory_rw(arguments: &serde_json::Value) -> PrimitivePlan {
@@ -5089,11 +6765,18 @@ fn merge_content_metadata(arguments: &serde_json::Value) -> serde_json::Value {
         "query",
         "url",
         "method",
+        "headers",
         "operation",
         "operation_id",
         "action_name",
         "body",
+        "arguments",
         "integration",
+        "timeout_secs",
+        "save_to",
+        "as_resource",
+        "suggested_name",
+        "persist_response",
         "duplicate_policy",
         "allow_duplicate",
     ] {
@@ -5102,6 +6785,45 @@ fn merge_content_metadata(arguments: &serde_json::Value) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(out)
+}
+
+fn browser_profile_payload_from_resource(
+    arguments: &serde_json::Value,
+    op: &str,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+
+    if let Some(object) = arguments.get("content").and_then(|value| value.as_object()) {
+        for (key, value) in object {
+            if skip_browser_profile_resource_wrapper_key(key) {
+                continue;
+            }
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(metadata) = arguments.get("metadata").cloned() {
+        out.entry("metadata".to_string()).or_insert(metadata);
+    }
+    if let Some(object) = arguments.as_object() {
+        for (key, value) in object {
+            if skip_browser_profile_resource_wrapper_key(key) {
+                continue;
+            }
+            out.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    out.insert(
+        "operation".to_string(),
+        serde_json::Value::String(op.to_string()),
+    );
+    serde_json::Value::Object(out)
+}
+
+fn skip_browser_profile_resource_wrapper_key(key: &str) -> bool {
+    matches!(key, "kind" | "op" | "content" | "metadata")
+        || key.starts_with('_')
+        || is_sensitive_tool_call_argument_key(key)
 }
 
 fn service_manage_payload_from_resource(arguments: &serde_json::Value) -> serde_json::Value {
@@ -5220,41 +6942,6 @@ fn file_body_text_from_value(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn service_manage_payload_has_deploy_material(payload: &serde_json::Value) -> bool {
-    let Some(object) = payload.as_object() else {
-        return false;
-    };
-    object
-        .get("files")
-        .and_then(|value| value.as_object())
-        .is_some_and(|files| {
-            service_files_have_browser_entry(files)
-                || service_payload_has_runtime_entrypoint(object)
-        })
-        || (object
-            .get("source_dir")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-            && object
-                .get("source_paths")
-                .and_then(|value| value.as_array())
-                .is_some_and(|paths| !paths.is_empty()))
-        || object
-            .get("repo_url")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        || object
-            .get("file_patches")
-            .and_then(|value| value.as_array())
-            .is_some_and(|patches| !patches.is_empty())
-        || object
-            .get("delete_paths")
-            .and_then(|value| value.as_array())
-            .is_some_and(|paths| !paths.is_empty())
-}
-
 fn text_looks_like_html_document(body: &str) -> bool {
     let trimmed = body.trim_start();
     if trimmed.is_empty() {
@@ -5292,18 +6979,6 @@ fn single_html_document_body(
     } else {
         None
     }
-}
-
-fn service_payload_has_runtime_entrypoint(
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    ["entry_command", "start_command"].iter().any(|key| {
-        object
-            .get(*key)
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-    })
 }
 
 fn merge_objects(left: serde_json::Value, right: serde_json::Value) -> serde_json::Value {
@@ -5358,7 +7033,41 @@ fn tool_result_error_with_extra(
     serde_json::Value::Object(object)
 }
 
+#[cfg(test)]
 fn spine_tool_result_value_for_model(
+    primitive: &str,
+    action_name: &str,
+    content: String,
+) -> serde_json::Value {
+    spine_tool_result_output_for_model(primitive, action_name, content).value
+}
+
+#[cfg(test)]
+fn spine_tool_result_output_for_model(
+    primitive: &str,
+    action_name: &str,
+    content: String,
+) -> crate::core::agent::ark_distill::ArkDistillOutput {
+    let profile = crate::core::agent::ark_distill::ArkDistillProfile::default();
+    spine_tool_result_output_for_model_with_profile(primitive, action_name, content, &profile)
+}
+
+fn spine_tool_result_output_for_model_with_profile(
+    primitive: &str,
+    action_name: &str,
+    content: String,
+    arkdistill_profile: &crate::core::agent::ark_distill::ArkDistillProfile,
+) -> crate::core::agent::ark_distill::ArkDistillOutput {
+    let value = spine_raw_tool_result_value_for_model(primitive, action_name, content);
+    crate::core::agent::ark_distill::distill_tool_output_for_model(
+        primitive,
+        action_name,
+        value,
+        arkdistill_profile,
+    )
+}
+
+fn spine_raw_tool_result_value_for_model(
     primitive: &str,
     action_name: &str,
     content: String,
@@ -5368,11 +7077,20 @@ fn spine_tool_result_value_for_model(
             return sanitize_service_manage_result_for_model(primitive, &value);
         }
     }
+    if action_name == "app_deploy" {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content.trim()) {
+            return sanitize_app_deploy_result_for_model(primitive, &value);
+        }
+    }
 
     if let Some(value) = parse_structured_tool_completion_for_model(&content) {
         if action_name == "service_manage" {
             let data = value.get("data").unwrap_or(&value);
             return sanitize_service_manage_result_for_model(primitive, data);
+        }
+        if action_name == "app_deploy" {
+            let data = value.get("data").unwrap_or(&value);
+            return sanitize_app_deploy_result_for_model(primitive, data);
         }
         if matches!(action_name, "file_write" | "pdf_generate") {
             return sanitize_managed_file_result_for_model(primitive, action_name, &value);
@@ -5387,17 +7105,124 @@ fn spine_tool_result_value_for_model(
     })
 }
 
+async fn log_arkdistill_tool_output(
+    cx: &SpineContext,
+    primitive: &str,
+    action_name: &str,
+    stats: &crate::core::agent::ark_distill::ArkDistillStats,
+) {
+    if stats.saved_chars == 0 && stats.transformed_fields.is_empty() {
+        return;
+    }
+    let cost_saved =
+        estimate_arkdistill_prompt_cost_saved_usd(&cx.agent, stats.estimated_saved_tokens);
+    let model_context = arkdistill_model_pricing_context(&cx.agent);
+    let mut payload = serde_json::to_value(stats).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(object) = &mut payload {
+        object.insert(
+            "trace_kind".to_string(),
+            serde_json::Value::String("arkdistill_telemetry".to_string()),
+        );
+        object.insert(
+            "primitive".to_string(),
+            serde_json::Value::String(primitive.to_string()),
+        );
+        object.insert(
+            "action".to_string(),
+            serde_json::Value::String(action_name.to_string()),
+        );
+        if let Some(cost_saved) = cost_saved {
+            object.insert(
+                "estimated_prompt_cost_saved_usd".to_string(),
+                serde_json::json!(cost_saved),
+            );
+        }
+        if let Some((provider, model)) = model_context {
+            object.insert(
+                "model_provider".to_string(),
+                serde_json::Value::String(provider),
+            );
+            object.insert("model".to_string(), serde_json::Value::String(model));
+        }
+    }
+    cx.emit(SpineTraceEvent::ArkDistillTelemetry {
+        data: payload.clone(),
+    })
+    .await;
+    cx.agent
+        .log_operational_event(OperationalEvent {
+            event_type: crate::core::agent::ark_distill::ARKDISTILL_EVENT_TYPE,
+            channel: &cx.request.channel,
+            success: true,
+            outcome: "distilled",
+            trace_id: None,
+            conversation_id: cx.request.conversation_id.as_deref(),
+            tool_name: Some(primitive),
+            latency_ms: None,
+            arguments: None,
+            payload: Some(&payload),
+            strategy_version: None,
+            policy_version: None,
+            prompt_version: None,
+            specialist_prompt_version: None,
+            model_slot: Some(&cx.agent.primary_model_id),
+        })
+        .await;
+}
+
+fn arkdistill_model_pricing_context(agent: &Agent) -> Option<(String, String)> {
+    let (slot, _) = agent.model_pool.get(&agent.primary_model_id)?;
+    match &slot.provider {
+        LlmProvider::OpenAI {
+            model, base_url, ..
+        } => Some((
+            crate::core::llm_provider::openai_provider_label(base_url.as_deref()).to_string(),
+            model.trim().to_string(),
+        )),
+        LlmProvider::Ollama { model, .. } => Some(("ollama".to_string(), model.trim().to_string())),
+        LlmProvider::Anthropic { model, .. } => {
+            Some(("anthropic".to_string(), model.trim().to_string()))
+        }
+    }
+    .filter(|(_, model)| !model.trim().is_empty())
+}
+
+fn estimate_arkdistill_prompt_cost_saved_usd(agent: &Agent, saved_tokens: usize) -> Option<f64> {
+    if saved_tokens == 0 {
+        return None;
+    }
+    let (slot, _) = agent.model_pool.get(&agent.primary_model_id)?;
+    match &slot.provider {
+        LlmProvider::OpenAI {
+            model, base_url, ..
+        } => {
+            let provider = crate::core::llm_provider::openai_provider_label(base_url.as_deref());
+            let cost = estimate_cost_usd(provider, model, saved_tokens as u64, 0);
+            (cost > 0.0).then_some(cost)
+        }
+        LlmProvider::Ollama { .. } => Some(0.0),
+        LlmProvider::Anthropic { .. } => None,
+    }
+}
+
 fn sanitize_structured_tool_result_for_model(
     primitive: &str,
     action_name: &str,
     value: &serde_json::Value,
 ) -> serde_json::Value {
     let mut out = value.clone();
-    compact_model_visible_tool_value(&mut out);
     if let Some(object) = out.as_object_mut() {
-        object
-            .entry("ok".to_string())
-            .or_insert_with(|| serde_json::Value::Bool(true));
+        object.entry("ok".to_string()).or_insert_with(|| {
+            let ok = super::tool_responses::structured_tool_value_outcome(value)
+                .map(|outcome| {
+                    matches!(
+                        outcome.state,
+                        super::tool_responses::StructuredToolOutcomeState::Success
+                    )
+                })
+                .unwrap_or(true);
+            serde_json::Value::Bool(ok)
+        });
         object
             .entry("primitive".to_string())
             .or_insert_with(|| serde_json::Value::String(primitive.to_string()));
@@ -5406,85 +7231,6 @@ fn sanitize_structured_tool_result_for_model(
             .or_insert_with(|| serde_json::Value::String(action_name.to_string()));
     }
     out
-}
-
-fn compact_model_visible_tool_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object.iter_mut() {
-                if matches!(
-                    key.as_str(),
-                    "content" | "body_text" | "text" | "markdown" | "html"
-                ) {
-                    if let Some(text) = value.as_str() {
-                        if text.chars().count() > 8_000 {
-                            *value =
-                                serde_json::Value::String(head_tail_excerpt(text, 6_500, 1_500));
-                        }
-                    }
-                } else if key == "image_base64" {
-                    if let Some(text) = value.as_str() {
-                        *value = serde_json::Value::String(format!(
-                            "[base64 omitted: {} chars]",
-                            text.chars().count()
-                        ));
-                    }
-                } else {
-                    compact_model_visible_tool_value(value);
-                }
-            }
-            if let Some(results) = object
-                .get_mut("results")
-                .and_then(|value| value.as_array_mut())
-            {
-                if results.len() > 5 {
-                    results.truncate(5);
-                }
-                for result in results {
-                    compact_model_visible_tool_value(result);
-                }
-            }
-            if let Some(attempts) = object
-                .get_mut("attempts")
-                .and_then(|value| value.as_array_mut())
-            {
-                if attempts.len() > 3 {
-                    attempts.truncate(3);
-                }
-                for attempt in attempts {
-                    compact_model_visible_tool_value(attempt);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                compact_model_visible_tool_value(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn head_tail_excerpt(text: &str, head_chars: usize, tail_chars: usize) -> String {
-    let total = text.chars().count();
-    if total <= head_chars + tail_chars {
-        return text.to_string();
-    }
-    let head = text.chars().take(head_chars).collect::<String>();
-    let tail = text
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!(
-        "{}\n...[omitted {} chars]...\n{}",
-        head,
-        total.saturating_sub(head_chars + tail_chars),
-        tail
-    )
 }
 
 fn parse_structured_tool_completion_for_model(content: &str) -> Option<serde_json::Value> {
@@ -5497,6 +7243,20 @@ fn parse_structured_tool_completion_for_model(content: &str) -> Option<serde_jso
             )
             .ok()
         })
+}
+
+fn sanitize_app_deploy_result_for_model(
+    primitive: &str,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    let mut out = sanitize_service_manage_result_for_model(primitive, value);
+    if let Some(object) = out.as_object_mut() {
+        object.insert(
+            "tool".to_string(),
+            serde_json::Value::String("app_deploy".to_string()),
+        );
+    }
+    out
 }
 
 fn sanitize_service_manage_result_for_model(
@@ -5515,6 +7275,10 @@ fn sanitize_service_manage_result_for_model(
     let url = json_value_text(value, "access_url").or_else(|| json_value_text(value, "url"));
     let status = json_value_text(value, "status").unwrap_or_else(|| "completed".to_string());
     let app_type = json_value_text(value, "type");
+    let quality_check = value
+        .get("quality_check")
+        .map(sanitize_app_quality_check_for_model)
+        .unwrap_or(serde_json::Value::Null);
     let duplicate_skipped = value
         .get("duplicate_skipped")
         .and_then(|value| value.as_bool())
@@ -5570,7 +7334,36 @@ fn sanitize_service_manage_result_for_model(
         "tool": "service_manage",
         "status": status,
         "app": app,
+        "quality_check": quality_check,
         "message": message,
+    })
+}
+
+fn sanitize_app_quality_check_for_model(value: &serde_json::Value) -> serde_json::Value {
+    let concerns = value
+        .get("concerns")
+        .and_then(|items| items.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .take(5)
+                .map(|item| safe_truncate(item, 500))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "status": json_value_text(value, "status"),
+        "needs_repair": value.get("needs_repair").and_then(|value| value.as_bool()).unwrap_or(false),
+        "request_context_attached": value.get("request_context_attached").and_then(|value| value.as_bool()),
+        "acceptance_criteria_count": value.get("acceptance_criteria_count").and_then(|value| value.as_u64()),
+        "browser_ok": value.get("browser_ok").and_then(|value| value.as_bool()),
+        "judge_available": value.get("judge_available").and_then(|value| value.as_bool()),
+        "judge_passed": value.get("judge_passed").and_then(|value| value.as_bool()),
+        "judge_summary": json_value_text(value, "judge_summary").map(|summary| safe_truncate(&summary, 900)),
+        "concerns": concerns,
     })
 }
 
@@ -5842,41 +7635,6 @@ fn estimate_prompt_tokens(messages: &[SpineMessage]) -> usize {
     chars.div_ceil(4)
 }
 
-fn stale_final_response_repair_prompt() -> String {
-    "The previous assistant message repeated content that was attached to an earlier tool-call turn instead of answering from the latest tool results. Provide the final answer now, grounded in the latest tool results. If the result is inconclusive or failed, state that clearly and include the blocker."
-        .to_string()
-}
-
-fn no_progress_final_response(messages: &[SpineMessage], final_text: &str) -> Option<String> {
-    if final_text.trim().is_empty() {
-        return None;
-    }
-    let last_tool_content = messages.iter().rev().find_map(|message| {
-        if let SpineMessage::Tool { content, .. } = message {
-            Some(content)
-        } else {
-            None
-        }
-    })?;
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(last_tool_content) else {
-        return None;
-    };
-    let error = value.get("error").and_then(|item| item.as_str());
-    if error != Some("repeated_no_progress_tool_call") {
-        return None;
-    }
-    let message = value
-        .get("message")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .unwrap_or("The last tool call repeated work that already produced no new progress.");
-    Some(format!(
-        "I could not complete this because the latest tool step made no new progress. {} Use the previous tool result, inspect the saved state, or call a different operation with different arguments before retrying.",
-        message
-    ))
-}
-
 fn needs_input_message_from_tool_results(results: &[ToolResult]) -> Option<String> {
     results.iter().find_map(|result| {
         let outcome = super::tool_responses::structured_tool_value_outcome(&result.value)?;
@@ -5885,6 +7643,40 @@ fn needs_input_message_from_tool_results(results: &[ToolResult]) -> Option<Strin
         }
         needs_input_message_from_tool_value(&result.value).or(outcome.message)
     })
+}
+
+fn failed_search_message_from_tool_results(results: &[ToolResult]) -> Option<String> {
+    results
+        .iter()
+        .find_map(failed_search_message_from_tool_result)
+}
+
+fn failed_search_message_from_tool_result(result: &ToolResult) -> Option<String> {
+    if result.ok {
+        return None;
+    }
+
+    let value = &result.value;
+    let domain = first_structured_string(value, &["domain"])
+        .and_then(|item| item.parse::<crate::actions::ActionErrorDomain>().ok());
+    let message = first_structured_string(value, &["message", "detail"])
+        .or_else(|| json_text_path(value, &["diagnostics", "message"]))
+        .unwrap_or_default();
+    if domain != Some(crate::actions::ActionErrorDomain::Search) {
+        return None;
+    }
+
+    Some(search_backend_unavailable_user_message(&message))
+}
+
+fn search_backend_unavailable_user_message(detail: &str) -> String {
+    let mut message = crate::actions::search::SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE.to_string();
+    let detail = detail.trim();
+    if !detail.is_empty() {
+        message.push_str("\n\nSearch failure detail: ");
+        message.push_str(&safe_truncate(detail, 700));
+    }
+    message
 }
 
 fn needs_input_message_from_tool_value(value: &serde_json::Value) -> Option<String> {
@@ -5896,145 +7688,282 @@ fn needs_input_message_from_tool_value(value: &serde_json::Value) -> Option<Stri
         .or_else(|| Some("I need your input before I can continue this browser task.".to_string()))
 }
 
-fn incomplete_no_tool_final_response_repair_prompt() -> String {
-    "The previous assistant message was an unfinished lead-in and did not call a tool or provide a final answer. Continue from the current state: call the required tool now, or give a concrete blocker grounded in the available evidence."
-        .to_string()
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionVerdict {
+    Complete,
+    Incomplete { evidence_gap: String },
 }
 
-fn incomplete_no_tool_final_response_blocker(final_text: &str) -> String {
-    let lead_in = final_text.trim();
-    if lead_in.is_empty() {
-        return "I could not complete this because the model stopped without calling a tool or giving a final answer."
-            .to_string();
-    }
-    format!(
-        "I could not complete this because the model stopped after an unfinished lead-in without calling a tool or giving a final answer: {}",
-        lead_in
-    )
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionStep {
+    Accept,
+    Reprompt { prompt: String },
+    AcceptWithCaveat { message: String },
 }
 
-fn incomplete_no_tool_final_response(messages: &[SpineMessage], final_text: &str) -> bool {
-    let trimmed = final_text.trim();
-    if trimmed.is_empty() || trimmed.lines().count() != 1 {
-        return false;
-    }
-    if trimmed.chars().count() > 240 {
-        return false;
-    }
-    let follows_live_context = messages.iter().rev().any(|message| {
-        matches!(
-            message,
-            SpineMessage::User { .. } | SpineMessage::Tool { .. }
-        )
-    });
-    if !follows_live_context {
-        return false;
-    }
-    if trimmed.ends_with(':') {
-        return true;
-    }
-    substantial_tool_run_before_final(messages) && !final_text_has_delivery_reference(trimmed)
+const MAX_COMPLETION_REPROMPTS: usize = 1;
+const COMPLETION_REPROMPT_CONTINUATION_TURNS: usize = 2;
+
+fn completion_guarded_max_turns(request_max_turns: usize) -> usize {
+    request_max_turns
+        .max(1)
+        .saturating_add(COMPLETION_REPROMPT_CONTINUATION_TURNS)
 }
 
-fn substantial_tool_run_before_final(messages: &[SpineMessage]) -> bool {
-    let mut assistant_tool_turns = 0usize;
-    let mut requested_tool_calls = 0usize;
-    let mut completed_tool_results = 0usize;
+fn completion_reprompts_after_tool_evidence(_completion_reprompts: usize) -> usize {
+    0
+}
 
-    for message in messages {
-        match message {
-            SpineMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
-                assistant_tool_turns += 1;
-                requested_tool_calls += tool_calls.len();
+fn next_completion_step(
+    verdict: CompletionVerdict,
+    completion_reprompts: usize,
+    turn: usize,
+    max_turns: usize,
+) -> CompletionStep {
+    match verdict {
+        CompletionVerdict::Complete => CompletionStep::Accept,
+        CompletionVerdict::Incomplete { evidence_gap }
+            if completion_reprompts < MAX_COMPLETION_REPROMPTS && turn + 1 < max_turns =>
+        {
+            CompletionStep::Reprompt {
+                prompt: completion_continue_prompt(&public_completion_gap(&evidence_gap)),
             }
-            SpineMessage::Tool { .. } => {
-                completed_tool_results += 1;
+        }
+        CompletionVerdict::Incomplete { evidence_gap } => CompletionStep::AcceptWithCaveat {
+            message: completion_incomplete_message(&public_completion_gap(&evidence_gap)),
+        },
+    }
+}
+
+fn extract_first_json_object(text: &str) -> Option<&str> {
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if start.is_none() {
+            if ch == '{' {
+                start = Some(idx);
+                depth = 1;
+            }
+            continue;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let start = start?;
+                    return Some(&text[start..=idx]);
+                }
             }
             _ => {}
         }
     }
 
-    assistant_tool_turns >= 2 || requested_tool_calls >= 4 || completed_tool_results >= 4
+    None
 }
 
-fn final_text_has_delivery_reference(text: &str) -> bool {
-    text.contains("](")
-        || text.contains("://")
-        || text.contains("/apps/")
-        || text.contains("/api/outputs/")
-        || text.contains("/ui/")
+fn parse_verification_verdict(text: &str) -> CompletionVerdict {
+    let Some(object_text) = extract_first_json_object(text) else {
+        return CompletionVerdict::Complete;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(object_text) else {
+        return CompletionVerdict::Complete;
+    };
+    if value
+        .get("complete")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+    {
+        return CompletionVerdict::Complete;
+    }
+    let Some(evidence_gap) = value
+        .get("evidence_gap")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return CompletionVerdict::Complete;
+    };
+    CompletionVerdict::Incomplete {
+        evidence_gap: evidence_gap.to_string(),
+    }
 }
 
-fn final_response_repeats_tool_call_content(messages: &[SpineMessage], final_text: &str) -> bool {
-    let final_normalized = normalize_text_for_repetition_check(final_text);
-    if final_normalized.len() < 12 {
+fn build_verification_prompt(
+    user_goal: &str,
+    proposed_answer: &str,
+    tool_evidence: &str,
+) -> String {
+    format!(
+        "You are a completion verifier. Decide whether the user's request has actually been fulfilled using the produced evidence, not merely announced or intended.\n\n\
+         USER REQUEST:\n{user_goal}\n\n\
+         PROPOSED FINAL ANSWER:\n{proposed_answer}\n\n\
+         EVIDENCE PRODUCED SO FAR:\n{tool_evidence}\n\n\
+         Reply with only a JSON object. Use {{\"complete\": true}} when every meaningful part of the request is genuinely done. Use {{\"complete\": false, \"evidence_gap\": \"<concrete missing user-visible outcome and how to tell>\"}} when the outcome is not yet evidenced. The evidence may contain internal traces, but evidence_gap must describe the missing user-visible outcome and visible proof, not internal procedure, tool names, function names, JSON keys, exact route names, or a prescribed implementation mechanism. Judge the outcome by the user's intent and the evidence, without assuming any particular task category, tool, wording, or response shape."
+    )
+}
+
+fn token_looks_like_internal_identifier(raw: &str) -> bool {
+    let token = raw
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() && !matches!(ch, '_' | ':' | '.' | '/'));
+    if token.len() < 3 || !token.chars().any(|ch| ch.is_ascii_alphabetic()) {
         return false;
     }
+    token.contains('_') || token.contains("::") || token.ends_with("()")
+}
 
-    messages.iter().any(|message| {
-        let SpineMessage::Assistant {
-            content,
-            tool_calls,
-        } = message
-        else {
-            return false;
-        };
-        if tool_calls.is_empty() {
-            return false;
+fn redact_internal_identifier_shapes(text: &str) -> String {
+    let mut out = String::new();
+    let mut token = String::new();
+
+    let flush = |token: &mut String, out: &mut String| {
+        if token.is_empty() {
+            return;
         }
-        let Some(content) = content.as_deref() else {
-            return false;
-        };
-        let prior_normalized = normalize_text_for_repetition_check(content);
-        texts_are_near_duplicates(&final_normalized, &prior_normalized)
-    })
-}
+        if token_looks_like_internal_identifier(token) {
+            out.push_str("internal operation");
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
 
-fn normalize_text_for_repetition_check(text: &str) -> String {
-    let mut normalized = String::new();
-    let mut last_was_space = true;
-    for ch in text.chars().flat_map(char::to_lowercase) {
-        if ch.is_alphanumeric() {
-            normalized.push(ch);
-            last_was_space = false;
-        } else if !last_was_space {
-            normalized.push(' ');
-            last_was_space = true;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '/' | '(' | ')') {
+            token.push(ch);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(ch);
         }
     }
-    normalized.trim().to_string()
+    flush(&mut token, &mut out);
+    out
 }
 
-fn texts_are_near_duplicates(left: &str, right: &str) -> bool {
-    if left.is_empty() || right.is_empty() {
-        return false;
+fn compact_public_gap_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut previous_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !previous_space && !out.is_empty() {
+                out.push(' ');
+            }
+            previous_space = true;
+        } else {
+            out.push(ch);
+            previous_space = false;
+        }
     }
+    out.trim().to_string()
+}
 
-    let left_len = left.chars().count();
-    let right_len = right.chars().count();
-    let shorter = left_len.min(right_len) as f64;
-    let longer = left_len.max(right_len) as f64;
-    if shorter / longer < 0.8 {
-        return false;
+fn public_completion_gap(evidence_gap: &str) -> String {
+    let gap = compact_public_gap_text(&redact_internal_identifier_shapes(evidence_gap));
+    if gap.is_empty() {
+        "the requested outcome is not yet evidenced".to_string()
+    } else {
+        gap
     }
+}
 
-    let left_tokens = left.split_whitespace().collect::<Vec<_>>();
-    let right_tokens = right.split_whitespace().collect::<Vec<_>>();
-    if left_tokens.len().min(right_tokens.len()) < 4 {
-        return false;
-    }
+fn completion_continue_prompt(evidence_gap: &str) -> String {
+    format!(
+        "The requested outcome is not yet fully done. Gap: {}. Continue by taking the next necessary action; do not summarize instead of finishing.",
+        evidence_gap.trim()
+    )
+}
 
-    let left_set = left_tokens
+fn completion_incomplete_message(evidence_gap: &str) -> String {
+    format!(
+        "I could not verify that the requested outcome is complete: {}",
+        evidence_gap.trim()
+    )
+}
+
+fn first_user_request_text(messages: &[SpineMessage]) -> String {
+    messages
         .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let right_set = right_tokens
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let intersection = left_set.intersection(&right_set).count() as f64;
-    let union = left_set.union(&right_set).count() as f64;
-    union > 0.0 && intersection / union >= 0.9
+        .find_map(|message| match message {
+            SpineMessage::User { content } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+const COMPLETION_VERIFIER_EVIDENCE_CHAR_BUDGET: usize = 12_000;
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let start = text
+        .char_indices()
+        .nth(char_count - max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    format!("[truncated]\n{}", &text[start..])
+}
+
+fn recent_tool_evidence_text(messages: &[SpineMessage]) -> String {
+    let mut remaining = COMPLETION_VERIFIER_EVIDENCE_CHAR_BUDGET;
+    let mut selected = Vec::new();
+
+    for content in messages.iter().rev().filter_map(|message| match message {
+        SpineMessage::Tool { content, .. } => Some(content.as_str()),
+        _ => None,
+    }) {
+        if remaining == 0 {
+            break;
+        }
+        let content_chars = content.chars().count();
+        if content_chars <= remaining {
+            selected.push(content.to_string());
+            remaining -= content_chars;
+        } else {
+            selected.push(tail_chars(content, remaining));
+            break;
+        }
+    }
+
+    selected.reverse();
+    selected.join("\n---\n")
+}
+
+async fn verify_completion(
+    server: &dyn SpineLlmServer,
+    messages: &[SpineMessage],
+    proposed_answer: &str,
+) -> CompletionVerdict {
+    let prompt = build_verification_prompt(
+        &first_user_request_text(messages),
+        proposed_answer,
+        &recent_tool_evidence_text(messages),
+    );
+    let verify_messages = vec![SpineMessage::User { content: prompt }];
+    match server
+        .chat_completion(verify_messages, Vec::new(), false, Vec::new())
+        .await
+    {
+        Ok(response) => parse_verification_verdict(&response.text),
+        Err(_) => CompletionVerdict::Complete,
+    }
 }
 
 #[cfg(test)]
@@ -6042,7 +7971,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn primitive_registry_has_exactly_seven_tools() {
+    fn primitive_registry_matches_declared_spine_primitives() {
         let registry = ToolRegistry::new();
         let names = registry
             .schemas()
@@ -6061,7 +7990,7 @@ mod tests {
             prompt
                 .contains("do not let older secondary material override current primary evidence")
         );
-        assert!(prompt.contains("Do not send description-only file creates"));
+        assert!(prompt.contains("Do not send description-only file writes"));
         assert!(prompt.contains("Finish every requested deliverable before the final answer"));
         assert!(prompt.contains("lead with one natural confirmation sentence"));
         assert!(prompt.contains("follow with compact details"));
@@ -6071,10 +8000,23 @@ mod tests {
                 .contains("do not introduce a formal summary block")
         );
         assert!(prompt.contains("do not add generic filler follow-up questions"));
+        assert!(prompt.contains("deliver it through app_deploy"));
+        assert!(prompt.contains("call app_deploy with source_dir"));
         assert!(prompt.contains("accessible /apps/ URL"));
         assert!(prompt.contains("Do not return container paths"));
         assert!(prompt.contains("do not expose internal container filesystem paths"));
         assert!(prompt.contains("Documents surface"));
+    }
+
+    #[test]
+    fn spine_prompt_prefers_agentark_native_integrations_before_mcp() {
+        let prompt = build_spine_system_prompt("", None, None);
+
+        assert!(prompt.contains("Prefer AgentArk-native integration substrates"));
+        assert!(
+            prompt.contains("MCP server only when the user or provider source explicitly asks")
+        );
+        assert!(prompt.contains("Do not choose MCP merely because a community MCP package"));
     }
 
     #[test]
@@ -6135,6 +8077,17 @@ mod tests {
         );
         assert!(ids.contains(&"spine.non_evolvable_safety"));
         assert!(ids.contains(&"spine.primitive_schema_summary"));
+        assert!(ids.contains(&"spine.tool_call_description_contract"));
+    }
+
+    #[test]
+    fn spine_prompt_requires_visible_model_progress_separate_from_tool_metadata() {
+        let prompt = build_spine_system_prompt("", None, None);
+
+        assert!(prompt.contains("short normal assistant sentence"));
+        assert!(prompt.contains("user-visible progress prose"));
+        assert!(prompt.contains("separate from `_describe`"));
+        assert!(prompt.contains("tool-call metadata only"));
     }
 
     #[test]
@@ -6177,99 +8130,250 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_no_tool_final_response_flags_short_multistep_tool_run() {
-        let messages = vec![
-            SpineMessage::User {
-                content: "Create a researched PDF report comparing agent platforms.".to_string(),
-            },
-            SpineMessage::Assistant {
-                content: Some("Gathering source evidence.".to_string()),
-                tool_calls: vec![
-                    test_tool_call("call-search-1", "search"),
-                    test_tool_call("call-search-2", "search"),
-                    test_tool_call("call-search-3", "search"),
-                ],
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-search-1".to_string(),
-                content: serde_json::json!({"ok": true, "results": ["source-a"]}).to_string(),
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-search-2".to_string(),
-                content: serde_json::json!({"ok": true, "results": ["source-b"]}).to_string(),
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-search-3".to_string(),
-                content: serde_json::json!({"ok": true, "results": ["source-c"]}).to_string(),
-            },
-            SpineMessage::Assistant {
-                content: Some("Checking the strongest sources.".to_string()),
-                tool_calls: vec![
-                    test_tool_call("call-fetch-1", "fetch"),
-                    test_tool_call("call-fetch-2", "fetch"),
-                    test_tool_call("call-fetch-3", "fetch"),
-                ],
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-fetch-1".to_string(),
-                content: serde_json::json!({"ok": true, "text": "evidence one"}).to_string(),
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-fetch-2".to_string(),
-                content: serde_json::json!({"ok": true, "text": "evidence two"}).to_string(),
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-fetch-3".to_string(),
-                content: serde_json::json!({"ok": true, "text": "evidence three"}).to_string(),
-            },
-        ];
-
-        assert!(incomplete_no_tool_final_response(
-            &messages,
-            "I need one more pass before the final synthesis."
-        ));
+    fn parse_verification_verdict_accepts_complete() {
+        assert_eq!(
+            parse_verification_verdict(r#"{"complete": true, "evidence_gap": ""}"#),
+            CompletionVerdict::Complete
+        );
     }
 
     #[test]
-    fn incomplete_no_tool_final_response_allows_short_delivery_reference() {
+    fn parse_verification_verdict_returns_gap_when_incomplete() {
+        let verdict = parse_verification_verdict(
+            r#"{"complete": false, "evidence_gap": "missing durable result"}"#,
+        );
+
+        assert_eq!(
+            verdict,
+            CompletionVerdict::Incomplete {
+                evidence_gap: "missing durable result".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_verification_verdict_fails_open_on_uncertain_output() {
+        assert_eq!(
+            parse_verification_verdict("not json"),
+            CompletionVerdict::Complete
+        );
+        assert_eq!(parse_verification_verdict(""), CompletionVerdict::Complete);
+        assert_eq!(
+            parse_verification_verdict(r#"{"complete": false}"#),
+            CompletionVerdict::Complete
+        );
+    }
+
+    #[test]
+    fn extract_first_json_object_handles_fenced_nested_and_trailing_text() {
+        let text = "```json\n{\"complete\": false, \"meta\": {\"brace\": \"}\"}, \"evidence_gap\": \"missing {value}\"}\n```\nignored";
+
+        assert_eq!(
+            extract_first_json_object(text),
+            Some(
+                "{\"complete\": false, \"meta\": {\"brace\": \"}\"}, \"evidence_gap\": \"missing {value}\"}"
+            )
+        );
+        assert_eq!(
+            parse_verification_verdict(text),
+            CompletionVerdict::Incomplete {
+                evidence_gap: "missing {value}".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn verification_prompt_includes_goal_answer_and_evidence() {
+        let prompt = build_verification_prompt(
+            "USER WANTS A TRACKER",
+            "Here is your result",
+            "operation result: ok",
+        );
+
+        assert!(prompt.contains("USER WANTS A TRACKER"));
+        assert!(prompt.contains("Here is your result"));
+        assert!(prompt.contains("operation result: ok"));
+        assert!(prompt.to_ascii_lowercase().contains("complete"));
+        assert!(prompt.contains("evidence_gap"));
+    }
+
+    #[test]
+    fn verification_prompt_stays_flow_agnostic() {
+        let prompt = build_verification_prompt("goal", "answer", "evidence").to_ascii_lowercase();
+        for banned in [
+            "app_deploy",
+            "app_restart",
+            "app_stop",
+            "app_delete",
+            "watcher",
+            "work_type",
+            "deliverable",
+            "automation",
+            "artifact",
+            "scheduled_task",
+            "terminal_observation",
+            "line",
+            "colon",
+            "240",
+            "char",
+        ] {
+            assert!(
+                !prompt.contains(banned),
+                "verifier prompt leaked flow-specific token: {banned}"
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_prompt_requires_user_visible_gaps_not_internal_procedure() {
+        let prompt = build_verification_prompt("goal", "answer", "evidence").to_ascii_lowercase();
+
+        assert!(prompt.contains("user-visible outcome"));
+        assert!(prompt.contains("visible proof"));
+        assert!(prompt.contains("not internal procedure"));
+    }
+
+    #[test]
+    fn recent_tool_evidence_is_bounded_by_character_budget() {
+        let old = "o".repeat(COMPLETION_VERIFIER_EVIDENCE_CHAR_BUDGET);
+        let new = "new-evidence".to_string();
         let messages = vec![
-            SpineMessage::Assistant {
-                content: Some("Saving the finished document.".to_string()),
-                tool_calls: vec![
-                    test_tool_call("call-search-1", "search"),
-                    test_tool_call("call-fetch-1", "fetch"),
-                    test_tool_call("call-pdf-1", "pdf_generate"),
-                    test_tool_call("call-fetch-2", "fetch"),
-                ],
+            SpineMessage::Tool {
+                tool_call_id: "old".to_string(),
+                content: old,
             },
             SpineMessage::Tool {
-                tool_call_id: "call-search-1".to_string(),
-                content: serde_json::json!({"ok": true}).to_string(),
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-fetch-1".to_string(),
-                content: serde_json::json!({"ok": true}).to_string(),
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-pdf-1".to_string(),
-                content: serde_json::json!({
-                    "ok": true,
-                    "artifact": {
-                        "download_url": "/api/outputs/report.pdf/download"
-                    }
-                })
-                .to_string(),
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call-fetch-2".to_string(),
-                content: serde_json::json!({"ok": true}).to_string(),
+                tool_call_id: "new".to_string(),
+                content: new.clone(),
             },
         ];
 
-        assert!(!incomplete_no_tool_final_response(
-            &messages,
-            "Saved the PDF: /api/outputs/report.pdf/download"
-        ));
+        let evidence = recent_tool_evidence_text(&messages);
+
+        assert!(evidence.chars().count() <= COMPLETION_VERIFIER_EVIDENCE_CHAR_BUDGET + 20);
+        assert!(evidence.contains(&new));
+        assert!(evidence.contains("[truncated]"));
+    }
+
+    #[test]
+    fn completion_continue_and_incomplete_messages_are_generic() {
+        let gap =
+            public_completion_gap("No app_deploy call was executed; file_write only staged files.");
+        let prompt = completion_continue_prompt(&gap);
+        let blocker = completion_incomplete_message(&gap);
+
+        assert!(prompt.contains("staged files"));
+        assert!(blocker.contains("staged files"));
+        for banned in [
+            "work_type",
+            "app_deploy",
+            "file_write",
+            "watcher",
+            "terminal_observation",
+        ] {
+            assert!(!prompt.contains(banned));
+            assert!(!blocker.contains(banned));
+        }
+    }
+
+    #[test]
+    fn public_completion_gap_redacts_internal_identifier_shapes() {
+        let gap = public_completion_gap(
+            "No app_deploy call was executed; tool_call_id abc and file_write staged source_paths only.",
+        );
+
+        assert!(!gap.contains("app_deploy"));
+        assert!(!gap.contains("tool_call_id"));
+        assert!(!gap.contains("file_write"));
+        assert!(!gap.contains("source_paths"));
+        assert!(gap.contains("staged"));
+        assert!(gap.contains("internal operation"));
+    }
+
+    #[test]
+    fn completion_guard_extends_budget_for_verify_nudge_and_finish() {
+        assert_eq!(
+            completion_guarded_max_turns(30),
+            30 + COMPLETION_REPROMPT_CONTINUATION_TURNS
+        );
+        assert_eq!(
+            completion_guarded_max_turns(0),
+            1 + COMPLETION_REPROMPT_CONTINUATION_TURNS
+        );
+    }
+
+    #[test]
+    fn interstitial_stop_gets_nudged_then_later_complete_can_accept() {
+        let first = next_completion_step(
+            CompletionVerdict::Incomplete {
+                evidence_gap: "the requested result is not evidenced yet".to_string(),
+            },
+            0,
+            0,
+            3,
+        );
+        assert!(matches!(first, CompletionStep::Reprompt { .. }));
+
+        let second = next_completion_step(CompletionVerdict::Complete, 1, 1, 3);
+        assert_eq!(second, CompletionStep::Accept);
+    }
+
+    #[test]
+    fn new_tool_evidence_reopens_one_generic_completion_reprompt() {
+        let used_reprompts = completion_reprompts_after_tool_evidence(MAX_COMPLETION_REPROMPTS);
+        let step = next_completion_step(
+            CompletionVerdict::Incomplete {
+                evidence_gap: "the visible result is still missing after the latest attempt"
+                    .to_string(),
+            },
+            used_reprompts,
+            2,
+            5,
+        );
+
+        assert!(
+            matches!(step, CompletionStep::Reprompt { .. }),
+            "fresh tool evidence should allow one more semantic recovery turn"
+        );
+    }
+
+    #[test]
+    fn persistent_gap_accepts_with_generic_incomplete_caveat() {
+        let step = next_completion_step(
+            CompletionVerdict::Incomplete {
+                evidence_gap: "the report was never generated by app_deploy".to_string(),
+            },
+            MAX_COMPLETION_REPROMPTS,
+            1,
+            3,
+        );
+
+        match step {
+            CompletionStep::AcceptWithCaveat { message } => {
+                assert!(message.contains("the report was never generated"));
+                for banned in ["work_type", "app_deploy", "watcher", "terminal_observation"] {
+                    assert!(
+                        !message.contains(banned),
+                        "caveat leaked flow-specific token: {banned}"
+                    );
+                }
+            }
+            other => panic!("expected generic caveat after persistent gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_verdict_accepts_with_caveat_when_no_turn_remains() {
+        let step = next_completion_step(
+            CompletionVerdict::Incomplete {
+                evidence_gap: "the final artifact is missing".to_string(),
+            },
+            0,
+            1,
+            2,
+        );
+
+        assert!(matches!(step, CompletionStep::AcceptWithCaveat { .. }));
     }
 
     fn test_tool_call(id: &str, name: &str) -> SpineToolCall {
@@ -6277,7 +8381,47 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments: serde_json::json!({}),
+            activity_label: None,
         }
+    }
+
+    #[test]
+    fn spine_turn_records_parse_structured_outcomes_without_substring_matching() {
+        let result = SpineResult::Completed {
+            messages: vec![
+                SpineMessage::Assistant {
+                    content: None,
+                    tool_calls: vec![
+                        test_tool_call("call-failed", "resource_rw"),
+                        test_tool_call("call-ok", "resource_rw"),
+                    ],
+                },
+                SpineMessage::Tool {
+                    tool_call_id: "call-failed".to_string(),
+                    content: serde_json::json!({
+                        "ok": false,
+                        "message": "quoted payload: \"ok\":true"
+                    })
+                    .to_string(),
+                },
+                SpineMessage::Tool {
+                    tool_call_id: "call-ok".to_string(),
+                    content: serde_json::json!({
+                        "result": {
+                            "status": "ok"
+                        }
+                    })
+                    .to_string(),
+                },
+            ],
+            final_text: "Done.".to_string(),
+            turns_used: 1,
+        };
+
+        let records = spine_turn_records(&result);
+
+        assert_eq!(records[0].outcome, AgentTurnOutcomeKind::Abandoned);
+        assert_eq!(records[1].outcome, AgentTurnOutcomeKind::Succeeded);
     }
 
     #[test]
@@ -6296,6 +8440,7 @@ mod tests {
                 },
                 "_internal": "hidden"
             }),
+            activity_label: None,
         };
 
         let payload = spine_tool_start_stream_payload(&call);
@@ -6322,11 +8467,33 @@ mod tests {
     }
 
     #[test]
+    fn spine_tool_start_stream_payload_uses_model_activity_label() {
+        let call = SpineToolCall {
+            id: "call-read-1".to_string(),
+            name: "resource_rw".to_string(),
+            arguments: serde_json::json!({
+                "kind": "file",
+                "op": "read",
+                "id": "assets/docs/arkmemory.md"
+            }),
+            activity_label: Some("Read arkmemory docs".to_string()),
+        };
+
+        let payload = spine_tool_start_stream_payload(&call);
+
+        assert_eq!(payload["activity_label"], "Read arkmemory docs");
+        assert_eq!(payload["display_label"], "Read arkmemory docs");
+        assert_eq!(payload["intent_summary"], "Read arkmemory docs");
+        assert!(payload["arguments"].get("activity_label").is_none());
+    }
+
+    #[test]
     fn spine_tool_result_stream_content_exposes_sanitized_result_preview() {
         let call = SpineToolCall {
             id: "call-fetch-1".to_string(),
             name: "fetch".to_string(),
             arguments: serde_json::json!({ "url": "https://example.com" }),
+            activity_label: None,
         };
         let result = ToolResult::from_value(
             true,
@@ -6369,6 +8536,41 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_model_json_adds_generic_evidence_envelope_without_dropping_payload() {
+        let call = SpineToolCall {
+            id: "call-app-1".to_string(),
+            name: "app_deploy".to_string(),
+            arguments: serde_json::json!({}),
+            activity_label: None,
+        };
+        let result = ToolResult::from_value(
+            false,
+            serde_json::json!({
+                "status": "error",
+                "tool": "app_deploy",
+                "domain": "app",
+                "reason": "failed",
+                "message": "{\"phase\":\"build\",\"command\":\"npm run build\",\"exit_code\":1,\"log_tail\":\"vite missing\",\"retryable\":false,\"hint\":\"patch dependencies\"}",
+                "remediation": {"type": "patch"}
+            }),
+        );
+
+        let payload: serde_json::Value = serde_json::from_str(&result.to_json_for_tool(&call))
+            .expect("tool result should serialize as JSON");
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["operation"]["primitive"], "app_deploy");
+        assert_eq!(payload["capability_tags"][0], "app_deploy");
+        assert_eq!(payload["error_class"], "runtime");
+        assert_eq!(payload["retryable"], false);
+        assert_eq!(payload["diagnostics"]["phase"], "build");
+        assert_eq!(payload["diagnostics"]["exit_code"], 1);
+        assert_eq!(payload["logs"]["log_tail"], "vite missing");
+        assert_eq!(payload["remediation"]["type"], "patch");
+    }
+
+    #[test]
     fn structured_chat_request_context_carries_attachments_and_arkorbit() {
         let hints = RequestExecutionHints {
             attachments_present: true,
@@ -6387,6 +8589,10 @@ mod tests {
                 "profile_name": "alex",
                 "browser": "chromium"
             })),
+            execution_profile: Some(serde_json::json!({
+                "capability_tags": ["automation"],
+                "deliverables": ["automation"]
+            })),
             ..Default::default()
         };
 
@@ -6399,6 +8605,8 @@ mod tests {
         assert!(context.contains("browser_profile_context"));
         assert!(context.contains("profile-1"));
         assert!(context.contains("alex"));
+        assert!(context.contains("execution_profile"));
+        assert!(context.contains("automation"));
     }
 
     #[test]
@@ -6420,6 +8628,72 @@ mod tests {
         assert!(context.contains("recent_actionable_artifacts"));
         assert!(context.contains("app-123"));
         assert!(context.contains("service_manage"));
+    }
+
+    #[test]
+    fn browser_profile_context_injects_selected_profile_into_browser_start() {
+        let invocation = PrimitiveActionInvocation {
+            action_name: "browser_auto".to_string(),
+            arguments: serde_json::json!({
+                "action": "start_session",
+                "task": "Open the account page and read the visible state."
+            }),
+        };
+
+        let repaired = browser_auto_invocation_with_request_profile(
+            &invocation,
+            Some(&serde_json::json!({
+                "profile_id": "profile-1",
+                "profile_name": "Primary login"
+            })),
+        );
+
+        assert_eq!(repaired.action_name, "browser_auto");
+        assert_eq!(repaired.arguments["profile_id"], "profile-1");
+    }
+
+    #[test]
+    fn browser_profile_context_does_not_override_explicit_browser_profile() {
+        let invocation = PrimitiveActionInvocation {
+            action_name: "browser_auto".to_string(),
+            arguments: serde_json::json!({
+                "action": "start_session",
+                "task": "Open the account page.",
+                "profile": "client account"
+            }),
+        };
+
+        let repaired = browser_auto_invocation_with_request_profile(
+            &invocation,
+            Some(&serde_json::json!({
+                "profile_id": "profile-1",
+                "profile_name": "Primary login"
+            })),
+        );
+
+        assert_eq!(repaired.arguments["profile"], "client account");
+        assert!(repaired.arguments.get("profile_id").is_none());
+    }
+
+    #[test]
+    fn browser_profile_context_can_inject_profile_name_when_id_is_absent() {
+        let invocation = PrimitiveActionInvocation {
+            action_name: "browser_auto".to_string(),
+            arguments: serde_json::json!({
+                "action": "start_session",
+                "task": "open the signed-in inbox"
+            }),
+        };
+
+        let repaired = browser_auto_invocation_with_request_profile(
+            &invocation,
+            Some(&serde_json::json!({
+                "profile_name": "debanka"
+            })),
+        );
+
+        assert_eq!(repaired.arguments["profile"], "debanka");
+        assert!(repaired.arguments.get("profile_id").is_none());
     }
 
     #[test]
@@ -6453,6 +8727,36 @@ mod tests {
         assert_eq!(data["trace_kind"], "prompt_telemetry");
         assert_eq!(data["final_system_prompt_chars"], 1234);
         assert_eq!(data["sections"]["action_catalog"], 5678);
+    }
+
+    #[test]
+    fn spine_trace_steps_preserve_arkdistill_telemetry_payload() {
+        let steps = spine_trace_steps(&[SpineTraceEvent::ArkDistillTelemetry {
+            data: serde_json::json!({
+                "trace_kind": "arkdistill_telemetry",
+                "primitive": "fetch",
+                "action": "page_fetch",
+                "original_chars": 12000,
+                "distilled_chars": 3400,
+                "saved_chars": 8600,
+                "estimated_saved_tokens": 2150
+            }),
+        }]);
+
+        let telemetry_step = steps
+            .iter()
+            .find(|step| step.title == "ArkDistill Context Savings")
+            .expect("arkdistill telemetry step should be present");
+        let data = telemetry_step
+            .data
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .expect("arkdistill telemetry step data should be JSON");
+
+        assert_eq!(data["trace_kind"], "arkdistill_telemetry");
+        assert_eq!(data["primitive"], "fetch");
+        assert_eq!(data["saved_chars"], 8600);
+        assert_eq!(data["estimated_saved_tokens"], 2150);
     }
 
     #[test]
@@ -6559,7 +8863,7 @@ mod tests {
                 }
             })
         );
-        let sanitized = spine_tool_result_value_for_model("resource_rw", "file_write", raw);
+        let sanitized = spine_tool_result_value_for_model("file_write", "file_write", raw);
         let rendered = sanitized.to_string();
 
         assert_eq!(sanitized["ok"], true);
@@ -6645,6 +8949,31 @@ mod tests {
         assert!(!rendered.contains("top-secret"));
         assert!(!rendered.contains("access_password"));
         assert!(!rendered.contains("access_key"));
+    }
+
+    #[test]
+    fn app_deploy_tool_result_preserves_quality_check_for_model() {
+        let raw = serde_json::json!({
+            "status": "deployed",
+            "type": "static",
+            "app_id": "abc12345",
+            "url": "/apps/abc12345/",
+            "title": "Generated App",
+            "quality_check": {
+                "status": "concerns",
+                "needs_repair": true,
+                "judge_passed": false,
+                "judge_summary": "Requested persistence was not evidenced.",
+                "concerns": ["Requested persistence was not evidenced."]
+            }
+        })
+        .to_string();
+        let sanitized = spine_tool_result_value_for_model("app_deploy", "app_deploy", raw);
+
+        assert_eq!(sanitized["ok"], true);
+        assert_eq!(sanitized["tool"], "app_deploy");
+        assert_eq!(sanitized["quality_check"]["needs_repair"], true);
+        assert_eq!(sanitized["quality_check"]["judge_passed"], false);
     }
 
     #[test]
@@ -6774,17 +9103,77 @@ mod tests {
     }
 
     #[test]
-    fn prepared_messages_do_not_leak_tool_call_json_as_dialogue() {
+    fn arkdistill_compacts_noisy_tool_output_for_model_context() {
+        let noisy = (0..500)
+            .map(|_| "same noisy browser line with repeated navigation chrome")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let raw = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "page_fetch",
+                "status": "completed",
+                "data": {
+                    "url": "https://example.com",
+                    "content": noisy,
+                    "status": "ok"
+                }
+            })
+        );
+
+        let output = spine_tool_result_output_for_model("fetch", "page_fetch", raw);
+        let rendered = output.value.to_string();
+
+        assert!(output.stats.saved_chars > 0);
+        assert!(output.stats.estimated_saved_tokens > 0);
+        assert!(rendered.len() < 7_500);
+        assert_eq!(output.value["data"]["url"], "https://example.com");
+        assert_eq!(output.value["data"]["status"], "ok");
+        assert!(rendered.contains("omitted"));
+    }
+
+    #[test]
+    fn arkdistill_omits_blob_payloads_with_size_metadata() {
+        let raw = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "browser_snapshot",
+                "status": "completed",
+                "data": {
+                    "screenshot_base64": "A".repeat(12_000),
+                    "body_text": "Loaded page"
+                }
+            })
+        );
+
+        let output = spine_tool_result_output_for_model("browse", "browser_snapshot", raw);
+        let rendered = output.value.to_string();
+
+        assert!(output.stats.saved_chars > 5_000);
+        assert!(!rendered.contains(&"A".repeat(256)));
+        assert!(rendered.contains("base64 omitted"));
+    }
+
+    #[test]
+    fn prepared_messages_preserve_redacted_internal_tool_context_without_raw_json() {
+        let large_content = "x".repeat(1200);
         let messages = vec![
             SpineMessage::System {
                 content: "system".to_string(),
             },
             SpineMessage::Assistant {
-                content: Some("Let me fetch that.".to_string()),
+                content: Some("Let me save that.".to_string()),
                 tool_calls: vec![SpineToolCall {
                     id: "call_1".to_string(),
-                    name: "fetch".to_string(),
-                    arguments: serde_json::json!({"url": "https://example.com"}),
+                    name: "file_write".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "reports/gpu-pricing/index.html",
+                        "content": large_content,
+                        "headers": {"authorization": "Bearer secret-token"}
+                    }),
+                    activity_label: None,
                 }],
             },
             SpineMessage::Tool {
@@ -6799,27 +9188,53 @@ mod tests {
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("Let me fetch that."));
-        assert!(prepared.user_message.contains("Tool result for `call_1`"));
-        assert!(!joined.contains("Tool calls requested by the prior model turn"));
-        assert!(
-            !prepared
-                .user_message
-                .contains("Tool calls requested by the prior model turn")
-        );
-        assert!(!joined.contains("\"name\":\"fetch\""));
-        assert!(!prepared.user_message.contains("\"name\":\"fetch\""));
+        let marker_sample =
+            crate::core::llm_context_sanitizer::wrap_internal_tool_context("sample");
+        let marker = marker_sample.lines().next().unwrap_or_default();
+        assert!(joined.contains("Let me save that."));
+        assert!(joined.contains(marker));
+        assert!(joined.contains("file_write"));
+        assert!(joined.contains("reports/gpu-pricing/index.html"));
+        assert!(joined.contains("chars: 1200"));
+        assert!(prepared.user_message.contains(marker));
+        assert!(!joined.contains(&"x".repeat(300)));
+        assert!(!joined.contains("`call_1` called"));
+        assert!(!joined.contains("secret-token"));
+        assert!(!joined.contains("\"name\":\"file_write\""));
+        assert!(!prepared.user_message.contains("\"name\":\"file_write\""));
     }
 
     #[test]
-    fn resource_file_write_plans_from_structured_fields() {
+    fn resource_file_create_with_content_requires_direct_file_write() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "file",
             "content": {"path": "notes.txt", "content": "hello"}
         }));
         match plan {
-            PrimitivePlan::Actions(actions) => assert_eq!(actions[0].action_name, "file_write"),
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("file_write"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "file_write");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_primitive_preserves_deep_research_depth() {
+        let plan = plan_search(&serde_json::json!({
+            "query": "India AI compute policy",
+            "depth": "deep",
+            "limit": 18
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "research");
+                assert_eq!(actions[0].arguments["query"], "India AI compute policy");
+                assert_eq!(actions[0].arguments["depth"], "deep");
+                assert_eq!(actions[0].arguments["max_sources"], 18);
+            }
             other => panic!("unexpected plan: {other:?}"),
         }
     }
@@ -6882,12 +9297,54 @@ mod tests {
         let kind_description = schema.input_schema["properties"]["kind"]["description"]
             .as_str()
             .expect("kind description should be present");
-        assert!(kind_description.contains("notification for user-facing notification delivery"));
-        assert!(kind_description.contains("custom_messaging_channel"));
+        assert!(kind_description.contains("backend resource adapter table"));
+        assert!(kind_description.contains("app_deploy"));
+
+        let ops = schema.input_schema["properties"]["op"]["enum"]
+            .as_array()
+            .expect("op enum should be present");
+        assert!(ops.iter().any(|op| op.as_str() == Some("create")));
+        assert!(ops.iter().any(|op| op.as_str() == Some("delete")));
+        assert!(ops.iter().any(|op| op.as_str() == Some("connect")));
     }
 
     #[test]
-    fn resource_file_write_requires_content_path() {
+    fn primitive_schema_exposes_direct_artifact_tools() {
+        let names = ToolRegistry::new()
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "app_deploy",
+            "file_read",
+            "file_search",
+            "file_write",
+            "file_patch",
+            "file_delete",
+            "skill_manage",
+        ] {
+            assert!(names.contains(expected), "missing primitive {expected}");
+        }
+    }
+
+    #[test]
+    fn primitive_app_deploy_schema_exposes_acceptance_contract() {
+        let schema = ToolRegistry::new()
+            .schemas()
+            .into_iter()
+            .find(|schema| schema.name == "app_deploy")
+            .expect("app_deploy schema should exist");
+        let properties = schema.input_schema["properties"]
+            .as_object()
+            .expect("app_deploy properties should be an object");
+
+        assert!(properties.contains_key("request_context"));
+        assert!(properties.contains_key("acceptance_criteria"));
+    }
+
+    #[test]
+    fn resource_file_create_without_path_still_requires_direct_file_write() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "file",
@@ -6896,15 +9353,15 @@ mod tests {
         }));
         match plan {
             PrimitivePlan::Unsupported { reason, extra } => {
-                assert!(reason.contains("content.path"));
-                assert_eq!(extra.unwrap()["field"], "content.path");
+                assert!(reason.contains("file_write"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "file_write");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
     }
 
     #[test]
-    fn resource_file_write_requires_file_body() {
+    fn resource_file_create_without_body_still_requires_direct_file_write() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "file",
@@ -6915,15 +9372,15 @@ mod tests {
         }));
         match plan {
             PrimitivePlan::Unsupported { reason, extra } => {
-                assert!(reason.contains("file body"));
-                assert_eq!(extra.unwrap()["field"], "content.content");
+                assert!(reason.contains("file_write"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "file_write");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
     }
 
     #[test]
-    fn resource_html_file_create_routes_to_app_service() {
+    fn resource_html_file_create_requires_direct_file_write() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "file",
@@ -6938,26 +9395,16 @@ mod tests {
             }
         }));
         match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].action_name, "service_manage");
-                assert_eq!(actions[0].arguments["operation"], "create");
-                assert_eq!(actions[0].arguments["kind"], "static");
-                assert_eq!(actions[0].arguments["name"], "Comparison Report");
-                assert_eq!(
-                    actions[0].arguments["files"]["index.html"],
-                    "<!doctype html><html><body>Report</body></html>"
-                );
-                assert_eq!(
-                    actions[0].arguments["metadata"]["original_path"],
-                    "reports/comparison.html"
-                );
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("file_write"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "file_write");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
     }
 
     #[test]
-    fn resource_html_path_without_html_document_stays_file_write() {
+    fn resource_html_path_without_html_document_requires_direct_file_write() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "file",
@@ -6968,16 +9415,16 @@ mod tests {
             }
         }));
         match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].action_name, "file_write");
-                assert_eq!(actions[0].arguments["document_visible"], true);
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("file_write"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "file_write");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
     }
 
     #[test]
-    fn resource_markdown_file_create_stays_file_write() {
+    fn resource_markdown_file_create_requires_direct_file_write() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "file",
@@ -6987,116 +9434,12 @@ mod tests {
             }
         }));
         match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].action_name, "file_write");
-                assert_eq!(actions[0].arguments["document_visible"], true);
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("file_write"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "file_write");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
-    }
-
-    #[test]
-    fn final_response_repeats_tool_call_content_detects_stale_intermediate_text() {
-        let messages = vec![
-            SpineMessage::User {
-                content: "Check whether the provider API works.".to_string(),
-            },
-            SpineMessage::Assistant {
-                content: Some("I will check the provider API now.".to_string()),
-                tool_calls: vec![SpineToolCall {
-                    id: "call_1".to_string(),
-                    name: "resource_rw".to_string(),
-                    arguments: serde_json::json!({"kind": "custom_api", "op": "status"}),
-                }],
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call_1".to_string(),
-                content: serde_json::json!({"ok": true, "status": "connected"}).to_string(),
-            },
-        ];
-
-        assert!(final_response_repeats_tool_call_content(
-            &messages,
-            "I will check the provider API now."
-        ));
-        assert!(final_response_repeats_tool_call_content(
-            &messages,
-            "  i will check the provider api now  "
-        ));
-    }
-
-    #[test]
-    fn final_response_repeats_tool_call_content_allows_new_terminal_answer() {
-        let messages = vec![
-            SpineMessage::User {
-                content: "Check whether the provider API works.".to_string(),
-            },
-            SpineMessage::Assistant {
-                content: Some("I will check the provider API now.".to_string()),
-                tool_calls: vec![SpineToolCall {
-                    id: "call_1".to_string(),
-                    name: "resource_rw".to_string(),
-                    arguments: serde_json::json!({"kind": "custom_api", "op": "status"}),
-                }],
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call_1".to_string(),
-                content: serde_json::json!({"ok": true, "status": "connected"}).to_string(),
-            },
-        ];
-
-        assert!(!final_response_repeats_tool_call_content(
-            &messages,
-            "The provider API status check completed. It is connected."
-        ));
-    }
-
-    #[test]
-    fn incomplete_no_tool_final_response_detects_unfinished_lead_in() {
-        let messages = vec![SpineMessage::User {
-            content: "Check whether the saved integration works.".to_string(),
-        }];
-
-        assert!(incomplete_no_tool_final_response(
-            &messages,
-            "Let me run an actual connectivity test:"
-        ));
-        assert!(!incomplete_no_tool_final_response(
-            &messages,
-            "The saved integration test failed with HTTP 400."
-        ));
-    }
-
-    #[test]
-    fn final_response_after_no_progress_tool_result_is_forced_to_blocker() {
-        let messages = vec![
-            SpineMessage::Assistant {
-                content: Some("I will update the saved API operation.".to_string()),
-                tool_calls: vec![SpineToolCall {
-                    id: "call_1".to_string(),
-                    name: "resource_rw".to_string(),
-                    arguments: serde_json::json!({
-                        "kind": "custom_api",
-                        "op": "update",
-                        "id": "provider-api"
-                    }),
-                }],
-            },
-            SpineMessage::Tool {
-                tool_call_id: "call_1".to_string(),
-                content: serde_json::json!({
-                    "ok": false,
-                    "error": "repeated_no_progress_tool_call",
-                    "message": "This exact tool request already completed."
-                })
-                .to_string(),
-            },
-        ];
-
-        let replacement = no_progress_final_response(&messages, "I will try a different approach.");
-
-        assert!(replacement.is_some());
-        assert!(!replacement.unwrap().contains("I will try"));
     }
 
     #[test]
@@ -7125,6 +9468,81 @@ mod tests {
             message,
             "Should I inspect the History section or the Products section?"
         );
+    }
+
+    #[test]
+    fn failed_search_tool_result_surfaces_backend_unavailable_message() {
+        let results = vec![ToolResult::from_value(
+            false,
+            serde_json::json!({
+                "status": "error",
+                "tool": "search",
+                "domain": crate::actions::ActionErrorDomain::Search.as_key(),
+                "reason": "failed",
+                "message": "DuckDuckGo backend failed: challenge page",
+            }),
+        )];
+
+        let message = failed_search_message_from_tool_results(&results)
+            .expect("failed search evidence should stop the turn");
+
+        assert!(message.contains("No search backend is currently available in AgentArk right now"));
+        assert!(message.contains("free anonymous DuckDuckGo/browser search"));
+        assert!(message.contains("best-effort and not always reliable"));
+        assert!(message.contains("SearXNG"));
+        assert!(message.contains("Serper"));
+        assert!(message.contains("DuckDuckGo backend failed: challenge page"));
+    }
+
+    #[test]
+    fn failed_search_tool_result_uses_structured_domain_not_message_text() {
+        let search_result = ToolResult::from_value(
+            false,
+            serde_json::json!({
+                "status": "error",
+                "domain": crate::actions::ActionErrorDomain::Search.as_key(),
+                "reason": "failed",
+                "message": "temporary provider failure",
+            }),
+        );
+        let non_search_result = ToolResult::from_value(
+            false,
+            serde_json::json!({
+                "status": "error",
+                "domain": crate::actions::ActionErrorDomain::Action.as_key(),
+                "reason": "failed",
+                "message": crate::actions::search::SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE,
+            }),
+        );
+
+        assert!(failed_search_message_from_tool_results(&[search_result]).is_some());
+        assert!(failed_search_message_from_tool_results(&[non_search_result]).is_none());
+    }
+
+    #[test]
+    fn structured_failed_browser_tool_result_is_not_marked_ok_for_model() {
+        let raw = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "browser_auto",
+                "status": "failed",
+                "detail": "The browser task failed.",
+                "data": {
+                    "success": false,
+                    "reason": "browser_loading_error",
+                    "session": {
+                        "status": "failed",
+                        "reason": "The page did not load."
+                    }
+                }
+            })
+        );
+
+        let sanitized = spine_tool_result_value_for_model("browse", "browser_auto", raw);
+
+        assert_eq!(sanitized["ok"], false);
+        assert_eq!(sanitized["status"], "failed");
     }
 
     #[test]
@@ -7165,6 +9583,50 @@ mod tests {
     }
 
     #[test]
+    fn resource_browser_profile_list_maps_to_profile_manager() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "kind": "browser_profile",
+            "op": "list"
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "browser_profile_manage");
+                assert_eq!(actions[0].arguments["operation"], "list");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_browser_profile_update_preserves_typed_resource_fields() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "kind": "browser_profile",
+            "op": "update",
+            "profile_id": "profile-1",
+            "name": "Debanka",
+            "enabled": true,
+            "metadata": {
+                "browser": "chrome",
+                "managed": false
+            }
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "browser_profile_manage");
+                assert_eq!(actions[0].arguments["operation"], "update");
+                assert_eq!(actions[0].arguments["profile_id"], "profile-1");
+                assert_eq!(actions[0].arguments["name"], "Debanka");
+                assert_eq!(actions[0].arguments["enabled"], true);
+                assert_eq!(actions[0].arguments["metadata"]["browser"], "chrome");
+                assert_eq!(actions[0].arguments["metadata"]["managed"], false);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn code_exec_requires_language_for_inline_code() {
         let plan = plan_code_exec(&serde_json::json!({
             "code": "print('hello')"
@@ -7199,7 +9661,53 @@ mod tests {
     }
 
     #[test]
-    fn resource_file_batch_patch_accepts_entry_paths() {
+    fn direct_app_deploy_maps_to_app_deploy_action() {
+        let plan = plan_direct_action(
+            "app_deploy",
+            &serde_json::json!({
+                "title": "Demo",
+                "files": {"index.html": "<!doctype html><html><body>Demo</body></html>"}
+            }),
+        );
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "app_deploy");
+                assert_eq!(actions[0].arguments["title"], "Demo");
+                assert_eq!(
+                    actions[0].arguments["files"]["index.html"],
+                    "<!doctype html><html><body>Demo</body></html>"
+                );
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_file_write_preserves_root_path_and_content() {
+        let plan = plan_direct_action(
+            "file_write",
+            &serde_json::json!({
+                "path": "reports/notes.md",
+                "content": "# Notes\n\nCurrent findings.",
+                "document_visible": true
+            }),
+        );
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "file_write");
+                assert_eq!(actions[0].arguments["path"], "reports/notes.md");
+                assert_eq!(
+                    actions[0].arguments["content"],
+                    "# Notes\n\nCurrent findings."
+                );
+                assert_eq!(actions[0].arguments["document_visible"], true);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_file_batch_patch_requires_direct_file_patch() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "update",
             "kind": "file",
@@ -7210,13 +9718,16 @@ mod tests {
             }
         }));
         match plan {
-            PrimitivePlan::Actions(actions) => assert_eq!(actions[0].action_name, "file_patch"),
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("file_patch"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "file_patch");
+            }
             other => panic!("unexpected plan: {other:?}"),
         }
     }
 
     #[test]
-    fn resource_app_service_create_maps_to_deploy_operation() {
+    fn resource_app_service_create_with_source_is_rejected() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "app_service",
@@ -7226,11 +9737,9 @@ mod tests {
             }
         }));
         match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].action_name, "service_manage");
-                assert_eq!(actions[0].arguments["operation"], "create");
-                assert_eq!(actions[0].arguments["kind"], "auto");
-                assert!(actions[0].arguments["files"].is_object());
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("app_deploy"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "app_deploy");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -7287,6 +9796,36 @@ mod tests {
     }
 
     #[test]
+    fn resource_custom_api_install_without_spec_routes_to_capability_resolution() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "install",
+            "kind": "custom_api",
+            "query": "project management provider"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "capability_resolve");
+                assert_eq!(
+                    actions[0].arguments["selected_action"],
+                    "capability_acquire"
+                );
+                assert_eq!(
+                    actions[0].arguments["requested_capability"],
+                    "project management provider"
+                );
+                assert!(
+                    actions[0].arguments["failure_output"]
+                        .as_str()
+                        .unwrap()
+                        .contains("missing structured resource fields")
+                );
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn resource_custom_api_update_preserves_target_id() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "update",
@@ -7324,6 +9863,7 @@ mod tests {
                     "path": "/graphql"
                 }
             }),
+            activity_label: None,
         };
         let post_call = SpineToolCall {
             id: "call_2".to_string(),
@@ -7337,6 +9877,7 @@ mod tests {
                     "path": "/graphql"
                 }
             }),
+            activity_label: None,
         };
 
         assert_ne!(
@@ -7373,6 +9914,64 @@ mod tests {
     }
 
     #[test]
+    fn fetch_post_forwards_body_headers_and_persistence_contract() {
+        let plan = plan_fetch(&serde_json::json!({
+            "url": "https://api.example.com/register",
+            "method": "POST",
+            "headers": { "Content-Type": "application/json" },
+            "body": { "model": "agentark" },
+            "persist_response": [{
+                "response_path": "token",
+                "secret_key": "provider:token",
+                "sensitive": true
+            }],
+            "timeout_secs": 20
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "http_request");
+                assert_eq!(
+                    actions[0].arguments["url"],
+                    "https://api.example.com/register"
+                );
+                assert_eq!(actions[0].arguments["method"], "POST");
+                assert_eq!(
+                    actions[0].arguments["headers"]["Content-Type"],
+                    "application/json"
+                );
+                assert_eq!(actions[0].arguments["body"]["model"], "agentark");
+                assert_eq!(
+                    actions[0].arguments["persist_response"][0]["secret_key"],
+                    "provider:token"
+                );
+                assert_eq!(actions[0].arguments["timeout_secs"], 20);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_resource_request_routes_to_http_request_without_requiring_user_path() {
+        let plan = plan_fetch(&serde_json::json!({
+            "url": "https://example.test/files/guide.md",
+            "as_resource": true,
+            "suggested_name": "guide.md"
+        }));
+
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "http_request");
+                assert_eq!(actions[0].arguments["as_resource"], true);
+                assert_eq!(actions[0].arguments["suggested_name"], "guide.md");
+                assert!(actions[0].arguments.get("save_to").is_none());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn resource_custom_api_test_maps_to_inspect_integration_with_run_check() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "test",
@@ -7403,6 +10002,28 @@ mod tests {
                 assert_eq!(actions[0].arguments["query"], "provider api");
                 assert_eq!(actions[0].arguments["run_check"], true);
                 assert!(actions[0].arguments.get("surface").is_none());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_generic_integration_install_without_structured_spec_routes_to_capability_resolution()
+     {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "install",
+            "kind": "integration",
+            "query": "provider integration"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "capability_resolve");
+                assert!(actions[0].arguments.get("selected_action").is_none());
+                assert_eq!(
+                    actions[0].arguments["requested_capability"],
+                    "provider integration"
+                );
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -7455,7 +10076,31 @@ mod tests {
     }
 
     #[test]
-    fn resource_generic_integration_with_mcp_like_fields_requires_explicit_substrate() {
+    fn resource_extension_pack_connect_without_pack_id_routes_to_capability_resolution() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "connect",
+            "kind": "extension_pack",
+            "query": "project management provider"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "capability_resolve");
+                assert_eq!(
+                    actions[0].arguments["selected_action"],
+                    "extension_pack_connect"
+                );
+                assert_eq!(
+                    actions[0].arguments["requested_capability"],
+                    "project management provider"
+                );
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_generic_integration_with_mcp_like_fields_resolves_before_mutation() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "install",
             "kind": "integration",
@@ -7467,18 +10112,57 @@ mod tests {
             }
         }));
         match plan {
-            PrimitivePlan::Unsupported { reason, extra } => {
-                assert!(reason.contains("structured integration content"));
-                let extra = extra.unwrap();
-                assert_eq!(extra["kind"], "integration");
-                assert_eq!(extra["op"], "install");
-                assert!(extra["hint"].as_str().unwrap().contains("mcp_server"));
-                assert!(extra["hint"].as_str().unwrap().contains("custom_api"));
-            }
             PrimitivePlan::Actions(actions) => {
-                panic!(
-                    "generic integration install inferred {}",
-                    actions[0].action_name
+                assert_eq!(actions[0].action_name, "capability_resolve");
+                assert!(actions[0].arguments.get("selected_action").is_none());
+                let failure_output = actions[0].arguments["failure_output"]
+                    .as_str()
+                    .expect("capability_resolve should include structured fallback output");
+                assert!(failure_output.contains("\"kind\":\"integration\""));
+                assert!(
+                    failure_output.contains("\"policy\":\"discover_or_inspect_first_then_mutate\"")
+                );
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_mcp_server_create_without_config_routes_to_capability_resolution() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "mcp_server",
+            "query": "provider MCP"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "capability_resolve");
+                assert_eq!(actions[0].arguments["selected_action"], "mcp_server_manage");
+                assert_eq!(actions[0].arguments["requested_capability"], "provider MCP");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_custom_messaging_channel_create_without_send_routes_to_capability_resolution() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "custom_messaging_channel",
+            "query": "provider alerts"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "capability_resolve");
+                assert_eq!(
+                    actions[0].arguments["selected_action"],
+                    "custom_messaging_channel_upsert"
+                );
+                assert_eq!(
+                    actions[0].arguments["requested_capability"],
+                    "provider alerts"
                 );
             }
             other => panic!("unexpected plan: {other:?}"),
@@ -7509,7 +10193,31 @@ mod tests {
     }
 
     #[test]
-    fn resource_custom_messaging_channel_create_requires_channel_definition() {
+    fn resource_custom_messaging_channel_lifecycle_maps_to_manage() {
+        for (op, expected_operation) in [
+            ("delete", "delete"),
+            ("enable", "enable"),
+            ("disable", "disable"),
+            ("test", "test"),
+        ] {
+            let plan = plan_resource_rw(&serde_json::json!({
+                "op": op,
+                "kind": "custom_messaging_channel",
+                "id": "provider-alerts"
+            }));
+            match plan {
+                PrimitivePlan::Actions(actions) => {
+                    assert_eq!(actions[0].action_name, "custom_messaging_channel_manage");
+                    assert_eq!(actions[0].arguments["id"], "provider-alerts");
+                    assert_eq!(actions[0].arguments["operation"], expected_operation);
+                }
+                other => panic!("unexpected plan for {op}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resource_custom_messaging_channel_create_with_notification_shape_routes_to_notification() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "create",
             "kind": "custom_messaging_channel",
@@ -7519,9 +10227,10 @@ mod tests {
             }
         }));
         match plan {
-            PrimitivePlan::Unsupported { reason, extra } => {
-                assert!(reason.contains("custom_messaging_channel create requires"));
-                assert_eq!(extra.unwrap()["kind"], "custom_messaging_channel");
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "notify_user");
+                assert_eq!(actions[0].arguments["message"], "Meeting with Mark");
+                assert_eq!(actions[0].arguments["delivery_channel"], "telegram");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -7574,7 +10283,23 @@ mod tests {
     }
 
     #[test]
-    fn resource_skill_import_maps_to_generic_skill_management() {
+    fn resource_extension_pack_delete_maps_to_delete_action() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "delete",
+            "kind": "extension_pack",
+            "id": "linear"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "extension_pack_delete");
+                assert_eq!(actions[0].arguments["pack_id"], "linear");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_skill_import_requires_direct_skill_manage() {
         let plan = plan_resource_rw(&serde_json::json!({
             "op": "install",
             "kind": "skill",
@@ -7582,6 +10307,22 @@ mod tests {
                 "url": "https://example.com/skills/SKILL.md",
                 "name": "source-checker"
             }
+        }));
+        match plan {
+            PrimitivePlan::Unsupported { reason, extra } => {
+                assert!(reason.contains("skill_manage"));
+                assert_eq!(extra.unwrap()["suggested_primitive"], "skill_manage");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_skill_manage_maps_to_generic_skill_management() {
+        let plan = plan_skill_manage(&serde_json::json!({
+            "operation": "import",
+            "url": "https://example.com/skills/SKILL.md",
+            "name": "source-checker"
         }));
         match plan {
             PrimitivePlan::Actions(actions) => {
@@ -7593,6 +10334,27 @@ mod tests {
                     "https://example.com/skills/SKILL.md"
                 );
                 assert_eq!(actions[0].arguments["name"], "source-checker");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_skill_manage_preserves_authored_skill_content() {
+        let plan = plan_skill_manage(&serde_json::json!({
+            "operation": "create",
+            "name": "source-checker",
+            "markdown": "---\nname: source-checker\n---\n\n# Source Checker"
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "manage_actions");
+                assert_eq!(actions[0].arguments["resource"], "skill");
+                assert_eq!(actions[0].arguments["operation"], "create");
+                assert_eq!(
+                    actions[0].arguments["content"],
+                    "---\nname: source-checker\n---\n\n# Source Checker"
+                );
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -7793,88 +10555,28 @@ mod tests {
     }
 
     #[test]
-    fn direct_notification_with_clock_time_in_request_is_repaired_to_schedule_task() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-05-27T13:27:00+05:30")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let invocation = PrimitiveActionInvocation {
-            action_name: "notify_user".to_string(),
-            arguments: serde_json::json!({
-                "title": "Meeting with Mark",
-                "message": "Meeting with Mark",
+    fn resource_notification_text_without_structured_schedule_stays_direct() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "create",
+            "kind": "notification",
+            "content": {
+                "message": "Meeting with Mark at 1:30 PM",
                 "delivery_channel": "telegram"
-            }),
-        };
-
-        let repaired = scheduled_notification_invocation_from_direct_notification(
-            &invocation,
-            "send me a notificaiton in telegram for meeting with mark at 1:30 PM today",
-            now,
-            Some(chrono_tz::Asia::Kolkata),
-        )
-        .expect("time-bearing notification request should schedule instead of sending now");
-
-        assert_eq!(repaired.action_name, "schedule_task");
-        assert_eq!(repaired.arguments["task"], "Meeting with Mark");
-        assert_eq!(repaired.arguments["local_time"], "1:30 PM");
-        assert_eq!(repaired.arguments["timezone"], "Asia/Kolkata");
-        assert_eq!(repaired.arguments["report_to"], "telegram");
-        assert_eq!(repaired.arguments["action"], "notify_user");
-        assert_eq!(
-            repaired.arguments["action_arguments"]["message"],
-            "⏰ Reminder: Meeting with Mark scheduled for today at 1:30 PM IST"
-        );
+            }
+        }));
+        match plan {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions[0].action_name, "notify_user");
+                assert_eq!(
+                    actions[0].arguments["message"],
+                    "Meeting with Mark at 1:30 PM"
+                );
+                assert_eq!(actions[0].arguments["delivery_channel"], "telegram");
+                assert!(actions[0].arguments.get("local_time").is_none());
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
     }
-
-    #[test]
-    fn direct_notification_clock_time_repair_preserves_arbitrary_delivery_route() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-05-27T13:27:00+05:30")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let invocation = PrimitiveActionInvocation {
-            action_name: "notify_user".to_string(),
-            arguments: serde_json::json!({
-                "message": "Meeting with Mark",
-                "delivery_channel": "whatsapp"
-            }),
-        };
-
-        let repaired = scheduled_notification_invocation_from_direct_notification(
-            &invocation,
-            "remind me on whatsapp about meeting with mark at 1:30 PM",
-            now,
-            Some(chrono_tz::Asia::Kolkata),
-        )
-        .expect("clock-time notification request should preserve any delivery route");
-
-        assert_eq!(repaired.action_name, "schedule_task");
-        assert_eq!(repaired.arguments["report_to"], "whatsapp");
-        assert_eq!(
-            repaired.arguments["action_arguments"]["message"],
-            "⏰ Reminder: Meeting with Mark scheduled for today at 1:30 PM IST"
-        );
-    }
-
-    #[test]
-    fn direct_notification_without_clock_time_is_not_repaired_to_schedule_task() {
-        let invocation = PrimitiveActionInvocation {
-            action_name: "notify_user".to_string(),
-            arguments: serde_json::json!({
-                "message": "Meeting with Mark",
-                "delivery_channel": "telegram"
-            }),
-        };
-
-        let repaired = scheduled_notification_invocation_from_direct_notification(
-            &invocation,
-            "send me a notificaiton in telegram for meeting with mark",
-            chrono::Utc::now(),
-            Some(chrono_tz::Asia::Kolkata),
-        );
-
-        assert!(repaired.is_none());
-    }
-
     #[test]
     fn resource_scheduled_task_message_payload_becomes_notify_user_action() {
         let plan = plan_resource_rw(&serde_json::json!({
@@ -8041,169 +10743,40 @@ mod tests {
         }
     }
     #[test]
-    fn resource_app_service_content_string_becomes_index_html_file() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "name": "Pricing report",
-                "content": "<!doctype html><html><body>Report</body></html>"
+    fn resource_app_service_source_payloads_are_not_deploy_material() {
+        for content in [
+            serde_json::json!({"name": "Pricing report", "content": "<!doctype html><html><body>Report</body></html>"}),
+            serde_json::json!({"name": "Generated app", "source": "<!doctype html><html><body>App</body></html>"}),
+            serde_json::json!({"name": "Nested files", "files": {"index.html": {"content": "<!doctype html><title>Nested</title>"}}}),
+            serde_json::json!({"name": "Empty app"}),
+        ] {
+            let plan = plan_resource_rw(&serde_json::json!({
+                "op": "create",
+                "kind": "app_service",
+                "content": content
+            }));
+            match plan {
+                PrimitivePlan::Unsupported { reason, extra } => {
+                    assert!(reason.contains("app_deploy"));
+                    assert_eq!(extra.unwrap()["suggested_primitive"], "app_deploy");
+                }
+                other => panic!("unexpected plan: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn resource_app_service_status_remains_lifecycle_resource() {
+        let plan = plan_resource_rw(&serde_json::json!({
+            "op": "status",
+            "kind": "app_service",
+            "id": "app-123"
         }));
         match plan {
             PrimitivePlan::Actions(actions) => {
                 assert_eq!(actions[0].action_name, "service_manage");
-                assert_eq!(actions[0].arguments["operation"], "create");
-                assert_eq!(
-                    actions[0].arguments["files"]["index.html"],
-                    "<!doctype html><html><body>Report</body></html>"
-                );
-            }
-            other => panic!("unexpected plan: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_app_service_plain_text_content_is_not_deploy_material() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "name": "Reusable workflow",
-                "content": "# Workflow\n\nFetch source, extract table, publish result."
-            }
-        }));
-        match plan {
-            PrimitivePlan::Unsupported { reason, extra } => {
-                assert!(reason.contains("deployable app content"));
-                assert_eq!(extra.unwrap()["field"], "content.files");
-            }
-            other => panic!("unexpected plan: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_app_service_markdown_files_are_not_deploy_material() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "name": "Documentation bundle",
-                "files": {
-                    "runbook.md": "# Workflow\n\nRepeatable steps."
-                }
-            }
-        }));
-        match plan {
-            PrimitivePlan::Unsupported { reason, extra } => {
-                assert!(reason.contains("deployable app content"));
-                assert_eq!(extra.unwrap()["field"], "content.files");
-            }
-            other => panic!("unexpected plan: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_app_service_structural_html_field_becomes_index_entry() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "name": "Generated app",
-                "source": "<!doctype html><html><body>App</body></html>"
-            }
-        }));
-        match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].action_name, "service_manage");
-                assert_eq!(
-                    actions[0].arguments["files"]["index.html"],
-                    "<!doctype html><html><body>App</body></html>"
-                );
-            }
-            other => panic!("unexpected plan: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_app_service_html_file_body_without_html_path_gets_entrypoint() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "name": "Generated app",
-                "files": {
-                    "main": "<!doctype html><html><body>App</body></html>"
-                }
-            }
-        }));
-        match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].action_name, "service_manage");
-                assert_eq!(
-                    actions[0].arguments["files"]["index.html"],
-                    "<!doctype html><html><body>App</body></html>"
-                );
-            }
-            other => panic!("unexpected plan: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_app_service_create_requires_deploy_material() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "name": "Empty app"
-            }
-        }));
-        match plan {
-            PrimitivePlan::Unsupported { reason, extra } => {
-                assert!(reason.contains("deployable app content"));
-                assert_eq!(extra.unwrap()["field"], "content.files");
-            }
-            other => panic!("unexpected plan: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_app_service_normalizes_nested_file_entries() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "name": "Nested files",
-                "files": {
-                    "index.html": {"content": "<!doctype html><title>Nested</title>"}
-                }
-            }
-        }));
-        match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(
-                    actions[0].arguments["files"]["index.html"],
-                    "<!doctype html><title>Nested</title>"
-                );
-            }
-            other => panic!("unexpected plan: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_app_service_preserves_explicit_service_kind() {
-        let plan = plan_resource_rw(&serde_json::json!({
-            "op": "create",
-            "kind": "app_service",
-            "content": {
-                "kind": "static",
-                "files": {"index.html": "<!doctype html><title>Report</title>"}
-            }
-        }));
-        match plan {
-            PrimitivePlan::Actions(actions) => {
-                assert_eq!(actions[0].arguments["operation"], "create");
-                assert_eq!(actions[0].arguments["kind"], "static");
+                assert_eq!(actions[0].arguments["operation"], "status");
+                assert_eq!(actions[0].arguments["service_id"], "app-123");
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -8222,6 +10795,7 @@ mod tests {
                     "files": {"index.html": "<!doctype html><html><body>v1</body></html>"}
                 }
             }),
+            activity_label: None,
         };
         let second = SpineToolCall {
             id: "b".to_string(),
@@ -8234,6 +10808,7 @@ mod tests {
                     "files": {"index.html": "<!doctype html><html><body>v2</body></html>"}
                 }
             }),
+            activity_label: None,
         };
 
         let first = tool_call_progress_signature(&first).expect("signature");
@@ -8241,6 +10816,160 @@ mod tests {
 
         assert_eq!(first.class, ToolProgressClass::Mutation);
         assert_eq!(first.key, second.key);
+    }
+
+    #[test]
+    fn file_write_progress_signature_is_content_aware_for_rewrites() {
+        let first = SpineToolCall {
+            id: "a".to_string(),
+            name: "file_write".to_string(),
+            arguments: serde_json::json!({
+                "path": "expense-tracker/server.py",
+                "content": "print('old')"
+            }),
+            activity_label: None,
+        };
+        let second = SpineToolCall {
+            id: "b".to_string(),
+            name: "file_write".to_string(),
+            arguments: serde_json::json!({
+                "path": "expense-tracker/server.py",
+                "content": "print('fixed')"
+            }),
+            activity_label: None,
+        };
+        let repeated = SpineToolCall {
+            id: "c".to_string(),
+            name: "file_write".to_string(),
+            arguments: first.arguments.clone(),
+            activity_label: None,
+        };
+
+        let first = tool_call_progress_signature(&first).expect("signature");
+        let second = tool_call_progress_signature(&second).expect("signature");
+        let repeated = tool_call_progress_signature(&repeated).expect("signature");
+
+        assert_eq!(first.class, ToolProgressClass::Mutation);
+        assert_ne!(first.key, second.key);
+        assert_eq!(first.key, repeated.key);
+    }
+
+    #[test]
+    fn file_write_progress_signature_includes_non_text_body_sources() {
+        let from_source_path = SpineToolCall {
+            id: "a".to_string(),
+            name: "file_write".to_string(),
+            arguments: serde_json::json!({
+                "path": "report.html",
+                "source_path": "tmp/report.html"
+            }),
+            activity_label: None,
+        };
+        let from_resource = SpineToolCall {
+            id: "b".to_string(),
+            name: "file_write".to_string(),
+            arguments: serde_json::json!({
+                "path": "report.html",
+                "source_resource": {"id": "resource-1", "kind": "managed_file"}
+            }),
+            activity_label: None,
+        };
+
+        let source_path = tool_call_progress_signature(&from_source_path).expect("signature");
+        let source_resource = tool_call_progress_signature(&from_resource).expect("signature");
+
+        assert_ne!(source_path.key, source_resource.key);
+    }
+
+    #[test]
+    fn file_patch_progress_signature_is_patch_aware() {
+        let first = SpineToolCall {
+            id: "a".to_string(),
+            name: "file_patch".to_string(),
+            arguments: serde_json::json!({
+                "path": "expense-tracker/server.py",
+                "patch": "@@\n-print('old')\n+print('fixed')\n"
+            }),
+            activity_label: None,
+        };
+        let second = SpineToolCall {
+            id: "b".to_string(),
+            name: "file_patch".to_string(),
+            arguments: serde_json::json!({
+                "path": "expense-tracker/server.py",
+                "patch": "@@\n-print('old')\n+print('newer')\n"
+            }),
+            activity_label: None,
+        };
+
+        let first = tool_call_progress_signature(&first).expect("signature");
+        let second = tool_call_progress_signature(&second).expect("signature");
+
+        assert_ne!(first.key, second.key);
+    }
+
+    #[test]
+    fn dependency_batches_serialize_file_write_before_source_dir_deploy() {
+        let calls = vec![
+            (
+                SpineToolCall {
+                    id: "write".to_string(),
+                    name: "file_write".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "apps/demo/index.html",
+                        "content": "<!doctype html><html><body>Demo</body></html>"
+                    }),
+                    activity_label: None,
+                },
+                None,
+                false,
+            ),
+            (
+                SpineToolCall {
+                    id: "deploy".to_string(),
+                    name: "app_deploy".to_string(),
+                    arguments: serde_json::json!({
+                        "source_dir": "apps/demo",
+                        "source_paths": ["index.html"]
+                    }),
+                    activity_label: None,
+                },
+                None,
+                false,
+            ),
+        ];
+
+        let batches = dependency_batches_for_tool_calls(&calls, Some("conversation-1"));
+        assert_eq!(batches, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn dependency_batches_keep_independent_reads_parallel() {
+        let calls = vec![
+            (
+                SpineToolCall {
+                    id: "search".to_string(),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({"query": "papers"}),
+                    activity_label: None,
+                },
+                None,
+                false,
+            ),
+            (
+                SpineToolCall {
+                    id: "read".to_string(),
+                    name: "file_read".to_string(),
+                    arguments: serde_json::json!({"path": "notes.md"}),
+                    activity_label: None,
+                },
+                None,
+                false,
+            ),
+        ];
+
+        let batches = dependency_batches_for_tool_calls(&calls, Some("conversation-1"));
+        assert_eq!(batches, vec![vec![0, 1]]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 const INTEGRATION_SYNC_STATE_KEY: &str = "integration_sync_state_v1";
 const INTEGRATION_SYNC_FEED_KEY: &str = "integration_sync_feed_v1";
@@ -23,10 +23,15 @@ const GITHUB_SYNC_ALERT_REPO_LIMIT: usize = 8;
 const GITHUB_SYNC_ALERT_LIMIT: usize = 5;
 const INTEGRATION_SYNC_STATUS_TIMEOUT_SECS: u64 = 8;
 const INTEGRATION_SYNC_FETCH_TIMEOUT_SECS: u64 = 45;
+const INTEGRATION_SYNC_HTTP_MAX_RETRIES: usize = 3;
+const INTEGRATION_SYNC_HTTP_INITIAL_RETRY_MS: u64 = 750;
+const INTEGRATION_SYNC_HTTP_MAX_RETRY_SECS: u64 = 30;
 const INTEGRATION_SYNC_BUSY_MESSAGE: &str =
     "Another integration sync run is already in progress. Try again in a moment.";
 const DEFAULT_INTEGRATION_SYNC_POLL_SECS: u64 = 30 * 60;
-static INTEGRATION_SYNC_MUTATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static INTEGRATION_SYNC_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static INTEGRATION_SYNC_STORE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Clone)]
 pub struct IntegrationSyncContext {
@@ -305,6 +310,22 @@ fn integration_manager(ctx: &IntegrationSyncContext) -> crate::integrations::Int
     crate::integrations::IntegrationManager::new(&ctx.config_dir)
 }
 
+fn integration_sync_lock_key(integration_id: &str) -> String {
+    integration_id.trim().to_ascii_lowercase()
+}
+
+async fn try_acquire_integration_sync_lock(integration_id: &str) -> Option<OwnedMutexGuard<()>> {
+    let key = integration_sync_lock_key(integration_id);
+    let lock = {
+        let mut locks = INTEGRATION_SYNC_LOCKS.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    lock.try_lock_owned().ok()
+}
+
 async fn load_state_store(ctx: &IntegrationSyncContext) -> IntegrationSyncStateStore {
     match ctx
         .encrypted_storage
@@ -333,6 +354,7 @@ pub async fn ensure_default_enabled(
     let Some(config) = default_config_for(integration_id) else {
         return Ok(());
     };
+    let _store_guard = INTEGRATION_SYNC_STORE_LOCK.lock().await;
     let mut store = load_state_store(ctx).await;
     if store.configs.contains_key(integration_id) {
         return Ok(());
@@ -503,13 +525,108 @@ fn github_authed_get(
         .header("Accept", "application/vnd.github+json")
 }
 
+fn integration_sync_retry_after(headers: &reqwest::header::HeaderMap) -> Option<StdDuration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(StdDuration::from_secs(
+            seconds.min(INTEGRATION_SYNC_HTTP_MAX_RETRY_SECS),
+        ));
+    }
+    let parsed = chrono::DateTime::parse_from_rfc2822(raw)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .ok()
+                .map(|value| value.with_timezone(&Utc))
+        })?;
+    let delay = (parsed - Utc::now()).to_std().ok()?;
+    Some(delay.min(StdDuration::from_secs(INTEGRATION_SYNC_HTTP_MAX_RETRY_SECS)))
+}
+
+fn integration_sync_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+async fn send_integration_sync_request(
+    label: &str,
+    mut request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    let mut attempt = 0usize;
+    let mut fallback_delay = StdDuration::from_millis(INTEGRATION_SYNC_HTTP_INITIAL_RETRY_MS);
+    loop {
+        let retry_request = if attempt < INTEGRATION_SYNC_HTTP_MAX_RETRIES {
+            request.try_clone()
+        } else {
+            None
+        };
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if integration_sync_retryable_status(status) {
+                    if let Some(next_request) = retry_request {
+                        let wait = integration_sync_retry_after(response.headers())
+                            .unwrap_or(fallback_delay)
+                            .min(StdDuration::from_secs(INTEGRATION_SYNC_HTTP_MAX_RETRY_SECS));
+                        attempt += 1;
+                        tracing::warn!(
+                            label,
+                            status = status.as_u16(),
+                            attempt,
+                            retry_after_ms = wait.as_millis(),
+                            "Integration sync HTTP request returned retryable status"
+                        );
+                        tokio::time::sleep(wait).await;
+                        request = next_request;
+                        fallback_delay = fallback_delay
+                            .saturating_mul(2)
+                            .min(StdDuration::from_secs(INTEGRATION_SYNC_HTTP_MAX_RETRY_SECS));
+                        continue;
+                    }
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                if error.is_timeout() || error.is_connect() {
+                    if let Some(next_request) = retry_request {
+                        let wait = fallback_delay
+                            .min(StdDuration::from_secs(INTEGRATION_SYNC_HTTP_MAX_RETRY_SECS));
+                        attempt += 1;
+                        tracing::warn!(
+                            label,
+                            error = %error,
+                            attempt,
+                            retry_after_ms = wait.as_millis(),
+                            "Integration sync HTTP request failed transiently"
+                        );
+                        tokio::time::sleep(wait).await;
+                        request = next_request;
+                        fallback_delay = fallback_delay
+                            .saturating_mul(2)
+                            .min(StdDuration::from_secs(INTEGRATION_SYNC_HTTP_MAX_RETRY_SECS));
+                        continue;
+                    }
+                }
+                return Err(error.into());
+            }
+        }
+    }
+}
+
 async fn github_get_json_value(
     client: &reqwest::Client,
     token: &str,
     url: reqwest::Url,
     label: &str,
 ) -> Result<serde_json::Value> {
-    let response = github_authed_get(client, token, url).send().await?;
+    let response =
+        send_integration_sync_request(label, github_authed_get(client, token, url)).await?;
     let status = response.status();
     if !status.is_success() {
         let error = response.text().await.unwrap_or_default();
@@ -1047,12 +1164,48 @@ pub async fn list_runs(
     }
 }
 
+fn merge_feed_items(
+    existing: &mut Vec<IntegrationSyncFeedItem>,
+    additions: Vec<IntegrationSyncFeedItem>,
+) {
+    let mut seen = existing
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<HashSet<_>>();
+    for item in additions {
+        if seen.insert(item.id.clone()) {
+            existing.push(item);
+        }
+    }
+    existing.sort_by(|left, right| right.detected_at.cmp(&left.detected_at));
+    existing.truncate(MAX_FEED_ITEMS);
+}
+
+fn merge_run_items(
+    existing: &mut Vec<IntegrationSyncRunItem>,
+    additions: Vec<IntegrationSyncRunItem>,
+) {
+    let mut seen = existing
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<HashSet<_>>();
+    for item in additions {
+        if seen.insert(item.id.clone()) {
+            existing.push(item);
+        }
+    }
+    existing.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    existing.truncate(MAX_RUN_ITEMS);
+}
+
 pub async fn update_config(
     ctx: &IntegrationSyncContext,
     integration_id: &str,
     request: IntegrationSyncUpdateRequest,
 ) -> Result<IntegrationSyncStatusView> {
-    let _guard = INTEGRATION_SYNC_MUTATION_LOCK.lock().await;
+    let Some(_integration_guard) = try_acquire_integration_sync_lock(integration_id).await else {
+        return Err(anyhow!(INTEGRATION_SYNC_BUSY_MESSAGE));
+    };
     let Some(default_config) = default_config_for(integration_id) else {
         return Err(anyhow!(
             "Background sync is not available for '{}'",
@@ -1060,33 +1213,34 @@ pub async fn update_config(
         ));
     };
 
-    let mut store = load_state_store(ctx).await;
-    let mut config = store
-        .configs
-        .get(integration_id)
-        .cloned()
-        .unwrap_or(default_config);
+    {
+        let _store_guard = INTEGRATION_SYNC_STORE_LOCK.lock().await;
+        let mut store = load_state_store(ctx).await;
+        let mut config = store
+            .configs
+            .get(integration_id)
+            .cloned()
+            .unwrap_or(default_config);
 
-    if let Some(enabled) = request.enabled {
-        config.enabled = enabled;
-    }
-    if let Some(poll_interval_secs) = request.poll_interval_secs {
-        config.poll_interval_secs = poll_interval_secs.clamp(60, 24 * 3600);
-    }
-    if let Some(importance_threshold) = request.importance_threshold {
-        config.importance_threshold = importance_threshold.clamp(0.1, 1.0);
-    }
-    if let Some(notify_on_important) = request.notify_on_important {
-        config.notify_on_important = notify_on_important;
-    }
-    if let Some(push_to_preferred_channel) = request.push_to_preferred_channel {
-        config.push_to_preferred_channel = push_to_preferred_channel;
-    }
+        if let Some(enabled) = request.enabled {
+            config.enabled = enabled;
+        }
+        if let Some(poll_interval_secs) = request.poll_interval_secs {
+            config.poll_interval_secs = poll_interval_secs.clamp(60, 24 * 3600);
+        }
+        if let Some(importance_threshold) = request.importance_threshold {
+            config.importance_threshold = importance_threshold.clamp(0.1, 1.0);
+        }
+        if let Some(notify_on_important) = request.notify_on_important {
+            config.notify_on_important = notify_on_important;
+        }
+        if let Some(push_to_preferred_channel) = request.push_to_preferred_channel {
+            config.push_to_preferred_channel = push_to_preferred_channel;
+        }
 
-    store
-        .configs
-        .insert(integration_id.to_string(), config.clone());
-    save_state_store(ctx, &store).await?;
+        store.configs.insert(integration_id.to_string(), config);
+        save_state_store(ctx, &store).await?;
+    }
 
     let statuses = list_statuses(ctx).await;
     let status = statuses
@@ -1101,15 +1255,100 @@ pub async fn update_config(
     Ok(status)
 }
 
+async fn sync_integration_persisted(
+    ctx: &IntegrationSyncContext,
+    integration_id: &str,
+    trigger: &str,
+    force: bool,
+) -> Result<bool> {
+    let Some(_integration_guard) = try_acquire_integration_sync_lock(integration_id).await else {
+        if force {
+            return Err(anyhow!(INTEGRATION_SYNC_BUSY_MESSAGE));
+        }
+        tracing::debug!(
+            integration_id = integration_id,
+            "Integration sync skipped because this integration is already active"
+        );
+        return Ok(false);
+    };
+    let manager = integration_manager(ctx);
+    let (config, mut store, mut feed, mut runs) = {
+        let _store_guard = INTEGRATION_SYNC_STORE_LOCK.lock().await;
+        let store = load_state_store(ctx).await;
+        let Some(config) = store
+            .configs
+            .get(integration_id)
+            .cloned()
+            .or_else(|| default_config_for(integration_id))
+        else {
+            return Err(anyhow!(
+                "Background sync is not available for '{}'",
+                integration_id
+            ));
+        };
+        let cursor = store
+            .cursors
+            .get(integration_id)
+            .cloned()
+            .unwrap_or_default();
+        if !force && !is_due(&cursor, &config) {
+            return Ok(false);
+        }
+        (config, store, load_feed(ctx).await, load_runs(ctx).await)
+    };
+
+    let base_feed_ids = feed
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<HashSet<_>>();
+    let base_run_ids = runs
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<HashSet<_>>();
+
+    sync_integration(
+        ctx, &manager, &config, &mut store, &mut feed, &mut runs, trigger, force,
+    )
+    .await;
+
+    let updated_cursor = store.cursors.get(integration_id).cloned();
+    let new_feed_items = feed
+        .into_iter()
+        .filter(|item| !base_feed_ids.contains(&item.id))
+        .collect::<Vec<_>>();
+    let new_run_items = runs
+        .into_iter()
+        .filter(|item| !base_run_ids.contains(&item.id))
+        .collect::<Vec<_>>();
+
+    {
+        let _store_guard = INTEGRATION_SYNC_STORE_LOCK.lock().await;
+        let mut latest_store = load_state_store(ctx).await;
+        if let Some(cursor) = updated_cursor {
+            latest_store
+                .cursors
+                .insert(integration_id.to_string(), cursor);
+        }
+        save_state_store(ctx, &latest_store).await?;
+
+        let mut latest_feed = load_feed(ctx).await;
+        merge_feed_items(&mut latest_feed, new_feed_items);
+        save_feed(ctx, &latest_feed).await?;
+
+        let mut latest_runs = load_runs(ctx).await;
+        merge_run_items(&mut latest_runs, new_run_items);
+        save_runs(ctx, &latest_runs).await?;
+    }
+
+    Ok(true)
+}
+
 pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
     let started = Instant::now();
-    let Ok(_guard) = INTEGRATION_SYNC_MUTATION_LOCK.try_lock() else {
-        tracing::debug!("Integration sync skipped because another sync mutation is active");
-        return Ok(());
+    let store = {
+        let _store_guard = INTEGRATION_SYNC_STORE_LOCK.lock().await;
+        load_state_store(ctx).await
     };
-    let mut store = load_state_store(ctx).await;
-    let mut feed = load_feed(ctx).await;
-    let mut runs = load_runs(ctx).await;
     let manager = integration_manager(ctx);
 
     let mut supported_ids = manager.ids();
@@ -1153,32 +1392,17 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
 
     let mut attempted_syncs = 0usize;
     for config in due_configs {
-        let cursor = store
-            .cursors
-            .get(&config.integration_id)
-            .cloned()
-            .unwrap_or_default();
-        if !is_due(&cursor, &config) {
-            continue;
+        match sync_integration_persisted(ctx, &config.integration_id, "background", false).await {
+            Ok(true) => attempted_syncs = attempted_syncs.saturating_add(1),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                integration_id = config.integration_id.as_str(),
+                error = %error,
+                "Integration sync skipped"
+            ),
         }
-        attempted_syncs = attempted_syncs.saturating_add(1);
-        sync_integration(
-            ctx,
-            &manager,
-            &config,
-            &mut store,
-            &mut feed,
-            &mut runs,
-            "background",
-            false,
-        )
-        .await;
     }
 
-    tracing::debug!("Integration sync persisting state");
-    save_state_store(ctx, &store).await?;
-    save_feed(ctx, &feed).await?;
-    save_runs(ctx, &runs).await?;
     if attempted_syncs > 0 {
         tracing::info!(
             attempted_syncs,
@@ -1199,34 +1423,13 @@ pub async fn sync_now(
     ctx: &IntegrationSyncContext,
     integration_id: &str,
 ) -> Result<IntegrationSyncStatusView> {
-    let Ok(_guard) = INTEGRATION_SYNC_MUTATION_LOCK.try_lock() else {
-        return Err(anyhow!(INTEGRATION_SYNC_BUSY_MESSAGE));
-    };
-    let Some(config) = ({
-        let store = load_state_store(ctx).await;
-        store
-            .configs
-            .get(integration_id)
-            .cloned()
-            .or_else(|| default_config_for(integration_id))
-    }) else {
+    if default_config_for(integration_id).is_none() {
         return Err(anyhow!(
             "Background sync is not available for '{}'",
             integration_id
         ));
-    };
-
-    let mut store = load_state_store(ctx).await;
-    let mut feed = load_feed(ctx).await;
-    let mut runs = load_runs(ctx).await;
-    let manager = integration_manager(ctx);
-    sync_integration(
-        ctx, &manager, &config, &mut store, &mut feed, &mut runs, "manual", true,
-    )
-    .await;
-    save_state_store(ctx, &store).await?;
-    save_feed(ctx, &feed).await?;
-    save_runs(ctx, &runs).await?;
+    }
+    sync_integration_persisted(ctx, integration_id, "manual", true).await?;
 
     let statuses = list_statuses(ctx).await;
     statuses
@@ -1728,7 +1931,11 @@ async fn fetch_workspace_drive_items(
         );
         query.append_pair("orderBy", "modifiedTime desc");
     }
-    let response = client.get(url).bearer_auth(access_token).send().await?;
+    let response = send_integration_sync_request(
+        "Google Drive activity",
+        client.get(url).bearer_auth(access_token),
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(anyhow!(
             "Google Drive activity failed: {}",
@@ -3211,7 +3418,8 @@ async fn fetch_gmail_items(
         query.append_pair("q", &q);
         query.append_pair("labelIds", "INBOX");
     }
-    let response = client.get(url).bearer_auth(&token).send().await?;
+    let response =
+        send_integration_sync_request("Gmail list", client.get(url).bearer_auth(&token)).await?;
     if !response.status().is_success() {
         return Err(anyhow!("Gmail list failed: {}", response.status()));
     }
@@ -3219,14 +3427,15 @@ async fn fetch_gmail_items(
     let ids = list.messages.unwrap_or_default();
     let mut items = Vec::new();
     for message_ref in ids {
-        let response = client
-            .get(format!(
+        let response = send_integration_sync_request(
+            "Gmail message metadata",
+            client.get(format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
                 message_ref.id
             ))
-            .bearer_auth(&token)
-            .send()
-            .await?;
+            .bearer_auth(&token),
+        )
+        .await?;
         if !response.status().is_success() {
             continue;
         }
@@ -3304,5 +3513,20 @@ mod tests {
         assert_eq!(cursor.recent_source_ids[1], "b");
         assert!(cursor.recent_source_ids.contains(&"c".to_string()));
         assert!(cursor.recent_source_ids.contains(&"d".to_string()));
+    }
+
+    #[tokio::test]
+    async fn integration_sync_locks_are_scoped_per_integration() {
+        let gmail_guard = try_acquire_integration_sync_lock("gmail")
+            .await
+            .expect("gmail lock should be available");
+        let github_guard = try_acquire_integration_sync_lock("github")
+            .await
+            .expect("github lock should be independently available");
+
+        assert!(try_acquire_integration_sync_lock("gmail").await.is_none());
+
+        drop(github_guard);
+        drop(gmail_guard);
     }
 }

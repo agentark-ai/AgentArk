@@ -123,8 +123,12 @@ export function parseReadableJson(value: unknown): unknown | null {
   }
 }
 
+function normalizeReadableText(value: string): string {
+  return (value || "").replace(/\s+/g, " ").trim();
+}
+
 function compactText(value: string, maxLen = 260): string {
-  const text = (value || "").replace(/\s+/g, " ").trim();
+  const text = normalizeReadableText(value);
   if (text.length <= maxLen) return text;
   return `${text.slice(0, Math.max(0, maxLen - 3)).trimEnd()}...`;
 }
@@ -244,7 +248,10 @@ export function readableFieldsFromRecord(
   return fields;
 }
 
-function summarizeStructuredValue(value: unknown): string {
+function summarizeStructuredValue(
+  value: unknown,
+  maxDirectTextLength: number | null = 260,
+): string {
   if (Array.isArray(value)) {
     if (value.length === 0) return "No items";
     return `${value.length} item${value.length === 1 ? "" : "s"}`;
@@ -261,7 +268,11 @@ function summarizeStructuredValue(value: unknown): string {
     readableString(record.content),
     readableString(record.error),
   ]
-    .map((item) => compactText(item))
+    .map((item) =>
+      maxDirectTextLength == null
+        ? normalizeReadableText(item)
+        : compactText(item, maxDirectTextLength),
+    )
     .find((item) => item && !omittedPlaceholder(item));
   if (direct) return direct;
 
@@ -423,7 +434,7 @@ function genericStructuredSummary(value: unknown): ReadablePayloadSummary | null
       "Structured update",
     );
   const detail =
-    summarizeStructuredValue(record) ||
+    summarizeStructuredValue(record, null) ||
     (error ? humanizePayloadStatus(error) : "Received structured details.");
   return {
     title,

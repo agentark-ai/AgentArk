@@ -23,6 +23,7 @@ import Grid2 from "@mui/material/Grid";
 import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
+import { humanizeMachineLabel, humanizeStatusLabel } from "../lib/displayLabels";
 import type { ExtensionPackView } from "../types";
 
 type ExtensionPackMode = "all" | "integrations" | "messaging" | "connectors" | "channels";
@@ -306,7 +307,7 @@ function hasStructuredSecretValue(value: unknown): boolean {
 }
 
 function runtimeStatusLabel(status: string): string {
-  return status.replace(/_/g, " ");
+  return humanizeStatusLabel(status);
 }
 
 function titleize(value: string): string {
@@ -329,7 +330,7 @@ function titleize(value: string): string {
 }
 
 function formatBadgeLabel(value: string): string {
-  return titleize(value.replace(/_/g, " "));
+  return humanizeMachineLabel(value);
 }
 
 function displayPackName(pack: ExtensionPackView): string {
@@ -1620,9 +1621,9 @@ export function ExtensionPacksPanel({
                   <Stack direction="row" spacing={0.75} useFlexGap sx={{
                     flexWrap: "wrap"
                   }}>
-                    <Chip size="small" label={event.event_type} variant="outlined" />
-                    <Chip size="small" label={event.status} variant="outlined" />
-                    <Chip size="small" label={event.transport} variant="outlined" />
+                    <Chip size="small" label={humanizeMachineLabel(event.event_type)} variant="outlined" />
+                    <Chip size="small" label={humanizeStatusLabel(event.status)} variant="outlined" />
+                    <Chip size="small" label={humanizeMachineLabel(event.transport)} variant="outlined" />
                   </Stack>
                   <Typography variant="caption" sx={{
                     color: "text.secondary"

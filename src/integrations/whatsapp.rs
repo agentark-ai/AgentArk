@@ -5,7 +5,7 @@
 
 use super::oauth::{OAuthClient, OAuthConfig, OAuthTokens, TokenStorage};
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -52,7 +52,7 @@ impl WhatsAppConnector {
             token_storage: None,
             waba_id: None,
             phone_number_id: None,
-            http: reqwest::Client::new(),
+            http: crate::core::net::default_outgoing_http_client(),
             oauth_client: OAuthClient::new(),
         }
     }
@@ -77,7 +77,7 @@ impl WhatsAppConnector {
 
         // Save tokens
         if let Some(ref storage) = self.token_storage {
-            storage.save(Self::SERVICE_ID, &tokens)?;
+            storage.save_async(Self::SERVICE_ID, &tokens).await?;
         }
 
         *self.tokens.write().await = Some(tokens);
@@ -108,7 +108,7 @@ impl WhatsAppConnector {
     /// Disconnect (revoke tokens)
     pub async fn disconnect(&self) -> Result<()> {
         if let Some(ref storage) = self.token_storage {
-            storage.delete(Self::SERVICE_ID)?;
+            storage.delete_async(Self::SERVICE_ID).await?;
         }
         *self.tokens.write().await = None;
         Ok(())
@@ -135,7 +135,7 @@ impl WhatsAppConnector {
                     .await?;
 
                 if let Some(ref storage) = self.token_storage {
-                    storage.save(Self::SERVICE_ID, &new_tokens)?;
+                    storage.save_async(Self::SERVICE_ID, &new_tokens).await?;
                 }
 
                 *tokens = new_tokens;

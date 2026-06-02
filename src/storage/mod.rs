@@ -4,16 +4,16 @@ pub mod entities;
 mod migrations;
 
 use crate::crypto::KeyManager;
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sea_orm::entity::prelude::PgVector;
 use sea_orm::sea_query::{
     Alias, Expr, Func, OnConflict, Order, PostgresQueryBuilder, Query, SimpleExpr,
 };
 #[allow(unused_imports)]
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database,
-    DatabaseConnection, DatabaseTransaction, DbBackend, EntityTrait, FromQueryResult,
+    ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectOptions, ConnectionTrait,
+    Database, DatabaseConnection, DatabaseTransaction, DbBackend, EntityTrait, FromQueryResult,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
     TryGetable, Unchanged,
 };
@@ -23,6 +23,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 pub use entities::*;
+
+const DB_CONNECT_RETRY_WINDOW_SECS: u64 = 60;
+const DB_CONNECT_INITIAL_RETRY_DELAY_MS: u64 = 500;
+const DB_CONNECT_MAX_RETRY_DELAY_SECS: u64 = 5;
 
 /// Database storage using SeaORM
 #[derive(Clone)]
@@ -136,11 +140,20 @@ struct ExecutionTraceMessageMetricRow {
     steps_json: String,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DbConnectionActivityCounts {
+    pub active: i64,
+    pub idle: i64,
+    pub total: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
+    pub min_connections: u32,
     pub connect_timeout_secs: u64,
+    pub acquire_timeout_secs: u64,
     pub statement_timeout_ms: u64,
     pub idle_timeout_secs: u64,
     pub schema: Option<String>,
@@ -150,8 +163,10 @@ impl DatabaseConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            max_connections: 20,
+            max_connections: 32,
+            min_connections: 2,
             connect_timeout_secs: 5,
+            acquire_timeout_secs: 30,
             statement_timeout_ms: 30_000,
             idle_timeout_secs: 300,
             schema: None,
@@ -164,9 +179,19 @@ impl DatabaseConfig {
                 self.max_connections = parsed.max(1);
             }
         }
+        if let Ok(value) = std::env::var("AGENTARK_DB_MIN_CONNECTIONS") {
+            if let Ok(parsed) = value.parse::<u32>() {
+                self.min_connections = parsed.max(1);
+            }
+        }
         if let Ok(value) = std::env::var("AGENTARK_DB_CONNECT_TIMEOUT_SECS") {
             if let Ok(parsed) = value.parse::<u64>() {
                 self.connect_timeout_secs = parsed.max(1);
+            }
+        }
+        if let Ok(value) = std::env::var("AGENTARK_DB_ACQUIRE_TIMEOUT_SECS") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                self.acquire_timeout_secs = parsed.max(1);
             }
         }
         if let Ok(value) = std::env::var("AGENTARK_DB_STATEMENT_TIMEOUT_MS") {
@@ -202,7 +227,9 @@ impl DatabaseConfig {
         let base = test_database_url()?;
         let mut config = Self::new(base);
         config.max_connections = 2;
+        config.min_connections = 1;
         config.connect_timeout_secs = 15;
+        config.acquire_timeout_secs = 15;
         Ok(config)
     }
 
@@ -236,13 +263,15 @@ impl DatabaseConfig {
 
     fn connect_options(&self) -> ConnectOptions {
         let mut options = ConnectOptions::new(self.url.clone());
+        let max_connections = self.max_connections.max(1);
+        let min_connections = self.min_connections.max(1).min(max_connections);
         let statement_timeout_ms = self.statement_timeout_ms.max(1).to_string();
         options
-            .max_connections(self.max_connections.max(1))
-            .min_connections(1)
+            .max_connections(max_connections)
+            .min_connections(min_connections)
             .connect_timeout(Duration::from_secs(self.connect_timeout_secs.max(1)))
             .idle_timeout(Duration::from_secs(self.idle_timeout_secs.max(1)))
-            .acquire_timeout(Duration::from_secs(self.connect_timeout_secs.max(1)))
+            .acquire_timeout(Duration::from_secs(self.acquire_timeout_secs.max(1)))
             .sqlx_logging(false)
             .map_sqlx_postgres_opts(move |opts| {
                 opts.application_name("agentark").options([
@@ -337,31 +366,176 @@ fn database_is_test_scoped(database: &str) -> bool {
 #[cfg(test)]
 mod database_config_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_database_guard_rejects_live_agentark_database() {
-        assert!(
-            ensure_database_url_is_test_scoped("postgres://agentark:secret@127.0.0.1/agentark")
-                .is_err()
-        );
+        assert!(ensure_database_url_is_test_scoped(
+            "postgres://agentark:secret@127.0.0.1/agentark"
+        )
+        .is_err());
         assert!(!database_is_test_scoped("agentark"));
     }
 
     #[test]
     fn test_database_guard_accepts_isolated_test_database() {
-        assert!(
-            ensure_database_url_is_test_scoped(
-                "postgres://agentark:secret@127.0.0.1/agentark_test_123"
-            )
-            .is_ok()
-        );
+        assert!(ensure_database_url_is_test_scoped(
+            "postgres://agentark:secret@127.0.0.1/agentark_test_123"
+        )
+        .is_ok());
         assert!(database_is_test_scoped("agentark_test_123"));
+    }
+
+    #[test]
+    fn database_config_defaults_use_separate_pool_acquire_timeout() {
+        let config = DatabaseConfig::new("postgres://agentark:secret@127.0.0.1/agentark_test");
+
+        assert_eq!(config.max_connections, 32);
+        assert_eq!(config.min_connections, 2);
+        assert_eq!(config.connect_timeout_secs, 5);
+        assert_eq!(config.acquire_timeout_secs, 30);
+    }
+
+    #[test]
+    fn database_config_env_overrides_include_min_and_acquire_timeouts() {
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("env test lock should not be poisoned");
+        let keys = [
+            "AGENTARK_DB_MAX_CONNECTIONS",
+            "AGENTARK_DB_MIN_CONNECTIONS",
+            "AGENTARK_DB_CONNECT_TIMEOUT_SECS",
+            "AGENTARK_DB_ACQUIRE_TIMEOUT_SECS",
+        ];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in [
+            ("AGENTARK_DB_MAX_CONNECTIONS", "24"),
+            ("AGENTARK_DB_MIN_CONNECTIONS", "3"),
+            ("AGENTARK_DB_CONNECT_TIMEOUT_SECS", "7"),
+            ("AGENTARK_DB_ACQUIRE_TIMEOUT_SECS", "45"),
+        ] {
+            std::env::set_var(key, value);
+        }
+
+        let mut config = DatabaseConfig::new("postgres://agentark:secret@127.0.0.1/agentark_test");
+        config.apply_optional_env_overrides();
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        assert_eq!(config.max_connections, 24);
+        assert_eq!(config.min_connections, 3);
+        assert_eq!(config.connect_timeout_secs, 7);
+        assert_eq!(config.acquire_timeout_secs, 45);
     }
 }
 
 static STORAGE_KEY_MANAGER: OnceLock<RwLock<Option<Arc<KeyManager>>>> = OnceLock::new();
 
 pub(crate) const ENCRYPTED_STORAGE_UNAVAILABLE: &str = "[Encrypted content unavailable]";
+
+const EXPERIENCE_RUN_LIGHT_UPSERT_COLUMNS: &[experience_run::Column] = &[
+    experience_run::Column::ExecutionRunId,
+    experience_run::Column::TraceId,
+    experience_run::Column::ConversationId,
+    experience_run::Column::ProjectId,
+    experience_run::Column::Channel,
+    experience_run::Column::Scope,
+    experience_run::Column::IntentKey,
+    experience_run::Column::TaskType,
+    experience_run::Column::ToolSequenceDigest,
+    experience_run::Column::StrategyVersion,
+    experience_run::Column::PolicyVersion,
+    experience_run::Column::PromptVersion,
+    experience_run::Column::ModelSlot,
+    experience_run::Column::SuccessState,
+    experience_run::Column::CorrectionState,
+    experience_run::Column::Consolidated,
+    experience_run::Column::AcceptedAt,
+    experience_run::Column::CorrectedAt,
+    experience_run::Column::HeuristicReflected,
+    experience_run::Column::HeuristicReflectionStatus,
+    experience_run::Column::HeuristicReflectionAttemptedAt,
+    experience_run::Column::HeuristicReflectionCompletedAt,
+    experience_run::Column::HeuristicLessonId,
+    experience_run::Column::UpdatedAt,
+];
+
+const EXPERIENCE_ITEM_LIGHT_UPSERT_COLUMNS: &[experience_item::Column] = &[
+    experience_item::Column::Kind,
+    experience_item::Column::Scope,
+    experience_item::Column::ProjectId,
+    experience_item::Column::ConversationId,
+    experience_item::Column::Title,
+    experience_item::Column::NormalizedKey,
+    experience_item::Column::Confidence,
+    experience_item::Column::SupportCount,
+    experience_item::Column::ContradictionCount,
+    experience_item::Column::Status,
+    experience_item::Column::LastSupportedAt,
+    experience_item::Column::LastContradictedAt,
+    experience_item::Column::UpdatedAt,
+];
+
+const MEMORY_CAPTURE_EVENT_LIGHT_UPSERT_COLUMNS: &[memory_capture_event::Column] = &[
+    memory_capture_event::Column::SourceMessageId,
+    memory_capture_event::Column::ConversationId,
+    memory_capture_event::Column::ProjectId,
+    memory_capture_event::Column::Channel,
+    memory_capture_event::Column::Status,
+    memory_capture_event::Column::CaptureKind,
+    memory_capture_event::Column::SourceHash,
+    memory_capture_event::Column::ReplayCount,
+    memory_capture_event::Column::NextRetryAt,
+    memory_capture_event::Column::CompletedAt,
+    memory_capture_event::Column::UpdatedAt,
+];
+
+const MEMORY_OPERATION_LIGHT_UPSERT_COLUMNS: &[memory_operation::Column] = &[
+    memory_operation::Column::CaptureEventId,
+    memory_operation::Column::OperationType,
+    memory_operation::Column::Status,
+    memory_operation::Column::TargetMemoryId,
+    memory_operation::Column::AppliedMemoryId,
+    memory_operation::Column::Key,
+    memory_operation::Column::MemoryKind,
+    memory_operation::Column::Durability,
+    memory_operation::Column::Scope,
+    memory_operation::Column::ProjectId,
+    memory_operation::Column::ConversationId,
+    memory_operation::Column::Confidence,
+    memory_operation::Column::LooksSensitive,
+    memory_operation::Column::ValidFrom,
+    memory_operation::Column::ExpiresAt,
+    memory_operation::Column::ReviewAt,
+    memory_operation::Column::AppliedAt,
+    memory_operation::Column::ReviewedAt,
+    memory_operation::Column::UpdatedAt,
+];
+
+const SEMANTIC_WORK_UNIT_LIGHT_UPSERT_COLUMNS: &[semantic_work_unit::Column] = &[
+    semantic_work_unit::Column::SourceKind,
+    semantic_work_unit::Column::SourceId,
+    semantic_work_unit::Column::ConversationId,
+    semantic_work_unit::Column::ProjectId,
+    semantic_work_unit::Column::Channel,
+    semantic_work_unit::Column::TextHash,
+    semantic_work_unit::Column::OccurredAt,
+    semantic_work_unit::Column::PeriodStart,
+    semantic_work_unit::Column::PeriodEnd,
+    semantic_work_unit::Column::MessageCount,
+    semantic_work_unit::Column::UpdatedAt,
+];
 
 fn storage_key_manager_slot() -> &'static RwLock<Option<Arc<KeyManager>>> {
     STORAGE_KEY_MANAGER.get_or_init(|| RwLock::new(None))
@@ -435,6 +609,59 @@ fn encrypt_optional_storage_string(value: Option<&str>) -> Result<Option<String>
     value.map(encrypt_storage_string).transpose()
 }
 
+fn set_if_changed<T>(field: &mut ActiveValue<T>, current: &T, next: &T, changed: &mut bool)
+where
+    T: Clone + PartialEq + Into<sea_orm::sea_query::Value>,
+{
+    if current != next {
+        *field = Set(next.clone());
+        *changed = true;
+    }
+}
+
+fn encrypted_storage_string_matches(stored: &str, next_plaintext: &str) -> bool {
+    decrypt_storage_string(stored) == next_plaintext
+}
+
+fn encrypted_optional_storage_string_matches(
+    stored: &Option<String>,
+    next_plaintext: &Option<String>,
+) -> bool {
+    match (stored.as_deref(), next_plaintext.as_deref()) {
+        (None, None) => true,
+        (Some(stored), Some(next_plaintext)) => {
+            encrypted_storage_string_matches(stored, next_plaintext)
+        }
+        _ => false,
+    }
+}
+
+fn set_encrypted_string_if_changed(
+    field: &mut ActiveValue<String>,
+    current: &str,
+    next: &str,
+    changed: &mut bool,
+) -> Result<()> {
+    if !encrypted_storage_string_matches(current, next) {
+        *field = Set(encrypt_storage_string(next)?);
+        *changed = true;
+    }
+    Ok(())
+}
+
+fn set_encrypted_optional_string_if_changed(
+    field: &mut ActiveValue<Option<String>>,
+    current: &Option<String>,
+    next: &Option<String>,
+    changed: &mut bool,
+) -> Result<()> {
+    if !encrypted_optional_storage_string_matches(current, next) {
+        *field = Set(encrypt_optional_storage_string(next.as_deref())?);
+        *changed = true;
+    }
+    Ok(())
+}
+
 fn decrypt_optional_storage_string(value: Option<String>) -> Option<String> {
     value.map(|inner| decrypt_storage_string(&inner))
 }
@@ -449,14 +676,24 @@ fn decrypt_message_model(model: &mut message::Model) {
 
 fn trace_time_to_first_token_ms(steps_json: &str) -> Option<i64> {
     let steps: Vec<crate::core::ExecutionStep> = serde_json::from_str(steps_json).ok()?;
-    steps.into_iter().find_map(|step| {
-        let data = step.data.as_deref()?;
-        let payload = serde_json::from_str::<serde_json::Value>(data).ok()?;
-        let metric = payload.get("metric").and_then(|value| value.as_str())?;
-        if metric != "time_to_first_token" {
-            return None;
+    let mut first_stream_activity = None;
+    for step in steps {
+        let Some(data) = step.data.as_deref() else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let Some(metric) = payload.get("metric").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !matches!(
+            metric,
+            "time_to_first_token" | "time_to_first_stream_activity"
+        ) {
+            continue;
         }
-        payload
+        let duration = payload
             .get("duration_ms")
             .and_then(|value| {
                 value
@@ -466,8 +703,15 @@ fn trace_time_to_first_token_ms(steps_json: &str) -> Option<i64> {
             .or_else(|| {
                 step.duration_ms
                     .map(|value| value.min(i64::MAX as u64) as i64)
-            })
-    })
+            });
+        if metric == "time_to_first_token" && duration.is_some() {
+            return duration;
+        }
+        if first_stream_activity.is_none() {
+            first_stream_activity = duration;
+        }
+    }
+    first_stream_activity
 }
 
 fn trace_prompt_cache_metrics(steps_json: &str) -> (i64, i64) {
@@ -632,6 +876,17 @@ fn kv_lease_guard_is_current(
     record.owner_id == guard.owner_id
         && record.fence_token == guard.fence_token
         && lease_is_active(record, now)
+}
+
+fn webhook_event_lock_key(source_id: &str, dedupe_key: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(source_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(dedupe_key.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes) & i64::MAX
 }
 
 fn parse_kv_json_value<T>(key: &str, raw: &[u8]) -> Result<Option<T>>
@@ -947,6 +1202,305 @@ mod learned_fact_record_tests {
         assert_eq!(record.key.as_deref(), Some("user_name"));
         assert_eq!(record.value, "Alex");
     }
+
+    #[cfg_attr(
+        not(feature = "db-tests"),
+        ignore = "requires explicit isolated Postgres test database"
+    )]
+    #[tokio::test]
+    async fn webhook_event_insert_once_rejects_duplicate_idempotency_key() {
+        let storage = Storage::connect(
+            DatabaseConfig::for_tests().expect("test database config should initialize"),
+        )
+        .await
+        .expect("test database should connect");
+        let source_id = format!("source-{}", uuid::Uuid::new_v4());
+        let idempotency_key = format!("delivery-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now().to_rfc3339();
+        let first = webhook_event::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_id: source_id.clone(),
+            source_name: "Build Alerts".to_string(),
+            provider: "generic".to_string(),
+            received_at: now.clone(),
+            updated_at: now.clone(),
+            event_type: "workflow".to_string(),
+            status: Some("failed".to_string()),
+            subject: "core-api".to_string(),
+            outcome: "received".to_string(),
+            matched: false,
+            queued: false,
+            message: None,
+            event_id: Some("event-1".to_string()),
+            dedupe_key: "display-dedupe".to_string(),
+            idempotency_key: idempotency_key.clone(),
+            payload_hash: "payload-hash".to_string(),
+            event_url: None,
+            payload_excerpt: Some("{}".to_string()),
+            task_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            severity: Some("failed".to_string()),
+            test_event: false,
+        };
+        let mut second = first.clone();
+        second.id = uuid::Uuid::new_v4().to_string();
+        second.received_at = chrono::Utc::now().to_rfc3339();
+
+        assert!(storage.insert_webhook_event_once(first).await.unwrap());
+        assert!(!storage.insert_webhook_event_once(second).await.unwrap());
+
+        let events = storage
+            .list_webhook_events(Some(&source_id), 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].idempotency_key, idempotency_key);
+    }
+}
+
+#[cfg(test)]
+mod storage_jsonb_churn_tests {
+    use super::*;
+
+    fn assert_not_upserted<C>(columns: &[C], column: C)
+    where
+        C: Copy + std::fmt::Debug,
+    {
+        let needle = format!("{column:?}");
+        assert!(
+            !columns
+                .iter()
+                .any(|candidate| format!("{candidate:?}") == needle),
+            "heavy column should not be part of the conflict update list: {column:?}"
+        );
+    }
+
+    fn sample_experience_run() -> experience_run::Model {
+        experience_run::Model {
+            id: "run-1".to_string(),
+            execution_run_id: Some("execution-1".to_string()),
+            trace_id: Some("trace-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            project_id: Some("project-1".to_string()),
+            channel: "chat".to_string(),
+            scope: "project".to_string(),
+            intent_key: "intent".to_string(),
+            task_type: Some("task".to_string()),
+            request_text: Some("large request".to_string()),
+            tool_sequence_digest: Some("digest".to_string()),
+            tool_sequence_json: serde_json::json!({"tools": ["search"]}),
+            strategy_version: Some("strategy-v1".to_string()),
+            policy_version: Some("policy-v1".to_string()),
+            prompt_version: Some("prompt-v1".to_string()),
+            model_slot: Some("primary".to_string()),
+            success_state: "succeeded".to_string(),
+            correction_state: "none".to_string(),
+            outcome_summary: Some("large outcome".to_string()),
+            failure_reason: None,
+            metadata: serde_json::json!({"k": "v"}),
+            consolidated: false,
+            accepted_at: None,
+            corrected_at: None,
+            heuristic_reflected: false,
+            heuristic_reflection_status: None,
+            heuristic_reflection_attempted_at: None,
+            heuristic_reflection_completed_at: None,
+            heuristic_lesson_id: None,
+            heuristic_reflection_error: None,
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:01Z".to_string(),
+        }
+    }
+
+    fn sample_experience_item() -> experience_item::Model {
+        experience_item::Model {
+            id: "item-1".to_string(),
+            kind: "fact".to_string(),
+            scope: "project".to_string(),
+            project_id: Some("project-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            title: "Fact".to_string(),
+            content: "large content".to_string(),
+            normalized_key: "fact::key".to_string(),
+            confidence: 0.9,
+            support_count: 1,
+            contradiction_count: 0,
+            status: "active".to_string(),
+            metadata: serde_json::json!({"source": "test"}),
+            last_supported_at: Some("2026-05-28T00:00:00Z".to_string()),
+            last_contradicted_at: None,
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:01Z".to_string(),
+            embedding: Some(PgVector::from(vec![0.1_f32, 0.2, 0.3])),
+        }
+    }
+
+    fn sample_memory_capture_event() -> memory_capture_event::Model {
+        memory_capture_event::Model {
+            id: "capture-1".to_string(),
+            source_message_id: Some("message-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            project_id: Some("project-1".to_string()),
+            channel: "chat".to_string(),
+            status: "completed".to_string(),
+            capture_kind: "message".to_string(),
+            source_hash: "hash".to_string(),
+            attempt_metadata: serde_json::json!({"attempts": [{"model": "primary"}]}),
+            error_history: serde_json::json!([]),
+            replay_count: 0,
+            next_retry_at: None,
+            completed_at: Some("2026-05-28T00:00:02Z".to_string()),
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:01Z".to_string(),
+        }
+    }
+
+    fn sample_memory_operation() -> memory_operation::Model {
+        memory_operation::Model {
+            id: "operation-1".to_string(),
+            capture_event_id: Some("capture-1".to_string()),
+            operation_type: "upsert".to_string(),
+            status: "applied".to_string(),
+            target_memory_id: Some("memory-1".to_string()),
+            applied_memory_id: Some("memory-1".to_string()),
+            key: Some("favorite_color".to_string()),
+            value: Some("large value".to_string()),
+            memory_kind: "fact".to_string(),
+            durability: "long_term".to_string(),
+            scope: "project".to_string(),
+            project_id: Some("project-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            confidence: 0.95,
+            looks_sensitive: false,
+            sensitive_reason: None,
+            valid_from: None,
+            expires_at: None,
+            review_at: None,
+            rationale: Some("large rationale".to_string()),
+            evidence_refs: serde_json::json!([{"kind": "message", "id": "message-1"}]),
+            model_metadata: serde_json::json!({"model": "primary"}),
+            apply_metadata: serde_json::json!({"applied": true}),
+            applied_at: Some("2026-05-28T00:00:02Z".to_string()),
+            reviewed_at: None,
+            review_notes: None,
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:01Z".to_string(),
+        }
+    }
+
+    fn sample_semantic_work_unit() -> semantic_work_unit::Model {
+        semantic_work_unit::Model {
+            id: "unit-1".to_string(),
+            source_kind: "conversation".to_string(),
+            source_id: "conversation-1".to_string(),
+            conversation_id: Some("conversation-1".to_string()),
+            project_id: Some("project-1".to_string()),
+            channel: "chat".to_string(),
+            title: "Daily recap".to_string(),
+            summary: "large summary".to_string(),
+            content_preview: "large preview".to_string(),
+            text_hash: "hash".to_string(),
+            occurred_at: "2026-05-28T00:00:00Z".to_string(),
+            period_start: Some("2026-05-28T00:00:00Z".to_string()),
+            period_end: Some("2026-05-28T01:00:00Z".to_string()),
+            message_count: 5,
+            metadata: serde_json::json!({"topics": ["ops"]}),
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:01Z".to_string(),
+            embedding: Some(PgVector::from(vec![0.4_f32, 0.5, 0.6])),
+        }
+    }
+
+    #[test]
+    fn conflict_updates_exclude_heavy_storage_columns() {
+        assert_not_upserted(
+            EXPERIENCE_RUN_LIGHT_UPSERT_COLUMNS,
+            experience_run::Column::ToolSequenceJson,
+        );
+        assert_not_upserted(
+            EXPERIENCE_RUN_LIGHT_UPSERT_COLUMNS,
+            experience_run::Column::Metadata,
+        );
+        assert_not_upserted(
+            EXPERIENCE_ITEM_LIGHT_UPSERT_COLUMNS,
+            experience_item::Column::Metadata,
+        );
+        assert_not_upserted(
+            EXPERIENCE_ITEM_LIGHT_UPSERT_COLUMNS,
+            experience_item::Column::Embedding,
+        );
+        assert_not_upserted(
+            MEMORY_CAPTURE_EVENT_LIGHT_UPSERT_COLUMNS,
+            memory_capture_event::Column::AttemptMetadata,
+        );
+        assert_not_upserted(
+            MEMORY_OPERATION_LIGHT_UPSERT_COLUMNS,
+            memory_operation::Column::ModelMetadata,
+        );
+        assert_not_upserted(
+            SEMANTIC_WORK_UNIT_LIGHT_UPSERT_COLUMNS,
+            semantic_work_unit::Column::Embedding,
+        );
+    }
+
+    #[test]
+    fn unchanged_heavy_columns_are_not_set_for_selective_updates() {
+        let run = sample_experience_run();
+        assert!(Storage::experience_run_heavy_update_active_model(&run, &run).is_none());
+
+        let item = sample_experience_item();
+        assert!(Storage::experience_item_heavy_update_active_model(&item, &item).is_none());
+
+        let capture = sample_memory_capture_event();
+        assert!(
+            Storage::memory_capture_event_heavy_update_active_model(&capture, &capture).is_none()
+        );
+
+        let operation = sample_memory_operation();
+        assert!(
+            Storage::memory_operation_heavy_update_active_model(&operation, &operation)
+                .expect("operation heavy update should build")
+                .is_none()
+        );
+
+        let unit = sample_semantic_work_unit();
+        assert!(
+            Storage::semantic_work_unit_heavy_update_active_model(&unit, &unit)
+                .expect("semantic work unit heavy update should build")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn selective_updates_set_only_changed_heavy_columns() {
+        let existing_item = sample_experience_item();
+        let mut next_item = existing_item.clone();
+        next_item.embedding = Some(PgVector::from(vec![0.9_f32, 0.8, 0.7]));
+
+        let item_update =
+            Storage::experience_item_heavy_update_active_model(&existing_item, &next_item)
+                .expect("changed embedding should create update model");
+
+        assert!(item_update.content.is_not_set());
+        assert!(item_update.metadata.is_not_set());
+        assert!(item_update.embedding.is_set());
+
+        let existing_operation = sample_memory_operation();
+        let mut next_operation = existing_operation.clone();
+        next_operation.model_metadata = serde_json::json!({"model": "secondary"});
+
+        let operation_update = Storage::memory_operation_heavy_update_active_model(
+            &existing_operation,
+            &next_operation,
+        )
+        .expect("operation heavy update should build")
+        .expect("changed model metadata should create update model");
+
+        assert!(operation_update.value.is_not_set());
+        assert!(operation_update.evidence_refs.is_not_set());
+        assert!(operation_update.model_metadata.is_set());
+        assert!(operation_update.apply_metadata.is_not_set());
+    }
 }
 
 fn procedural_pattern_status_rank(status: &str) -> i32 {
@@ -1116,6 +1670,31 @@ impl Storage {
         &self.db
     }
 
+    pub async fn connection_activity_counts(&self) -> Result<DbConnectionActivityCounts> {
+        let row = self
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT \
+                    COUNT(*) FILTER (WHERE state = 'active') AS active, \
+                    COUNT(*) FILTER (WHERE state = 'idle') AS idle, \
+                    COUNT(*) AS total \
+                 FROM pg_stat_activity \
+                 WHERE application_name = 'agentark' \
+                   AND datname = current_database()"
+                    .to_string(),
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(DbConnectionActivityCounts::default());
+        };
+        Ok(DbConnectionActivityCounts {
+            active: row.try_get::<i64>("", "active").unwrap_or_default(),
+            idle: row.try_get::<i64>("", "idle").unwrap_or_default(),
+            total: row.try_get::<i64>("", "total").unwrap_or_default(),
+        })
+    }
+
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
         let normalized_key = key.trim().to_ascii_lowercase();
         let scope = project_id
@@ -1156,20 +1735,72 @@ impl Storage {
         config.validate()?;
         let target_summary = config.target_summary();
         let connect_timeout_secs = config.connect_timeout_secs.max(1);
-        let db = Database::connect(config.connect_options())
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to connect to Postgres at {} within {}s",
-                    target_summary, connect_timeout_secs
-                )
-            })?;
+        let retry_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(DB_CONNECT_RETRY_WINDOW_SECS);
+        let mut retry_delay = Duration::from_millis(DB_CONNECT_INITIAL_RETRY_DELAY_MS);
+        let db = loop {
+            match Database::connect(config.connect_options()).await {
+                Ok(db) => break db,
+                Err(error) if tokio::time::Instant::now() < retry_deadline => {
+                    tracing::warn!(
+                        "Failed to connect to Postgres at {}; retrying in {:?}: {}",
+                        target_summary,
+                        retry_delay,
+                        error
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay =
+                        (retry_delay * 2).min(Duration::from_secs(DB_CONNECT_MAX_RETRY_DELAY_SECS));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to connect to Postgres at {} within {}s after {}s retry window",
+                            target_summary, connect_timeout_secs, DB_CONNECT_RETRY_WINDOW_SECS
+                        )
+                    });
+                }
+            }
+        };
         if db.get_database_backend() != DbBackend::Postgres {
             anyhow::bail!("Postgres storage requires the SeaORM Postgres backend");
         }
         migrations::run(&db).await?;
         Ok(Self { db })
     }
+
+    pub fn spawn_housekeeping_purge_worker(
+        &self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let storage = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                let lifecycle =
+                    crate::core::data_lifecycle::load_data_lifecycle_settings(&storage).await;
+                let sleep = tokio::time::sleep(Duration::from_secs(
+                    lifecycle.housekeeping_interval_secs.max(1),
+                ));
+                tokio::pin!(sleep);
+                tokio::select! {
+                    _ = &mut sleep => {
+                        if let Err(error) = storage.run_housekeeping_purge().await {
+                            tracing::warn!("Storage housekeeping purge failed: {}", error);
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     // ==================== Key-Value Store ====================
 
     /// Get a value from the key-value store
@@ -1545,6 +2176,282 @@ impl Storage {
         }
         txn.commit().await?;
         Ok(())
+    }
+
+    pub async fn list_webhook_sources(&self) -> Result<Vec<webhook_source::Model>> {
+        Ok(webhook_source::Entity::find()
+            .order_by_desc(webhook_source::Column::UpdatedAt)
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn get_webhook_source(&self, id: &str) -> Result<Option<webhook_source::Model>> {
+        Ok(webhook_source::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
+    }
+
+    pub async fn upsert_webhook_source(&self, source: webhook_source::Model) -> Result<()> {
+        webhook_source::Entity::insert(Self::webhook_source_active_model(source))
+            .on_conflict(
+                OnConflict::column(webhook_source::Column::Id)
+                    .update_columns([
+                        webhook_source::Column::Name,
+                        webhook_source::Column::Provider,
+                        webhook_source::Column::Description,
+                        webhook_source::Column::Enabled,
+                        webhook_source::Column::AuthMode,
+                        webhook_source::Column::MatchMode,
+                        webhook_source::Column::Instruction,
+                        webhook_source::Column::EventHeader,
+                        webhook_source::Column::SecretHeader,
+                        webhook_source::Column::SignatureTimestampHeader,
+                        webhook_source::Column::SignatureTimestampToleranceSecs,
+                        webhook_source::Column::SignaturePayloadMode,
+                        webhook_source::Column::AllowDuplicate,
+                        webhook_source::Column::RequireApproval,
+                        webhook_source::Column::DedupeWindowSecs,
+                        webhook_source::Column::NotifyOnQueued,
+                        webhook_source::Column::NotifyOnSuccess,
+                        webhook_source::Column::NotifyOnFailure,
+                        webhook_source::Column::OutputTarget,
+                        webhook_source::Column::OutputChannel,
+                        webhook_source::Column::ConversationId,
+                        webhook_source::Column::UpdatedAt,
+                        webhook_source::Column::LastReceivedAt,
+                        webhook_source::Column::LastOutcome,
+                        webhook_source::Column::LastTaskId,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_webhook_source(&self, id: &str) -> Result<bool> {
+        let result = webhook_source::Entity::delete_by_id(id.to_string())
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    pub async fn update_webhook_source_runtime_state(
+        &self,
+        id: &str,
+        received_at: &str,
+        outcome: &str,
+        task_id: Option<&str>,
+    ) -> Result<bool> {
+        let result = webhook_source::Entity::update_many()
+            .col_expr(
+                webhook_source::Column::UpdatedAt,
+                Expr::value(received_at.to_string()),
+            )
+            .col_expr(
+                webhook_source::Column::LastReceivedAt,
+                Expr::value(Some(received_at.to_string())),
+            )
+            .col_expr(
+                webhook_source::Column::LastOutcome,
+                Expr::value(Some(outcome.to_string())),
+            )
+            .col_expr(
+                webhook_source::Column::LastTaskId,
+                Expr::value(task_id.map(|value| value.to_string())),
+            )
+            .filter(webhook_source::Column::Id.eq(id.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    #[cfg(test)]
+    pub async fn insert_webhook_event_once(&self, event: webhook_event::Model) -> Result<bool> {
+        let result = webhook_event::Entity::insert(Self::webhook_event_active_model(event))
+            .on_conflict(
+                OnConflict::columns([
+                    webhook_event::Column::SourceId,
+                    webhook_event::Column::IdempotencyKey,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(&self.db)
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotInserted) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn reserve_webhook_event_once(
+        &self,
+        event: webhook_event::Model,
+        dedupe_window_secs: u64,
+    ) -> Result<bool> {
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1)",
+            vec![webhook_event_lock_key(&event.source_id, &event.dedupe_key).into()],
+        ))
+        .await?;
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::seconds(dedupe_window_secs.max(1) as i64))
+        .to_rfc3339();
+        let duplicate = webhook_event::Entity::find()
+            .filter(webhook_event::Column::SourceId.eq(event.source_id.clone()))
+            .filter(webhook_event::Column::DedupeKey.eq(event.dedupe_key.clone()))
+            .filter(webhook_event::Column::ReceivedAt.gte(cutoff))
+            .one(&txn)
+            .await?
+            .is_some();
+        if duplicate {
+            txn.commit().await?;
+            return Ok(false);
+        }
+        let insert_result = webhook_event::Entity::insert(Self::webhook_event_active_model(event))
+            .on_conflict(
+                OnConflict::columns([
+                    webhook_event::Column::SourceId,
+                    webhook_event::Column::IdempotencyKey,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(&txn)
+            .await;
+        match insert_result {
+            Ok(_) => {
+                txn.commit().await?;
+                Ok(true)
+            }
+            Err(sea_orm::DbErr::RecordNotInserted) => {
+                txn.commit().await?;
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub async fn insert_webhook_event(&self, event: webhook_event::Model) -> Result<()> {
+        webhook_event::Entity::insert(Self::webhook_event_active_model(event))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_webhook_event_outcome(
+        &self,
+        id: &str,
+        outcome: &str,
+        matched: bool,
+        queued: bool,
+        task_id: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        webhook_event::Entity::update_many()
+            .col_expr(
+                webhook_event::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now().to_rfc3339()),
+            )
+            .col_expr(
+                webhook_event::Column::Outcome,
+                Expr::value(outcome.to_string()),
+            )
+            .col_expr(webhook_event::Column::Matched, Expr::value(matched))
+            .col_expr(webhook_event::Column::Queued, Expr::value(queued))
+            .col_expr(
+                webhook_event::Column::TaskId,
+                Expr::value(task_id.map(|value| value.to_string())),
+            )
+            .col_expr(
+                webhook_event::Column::Message,
+                Expr::value(message.map(|value| value.to_string())),
+            )
+            .filter(webhook_event::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_webhook_events(
+        &self,
+        source_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<webhook_event::Model>> {
+        let mut query = webhook_event::Entity::find()
+            .order_by_desc(webhook_event::Column::ReceivedAt)
+            .limit(Self::db_limit(limit));
+        if let Some(source_id) = source_id.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(webhook_event::Column::SourceId.eq(source_id.to_string()));
+        }
+        Ok(query.all(&self.db).await?)
+    }
+
+    fn webhook_source_active_model(source: webhook_source::Model) -> webhook_source::ActiveModel {
+        webhook_source::ActiveModel {
+            id: Set(source.id),
+            name: Set(source.name),
+            provider: Set(source.provider),
+            description: Set(source.description),
+            enabled: Set(source.enabled),
+            auth_mode: Set(source.auth_mode),
+            match_mode: Set(source.match_mode),
+            instruction: Set(source.instruction),
+            event_header: Set(source.event_header),
+            secret_header: Set(source.secret_header),
+            signature_timestamp_header: Set(source.signature_timestamp_header),
+            signature_timestamp_tolerance_secs: Set(source.signature_timestamp_tolerance_secs),
+            signature_payload_mode: Set(source.signature_payload_mode),
+            allow_duplicate: Set(source.allow_duplicate),
+            require_approval: Set(source.require_approval),
+            dedupe_window_secs: Set(source.dedupe_window_secs),
+            notify_on_queued: Set(source.notify_on_queued),
+            notify_on_success: Set(source.notify_on_success),
+            notify_on_failure: Set(source.notify_on_failure),
+            output_target: Set(source.output_target),
+            output_channel: Set(source.output_channel),
+            conversation_id: Set(source.conversation_id),
+            created_at: Set(source.created_at),
+            updated_at: Set(source.updated_at),
+            last_received_at: Set(source.last_received_at),
+            last_outcome: Set(source.last_outcome),
+            last_task_id: Set(source.last_task_id),
+        }
+    }
+
+    fn webhook_event_active_model(event: webhook_event::Model) -> webhook_event::ActiveModel {
+        webhook_event::ActiveModel {
+            id: Set(event.id),
+            source_id: Set(event.source_id),
+            source_name: Set(event.source_name),
+            provider: Set(event.provider),
+            received_at: Set(event.received_at),
+            updated_at: Set(event.updated_at),
+            event_type: Set(event.event_type),
+            status: Set(event.status),
+            subject: Set(event.subject),
+            outcome: Set(event.outcome),
+            matched: Set(event.matched),
+            queued: Set(event.queued),
+            message: Set(event.message),
+            event_id: Set(event.event_id),
+            dedupe_key: Set(event.dedupe_key),
+            idempotency_key: Set(event.idempotency_key),
+            payload_hash: Set(event.payload_hash),
+            event_url: Set(event.event_url),
+            payload_excerpt: Set(event.payload_excerpt),
+            task_id: Set(event.task_id),
+            conversation_id: Set(event.conversation_id),
+            severity: Set(event.severity),
+            test_event: Set(event.test_event),
+        }
     }
 
     pub async fn get_encrypted(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -2189,12 +3096,6 @@ impl Storage {
         }
         .insert(&self.db)
         .await?;
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after llm usage insert: {}",
-                e
-            );
-        }
         Ok(())
     }
 
@@ -2805,6 +3706,248 @@ impl Storage {
             .exec(&self.db)
             .await?;
         Ok(result.rows_affected > 0)
+    }
+
+    pub async fn upsert_knowledge_entity(&self, entity: &knowledge_entity::Model) -> Result<()> {
+        knowledge_entity::Entity::insert(knowledge_entity::ActiveModel {
+            id: Set(entity.id.clone()),
+            entity_type: Set(entity.entity_type.clone()),
+            canonical_name: Set(entity.canonical_name.clone()),
+            normalized_name: Set(entity.normalized_name.clone()),
+            project_id: Set(entity.project_id.clone()),
+            status: Set(entity.status.clone()),
+            confidence: Set(entity.confidence),
+            aliases: Set(entity.aliases.clone()),
+            metadata: Set(entity.metadata.clone()),
+            first_seen_at: Set(entity.first_seen_at.clone()),
+            last_seen_at: Set(entity.last_seen_at.clone()),
+            created_at: Set(entity.created_at.clone()),
+            updated_at: Set(entity.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(knowledge_entity::Column::Id)
+                .update_columns([
+                    knowledge_entity::Column::EntityType,
+                    knowledge_entity::Column::CanonicalName,
+                    knowledge_entity::Column::NormalizedName,
+                    knowledge_entity::Column::ProjectId,
+                    knowledge_entity::Column::Status,
+                    knowledge_entity::Column::Confidence,
+                    knowledge_entity::Column::Aliases,
+                    knowledge_entity::Column::Metadata,
+                    knowledge_entity::Column::LastSeenAt,
+                    knowledge_entity::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_knowledge_entity(&self, id: &str) -> Result<Option<knowledge_entity::Model>> {
+        Ok(knowledge_entity::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
+    }
+
+    pub async fn list_knowledge_entities_for_graph(
+        &self,
+        statuses: &[String],
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<knowledge_entity::Model>> {
+        let mut query = knowledge_entity::Entity::find();
+        if !statuses.is_empty() {
+            query = query.filter(knowledge_entity::Column::Status.is_in(statuses.to_vec()));
+        }
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(knowledge_entity::Column::ProjectId.is_null())
+                    .add(knowledge_entity::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(knowledge_entity::Column::ProjectId.is_null()),
+        };
+        Ok(query
+            .order_by_desc(knowledge_entity::Column::UpdatedAt)
+            .limit(Self::db_limit(limit.min(500)))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn upsert_knowledge_relation(
+        &self,
+        relation: &knowledge_relation::Model,
+    ) -> Result<()> {
+        knowledge_relation::Entity::insert(knowledge_relation::ActiveModel {
+            id: Set(relation.id.clone()),
+            source_entity_id: Set(relation.source_entity_id.clone()),
+            target_entity_id: Set(relation.target_entity_id.clone()),
+            relation_type: Set(relation.relation_type.clone()),
+            status: Set(relation.status.clone()),
+            confidence: Set(relation.confidence),
+            project_id: Set(relation.project_id.clone()),
+            valid_from: Set(relation.valid_from.clone()),
+            valid_until: Set(relation.valid_until.clone()),
+            support_count: Set(relation.support_count),
+            contradiction_count: Set(relation.contradiction_count),
+            metadata: Set(relation.metadata.clone()),
+            first_seen_at: Set(relation.first_seen_at.clone()),
+            last_seen_at: Set(relation.last_seen_at.clone()),
+            created_at: Set(relation.created_at.clone()),
+            updated_at: Set(relation.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(knowledge_relation::Column::Id)
+                .update_columns([
+                    knowledge_relation::Column::SourceEntityId,
+                    knowledge_relation::Column::TargetEntityId,
+                    knowledge_relation::Column::RelationType,
+                    knowledge_relation::Column::Status,
+                    knowledge_relation::Column::Confidence,
+                    knowledge_relation::Column::ProjectId,
+                    knowledge_relation::Column::ValidFrom,
+                    knowledge_relation::Column::ValidUntil,
+                    knowledge_relation::Column::SupportCount,
+                    knowledge_relation::Column::ContradictionCount,
+                    knowledge_relation::Column::Metadata,
+                    knowledge_relation::Column::LastSeenAt,
+                    knowledge_relation::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_knowledge_relation(
+        &self,
+        id: &str,
+    ) -> Result<Option<knowledge_relation::Model>> {
+        Ok(knowledge_relation::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
+    }
+
+    pub async fn update_knowledge_relation_status(&self, id: &str, status: &str) -> Result<bool> {
+        let Some(row) = knowledge_relation::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut model: knowledge_relation::ActiveModel = row.into();
+        model.status = Set(status.to_string());
+        model.updated_at = Set(chrono::Utc::now().to_rfc3339());
+        model.update(&self.db).await?;
+        Ok(true)
+    }
+
+    pub async fn list_knowledge_relations_for_entities(
+        &self,
+        entity_ids: &[String],
+        statuses: &[String],
+        relation_types: &[String],
+        limit: u64,
+    ) -> Result<Vec<knowledge_relation::Model>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = knowledge_relation::Entity::find().filter(
+            Condition::any()
+                .add(knowledge_relation::Column::SourceEntityId.is_in(entity_ids.to_vec()))
+                .add(knowledge_relation::Column::TargetEntityId.is_in(entity_ids.to_vec())),
+        );
+        if !statuses.is_empty() {
+            query = query.filter(knowledge_relation::Column::Status.is_in(statuses.to_vec()));
+        }
+        if !relation_types.is_empty() {
+            query = query
+                .filter(knowledge_relation::Column::RelationType.is_in(relation_types.to_vec()));
+        }
+        Ok(query
+            .order_by_desc(knowledge_relation::Column::UpdatedAt)
+            .limit(Self::db_limit(limit.min(1_000)))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn upsert_knowledge_relation_evidence(
+        &self,
+        evidence: &knowledge_relation_evidence::Model,
+    ) -> Result<()> {
+        knowledge_relation_evidence::Entity::insert(knowledge_relation_evidence::ActiveModel {
+            id: Set(evidence.id.clone()),
+            relation_id: Set(evidence.relation_id.clone()),
+            evidence_kind: Set(evidence.evidence_kind.clone()),
+            evidence_ref: Set(evidence.evidence_ref.clone()),
+            memory_id: Set(evidence.memory_id.clone()),
+            message_id: Set(evidence.message_id.clone()),
+            document_id: Set(evidence.document_id.clone()),
+            project_id: Set(evidence.project_id.clone()),
+            conversation_id: Set(evidence.conversation_id.clone()),
+            polarity: Set(evidence.polarity.clone()),
+            confidence: Set(evidence.confidence),
+            excerpt: Set(evidence.excerpt.clone()),
+            metadata: Set(evidence.metadata.clone()),
+            created_at: Set(evidence.created_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(knowledge_relation_evidence::Column::Id)
+                .update_columns([
+                    knowledge_relation_evidence::Column::RelationId,
+                    knowledge_relation_evidence::Column::EvidenceKind,
+                    knowledge_relation_evidence::Column::EvidenceRef,
+                    knowledge_relation_evidence::Column::MemoryId,
+                    knowledge_relation_evidence::Column::MessageId,
+                    knowledge_relation_evidence::Column::DocumentId,
+                    knowledge_relation_evidence::Column::ProjectId,
+                    knowledge_relation_evidence::Column::ConversationId,
+                    knowledge_relation_evidence::Column::Polarity,
+                    knowledge_relation_evidence::Column::Confidence,
+                    knowledge_relation_evidence::Column::Excerpt,
+                    knowledge_relation_evidence::Column::Metadata,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_knowledge_relation_evidence_for_relations(
+        &self,
+        relation_ids: &[String],
+        limit: u64,
+    ) -> Result<Vec<knowledge_relation_evidence::Model>> {
+        if relation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(knowledge_relation_evidence::Entity::find()
+            .filter(knowledge_relation_evidence::Column::RelationId.is_in(relation_ids.to_vec()))
+            .order_by_desc(knowledge_relation_evidence::Column::CreatedAt)
+            .limit(Self::db_limit(limit.min(1_000)))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn list_knowledge_relation_evidence_for_memory(
+        &self,
+        memory_id: &str,
+        limit: u64,
+    ) -> Result<Vec<knowledge_relation_evidence::Model>> {
+        let memory_id = memory_id.trim();
+        if memory_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(knowledge_relation_evidence::Entity::find()
+            .filter(knowledge_relation_evidence::Column::MemoryId.eq(memory_id.to_string()))
+            .order_by_desc(knowledge_relation_evidence::Column::CreatedAt)
+            .limit(Self::db_limit(limit.min(1_000)))
+            .all(&self.db)
+            .await?)
     }
 
     /// Insert a task
@@ -3538,8 +4681,12 @@ impl Storage {
             task_description: Set(encrypt_storage_string(&session.task_description)?),
             channel: Set(session.channel.clone()),
             chat_id: Set(encrypt_optional_storage_string(session.chat_id.as_deref())?),
-            profile_id: Set(encrypt_optional_storage_string(session.profile_id.as_deref())?),
-            profile_name: Set(encrypt_optional_storage_string(session.profile_name.as_deref())?),
+            profile_id: Set(encrypt_optional_storage_string(
+                session.profile_id.as_deref(),
+            )?),
+            profile_name: Set(encrypt_optional_storage_string(
+                session.profile_name.as_deref(),
+            )?),
             status_detail: Set(encrypt_optional_storage_string(
                 session.status_detail.as_deref(),
             )?),
@@ -3877,6 +5024,7 @@ impl Storage {
     // ==================== Experience Graph ====================
 
     pub async fn upsert_experience_run(&self, run: &experience_run::Model) -> Result<()> {
+        let txn = self.db.begin().await?;
         experience_run::Entity::insert(experience_run::ActiveModel {
             id: Set(run.id.clone()),
             execution_run_id: Set(run.execution_run_id.clone()),
@@ -3913,42 +5061,20 @@ impl Storage {
         })
         .on_conflict(
             OnConflict::column(experience_run::Column::Id)
-                .update_columns([
-                    experience_run::Column::ExecutionRunId,
-                    experience_run::Column::TraceId,
-                    experience_run::Column::ConversationId,
-                    experience_run::Column::ProjectId,
-                    experience_run::Column::Channel,
-                    experience_run::Column::Scope,
-                    experience_run::Column::IntentKey,
-                    experience_run::Column::TaskType,
-                    experience_run::Column::RequestText,
-                    experience_run::Column::ToolSequenceDigest,
-                    experience_run::Column::ToolSequenceJson,
-                    experience_run::Column::StrategyVersion,
-                    experience_run::Column::PolicyVersion,
-                    experience_run::Column::PromptVersion,
-                    experience_run::Column::ModelSlot,
-                    experience_run::Column::SuccessState,
-                    experience_run::Column::CorrectionState,
-                    experience_run::Column::OutcomeSummary,
-                    experience_run::Column::FailureReason,
-                    experience_run::Column::Metadata,
-                    experience_run::Column::Consolidated,
-                    experience_run::Column::AcceptedAt,
-                    experience_run::Column::CorrectedAt,
-                    experience_run::Column::HeuristicReflected,
-                    experience_run::Column::HeuristicReflectionStatus,
-                    experience_run::Column::HeuristicReflectionAttemptedAt,
-                    experience_run::Column::HeuristicReflectionCompletedAt,
-                    experience_run::Column::HeuristicLessonId,
-                    experience_run::Column::HeuristicReflectionError,
-                    experience_run::Column::UpdatedAt,
-                ])
+                .update_columns(EXPERIENCE_RUN_LIGHT_UPSERT_COLUMNS.iter().copied())
                 .to_owned(),
         )
-        .exec(&self.db)
+        .exec(&txn)
         .await?;
+        let current = experience_run::Entity::find_by_id(run.id.clone())
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| anyhow!("Experience run '{}' missing after upsert", run.id))?;
+        if let Some(model) = Self::experience_run_heavy_update_active_model(&current, run) {
+            model.update(&txn).await?;
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -4485,6 +5611,214 @@ impl Storage {
         })
     }
 
+    fn experience_run_heavy_update_active_model(
+        current: &experience_run::Model,
+        next: &experience_run::Model,
+    ) -> Option<experience_run::ActiveModel> {
+        let mut model = experience_run::ActiveModel {
+            id: Unchanged(next.id.clone()),
+            ..Default::default()
+        };
+        let mut changed = false;
+
+        set_if_changed(
+            &mut model.request_text,
+            &current.request_text,
+            &next.request_text,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.tool_sequence_json,
+            &current.tool_sequence_json,
+            &next.tool_sequence_json,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.outcome_summary,
+            &current.outcome_summary,
+            &next.outcome_summary,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.failure_reason,
+            &current.failure_reason,
+            &next.failure_reason,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.metadata,
+            &current.metadata,
+            &next.metadata,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.heuristic_reflection_error,
+            &current.heuristic_reflection_error,
+            &next.heuristic_reflection_error,
+            &mut changed,
+        );
+
+        changed.then_some(model)
+    }
+
+    fn experience_item_heavy_update_active_model(
+        current: &experience_item::Model,
+        next: &experience_item::Model,
+    ) -> Option<experience_item::ActiveModel> {
+        let mut model = experience_item::ActiveModel {
+            id: Unchanged(next.id.clone()),
+            ..Default::default()
+        };
+        let mut changed = false;
+
+        set_if_changed(
+            &mut model.content,
+            &current.content,
+            &next.content,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.metadata,
+            &current.metadata,
+            &next.metadata,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.embedding,
+            &current.embedding,
+            &next.embedding,
+            &mut changed,
+        );
+
+        changed.then_some(model)
+    }
+
+    fn memory_capture_event_heavy_update_active_model(
+        current: &memory_capture_event::Model,
+        next: &memory_capture_event::Model,
+    ) -> Option<memory_capture_event::ActiveModel> {
+        let mut model = memory_capture_event::ActiveModel {
+            id: Unchanged(next.id.clone()),
+            ..Default::default()
+        };
+        let mut changed = false;
+
+        set_if_changed(
+            &mut model.attempt_metadata,
+            &current.attempt_metadata,
+            &next.attempt_metadata,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.error_history,
+            &current.error_history,
+            &next.error_history,
+            &mut changed,
+        );
+
+        changed.then_some(model)
+    }
+
+    fn memory_operation_heavy_update_active_model(
+        current: &memory_operation::Model,
+        next: &memory_operation::Model,
+    ) -> Result<Option<memory_operation::ActiveModel>> {
+        let mut model = memory_operation::ActiveModel {
+            id: Unchanged(next.id.clone()),
+            ..Default::default()
+        };
+        let mut changed = false;
+
+        set_encrypted_optional_string_if_changed(
+            &mut model.value,
+            &current.value,
+            &next.value,
+            &mut changed,
+        )?;
+        set_encrypted_optional_string_if_changed(
+            &mut model.sensitive_reason,
+            &current.sensitive_reason,
+            &next.sensitive_reason,
+            &mut changed,
+        )?;
+        set_encrypted_optional_string_if_changed(
+            &mut model.rationale,
+            &current.rationale,
+            &next.rationale,
+            &mut changed,
+        )?;
+        set_if_changed(
+            &mut model.evidence_refs,
+            &current.evidence_refs,
+            &next.evidence_refs,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.model_metadata,
+            &current.model_metadata,
+            &next.model_metadata,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.apply_metadata,
+            &current.apply_metadata,
+            &next.apply_metadata,
+            &mut changed,
+        );
+        set_encrypted_optional_string_if_changed(
+            &mut model.review_notes,
+            &current.review_notes,
+            &next.review_notes,
+            &mut changed,
+        )?;
+
+        Ok(changed.then_some(model))
+    }
+
+    fn semantic_work_unit_heavy_update_active_model(
+        current: &semantic_work_unit::Model,
+        next: &semantic_work_unit::Model,
+    ) -> Result<Option<semantic_work_unit::ActiveModel>> {
+        let mut model = semantic_work_unit::ActiveModel {
+            id: Unchanged(next.id.clone()),
+            ..Default::default()
+        };
+        let mut changed = false;
+
+        set_encrypted_string_if_changed(
+            &mut model.title,
+            &current.title,
+            &next.title,
+            &mut changed,
+        )?;
+        set_encrypted_string_if_changed(
+            &mut model.summary,
+            &current.summary,
+            &next.summary,
+            &mut changed,
+        )?;
+        set_encrypted_string_if_changed(
+            &mut model.content_preview,
+            &current.content_preview,
+            &next.content_preview,
+            &mut changed,
+        )?;
+        set_if_changed(
+            &mut model.metadata,
+            &current.metadata,
+            &next.metadata,
+            &mut changed,
+        );
+        set_if_changed(
+            &mut model.embedding,
+            &current.embedding,
+            &next.embedding,
+            &mut changed,
+        );
+
+        Ok(changed.then_some(model))
+    }
+
     fn memory_evidence_link_active_model(
         link: &memory_evidence_link::Model,
     ) -> memory_evidence_link::ActiveModel {
@@ -4630,28 +5964,19 @@ impl Storage {
         experience_item::Entity::insert(Self::experience_item_active_model(item))
             .on_conflict(
                 OnConflict::column(experience_item::Column::Id)
-                    .update_columns([
-                        experience_item::Column::Kind,
-                        experience_item::Column::Scope,
-                        experience_item::Column::ProjectId,
-                        experience_item::Column::ConversationId,
-                        experience_item::Column::Title,
-                        experience_item::Column::Content,
-                        experience_item::Column::NormalizedKey,
-                        experience_item::Column::Confidence,
-                        experience_item::Column::SupportCount,
-                        experience_item::Column::ContradictionCount,
-                        experience_item::Column::Status,
-                        experience_item::Column::Metadata,
-                        experience_item::Column::LastSupportedAt,
-                        experience_item::Column::LastContradictedAt,
-                        experience_item::Column::UpdatedAt,
-                        experience_item::Column::Embedding,
-                    ])
+                    .update_columns(EXPERIENCE_ITEM_LIGHT_UPSERT_COLUMNS.iter().copied())
                     .to_owned(),
             )
             .exec(conn)
             .await?;
+        let current = experience_item::Entity::find_by_id(item.id.clone())
+            .lock_exclusive()
+            .one(conn)
+            .await?
+            .ok_or_else(|| anyhow!("Experience item '{}' missing after upsert", item.id))?;
+        if let Some(model) = Self::experience_item_heavy_update_active_model(&current, item) {
+            model.update(conn).await?;
+        }
         if let Some(event_type) = Self::experience_item_recall_event_type(previous.as_ref(), item) {
             Self::record_experience_item_recall_event_conn(
                 conn,
@@ -5332,6 +6657,44 @@ impl Storage {
         Ok(items)
     }
 
+    pub async fn list_memory_experience_items_for_graph(
+        &self,
+        statuses: &[String],
+        project_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<experience_item::Model>> {
+        let mut query = experience_item::Entity::find().filter(
+            experience_item::Column::Kind
+                .is_in(["personal_fact".to_string(), "constraint".to_string()]),
+        );
+        if !statuses.is_empty() {
+            query = query.filter(experience_item::Column::Status.is_in(statuses.to_vec()));
+        }
+        query = match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(pid) => query.filter(
+                Condition::any()
+                    .add(experience_item::Column::ProjectId.is_null())
+                    .add(experience_item::Column::ProjectId.eq(pid.to_string())),
+            ),
+            None => query.filter(experience_item::Column::ProjectId.is_null()),
+        };
+        let capped_limit = limit.min(Self::MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY);
+        let mut items = query
+            .order_by_desc(experience_item::Column::UpdatedAt)
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
+            .await?;
+        items.sort_by(|left, right| {
+            experience_item_kind_rank(&left.kind)
+                .cmp(&experience_item_kind_rank(&right.kind))
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| right.support_count.cmp(&left.support_count))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        items.truncate(capped_limit as usize);
+        Ok(items)
+    }
+
     pub async fn search_experience_items(
         &self,
         query: &str,
@@ -5794,28 +7157,24 @@ impl Storage {
         &self,
         event: &memory_capture_event::Model,
     ) -> Result<()> {
+        let txn = self.db.begin().await?;
         memory_capture_event::Entity::insert(Self::memory_capture_event_active_model(event))
             .on_conflict(
                 OnConflict::column(memory_capture_event::Column::Id)
-                    .update_columns([
-                        memory_capture_event::Column::SourceMessageId,
-                        memory_capture_event::Column::ConversationId,
-                        memory_capture_event::Column::ProjectId,
-                        memory_capture_event::Column::Channel,
-                        memory_capture_event::Column::Status,
-                        memory_capture_event::Column::CaptureKind,
-                        memory_capture_event::Column::SourceHash,
-                        memory_capture_event::Column::AttemptMetadata,
-                        memory_capture_event::Column::ErrorHistory,
-                        memory_capture_event::Column::ReplayCount,
-                        memory_capture_event::Column::NextRetryAt,
-                        memory_capture_event::Column::CompletedAt,
-                        memory_capture_event::Column::UpdatedAt,
-                    ])
+                    .update_columns(MEMORY_CAPTURE_EVENT_LIGHT_UPSERT_COLUMNS.iter().copied())
                     .to_owned(),
             )
-            .exec(&self.db)
+            .exec(&txn)
             .await?;
+        let current = memory_capture_event::Entity::find_by_id(event.id.clone())
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| anyhow!("Memory capture event '{}' missing after upsert", event.id))?;
+        if let Some(model) = Self::memory_capture_event_heavy_update_active_model(&current, event) {
+            model.update(&txn).await?;
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -6017,41 +7376,25 @@ impl Storage {
     }
 
     pub async fn upsert_memory_operation(&self, operation: &memory_operation::Model) -> Result<()> {
+        let txn = self.db.begin().await?;
         memory_operation::Entity::insert(Self::memory_operation_active_model(operation)?)
             .on_conflict(
                 OnConflict::column(memory_operation::Column::Id)
-                    .update_columns([
-                        memory_operation::Column::CaptureEventId,
-                        memory_operation::Column::OperationType,
-                        memory_operation::Column::Status,
-                        memory_operation::Column::TargetMemoryId,
-                        memory_operation::Column::AppliedMemoryId,
-                        memory_operation::Column::Key,
-                        memory_operation::Column::Value,
-                        memory_operation::Column::MemoryKind,
-                        memory_operation::Column::Durability,
-                        memory_operation::Column::Scope,
-                        memory_operation::Column::ProjectId,
-                        memory_operation::Column::ConversationId,
-                        memory_operation::Column::Confidence,
-                        memory_operation::Column::LooksSensitive,
-                        memory_operation::Column::SensitiveReason,
-                        memory_operation::Column::ValidFrom,
-                        memory_operation::Column::ExpiresAt,
-                        memory_operation::Column::ReviewAt,
-                        memory_operation::Column::Rationale,
-                        memory_operation::Column::EvidenceRefs,
-                        memory_operation::Column::ModelMetadata,
-                        memory_operation::Column::ApplyMetadata,
-                        memory_operation::Column::AppliedAt,
-                        memory_operation::Column::ReviewedAt,
-                        memory_operation::Column::ReviewNotes,
-                        memory_operation::Column::UpdatedAt,
-                    ])
+                    .update_columns(MEMORY_OPERATION_LIGHT_UPSERT_COLUMNS.iter().copied())
                     .to_owned(),
             )
-            .exec(&self.db)
+            .exec(&txn)
             .await?;
+        let current = memory_operation::Entity::find_by_id(operation.id.clone())
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| anyhow!("Memory operation '{}' missing after upsert", operation.id))?;
+        if let Some(model) = Self::memory_operation_heavy_update_active_model(&current, operation)?
+        {
+            model.update(&txn).await?;
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -6688,7 +8031,18 @@ impl Storage {
     }
 
     pub async fn latest_migration_version(&self) -> Result<Option<i64>> {
-        Ok(None)
+        match self
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT MAX(version) AS version FROM schema_migrations".to_string(),
+            ))
+            .await
+        {
+            Ok(Some(row)) => Ok(row.try_get::<i64>("", "version").ok()),
+            Ok(None) => Ok(None),
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn expected_migration_version(&self) -> i64 {
@@ -7129,12 +8483,6 @@ impl Storage {
         }
         .insert(&self.db)
         .await?;
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after delegation insert: {}",
-                e
-            );
-        }
         Ok(())
     }
 
@@ -7172,12 +8520,6 @@ impl Storage {
         )
         .exec(&self.db)
         .await?;
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after delegation upsert: {}",
-                e
-            );
-        }
         Ok(())
     }
 
@@ -7234,31 +8576,24 @@ impl Storage {
 
     /// Upsert a derived semantic work unit used by reflection and clustering.
     pub async fn upsert_semantic_work_unit(&self, unit: &semantic_work_unit::Model) -> Result<()> {
+        let txn = self.db.begin().await?;
         semantic_work_unit::Entity::insert(Self::semantic_work_unit_active_model(unit)?)
             .on_conflict(
                 OnConflict::column(semantic_work_unit::Column::Id)
-                    .update_columns([
-                        semantic_work_unit::Column::SourceKind,
-                        semantic_work_unit::Column::SourceId,
-                        semantic_work_unit::Column::ConversationId,
-                        semantic_work_unit::Column::ProjectId,
-                        semantic_work_unit::Column::Channel,
-                        semantic_work_unit::Column::Title,
-                        semantic_work_unit::Column::Summary,
-                        semantic_work_unit::Column::ContentPreview,
-                        semantic_work_unit::Column::TextHash,
-                        semantic_work_unit::Column::OccurredAt,
-                        semantic_work_unit::Column::PeriodStart,
-                        semantic_work_unit::Column::PeriodEnd,
-                        semantic_work_unit::Column::MessageCount,
-                        semantic_work_unit::Column::Metadata,
-                        semantic_work_unit::Column::UpdatedAt,
-                        semantic_work_unit::Column::Embedding,
-                    ])
+                    .update_columns(SEMANTIC_WORK_UNIT_LIGHT_UPSERT_COLUMNS.iter().copied())
                     .to_owned(),
             )
-            .exec(&self.db)
+            .exec(&txn)
             .await?;
+        let current = semantic_work_unit::Entity::find_by_id(unit.id.clone())
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| anyhow!("Semantic work unit '{}' missing after upsert", unit.id))?;
+        if let Some(model) = Self::semantic_work_unit_heavy_update_active_model(&current, unit)? {
+            model.update(&txn).await?;
+        }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -7891,13 +9226,6 @@ impl Storage {
             .exec(&self.db)
             .await?;
 
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after message insert: {}",
-                e
-            );
-        }
-
         Ok(())
     }
 
@@ -8209,6 +9537,26 @@ impl Storage {
         Ok(docs)
     }
 
+    /// Get a single user-visible document by id.
+    pub async fn get_document(&self, id: &str) -> Result<Option<document::Model>> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let Some(mut doc) = document::Entity::find_by_id(id.to_string())
+            .filter(Self::user_visible_document_filter())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        doc.filename = decrypt_storage_string(&doc.filename);
+        if !Self::document_is_user_visible_after_load(&doc) {
+            return Ok(None);
+        }
+        Ok(Some(doc))
+    }
+
     /// Count documents
     pub async fn count_documents(&self, project_id: Option<&str>) -> Result<u64> {
         let mut query = document::Entity::find().filter(Self::user_visible_document_filter());
@@ -8287,6 +9635,39 @@ impl Storage {
         let mut chunks = document_chunk::Entity::find()
             .filter(document_chunk::Column::DocumentId.eq(document_id))
             .order_by_asc(document_chunk::Column::ChunkIndex)
+            .all(&self.db)
+            .await?;
+        for chunk in &mut chunks {
+            chunk.content = decrypt_storage_string(&chunk.content);
+        }
+        Ok(chunks)
+    }
+
+    /// Get a bounded document chunk window for background extraction.
+    pub async fn list_document_chunks_for_document_window(
+        &self,
+        document_id: &str,
+        min_chunk_index: i32,
+        limit: u64,
+    ) -> Result<Vec<document_chunk::Model>> {
+        let document_id = document_id.trim();
+        if document_id.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let visible = document::Entity::find_by_id(document_id.to_string())
+            .filter(Self::user_visible_document_filter())
+            .one(&self.db)
+            .await?
+            .is_some();
+        if !visible {
+            return Ok(Vec::new());
+        }
+
+        let mut chunks = document_chunk::Entity::find()
+            .filter(document_chunk::Column::DocumentId.eq(document_id.to_string()))
+            .filter(document_chunk::Column::ChunkIndex.gte(min_chunk_index.max(0)))
+            .order_by_asc(document_chunk::Column::ChunkIndex)
+            .limit(Self::db_limit(limit.min(64)))
             .all(&self.db)
             .await?;
         for chunk in &mut chunks {
@@ -8912,12 +10293,6 @@ impl Storage {
         }
         .insert(&self.db)
         .await?;
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after proof insert: {}",
-                e
-            );
-        }
         Ok(())
     }
 
@@ -9036,12 +10411,6 @@ impl Storage {
             } else {
                 return Err(error.into());
             }
-        }
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after trace insert: {}",
-                e
-            );
         }
         Ok(())
     }
@@ -9193,12 +10562,6 @@ impl Storage {
         }
         .insert(&self.db)
         .await?;
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after security log insert: {}",
-                e
-            );
-        }
         Ok(())
     }
 
@@ -9223,12 +10586,6 @@ impl Storage {
             .await?;
         }
         txn.commit().await?;
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after security log batch insert: {}",
-                e
-            );
-        }
         Ok(())
     }
 
@@ -9507,12 +10864,6 @@ impl Storage {
             } else {
                 return Err(error.into());
             }
-        }
-        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
-            tracing::warn!(
-                "Storage housekeeping purge failed after operational log insert: {}",
-                e
-            );
         }
         Ok(())
     }
@@ -10191,6 +11542,46 @@ impl Storage {
         Ok(())
     }
 
+    async fn purge_memory_operation_batches(&self, memory_operation_cutoff: &str) -> Result<()> {
+        loop {
+            let txn = self.db.begin().await?;
+            let rows = txn
+                .query_all(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT id \
+                     FROM memory_operations \
+                     WHERE updated_at < $1 \
+                       AND (applied_at IS NOT NULL OR reviewed_at IS NOT NULL) \
+                     ORDER BY updated_at ASC \
+                     LIMIT $2",
+                    vec![
+                        memory_operation_cutoff.to_string().into(),
+                        Self::HOUSEKEEPING_PURGE_BATCH_SIZE.into(),
+                    ],
+                ))
+                .await?;
+            let operation_ids = rows
+                .into_iter()
+                .filter_map(|row| row.try_get::<String>("", "id").ok())
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>();
+            if operation_ids.is_empty() {
+                txn.commit().await?;
+                break;
+            }
+            Self::delete_rows_by_ids(
+                &txn,
+                "memory_evidence_links",
+                "operation_id",
+                &operation_ids,
+            )
+            .await?;
+            Self::delete_rows_by_ids(&txn, "memory_operations", "id", &operation_ids).await?;
+            txn.commit().await?;
+        }
+        Ok(())
+    }
+
     async fn maybe_purge_housekeeping_tables(&self) -> Result<()> {
         let now = chrono::Utc::now();
         let lifecycle = crate::core::data_lifecycle::load_data_lifecycle_settings(self).await;
@@ -10228,7 +11619,12 @@ impl Storage {
             && lifecycle.experience_item_retention_days == 0
             && lifecycle.procedural_pattern_retention_days == 0
             && lifecycle.recall_event_retention_days == 0
-            && lifecycle.recall_test_retention_days == 0;
+            && lifecycle.recall_test_retention_days == 0
+            && lifecycle.readiness_evaluation_retention_days == 0
+            && lifecycle.memory_capture_event_retention_days == 0
+            && lifecycle.memory_operation_retention_days == 0
+            && lifecycle.memory_evidence_link_retention_days == 0
+            && lifecycle.semantic_work_unit_retention_days == 0;
 
         if all_retention_disabled {
             self.set(
@@ -10435,6 +11831,65 @@ impl Storage {
             )
             .await?;
         }
+        if lifecycle.readiness_evaluation_retention_days > 0 {
+            let readiness_cutoff = (now
+                - chrono::Duration::days(lifecycle.readiness_evaluation_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "readiness_evaluations",
+                "id",
+                "created_at",
+                &readiness_cutoff,
+                "",
+            )
+            .await?;
+        }
+        if lifecycle.memory_capture_event_retention_days > 0 {
+            let memory_capture_cutoff = (now
+                - chrono::Duration::days(lifecycle.memory_capture_event_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "memory_capture_events",
+                "id",
+                "completed_at",
+                &memory_capture_cutoff,
+                "",
+            )
+            .await?;
+        }
+        if lifecycle.memory_operation_retention_days > 0 {
+            let memory_operation_cutoff = (now
+                - chrono::Duration::days(lifecycle.memory_operation_retention_days as i64))
+            .to_rfc3339();
+            self.purge_memory_operation_batches(&memory_operation_cutoff)
+                .await?;
+        }
+        if lifecycle.memory_evidence_link_retention_days > 0 {
+            let memory_evidence_cutoff = (now
+                - chrono::Duration::days(lifecycle.memory_evidence_link_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "memory_evidence_links",
+                "id",
+                "created_at",
+                &memory_evidence_cutoff,
+                "",
+            )
+            .await?;
+        }
+        if lifecycle.semantic_work_unit_retention_days > 0 {
+            let semantic_work_unit_cutoff = (now
+                - chrono::Duration::days(lifecycle.semantic_work_unit_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "semantic_work_units",
+                "id",
+                "occurred_at",
+                &semantic_work_unit_cutoff,
+                "",
+            )
+            .await?;
+        }
         if lifecycle.background_session_retention_days > 0 {
             let background_session_cutoff = (now
                 - chrono::Duration::days(lifecycle.background_session_retention_days as i64))
@@ -10510,5 +11965,9 @@ impl Storage {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn run_housekeeping_purge(&self) -> Result<()> {
+        self.maybe_purge_housekeeping_tables().await
     }
 }

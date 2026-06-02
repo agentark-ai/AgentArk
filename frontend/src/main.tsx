@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { initializeUiSession } from "./api/client";
 import { appTheme } from "./theme";
+import "./fonts.css";
 import "./styles.css";
 
 const QUERY_STALE_TIME_MS = 10_000;

@@ -121,22 +121,21 @@ impl SpinePromptBundle {
     }
 
     pub(super) fn fragment_metadata_json(&self) -> serde_json::Value {
-        serde_json::json!(
-            self.ordered_fragments()
-                .into_iter()
-                .map(|fragment| {
-                    serde_json::json!({
-                        "id": fragment.id,
-                        "version": fragment.version.clone(),
-                        "layer": fragment.layer.as_str(),
-                        "evolvable": fragment.evolvable,
-                        "hash": fragment.content_hash(),
-                        "chars": fragment.char_count(),
-                        "estimated_tokens": fragment.estimated_tokens(),
-                    })
+        serde_json::json!(self
+            .ordered_fragments()
+            .into_iter()
+            .map(|fragment| {
+                serde_json::json!({
+                    "id": fragment.id,
+                    "version": fragment.version.clone(),
+                    "layer": fragment.layer.as_str(),
+                    "evolvable": fragment.evolvable,
+                    "hash": fragment.content_hash(),
+                    "chars": fragment.char_count(),
+                    "estimated_tokens": fragment.estimated_tokens(),
                 })
-                .collect::<Vec<_>>()
-        )
+            })
+            .collect::<Vec<_>>())
     }
 }
 
@@ -199,6 +198,10 @@ pub(super) fn build_spine_prompt_bundle(
             stable_fragment(
                 "spine.primitive_schema_summary",
                 primitive_schema_summary_fragment(primitive_names),
+            ),
+            stable_fragment(
+                "spine.tool_call_description_contract",
+                tool_call_description_contract_fragment(),
             ),
             stable_fragment(
                 "spine.tool_result_contract",
@@ -324,6 +327,9 @@ fn non_evolvable_safety_fragment() -> &'static str {
 fn authorization_and_credentials_fragment() -> &'static str {
     "When the user asks to set up, connect, install, inspect, or change an external capability, integration, connector, plugin, MCP server, messaging/notification channel, API, or provider and does not explicitly name another client as the target, treat AgentArk itself as the target runtime. \
      Use resource_rw integration kinds to inspect existing surfaces, save non-secret configuration, register generated actions, or report the exact secure credential step that remains. \
+     Prefer AgentArk-native integration substrates: built-in integrations when already supported, extension packs when a bundled/manifest pack or explicit pack source is available, and custom APIs for official HTTP, REST, or GraphQL provider APIs. \
+     Use an MCP server only when the user or provider source explicitly asks AgentArk to configure an MCP transport/server, or supplies concrete MCP transport details such as an MCP endpoint, stdio command, or MCP manifest. Do not choose MCP merely because a community MCP package, npm package, or third-party wrapper exists for the provider. \
+     For custom APIs, choose the auth shape from provider evidence: API keys sent in an Authorization header without a Bearer prefix are api_key_header with auth_header_name=Authorization; Bearer auth is only for docs or sources that require a Bearer-prefixed token or OAuth access token. \
      Treat an external integration or channel as connected only when the runtime reports it configured and auth-ready; configured-but-unauthenticated surfaces are not execution-ready. If readiness is unknown and the requested action depends on that external surface, inspect the integration/channel status before using it. \
      Treat bundled iPhone and Android companions as notification/approval devices only unless the runtime reports concrete declared commands for more; do not claim they can read SMS, iMessage, photos, camera, location, or Shortcuts. \
      When a secret is still needed, direct the user to the returned Settings or secure credential entry path; do not ask them to paste API keys, passwords, tokens, or private credentials into ordinary chat. \
@@ -340,6 +346,12 @@ fn primitive_schema_summary_fragment(primitive_names: &[&str]) -> String {
     )
 }
 
+fn tool_call_description_contract_fragment() -> &'static str {
+    "Every tool call must include `_describe`: a brief present-tense, user-facing description of this exact call. \
+     Prefer the target or outcome over repeating the tool name. Keep `_describe` under 80 characters. \
+     Do not put JSON, credentials, secrets, hidden chain-of-thought, or internal IDs in `_describe`; it is UI metadata only, not an execution argument."
+}
+
 fn tool_result_contract_fragment() -> &'static str {
     "Tools and results are source of truth. Do not invent tool results, IDs, links, schedules, managed resources, credentials, notifications, or filesystem paths. \
      A successful resource create/update result is authoritative. Do not redeploy, rewrite, browse, read back, or repeatedly status-check the same resource unless the returned status is pending/restoring, the user asked for visual/runtime verification, or new information changes the target."
@@ -347,13 +359,13 @@ fn tool_result_contract_fragment() -> &'static str {
 
 fn tool_use_style_policy_fragment() -> &'static str {
     "Use search for public discovery and research. Use fetch for HTTP and integration reads. Use browse for real browser interaction. \
-     Use code_exec for sandboxed commands, tests, builds, parsing, and local analysis. Use pdf_generate for complete PDF document deliverables so the PDF is saved as a managed artifact directly. Use resource_rw for backed durable resources such as files, app services, dashboards, watchers, scheduled tasks, background sessions, conversations, goals, integrations, custom APIs, custom messaging channels, extension packs, MCP servers, skills, and skill marketplaces. \
+     Use code_exec for sandboxed commands, tests, builds, parsing, and local analysis. For diagnostics or repair, code_exec may run ordered command probes such as version checks, installed-package checks, logs, builds, and tests; call it repeatedly or with a small script when later steps depend on earlier evidence. code_exec has its own isolated /workspace and does not automatically contain files staged by file_write; inspect staged files with file_read/file_search, pass explicit input files, or use app_deploy source_dir for staged app source. Use pdf_generate for complete PDF document deliverables so the PDF is saved as a managed artifact directly. Use app_deploy for generated browser-runnable apps, dashboards, pages, games, tools, repo deployments, and app patches. Use file_read/file_search/file_write/file_patch/file_delete for direct file work and staged app source; generated app source staged with /workspace-style paths is stored in AgentArk's data-owned workspace, not the product source checkout. Use skill_manage for generated or imported skills. Use resource_rw for backed durable resource lifecycle and registry operations such as app service status/control, watchers, scheduled tasks, background sessions, conversations, goals, integrations, custom APIs, custom messaging channels, extension packs, MCP servers, skill lifecycle/status, and skill marketplaces. \
      Use delegate when another agent or service should own execution. When using code_exec with inline code, provide the execution language.\n\n\
      When the current turn includes visual attachments and the user's intent depends on visible content, inspect that visual evidence before diagnosing, editing, or finalizing. \
      The current model may receive image attachments directly; if direct visual content is unavailable or insufficient, use an available visual-analysis capability from the current tool schemas with the upload id from the request context.\n\n\
      Finish every requested deliverable before the final answer. If the next step is to save, deploy, schedule, edit, or fetch something, call the appropriate primitive instead of describing that future step.\n\n\
      When all information needed for multiple independent tool calls is already available, issue those tool calls together in the same assistant turn so the runtime can execute them in parallel; do not serialize app creation, document saves, status reads, or other independent work across extra model turns. \
-     Before each tool call or parallel batch, emit one short natural-prose line (about 5-15 words) telling the user what you are about to do next (e.g., \"Checking your calendar.\", \"Saving the report.\", \"Searching recent papers.\"). This keeps the user informed during long runs so the chat never goes silent while work is in flight. Do not pad with multi-paragraph explanations, justifications, or restated user input; reserve longer prose for the final answer or a real blocker."
+     Before each tool call or parallel batch, emit one short normal assistant sentence telling the user what you are doing next in task-specific terms. This sentence is user-visible progress prose, separate from `_describe`, which remains tool-call metadata only. Keep progress prose brief and concrete; do not pad with multi-paragraph explanations, justifications, restated user input, tool names by themselves, JSON, code, secrets, hidden reasoning, or internal IDs. Reserve longer prose for the final answer or a real blocker."
 }
 
 fn source_grounding_policy_fragment() -> &'static str {
@@ -371,13 +383,15 @@ fn source_grounding_policy_fragment() -> &'static str {
 }
 
 fn artifact_delivery_policy_fragment() -> &'static str {
-    "When the user wants a browser-viewable page, HTML report, dashboard, app, game, tool, or other UI artifact, deliver it through resource_rw as app_service or dashboard so the user gets an accessible /apps/ URL. \
+    "When the user wants a browser-viewable page, HTML report, dashboard, app, game, tool, or other UI artifact, deliver it through app_deploy so the user gets an accessible /apps/ URL. \
      Do not return container paths such as /app/..., /data/..., or /workspace/... as a delivery surface.\n\n\
      If the requested app, dashboard, page, tool, widget, or UI artifact needs data, implement data loading, refresh controls, dedupe, ranking, fallback, persistence, and last-good-data behavior in the artifact itself whenever the artifact can access the source at runtime. \
      Do not prefetch current rows merely to populate initial content unless the user's requested deliverable needs agent-authored current facts, or the implementation needs one bounded read to validate a public endpoint contract.\n\n\
-     Use pdf_generate for PDF files from final content; do not create PDFs by running ad-hoc code and then copying temporary files through resource_rw. Use resource_rw file for raw documents, runbooks, source assets, and non-runnable artifacts; saved managed files appear through the Documents surface, so refer to their human-readable label or Documents, not an internal filesystem path. \
-     When the user wants a saved report, table, reusable artifact, or supporting document, create it through resource_rw with workspace/data-relative paths; do not invent machine-specific absolute paths.\n\n\
-     A resource_rw file create/update is not a note to save later: include content.path and either content.content with the complete file body, content.content_base64, content.source_path, or content.source_resource in the same call. Do not send description-only file creates.\n\n\
+     Use pdf_generate for PDF files from final content; do not create PDFs by running ad-hoc code and then copying temporary files through resource_rw. Use file_write for raw documents, runbooks, source assets, and non-runnable artifacts; set document_visible=true when the file is meant for the user's Documents surface, then refer to its human-readable label or Documents, not an internal filesystem path. \
+     When the user wants a saved report, table, reusable artifact, or supporting document, create it with file_write using workspace/data-relative paths and document_visible=true; do not invent machine-specific absolute paths.\n\n\
+     A file_write call is not a note to save later: include path and one body source in the same call: content, content_base64, source_path, or source_resource. Do not send description-only file writes.\n\n\
+     When a fetched URL response must be reused as an exact artifact by later same-turn or follow-up steps, request a ResourceRef through the fetch/http schema and pass that ResourceRef directly to file_write, skill_manage, app staging, document ingestion, or other resource-consuming tools. Do not rely on clipped readable text or invented local paths for byte-exact reuse.\n\n\
+     For multi-file or large generated apps, prefer streaming each source file with file_write into one data-owned workspace subdirectory, then call app_deploy with source_dir; include source_paths only when you intentionally want to deploy a subset of that staged directory. Do not spend extra turns running code_exec install/build checks against staged app directories; app_deploy owns dependency installation, runtime isolation, lifecycle inference, startup, and deploy review for generated apps. For small single-file apps, app_deploy with files is acceptable. In every app_deploy call, include request_context and acceptance_criteria that summarize the user's requested behavior, workflows, implementation preferences, persistence/runtime/integration requirements, and explicit constraints by meaning rather than exact wording; deploy review uses this contract to catch missing or weaker implementations. For follow-up defects, runtime errors, or requested changes to an existing app, first inspect the existing app registry/status/logs and relevant source files, run targeted diagnostic commands when that evidence is not enough, then choose the smallest sufficient operation: app_restart for runtime-only recovery, app_deploy mode=patch with app_id and file_patches for localized source changes, or replacement only when the app's intended behavior requires broad structural changes. Keep the existing app_id unless a separate duplicate is intentionally requested; do not regenerate a full bundle or reinstall dependencies just because the user phrased the follow-up differently.\n\n\
      For browser apps and document-visible files, identical content is reused or skipped by default to avoid duplicate Apps/Documents entries. If the user explicitly wants another copy after being told one exists, set duplicate_policy=create_new or allow_duplicate=true.\n\n\
      For source-grounded apps, dashboards, reports, and runbooks, include stable non-sensitive provenance in metadata.artifact_identity when creating the artifact: source URLs plus a compact representation or fingerprint of the source facts used. This identity is for duplicate detection and updates; it must be derived from the evidence, not from the user's phrasing.\n\n\
      When the user wants the work to be repeatable, persist a reusable workflow, runbook, or source artifact unless their intent includes independent future execution, monitoring, notification, or a concrete cadence that requires a scheduled task or watcher. \
@@ -396,7 +410,7 @@ fn background_automation_policy_fragment() -> &'static str {
 fn memory_policy_fragment() -> &'static str {
     "Use memory_rw read/search only when saved memory is needed to answer the current request. \
      Use memory_rw write/update/delete only when the user's current intent is active memory management. \
-     Durable facts, preferences, notes, and user data belong in memory; reusable AgentArk procedures/capabilities, explicit skill sources, and skill marketplaces belong in resource_rw skill or skill_marketplace. \
+     Durable facts, preferences, notes, and user data belong in memory; generated or imported AgentArk skills belong in skill_manage, while existing skill lifecycle/status and skill marketplaces belong in resource_rw skill or skill_marketplace. \
      Do not call memory_rw merely because the user shared durable information, preferences, or personal context; answer naturally and let background memory capture handle incidental memory."
 }
 

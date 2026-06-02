@@ -5,7 +5,7 @@
 //! Uses API key authentication (not OAuth) for simplicity.
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,7 @@ impl GooglePlacesConnector {
 
     pub fn new_with_config_dir(config_dir: PathBuf) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::core::net::default_outgoing_http_client(),
             config_dir,
         }
     }

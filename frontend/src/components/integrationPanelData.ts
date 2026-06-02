@@ -1,5 +1,22 @@
 export type JsonRecord = Record<string, unknown>;
 
+export type IntegrationHubPanel =
+  | "custom_apis"
+  | "webhooks"
+  | "plugins"
+  | "extension_packs"
+  | "custom_messaging_channels";
+
+export type IntegrationHubCardSource =
+  | "builtin_integration"
+  | "custom_api"
+  | "webhook"
+  | "plugin"
+  | "extension_pack"
+  | "custom_messaging_channel"
+  | "messaging_channel"
+  | "email_channel";
+
 const EMPTY_JSON_RECORD: JsonRecord = Object.freeze({}) as JsonRecord;
 
 export function isRecord(value: unknown): value is JsonRecord {
@@ -29,4 +46,25 @@ export function toBool(value: unknown): boolean {
     return v === "true" || v === "1" || v === "yes";
   }
   return false;
+}
+
+export function integrationHubPanelForCardSource(
+  source: IntegrationHubCardSource
+): IntegrationHubPanel | null {
+  switch (source) {
+    case "custom_api":
+      return "custom_apis";
+    case "webhook":
+      return "webhooks";
+    case "plugin":
+      return "plugins";
+    case "extension_pack":
+      return "extension_packs";
+    case "custom_messaging_channel":
+      return "custom_messaging_channels";
+    case "builtin_integration":
+    case "messaging_channel":
+    case "email_channel":
+      return null;
+  }
 }

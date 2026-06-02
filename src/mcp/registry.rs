@@ -1,6 +1,6 @@
 //! MCP registry for managing external servers and tool/resource bindings
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};

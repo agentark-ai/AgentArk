@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use regex::Regex;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1568,7 +1568,7 @@ impl ExtensionPackRegistry {
             .timeout(std::time::Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::core::net::build_outgoing_http_client(20));
         Self {
             storage,
             config_dir,
@@ -2309,7 +2309,7 @@ impl ExtensionPackRegistry {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            self.fetch_manifest_from_path(source_path)?
+            self.fetch_manifest_from_path(source_path).await?
         } else {
             anyhow::bail!(
                 "pack_id, source_url, source_path, manifest_text, or manifest is required"
@@ -2951,7 +2951,8 @@ impl ExtensionPackRegistry {
                 "Bundled AgentArk packs cannot be deleted. Disable the pack or remove its saved connections instead."
             );
         }
-        self.clear_pack_runtime_artifacts(&existing.manifest.id)?;
+        self.clear_pack_runtime_artifacts(&existing.manifest.id)
+            .await?;
         self.installed.remove(pack_id);
         let mut removed_auth_profile_ids = HashSet::new();
         if remove_connections {
@@ -3679,23 +3680,34 @@ impl ExtensionPackRegistry {
             .join(sanitize_pack_id(pack_id))
     }
 
-    fn clear_pack_runtime_artifacts(&self, pack_id: &str) -> Result<()> {
+    async fn clear_pack_runtime_artifacts(&self, pack_id: &str) -> Result<()> {
         let runtime_dir = self.pack_runtime_dir(pack_id);
-        if !runtime_dir.exists() {
-            return Ok(());
-        }
-        if !runtime_dir.is_dir() {
+        let metadata = match tokio::fs::metadata(&runtime_dir).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect extension-pack runtime path '{}'",
+                        runtime_dir.display()
+                    )
+                });
+            }
+        };
+        if !metadata.is_dir() {
             anyhow::bail!(
                 "Extension pack runtime path '{}' is not a directory",
                 runtime_dir.display()
             );
         }
-        std::fs::remove_dir_all(&runtime_dir).with_context(|| {
-            format!(
-                "Failed to remove extension-pack runtime directory '{}'",
-                runtime_dir.display()
-            )
-        })
+        tokio::fs::remove_dir_all(&runtime_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to remove extension-pack runtime directory '{}'",
+                    runtime_dir.display()
+                )
+            })
     }
 
     async fn delete_pack_auth_profiles(
@@ -3752,12 +3764,14 @@ impl ExtensionPackRegistry {
             );
         }
         let runtime_dir = self.pack_runtime_dir(pack_id);
-        std::fs::create_dir_all(&runtime_dir).with_context(|| {
-            format!(
-                "Failed to create extension-pack runtime directory '{}'",
-                runtime_dir.display()
-            )
-        })?;
+        tokio::fs::create_dir_all(&runtime_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create extension-pack runtime directory '{}'",
+                    runtime_dir.display()
+                )
+            })?;
         let matching = commands
             .iter()
             .filter(|command| command_matches_platform(command))
@@ -3783,6 +3797,7 @@ impl ExtensionPackRegistry {
             for (key, value) in &command.env {
                 child.env(key, value);
             }
+            child.kill_on_drop(true);
             child.stdin(std::process::Stdio::piped());
             child.stdout(std::process::Stdio::piped());
             child.stderr(std::process::Stdio::piped());
@@ -3997,8 +4012,8 @@ impl ExtensionPackRegistry {
             .ok_or_else(|| anyhow!("uploaded pack disappeared after install"))
     }
 
-    fn fetch_manifest_from_path(&self, source_path: &str) -> Result<ExtensionPackManifest> {
-        let bytes = std::fs::read(source_path).with_context(|| {
+    async fn fetch_manifest_from_path(&self, source_path: &str) -> Result<ExtensionPackManifest> {
+        let bytes = tokio::fs::read(source_path).await.with_context(|| {
             format!(
                 "failed to read pack manifest or bundle from {}",
                 source_path
@@ -4552,12 +4567,14 @@ impl ExtensionPackRegistry {
             .filter_map(|item| scalar_to_string(&item))
             .collect::<Vec<_>>();
         let runtime_dir = self.pack_runtime_dir(&manifest.id);
-        std::fs::create_dir_all(&runtime_dir).with_context(|| {
-            format!(
-                "Failed to create extension-pack runtime directory '{}'",
-                runtime_dir.display()
-            )
-        })?;
+        tokio::fs::create_dir_all(&runtime_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create extension-pack runtime directory '{}'",
+                    runtime_dir.display()
+                )
+            })?;
         let mut child = tokio::process::Command::new(program);
         child.env_clear();
         child.current_dir(runtime_dir);
@@ -4583,6 +4600,7 @@ impl ExtensionPackRegistry {
                 child.env(key, value);
             }
         }
+        child.kill_on_drop(true);
         child.stdin(std::process::Stdio::piped());
         child.stdout(std::process::Stdio::piped());
         child.stderr(std::process::Stdio::piped());
@@ -4828,11 +4846,9 @@ fn required_secrets_for_imported_auth(
             vec!["api_key".to_string()]
         }
         CustomApiAuthMode::Bearer | CustomApiAuthMode::OAuth2 => {
-            vec![
-                imported_secret_path(requested_mode, preview_mode)
-                    .unwrap_or("access_token")
-                    .to_string(),
-            ]
+            vec![imported_secret_path(requested_mode, preview_mode)
+                .unwrap_or("access_token")
+                .to_string()]
         }
     }
 }
@@ -5788,13 +5804,13 @@ fn scalar_to_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
+        auth_profile_material_for_secret_backed_pack, connection_secret_key,
+        imported_auth_contract, manifest_uses_connection_secret, required_secrets_for_auth_mode,
         ExtensionConnectionState, ExtensionPackAuthMode, ExtensionPackAuthSpec,
         ExtensionPackBinding, ExtensionPackConnection, ExtensionPackConnectionUpsertRequest,
         ExtensionPackEventRecord, ExtensionPackManifest, ExtensionPackRegistry,
         ExtensionPackRuntimeStateRecord, ExtensionPackSourceKind, ExtensionPackTrustLevel,
-        InstalledExtensionPack, PackFeatureManifest, auth_profile_material_for_secret_backed_pack,
-        connection_secret_key, imported_auth_contract, manifest_uses_connection_secret,
-        required_secrets_for_auth_mode,
+        InstalledExtensionPack, PackFeatureManifest,
     };
     use crate::core::auth_profiles::{
         AuthProfileControlPlane, AuthProfileKind, AuthProfileMaterial, AuthProfileScope,
@@ -5850,6 +5866,7 @@ mod tests {
                 default_query: Default::default(),
                 parameters: Vec::new(),
                 body_required: false,
+                default_body: None,
             }],
             notes: Vec::new(),
             source_kind: "curl".to_string(),
@@ -6284,36 +6301,26 @@ mod tests {
 
         assert!(!registry.installed.contains_key(&manifest.id));
         assert!(!registry.connections.contains_key(&connection_id));
-        assert!(
-            registry
-                .events
-                .iter()
-                .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id))
-        );
-        assert!(
-            registry
-                .get_connection_secret(&manifest.id, &connection_id)
-                .expect("lookup deleted secret")
-                .is_none()
-        );
-        assert!(
-            registry
-                .get_connection_secret(&manifest.id, "orphan")
-                .expect("lookup orphan secret")
-                .is_none()
-        );
-        assert!(
-            registry
-                .get_connection_secret("github", "default")
-                .expect("lookup unrelated secret")
-                .is_some()
-        );
-        assert!(
-            AuthProfileControlPlane::get(&storage, &auth_profile_id)
-                .await
-                .expect("read deleted profile")
-                .is_none()
-        );
+        assert!(registry
+            .events
+            .iter()
+            .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id)));
+        assert!(registry
+            .get_connection_secret(&manifest.id, &connection_id)
+            .expect("lookup deleted secret")
+            .is_none());
+        assert!(registry
+            .get_connection_secret(&manifest.id, "orphan")
+            .expect("lookup orphan secret")
+            .is_none());
+        assert!(registry
+            .get_connection_secret("github", "default")
+            .expect("lookup unrelated secret")
+            .is_some());
+        assert!(AuthProfileControlPlane::get(&storage, &auth_profile_id)
+            .await
+            .expect("read deleted profile")
+            .is_none());
         assert!(!runtime_dir.exists());
         assert!(
             AuthProfileControlPlane::get(&storage, &unrelated_profile.id)
@@ -6329,18 +6336,14 @@ mod tests {
         );
         reloaded.sync_from_storage().await.expect("reload registry");
         assert!(!reloaded.installed.contains_key(&manifest.id));
-        assert!(
-            !reloaded
-                .connections
-                .values()
-                .any(|connection| connection.pack_id.eq_ignore_ascii_case(&manifest.id))
-        );
-        assert!(
-            reloaded
-                .events
-                .iter()
-                .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id))
-        );
+        assert!(!reloaded
+            .connections
+            .values()
+            .any(|connection| connection.pack_id.eq_ignore_ascii_case(&manifest.id)));
+        assert!(reloaded
+            .events
+            .iter()
+            .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id)));
     }
 
     #[cfg_attr(

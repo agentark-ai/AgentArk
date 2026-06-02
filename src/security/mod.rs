@@ -39,15 +39,15 @@ pub use action_guard::ActionGuard;
 pub use model_hardening::protect_system_prompt;
 #[allow(unused_imports)]
 pub use model_input::{
+    render_model_input_fallback, sanitize_model_input_json, sanitize_model_input_text,
     CurrentChatPiiPolicy, ModelInputContext, ModelInputPrivacyDecision,
     ModelInputPrivacyJsonResult, ModelInputPrivacyMode, ModelInputPrivacyTextResult,
-    ModelPrivacyConfig, render_model_input_fallback, sanitize_model_input_json,
-    sanitize_model_input_text,
+    ModelPrivacyConfig,
 };
 pub use normalize::normalize_for_analysis;
 pub use outbound::{
-    OutboundPrivacyDecision, OutboundPrivacyPolicy, check_outbound_text,
-    format_outbound_privacy_block, sanitize_outbound_json,
+    check_outbound_text, format_outbound_privacy_block, sanitize_outbound_json,
+    OutboundPrivacyDecision, OutboundPrivacyPolicy,
 };
 pub use pii::redact_pii;
 pub use trust_boundary::{
@@ -534,6 +534,38 @@ fn is_redaction_placeholder_token(value: &str) -> bool {
     value.starts_with("REDACTED_") && value.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
 }
 
+fn is_untrusted_output_envelope_token(value: &str) -> bool {
+    value.starts_with("UNTRUSTED_")
+        && value.ends_with("_OUTPUT")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_untrusted_output_envelope_span(source: &str, span: RedactionSpan) -> bool {
+    if !is_untrusted_output_envelope_token(&source[span.start..span.end]) {
+        return false;
+    }
+    if source.as_bytes().get(span.end) != Some(&b']') {
+        return false;
+    }
+
+    let prefix = &source[..span.start];
+    let marker_start = if prefix.ends_with("[/") {
+        span.start.saturating_sub(2)
+    } else if prefix.ends_with('[') {
+        span.start.saturating_sub(1)
+    } else {
+        return false;
+    };
+    let marker_end = span.end + 1;
+    let before_marker = source[..marker_start].chars().next_back();
+    let after_marker = source[marker_end..].chars().next();
+
+    before_marker.is_none_or(|ch| matches!(ch, '\n' | '\r'))
+        && after_marker.is_none_or(|ch| matches!(ch, '\n' | '\r'))
+}
+
 fn apply_opaque_token_redaction(
     text: &mut String,
     redactions: &mut Vec<String>,
@@ -558,6 +590,7 @@ fn apply_opaque_token_redaction(
             let span = RedactionSpan { start, end: idx };
             if is_opaque_token_shape(candidate)
                 && !is_likely_namespaced_public_identifier(&source, span)
+                && !is_untrusted_output_envelope_span(&source, span)
             {
                 redacted.push_str(&source[last..start]);
                 redacted.push_str("[REDACTED_SECRET]");
@@ -575,6 +608,7 @@ fn apply_opaque_token_redaction(
         };
         if is_opaque_token_shape(candidate)
             && !is_likely_namespaced_public_identifier(&source, span)
+            && !is_untrusted_output_envelope_span(&source, span)
         {
             redacted.push_str(&source[last..start]);
             redacted.push_str("[REDACTED_SECRET]");
@@ -1076,6 +1110,25 @@ mod tests {
             assert!(!result.had_secret(), "unexpected redaction for {value}");
             assert_eq!(result.text, value);
         }
+    }
+
+    #[test]
+    fn test_secret_redaction_keeps_untrusted_output_envelopes() {
+        let wrapped = crate::security::sanitize_untrusted_output(
+            "web_search",
+            "Search result snippet with api_key=sk-1234567890abcdefghijklmnop.",
+        );
+        let result = redact_secret_input(&wrapped);
+
+        assert!(result.text.contains("[UNTRUSTED_WEB_SEARCH_OUTPUT]"));
+        assert!(result.text.contains("[/UNTRUSTED_WEB_SEARCH_OUTPUT]"));
+        assert!(!result.text.contains("[[REDACTED_SECRET]]"));
+        assert!(!result.text.contains("sk-1234567890abcdefghijklmnop"));
+        assert!(result.text.contains("api_key=[REDACTED_SECRET]"));
+
+        let bare = redact_secret_input("UNTRUSTED_SEARCH_RESULT_TOKEN_OUTPUT");
+        assert!(bare.had_secret());
+        assert_eq!(bare.text, "[REDACTED_SECRET]");
     }
 
     #[test]

@@ -1601,6 +1601,32 @@ pub(super) async fn update_settings(
         if let Some(v) = update.recall_test_retention_days {
             current.recall_test_retention_days = v;
         }
+        if let Some(v) = update.readiness_retention_days {
+            current.readiness_retention_days = v;
+            current.readiness_evaluation_retention_days = v;
+        }
+        if let Some(v) = update.operational_memory_retention_days {
+            current.operational_memory_retention_days = v;
+            current.memory_capture_event_retention_days = v;
+            current.memory_operation_retention_days = v;
+            current.memory_evidence_link_retention_days = v;
+            current.semantic_work_unit_retention_days = v;
+        }
+        if let Some(v) = update.readiness_evaluation_retention_days {
+            current.readiness_evaluation_retention_days = v;
+        }
+        if let Some(v) = update.memory_capture_event_retention_days {
+            current.memory_capture_event_retention_days = v;
+        }
+        if let Some(v) = update.memory_operation_retention_days {
+            current.memory_operation_retention_days = v;
+        }
+        if let Some(v) = update.memory_evidence_link_retention_days {
+            current.memory_evidence_link_retention_days = v;
+        }
+        if let Some(v) = update.semantic_work_unit_retention_days {
+            current.semantic_work_unit_retention_days = v;
+        }
         if let Some(v) = update.housekeeping_interval_secs {
             current.housekeeping_interval_secs = v;
         }
@@ -4755,19 +4781,20 @@ pub(super) async fn update_server(State(state): State<AppState>) -> Response {
 
 pub(super) async fn rotate_internal_service_tokens(State(state): State<AppState>) -> Response {
     let config_dir = { state.agent.read().await.config_dir.clone() };
-    let token_status = match crate::clients::describe_internal_service_tokens(&config_dir) {
-        Ok(value) => value,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "message": format!("Failed to inspect internal credentials: {}", error)
-                })),
-            )
-                .into_response();
-        }
-    };
+    let token_status =
+        match crate::clients::describe_internal_service_tokens_async(&config_dir).await {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to inspect internal credentials: {}", error)
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     if token_status.iter().any(|item| item.managed_by_env) {
         let managed_by_env = token_status
@@ -4789,10 +4816,12 @@ pub(super) async fn rotate_internal_service_tokens(State(state): State<AppState>
             .into_response();
     }
 
-    let previous_executor = match crate::clients::read_persisted_internal_service_token(
+    let previous_executor = match crate::clients::read_persisted_internal_service_token_async(
         &config_dir,
         crate::clients::InternalServiceKind::Executor,
-    ) {
+    )
+    .await
+    {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -4805,10 +4834,12 @@ pub(super) async fn rotate_internal_service_tokens(State(state): State<AppState>
                 .into_response();
         }
     };
-    let previous_workspace = match crate::clients::read_persisted_internal_service_token(
+    let previous_workspace = match crate::clients::read_persisted_internal_service_token_async(
         &config_dir,
         crate::clients::InternalServiceKind::Workspace,
-    ) {
+    )
+    .await
+    {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -4822,10 +4853,12 @@ pub(super) async fn rotate_internal_service_tokens(State(state): State<AppState>
         }
     };
 
-    if let Err(error) = crate::clients::rotate_internal_service_token(
+    let executor_rotation = crate::clients::rotate_internal_service_token_async(
         &config_dir,
         crate::clients::InternalServiceKind::Executor,
-    ) {
+    )
+    .await;
+    if let Err(error) = executor_rotation {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -4836,15 +4869,19 @@ pub(super) async fn rotate_internal_service_tokens(State(state): State<AppState>
             .into_response();
     }
 
-    if let Err(error) = crate::clients::rotate_internal_service_token(
+    let workspace_rotation = crate::clients::rotate_internal_service_token_async(
         &config_dir,
         crate::clients::InternalServiceKind::Workspace,
-    ) {
-        if let Err(restore_error) = crate::clients::restore_internal_service_token(
+    )
+    .await;
+    if let Err(error) = workspace_rotation {
+        let restore_result = crate::clients::restore_internal_service_token_async(
             &config_dir,
             crate::clients::InternalServiceKind::Executor,
             previous_executor.as_deref(),
-        ) {
+        )
+        .await;
+        if let Err(restore_error) = restore_result {
             tracing::error!(
                 "Failed to roll back executor credential after workspace rotation failure: {}",
                 restore_error
@@ -4887,9 +4924,13 @@ pub(super) async fn rotate_internal_service_tokens(State(state): State<AppState>
                     previous_workspace.as_deref(),
                 ),
             ] {
-                if let Err(error) =
-                    crate::clients::restore_internal_service_token(&config_dir, service, previous)
-                {
+                let restore_result = crate::clients::restore_internal_service_token_async(
+                    &config_dir,
+                    service,
+                    previous,
+                )
+                .await;
+                if let Err(error) = restore_result {
                     tracing::error!(
                         "Failed to roll back {} credential after restart delegation failure: {}",
                         service.label(),

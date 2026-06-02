@@ -57,6 +57,8 @@ pub(super) async fn list_available_channels(State(state): State<AppState>) -> Re
 
 // ==================== Memory Endpoints ====================
 
+const ARKMEMORY_CLEANUP_MEMORY_SCAN_LIMIT: u64 = 2_000;
+
 pub(super) async fn memory_stats(
     State(state): State<AppState>,
     axum::extract::Query(_params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -735,6 +737,65 @@ mod memory_control_tests {
     }
 
     #[test]
+    fn expired_memory_cleanup_candidate_requires_temporary_metadata_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let mut expired = memory_fact_test_item(
+            "travel_context: Visiting family next week.",
+            serde_json::json!({
+                "key": "travel_context",
+                "memory_kind": "personal_fact",
+                "memory_category": "ephemeral_context",
+                "durability": "temporary",
+                "expires_at": "2026-06-23T00:00:00Z",
+            }),
+        );
+        expired.id = "memory-expired".to_string();
+
+        let candidate = arkmemory_expired_memory_cleanup_item(&expired, now)
+            .expect("expired active memory should be a cleanup candidate");
+        assert_eq!(
+            candidate.get("kind").and_then(|value| value.as_str()),
+            Some("expired_memory")
+        );
+        assert_eq!(
+            candidate.get("action").and_then(|value| value.as_str()),
+            Some("expire_memory")
+        );
+        assert_eq!(
+            candidate.get("memory_id").and_then(|value| value.as_str()),
+            Some("memory-expired")
+        );
+
+        let mut future = expired.clone();
+        future.metadata["expires_at"] = serde_json::json!("2026-06-25T00:00:00Z");
+        assert!(arkmemory_expired_memory_cleanup_item(&future, now).is_none());
+
+        let mut inactive = expired;
+        inactive.status = "deprecated".to_string();
+        assert!(arkmemory_expired_memory_cleanup_item(&inactive, now).is_none());
+
+        let durable_dated_memory = memory_fact_test_item(
+            "important_life_event: A significant personal event happened last week.",
+            serde_json::json!({
+                "key": "important_life_event",
+                "memory_kind": "personal_fact",
+                "memory_category": "profile_fact",
+                "durability": "permanent",
+            }),
+        );
+        assert!(arkmemory_expired_memory_cleanup_item(&durable_dated_memory, now).is_none());
+
+        let mut permanent_with_expiry_metadata = durable_dated_memory;
+        permanent_with_expiry_metadata.metadata["expires_at"] =
+            serde_json::json!("2026-06-23T00:00:00Z");
+        assert!(
+            arkmemory_expired_memory_cleanup_item(&permanent_with_expiry_metadata, now).is_none()
+        );
+    }
+
+    #[test]
     fn pending_capture_events_group_by_semantic_capture_key() {
         let now = "2026-05-03T00:00:00Z".to_string();
         let event = crate::storage::memory_capture_event::Model {
@@ -820,6 +881,68 @@ mod memory_control_tests {
         assert_eq!(decision.outcome.as_deref(), Some("expected_sensitive_skip"));
         assert_eq!(decision.matched_example_id.as_deref(), Some("capture-1"));
         assert!(decision.confidence > 0.9);
+    }
+
+    #[test]
+    fn memory_graph_semantic_edges_skip_explicit_links_and_cap_per_node() {
+        use sea_orm::entity::prelude::PgVector;
+
+        let mut a = memory_fact_test_item(
+            "memory_a: A",
+            serde_json::json!({"memory_category": "profile_fact"}),
+        );
+        a.id = "memory-a".to_string();
+        a.embedding = Some(PgVector::from(vec![1.0_f32, 0.0, 0.0]));
+
+        let mut b = memory_fact_test_item(
+            "memory_b: B",
+            serde_json::json!({"memory_category": "profile_fact"}),
+        );
+        b.id = "memory-b".to_string();
+        b.embedding = Some(PgVector::from(vec![0.96_f32, 0.04, 0.0]));
+
+        let mut c = memory_fact_test_item(
+            "memory_c: C",
+            serde_json::json!({"memory_category": "profile_fact"}),
+        );
+        c.id = "memory-c".to_string();
+        c.embedding = Some(PgVector::from(vec![0.95_f32, 0.05, 0.0]));
+
+        let mut explicit_pairs = std::collections::HashSet::new();
+        explicit_pairs.insert(arkmemory_graph_pair_key("memory-a", "memory-b"));
+
+        let edges = arkmemory_graph_semantic_edges(&[a, b, c], &explicit_pairs, 0.90, 1, 16);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].edge_type, "semantic_nearby");
+        assert!(edges[0].semantic);
+        assert_ne!(
+            arkmemory_graph_pair_key(&edges[0].source, &edges[0].target),
+            arkmemory_graph_pair_key("memory-a", "memory-b")
+        );
+        assert!(edges[0].weight >= 0.90);
+    }
+
+    #[test]
+    fn memory_graph_csv_filter_ignores_empty_values_and_dedupes() {
+        assert_eq!(
+            arkmemory_graph_csv_filter(" active,deprecated,active, ,stale "),
+            vec![
+                "active".to_string(),
+                "deprecated".to_string(),
+                "stale".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn document_memory_sensitivity_gate_blocks_non_prompt_safe_candidates() {
+        assert!(arkmemory_document_memory_sensitivity_safe("prompt_safe"));
+        assert!(arkmemory_document_memory_sensitivity_safe(""));
+        assert!(!arkmemory_document_memory_sensitivity_safe(
+            "personal_identifier"
+        ));
+        assert!(!arkmemory_document_memory_sensitivity_safe("sensitive"));
     }
 }
 
@@ -1309,8 +1432,11 @@ struct MemoryLearnedReviewDecision {
 }
 
 pub(super) fn arkmemory_project_param(params: &HashMap<String, String>) -> Option<&str> {
-    let _ = params;
-    None
+    params
+        .get("project_id")
+        .or_else(|| params.get("project"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
 }
 
 fn arkmemory_capture_event_visible_for_project(
@@ -2123,6 +2249,271 @@ pub(super) fn arkmemory_item_visible_for_project(
 ) -> bool {
     let _ = item;
     true
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ArkmemoryGraphNode {
+    pub id: String,
+    pub node_type: String,
+    pub label: String,
+    pub detail: String,
+    pub category: Option<String>,
+    pub status: Option<String>,
+    pub memory_kind: Option<String>,
+    pub confidence: Option<f64>,
+    pub support_count: Option<i32>,
+    pub stale: bool,
+    pub pinned: bool,
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ArkmemoryGraphEdge {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub edge_type: String,
+    pub label: String,
+    pub detail: String,
+    pub weight: f64,
+    pub semantic: bool,
+    pub explicit: bool,
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+fn arkmemory_graph_csv_filter(raw: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut values = Vec::new();
+    for value in raw.split(',') {
+        let normalized = value.trim();
+        if normalized.is_empty() || !seen.insert(normalized.to_string()) {
+            continue;
+        }
+        values.push(normalized.to_string());
+    }
+    values
+}
+
+fn arkmemory_graph_params_filter(params: &HashMap<String, String>, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .map(|value| arkmemory_graph_csv_filter(value))
+        .unwrap_or_default()
+}
+
+fn arkmemory_graph_pair_key(left: &str, right: &str) -> String {
+    if left <= right {
+        format!("{left}\n{right}")
+    } else {
+        format!("{right}\n{left}")
+    }
+}
+
+fn arkmemory_graph_memory_category(item: &crate::storage::experience_item::Model) -> String {
+    let semantic_kind = item
+        .metadata
+        .get("memory_kind")
+        .and_then(|value| value.as_str());
+    crate::core::memory_schema::memory_category_from_metadata(&item.metadata, semantic_kind)
+        .to_string()
+}
+
+fn arkmemory_graph_memory_kind(item: &crate::storage::experience_item::Model) -> Option<String> {
+    item.metadata
+        .get("memory_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn arkmemory_graph_memory_node(
+    item: &crate::storage::experience_item::Model,
+    pinned: bool,
+) -> ArkmemoryGraphNode {
+    let key = item
+        .metadata
+        .get("key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let label = key
+        .or_else(|| {
+            item.title
+                .trim()
+                .split_once(':')
+                .map(|(left, _)| left.trim())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| item.title.trim())
+        .trim();
+    let label = if label.is_empty() {
+        item.id.as_str()
+    } else {
+        label
+    };
+    ArkmemoryGraphNode {
+        id: item.id.clone(),
+        node_type: "memory".to_string(),
+        label: label.to_string(),
+        detail: item.content.clone(),
+        category: Some(arkmemory_graph_memory_category(item)),
+        status: Some(item.status.clone()),
+        memory_kind: arkmemory_graph_memory_kind(item),
+        confidence: Some(item.confidence),
+        support_count: Some(item.support_count),
+        stale: item.status != "active",
+        pinned,
+        updated_at: Some(item.updated_at.clone()),
+        ref_kind: None,
+        metadata: Some(item.metadata.clone()),
+    }
+}
+
+fn arkmemory_graph_ref_node(id: String, ref_kind: &str, label: String) -> ArkmemoryGraphNode {
+    ArkmemoryGraphNode {
+        id,
+        node_type: "source".to_string(),
+        label,
+        detail: ref_kind.to_string(),
+        category: None,
+        status: None,
+        memory_kind: None,
+        confidence: None,
+        support_count: None,
+        stale: false,
+        pinned: false,
+        updated_at: None,
+        ref_kind: Some(ref_kind.to_string()),
+        metadata: None,
+    }
+}
+
+fn arkmemory_graph_edge_label(edge_type: &str) -> String {
+    if edge_type == "semantic_nearby" {
+        return "Semantic".to_string();
+    }
+    edge_type
+        .split(['_', '-'])
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn arkmemory_graph_explicit_edge(
+    edge: &crate::storage::experience_edge::Model,
+) -> ArkmemoryGraphEdge {
+    ArkmemoryGraphEdge {
+        id: edge.id.clone(),
+        source: edge.source_ref.clone(),
+        target: edge.target_ref.clone(),
+        edge_type: edge.edge_type.clone(),
+        label: arkmemory_graph_edge_label(&edge.edge_type),
+        detail: edge.edge_type.clone(),
+        weight: edge.weight,
+        semantic: false,
+        explicit: true,
+        updated_at: Some(edge.updated_at.clone()),
+        metadata: Some(edge.metadata.clone()),
+    }
+}
+
+fn arkmemory_graph_ref_edge(
+    memory_id: &str,
+    target_id: &str,
+    edge_type: &str,
+    detail: String,
+) -> ArkmemoryGraphEdge {
+    ArkmemoryGraphEdge {
+        id: arkmemory_stable_event_id(&["graph_edge", memory_id, target_id, edge_type]),
+        source: memory_id.to_string(),
+        target: target_id.to_string(),
+        edge_type: edge_type.to_string(),
+        label: arkmemory_graph_edge_label(edge_type),
+        detail,
+        weight: 0.45,
+        semantic: false,
+        explicit: true,
+        updated_at: None,
+        metadata: None,
+    }
+}
+
+fn arkmemory_graph_semantic_edges(
+    items: &[crate::storage::experience_item::Model],
+    explicit_pairs: &HashSet<String>,
+    threshold: f64,
+    per_node_limit: usize,
+    global_limit: usize,
+) -> Vec<ArkmemoryGraphEdge> {
+    let mut scored: Vec<(String, String, f64)> = Vec::new();
+    for (left_index, left) in items.iter().enumerate() {
+        let Some(left_embedding) = left.embedding.as_ref() else {
+            continue;
+        };
+        for right in items.iter().skip(left_index + 1) {
+            let Some(right_embedding) = right.embedding.as_ref() else {
+                continue;
+            };
+            let pair_key = arkmemory_graph_pair_key(&left.id, &right.id);
+            if explicit_pairs.contains(&pair_key) {
+                continue;
+            }
+            let Some(score) = crate::core::document_search::normalized_embedding_similarity(
+                left_embedding.as_slice(),
+                right_embedding.as_slice(),
+            ) else {
+                continue;
+            };
+            let score = f64::from(score);
+            if score >= threshold {
+                scored.push((left.id.clone(), right.id.clone(), score.clamp(0.0, 1.0)));
+            }
+        }
+    }
+    scored.sort_by(|left, right| right.2.total_cmp(&left.2));
+    let mut per_node_counts: HashMap<String, usize> = HashMap::new();
+    let mut edges = Vec::new();
+    for (source, target, score) in scored {
+        if edges.len() >= global_limit {
+            break;
+        }
+        let source_count = per_node_counts.get(&source).copied().unwrap_or(0);
+        let target_count = per_node_counts.get(&target).copied().unwrap_or(0);
+        if source_count >= per_node_limit || target_count >= per_node_limit {
+            continue;
+        }
+        per_node_counts.insert(source.clone(), source_count + 1);
+        per_node_counts.insert(target.clone(), target_count + 1);
+        let score_label = format!("{:.0}% embedding similarity", score * 100.0);
+        edges.push(ArkmemoryGraphEdge {
+            id: arkmemory_stable_event_id(&["semantic_nearby", &source, &target]),
+            source,
+            target,
+            edge_type: "semantic_nearby".to_string(),
+            label: "Semantic".to_string(),
+            detail: score_label,
+            weight: score,
+            semantic: true,
+            explicit: false,
+            updated_at: None,
+            metadata: Some(serde_json::json!({ "score": score })),
+        });
+    }
+    edges
 }
 
 #[derive(Default)]
@@ -3389,6 +3780,2105 @@ pub(super) async fn arkmemory_summary(
         .into_response()
 }
 
+fn arkmemory_graph_limit(params: &HashMap<String, String>) -> u64 {
+    params
+        .get("limit")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120)
+        .clamp(1, 220)
+}
+
+fn arkmemory_graph_bool_param(
+    params: &HashMap<String, String>,
+    key: &str,
+    default_value: bool,
+) -> bool {
+    params
+        .get(key)
+        .map(|value| value.trim().eq_ignore_ascii_case("true") || value.trim() == "1")
+        .unwrap_or(default_value)
+}
+
+fn arkmemory_graph_semantic_threshold(params: &HashMap<String, String>) -> f64 {
+    params
+        .get("semantic_threshold")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.78)
+        .clamp(0.50, 0.98)
+}
+
+fn arkmemory_graph_per_node_semantic_limit(params: &HashMap<String, String>) -> usize {
+    params
+        .get("semantic_per_node")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, 8)
+}
+
+fn arkmemory_graph_min_confidence(params: &HashMap<String, String>) -> f64 {
+    params
+        .get("min_confidence")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+fn arkmemory_graph_updated_after(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .get("updated_after")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn arkmemory_graph_updated_before(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .get("updated_before")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn arkmemory_graph_updated_in_range(
+    updated_at: &str,
+    updated_after: Option<&str>,
+    updated_before: Option<&str>,
+) -> bool {
+    updated_after
+        .map(|after| updated_at >= after)
+        .unwrap_or(true)
+        && updated_before
+            .map(|before| updated_at <= before)
+            .unwrap_or(true)
+}
+
+fn arkmemory_graph_filter_item(
+    item: &crate::storage::experience_item::Model,
+    categories: &HashSet<String>,
+    statuses: &HashSet<String>,
+    min_confidence: f64,
+    updated_after: Option<&str>,
+    updated_before: Option<&str>,
+) -> bool {
+    (categories.is_empty() || categories.contains(&arkmemory_graph_memory_category(item)))
+        && (statuses.is_empty() || statuses.contains(&item.status))
+        && item.confidence >= min_confidence
+        && arkmemory_graph_updated_in_range(&item.updated_at, updated_after, updated_before)
+}
+
+fn arkmemory_graph_filter_edge(edge_type: &str, edge_types: &HashSet<String>) -> bool {
+    edge_types.is_empty() || edge_types.contains(edge_type)
+}
+
+fn arkmemory_graph_ref_kind(source_ref: &str) -> String {
+    source_ref
+        .split_once(':')
+        .map(|(kind, _)| kind.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("source")
+        .to_string()
+}
+
+fn arkmemory_graph_ref_label(source_ref: &str) -> String {
+    let trimmed = source_ref.trim();
+    let label = trimmed
+        .split_once(':')
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(trimmed);
+    if label.chars().count() > 34 {
+        let prefix = label.chars().take(31).collect::<String>();
+        format!("{prefix}...")
+    } else {
+        label.to_string()
+    }
+}
+
+fn arkmemory_graph_add_ref_node(
+    nodes: &mut Vec<ArkmemoryGraphNode>,
+    edges: &mut Vec<ArkmemoryGraphEdge>,
+    seen_nodes: &mut HashSet<String>,
+    anchor_id: &str,
+    source_ref: &str,
+    edge_type: &str,
+) {
+    let source_ref = source_ref.trim();
+    if source_ref.is_empty() {
+        return;
+    }
+    let node_id = arkmemory_stable_event_id(&["graph_source", source_ref]);
+    if seen_nodes.insert(node_id.clone()) {
+        nodes.push(arkmemory_graph_ref_node(
+            node_id.clone(),
+            &arkmemory_graph_ref_kind(source_ref),
+            arkmemory_graph_ref_label(source_ref),
+        ));
+    }
+    edges.push(arkmemory_graph_ref_edge(
+        anchor_id,
+        &node_id,
+        edge_type,
+        source_ref.to_string(),
+    ));
+}
+
+fn arkmemory_graph_relation_statuses(params: &HashMap<String, String>) -> Vec<String> {
+    let requested = arkmemory_graph_params_filter(params, "relation_status");
+    if requested.is_empty() {
+        vec!["candidate".to_string(), "confirmed".to_string()]
+    } else {
+        requested
+    }
+}
+
+fn arkmemory_graph_entity_statuses(params: &HashMap<String, String>) -> Vec<String> {
+    let requested = arkmemory_graph_params_filter(params, "entity_status");
+    if requested.is_empty() {
+        vec!["active".to_string()]
+    } else {
+        requested
+    }
+}
+
+fn arkmemory_graph_knowledge_entity_node(
+    entity: &crate::storage::knowledge_entity::Model,
+    pinned: bool,
+) -> ArkmemoryGraphNode {
+    ArkmemoryGraphNode {
+        id: entity.id.clone(),
+        node_type: "entity".to_string(),
+        label: entity.canonical_name.clone(),
+        detail: entity.entity_type.clone(),
+        category: Some(entity.entity_type.clone()),
+        status: Some(entity.status.clone()),
+        memory_kind: None,
+        confidence: Some(entity.confidence),
+        support_count: None,
+        stale: entity.status != "active",
+        pinned,
+        updated_at: Some(entity.updated_at.clone()),
+        ref_kind: None,
+        metadata: Some(serde_json::json!({
+            "entity_type": entity.entity_type,
+            "normalized_name": entity.normalized_name,
+            "aliases": entity.aliases,
+            "metadata": entity.metadata,
+        })),
+    }
+}
+
+fn arkmemory_graph_add_knowledge_entity_node(
+    nodes: &mut Vec<ArkmemoryGraphNode>,
+    seen_nodes: &mut HashSet<String>,
+    entity: &crate::storage::knowledge_entity::Model,
+    pinned: bool,
+) {
+    if seen_nodes.insert(entity.id.clone()) {
+        nodes.push(arkmemory_graph_knowledge_entity_node(entity, pinned));
+    }
+}
+
+fn arkmemory_graph_relation_evidence_payload(
+    evidence: &[crate::storage::knowledge_relation_evidence::Model],
+) -> Vec<serde_json::Value> {
+    evidence
+        .iter()
+        .take(12)
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "evidence_kind": item.evidence_kind,
+                "evidence_ref": item.evidence_ref,
+                "memory_id": item.memory_id,
+                "message_id": item.message_id,
+                "document_id": item.document_id,
+                "project_id": item.project_id,
+                "conversation_id": item.conversation_id,
+                "polarity": item.polarity,
+                "confidence": item.confidence,
+                "excerpt": item.excerpt,
+                "created_at": item.created_at,
+            })
+        })
+        .collect()
+}
+
+fn arkmemory_graph_knowledge_relation_edge(
+    relation: &crate::storage::knowledge_relation::Model,
+    evidence: &[crate::storage::knowledge_relation_evidence::Model],
+) -> ArkmemoryGraphEdge {
+    let relation_type_label = arkmemory_graph_edge_label(&relation.relation_type);
+    ArkmemoryGraphEdge {
+        id: relation.id.clone(),
+        source: relation.source_entity_id.clone(),
+        target: relation.target_entity_id.clone(),
+        edge_type: "knowledge_relation".to_string(),
+        label: relation_type_label.clone(),
+        detail: format!(
+            "{} relation, status {}, {} supporting evidence, {} contradicting evidence",
+            relation_type_label,
+            relation.status,
+            relation.support_count,
+            relation.contradiction_count
+        ),
+        weight: relation.confidence.clamp(0.05, 1.0),
+        semantic: false,
+        explicit: true,
+        updated_at: Some(relation.updated_at.clone()),
+        metadata: Some(serde_json::json!({
+            "relation_id": relation.id,
+            "relation_type": relation.relation_type,
+            "status": relation.status,
+            "confidence": relation.confidence,
+            "support_count": relation.support_count,
+            "contradiction_count": relation.contradiction_count,
+            "evidence_count": evidence.len(),
+            "evidence": arkmemory_graph_relation_evidence_payload(evidence),
+        })),
+    }
+}
+
+fn arkmemory_graph_relation_evidence_edge(
+    anchor_id: &str,
+    entity_id: &str,
+    relation_id: &str,
+) -> ArkmemoryGraphEdge {
+    ArkmemoryGraphEdge {
+        id: arkmemory_stable_event_id(&["relation_evidence", anchor_id, entity_id, relation_id]),
+        source: anchor_id.to_string(),
+        target: entity_id.to_string(),
+        edge_type: "relation_evidence".to_string(),
+        label: "Relation Evidence".to_string(),
+        detail: "This source supports or contradicts a stored relation candidate.".to_string(),
+        weight: 0.55,
+        semantic: false,
+        explicit: true,
+        updated_at: None,
+        metadata: Some(serde_json::json!({ "relation_id": relation_id })),
+    }
+}
+
+fn arkmemory_graph_relation_evidence_ref(
+    evidence: &crate::storage::knowledge_relation_evidence::Model,
+) -> Option<String> {
+    let kind = evidence.evidence_kind.trim();
+    let reference = evidence.evidence_ref.trim();
+    if kind.is_empty() || reference.is_empty() {
+        return None;
+    }
+    Some(format!("{kind}:{reference}"))
+}
+
+fn arkmemory_graph_evidence_matches_sources(
+    evidence: &crate::storage::knowledge_relation_evidence::Model,
+    source_filters: &HashSet<String>,
+) -> bool {
+    source_filters.is_empty()
+        || source_filters.contains(evidence.evidence_kind.as_str())
+        || source_filters.contains(evidence.evidence_ref.as_str())
+}
+
+fn arkmemory_graph_relation_matches_filters(
+    relation: &crate::storage::knowledge_relation::Model,
+    min_confidence: f64,
+    updated_after: Option<&str>,
+    updated_before: Option<&str>,
+) -> bool {
+    relation.confidence >= min_confidence
+        && arkmemory_graph_updated_in_range(&relation.updated_at, updated_after, updated_before)
+}
+
+const ARKMEMORY_KNOWLEDGE_EXTRACT_MEMORY_LIMIT: u64 = 80;
+const ARKMEMORY_KNOWLEDGE_EXTRACT_DOCUMENT_LIMIT: u64 = 12;
+const ARKMEMORY_DOCUMENT_EXTRACT_CHUNK_BATCH_LIMIT: u64 = 6;
+const ARKMEMORY_KNOWLEDGE_RELATION_MIN_CONFIDENCE: f64 = 0.72;
+const ARKMEMORY_DOCUMENT_MEMORY_MIN_CONFIDENCE: f64 = 0.86;
+const ARKMEMORY_DOCUMENT_MEMORY_CAPTURE_KIND: &str = "document_memory_extract";
+const ARKMEMORY_DOCUMENT_MEMORY_PENDING_STATUS: &str = "pending_document_memory_extract";
+const ARKMEMORY_DOCUMENT_MEMORY_PROCESSING_STATUS: &str = "processing_document_memory_extract";
+const ARKMEMORY_DOCUMENT_MEMORY_COMPLETED_STATUS: &str = "completed_document_memory_extract";
+const ARKMEMORY_DOCUMENT_MEMORY_FAILED_STATUS: &str = "failed_document_memory_extract";
+const ARKMEMORY_DOCUMENT_MEMORY_IDLE_INTERVAL: Duration = Duration::from_secs(90);
+static ARKMEMORY_DOCUMENT_MEMORY_IDLE_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+static ARKMEMORY_DOCUMENT_MEMORY_EXTRACT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone)]
+struct ArkmemoryKnowledgeExtractionSource {
+    source_kind: String,
+    source_id: String,
+    title: String,
+    text: String,
+    project_id: Option<String>,
+    conversation_id: Option<String>,
+    memory_id: Option<String>,
+    document_id: Option<String>,
+    document_chunk_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ArkmemoryExtractedRelation {
+    source_entity_name: String,
+    source_entity_type: String,
+    target_entity_name: String,
+    target_entity_type: String,
+    relation_type: String,
+    confidence: f64,
+    polarity: String,
+    evidence: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct ArkmemoryExtractedMemoryCandidate {
+    key: String,
+    value: String,
+    category: String,
+    kind: String,
+    durability: String,
+    scope: String,
+    sensitivity: String,
+    topics: Vec<String>,
+    confidence: f64,
+    evidence: String,
+    reason: String,
+    looks_sensitive: bool,
+    sensitive_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArkmemoryKnowledgeExtractionResult {
+    relations: Vec<ArkmemoryExtractedRelation>,
+    memory_candidates: Vec<ArkmemoryExtractedMemoryCandidate>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ArkmemoryKnowledgeExtractionStats {
+    sources_seen: usize,
+    sources_processed: usize,
+    relations_written: usize,
+    memory_candidates_queued: usize,
+    skipped_low_confidence: usize,
+    failed_sources: usize,
+}
+
+struct ArkmemoryDocumentExtractGuard;
+
+impl Drop for ArkmemoryDocumentExtractGuard {
+    fn drop(&mut self) {
+        ARKMEMORY_DOCUMENT_MEMORY_EXTRACT_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn arkmemory_document_extract_try_guard() -> Option<ArkmemoryDocumentExtractGuard> {
+    ARKMEMORY_DOCUMENT_MEMORY_EXTRACT_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| ArkmemoryDocumentExtractGuard)
+}
+
+fn arkmemory_kg_json_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn arkmemory_kg_json_bool(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn arkmemory_kg_json_confidence(value: &serde_json::Value) -> f64 {
+    value
+        .get("confidence")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+fn arkmemory_kg_string_tokens(value: Option<&serde_json::Value>, limit: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    if let Some(values) = value.and_then(|value| value.as_array()) {
+        for item in values {
+            let token = item
+                .as_str()
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+            let Some(token) = token else {
+                continue;
+            };
+            let token = arkmemory_truncate_chars(token, 80);
+            if seen.insert(token.clone()) {
+                out.push(token);
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn arkmemory_kg_normalize_token(raw: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    let mut last_separator = false;
+    for ch in raw.trim().chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_separator = false;
+        } else if !last_separator && !out.is_empty() {
+            out.push('_');
+            last_separator = true;
+        }
+    }
+    let normalized = out.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        fallback.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn arkmemory_kg_normalize_name(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in raw.trim().chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            last_space = false;
+        } else if !last_space && !out.is_empty() {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn arkmemory_kg_stable_id(prefix: &str, parts: &[&str]) -> String {
+    let mut owned_parts = vec![prefix];
+    owned_parts.extend_from_slice(parts);
+    arkmemory_stable_event_id(&owned_parts).replace("arkmemory-event-", &format!("{prefix}-"))
+}
+
+fn arkmemory_kg_entity_id(
+    project_id: Option<&str>,
+    entity_type: &str,
+    normalized_name: &str,
+) -> String {
+    arkmemory_kg_stable_id(
+        "kg-entity",
+        &[project_id.unwrap_or_default(), entity_type, normalized_name],
+    )
+}
+
+fn arkmemory_kg_relation_id(
+    project_id: Option<&str>,
+    source_entity_id: &str,
+    relation_type: &str,
+    target_entity_id: &str,
+) -> String {
+    arkmemory_kg_stable_id(
+        "kg-relation",
+        &[
+            project_id.unwrap_or_default(),
+            source_entity_id,
+            relation_type,
+            target_entity_id,
+        ],
+    )
+}
+
+fn arkmemory_kg_evidence_id(
+    relation_id: &str,
+    source_kind: &str,
+    source_id: &str,
+    polarity: &str,
+    evidence: &str,
+) -> String {
+    arkmemory_kg_stable_id(
+        "kg-evidence",
+        &[relation_id, source_kind, source_id, polarity, evidence],
+    )
+}
+
+fn arkmemory_document_memory_sensitivity_safe(sensitivity: &str) -> bool {
+    let normalized = arkmemory_kg_normalize_token(sensitivity, "prompt_safe");
+    normalized.is_empty() || normalized == "prompt_safe"
+}
+
+fn arkmemory_parse_knowledge_extraction(text: &str) -> ArkmemoryKnowledgeExtractionResult {
+    let Some(json) = arkmemory_extract_json_object(text) else {
+        return ArkmemoryKnowledgeExtractionResult::default();
+    };
+    let mut result = ArkmemoryKnowledgeExtractionResult::default();
+    if let Some(relations) = json.get("relations").and_then(|value| value.as_array()) {
+        for item in relations.iter().take(8) {
+            let source_entity_name = arkmemory_kg_json_string(item, "source_entity_name");
+            let target_entity_name = arkmemory_kg_json_string(item, "target_entity_name");
+            let relation_type = arkmemory_kg_json_string(item, "relation_type");
+            let evidence = arkmemory_kg_json_string(item, "evidence");
+            if source_entity_name.is_empty()
+                || target_entity_name.is_empty()
+                || relation_type.is_empty()
+                || evidence.is_empty()
+            {
+                continue;
+            }
+            result.relations.push(ArkmemoryExtractedRelation {
+                source_entity_name: arkmemory_truncate_chars(&source_entity_name, 160),
+                source_entity_type: arkmemory_kg_json_string(item, "source_entity_type"),
+                target_entity_name: arkmemory_truncate_chars(&target_entity_name, 160),
+                target_entity_type: arkmemory_kg_json_string(item, "target_entity_type"),
+                relation_type,
+                confidence: arkmemory_kg_json_confidence(item),
+                polarity: arkmemory_kg_json_string(item, "polarity"),
+                evidence: arkmemory_truncate_chars(&evidence, 500),
+                reason: arkmemory_truncate_chars(&arkmemory_kg_json_string(item, "reason"), 300),
+            });
+        }
+    }
+    if let Some(candidates) = json
+        .get("memory_candidates")
+        .and_then(|value| value.as_array())
+    {
+        for item in candidates.iter().take(4) {
+            let key = arkmemory_kg_json_string(item, "key");
+            let value = arkmemory_kg_json_string(item, "value");
+            let evidence = arkmemory_kg_json_string(item, "evidence");
+            if key.is_empty() || value.is_empty() || evidence.is_empty() {
+                continue;
+            }
+            result
+                .memory_candidates
+                .push(ArkmemoryExtractedMemoryCandidate {
+                    key: arkmemory_kg_normalize_token(&key, "document_memory"),
+                    value: arkmemory_truncate_chars(&value, 900),
+                    category: arkmemory_kg_json_string(item, "category"),
+                    kind: arkmemory_kg_json_string(item, "kind"),
+                    durability: arkmemory_kg_json_string(item, "durability"),
+                    scope: arkmemory_kg_json_string(item, "scope"),
+                    sensitivity: arkmemory_kg_json_string(item, "sensitivity"),
+                    topics: arkmemory_kg_string_tokens(item.get("topics"), 8),
+                    confidence: arkmemory_kg_json_confidence(item),
+                    evidence: arkmemory_truncate_chars(&evidence, 500),
+                    reason: arkmemory_truncate_chars(
+                        &arkmemory_kg_json_string(item, "reason"),
+                        300,
+                    ),
+                    looks_sensitive: arkmemory_kg_json_bool(item, "looks_sensitive"),
+                    sensitive_reason: Some(arkmemory_kg_json_string(item, "sensitive_reason"))
+                        .filter(|value| !value.is_empty()),
+                });
+        }
+    }
+    result
+}
+
+async fn arkmemory_extract_knowledge_from_source(
+    llm: &crate::core::LlmClient,
+    source: &ArkmemoryKnowledgeExtractionSource,
+    include_memory_candidates: bool,
+) -> Result<ArkmemoryKnowledgeExtractionResult> {
+    let text = arkmemory_truncate_chars(&source.text, 6_000);
+    if text.trim().chars().count() < 80 {
+        return Ok(ArkmemoryKnowledgeExtractionResult::default());
+    }
+    let memory_candidate_rule = if include_memory_candidates {
+        "Also emit memory_candidates only for durable or explicitly bounded facts, preferences, constraints, or project/domain memory that are directly stated in this document text and would help future assistance. These are review candidates only; be selective."
+    } else {
+        "Return an empty memory_candidates array."
+    };
+    let system_prompt = format!(
+        "You are AgentArk's background memory graph extractor. Extract only what the source text itself directly supports. Do not rely on model world knowledge, co-occurrence, headings alone, keyword rules, exact phrase matching, or guessed implications.\n\nReturn JSON only with this shape:\n{{\"relations\":[{{\"source_entity_name\":\"canonical entity name\",\"source_entity_type\":\"person|organization|project|product|document|concept|other\",\"relation_type\":\"open_snake_case_relation\",\"target_entity_name\":\"canonical entity name\",\"target_entity_type\":\"person|organization|project|product|document|concept|other\",\"polarity\":\"supports|contradicts\",\"confidence\":0.0,\"evidence\":\"short source excerpt\",\"reason\":\"brief rationale\"}}],\"memory_candidates\":[{{\"key\":\"stable_snake_case_slot\",\"value\":\"concise memory value\",\"category\":\"profile_fact|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|other\",\"kind\":\"identity|preference|workflow|constraint|project_domain_memory|knowledge|other\",\"durability\":\"permanent|temporary|situational\",\"scope\":\"global|project|conversation\",\"sensitivity\":\"prompt_safe|personal_identifier|sensitive|crisis_sensitive\",\"topics\":[\"semantic topic\"],\"confidence\":0.0,\"evidence\":\"short source excerpt\",\"reason\":\"brief rationale\",\"looks_sensitive\":false,\"sensitive_reason\":\"\"}}]}}\n\nRules:\n- Relations are candidates, not confirmed real-world facts. Emit a relation only when the source text explicitly states or strongly entails a useful relationship between two named/identifiable entities.\n- Do not emit generic topical associations, repeated words, document structure, vague similarity, or relations that merely say a document mentions a concept.\n- Prefer no output over low-value or weakly supported output.\n- Keep at most five relations and at most two memory candidates for this source.\n- Do not include credentials, secrets, tokens, private keys, passwords, or auth material.\n- {memory_candidate_rule}"
+    );
+    let user_message = format!(
+        "Source kind: {}\nSource id: {}\nTitle: {}\n\nSource text:\n{}",
+        source.source_kind, source.source_id, source.title, text
+    );
+    let response = llm
+        .chat_classifier_bounded(&system_prompt, &user_message, 1_400)
+        .await?;
+    Ok(arkmemory_parse_knowledge_extraction(&response.content))
+}
+
+async fn arkmemory_upsert_relation_candidate(
+    storage: &crate::storage::Storage,
+    source: &ArkmemoryKnowledgeExtractionSource,
+    relation: &ArkmemoryExtractedRelation,
+) -> Result<bool> {
+    if relation.confidence < ARKMEMORY_KNOWLEDGE_RELATION_MIN_CONFIDENCE {
+        return Ok(false);
+    }
+    let project_id = source.project_id.as_deref();
+    let source_entity_type = arkmemory_kg_normalize_token(&relation.source_entity_type, "entity");
+    let target_entity_type = arkmemory_kg_normalize_token(&relation.target_entity_type, "entity");
+    let source_normalized_name = arkmemory_kg_normalize_name(&relation.source_entity_name);
+    let target_normalized_name = arkmemory_kg_normalize_name(&relation.target_entity_name);
+    if source_normalized_name.is_empty() || target_normalized_name.is_empty() {
+        return Ok(false);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let source_entity_id =
+        arkmemory_kg_entity_id(project_id, &source_entity_type, &source_normalized_name);
+    let target_entity_id =
+        arkmemory_kg_entity_id(project_id, &target_entity_type, &target_normalized_name);
+    let source_entity = crate::storage::knowledge_entity::Model {
+        id: source_entity_id.clone(),
+        entity_type: source_entity_type.clone(),
+        canonical_name: relation.source_entity_name.clone(),
+        normalized_name: source_normalized_name,
+        project_id: source.project_id.clone(),
+        status: "active".to_string(),
+        confidence: relation.confidence,
+        aliases: serde_json::json!([]),
+        metadata: serde_json::json!({ "last_source_kind": source.source_kind }),
+        first_seen_at: now.clone(),
+        last_seen_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let target_entity = crate::storage::knowledge_entity::Model {
+        id: target_entity_id.clone(),
+        entity_type: target_entity_type.clone(),
+        canonical_name: relation.target_entity_name.clone(),
+        normalized_name: arkmemory_kg_normalize_name(&relation.target_entity_name),
+        project_id: source.project_id.clone(),
+        status: "active".to_string(),
+        confidence: relation.confidence,
+        aliases: serde_json::json!([]),
+        metadata: serde_json::json!({ "last_source_kind": source.source_kind }),
+        first_seen_at: now.clone(),
+        last_seen_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    storage.upsert_knowledge_entity(&source_entity).await?;
+    storage.upsert_knowledge_entity(&target_entity).await?;
+
+    let relation_type = arkmemory_kg_normalize_token(&relation.relation_type, "related_to");
+    let relation_id = arkmemory_kg_relation_id(
+        project_id,
+        &source_entity_id,
+        &relation_type,
+        &target_entity_id,
+    );
+    let polarity = match relation.polarity.trim() {
+        "contradicts" => "contradicts",
+        _ => "supports",
+    };
+    let evidence_id = arkmemory_kg_evidence_id(
+        &relation_id,
+        &source.source_kind,
+        &source.source_id,
+        polarity,
+        &relation.evidence,
+    );
+    let prior_evidence = storage
+        .list_knowledge_relation_evidence_for_relations(&[relation_id.clone()], 1_000)
+        .await?;
+    let evidence_is_new = prior_evidence.iter().all(|item| item.id != evidence_id);
+    let prior_relation = storage.get_knowledge_relation(&relation_id).await?;
+    let mut support_count = prior_relation
+        .as_ref()
+        .map(|item| item.support_count)
+        .unwrap_or_else(|| {
+            prior_evidence
+                .iter()
+                .filter(|item| item.polarity == "supports")
+                .count() as i32
+        });
+    let mut contradiction_count = prior_relation
+        .as_ref()
+        .map(|item| item.contradiction_count)
+        .unwrap_or_else(|| {
+            prior_evidence
+                .iter()
+                .filter(|item| item.polarity == "contradicts")
+                .count() as i32
+        });
+    if evidence_is_new {
+        if polarity == "contradicts" {
+            contradiction_count += 1;
+        } else {
+            support_count += 1;
+        }
+    }
+    let stored_relation = crate::storage::knowledge_relation::Model {
+        id: relation_id.clone(),
+        source_entity_id: source_entity_id.clone(),
+        target_entity_id: target_entity_id.clone(),
+        relation_type: relation_type.clone(),
+        status: prior_relation
+            .as_ref()
+            .map(|item| item.status.clone())
+            .unwrap_or_else(|| "candidate".to_string()),
+        confidence: prior_relation
+            .as_ref()
+            .map(|item| item.confidence.max(relation.confidence))
+            .unwrap_or(relation.confidence),
+        project_id: source.project_id.clone(),
+        valid_from: None,
+        valid_until: None,
+        support_count,
+        contradiction_count,
+        metadata: serde_json::json!({
+            "last_reason": relation.reason,
+            "last_source_kind": source.source_kind,
+            "last_source_id": source.source_id,
+        }),
+        first_seen_at: prior_relation
+            .as_ref()
+            .map(|item| item.first_seen_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        last_seen_at: now.clone(),
+        created_at: prior_relation
+            .as_ref()
+            .map(|item| item.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        updated_at: now.clone(),
+    };
+    storage.upsert_knowledge_relation(&stored_relation).await?;
+    let evidence = crate::storage::knowledge_relation_evidence::Model {
+        id: evidence_id,
+        relation_id,
+        evidence_kind: source.source_kind.clone(),
+        evidence_ref: source.source_id.clone(),
+        memory_id: source.memory_id.clone(),
+        message_id: None,
+        document_id: source.document_id.clone(),
+        project_id: source.project_id.clone(),
+        conversation_id: source.conversation_id.clone(),
+        polarity: polarity.to_string(),
+        confidence: relation.confidence,
+        excerpt: Some(relation.evidence.clone()),
+        metadata: serde_json::json!({
+            "document_chunk_id": source.document_chunk_id,
+            "reason": relation.reason,
+        }),
+        created_at: now,
+    };
+    storage
+        .upsert_knowledge_relation_evidence(&evidence)
+        .await?;
+    Ok(true)
+}
+
+async fn arkmemory_queue_document_memory_candidate(
+    storage: &crate::storage::Storage,
+    source: &ArkmemoryKnowledgeExtractionSource,
+    capture_event_id: Option<&str>,
+    candidate: &ArkmemoryExtractedMemoryCandidate,
+) -> Result<bool> {
+    if candidate.confidence < ARKMEMORY_DOCUMENT_MEMORY_MIN_CONFIDENCE
+        || candidate.looks_sensitive
+        || !arkmemory_document_memory_sensitivity_safe(&candidate.sensitivity)
+        || candidate.value.trim().is_empty()
+        || candidate.evidence.trim().is_empty()
+    {
+        return Ok(false);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let category = arkmemory_kg_normalize_token(&candidate.category, "knowledge");
+    let kind = arkmemory_kg_normalize_token(&candidate.kind, &category);
+    let durability = match candidate.durability.trim() {
+        "temporary" | "situational" | "permanent" => candidate.durability.trim(),
+        _ => "permanent",
+    };
+    let scope = match candidate.scope.trim() {
+        "project" | "conversation" | "global" => candidate.scope.trim(),
+        _ => "project",
+    };
+    let semantic_key = arkmemory_kg_stable_id(
+        "document-memory-subject",
+        &[
+            source.project_id.as_deref().unwrap_or_default(),
+            scope,
+            &candidate.key,
+        ],
+    );
+    let operation_id = arkmemory_kg_stable_id(
+        "document-memory-operation",
+        &[
+            source.source_id.as_str(),
+            candidate.key.as_str(),
+            candidate.value.as_str(),
+        ],
+    );
+    let evidence_refs = serde_json::json!([
+        format!(
+            "document:{}",
+            source.document_id.as_deref().unwrap_or_default()
+        ),
+        format!(
+            "document_chunk:{}",
+            source
+                .document_chunk_id
+                .as_deref()
+                .unwrap_or(source.source_id.as_str())
+        ),
+    ]);
+    let model_metadata = serde_json::json!({
+        "memory_category": category,
+        "topics": candidate.topics,
+        "sensitivity": if candidate.sensitivity.trim().is_empty() { "prompt_safe" } else { candidate.sensitivity.trim() },
+        "source_support": "explicit_document_text",
+        "source_evidence": candidate.evidence,
+        "scope_explicit": true,
+        "semantic_key": semantic_key,
+        "document_id": source.document_id,
+        "document_chunk_id": source.document_chunk_id,
+    });
+    let operation = crate::storage::memory_operation::Model {
+        id: operation_id.clone(),
+        capture_event_id: capture_event_id.map(str::to_string),
+        operation_type: "add".to_string(),
+        status: "queued_review".to_string(),
+        target_memory_id: None,
+        applied_memory_id: None,
+        key: Some(candidate.key.clone()),
+        value: Some(candidate.value.clone()),
+        memory_kind: kind,
+        durability: durability.to_string(),
+        scope: scope.to_string(),
+        project_id: source.project_id.clone(),
+        conversation_id: source.conversation_id.clone(),
+        confidence: candidate.confidence,
+        looks_sensitive: false,
+        sensitive_reason: candidate.sensitive_reason.clone(),
+        valid_from: None,
+        expires_at: None,
+        review_at: None,
+        rationale: Some(candidate.reason.clone()),
+        evidence_refs: evidence_refs.clone(),
+        model_metadata: model_metadata.clone(),
+        apply_metadata: serde_json::json!({ "source": "document_memory_extractor" }),
+        applied_at: None,
+        reviewed_at: None,
+        review_notes: Some(
+            "Queued from document extraction; requires review before Memory stores it.".to_string(),
+        ),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    storage.upsert_memory_operation(&operation).await?;
+    let candidate_row = crate::storage::learning_candidate::Model {
+        id: format!("memory-candidate-{}", operation_id),
+        candidate_type: "memory_add".to_string(),
+        subject_key: semantic_key,
+        title: format!("Review document memory: {}", candidate.key),
+        summary: Some(candidate.reason.clone()),
+        project_id: source.project_id.clone(),
+        conversation_id: source.conversation_id.clone(),
+        pattern_id: None,
+        evidence_refs,
+        proposed_content: serde_json::json!({
+            "operation_id": operation_id,
+            "capture_event_id": capture_event_id,
+            "operation_type": "add",
+            "target_memory_id": null,
+            "applied_memory_id": null,
+            "key": candidate.key,
+            "value": candidate.value,
+            "memory_kind": operation.memory_kind,
+            "memory_category": model_metadata.get("memory_category").cloned(),
+            "topics": model_metadata.get("topics").cloned(),
+            "durability": operation.durability,
+            "scope": operation.scope,
+            "confidence": operation.confidence,
+            "looks_sensitive": false,
+            "sensitive_reason": operation.sensitive_reason,
+            "sensitivity": model_metadata.get("sensitivity").cloned(),
+            "valid_from": null,
+            "expires_at": null,
+            "review_at": null,
+            "rationale": operation.rationale,
+            "status": operation.status,
+            "scope_explicit": true,
+            "semantic_key": operation.model_metadata.get("semantic_key").cloned(),
+            "source": "document_memory_extractor",
+        }),
+        confidence: candidate.confidence,
+        approval_status: "draft".to_string(),
+        review_notes: Some(
+            "Document-derived memory candidate. Review before applying.".to_string(),
+        ),
+        reviewed_at: None,
+        approved_ref: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    storage.upsert_learning_candidate(&candidate_row).await?;
+    Ok(true)
+}
+
+async fn arkmemory_persist_knowledge_extraction(
+    storage: &crate::storage::Storage,
+    source: &ArkmemoryKnowledgeExtractionSource,
+    capture_event_id: Option<&str>,
+    extraction: ArkmemoryKnowledgeExtractionResult,
+    include_memory_candidates: bool,
+) -> Result<ArkmemoryKnowledgeExtractionStats> {
+    let mut stats = ArkmemoryKnowledgeExtractionStats {
+        sources_processed: 1,
+        ..Default::default()
+    };
+    for relation in extraction.relations {
+        if relation.confidence < ARKMEMORY_KNOWLEDGE_RELATION_MIN_CONFIDENCE {
+            stats.skipped_low_confidence += 1;
+            continue;
+        }
+        if arkmemory_upsert_relation_candidate(storage, source, &relation).await? {
+            stats.relations_written += 1;
+        }
+    }
+    if include_memory_candidates {
+        for candidate in extraction.memory_candidates {
+            if candidate.confidence < ARKMEMORY_DOCUMENT_MEMORY_MIN_CONFIDENCE
+                || candidate.looks_sensitive
+                || !arkmemory_document_memory_sensitivity_safe(&candidate.sensitivity)
+            {
+                stats.skipped_low_confidence += 1;
+                continue;
+            }
+            if arkmemory_queue_document_memory_candidate(
+                storage,
+                source,
+                capture_event_id,
+                &candidate,
+            )
+            .await?
+            {
+                stats.memory_candidates_queued += 1;
+            }
+        }
+    }
+    Ok(stats)
+}
+
+fn arkmemory_knowledge_source_from_memory(
+    item: &crate::storage::experience_item::Model,
+) -> ArkmemoryKnowledgeExtractionSource {
+    ArkmemoryKnowledgeExtractionSource {
+        source_kind: "memory".to_string(),
+        source_id: item.id.clone(),
+        title: item.title.clone(),
+        text: item.content.clone(),
+        project_id: item.project_id.clone(),
+        conversation_id: item.conversation_id.clone(),
+        memory_id: Some(item.id.clone()),
+        document_id: None,
+        document_chunk_id: None,
+    }
+}
+
+fn arkmemory_knowledge_source_from_document_chunk(
+    document: &crate::storage::document::Model,
+    chunk: &crate::storage::document_chunk::Model,
+) -> ArkmemoryKnowledgeExtractionSource {
+    ArkmemoryKnowledgeExtractionSource {
+        source_kind: "document_chunk".to_string(),
+        source_id: chunk.id.clone(),
+        title: format!("{} #{}", document.filename, chunk.chunk_index),
+        text: chunk.content.clone(),
+        project_id: document.project_id.clone(),
+        conversation_id: None,
+        memory_id: None,
+        document_id: Some(document.id.clone()),
+        document_chunk_id: Some(chunk.id.clone()),
+    }
+}
+
+fn arkmemory_merge_extraction_stats(
+    total: &mut ArkmemoryKnowledgeExtractionStats,
+    next: ArkmemoryKnowledgeExtractionStats,
+) {
+    total.sources_seen += next.sources_seen;
+    total.sources_processed += next.sources_processed;
+    total.relations_written += next.relations_written;
+    total.memory_candidates_queued += next.memory_candidates_queued;
+    total.skipped_low_confidence += next.skipped_low_confidence;
+    total.failed_sources += next.failed_sources;
+}
+
+async fn arkmemory_run_knowledge_extraction_sources(
+    storage: crate::storage::Storage,
+    llm: crate::core::LlmClient,
+    sources: Vec<ArkmemoryKnowledgeExtractionSource>,
+    include_memory_candidates_for_documents: bool,
+) -> ArkmemoryKnowledgeExtractionStats {
+    let mut stats = ArkmemoryKnowledgeExtractionStats::default();
+    for source in sources {
+        stats.sources_seen += 1;
+        let include_memory_candidates =
+            include_memory_candidates_for_documents && source.source_kind == "document_chunk";
+        let extraction =
+            match arkmemory_extract_knowledge_from_source(&llm, &source, include_memory_candidates)
+                .await
+            {
+                Ok(extraction) => extraction,
+                Err(error) => {
+                    stats.failed_sources += 1;
+                    tracing::debug!(
+                        source_kind = %source.source_kind,
+                        source_id = %source.source_id,
+                        "Memory graph extraction source failed: {}",
+                        error
+                    );
+                    continue;
+                }
+            };
+        match arkmemory_persist_knowledge_extraction(
+            &storage,
+            &source,
+            None,
+            extraction,
+            include_memory_candidates,
+        )
+        .await
+        {
+            Ok(next) => arkmemory_merge_extraction_stats(&mut stats, next),
+            Err(error) => {
+                stats.failed_sources += 1;
+                tracing::warn!(
+                    source_kind = %source.source_kind,
+                    source_id = %source.source_id,
+                    "Failed to persist Memory graph extraction: {}",
+                    error
+                );
+            }
+        }
+    }
+    stats
+}
+
+pub(super) async fn arkmemory_mark_document_memory_extract_candidate(
+    storage: &crate::storage::Storage,
+    document_id: &str,
+    project_id: Option<&str>,
+) -> bool {
+    let document_id = document_id.trim();
+    if document_id.is_empty() {
+        return false;
+    }
+    let source_hash = format!(
+        "document_memory:{}",
+        arkmemory_stable_event_id(&[document_id])
+    );
+    if storage
+        .count_memory_capture_events_by_source_hash(&source_hash)
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        return false;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let event = crate::storage::memory_capture_event::Model {
+        id: arkmemory_kg_stable_id("document-memory-capture", &[document_id]),
+        source_message_id: None,
+        conversation_id: None,
+        project_id: project_id.map(str::to_string),
+        channel: "documents".to_string(),
+        status: ARKMEMORY_DOCUMENT_MEMORY_PENDING_STATUS.to_string(),
+        capture_kind: ARKMEMORY_DOCUMENT_MEMORY_CAPTURE_KIND.to_string(),
+        source_hash,
+        attempt_metadata: serde_json::json!({
+            "schema_version": 1,
+            "document_id": document_id,
+            "next_chunk_index": 0,
+            "queued_at": now,
+            "source": "document_upload",
+        }),
+        error_history: serde_json::json!([]),
+        replay_count: 0,
+        next_retry_at: None,
+        completed_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    match storage.upsert_memory_capture_event(&event).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                document_id,
+                "Failed to queue document Memory extraction: {}",
+                error
+            );
+            false
+        }
+    }
+}
+
+async fn arkmemory_process_document_memory_capture_event(
+    storage: &crate::storage::Storage,
+    llm: &crate::core::LlmClient,
+    mut event: crate::storage::memory_capture_event::Model,
+) -> Result<ArkmemoryKnowledgeExtractionStats> {
+    let document_id = event
+        .attempt_metadata
+        .get("document_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("document Memory extraction event is missing document_id")
+        })?;
+    let next_chunk_index = event
+        .attempt_metadata
+        .get("next_chunk_index")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1)
+        .clamp(0, i32::MAX as i64) as i32;
+    let document = storage
+        .get_document(document_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("document not found or not visible"))?;
+    let chunks = storage
+        .list_document_chunks_for_document_window(
+            document_id,
+            next_chunk_index,
+            ARKMEMORY_DOCUMENT_EXTRACT_CHUNK_BATCH_LIMIT,
+        )
+        .await?;
+    if chunks.is_empty() {
+        event.status = ARKMEMORY_DOCUMENT_MEMORY_COMPLETED_STATUS.to_string();
+        event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        event.updated_at = chrono::Utc::now().to_rfc3339();
+        event.attempt_metadata["completed_at"] = serde_json::json!(event.completed_at.clone());
+        storage.upsert_memory_capture_event(&event).await?;
+        return Ok(ArkmemoryKnowledgeExtractionStats::default());
+    }
+    let mut total = ArkmemoryKnowledgeExtractionStats::default();
+    let mut last_chunk_index = next_chunk_index;
+    for chunk in &chunks {
+        last_chunk_index = chunk.chunk_index;
+        let source = arkmemory_knowledge_source_from_document_chunk(&document, chunk);
+        let extraction = match arkmemory_extract_knowledge_from_source(llm, &source, true).await {
+            Ok(extraction) => extraction,
+            Err(error) => {
+                total.failed_sources += 1;
+                tracing::debug!(
+                    document_id = %document.id,
+                    chunk_id = %chunk.id,
+                    "Document Memory extraction skipped chunk after model failure: {}",
+                    error
+                );
+                continue;
+            }
+        };
+        match arkmemory_persist_knowledge_extraction(
+            storage,
+            &source,
+            Some(&event.id),
+            extraction,
+            true,
+        )
+        .await
+        {
+            Ok(stats) => arkmemory_merge_extraction_stats(&mut total, stats),
+            Err(error) => {
+                total.failed_sources += 1;
+                tracing::warn!(
+                    document_id = %document.id,
+                    chunk_id = %chunk.id,
+                    "Document Memory extraction failed to persist chunk: {}",
+                    error
+                );
+            }
+        }
+    }
+    let next_index = last_chunk_index.saturating_add(1);
+    let has_more = next_index < document.chunk_count;
+    event.status = if has_more {
+        ARKMEMORY_DOCUMENT_MEMORY_PENDING_STATUS.to_string()
+    } else {
+        ARKMEMORY_DOCUMENT_MEMORY_COMPLETED_STATUS.to_string()
+    };
+    event.completed_at = if has_more {
+        None
+    } else {
+        Some(chrono::Utc::now().to_rfc3339())
+    };
+    event.updated_at = chrono::Utc::now().to_rfc3339();
+    event.replay_count = event.replay_count.saturating_add(1);
+    event.attempt_metadata["next_chunk_index"] = serde_json::json!(next_index);
+    event.attempt_metadata["last_batch"] = serde_json::json!({
+        "processed_chunks": chunks.len(),
+        "relations_written": total.relations_written,
+        "memory_candidates_queued": total.memory_candidates_queued,
+        "finished_document": !has_more,
+        "updated_at": event.updated_at,
+    });
+    storage.upsert_memory_capture_event(&event).await?;
+    Ok(total)
+}
+
+async fn arkmemory_process_document_memory_capture_batch(
+    state: AppState,
+    limit: u64,
+) -> ArkmemoryKnowledgeExtractionStats {
+    let Some(_guard) = arkmemory_document_extract_try_guard() else {
+        return ArkmemoryKnowledgeExtractionStats::default();
+    };
+    let (storage, llm) = {
+        let agent = state.agent.read().await;
+        (agent.storage.clone(), agent.llm.clone())
+    };
+    let events = match storage
+        .list_memory_capture_events_by_statuses_all_scopes(
+            &[ARKMEMORY_DOCUMENT_MEMORY_PENDING_STATUS],
+            limit,
+        )
+        .await
+    {
+        Ok(events) => events
+            .into_iter()
+            .filter(|event| event.capture_kind == ARKMEMORY_DOCUMENT_MEMORY_CAPTURE_KIND)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::debug!("Failed to list document Memory extraction jobs: {}", error);
+            return ArkmemoryKnowledgeExtractionStats::default();
+        }
+    };
+    let mut total = ArkmemoryKnowledgeExtractionStats::default();
+    for mut event in events {
+        let now = chrono::Utc::now().to_rfc3339();
+        match storage
+            .try_claim_memory_capture_event_status(
+                &event.id,
+                ARKMEMORY_DOCUMENT_MEMORY_PENDING_STATUS,
+                ARKMEMORY_DOCUMENT_MEMORY_PROCESSING_STATUS,
+                &now,
+            )
+            .await
+        {
+            Ok(true) => {
+                event.status = ARKMEMORY_DOCUMENT_MEMORY_PROCESSING_STATUS.to_string();
+                event.updated_at = now;
+            }
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    capture_event_id = %event.id,
+                    "Failed to claim document Memory extraction event: {}",
+                    error
+                );
+                continue;
+            }
+        }
+        match arkmemory_process_document_memory_capture_event(&storage, &llm, event.clone()).await {
+            Ok(stats) => arkmemory_merge_extraction_stats(&mut total, stats),
+            Err(error) => {
+                total.failed_sources += 1;
+                event.status = ARKMEMORY_DOCUMENT_MEMORY_FAILED_STATUS.to_string();
+                event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                event.updated_at = chrono::Utc::now().to_rfc3339();
+                event.error_history = serde_json::json!([{
+                    "code": "document_memory_extract_failed",
+                    "message": arkmemory_truncate_chars(&error.to_string(), 500),
+                    "at": event.updated_at,
+                }]);
+                let _ = storage.upsert_memory_capture_event(&event).await;
+            }
+        }
+    }
+    total
+}
+
+async fn arkmemory_document_memory_server_is_idle(state: &AppState) -> bool {
+    if server_under_load(state).await || crate::sentinel::is_pulse_running() {
+        return false;
+    }
+    let agent = state.agent.read().await;
+    agent.active_message_request_count() == 0
+}
+
+async fn arkmemory_document_memory_idle_loop(
+    state: AppState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(ARKMEMORY_DOCUMENT_MEMORY_IDLE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            _ = interval.tick() => {}
+        }
+        if !arkmemory_document_memory_server_is_idle(&state).await {
+            continue;
+        }
+        let stats = arkmemory_process_document_memory_capture_batch(state.clone(), 2).await;
+        if stats.sources_processed > 0
+            || stats.relations_written > 0
+            || stats.memory_candidates_queued > 0
+        {
+            tracing::debug!(
+                sources_processed = stats.sources_processed,
+                relations_written = stats.relations_written,
+                memory_candidates_queued = stats.memory_candidates_queued,
+                "Document Memory extraction idle pass completed"
+            );
+        }
+    }
+}
+
+pub(super) fn spawn_arkmemory_document_memory_idle_loop(
+    state: AppState,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if ARKMEMORY_DOCUMENT_MEMORY_IDLE_LOOP_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    Some(crate::spawn_logged!(
+        "src/channels/http/memory_control.rs:document_memory_idle_loop",
+        async move {
+            arkmemory_document_memory_idle_loop(state, shutdown_rx).await;
+        }
+    ))
+}
+
+pub(super) async fn arkmemory_graph(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let mode = params
+        .get("mode")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("map");
+    let project_id = arkmemory_project_param(&params);
+    let limit = arkmemory_graph_limit(&params);
+    let categories = arkmemory_graph_params_filter(&params, "category")
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let requested_statuses = arkmemory_graph_params_filter(&params, "status");
+    let statuses_for_query = if requested_statuses.is_empty() {
+        vec!["active".to_string()]
+    } else {
+        requested_statuses.clone()
+    };
+    let statuses = statuses_for_query.iter().cloned().collect::<HashSet<_>>();
+    let edge_types = arkmemory_graph_params_filter(&params, "edge_type")
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let include_semantic = arkmemory_graph_bool_param(&params, "include_semantic", true)
+        && arkmemory_graph_filter_edge("semantic_nearby", &edge_types);
+    let include_knowledge_relations = edge_types.is_empty()
+        || edge_types.contains("knowledge_relation")
+        || edge_types.contains("relation_evidence");
+    let relation_statuses = arkmemory_graph_relation_statuses(&params);
+    let entity_statuses = arkmemory_graph_entity_statuses(&params);
+    let relation_types = arkmemory_graph_params_filter(&params, "relation_type");
+    let source_filters = arkmemory_graph_params_filter(&params, "source")
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let min_confidence = arkmemory_graph_min_confidence(&params);
+    let updated_after = arkmemory_graph_updated_after(&params);
+    let updated_before = arkmemory_graph_updated_before(&params);
+    let semantic_threshold = arkmemory_graph_semantic_threshold(&params);
+    let semantic_per_node = arkmemory_graph_per_node_semantic_limit(&params);
+    let agent = state.agent.read().await;
+    let storage = &agent.storage;
+
+    let result = async {
+        let mut nodes = Vec::<ArkmemoryGraphNode>::new();
+        let mut edges = Vec::<ArkmemoryGraphEdge>::new();
+        let mut memory_items = Vec::<crate::storage::experience_item::Model>::new();
+        let mut seen_nodes = HashSet::<String>::new();
+        let mut knowledge_relation_count = 0usize;
+        let mut truncated = false;
+
+        if mode == "focus" {
+            let memory_id = params
+                .get("memory_id")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required for focused graph mode"))?;
+            let memory = storage
+                .get_experience_item(memory_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Memory item not found."))?;
+            if !arkmemory_item_is_memory(&memory)
+                || !arkmemory_item_visible_for_project(&memory, project_id)
+                || !arkmemory_graph_filter_item(
+                    &memory,
+                    &categories,
+                    &statuses,
+                    min_confidence,
+                    updated_after.as_deref(),
+                    updated_before.as_deref(),
+                )
+            {
+                anyhow::bail!("Memory item is outside the graph scope.");
+            }
+
+            seen_nodes.insert(memory.id.clone());
+            nodes.push(arkmemory_graph_memory_node(&memory, true));
+            memory_items.push(memory.clone());
+
+            let raw_edges = storage
+                .list_experience_edges_for_item(memory_id, limit.saturating_mul(4).min(240))
+                .await?;
+            let mut related_items = HashMap::new();
+            for edge in &raw_edges {
+                let related_id = if edge.source_kind == "experience_item"
+                    && edge.source_ref != memory_id
+                {
+                    Some(edge.source_ref.as_str())
+                } else if edge.target_kind == "experience_item" && edge.target_ref != memory_id {
+                    Some(edge.target_ref.as_str())
+                } else {
+                    None
+                };
+                let Some(related_id) = related_id else {
+                    continue;
+                };
+                if related_items.contains_key(related_id) {
+                    continue;
+                }
+                if related_items.len() >= limit.saturating_sub(1) as usize {
+                    truncated = true;
+                    break;
+                }
+                if let Some(item) = storage.get_experience_item(related_id).await? {
+                    if arkmemory_item_is_memory(&item)
+                        && arkmemory_item_visible_for_project(&item, project_id)
+                        && arkmemory_graph_filter_item(
+                            &item,
+                            &categories,
+                            &statuses,
+                            min_confidence,
+                            updated_after.as_deref(),
+                            updated_before.as_deref(),
+                        )
+                    {
+                        related_items.insert(related_id.to_string(), item);
+                    }
+                }
+            }
+            for item in related_items.into_values() {
+                if seen_nodes.insert(item.id.clone()) {
+                    nodes.push(arkmemory_graph_memory_node(&item, false));
+                    memory_items.push(item);
+                }
+            }
+
+            let memory_node_ids = memory_items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<HashSet<_>>();
+            for edge in raw_edges {
+                if edges.len() >= limit.saturating_mul(3) as usize {
+                    truncated = true;
+                    break;
+                }
+                if !arkmemory_graph_filter_edge(&edge.edge_type, &edge_types) {
+                    continue;
+                }
+                if memory_node_ids.contains(&edge.source_ref)
+                    && memory_node_ids.contains(&edge.target_ref)
+                {
+                    edges.push(arkmemory_graph_explicit_edge(&edge));
+                }
+            }
+
+            let source_cap = (limit as usize / 2).clamp(8, 40);
+            for source in arkmemory_memory_sources(&memory)
+                .into_iter()
+                .take(source_cap)
+            {
+                if arkmemory_graph_filter_edge("evidence", &edge_types) {
+                    arkmemory_graph_add_ref_node(
+                        &mut nodes,
+                        &mut edges,
+                        &mut seen_nodes,
+                        memory_id,
+                        &source,
+                        "evidence",
+                    );
+                }
+            }
+            if arkmemory_graph_filter_edge("evidence", &edge_types) {
+                let evidence_links = storage
+                    .list_memory_evidence_links_for_memory(memory_id, project_id, source_cap as u64)
+                    .await?;
+                for link in evidence_links {
+                    arkmemory_graph_add_ref_node(
+                        &mut nodes,
+                        &mut edges,
+                        &mut seen_nodes,
+                        memory_id,
+                        &format!("{}:{}", link.evidence_kind, link.evidence_ref),
+                        "evidence",
+                    );
+                }
+            }
+            if arkmemory_graph_filter_edge("operation", &edge_types) {
+                let operations = storage
+                    .list_memory_operations_for_memory(memory_id, project_id, 24)
+                    .await?;
+                for operation in operations {
+                    arkmemory_graph_add_ref_node(
+                        &mut nodes,
+                        &mut edges,
+                        &mut seen_nodes,
+                        memory_id,
+                        &format!("operation:{}", operation.id),
+                        "operation",
+                    );
+                }
+            }
+            if arkmemory_graph_filter_edge("event", &edge_types) {
+                let events = storage
+                    .list_recall_events_for_memory(memory_id, 24, project_id)
+                    .await?;
+                for event in events {
+                    arkmemory_graph_add_ref_node(
+                        &mut nodes,
+                        &mut edges,
+                        &mut seen_nodes,
+                        memory_id,
+                        &format!("event:{}", event.id),
+                        "event",
+                    );
+                }
+            }
+            if include_knowledge_relations {
+                let evidence_rows = storage
+                    .list_knowledge_relation_evidence_for_memory(memory_id, limit.min(120))
+                    .await?;
+                let relation_ids = evidence_rows
+                    .iter()
+                    .filter(|evidence| {
+                        arkmemory_graph_evidence_matches_sources(evidence, &source_filters)
+                    })
+                    .map(|evidence| evidence.relation_id.clone())
+                    .collect::<HashSet<_>>();
+                let mut evidence_by_relation: HashMap<
+                    String,
+                    Vec<crate::storage::knowledge_relation_evidence::Model>,
+                > = HashMap::new();
+                for evidence in evidence_rows {
+                    if !arkmemory_graph_evidence_matches_sources(&evidence, &source_filters) {
+                        continue;
+                    }
+                    if arkmemory_graph_filter_edge("evidence", &edge_types) {
+                        if let Some(source_ref) = arkmemory_graph_relation_evidence_ref(&evidence) {
+                            arkmemory_graph_add_ref_node(
+                                &mut nodes,
+                                &mut edges,
+                                &mut seen_nodes,
+                                memory_id,
+                                &source_ref,
+                                "evidence",
+                            );
+                        }
+                    }
+                    evidence_by_relation
+                        .entry(evidence.relation_id.clone())
+                        .or_default()
+                        .push(evidence);
+                }
+                for relation_id in relation_ids {
+                    let Some(relation) = storage.get_knowledge_relation(&relation_id).await? else {
+                        continue;
+                    };
+                    if !relation_statuses.is_empty()
+                        && !relation_statuses.contains(&relation.status)
+                    {
+                        continue;
+                    }
+                    if !relation_types.is_empty()
+                        && !relation_types.contains(&relation.relation_type)
+                    {
+                        continue;
+                    }
+                    if !arkmemory_graph_relation_matches_filters(
+                        &relation,
+                        min_confidence,
+                        updated_after.as_deref(),
+                        updated_before.as_deref(),
+                    ) {
+                        continue;
+                    }
+                    let Some(source_entity) = storage
+                        .get_knowledge_entity(&relation.source_entity_id)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    let Some(target_entity) = storage
+                        .get_knowledge_entity(&relation.target_entity_id)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    if (!entity_statuses.is_empty()
+                        && (!entity_statuses.contains(&source_entity.status)
+                            || !entity_statuses.contains(&target_entity.status)))
+                        || source_entity.confidence < min_confidence
+                        || target_entity.confidence < min_confidence
+                        || !arkmemory_graph_updated_in_range(
+                            &source_entity.updated_at,
+                            updated_after.as_deref(),
+                            updated_before.as_deref(),
+                        )
+                        || !arkmemory_graph_updated_in_range(
+                            &target_entity.updated_at,
+                            updated_after.as_deref(),
+                            updated_before.as_deref(),
+                        )
+                    {
+                        continue;
+                    }
+                    arkmemory_graph_add_knowledge_entity_node(
+                        &mut nodes,
+                        &mut seen_nodes,
+                        &source_entity,
+                        false,
+                    );
+                    arkmemory_graph_add_knowledge_entity_node(
+                        &mut nodes,
+                        &mut seen_nodes,
+                        &target_entity,
+                        false,
+                    );
+                    let relation_evidence = evidence_by_relation
+                        .get(&relation.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    if arkmemory_graph_filter_edge("knowledge_relation", &edge_types) {
+                        edges.push(arkmemory_graph_knowledge_relation_edge(
+                            &relation,
+                            relation_evidence,
+                        ));
+                    }
+                    if arkmemory_graph_filter_edge("relation_evidence", &edge_types) {
+                        edges.push(arkmemory_graph_relation_evidence_edge(
+                            memory_id,
+                            &source_entity.id,
+                            &relation.id,
+                        ));
+                        edges.push(arkmemory_graph_relation_evidence_edge(
+                            memory_id,
+                            &target_entity.id,
+                            &relation.id,
+                        ));
+                    }
+                    knowledge_relation_count += 1;
+                }
+            }
+        } else {
+            let scan_limit = if categories.is_empty() {
+                limit
+            } else {
+                limit.saturating_mul(4).clamp(limit, 880)
+            };
+            let items = storage
+                .list_memory_experience_items_for_graph(&statuses_for_query, project_id, scan_limit)
+                .await?;
+            for item in items {
+                if !arkmemory_item_is_memory(&item)
+                    || !arkmemory_graph_filter_item(
+                        &item,
+                        &categories,
+                        &statuses,
+                        min_confidence,
+                        updated_after.as_deref(),
+                        updated_before.as_deref(),
+                    )
+                {
+                    continue;
+                }
+                if memory_items.len() >= limit as usize {
+                    truncated = true;
+                    break;
+                }
+                seen_nodes.insert(item.id.clone());
+                nodes.push(arkmemory_graph_memory_node(&item, false));
+                memory_items.push(item);
+            }
+
+            let ids = memory_items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            let id_set = ids.iter().cloned().collect::<HashSet<_>>();
+            let raw_edges = storage
+                .list_experience_edges_for_refs(&ids, limit.saturating_mul(4).min(500))
+                .await?;
+            for edge in raw_edges {
+                if edges.len() >= limit.saturating_mul(3) as usize {
+                    truncated = true;
+                    break;
+                }
+                if !arkmemory_graph_filter_edge(&edge.edge_type, &edge_types) {
+                    continue;
+                }
+                if id_set.contains(&edge.source_ref) && id_set.contains(&edge.target_ref) {
+                    edges.push(arkmemory_graph_explicit_edge(&edge));
+                }
+            }
+            if include_knowledge_relations {
+                let entity_rows = storage
+                    .list_knowledge_entities_for_graph(&entity_statuses, project_id, limit)
+                    .await?;
+                let entity_rows = entity_rows
+                    .into_iter()
+                    .filter(|entity| {
+                        entity.confidence >= min_confidence
+                            && arkmemory_graph_updated_in_range(
+                                &entity.updated_at,
+                                updated_after.as_deref(),
+                                updated_before.as_deref(),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                let entity_ids = entity_rows
+                    .iter()
+                    .map(|entity| entity.id.clone())
+                    .collect::<Vec<_>>();
+                for entity in &entity_rows {
+                    arkmemory_graph_add_knowledge_entity_node(
+                        &mut nodes,
+                        &mut seen_nodes,
+                        entity,
+                        false,
+                    );
+                }
+                let relation_limit = limit.saturating_mul(4).min(500);
+                let relations = storage
+                    .list_knowledge_relations_for_entities(
+                        &entity_ids,
+                        &relation_statuses,
+                        &relation_types,
+                        relation_limit,
+                    )
+                    .await?;
+                let relation_ids = relations
+                    .iter()
+                    .map(|relation| relation.id.clone())
+                    .collect::<Vec<_>>();
+                let mut evidence_by_relation: HashMap<
+                    String,
+                    Vec<crate::storage::knowledge_relation_evidence::Model>,
+                > = HashMap::new();
+                for evidence in storage
+                    .list_knowledge_relation_evidence_for_relations(
+                        &relation_ids,
+                        limit.saturating_mul(4).min(500),
+                    )
+                    .await?
+                {
+                    evidence_by_relation
+                        .entry(evidence.relation_id.clone())
+                        .or_default()
+                        .push(evidence);
+                }
+                let entity_id_set = entity_ids.into_iter().collect::<HashSet<_>>();
+                for relation in relations {
+                    if !entity_id_set.contains(&relation.source_entity_id)
+                        || !entity_id_set.contains(&relation.target_entity_id)
+                    {
+                        continue;
+                    }
+                    if !arkmemory_graph_relation_matches_filters(
+                        &relation,
+                        min_confidence,
+                        updated_after.as_deref(),
+                        updated_before.as_deref(),
+                    ) {
+                        continue;
+                    }
+                    let relation_evidence = evidence_by_relation
+                        .get(&relation.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    if !source_filters.is_empty()
+                        && !relation_evidence.iter().any(|evidence| {
+                            arkmemory_graph_evidence_matches_sources(evidence, &source_filters)
+                        })
+                    {
+                        continue;
+                    }
+                    if arkmemory_graph_filter_edge("knowledge_relation", &edge_types) {
+                        edges.push(arkmemory_graph_knowledge_relation_edge(
+                            &relation,
+                            relation_evidence,
+                        ));
+                    }
+                    knowledge_relation_count += 1;
+                    if edges.len() >= limit.saturating_mul(4) as usize {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let explicit_pairs = edges
+            .iter()
+            .filter(|edge| !edge.semantic)
+            .map(|edge| arkmemory_graph_pair_key(&edge.source, &edge.target))
+            .collect::<HashSet<_>>();
+        if include_semantic {
+            let semantic_edges = arkmemory_graph_semantic_edges(
+                &memory_items,
+                &explicit_pairs,
+                semantic_threshold,
+                semantic_per_node,
+                limit as usize,
+            );
+            edges.extend(semantic_edges);
+        }
+        let semantic_edge_count = edges.iter().filter(|edge| edge.semantic).count();
+        let edge_count = edges.len();
+        let node_count = nodes.len();
+        Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({
+            "mode": if mode == "focus" { "focus" } else { "map" },
+            "nodes": nodes,
+            "edges": edges,
+            "node_count": node_count,
+            "memory_node_count": memory_items.len(),
+            "edge_count": edge_count,
+            "semantic_edge_count": semantic_edge_count,
+            "knowledge_relation_count": knowledge_relation_count,
+            "limit": limit,
+            "truncated": truncated,
+            "filters": {
+                "categories": categories,
+                "statuses": statuses,
+                "edge_types": edge_types,
+                "source_filters": source_filters,
+                "entity_statuses": entity_statuses,
+                "relation_statuses": relation_statuses,
+                "relation_types": relation_types,
+                "min_confidence": min_confidence,
+                "updated_after": updated_after,
+                "updated_before": updated_before,
+                "include_semantic": include_semantic,
+                "semantic_threshold": semantic_threshold,
+                "semantic_per_node": semantic_per_node,
+            }
+        }))
+    }
+    .await;
+
+    match result {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn arkmemory_knowledge_graph_extract(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let project_id = arkmemory_project_param(&params).map(str::to_string);
+    let include_memories = body
+        .get("include_memories")
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| arkmemory_graph_bool_param(&params, "include_memories", true));
+    let include_documents = body
+        .get("include_documents")
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| arkmemory_graph_bool_param(&params, "include_documents", true));
+    let memory_limit = body
+        .get("memory_limit")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            params
+                .get("memory_limit")
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(ARKMEMORY_KNOWLEDGE_EXTRACT_MEMORY_LIMIT)
+        .clamp(1, 220);
+    let document_limit = body
+        .get("document_limit")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            params
+                .get("document_limit")
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(ARKMEMORY_KNOWLEDGE_EXTRACT_DOCUMENT_LIMIT)
+        .clamp(1, 50);
+    let (storage, llm) = {
+        let agent = state.agent.read().await;
+        (agent.storage.clone(), agent.llm.clone())
+    };
+    crate::spawn_logged!(
+        "src/channels/http/memory_control.rs:knowledge_graph_extract",
+        async move {
+            let mut sources = Vec::new();
+            if include_memories {
+                match storage
+                    .list_memory_experience_items_for_graph(
+                        &["active".to_string()],
+                        project_id.as_deref(),
+                        memory_limit,
+                    )
+                    .await
+                {
+                    Ok(items) => {
+                        sources.extend(
+                            items
+                                .into_iter()
+                                .filter(arkmemory_item_is_memory)
+                                .map(|item| arkmemory_knowledge_source_from_memory(&item)),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Failed to load memories for knowledge graph extraction: {}",
+                            error
+                        );
+                    }
+                }
+            }
+            if include_documents {
+                match storage
+                    .list_documents(document_limit, 0, project_id.as_deref())
+                    .await
+                {
+                    Ok(documents) => {
+                        for document in documents {
+                            match storage
+                                .list_document_chunks_for_document_window(
+                                    &document.id,
+                                    0,
+                                    ARKMEMORY_DOCUMENT_EXTRACT_CHUNK_BATCH_LIMIT,
+                                )
+                                .await
+                            {
+                                Ok(chunks) => {
+                                    sources.extend(chunks.into_iter().map(|chunk| {
+                                        arkmemory_knowledge_source_from_document_chunk(
+                                            &document, &chunk,
+                                        )
+                                    }));
+                                }
+                                Err(error) => {
+                                    tracing::debug!(
+                                        document_id = %document.id,
+                                        "Failed to load document chunks for knowledge graph extraction: {}",
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Failed to load documents for knowledge graph extraction: {}",
+                            error
+                        );
+                    }
+                }
+            }
+            let stats = arkmemory_run_knowledge_extraction_sources(
+                storage,
+                llm,
+                sources,
+                include_documents,
+            )
+            .await;
+            tracing::debug!(
+                sources_seen = stats.sources_seen,
+                sources_processed = stats.sources_processed,
+                relations_written = stats.relations_written,
+                memory_candidates_queued = stats.memory_candidates_queued,
+                failed_sources = stats.failed_sources,
+                "Manual Memory graph extraction completed"
+            );
+        }
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "queued": true,
+            "include_memories": include_memories,
+            "include_documents": include_documents,
+            "memory_limit": memory_limit,
+            "document_limit": document_limit,
+        })),
+    )
+        .into_response()
+}
+
+async fn arkmemory_set_knowledge_relation_status(
+    state: AppState,
+    relation_id: String,
+    status: &'static str,
+) -> Response {
+    let relation_id = relation_id.trim();
+    if relation_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "relation id is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let agent = state.agent.read().await;
+    match agent
+        .storage
+        .update_knowledge_relation_status(relation_id, status)
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "updated": true, "status": status })),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "relation not found".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn arkmemory_confirm_knowledge_relation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    arkmemory_set_knowledge_relation_status(state, id, "confirmed").await
+}
+
+pub(super) async fn arkmemory_reject_knowledge_relation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    arkmemory_set_knowledge_relation_status(state, id, "rejected").await
+}
+
 pub(super) async fn arkmemory_queue(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
@@ -4127,6 +6617,143 @@ pub(super) async fn arkmemory_run_tests(
     }
 }
 
+fn arkmemory_memory_metadata_datetime_field(
+    item: &crate::storage::experience_item::Model,
+    field: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    item.metadata
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn arkmemory_memory_durability(item: &crate::storage::experience_item::Model) -> Option<String> {
+    item.metadata
+        .get("durability")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn arkmemory_expired_memory_cleanup_item(
+    item: &crate::storage::experience_item::Model,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<serde_json::Value> {
+    if item.status != "active" || !arkmemory_item_is_memory(item) {
+        return None;
+    }
+    if arkmemory_memory_durability(item).as_deref() != Some("temporary") {
+        return None;
+    }
+    let expires_at = arkmemory_memory_metadata_datetime_field(item, "expires_at")?;
+    if expires_at > now {
+        return None;
+    }
+    let memory_kind = item
+        .metadata
+        .get("memory_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let memory_category =
+        crate::core::memory_schema::memory_category_from_metadata(&item.metadata, memory_kind);
+    Some(serde_json::json!({
+        "id": format!("expired-memory:{}", item.id),
+        "kind": "expired_memory",
+        "action": "expire_memory",
+        "title": format!(
+            "Expired {}",
+            crate::core::memory_schema::memory_category_label(memory_category)
+                .to_ascii_lowercase()
+        ),
+        "detail": "This memory is past its structured expires_at lifecycle metadata and can be marked expired.",
+        "memory_id": item.id,
+        "memory_category": memory_category,
+        "memory_kind": memory_kind,
+        "durability": "temporary",
+        "scope": item.scope,
+        "conversation_id": item.conversation_id,
+        "expires_at": expires_at.to_rfc3339(),
+        "created_at": item.updated_at,
+        "preview": arkmemory_truncate_chars(&item.content, 180),
+    }))
+}
+
+async fn arkmemory_expired_memory_cleanup_items(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<serde_json::Value>> {
+    let now = chrono::Utc::now();
+    let items = storage
+        .list_active_experience_items_any_scope(
+            &["personal_fact", "constraint"],
+            ARKMEMORY_CLEANUP_MEMORY_SCAN_LIMIT,
+        )
+        .await?;
+    Ok(items
+        .iter()
+        .filter(|item| arkmemory_item_visible_for_project(item, project_id))
+        .filter_map(|item| arkmemory_expired_memory_cleanup_item(item, now))
+        .take(limit as usize)
+        .collect())
+}
+
+async fn arkmemory_expire_stale_memory_items(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+) -> Result<usize> {
+    let now = chrono::Utc::now();
+    let items = storage
+        .list_active_experience_items_any_scope(
+            &["personal_fact", "constraint"],
+            ARKMEMORY_CLEANUP_MEMORY_SCAN_LIMIT,
+        )
+        .await?;
+    let mut expired = 0usize;
+    for item in items {
+        if !arkmemory_item_visible_for_project(&item, project_id) {
+            continue;
+        }
+        let Some(candidate) = arkmemory_expired_memory_cleanup_item(&item, now) else {
+            continue;
+        };
+        storage
+            .update_experience_item_status(&item.id, "expired")
+            .await?;
+        let expires_at = candidate
+            .get("expires_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let category = candidate
+            .get("memory_category")
+            .and_then(|value| value.as_str())
+            .unwrap_or(crate::core::memory_schema::MEMORY_CATEGORY_OTHER);
+        arkmemory_record_event_once(
+            storage,
+            arkmemory_stable_event_id(&["expired_memory_cleanup_applied", &item.id, expires_at]),
+            "expired_memory_cleanup_applied",
+            Some(item.id.clone()),
+            None,
+            format!("Expired stale memory {}", item.id),
+            serde_json::json!({
+                "action": "expire_memory",
+                "expires_at": expires_at,
+                "memory_category": category,
+                "durability": "temporary",
+            }),
+            MemoryEventContext::from_memory(&item),
+        )
+        .await?;
+        expired += 1;
+    }
+    Ok(expired)
+}
+
 pub(super) async fn arkmemory_cleanup(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
@@ -4135,9 +6762,15 @@ pub(super) async fn arkmemory_cleanup(
     let limit = arkmemory_limit(&params, 80);
     let agent = state.agent.read().await;
     let result = async {
+        let mut items = arkmemory_expired_memory_cleanup_items(&agent.storage, project_id, limit)
+            .await?;
+        let remaining = limit.saturating_sub(items.len() as u64);
+        if remaining == 0 {
+            return Ok::<Vec<serde_json::Value>, anyhow::Error>(items);
+        }
         let events = agent
             .storage
-            .list_reverted_recall_events(limit, project_id)
+            .list_reverted_recall_events(remaining, project_id)
             .await?
             .into_iter()
             .map(|event| {
@@ -4155,7 +6788,8 @@ pub(super) async fn arkmemory_cleanup(
                 })
             })
             .collect::<Vec<_>>();
-        Ok::<Vec<serde_json::Value>, anyhow::Error>(events)
+        items.extend(events);
+        Ok::<Vec<serde_json::Value>, anyhow::Error>(items)
     }
     .await;
     match result {
@@ -4178,24 +6812,37 @@ pub(super) async fn arkmemory_apply_cleanup(
     let agent = state.agent.read().await;
     let project_part = project_id.unwrap_or("global");
     let event_id = arkmemory_stable_event_id(&["cleanup_review_acknowledged", project_part]);
-    let result = arkmemory_record_event_once(
-        &agent.storage,
-        event_id,
-        "cleanup_review_acknowledged",
-        None,
-        None,
-        "Acknowledged Memory cleanup review",
-        serde_json::json!({ "cleanup": "retention_managed" }),
-        MemoryEventContext {
-            project_id: None,
-            ..MemoryEventContext::default()
-        },
-    )
+    let result = async {
+        let expired_memories =
+            arkmemory_expire_stale_memory_items(&agent.storage, project_id).await?;
+        arkmemory_record_event_once(
+            &agent.storage,
+            event_id,
+            "cleanup_review_acknowledged",
+            None,
+            None,
+            "Acknowledged Memory cleanup review",
+            serde_json::json!({
+                "cleanup": "retention_managed",
+                "expired_memories": expired_memories,
+            }),
+            MemoryEventContext {
+                project_id: None,
+                ..MemoryEventContext::default()
+            },
+        )
+        .await?;
+        Ok::<usize, anyhow::Error>(expired_memories)
+    }
     .await;
     match result {
-        Ok(()) => (
+        Ok(expired_memories) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "applied": true, "retention_managed": true })),
+            Json(serde_json::json!({
+                "applied": true,
+                "retention_managed": true,
+                "expired_memories": expired_memories,
+            })),
         )
             .into_response(),
         Err(error) => (

@@ -8,6 +8,7 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
+  IconButton,
   InputAdornment,
   LinearProgress,
   Stack,
@@ -23,7 +24,10 @@ import BubbleChartRoundedIcon from "@mui/icons-material/BubbleChartRounded";
 import CalendarMonthRoundedIcon from "@mui/icons-material/CalendarMonthRounded";
 import ChatRoundedIcon from "@mui/icons-material/ChatRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
+import FitScreenRoundedIcon from "@mui/icons-material/FitScreenRounded";
 import HubRoundedIcon from "@mui/icons-material/HubRounded";
+import KeyboardArrowLeftRoundedIcon from "@mui/icons-material/KeyboardArrowLeftRounded";
+import KeyboardArrowRightRoundedIcon from "@mui/icons-material/KeyboardArrowRightRounded";
 import MemoryRoundedIcon from "@mui/icons-material/MemoryRounded";
 import OpenInNewRoundedIcon from "@mui/icons-material/OpenInNewRounded";
 import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
@@ -41,6 +45,7 @@ import {
   formatUiDateRange,
   formatUiDateTime,
 } from "../../lib/dateFormat";
+import { humanizeStatusLabel } from "../../lib/displayLabels";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { asRecord, errMessage, num, pickRecords, str } from "./pageHelpers";
 
@@ -51,6 +56,7 @@ type ReflectPageProps = {
 
 type ReflectPeriod = "daily" | "weekly" | "monthly";
 type ReflectStoryTab = "overview" | "topics" | "latest" | "review";
+type ReflectTopicSortMode = "ranked" | "recent";
 
 type ReflectUnit = {
   id: string;
@@ -794,6 +800,43 @@ function tacticalCode(source: string): string {
   return map[source] ?? "WRK";
 }
 
+function hexToRgba(hex: string, opacity: number): string {
+  const m = hex.match(/^#([0-9a-f]{6})$/i);
+  if (!m) return `rgba(120, 242, 176, ${opacity})`;
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 0xff;
+  const g = (n >> 8) & 0xff;
+  const b = n & 0xff;
+  return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+}
+
+function clusterMostRecentTimestamp(cluster: ReflectCluster): number {
+  const unitTimes = cluster.units
+    .map((unit) => Date.parse(unit.occurred_at))
+    .filter(Number.isFinite);
+  const historyTime = Date.parse(cluster.related_history.most_recent_at);
+  if (Number.isFinite(historyTime)) unitTimes.push(historyTime);
+  return unitTimes.length > 0 ? Math.max(...unitTimes) : 0;
+}
+
+function topicStrength(cluster: ReflectCluster, maxUnits: number): { label: "High" | "Medium" | "Low"; score: number } {
+  const volumeScore = maxUnits > 0 ? cluster.unit_count / maxUnits : 0;
+  const recurrenceScore =
+    cluster.related_history.mode === "recurring"
+      ? Math.min(0.24, cluster.related_history.similar_count / Math.max(12, cluster.unit_count * 2))
+      : 0;
+  const score = Math.min(1, volumeScore * 0.78 + recurrenceScore);
+  if (score >= 0.64) return { label: "High", score };
+  if (score >= 0.34) return { label: "Medium", score };
+  return { label: "Low", score };
+}
+
+function topicStrengthColor(label: "High" | "Medium" | "Low"): string {
+  if (label === "High") return "#36F5B8";
+  if (label === "Medium") return "#62A8FF";
+  return "#FFB24C";
+}
+
 function clusterDisplayLabel(cluster: ReflectCluster): string {
   const explicit = cluster.label?.trim();
   if (explicit) return explicit;
@@ -990,7 +1033,7 @@ function clusterTopicDetail(cluster: ReflectCluster): string {
   const sources = Object.entries(cluster.source_mix)
     .sort((left, right) => right[1] - left[1])
     .slice(0, 2)
-    .map(([label, count]) => `${label}${count > 1 ? ` (${count})` : ""}`)
+    .map(([label, count]) => `${sourceMeta(label).label}${count > 1 ? ` (${count})` : ""}`)
     .join(" / ");
   return `${cluster.unit_count} item${cluster.unit_count === 1 ? "" : "s"}${sources ? ` from ${sources}` : ""}. ${relatedHistoryText(cluster.related_history)}`;
 }
@@ -1093,7 +1136,7 @@ function followupStatusLabel(item: ReflectSuggestedFollowup): string {
     }
     if (item.search_results.length > 0) return `${item.search_results.length} source${item.search_results.length === 1 ? "" : "s"}`;
   }
-  return item.status ? item.status.replace(/_/g, " ") : "ready";
+  return humanizeStatusLabel(item.status, "Ready");
 }
 
 function followupActionLabel(kind: string): string {
@@ -1182,6 +1225,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   const [storyTab, setStoryTab] = useState<ReflectStoryTab>("latest");
   const [selectedFollowupId, setSelectedFollowupId] = useState<string | null>(null);
   const [topicPage, setTopicPage] = useState(0);
+  const [topicSortMode, setTopicSortMode] = useState<ReflectTopicSortMode>("ranked");
+  const [showAllTopics, setShowAllTopics] = useState(false);
   const [opportunityPage, setOpportunityPage] = useState(0);
   const [localRefreshRunning, setLocalRefreshRunning] = useState(false);
   const [refreshNotice, setRefreshNotice] = useState("");
@@ -1489,69 +1534,165 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
       ? "Collecting"
       : "Waiting for activity";
 
+  const rankedTopicRows = useMemo(
+    () =>
+      uniqueByVisibleMeaning(
+        [...clusters].sort((left, right) => right.unit_count - left.unit_count),
+        (cluster) => clusterTopicTitle(cluster),
+      ),
+    [clusters],
+  );
+  const recentTopicRows = useMemo(
+    () =>
+      uniqueByVisibleMeaning(
+        [...clusters].sort(
+          (left, right) => clusterMostRecentTimestamp(right) - clusterMostRecentTimestamp(left),
+        ),
+        (cluster) => clusterTopicTitle(cluster),
+      ),
+    [clusters],
+  );
+  const sortedClusters = rankedTopicRows;
+  const topicRows = topicSortMode === "recent" ? recentTopicRows : rankedTopicRows;
+  const topClusters = rankedTopicRows.slice(0, 5);
+  const graphTopicRows = useMemo(() => topicRows.slice(0, 8), [topicRows]);
+  const maxTopicUnits = Math.max(1, ...topicRows.map((cluster) => cluster.unit_count));
+  const topicPageCount = showAllTopics ? 1 : Math.max(1, Math.ceil(topicRows.length / TOPIC_PAGE_SIZE));
+  const visibleTopicRows = showAllTopics
+    ? topicRows
+    : topicRows.slice(
+      topicPage * TOPIC_PAGE_SIZE,
+      topicPage * TOPIC_PAGE_SIZE + TOPIC_PAGE_SIZE,
+    );
+  const leadCluster = topicRows[0] ?? sortedClusters[0] ?? null;
+
   const constellationOption = useMemo(() => {
     const nodes: Array<Record<string, unknown>> = [];
     const links: Array<Record<string, unknown>> = [];
     const seen = new Set<string>();
     const clusterNodeIds: string[] = [];
-    clusters.forEach((cluster, index) => {
+    const centerName = leadCluster ? clusterTopicTitle(leadCluster) : "Reflect focus";
+    nodes.push({
+      id: "reflect-center",
+      name: centerName,
+      value: totalUnits,
+      symbol: "path://M50,8 C72,8 88,24 88,46 C88,70 66,86 50,94 C34,86 12,70 12,46 C12,24 28,8 50,8 Z",
+      symbolSize: 88,
+      category: 0,
+      x: 0,
+      y: 0,
+      itemStyle: {
+        color: "rgba(16, 255, 214, 0.12)",
+        borderColor: "#34F7DD",
+        borderWidth: 2,
+        shadowBlur: 34,
+        shadowColor: "rgba(52, 247, 221, 0.86)",
+      },
+      label: {
+        show: true,
+        position: "bottom",
+        distance: 10,
+        formatter: `{center|${compactText(centerName, 28)}}\n{count|${totalUnits} trace${totalUnits === 1 ? "" : "s"}}`,
+        rich: {
+          center: {
+            color: "#F7FEFF",
+            fontSize: 15,
+            fontWeight: 800,
+            fontFamily: "Inter, system-ui, sans-serif",
+            lineHeight: 22,
+          },
+          count: {
+            color: "#34F7DD",
+            fontSize: 10,
+            fontWeight: 700,
+            fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+            lineHeight: 16,
+            backgroundColor: "rgba(9, 219, 200, 0.12)",
+            padding: [3, 7, 3, 7],
+            borderRadius: 4,
+          },
+        },
+      },
+      emphasis: {
+        scale: 1.08,
+        itemStyle: {
+          shadowBlur: 44,
+          shadowColor: "rgba(52, 247, 221, 0.95)",
+        },
+      },
+    });
+    graphTopicRows.forEach((cluster, index) => {
       const source = dominantSource(cluster);
       const meta = sourceMeta(source);
-      const clusterName = clusterTopicTitle(cluster);
+      const clusterName = clusterTopicTitle(cluster) || clusterLabelById[cluster.id] || sourceMeta(source).group;
       const nodeId = `cluster-${cluster.id}`;
       seen.add(nodeId);
       clusterNodeIds.push(nodeId);
-      const nodeSize = Math.max(14, Math.min(28, 12 + cluster.unit_count * 3));
       const stroke = tacticalAccent(meta.color);
+      const ratio = cluster.unit_count / maxTopicUnits;
+      const nodeSize = Math.max(48, Math.min(74, 46 + ratio * 28));
       const code = tacticalCode(source);
       const idx = String(index + 1).padStart(2, "0");
-      const truncated = clusterName.length > 38 ? `${clusterName.slice(0, 36)}...` : clusterName;
+      const truncated = compactText(clusterName, 44);
+      const angle = (index / Math.max(graphTopicRows.length, 1)) * Math.PI * 2 - Math.PI / 2;
+      const radiusX = 300 + (index % 2) * 32;
+      const radiusY = 170 + ((index + 1) % 2) * 26;
+      const x = Math.cos(angle) * radiusX;
+      const y = Math.sin(angle) * radiusY;
+      const labelPosition = x < -24 ? "left" : x > 24 ? "right" : y < 0 ? "top" : "bottom";
       nodes.push({
         id: nodeId,
         name: clusterName,
         value: cluster.unit_count,
         symbol: tacticalSymbol(source),
         symbolSize: nodeSize,
-        category: 0,
+        category: 1,
         itemStyle: {
-          color: "rgba(0,0,0,0)",
+          color: hexToRgba(stroke, 0.12),
           borderColor: stroke,
-          borderWidth: 1,
-          shadowBlur: 6,
-          shadowColor: stroke,
+          borderWidth: 2,
+          shadowBlur: 24,
+          shadowColor: hexToRgba(stroke, 0.72),
         },
         label: {
           show: true,
-          position: "right",
-          distance: 8,
-          formatter: `{code|${idx}-${code}}  {name|${truncated.toUpperCase()}}`,
+          position: labelPosition,
+          distance: 12,
+          formatter: `{code|${idx} - ${code}}\n{name|${truncated}}\n{count|${cluster.unit_count} traces}`,
           rich: {
             code: {
               color: stroke,
-              fontSize: 8.5,
+              fontSize: 11,
               fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
-              fontWeight: 500,
-              letterSpacing: 1,
-              backgroundColor: "rgba(0,0,0,0.35)",
-              padding: [2, 4, 2, 4],
-              borderRadius: 1,
+              fontWeight: 800,
+              lineHeight: 18,
             },
             name: {
-              color: "rgba(210, 226, 238, 0.78)",
-              fontSize: 9.5,
+              color: "rgba(246, 251, 255, 0.96)",
+              fontSize: 13,
+              fontFamily: "Inter, system-ui, sans-serif",
+              fontWeight: 750,
+              lineHeight: 18,
+            },
+            count: {
+              color: stroke,
+              fontSize: 10,
               fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
-              fontWeight: 400,
-              letterSpacing: 0.6,
+              fontWeight: 700,
+              lineHeight: 17,
+              backgroundColor: hexToRgba(stroke, 0.12),
+              padding: [2, 6, 2, 6],
+              borderRadius: 4,
             },
           },
         },
         emphasis: {
-          scale: 1.4,
+          scale: 1.12,
           itemStyle: {
             borderColor: stroke,
-            borderWidth: 1.4,
-            shadowBlur: 14,
-            shadowColor: stroke,
+            borderWidth: 2.4,
+            shadowBlur: 32,
+            shadowColor: hexToRgba(stroke, 0.92),
           },
           label: {
             rich: {
@@ -1560,13 +1701,25 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             },
           },
         },
-        x: Math.cos((index / Math.max(clusters.length, 1)) * Math.PI * 2 - Math.PI / 2) * 240,
-        y: Math.sin((index / Math.max(clusters.length, 1)) * Math.PI * 2 - Math.PI / 2) * 150,
+        x,
+        y,
       });
-      const angle = (index / Math.max(clusters.length, 1)) * Math.PI * 2 - Math.PI / 2;
+      links.push({
+        source: "reflect-center",
+        target: nodeId,
+        value: cluster.unit_count,
+        lineStyle: {
+          width: 1.3 + ratio * 2.7,
+          color: stroke,
+          opacity: 0.72,
+          curveness: index % 2 === 0 ? 0.18 : -0.18,
+          shadowBlur: 12,
+          shadowColor: hexToRgba(stroke, 0.64),
+        },
+      });
       cluster.related_history.items.slice(0, 2).forEach((item, itemIndex) => {
         const historyId = `history-${item.id}`;
-        const satOffset = 36 + itemIndex * 18;
+        const satOffset = 54 + itemIndex * 22;
         const satAngle = angle + (itemIndex === 0 ? -0.22 : 0.22);
         if (!seen.has(historyId)) {
           seen.add(historyId);
@@ -1585,17 +1738,19 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
               has_embedding: true,
             }),
             value: 1,
-            symbol: "path://M50,8 L92,50 L50,92 L8,50 Z",
-            symbolSize: 6,
-            category: 1,
+            symbol: "circle",
+            symbolSize: 8,
+            category: 2,
             itemStyle: {
-              color: "rgba(0,0,0,0)",
-              borderColor: "rgba(170, 200, 220, 0.4)",
-              borderWidth: 0.8,
+              color: hexToRgba(stroke, 0.18),
+              borderColor: hexToRgba(stroke, 0.62),
+              borderWidth: 1.2,
+              shadowBlur: 8,
+              shadowColor: hexToRgba(stroke, 0.45),
             },
             label: { show: false },
-            x: Math.cos(satAngle) * (240 + satOffset),
-            y: Math.sin(satAngle) * (150 + satOffset * 0.6),
+            x: x + Math.cos(satAngle) * satOffset,
+            y: y + Math.sin(satAngle) * (satOffset * 0.68),
           });
         }
         links.push({
@@ -1603,30 +1758,30 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           target: historyId,
           value: item.similarity,
           lineStyle: {
-            width: 0.8 + item.similarity * 1.4,
+            width: 0.9 + item.similarity * 1.2,
             color: stroke,
-            opacity: 0.42,
+            opacity: 0.46,
             curveness: 0.14 + itemIndex * 0.06,
             type: "solid",
           },
         });
       });
     });
-    if (links.length === 0 && clusterNodeIds.length >= 2) {
+    if (clusterNodeIds.length >= 2) {
       for (let i = 0; i < clusterNodeIds.length; i += 1) {
-        for (let j = i + 1; j < clusterNodeIds.length; j += 1) {
-          links.push({
-            source: clusterNodeIds[i],
-            target: clusterNodeIds[j],
-            lineStyle: {
-              width: 0.6,
-              color: "rgba(140, 200, 220, 0.16)",
-              curveness: 0.18,
-              type: [3, 5],
-              dashOffset: 0,
-            },
-          });
-        }
+        const next = clusterNodeIds[(i + 1) % clusterNodeIds.length];
+        links.push({
+          source: clusterNodeIds[i],
+          target: next,
+          lineStyle: {
+            width: 0.7,
+            color: "rgba(150, 180, 215, 0.22)",
+            opacity: 0.48,
+            curveness: i % 2 === 0 ? 0.22 : -0.22,
+            type: [3, 6],
+            dashOffset: 0,
+          },
+        });
       }
     }
     return {
@@ -1645,7 +1800,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           const name = (info.data?.name || "node").toUpperCase();
           const v = info.data?.value;
           return v
-            ? `<span style="opacity:0.6">TRACE</span> ${name}<br/><span style="opacity:0.6">UNITS</span> ${v}`
+            ? `<span style="opacity:0.6">THEME</span> ${name}<br/><span style="opacity:0.6">TRACES</span> ${v}`
             : `<span style="opacity:0.6">NODE</span> ${name}`;
         },
       },
@@ -1665,13 +1820,37 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             ],
           },
           {
+            type: "circle",
+            left: "center",
+            top: "middle",
+            shape: { cx: 0, cy: 0, r: 82 },
+            style: { fill: "transparent", stroke: "rgba(52,247,221,0.18)", lineWidth: 1 },
+            silent: true,
+          },
+          {
+            type: "circle",
+            left: "center",
+            top: "middle",
+            shape: { cx: 0, cy: 0, r: 132 },
+            style: { fill: "transparent", stroke: "rgba(52,247,221,0.11)", lineWidth: 1 },
+            silent: true,
+          },
+          {
+            type: "circle",
+            left: "center",
+            top: "middle",
+            shape: { cx: 0, cy: 0, r: 184 },
+            style: { fill: "transparent", stroke: "rgba(98,168,255,0.08)", lineWidth: 1 },
+            silent: true,
+          },
+          {
             type: "text",
             left: 14,
             top: 12,
             style: {
-              text: `PANORAMA - ${clusters.length.toString().padStart(2, "0")} TRACES`,
-              fill: "rgba(130, 170, 160, 0.55)",
-              font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+              text: `MEMORY GRAPH - ${topicRows.length.toString().padStart(2, "0")} THEMES`,
+              fill: "rgba(165, 184, 255, 0.64)",
+              font: "700 10px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
             },
           },
           {
@@ -1679,9 +1858,9 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             right: 14,
             bottom: 12,
             style: {
-              text: "FOCUS MAP",
-              fill: "rgba(130, 170, 160, 0.45)",
-              font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+              text: `${allUnits.length.toString().padStart(2, "0")} SOURCED TRACES`,
+              fill: "rgba(130, 170, 220, 0.5)",
+              font: "700 10px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
               textAlign: "right",
             },
           },
@@ -1695,7 +1874,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           layout: "none",
           roam: false,
           draggable: false,
-          categories: [{ name: "Active" }, { name: "Bridge" }],
+          categories: [{ name: "Core" }, { name: "Theme" }, { name: "Evidence" }],
           data: nodes,
           links,
           edgeSymbol: ["none", "none"],
@@ -1704,7 +1883,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
         },
       ],
     };
-  }, [clusters, clusterLabelById]);
+  }, [allUnits.length, clusterLabelById, graphTopicRows, leadCluster, maxTopicUnits, topicRows.length, totalUnits]);
 
   const activityOption = useMemo(() => {
     const TIMELINE_BUCKETS = period === "daily" ? 24 : period === "weekly" ? 28 : 36;
@@ -1812,21 +1991,6 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
     };
   }, [allUnits, period, response?.from, response?.to]);
 
-  const sortedClusters = useMemo(
-    () => [...clusters].sort((left, right) => right.unit_count - left.unit_count),
-    [clusters],
-  );
-  const topicRows = useMemo(
-    () => uniqueByVisibleMeaning(sortedClusters, (cluster) => clusterTopicTitle(cluster)),
-    [sortedClusters],
-  );
-  const topClusters = topicRows.slice(0, 5);
-  const topicPageCount = Math.max(1, Math.ceil(topicRows.length / TOPIC_PAGE_SIZE));
-  const visibleTopicRows = topicRows.slice(
-    topicPage * TOPIC_PAGE_SIZE,
-    topicPage * TOPIC_PAGE_SIZE + TOPIC_PAGE_SIZE,
-  );
-  const leadCluster = topicRows[0] ?? sortedClusters[0] ?? null;
   const recoveryFollowups = suggestedFollowups.filter((item) => item.kind === "recovery_advice");
   const latestFollowups = suggestedFollowups.filter((item) => item.kind === "latest_developments");
   const sourceBackedLatestFollowups = latestFollowups.filter(followupHasSourceEvidence);
@@ -1907,6 +2071,10 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
     if (topicPage < topicPageCount) return;
     setTopicPage(Math.max(0, topicPageCount - 1));
   }, [topicPage, topicPageCount]);
+  useEffect(() => {
+    setTopicPage(0);
+    setShowAllTopics(false);
+  }, [topicSortMode, period, anchor]);
   useEffect(() => {
     if (opportunityPage < opportunityPageCount) return;
     setOpportunityPage(Math.max(0, opportunityPageCount - 1));
@@ -2211,98 +2379,214 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
 
         {storyTab === "topics" ? (
         <Grid2 container spacing={1.4}>
-          <Grid2 size={{ xs: 12, lg: 7 }}>
-            <Box className="arkreflect-panorama" sx={{ ...panelSx, p: 1.35, minHeight: 430 }}>
-              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1 }}>
-                <Box>
-                  <Typography sx={labelSx}>Topic map</Typography>
-                  <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
-                    Work themes and evidence links
+          <Grid2 size={{ xs: 12, lg: 8 }}>
+            <Box className="arkreflect-panorama arkreflect-memory-graph" sx={{ ...panelSx, p: { xs: 1.25, md: 1.65 }, minHeight: { xs: 560, md: 650 } }}>
+              <Box className="arkreflect-panorama-backdrop" />
+              <Box className="arkreflect-panorama-grid" />
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                spacing={1}
+                className="arkreflect-memory-graph-head"
+                sx={{ justifyContent: "space-between", alignItems: { xs: "stretch", sm: "flex-start" }, position: "relative", zIndex: 2 }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography sx={labelSx}>Memory graph</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: { xs: "1.18rem", md: "1.34rem" }, mt: 0.35 }}>
+                    {leadCluster ? clusterTopicTitle(leadCluster) : "Work themes"}
+                  </Typography>
+                  <Typography sx={{ ...bodySx, mt: 0.45, maxWidth: 580 }}>
+                    {topicRows.length} topic{topicRows.length === 1 ? "" : "s"} - {totalUnits} trace{totalUnits === 1 ? "" : "s"} - {sourceRows.length} source{sourceRows.length === 1 ? "" : "s"}
                   </Typography>
                 </Box>
-                <Chip className="arkreflect-pill" icon={<BubbleChartRoundedIcon />} label={`${clusters.length} topics`} />
+                <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", flexWrap: "wrap", rowGap: 0.75 }}>
+                  <Chip className="arkreflect-pill" icon={<BubbleChartRoundedIcon />} label={`${graphTopicRows.length} shown`} />
+                  <Chip className="arkreflect-pill" icon={<FitScreenRoundedIcon />} label="Fit view" />
+                </Stack>
               </Stack>
-              <ReactECharts option={constellationOption} style={{ height: 345, width: "100%" }} />
+              <Box className="arkreflect-panorama-canvas" sx={{ mt: 0.5, position: "relative", zIndex: 1 }}>
+                <ReactECharts option={constellationOption} style={{ height: 510, width: "100%" }} />
+              </Box>
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                spacing={1}
+                className="arkreflect-memory-legend"
+                sx={{ position: "relative", zIndex: 2, justifyContent: "space-between", alignItems: { xs: "flex-start", md: "center" } }}
+              >
+                <Stack direction="row" spacing={1.2} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
+                  {sourceRows.slice(0, 6).map((source) => (
+                    <Box key={source.source} className="arkreflect-memory-legend-item">
+                      <Box sx={{ bgcolor: tacticalAccent(source.color) }} />
+                      <Typography variant="caption">{source.label}</Typography>
+                    </Box>
+                  ))}
+                </Stack>
+                <Stack direction="row" spacing={1.2} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
+                  <Box className="arkreflect-memory-legend-item">
+                    <Box className="arkreflect-memory-legend-line is-strong" />
+                    <Typography variant="caption">Strong link</Typography>
+                  </Box>
+                  <Box className="arkreflect-memory-legend-item">
+                    <Box className="arkreflect-memory-legend-line is-weak" />
+                    <Typography variant="caption">Weak link</Typography>
+                  </Box>
+                </Stack>
+              </Stack>
             </Box>
           </Grid2>
-          <Grid2 size={{ xs: 12, lg: 5 }}>
-            <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35, minHeight: 430 }}>
+          <Grid2 size={{ xs: 12, lg: 4 }}>
+            <Box className="arkreflect-motion-panel arkreflect-theme-panel" sx={{ ...panelSx, p: { xs: 1.2, md: 1.45 }, minHeight: { xs: 420, md: 650 } }}>
               <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center", gap: 1 }}>
-                <Box>
-                  <Typography sx={labelSx}>Topic list</Typography>
-                  <Typography sx={{ ...titleSx, fontSize: "1rem", mt: 0.35 }}>
-                    {topicRows.length} deduped themes
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography sx={labelSx}>Deduped themes</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1.02rem", mt: 0.35 }}>
+                    {topicRows.length} theme{topicRows.length === 1 ? "" : "s"}
                   </Typography>
                 </Box>
-                {topicRows.length > TOPIC_PAGE_SIZE ? (
-                  <Chip size="small" variant="outlined" label={`${topicPage + 1}/${topicPageCount}`} />
-                ) : null}
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  value={topicSortMode}
+                  onChange={(_, value: ReflectTopicSortMode | null) => {
+                    if (value) setTopicSortMode(value);
+                  }}
+                  sx={{
+                    p: 0.25,
+                    border: "1px solid var(--surface-border)",
+                    borderRadius: "8px",
+                    "& .MuiToggleButton-root": {
+                      px: 1.15,
+                      py: 0.45,
+                      border: 0,
+                      borderRadius: "7px",
+                      color: "var(--text-secondary)",
+                      fontSize: "0.72rem",
+                      fontWeight: 750,
+                      textTransform: "none",
+                    },
+                    "& .Mui-selected": {
+                      color: "var(--text-primary) !important",
+                      background: "rgba(138, 92, 246, 0.22) !important",
+                      boxShadow: "inset 0 0 0 1px rgba(167, 139, 250, 0.3)",
+                    },
+                  }}
+                >
+                  <ToggleButton value="ranked">Ranked</ToggleButton>
+                  <ToggleButton value="recent">Recent</ToggleButton>
+                </ToggleButtonGroup>
               </Stack>
-              <Box
-                sx={{
-                  mt: 1,
-                  display: "grid",
-                  gap: 0.75,
-                  maxHeight: 346,
-                  overflow: "auto",
-                  pr: 0.35,
-                }}
-              >
+              <Box className="arkreflect-theme-list">
                 {visibleTopicRows.map((cluster, index) => {
                   const name = clusterTopicTitle(cluster);
-                  const source = sourceMeta(dominantSource(cluster));
+                  const sourceKey = dominantSource(cluster);
+                  const source = sourceMeta(sourceKey);
+                  const accent = tacticalAccent(source.color);
                   const displayIndex = topicPage * TOPIC_PAGE_SIZE + index;
+                  const strength = topicStrength(cluster, maxTopicUnits);
+                  const strengthColor = topicStrengthColor(strength.label);
+                  const clusterSourceCount = Math.max(1, Object.keys(cluster.source_mix).length);
                   return (
                     <Box
                       key={cluster.id}
+                      className="arkreflect-theme-card"
                       sx={{
-                        display: "grid",
-                        gridTemplateColumns: "30px minmax(0, 1fr) auto",
-                        gap: 0.9,
-                        alignItems: "center",
-                        p: 0.9,
-                        minHeight: 58,
-                        border: "1px solid var(--surface-border)",
-                        borderRadius: "8px",
-                        background: index === 0 ? "rgba(0, 255, 170, 0.055)" : "var(--ui-rgba-255-255-255-020)",
+                        borderColor: hexToRgba(accent, displayIndex === 0 ? 0.42 : 0.22),
+                        background:
+                          displayIndex === 0
+                            ? `linear-gradient(90deg, ${hexToRgba(accent, 0.16)}, rgba(11, 24, 36, 0.82))`
+                            : `linear-gradient(90deg, ${hexToRgba(accent, 0.08)}, rgba(8, 18, 28, 0.68))`,
+                        boxShadow:
+                          displayIndex === 0
+                            ? `inset 3px 0 0 ${accent}, 0 0 28px ${hexToRgba(accent, 0.13)}`
+                            : `inset 2px 0 0 ${hexToRgba(accent, 0.45)}`,
                       }}
                     >
-                      <Box sx={{ color: tacticalAccent(source.color), display: "grid", placeItems: "center" }}>
+                      <Typography className="arkreflect-theme-rank" sx={{ color: accent }}>
+                        {String(displayIndex + 1).padStart(2, "0")}
+                      </Typography>
+                      <Box
+                        className="arkreflect-theme-icon"
+                        sx={{
+                          color: accent,
+                          borderColor: hexToRgba(accent, 0.58),
+                          background: hexToRgba(accent, 0.12),
+                          boxShadow: `0 0 24px ${hexToRgba(accent, 0.34)}`,
+                        }}
+                      >
                         {sourceIcon(source.label)}
                       </Box>
                       <Box sx={{ minWidth: 0 }}>
-                        <Typography sx={{ fontWeight: 850, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {name}
+                        <Typography className="arkreflect-theme-title">{name}</Typography>
+                        <Typography className="arkreflect-theme-meta">
+                          {source.label} - {cluster.unit_count} trace{cluster.unit_count === 1 ? "" : "s"} - {clusterSourceCount} source{clusterSourceCount === 1 ? "" : "s"}
                         </Typography>
-                        <Typography variant="caption" sx={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <Typography className="arkreflect-theme-detail">
                           {clusterTopicDetail(cluster)}
                         </Typography>
                       </Box>
-                      <Stack sx={{ alignItems: "flex-end" }}>
-                        <Typography sx={{ fontFamily: "var(--font-mono)", color: tacticalAccent(source.color), fontWeight: 850 }}>
-                          {String(displayIndex + 1).padStart(2, "0")}
-                        </Typography>
-                        <Typography variant="caption">{cluster.unit_count}</Typography>
+                      <Stack className="arkreflect-theme-score" spacing={0.5}>
+                        <Stack direction="row" spacing={0.55} sx={{ alignItems: "center", justifyContent: "flex-end" }}>
+                          <Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: strengthColor, boxShadow: `0 0 10px ${hexToRgba(strengthColor, 0.78)}` }} />
+                          <Typography variant="caption" sx={{ color: strengthColor, fontWeight: 800 }}>
+                            {strength.label}
+                          </Typography>
+                        </Stack>
+                        <Typography>{cluster.unit_count}</Typography>
                       </Stack>
                     </Box>
                   );
                 })}
               </Box>
-              {topicRows.length > TOPIC_PAGE_SIZE ? (
-                <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", mt: 0.9 }}>
-                  <Typography variant="caption" sx={{ color: "var(--text-dim)" }}>
-                    {topicPage * TOPIC_PAGE_SIZE + 1}-{Math.min(topicRows.length, (topicPage + 1) * TOPIC_PAGE_SIZE)} of {topicRows.length}
+              <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", mt: 1 }}>
+                {topicRows.length > TOPIC_PAGE_SIZE ? (
+                  <Button
+                    size="small"
+                    variant="text"
+                    startIcon={<OpenInNewRoundedIcon />}
+                    onClick={() => {
+                      setTopicPage(0);
+                      setShowAllTopics((expanded) => !expanded);
+                    }}
+                    sx={{ borderRadius: "8px", color: "var(--text-secondary)", textTransform: "none" }}
+                  >
+                    {showAllTopics ? "Show page" : "View all themes"}
+                  </Button>
+                ) : (
+                  <Box />
+                )}
+                <Stack direction="row" spacing={0.8} sx={{ alignItems: "center" }}>
+                  <Typography variant="caption" sx={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>
+                    {showAllTopics ? 1 : topicPage * TOPIC_PAGE_SIZE + 1}-{showAllTopics ? topicRows.length : Math.min(topicRows.length, (topicPage + 1) * TOPIC_PAGE_SIZE)} of {topicRows.length}
                   </Typography>
-                  <Stack direction="row" spacing={0.75}>
-                    <Button size="small" variant="outlined" disabled={topicPage === 0} onClick={() => setTopicPage((page) => Math.max(0, page - 1))} sx={{ borderRadius: "8px" }}>
-                      Previous
-                    </Button>
-                    <Button size="small" variant="outlined" disabled={topicPage >= topicPageCount - 1} onClick={() => setTopicPage((page) => Math.min(topicPageCount - 1, page + 1))} sx={{ borderRadius: "8px" }}>
-                      Next
-                    </Button>
-                  </Stack>
+                  {!showAllTopics ? (
+                    <>
+                      <Tooltip title="Previous themes">
+                        <span>
+                          <IconButton
+                            size="small"
+                            disabled={topicPage === 0}
+                            onClick={() => setTopicPage((page) => Math.max(0, page - 1))}
+                            className="arkreflect-theme-pager"
+                          >
+                            <KeyboardArrowLeftRoundedIcon fontSize="small" />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                      <Tooltip title="Next themes">
+                        <span>
+                          <IconButton
+                            size="small"
+                            disabled={topicPage >= topicPageCount - 1}
+                            onClick={() => setTopicPage((page) => Math.min(topicPageCount - 1, page + 1))}
+                            className="arkreflect-theme-pager"
+                          >
+                            <KeyboardArrowRightRoundedIcon fontSize="small" />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    </>
+                  ) : null}
                 </Stack>
-              ) : null}
+              </Stack>
             </Box>
           </Grid2>
         </Grid2>
@@ -2356,18 +2640,9 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                     {isReflectRunning
                       ? "Reflect is refreshing this range. Useful opportunities will appear here when there is something worth acting on."
                       : totalUnits > 0
-                        ? "This range has activity, but nothing has been promoted into a clear opportunity yet. Run Reflect to re-check the range."
+                        ? "This range has activity, but nothing has been promoted into a clear opportunity yet. The header action can re-check the range."
                         : "No activity is cached for this range yet. This tab stays available so users always know where opportunities will appear."}
                   </Typography>
-                  <Button
-                    variant="outlined"
-                    startIcon={<RefreshRoundedIcon />}
-                    disabled={isReflectRunning}
-                    onClick={runReflectNow}
-                    sx={{ alignSelf: "flex-start", borderRadius: "8px" }}
-                  >
-                    {isReflectRunning ? "Running Reflect" : "Run Reflect now"}
-                  </Button>
                 </Stack>
               </Box>
             ) : null}

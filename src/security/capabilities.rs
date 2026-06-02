@@ -1741,9 +1741,9 @@ pub fn evaluate_cross_layer_capabilities(
     }
 
     let mut report = evaluate_capability_observations(observations);
-    report.matched_rules.retain(|rule| {
-        correlated_rules.contains(&rule.id.as_str())
-    });
+    report
+        .matched_rules
+        .retain(|rule| correlated_rules.contains(&rule.id.as_str()));
     report.warnings = report
         .matched_rules
         .iter()
@@ -1799,12 +1799,10 @@ mod tests {
         );
 
         assert!(report.blocked);
-        assert!(
-            report
-                .matched_rules
-                .iter()
-                .any(|rule| rule.id == "block-shell-file-network")
-        );
+        assert!(report
+            .matched_rules
+            .iter()
+            .any(|rule| rule.id == "block-shell-file-network"));
     }
 
     #[test]
@@ -1828,12 +1826,10 @@ mod tests {
         let report = evaluate_cross_layer_capabilities(observations)
             .expect("cross-layer report should be produced");
         assert!(report.blocked);
-        assert!(
-            report
-                .matched_rules
-                .iter()
-                .any(|rule| rule.id == "block-shell-file-network")
-        );
+        assert!(report
+            .matched_rules
+            .iter()
+            .any(|rule| rule.id == "block-shell-file-network"));
     }
 
     #[test]

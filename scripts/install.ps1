@@ -285,6 +285,13 @@ function Select-AgentArkInstallKind {
     }
 }
 
+function Invoke-AgentArkRuntimeImagePull {
+    & docker compose pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to pull AgentArk runtime images."
+    }
+}
+
 Write-Host ""
 Write-Host "=========================================" -ForegroundColor White
 Write-Host "  AgentArk Installer" -ForegroundColor White
@@ -374,10 +381,7 @@ try {
             throw "Failed to build and start AgentArk from source."
         }
     } else {
-        & docker compose pull
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to pull AgentArk images."
-        }
+        Invoke-AgentArkRuntimeImagePull
         & docker compose up -d
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to start AgentArk."

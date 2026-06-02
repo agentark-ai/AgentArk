@@ -10,6 +10,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import Box from "@mui/material/Box";
@@ -27,10 +28,17 @@ import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import FiberManualRecordRoundedIcon from "@mui/icons-material/FiberManualRecordRounded";
 import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownRounded";
 import KeyboardArrowUpRoundedIcon from "@mui/icons-material/KeyboardArrowUpRounded";
+import KeyboardArrowRightRoundedIcon from "@mui/icons-material/KeyboardArrowRightRounded";
+import FolderRoundedIcon from "@mui/icons-material/FolderRounded";
+import InsertDriveFileRoundedIcon from "@mui/icons-material/InsertDriveFileRounded";
 import TerminalRoundedIcon from "@mui/icons-material/TerminalRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 
 import type { ChatStepCard, ComputerPaneFile, ComputerPaneTab, SurfaceStatus } from "./types";
+import {
+  isOmittedContentPlaceholder,
+  resolveComputerPaneFileContent,
+} from "./computerPaneFileContent";
 import { extractFilePath, pickComputerView } from "./dispatch";
 import {
   AGENTARK_RENDERERS,
@@ -740,7 +748,7 @@ function findWorkspaceFileContent(
     const file = files[idx];
     const filePath = normalizePath(file.path);
     if (filePath && (filePath === target || filePath.endsWith(`/${target}`))) {
-      return file.content || "";
+      return isOmittedContentPlaceholder(file.content || "") ? "" : file.content || "";
     }
   }
   return "";
@@ -765,6 +773,10 @@ function fileNameFromPath(path: string): string {
   return normalized.split("/").filter(Boolean).pop() || normalized || "file";
 }
 
+function fileDisplayPath(file: ComputerPaneFile): string {
+  return (file.displayPath || file.path || "").replace(/\\/g, "/").trim();
+}
+
 function workspaceFileMeta(file: ComputerPaneFile, live: boolean): string {
   if (live) return "writing";
   const lineCount = file.content ? file.content.split(/\r?\n/).length : 0;
@@ -773,6 +785,116 @@ function workspaceFileMeta(file: ComputerPaneFile, live: boolean): string {
     return `${lineCount} line${lineCount === 1 ? "" : "s"} / ${formatBytes(byteCount)}`;
   }
   return "queued";
+}
+
+interface WorkspaceFileRow {
+  file: ComputerPaneFile;
+  live: boolean;
+  selected: boolean;
+  name: string;
+  meta: string;
+}
+
+interface MutableWorkspaceFileFolder {
+  kind: "folder";
+  name: string;
+  path: string;
+  folders: Map<string, MutableWorkspaceFileFolder>;
+  files: WorkspaceFileRow[];
+  selected: boolean;
+  live: boolean;
+}
+
+interface WorkspaceFileFolderNode {
+  kind: "folder";
+  name: string;
+  path: string;
+  children: WorkspaceFileTreeNode[];
+  fileCount: number;
+  selected: boolean;
+  live: boolean;
+}
+
+interface WorkspaceFileLeafNode {
+  kind: "file";
+  row: WorkspaceFileRow;
+}
+
+type WorkspaceFileTreeNode = WorkspaceFileFolderNode | WorkspaceFileLeafNode;
+
+function createWorkspaceFileFolder(name: string, path: string): MutableWorkspaceFileFolder {
+  return {
+    kind: "folder",
+    name,
+    path,
+    folders: new Map(),
+    files: [],
+    selected: false,
+    live: false,
+  };
+}
+
+function sortWorkspaceFileRows(rows: WorkspaceFileRow[]): WorkspaceFileRow[] {
+  return [...rows].sort((a, b) =>
+    normalizePath(fileDisplayPath(a.file)).localeCompare(
+      normalizePath(fileDisplayPath(b.file)),
+    ),
+  );
+}
+
+function materializeWorkspaceFileFolder(
+  folder: MutableWorkspaceFileFolder,
+): WorkspaceFileFolderNode {
+  const childFolders = [...folder.folders.values()]
+    .map(materializeWorkspaceFileFolder)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const childFiles = sortWorkspaceFileRows(folder.files).map<WorkspaceFileLeafNode>((row) => ({
+    kind: "file",
+    row,
+  }));
+  const children: WorkspaceFileTreeNode[] = [...childFolders, ...childFiles];
+  const nestedFileCount = childFolders.reduce((sum, child) => sum + child.fileCount, 0);
+  return {
+    kind: "folder",
+    name: folder.name,
+    path: folder.path,
+    children,
+    fileCount: nestedFileCount + childFiles.length,
+    selected: folder.selected || childFolders.some((child) => child.selected),
+    live: folder.live || childFolders.some((child) => child.live),
+  };
+}
+
+function buildWorkspaceFileTree(rows: WorkspaceFileRow[]): WorkspaceFileTreeNode[] {
+  const root = createWorkspaceFileFolder("", "");
+  for (const row of rows) {
+    const normalized = normalizePath(fileDisplayPath(row.file));
+    const segments = normalized.split("/").filter(Boolean);
+    if (segments.length <= 1) {
+      root.files.push(row);
+      root.selected = root.selected || row.selected;
+      root.live = root.live || row.live;
+      continue;
+    }
+
+    let folder = root;
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      const name = segments[index];
+      const path = segments.slice(0, index + 1).join("/");
+      let next = folder.folders.get(name);
+      if (!next) {
+        next = createWorkspaceFileFolder(name, path);
+        folder.folders.set(name, next);
+      }
+      next.selected = next.selected || row.selected;
+      next.live = next.live || row.live;
+      folder = next;
+    }
+    folder.files.push(row);
+    folder.selected = folder.selected || row.selected;
+    folder.live = folder.live || row.live;
+  }
+  return materializeWorkspaceFileFolder(root).children;
 }
 
 function syntheticFileCard(source: ChatStepCard, path: string): ChatStepCard {
@@ -1732,6 +1854,9 @@ function ComputerPaneInner({
   const [deployFilePath, setDeployFilePath] = useState<string | null>(null);
   const [userPickedDeployFile, setUserPickedDeployFile] = useState(false);
   const [filesListCollapsed, setFilesListCollapsed] = useState(false);
+  const [expandedFileFolders, setExpandedFileFolders] = useState<Set<string>>(
+    () => new Set(),
+  );
   const filesListId = useId();
   const lastLiveWritePathRef = useRef<string | null>(null);
   const hasWorkspaceFiles = workspaceFiles.length > 0;
@@ -1833,12 +1958,23 @@ function ComputerPaneInner({
           file,
           live,
           selected,
-          name: fileNameFromPath(file.path),
+          name: fileNameFromPath(fileDisplayPath(file)),
           meta: workspaceFileMeta(file, live),
         };
       }),
     [headerFilePath, liveWriteActive, liveWritePath, workspaceFiles],
   );
+  const workspaceFileTree = useMemo(
+    () => buildWorkspaceFileTree(workspaceFileRows),
+    [workspaceFileRows],
+  );
+  const headerDisplayFilePath = useMemo(() => {
+    if (!headerFilePath) return "";
+    return (
+      workspaceFiles.find((file) => filePathsMatch(file.path, headerFilePath))
+        ?.displayPath || headerFilePath
+    );
+  }, [headerFilePath, workspaceFiles]);
 
   const activeCard = useMemo(
     () => pickActiveCard(navPool, activeStepId),
@@ -1877,10 +2013,10 @@ function ComputerPaneInner({
   }, [activeDelegationRunId, delegationCardsForRun]);
   const activeSurfaceStatus = activeCard ? surfaceStatus(activeCard, Boolean(isStreaming)) : null;
   const fileHeaderText =
-    liveWriteActive && headerFilePath
-      ? `Writing ${headerFilePath}`
-      : headerFilePath
-        ? `Files: ${headerFilePath}`
+    liveWriteActive && headerDisplayFilePath
+      ? `Writing ${headerDisplayFilePath}`
+      : headerDisplayFilePath
+        ? `Files: ${headerDisplayFilePath}`
         : "Files";
   const consoleHeaderText = activeCard
     ? surfaceDisplayTitle(activeCard)
@@ -1915,17 +2051,17 @@ function ComputerPaneInner({
     filePathsMatch(selectedDeployFilePath, liveWritePath);
   const deployFileContent = useMemo(() => {
     if (!selectedDeployFilePath) return "";
-    // While the file is streaming, prefer the live buffer over any captured
-    // workspace snapshot so the user sees the just-written line, not stale
-    // content from a previous run.
-    if (deployFileIsLiveWrite && liveWriteContent) return liveWriteContent;
-    return (
-      findWorkspaceFileContent(workspaceFiles, selectedDeployFilePath) ||
-      findFileContentForPath(cardsForRun, selectedDeployFilePath)
-    );
+    return resolveComputerPaneFileContent({
+      workspaceContent: findWorkspaceFileContent(workspaceFiles, selectedDeployFilePath),
+      fallbackContent: findFileContentForPath(cardsForRun, selectedDeployFilePath),
+      liveWriteContent,
+      isLiveWrite: deployFileIsLiveWrite,
+      liveWriteActive,
+    });
   }, [
     cardsForRun,
     deployFileIsLiveWrite,
+    liveWriteActive,
     liveWriteContent,
     selectedDeployFilePath,
     workspaceFiles,
@@ -1943,16 +2079,19 @@ function ComputerPaneInner({
     if (selectedDeployFilePath && filePathsMatch(focusedFilePath, selectedDeployFilePath)) {
       return deployFileContent;
     }
-    if (focusedFileIsLiveWrite && liveWriteContent) return liveWriteContent;
-    return (
-      findWorkspaceFileContent(workspaceFiles, focusedFilePath) ||
-      findFileContentForPath(cardsForRun, focusedFilePath)
-    );
+    return resolveComputerPaneFileContent({
+      workspaceContent: findWorkspaceFileContent(workspaceFiles, focusedFilePath),
+      fallbackContent: findFileContentForPath(cardsForRun, focusedFilePath),
+      liveWriteContent,
+      isLiveWrite: focusedFileIsLiveWrite,
+      liveWriteActive,
+    });
   }, [
     cardsForRun,
     deployFileContent,
     focusedFileIsLiveWrite,
     focusedFilePath,
+    liveWriteActive,
     liveWriteContent,
     selectedDeployFilePath,
     workspaceFiles,
@@ -1967,15 +2106,18 @@ function ComputerPaneInner({
     filePathsMatch(activeFilePath, liveWritePath);
   const activeFileContent = useMemo(() => {
     if (!activeFilePath) return "";
-    if (activeFileIsLiveWrite && liveWriteContent) return liveWriteContent;
-    return (
-      findWorkspaceFileContent(workspaceFiles, activeFilePath) ||
-      findFileContentForPath(cardsForRun, activeFilePath)
-    );
+    return resolveComputerPaneFileContent({
+      workspaceContent: findWorkspaceFileContent(workspaceFiles, activeFilePath),
+      fallbackContent: findFileContentForPath(cardsForRun, activeFilePath),
+      liveWriteContent,
+      isLiveWrite: activeFileIsLiveWrite,
+      liveWriteActive,
+    });
   }, [
     activeFilePath,
     activeFileIsLiveWrite,
     cardsForRun,
+    liveWriteActive,
     liveWriteContent,
     workspaceFiles,
   ]);
@@ -1993,17 +2135,18 @@ function ComputerPaneInner({
     filePathsMatch(fallbackFilePath, liveWritePath);
   const fallbackFileContent = useMemo(() => {
     if (!fallbackFilePath) return "";
-    if (fallbackFileIsLiveWrite && liveWriteContent) {
-      return liveWriteContent;
-    }
-    return (
-      findWorkspaceFileContent(workspaceFiles, fallbackFilePath) ||
-      findFileContentForPath(cardsForRun, fallbackFilePath)
-    );
+    return resolveComputerPaneFileContent({
+      workspaceContent: findWorkspaceFileContent(workspaceFiles, fallbackFilePath),
+      fallbackContent: findFileContentForPath(cardsForRun, fallbackFilePath),
+      liveWriteContent,
+      isLiveWrite: fallbackFileIsLiveWrite,
+      liveWriteActive,
+    });
   }, [
     cardsForRun,
     fallbackFileIsLiveWrite,
     fallbackFilePath,
+    liveWriteActive,
     liveWriteContent,
     workspaceFiles,
   ]);
@@ -2092,6 +2235,89 @@ function ComputerPaneInner({
         : isStreaming
           ? "Live output"
           : "";
+  const toggleFileFolder = (path: string) => {
+    setExpandedFileFolders((current) => {
+      const next = new Set(current);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+  const renderWorkspaceFileNode = (
+    node: WorkspaceFileTreeNode,
+    depth: number,
+  ): ReactNode => {
+    const depthStyle = { "--file-tree-indent": `${depth * 16}px` } as CSSProperties;
+    if (node.kind === "folder") {
+      const expanded = expandedFileFolders.has(node.path);
+      return (
+        <div
+          key={`folder:${node.path}`}
+          className={`computer-pane-file-tree-folder${expanded ? " is-expanded" : ""}${node.selected ? " is-selected" : ""}${node.live ? " is-live" : ""}`}
+        >
+          <button
+            type="button"
+            className="computer-pane-file-folder"
+            style={depthStyle}
+            onClick={() => toggleFileFolder(node.path)}
+            aria-expanded={expanded}
+            title={node.path}
+          >
+            <span className="computer-pane-file-folder-chevron" aria-hidden="true">
+              {expanded ? (
+                <KeyboardArrowDownRoundedIcon fontSize="inherit" />
+              ) : (
+                <KeyboardArrowRightRoundedIcon fontSize="inherit" />
+              )}
+            </span>
+            <FolderRoundedIcon
+              fontSize="inherit"
+              className="computer-pane-file-folder-icon"
+              aria-hidden="true"
+            />
+            <span className="computer-pane-file-folder-name">{node.name}</span>
+            <span className="computer-pane-file-folder-meta">
+              {node.fileCount} file{node.fileCount === 1 ? "" : "s"}
+            </span>
+          </button>
+          {expanded ? (
+            <div className="computer-pane-file-folder-children">
+              {node.children.map((child) => renderWorkspaceFileNode(child, depth + 1))}
+            </div>
+          ) : null}
+        </div>
+      );
+    }
+
+    const { file, live, selected, name, meta } = node.row;
+    const displayPath = fileDisplayPath(file) || file.path;
+    return (
+      <button
+        key={`file:${file.path}`}
+        type="button"
+        className={`computer-pane-file-pill is-tree-file${selected ? " is-selected" : ""}${live ? " is-live" : ""}`}
+        style={depthStyle}
+        onClick={() => {
+          setUserPickedDeployFile(!filePathsMatch(file.path, liveWritePath || ""));
+          setDeployFilePath(file.path);
+          onActivate(null);
+        }}
+        title={displayPath}
+      >
+        <InsertDriveFileRoundedIcon
+          fontSize="inherit"
+          className="computer-pane-file-icon"
+          aria-hidden="true"
+        />
+        <span className="computer-pane-file-name">{name}</span>
+        <span className="computer-pane-file-path">{displayPath}</span>
+        <span className="computer-pane-file-meta">{meta}</span>
+      </button>
+    );
+  };
 
   return (
     <Box
@@ -2353,33 +2579,7 @@ function ComputerPaneInner({
               </Box>
               {!filesListCollapsed ? (
                 <div id={filesListId} className="computer-pane-files-list">
-                  {workspaceFileRows.map(({ file, live, selected, name, meta }) => {
-                    return (
-                      <button
-                        key={file.path}
-                        type="button"
-                        className={`computer-pane-file-pill${selected ? " is-selected" : ""}${live ? " is-live" : ""}`}
-                        onClick={() => {
-                          setUserPickedDeployFile(
-                            !filePathsMatch(file.path, liveWritePath || ""),
-                          );
-                          setDeployFilePath(file.path);
-                          onActivate(null);
-                        }}
-                        title={file.path}
-                      >
-                        <span
-                          className="computer-pane-file-dot"
-                          aria-hidden="true"
-                        />
-                        <span className="computer-pane-file-name">{name}</span>
-                        <span className="computer-pane-file-path">
-                          {file.path}
-                        </span>
-                        <span className="computer-pane-file-meta">{meta}</span>
-                      </button>
-                    );
-                  })}
+                  {workspaceFileTree.map((node) => renderWorkspaceFileNode(node, 0))}
                 </div>
               ) : null}
             </Box>

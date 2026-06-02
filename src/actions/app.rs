@@ -49,6 +49,9 @@ const MAX_REPO_TEXT_FILE_BYTES: usize = 512 * 1024;
 const MAX_REPO_TOTAL_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REPO_TEXT_FILES: usize = 600;
 const MAX_README_BYTES: usize = 256 * 1024;
+const DEFAULT_STAGED_APP_SOURCE_FILE_BYTES: usize = MAX_REPO_TEXT_FILE_BYTES;
+const DEFAULT_STAGED_APP_SOURCE_TOTAL_BYTES: usize = MAX_REPO_TOTAL_TEXT_BYTES;
+const DEFAULT_STAGED_APP_SOURCE_FILES: usize = MAX_REPO_TEXT_FILES;
 
 fn startup_restore_parallelism() -> usize {
     std::thread::available_parallelism()
@@ -60,6 +63,14 @@ fn env_timeout_secs(name: &str, default_value: u64, min_value: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= min_value)
+        .unwrap_or(default_value)
+}
+
+fn env_limit_usize(name: &str, default_value: usize, min_value: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value >= min_value)
         .unwrap_or(default_value)
 }
@@ -308,6 +319,41 @@ pub(crate) fn detect_unclosed_html_raw_text_element(content: &str) -> Option<&'s
     }
 
     None
+}
+
+fn effective_bundle_has_html_entrypoint(
+    files: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    files.keys().any(|path| {
+        normalize_static_bundle_path(path).is_some_and(|normalized| {
+            let lower = normalized.to_ascii_lowercase();
+            lower == "index.html" || lower.ends_with("/index.html")
+        })
+    })
+}
+
+fn effective_bundle_has_runtime_manifest(
+    files: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    files.keys().any(|path| {
+        let normalized = normalize_repo_relative_path(Path::new(path));
+        let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+        matches!(
+            file_name,
+            "package.json"
+                | "requirements.txt"
+                | "pyproject.toml"
+                | "Cargo.toml"
+                | "go.mod"
+                | "deno.json"
+                | "deno.jsonc"
+                | "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "Gemfile"
+                | "composer.json"
+        ) || file_name.ends_with(".csproj")
+    })
 }
 
 fn validate_static_app_html_structure(
@@ -617,6 +663,7 @@ struct RepoReadmeHints {
 #[derive(Debug, Clone, Default)]
 struct RepoNodeManifest {
     name: Option<String>,
+    package_manager: Option<String>,
     scripts: HashSet<String>,
     dependencies: HashSet<String>,
     has_workspaces: bool,
@@ -629,6 +676,7 @@ struct RepoServicePlan {
     kind: RepoServiceKind,
     copy_scope: RepoCopyScope,
     install_command: Option<String>,
+    build_command: Option<String>,
     entry_command: Option<String>,
     required_inputs: Vec<AppRequiredInput>,
     detection_reason: String,
@@ -909,6 +957,11 @@ fn parse_node_manifest_value(parsed: &serde_json::Value) -> RepoNodeManifest {
             .and_then(|value| value.as_str())
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        package_manager: parsed
+            .get("packageManager")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty()),
         ..RepoNodeManifest::default()
     };
     if parsed.get("workspaces").is_some() {
@@ -972,6 +1025,29 @@ fn build_relative_file_arg(relative_dir: &str, filename: &str) -> String {
     } else {
         format!("{}/{}", relative_dir.trim_end_matches('/'), filename)
     }
+}
+
+fn build_relative_dir_arg(relative_dir: &str) -> String {
+    if relative_dir.trim().is_empty() {
+        ".".to_string()
+    } else {
+        format!("./{}", relative_dir.trim_matches('/'))
+    }
+}
+
+fn first_existing_file_with_extension(dir: &Path, extension: &str) -> Option<PathBuf> {
+    let normalized_extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&normalized_extension))
+        })
 }
 
 fn detect_fastapi_entry(dir: &Path) -> Option<PathBuf> {
@@ -1145,6 +1221,173 @@ fn build_rust_commands(
     ))
 }
 
+fn build_go_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    if !dir.join("go.mod").exists() {
+        return None;
+    }
+    Some((
+        repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+        None,
+        format!(
+            "go run {}",
+            shell_quote_arg(&build_relative_dir_arg(relative_dir))
+        ),
+    ))
+}
+
+fn build_deno_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    if !(dir.join("deno.json").exists() || dir.join("deno.jsonc").exists()) {
+        return None;
+    }
+    let entry = first_existing_file(
+        dir,
+        &[
+            "main.ts",
+            "main.js",
+            "server.ts",
+            "server.js",
+            "app.ts",
+            "app.js",
+        ],
+    )?;
+    let rel = normalize_repo_relative_path(entry.strip_prefix(dir).ok().unwrap_or(&entry));
+    Some((
+        repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+        None,
+        format!(
+            "deno run --allow-net --allow-read --allow-env {}",
+            shell_quote_arg(&build_relative_file_arg(relative_dir, &rel))
+        ),
+    ))
+}
+
+fn build_java_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    if dir.join("pom.xml").exists() {
+        let project_arg = build_relative_file_arg(relative_dir, "pom.xml");
+        return Some((
+            repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+            None,
+            format!(
+                "mvn -f {} spring-boot:run -Dspring-boot.run.arguments=--server.port={{PORT}}",
+                shell_quote_arg(&project_arg)
+            ),
+        ));
+    }
+    if dir.join("gradlew").exists()
+        || dir.join("build.gradle").exists()
+        || dir.join("build.gradle.kts").exists()
+    {
+        let gradle_program = if dir.join("gradlew").exists() {
+            build_relative_file_arg(relative_dir, "gradlew")
+        } else {
+            "gradle".to_string()
+        };
+        return Some((
+            repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+            None,
+            format!(
+                "{} bootRun --args=--server.port={{PORT}}",
+                shell_quote_arg(&gradle_program)
+            ),
+        ));
+    }
+    None
+}
+
+fn build_dotnet_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    let project = first_existing_file_with_extension(dir, "csproj")?;
+    let rel = normalize_repo_relative_path(project.strip_prefix(dir).ok().unwrap_or(&project));
+    Some((
+        repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+        None,
+        format!(
+            "dotnet run --project {} --urls http://0.0.0.0:{{PORT}}",
+            shell_quote_arg(&build_relative_file_arg(relative_dir, &rel))
+        ),
+    ))
+}
+
+fn build_ruby_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    if !dir.join("Gemfile").exists() {
+        return None;
+    }
+    let install_command = Some(if relative_dir.trim().is_empty() {
+        "bundle install".to_string()
+    } else {
+        format!(
+            "bundle install --gemfile {}",
+            shell_quote_arg(&build_relative_file_arg(relative_dir, "Gemfile"))
+        )
+    });
+    if dir.join("config.ru").exists() {
+        return Some((
+            repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+            install_command,
+            format!(
+                "bundle exec rackup {} -o 0.0.0.0 -p {{PORT}}",
+                shell_quote_arg(&build_relative_file_arg(relative_dir, "config.ru"))
+            ),
+        ));
+    }
+    if dir.join("config").join("environment.rb").exists() {
+        return Some((
+            repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+            install_command,
+            "bundle exec rails server -b 0.0.0.0 -p {PORT}".to_string(),
+        ));
+    }
+    None
+}
+
+fn build_php_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    if !(dir.join("composer.json").exists()
+        || dir.join("index.php").exists()
+        || dir.join("public").join("index.php").exists())
+    {
+        return None;
+    }
+    let install_command = dir.join("composer.json").exists().then(|| {
+        if relative_dir.trim().is_empty() {
+            "composer install".to_string()
+        } else {
+            format!(
+                "composer install --working-dir {}",
+                shell_quote_arg(relative_dir)
+            )
+        }
+    });
+    let doc_root = if dir.join("public").join("index.php").exists() {
+        build_relative_file_arg(relative_dir, "public")
+    } else if relative_dir.trim().is_empty() {
+        ".".to_string()
+    } else {
+        relative_dir.to_string()
+    };
+    Some((
+        repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+        install_command,
+        format!("php -S 0.0.0.0:{{PORT}} -t {}", shell_quote_arg(&doc_root)),
+    ))
+}
+
 fn classify_node_service_kind(manifest: &RepoNodeManifest, relative_dir: &str) -> RepoServiceKind {
     let deps = &manifest.dependencies;
     let has_frontend_framework = deps.iter().any(|dep| {
@@ -1189,7 +1432,108 @@ fn classify_node_service_kind(manifest: &RepoNodeManifest, relative_dir: &str) -
     repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend)
 }
 
-fn build_node_run_command(
+fn node_package_manager_from_manifest<F>(
+    relative_dir: &str,
+    manifest: &RepoNodeManifest,
+    file_exists: &F,
+) -> &'static str
+where
+    F: Fn(&str) -> bool,
+{
+    if let Some(raw) = manifest.package_manager.as_deref() {
+        let executable = raw
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches("node:")
+            .trim();
+        match executable {
+            "npm" => return "npm",
+            "pnpm" => return "pnpm",
+            "yarn" => return "yarn",
+            "bun" => return "bun",
+            _ => {}
+        }
+    }
+
+    // Lockfile names are stable package-manager file formats, not user prompt
+    // wording. They are only a fallback when package.json has no packageManager.
+    for (filename, manager) in [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("bun.lockb", "bun"),
+        ("bun.lock", "bun"),
+        ("package-lock.json", "npm"),
+        ("npm-shrinkwrap.json", "npm"),
+    ] {
+        if file_exists(filename)
+            || (!relative_dir.trim().is_empty()
+                && file_exists(&build_relative_file_arg(relative_dir, filename)))
+        {
+            return manager;
+        }
+    }
+
+    "npm"
+}
+
+fn build_node_install_command(manager: &str, relative_dir: &str, production_only: bool) -> String {
+    match manager {
+        "pnpm" => {
+            let mut command = if relative_dir.trim().is_empty() {
+                "pnpm install".to_string()
+            } else {
+                format!("pnpm --dir {} install", shell_quote_arg(relative_dir))
+            };
+            if production_only {
+                command.push_str(" --prod");
+            }
+            command
+        }
+        "yarn" => {
+            let mut command = if relative_dir.trim().is_empty() {
+                "yarn install".to_string()
+            } else {
+                format!("yarn --cwd {} install", shell_quote_arg(relative_dir))
+            };
+            if production_only {
+                command.push_str(" --production=true");
+            }
+            command
+        }
+        "bun" => {
+            let mut command = if relative_dir.trim().is_empty() {
+                "bun install".to_string()
+            } else {
+                format!("bun --cwd {} install", shell_quote_arg(relative_dir))
+            };
+            if production_only {
+                command.push_str(" --production");
+            }
+            command
+        }
+        _ => {
+            if relative_dir.trim().is_empty() {
+                if production_only {
+                    "npm install --omit=dev".to_string()
+                } else {
+                    "npm install".to_string()
+                }
+            } else if production_only {
+                format!(
+                    "npm --prefix {} install --omit=dev",
+                    shell_quote_arg(relative_dir)
+                )
+            } else {
+                format!("npm --prefix {} install", shell_quote_arg(relative_dir))
+            }
+        }
+    }
+}
+
+fn build_node_run_command_for_manager(
+    manager: &str,
     manifest: &RepoNodeManifest,
     relative_dir: &str,
     script: &str,
@@ -1197,20 +1541,104 @@ fn build_node_run_command(
     root_has_workspaces: bool,
 ) -> String {
     let workspace_name = manifest.name.as_deref().filter(|_| root_has_workspaces);
-    let mut command = if let Some(name) = workspace_name {
-        format!("npm run {} --workspace={}", script, shell_quote_arg(name))
-    } else if relative_dir.trim().is_empty() {
-        format!("npm run {}", script)
-    } else {
-        format!(
-            "npm --prefix {} run {}",
-            shell_quote_arg(relative_dir),
-            script
-        )
+    let mut command = match manager {
+        "pnpm" => {
+            if let Some(name) = workspace_name {
+                format!("pnpm --filter {} run {}", shell_quote_arg(name), script)
+            } else if relative_dir.trim().is_empty() {
+                format!("pnpm run {}", script)
+            } else {
+                format!(
+                    "pnpm --dir {} run {}",
+                    shell_quote_arg(relative_dir),
+                    script
+                )
+            }
+        }
+        "yarn" => {
+            if let Some(name) = workspace_name {
+                format!("yarn workspace {} {}", shell_quote_arg(name), script)
+            } else if relative_dir.trim().is_empty() {
+                format!("yarn {}", script)
+            } else {
+                format!("yarn --cwd {} {}", shell_quote_arg(relative_dir), script)
+            }
+        }
+        "bun" => {
+            if relative_dir.trim().is_empty() {
+                format!("bun run {}", script)
+            } else {
+                format!("bun --cwd {} run {}", shell_quote_arg(relative_dir), script)
+            }
+        }
+        _ => {
+            if let Some(name) = workspace_name {
+                format!("npm run {} --workspace={}", script, shell_quote_arg(name))
+            } else if relative_dir.trim().is_empty() {
+                format!("npm run {}", script)
+            } else {
+                format!(
+                    "npm --prefix {} run {}",
+                    shell_quote_arg(relative_dir),
+                    script
+                )
+            }
+        }
     };
     if !extra_args.is_empty() {
         command.push_str(" -- ");
         command.push_str(&extra_args.join(" "));
+    }
+    command
+}
+
+fn build_node_exec_command_for_manager(
+    manager: &str,
+    relative_dir: &str,
+    binary: &str,
+    args: &[&str],
+) -> String {
+    let mut command = match manager {
+        "pnpm" => {
+            if relative_dir.trim().is_empty() {
+                format!("pnpm exec {}", binary)
+            } else {
+                format!(
+                    "pnpm --dir {} exec {}",
+                    shell_quote_arg(relative_dir),
+                    binary
+                )
+            }
+        }
+        "yarn" => {
+            if relative_dir.trim().is_empty() {
+                format!("yarn {}", binary)
+            } else {
+                format!("yarn --cwd {} {}", shell_quote_arg(relative_dir), binary)
+            }
+        }
+        "bun" => {
+            if relative_dir.trim().is_empty() {
+                format!("bunx {}", binary)
+            } else {
+                format!("bun --cwd {} run {}", shell_quote_arg(relative_dir), binary)
+            }
+        }
+        _ => {
+            if relative_dir.trim().is_empty() {
+                format!("npm exec {} --", binary)
+            } else {
+                format!(
+                    "npm --prefix {} exec {} --",
+                    shell_quote_arg(relative_dir),
+                    binary
+                )
+            }
+        }
+    };
+    if !args.is_empty() {
+        command.push(' ');
+        command.push_str(&args.join(" "));
     }
     command
 }
@@ -1220,7 +1648,7 @@ fn build_node_commands(
     relative_dir: &str,
     manifest: &RepoNodeManifest,
     root_has_workspaces: bool,
-) -> Option<(RepoServiceKind, String, String)> {
+) -> Option<(RepoServiceKind, String, Option<String>, String)> {
     build_node_commands_from_manifest(relative_dir, manifest, root_has_workspaces, |entry| {
         dir.join(entry).exists()
     })
@@ -1231,18 +1659,25 @@ fn build_node_commands_from_manifest<F>(
     manifest: &RepoNodeManifest,
     root_has_workspaces: bool,
     entry_file_exists: F,
-) -> Option<(RepoServiceKind, String, String)>
+) -> Option<(RepoServiceKind, String, Option<String>, String)>
 where
     F: Fn(&str) -> bool,
 {
     let kind = classify_node_service_kind(manifest, relative_dir);
-    let install_command = if relative_dir.trim().is_empty() || root_has_workspaces {
-        "npm install --omit=dev".to_string()
+    let manager = node_package_manager_from_manifest(relative_dir, manifest, &entry_file_exists);
+    let needs_build_deps = matches!(kind, RepoServiceKind::Frontend | RepoServiceKind::Fullstack);
+    let install_command = build_node_install_command(manager, relative_dir, !needs_build_deps);
+    let build_command = if needs_build_deps && manifest.scripts.contains("build") {
+        Some(build_node_run_command_for_manager(
+            manager,
+            manifest,
+            relative_dir,
+            "build",
+            &[],
+            root_has_workspaces,
+        ))
     } else {
-        format!(
-            "npm --prefix {} install --omit=dev",
-            shell_quote_arg(relative_dir)
-        )
+        None
     };
 
     let frontend_args = if manifest.dependencies.contains("next") {
@@ -1251,19 +1686,12 @@ where
         vec!["--host", "0.0.0.0", "--port", "{PORT}"]
     };
 
-    let entry_command = if manifest.scripts.contains("preview")
-        && matches!(kind, RepoServiceKind::Frontend | RepoServiceKind::Fullstack)
+    let entry_command = if manifest.scripts.contains("start")
+        && matches!(kind, RepoServiceKind::Backend | RepoServiceKind::Fullstack)
     {
-        build_node_run_command(
-            manifest,
-            relative_dir,
-            "preview",
-            &frontend_args,
-            root_has_workspaces,
-        )
-    } else if manifest.scripts.contains("start") {
         if manifest.dependencies.contains("next") {
-            build_node_run_command(
+            build_node_run_command_for_manager(
+                manager,
                 manifest,
                 relative_dir,
                 "start",
@@ -1271,11 +1699,55 @@ where
                 root_has_workspaces,
             )
         } else {
-            build_node_run_command(manifest, relative_dir, "start", &[], root_has_workspaces)
+            build_node_run_command_for_manager(
+                manager,
+                manifest,
+                relative_dir,
+                "start",
+                &[],
+                root_has_workspaces,
+            )
+        }
+    } else if manifest.scripts.contains("preview") && matches!(kind, RepoServiceKind::Frontend) {
+        build_node_run_command_for_manager(
+            manager,
+            manifest,
+            relative_dir,
+            "preview",
+            &frontend_args,
+            root_has_workspaces,
+        )
+    } else if build_command.is_some()
+        && manifest.dependencies.contains("vite")
+        && matches!(kind, RepoServiceKind::Frontend)
+    {
+        let mut args = vec!["preview"];
+        args.extend(frontend_args.iter().copied());
+        build_node_exec_command_for_manager(manager, relative_dir, "vite", &args)
+    } else if manifest.scripts.contains("start") {
+        if manifest.dependencies.contains("next") {
+            build_node_run_command_for_manager(
+                manager,
+                manifest,
+                relative_dir,
+                "start",
+                &["--hostname", "0.0.0.0", "--port", "{PORT}"],
+                root_has_workspaces,
+            )
+        } else {
+            build_node_run_command_for_manager(
+                manager,
+                manifest,
+                relative_dir,
+                "start",
+                &[],
+                root_has_workspaces,
+            )
         }
     } else if manifest.scripts.contains("dev") {
-        if matches!(kind, RepoServiceKind::Frontend | RepoServiceKind::Fullstack) {
-            build_node_run_command(
+        if matches!(kind, RepoServiceKind::Frontend) {
+            build_node_run_command_for_manager(
+                manager,
                 manifest,
                 relative_dir,
                 "dev",
@@ -1283,7 +1755,14 @@ where
                 root_has_workspaces,
             )
         } else {
-            build_node_run_command(manifest, relative_dir, "dev", &[], root_has_workspaces)
+            build_node_run_command_for_manager(
+                manager,
+                manifest,
+                relative_dir,
+                "dev",
+                &[],
+                root_has_workspaces,
+            )
         }
     } else if entry_file_exists("server.js") {
         let path = build_relative_file_arg(relative_dir, "server.js");
@@ -1298,12 +1777,13 @@ where
         return None;
     };
 
-    Some((kind, install_command, entry_command))
+    Some((kind, install_command, build_command, entry_command))
 }
 
 #[derive(Debug, Clone)]
 struct GeneratedBundleLifecycleInference {
     install_command: Option<String>,
+    build_command: Option<String>,
     entry_command: String,
     runtime_reason: String,
 }
@@ -1363,6 +1843,42 @@ fn bundle_file_text<'a>(
         .map(String::as_str)
 }
 
+fn bundle_first_file_with_extension(
+    files: &HashMap<String, String>,
+    relative_dir: &str,
+    extension: &str,
+) -> Option<String> {
+    let prefix = relative_dir.trim_matches('/');
+    let normalized_extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    let mut candidates = files
+        .keys()
+        .filter(|path| {
+            if !prefix.is_empty() {
+                let expected = format!("{}/", prefix);
+                if !path.starts_with(&expected) {
+                    return false;
+                }
+            } else if path.contains('/') {
+                return false;
+            }
+            path.rsplit_once('.')
+                .map(|(_, ext)| ext.eq_ignore_ascii_case(&normalized_extension))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().map(|path| {
+        if prefix.is_empty() {
+            path
+        } else {
+            path.strip_prefix(&format!("{}/", prefix))
+                .unwrap_or(path.as_str())
+                .to_string()
+        }
+    })
+}
+
 fn infer_generated_node_bundle_lifecycle(
     files: &HashMap<String, String>,
 ) -> Option<GeneratedBundleLifecycleInference> {
@@ -1378,16 +1894,19 @@ fn infer_generated_node_bundle_lifecycle(
         else {
             continue;
         };
-        let Some((_kind, install_command, entry_command)) = build_node_commands_from_manifest(
-            &relative_dir,
-            &manifest,
-            root_has_workspaces,
-            |entry| bundle_file_exists(files, &relative_dir, entry),
-        ) else {
+        let Some((_kind, install_command, build_command, entry_command)) =
+            build_node_commands_from_manifest(
+                &relative_dir,
+                &manifest,
+                root_has_workspaces,
+                |entry| bundle_file_exists(files, &relative_dir, entry),
+            )
+        else {
             continue;
         };
         return Some(GeneratedBundleLifecycleInference {
             install_command: Some(install_command),
+            build_command,
             entry_command,
             runtime_reason: "generated bundle contains a runnable Node package manifest"
                 .to_string(),
@@ -1442,6 +1961,44 @@ fn generated_python_entry_content<'a>(
     None
 }
 
+fn generated_node_bundle_runnable_candidate_dirs(files: &HashMap<String, String>) -> Vec<String> {
+    let root_has_workspaces = files
+        .get("package.json")
+        .and_then(|raw| parse_node_manifest_text(raw))
+        .map(|manifest| manifest.has_workspaces)
+        .unwrap_or(false);
+    let mut dirs = Vec::new();
+    for relative_dir in bundle_candidate_dirs_with_file(files, "package.json") {
+        let Some(manifest) = bundle_file_text(files, &relative_dir, "package.json")
+            .and_then(parse_node_manifest_text)
+        else {
+            continue;
+        };
+        if build_node_commands_from_manifest(
+            &relative_dir,
+            &manifest,
+            root_has_workspaces,
+            |entry| bundle_file_exists(files, &relative_dir, entry),
+        )
+        .is_some()
+        {
+            dirs.push(relative_dir);
+        }
+    }
+    dirs
+}
+
+fn generated_bundle_requires_explicit_service_selection(
+    files: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<String>> {
+    let text_files = text_files_from_effective_bundle(files);
+    let node_dirs = generated_node_bundle_runnable_candidate_dirs(&text_files);
+    if node_dirs.len() > 1 && !node_dirs.iter().any(|dir| dir.is_empty()) {
+        return Some(node_dirs);
+    }
+    None
+}
+
 fn infer_generated_python_bundle_lifecycle(
     files: &HashMap<String, String>,
 ) -> Option<GeneratedBundleLifecycleInference> {
@@ -1468,6 +2025,7 @@ fn infer_generated_python_bundle_lifecycle(
         if bundle_file_exists(files, &relative_dir, "manage.py") {
             return Some(GeneratedBundleLifecycleInference {
                 install_command,
+                build_command: None,
                 entry_command: format!(
                     "python {} runserver 0.0.0.0:{{PORT}}",
                     shell_quote_arg(&build_relative_file_arg(&relative_dir, "manage.py"))
@@ -1485,6 +2043,7 @@ fn infer_generated_python_bundle_lifecycle(
             ) {
                 return Some(GeneratedBundleLifecycleInference {
                     install_command,
+                    build_command: None,
                     entry_command: format!(
                         "streamlit run {} --server.address 0.0.0.0 --server.port {{PORT}}",
                         shell_quote_arg(&build_relative_file_arg(&relative_dir, &entry))
@@ -1505,6 +2064,7 @@ fn infer_generated_python_bundle_lifecycle(
                     };
                     return Some(GeneratedBundleLifecycleInference {
                         install_command,
+                        build_command: None,
                         entry_command: format!(
                             "uvicorn --app-dir {} {}:app --host 0.0.0.0 --port {{PORT}}",
                             shell_quote_arg(app_dir_arg),
@@ -1522,6 +2082,7 @@ fn infer_generated_python_bundle_lifecycle(
                 if text.contains("Flask(") || text.contains("from flask import") {
                     return Some(GeneratedBundleLifecycleInference {
                         install_command,
+                        build_command: None,
                         entry_command: format!(
                             "flask --app {} run --host 0.0.0.0 --port {{PORT}}",
                             shell_quote_arg(&build_relative_file_arg(&relative_dir, entry))
@@ -1538,6 +2099,7 @@ fn infer_generated_python_bundle_lifecycle(
             {
                 return Some(GeneratedBundleLifecycleInference {
                     install_command,
+                    build_command: None,
                     entry_command: format!(
                         "python {}",
                         shell_quote_arg(&build_relative_file_arg(&relative_dir, &entry))
@@ -1554,6 +2116,7 @@ fn infer_generated_python_bundle_lifecycle(
         ) {
             return Some(GeneratedBundleLifecycleInference {
                 install_command,
+                build_command: None,
                 entry_command: format!(
                     "python {}",
                     shell_quote_arg(&build_relative_file_arg(&relative_dir, &entry))
@@ -1581,9 +2144,214 @@ fn infer_generated_rust_bundle_lifecycle(
     };
     Some(GeneratedBundleLifecycleInference {
         install_command: None,
+        build_command: None,
         entry_command,
         runtime_reason: "generated bundle contains a Cargo manifest".to_string(),
     })
+}
+
+fn infer_generated_go_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    let relative_dir = bundle_candidate_dirs_with_file(files, "go.mod")
+        .into_iter()
+        .next()?;
+    Some(GeneratedBundleLifecycleInference {
+        install_command: None,
+        build_command: None,
+        entry_command: format!(
+            "go run {}",
+            shell_quote_arg(&build_relative_dir_arg(&relative_dir))
+        ),
+        runtime_reason: "generated bundle contains a Go module".to_string(),
+    })
+}
+
+fn infer_generated_deno_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    let mut dirs = bundle_candidate_dirs_with_file(files, "deno.json");
+    dirs.extend(bundle_candidate_dirs_with_file(files, "deno.jsonc"));
+    dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
+    dirs.dedup();
+    for relative_dir in dirs {
+        for entry in [
+            "main.ts",
+            "main.js",
+            "server.ts",
+            "server.js",
+            "app.ts",
+            "app.js",
+        ] {
+            if bundle_file_exists(files, &relative_dir, entry) {
+                return Some(GeneratedBundleLifecycleInference {
+                    install_command: None,
+                    build_command: None,
+                    entry_command: format!(
+                        "deno run --allow-net --allow-read --allow-env {}",
+                        shell_quote_arg(&build_relative_file_arg(&relative_dir, entry))
+                    ),
+                    runtime_reason: "generated bundle contains a Deno manifest".to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn infer_generated_java_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    if let Some(relative_dir) = bundle_candidate_dirs_with_file(files, "pom.xml")
+        .into_iter()
+        .next()
+    {
+        return Some(GeneratedBundleLifecycleInference {
+            install_command: None,
+            build_command: None,
+            entry_command: format!(
+                "mvn -f {} spring-boot:run -Dspring-boot.run.arguments=--server.port={{PORT}}",
+                shell_quote_arg(&build_relative_file_arg(&relative_dir, "pom.xml"))
+            ),
+            runtime_reason: "generated bundle contains a Maven project".to_string(),
+        });
+    }
+    let mut dirs = bundle_candidate_dirs_with_file(files, "gradlew");
+    dirs.extend(bundle_candidate_dirs_with_file(files, "build.gradle"));
+    dirs.extend(bundle_candidate_dirs_with_file(files, "build.gradle.kts"));
+    dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
+    dirs.dedup();
+    for relative_dir in dirs {
+        let program = if bundle_file_exists(files, &relative_dir, "gradlew") {
+            build_relative_file_arg(&relative_dir, "gradlew")
+        } else {
+            "gradle".to_string()
+        };
+        return Some(GeneratedBundleLifecycleInference {
+            install_command: None,
+            build_command: None,
+            entry_command: format!(
+                "{} bootRun --args=--server.port={{PORT}}",
+                shell_quote_arg(&program)
+            ),
+            runtime_reason: "generated bundle contains a Gradle project".to_string(),
+        });
+    }
+    None
+}
+
+fn infer_generated_dotnet_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    let mut dirs = files
+        .keys()
+        .filter_map(|path| {
+            if !path
+                .rsplit_once('.')
+                .map(|(_, ext)| ext.eq_ignore_ascii_case("csproj"))
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            Some(
+                path.rsplit_once('/')
+                    .map(|(dir, _)| dir.to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
+    dirs.dedup();
+    for relative_dir in dirs {
+        let project = bundle_first_file_with_extension(files, &relative_dir, "csproj")?;
+        return Some(GeneratedBundleLifecycleInference {
+            install_command: None,
+            build_command: None,
+            entry_command: format!(
+                "dotnet run --project {} --urls http://0.0.0.0:{{PORT}}",
+                shell_quote_arg(&build_relative_file_arg(&relative_dir, &project))
+            ),
+            runtime_reason: "generated bundle contains a .NET project".to_string(),
+        });
+    }
+    None
+}
+
+fn infer_generated_ruby_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    for relative_dir in bundle_candidate_dirs_with_file(files, "Gemfile") {
+        let install_command = Some(if relative_dir.trim().is_empty() {
+            "bundle install".to_string()
+        } else {
+            format!(
+                "bundle install --gemfile {}",
+                shell_quote_arg(&build_relative_file_arg(&relative_dir, "Gemfile"))
+            )
+        });
+        if bundle_file_exists(files, &relative_dir, "config.ru") {
+            return Some(GeneratedBundleLifecycleInference {
+                install_command,
+                build_command: None,
+                entry_command: format!(
+                    "bundle exec rackup {} -o 0.0.0.0 -p {{PORT}}",
+                    shell_quote_arg(&build_relative_file_arg(&relative_dir, "config.ru"))
+                ),
+                runtime_reason: "generated bundle contains a Rack application".to_string(),
+            });
+        }
+        if bundle_file_exists(files, &relative_dir, "config/environment.rb") {
+            return Some(GeneratedBundleLifecycleInference {
+                install_command,
+                build_command: None,
+                entry_command: "bundle exec rails server -b 0.0.0.0 -p {PORT}".to_string(),
+                runtime_reason: "generated bundle contains a Rails application".to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn infer_generated_php_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    let mut dirs = bundle_candidate_dirs_with_file(files, "composer.json");
+    dirs.extend(bundle_candidate_dirs_with_file(files, "index.php"));
+    dirs.extend(bundle_candidate_dirs_with_file(files, "public/index.php"));
+    dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
+    dirs.dedup();
+    for relative_dir in dirs {
+        let has_entry = bundle_file_exists(files, &relative_dir, "index.php")
+            || bundle_file_exists(files, &relative_dir, "public/index.php");
+        if !has_entry {
+            continue;
+        }
+        let install_command =
+            bundle_file_exists(files, &relative_dir, "composer.json").then(|| {
+                if relative_dir.trim().is_empty() {
+                    "composer install".to_string()
+                } else {
+                    format!(
+                        "composer install --working-dir {}",
+                        shell_quote_arg(&relative_dir)
+                    )
+                }
+            });
+        let doc_root = if bundle_file_exists(files, &relative_dir, "public/index.php") {
+            build_relative_file_arg(&relative_dir, "public")
+        } else if relative_dir.trim().is_empty() {
+            ".".to_string()
+        } else {
+            relative_dir.clone()
+        };
+        return Some(GeneratedBundleLifecycleInference {
+            install_command,
+            build_command: None,
+            entry_command: format!("php -S 0.0.0.0:{{PORT}} -t {}", shell_quote_arg(&doc_root)),
+            runtime_reason: "generated bundle contains a PHP web entry point".to_string(),
+        });
+    }
+    None
 }
 
 fn infer_generated_bundle_lifecycle(
@@ -1593,6 +2361,12 @@ fn infer_generated_bundle_lifecycle(
     infer_generated_node_bundle_lifecycle(&text_files)
         .or_else(|| infer_generated_python_bundle_lifecycle(&text_files))
         .or_else(|| infer_generated_rust_bundle_lifecycle(&text_files))
+        .or_else(|| infer_generated_go_bundle_lifecycle(&text_files))
+        .or_else(|| infer_generated_deno_bundle_lifecycle(&text_files))
+        .or_else(|| infer_generated_java_bundle_lifecycle(&text_files))
+        .or_else(|| infer_generated_dotnet_bundle_lifecycle(&text_files))
+        .or_else(|| infer_generated_ruby_bundle_lifecycle(&text_files))
+        .or_else(|| infer_generated_php_bundle_lifecycle(&text_files))
 }
 
 fn set_generated_app_lifecycle_meta(
@@ -1600,6 +2374,7 @@ fn set_generated_app_lifecycle_meta(
     inferred: &GeneratedBundleLifecycleInference,
 ) {
     let install_missing = app_meta_lifecycle_command(meta, "install_command").is_none();
+    let build_missing = app_meta_lifecycle_command(meta, "build_command").is_none();
     let Some(obj) = meta.as_object_mut() else {
         return;
     };
@@ -1648,6 +2423,14 @@ fn set_generated_app_lifecycle_meta(
                 );
             }
         }
+        if build_missing {
+            if let Some(build) = inferred.build_command.as_ref() {
+                commands.insert(
+                    "build".to_string(),
+                    serde_json::Value::String(build.clone()),
+                );
+            }
+        }
     }
 
     if install_missing {
@@ -1655,6 +2438,14 @@ fn set_generated_app_lifecycle_meta(
             obj.insert(
                 "install_command".to_string(),
                 serde_json::Value::String(install.clone()),
+            );
+        }
+    }
+    if build_missing {
+        if let Some(build) = inferred.build_command.as_ref() {
+            obj.insert(
+                "build_command".to_string(),
+                serde_json::Value::String(build.clone()),
             );
         }
     }
@@ -1715,6 +2506,16 @@ fn discover_repo_candidate_dirs(root: &Path) -> Vec<PathBuf> {
             || dir.join("pyproject.toml").exists()
             || dir.join("manage.py").exists()
             || dir.join("Cargo.toml").exists()
+            || dir.join("go.mod").exists()
+            || dir.join("deno.json").exists()
+            || dir.join("deno.jsonc").exists()
+            || dir.join("pom.xml").exists()
+            || dir.join("build.gradle").exists()
+            || dir.join("build.gradle.kts").exists()
+            || first_existing_file_with_extension(dir, "csproj").is_some()
+            || dir.join("Gemfile").exists()
+            || dir.join("composer.json").exists()
+            || dir.join("public").join("index.php").exists()
             || dir.join("index.html").exists();
         if is_candidate {
             candidates.push(dir.to_path_buf());
@@ -1773,7 +2574,7 @@ fn plan_repo_services(
         };
 
         if let Some(manifest) = load_node_manifest(&dir) {
-            let Some((kind, install_command, entry_command)) =
+            let Some((kind, install_command, build_command, entry_command)) =
                 build_node_commands(&dir, &relative_dir, &manifest, root_has_workspaces)
             else {
                 continue;
@@ -1787,6 +2588,7 @@ fn plan_repo_services(
                 kind,
                 copy_scope: RepoCopyScope::RepositoryRoot,
                 install_command: Some(install_command),
+                build_command,
                 entry_command: Some(entry_command),
                 required_inputs,
                 detection_reason: "package.json scripts".to_string(),
@@ -1806,6 +2608,7 @@ fn plan_repo_services(
                 kind,
                 copy_scope: RepoCopyScope::RepositoryRoot,
                 install_command,
+                build_command: None,
                 entry_command: Some(entry_command),
                 required_inputs,
                 detection_reason: "python app manifest".to_string(),
@@ -1825,9 +2628,129 @@ fn plan_repo_services(
                 kind,
                 copy_scope: RepoCopyScope::RepositoryRoot,
                 install_command,
+                build_command: None,
                 entry_command: Some(entry_command),
                 required_inputs,
                 detection_reason: "cargo manifest".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) = build_go_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                build_command: None,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "go module".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) =
+            build_deno_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                build_command: None,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "deno manifest".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) =
+            build_java_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                build_command: None,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "java build manifest".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) =
+            build_dotnet_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                build_command: None,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: ".NET project".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) =
+            build_ruby_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                build_command: None,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "ruby app manifest".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) =
+            build_php_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                build_command: None,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "php app manifest".to_string(),
             });
             continue;
         }
@@ -1843,6 +2766,7 @@ fn plan_repo_services(
                 kind,
                 copy_scope: RepoCopyScope::ServiceRoot,
                 install_command: None,
+                build_command: None,
                 entry_command: None,
                 required_inputs,
                 detection_reason: "static index.html".to_string(),
@@ -1865,6 +2789,7 @@ fn plan_repo_services(
                         kind: RepoServiceKind::Fullstack,
                         copy_scope: RepoCopyScope::RepositoryRoot,
                         install_command: hints.install_command,
+                        build_command: None,
                         entry_command: Some(start_command),
                         required_inputs: collect_env_example_inputs(repo_root),
                         detection_reason: "README install/run instructions".to_string(),
@@ -2501,6 +3426,9 @@ async fn deploy_repo_bundle(
         if let Some(command) = plan.install_command.as_ref() {
             service_args.insert("install_command".to_string(), serde_json::json!(command));
         }
+        if let Some(command) = plan.build_command.as_ref() {
+            service_args.insert("build_command".to_string(), serde_json::json!(command));
+        }
         if let Some(command) = plan.entry_command.as_ref() {
             service_args.insert("entry_command".to_string(), serde_json::json!(command));
             service_args.insert("runtime_required".to_string(), serde_json::json!(true));
@@ -2795,6 +3723,9 @@ pub fn parse_config_values(arguments: &serde_json::Value) -> HashMap<String, Str
         return out;
     };
     for (k, v) in obj {
+        if env_name_looks_secret(k) {
+            continue;
+        }
         let value = match v {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Bool(b) => b.to_string(),
@@ -2842,9 +3773,17 @@ pub fn parse_runtime_actions(arguments: &serde_json::Value) -> Vec<String> {
 
 fn resolve_secret_value(
     custom: &std::collections::HashMap<String, String>,
-    _llm_env: &HashMap<String, String>,
+    app_id: Option<&str>,
     env: &str,
 ) -> Option<String> {
+    if let Some(app_storage_key) = app_id.and_then(|id| app_env_secret_storage_key(id, env)) {
+        if let Some(v) = custom.get(&app_storage_key) {
+            if !v.trim().is_empty() {
+                return Some(v.clone());
+            }
+        }
+    }
+
     if let Some(v) = custom
         .get(&format!("env:{}", env))
         .or_else(|| custom.get(&format!("secret:{}", env)))
@@ -2869,10 +3808,12 @@ fn resolve_secret_value(
 pub async fn resolve_required_env_values(
     config_dir: &Path,
     data_dir: &Path,
+    app_id: Option<&str>,
     required_inputs: &[AppRequiredInput],
     llm_env: &HashMap<String, String>,
     config_values: &HashMap<String, String>,
 ) -> Result<(HashMap<String, String>, Vec<String>, Vec<String>)> {
+    let _ = llm_env;
     let mgr =
         crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
     let secrets = mgr.load_secrets()?;
@@ -2886,7 +3827,7 @@ pub async fn resolve_required_env_values(
             continue;
         }
         if required.sensitive {
-            if let Some(v) = resolve_secret_value(&secrets.custom, llm_env, key) {
+            if let Some(v) = resolve_secret_value(&secrets.custom, app_id, key) {
                 resolved.insert(key.to_string(), v);
             } else if !missing_sensitive.iter().any(|m| m == key) {
                 missing_sensitive.push(key.to_string());
@@ -2900,7 +3841,7 @@ pub async fn resolve_required_env_values(
         }
 
         // Fallback: allow resolving non-sensitive values from encrypted store if user chose to save there.
-        if let Some(v) = resolve_secret_value(&secrets.custom, llm_env, key) {
+        if let Some(v) = resolve_secret_value(&secrets.custom, app_id, key) {
             resolved.insert(key.to_string(), v);
         } else if !missing_config.iter().any(|m| m == key) {
             missing_config.push(key.to_string());
@@ -2911,6 +3852,81 @@ pub async fn resolve_required_env_values(
 
 fn normalize_mount_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[derive(Debug, Clone)]
+struct DynamicContainerMountPlan {
+    args: Vec<String>,
+    workdir: String,
+}
+
+fn configured_data_docker_volume() -> Option<String> {
+    std::env::var("AGENTARK_DATA_DOCKER_VOLUME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn agent_data_dir() -> PathBuf {
+    std::env::var_os("AGENTARK_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/app/data"))
+}
+
+fn dynamic_container_mount_plan_from(
+    app_dir: &Path,
+    data_dir: &Path,
+    data_volume: Option<&str>,
+) -> Result<DynamicContainerMountPlan> {
+    let volume = data_volume
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "container runtime requires AGENTARK_DATA_DOCKER_VOLUME so app containers mount the shared data volume instead of a host path"
+            )
+        })?;
+    app_dir.strip_prefix(data_dir).with_context(|| {
+        format!(
+            "container runtime app dir {} is outside data dir {}",
+            app_dir.display(),
+            data_dir.display()
+        )
+    })?;
+    Ok(DynamicContainerMountPlan {
+        args: vec![
+            "--mount".to_string(),
+            format!(
+                "type=volume,source={},target={}",
+                volume,
+                normalize_mount_path(data_dir)
+            ),
+        ],
+        workdir: normalize_mount_path(app_dir),
+    })
+}
+
+fn dynamic_container_mount_plan(app_dir: &Path) -> Result<DynamicContainerMountPlan> {
+    let data_dir = agent_data_dir();
+    dynamic_container_mount_plan_from(
+        app_dir,
+        &data_dir,
+        configured_data_docker_volume().as_deref(),
+    )
+}
+
+#[cfg(unix)]
+fn app_dir_container_user(app_dir: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(app_dir)
+        .map(|metadata| format!("{}:{}", metadata.uid(), metadata.gid()))
+        .unwrap_or_else(|_| "65532:65532".to_string())
+}
+
+#[cfg(not(unix))]
+fn app_dir_container_user(_app_dir: &Path) -> String {
+    "65532:65532".to_string()
 }
 
 fn command_looks_python_related(command: &str) -> bool {
@@ -2933,6 +3949,7 @@ fn command_looks_python_related(command: &str) -> bool {
 fn build_dynamic_container_run_args(
     app_id: &str,
     app_dir: &Path,
+    mount_plan: &DynamicContainerMountPlan,
     port: u16,
     image: &str,
     container_name: String,
@@ -2940,7 +3957,7 @@ fn build_dynamic_container_run_args(
     network_container_ref: Option<&str>,
     launch_script: String,
 ) -> Vec<String> {
-    let mount = normalize_mount_path(app_dir);
+    let container_user = app_dir_container_user(app_dir);
     let mut args = vec![
         "run".to_string(),
         "-d".to_string(),
@@ -2957,15 +3974,16 @@ fn build_dynamic_container_run_args(
         "--cap-drop".to_string(),
         "ALL".to_string(),
         "--user".to_string(),
-        "65532:65532".to_string(),
+        container_user,
         "--tmpfs".to_string(),
         "/tmp:size=64m,noexec,nosuid,nodev".to_string(),
         "--name".to_string(),
         container_name,
-        "-v".to_string(),
-        format!("{}:/workspace", mount),
+    ];
+    args.extend(mount_plan.args.clone());
+    args.extend([
         "-w".to_string(),
-        "/workspace".to_string(),
+        mount_plan.workdir.clone(),
         "--label".to_string(),
         "agentark.managed=true".to_string(),
         "--label".to_string(),
@@ -2976,7 +3994,7 @@ fn build_dynamic_container_run_args(
         format!("PORT={}", port),
         "-e".to_string(),
         "HOST=0.0.0.0".to_string(),
-    ];
+    ]);
     if let Some(container_ref) = network_container_ref
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -3000,13 +4018,14 @@ fn build_dynamic_container_run_args(
 fn build_dynamic_container_install_args(
     app_id: &str,
     app_dir: &Path,
+    mount_plan: &DynamicContainerMountPlan,
     port: u16,
     image: &str,
     container_name: String,
     env_file_path: Option<&Path>,
     install_script: String,
 ) -> Vec<String> {
-    let mount = normalize_mount_path(app_dir);
+    let container_user = app_dir_container_user(app_dir);
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -3023,17 +4042,18 @@ fn build_dynamic_container_install_args(
         "--cap-drop".to_string(),
         "ALL".to_string(),
         "--user".to_string(),
-        "65532:65532".to_string(),
+        container_user,
         "--tmpfs".to_string(),
         "/tmp:size=64m,noexec,nosuid,nodev".to_string(),
         "--name".to_string(),
         container_name,
         "--entrypoint".to_string(),
         "/bin/sh".to_string(),
-        "-v".to_string(),
-        format!("{}:/workspace", mount),
+    ];
+    args.extend(mount_plan.args.clone());
+    args.extend([
         "-w".to_string(),
-        "/workspace".to_string(),
+        mount_plan.workdir.clone(),
         "--label".to_string(),
         "agentark.managed=true".to_string(),
         "--label".to_string(),
@@ -3042,7 +4062,7 @@ fn build_dynamic_container_install_args(
         format!("PORT={}", port),
         "-e".to_string(),
         "HOST=0.0.0.0".to_string(),
-    ];
+    ]);
     if let Some(path) = env_file_path {
         args.push("--env-file".to_string());
         args.push(path.to_string_lossy().to_string());
@@ -3259,8 +4279,7 @@ fn validate_app_command(command: &str, label: &str) -> Result<String> {
         );
     }
 
-    let shell_tokens = ["&&", "||", ";", "|", "`", "$(", "<", ">"];
-    if shell_tokens.iter().any(|tok| collapsed.contains(tok)) {
+    if contains_unquoted_shell_operator(&collapsed)? {
         anyhow::bail!(
             "{} contains shell operators and must be a direct command only",
             label
@@ -3270,12 +4289,66 @@ fn validate_app_command(command: &str, label: &str) -> Result<String> {
     Ok(collapsed)
 }
 
+fn contains_unquoted_shell_operator(command: &str) -> Result<bool> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut quote: Option<char> = None;
+    let mut escape = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if escape {
+            escape = false;
+            idx += 1;
+            continue;
+        }
+
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' {
+                    escape = true;
+                } else if ch == q {
+                    quote = None;
+                }
+                idx += 1;
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    idx += 1;
+                } else if ch == '\\' {
+                    escape = true;
+                    idx += 1;
+                } else if ch == '&' && chars.get(idx + 1) == Some(&'&') {
+                    return Ok(true);
+                } else if ch == '|' || ch == ';' || ch == '`' || ch == '<' || ch == '>' {
+                    return Ok(true);
+                } else if ch == '$' && chars.get(idx + 1) == Some(&'(') {
+                    return Ok(true);
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    if escape {
+        anyhow::bail!("command has a trailing escape character");
+    }
+    if quote.is_some() {
+        anyhow::bail!("command has an unclosed quote");
+    }
+    Ok(false)
+}
+
 fn is_valid_env_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 128
-        && key
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    key.len() <= 128
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 async fn write_runtime_env_file(
@@ -3289,7 +4362,10 @@ async fn write_runtime_env_file(
     let mut ordered: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in extra_env {
         if !is_valid_env_key(k) {
-            anyhow::bail!("Invalid env key '{}': use [A-Z0-9_]", k);
+            anyhow::bail!(
+                "Invalid env key '{}': use letters, digits, and '_' with a non-digit first character",
+                k
+            );
         }
         if v.contains('\0') || v.contains('\n') || v.contains('\r') {
             anyhow::bail!(
@@ -3308,9 +4384,27 @@ async fn write_runtime_env_file(
         content.push_str(&v);
         content.push('\n');
     }
-    tokio::fs::write(&env_file_path, content)
-        .await
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&env_file_path)
+        .with_context(|| format!("failed to create runtime env file at {:?}", env_file_path))?;
+    std::io::Write::write_all(&mut file, content.as_bytes())
         .with_context(|| format!("failed to write runtime env file at {:?}", env_file_path))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &env_file_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .with_context(|| format!("failed to restrict runtime env file at {:?}", env_file_path))?;
+    }
 
     Ok(Some(env_file_path))
 }
@@ -3457,7 +4551,7 @@ fn app_manifest_uses_vite(app_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn command_is_vite_runtime(args: &[String], app_dir: &Path) -> bool {
+fn command_is_vite_command(args: &[String], app_dir: &Path, include_build_scripts: bool) -> bool {
     let Some(first) = args.first() else {
         return false;
     };
@@ -3476,7 +4570,13 @@ fn command_is_vite_runtime(args: &[String], app_dir: &Path) -> bool {
     let Some(script) = package_manager_script_name(args) else {
         return false;
     };
-    app_manifest_uses_vite(app_dir) && matches!(script, "dev" | "start" | "preview")
+    app_manifest_uses_vite(app_dir)
+        && (matches!(script, "dev" | "start" | "preview")
+            || (include_build_scripts && script == "build"))
+}
+
+fn command_is_vite_runtime(args: &[String], app_dir: &Path) -> bool {
+    command_is_vite_command(args, app_dir, false)
 }
 
 fn command_vite_base_arg(args: &[String]) -> Option<&str> {
@@ -3600,8 +4700,17 @@ fn apply_app_mount_base_to_vite_entry_command(
     app_dir: &Path,
     app_id: &str,
 ) -> Result<String> {
-    let mut args = split_command_args(command, "entry_command")?;
-    if !command_is_vite_runtime(&args, app_dir) || command_has_vite_base_arg(&args) {
+    apply_app_mount_base_to_vite_command(command, app_dir, app_id, "entry_command")
+}
+
+fn apply_app_mount_base_to_vite_command(
+    command: &str,
+    app_dir: &Path,
+    app_id: &str,
+    label: &str,
+) -> Result<String> {
+    let mut args = split_command_args(command, label)?;
+    if !command_is_vite_command(&args, app_dir, true) || command_has_vite_base_arg(&args) {
         return Ok(command.to_string());
     }
     if is_package_manager_run(&args) && !args.iter().any(|arg| arg == "--") {
@@ -3665,6 +4774,78 @@ fn split_command_args(command: &str, label: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn split_direct_command_sequence(command: &str, label: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escape = false;
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if escape {
+            current.push(ch);
+            escape = false;
+            idx += 1;
+            continue;
+        }
+
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' {
+                    escape = true;
+                } else if ch == q {
+                    quote = None;
+                    current.push(ch);
+                } else {
+                    current.push(ch);
+                }
+                idx += 1;
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    current.push(ch);
+                    idx += 1;
+                } else if ch == '\\' {
+                    escape = true;
+                    current.push(ch);
+                    idx += 1;
+                } else if ch == '&' && chars.get(idx + 1) == Some(&'&') {
+                    let part = current.trim();
+                    if part.is_empty() {
+                        anyhow::bail!("{} contains an empty command before &&", label);
+                    }
+                    out.push(validate_app_command(part, label)?);
+                    current.clear();
+                    idx += 2;
+                } else {
+                    current.push(ch);
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    if escape {
+        anyhow::bail!("{} has a trailing escape character", label);
+    }
+    if quote.is_some() {
+        anyhow::bail!("{} has an unclosed quote", label);
+    }
+
+    let part = current.trim();
+    if part.is_empty() {
+        if out.is_empty() {
+            anyhow::bail!("{} cannot be empty", label);
+        }
+        anyhow::bail!("{} contains an empty command after &&", label);
+    }
+    out.push(validate_app_command(part, label)?);
+    Ok(out)
+}
+
 fn shell_quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
@@ -3689,6 +4870,7 @@ pub fn app_meta_lifecycle_command(meta: &serde_json::Value, key: &str) -> Option
             (&["entry_command", "start_command"], &["start", "entry"])
         }
         "install_command" => (&["install_command"], &["install", "setup"]),
+        "build_command" => (&["build_command"], &["build"]),
         "stop_command" => (&["stop_command"], &["stop"]),
         _ => (&[], &[]),
     };
@@ -4178,6 +5360,155 @@ fn with_node_bin_path(app_dir: &Path) -> Option<String> {
         .and_then(|os| os.into_string().ok())
 }
 
+fn app_runtime_isolation_path(app_dir: &Path, parts: &[&str]) -> PathBuf {
+    let mut out = app_dir.to_path_buf();
+    for part in parts {
+        out.push(part);
+    }
+    out
+}
+
+fn set_app_runtime_isolation_path(
+    env: &mut HashMap<String, String>,
+    key: &str,
+    app_dir: &Path,
+    parts: &[&str],
+) {
+    env.insert(
+        key.to_string(),
+        app_runtime_isolation_path(app_dir, parts)
+            .to_string_lossy()
+            .to_string(),
+    );
+}
+
+fn install_app_runtime_isolation_env(
+    app_dir: &Path,
+    env: &mut HashMap<String, String>,
+) -> Result<()> {
+    let dirs: &[&[&str]] = &[
+        &[".agentark", "home"],
+        &[".agentark", "cache"],
+        &[".agentark", "cache", "pip"],
+        &[".agentark", "cache", "uv"],
+        &[".agentark", "cache", "npm"],
+        &[".agentark", "cache", "yarn"],
+        &[".agentark", "cache", "pnpm-store"],
+        &[".agentark", "cache", "bun"],
+        &[".agentark", "cargo-home"],
+        &[".agentark", "cargo-target"],
+        &[".agentark", "go"],
+        &[".agentark", "go", "pkg", "mod"],
+        &[".agentark", "go", "build"],
+        &[".agentark", "deno"],
+        &[".agentark", "gradle"],
+        &[".agentark", "dotnet"],
+        &[".agentark", "nuget"],
+        &[".agentark", "gems"],
+        &[".agentark", "bundle"],
+        &[".agentark", "composer-cache"],
+    ];
+    for parts in dirs {
+        std::fs::create_dir_all(app_runtime_isolation_path(app_dir, parts))
+            .with_context(|| format!("create app runtime isolation dir {:?}", parts))?;
+    }
+
+    set_app_runtime_isolation_path(env, "HOME", app_dir, &[".agentark", "home"]);
+    if cfg!(windows) {
+        set_app_runtime_isolation_path(env, "USERPROFILE", app_dir, &[".agentark", "home"]);
+    }
+    set_app_runtime_isolation_path(env, "XDG_CACHE_HOME", app_dir, &[".agentark", "cache"]);
+    set_app_runtime_isolation_path(
+        env,
+        "PIP_CACHE_DIR",
+        app_dir,
+        &[".agentark", "cache", "pip"],
+    );
+    set_app_runtime_isolation_path(env, "UV_CACHE_DIR", app_dir, &[".agentark", "cache", "uv"]);
+    set_app_runtime_isolation_path(
+        env,
+        "NPM_CONFIG_CACHE",
+        app_dir,
+        &[".agentark", "cache", "npm"],
+    );
+    set_app_runtime_isolation_path(
+        env,
+        "YARN_CACHE_FOLDER",
+        app_dir,
+        &[".agentark", "cache", "yarn"],
+    );
+    set_app_runtime_isolation_path(
+        env,
+        "PNPM_STORE_DIR",
+        app_dir,
+        &[".agentark", "cache", "pnpm-store"],
+    );
+    set_app_runtime_isolation_path(
+        env,
+        "BUN_INSTALL_CACHE_DIR",
+        app_dir,
+        &[".agentark", "cache", "bun"],
+    );
+    set_app_runtime_isolation_path(env, "CARGO_HOME", app_dir, &[".agentark", "cargo-home"]);
+    set_app_runtime_isolation_path(
+        env,
+        "CARGO_TARGET_DIR",
+        app_dir,
+        &[".agentark", "cargo-target"],
+    );
+    set_app_runtime_isolation_path(env, "GOPATH", app_dir, &[".agentark", "go"]);
+    set_app_runtime_isolation_path(
+        env,
+        "GOMODCACHE",
+        app_dir,
+        &[".agentark", "go", "pkg", "mod"],
+    );
+    set_app_runtime_isolation_path(env, "GOCACHE", app_dir, &[".agentark", "go", "build"]);
+    set_app_runtime_isolation_path(env, "DENO_DIR", app_dir, &[".agentark", "deno"]);
+    set_app_runtime_isolation_path(env, "GRADLE_USER_HOME", app_dir, &[".agentark", "gradle"]);
+    set_app_runtime_isolation_path(env, "DOTNET_CLI_HOME", app_dir, &[".agentark", "dotnet"]);
+    set_app_runtime_isolation_path(env, "NUGET_PACKAGES", app_dir, &[".agentark", "nuget"]);
+    set_app_runtime_isolation_path(env, "GEM_HOME", app_dir, &[".agentark", "gems"]);
+    set_app_runtime_isolation_path(env, "GEM_PATH", app_dir, &[".agentark", "gems"]);
+    set_app_runtime_isolation_path(env, "BUNDLE_PATH", app_dir, &[".agentark", "bundle"]);
+    set_app_runtime_isolation_path(env, "BUNDLE_USER_HOME", app_dir, &[".agentark", "bundle"]);
+    set_app_runtime_isolation_path(
+        env,
+        "COMPOSER_CACHE_DIR",
+        app_dir,
+        &[".agentark", "composer-cache"],
+    );
+    Ok(())
+}
+
+fn container_runtime_isolation_setup_parts() -> Vec<String> {
+    vec![
+        "mkdir -p .agentark/home .agentark/cache/pip .agentark/cache/uv .agentark/cache/npm .agentark/cache/yarn .agentark/cache/pnpm-store .agentark/cache/bun .agentark/cargo-home .agentark/cargo-target .agentark/go/pkg/mod .agentark/go/build .agentark/deno .agentark/gradle .agentark/dotnet .agentark/nuget .agentark/gems .agentark/bundle .agentark/composer-cache".to_string(),
+        "export HOME=\"$PWD/.agentark/home\"".to_string(),
+        "export XDG_CACHE_HOME=\"$PWD/.agentark/cache\"".to_string(),
+        "export PIP_CACHE_DIR=\"$PWD/.agentark/cache/pip\"".to_string(),
+        "export UV_CACHE_DIR=\"$PWD/.agentark/cache/uv\"".to_string(),
+        "export NPM_CONFIG_CACHE=\"$PWD/.agentark/cache/npm\"".to_string(),
+        "export YARN_CACHE_FOLDER=\"$PWD/.agentark/cache/yarn\"".to_string(),
+        "export PNPM_STORE_DIR=\"$PWD/.agentark/cache/pnpm-store\"".to_string(),
+        "export BUN_INSTALL_CACHE_DIR=\"$PWD/.agentark/cache/bun\"".to_string(),
+        "export CARGO_HOME=\"$PWD/.agentark/cargo-home\"".to_string(),
+        "export CARGO_TARGET_DIR=\"$PWD/.agentark/cargo-target\"".to_string(),
+        "export GOPATH=\"$PWD/.agentark/go\"".to_string(),
+        "export GOMODCACHE=\"$PWD/.agentark/go/pkg/mod\"".to_string(),
+        "export GOCACHE=\"$PWD/.agentark/go/build\"".to_string(),
+        "export DENO_DIR=\"$PWD/.agentark/deno\"".to_string(),
+        "export GRADLE_USER_HOME=\"$PWD/.agentark/gradle\"".to_string(),
+        "export DOTNET_CLI_HOME=\"$PWD/.agentark/dotnet\"".to_string(),
+        "export NUGET_PACKAGES=\"$PWD/.agentark/nuget\"".to_string(),
+        "export GEM_HOME=\"$PWD/.agentark/gems\"".to_string(),
+        "export GEM_PATH=\"$PWD/.agentark/gems\"".to_string(),
+        "export BUNDLE_PATH=\"$PWD/.agentark/bundle\"".to_string(),
+        "export BUNDLE_USER_HOME=\"$PWD/.agentark/bundle\"".to_string(),
+        "export COMPOSER_CACHE_DIR=\"$PWD/.agentark/composer-cache\"".to_string(),
+    ]
+}
+
 fn node_modules_populated(app_dir: &Path) -> bool {
     let modules = app_dir.join("node_modules");
     modules.is_dir()
@@ -4215,6 +5546,8 @@ fn detect_node_install_command(app_dir: &Path) -> Option<&'static str> {
         Some("pnpm install")
     } else if app_dir.join("yarn.lock").is_file() {
         Some("yarn install")
+    } else if app_dir.join("bun.lockb").is_file() || app_dir.join("bun.lock").is_file() {
+        Some("bun install")
     } else {
         Some("npm install")
     }
@@ -4300,7 +5633,7 @@ fn program_resolvable_on_path(program: &str, path_value: Option<&str>) -> bool {
 /// `(canonical_name, accepted_aliases)` so a missing `python3` can also be
 /// satisfied by `python` / `py`.
 fn required_runtimes_for_command(args: &[String]) -> Vec<(&'static str, Vec<&'static str>)> {
-    let Some(program) = args.first().map(|s| s.to_ascii_lowercase()) else {
+    let Some(program) = args.first().map(|s| command_program_name(s)) else {
         return Vec::new();
     };
     let py_aliases: Vec<&'static str> = if cfg!(windows) {
@@ -4320,6 +5653,13 @@ fn required_runtimes_for_command(args: &[String]) -> Vec<(&'static str, Vec<&'st
         "go" => vec![("go", vec!["go"])],
         "ruby" | "bundle" | "bundler" | "rails" => vec![("ruby", vec!["ruby"])],
         "java" => vec![("java", vec!["java"])],
+        "mvn" => vec![("maven", vec!["mvn"]), ("java", vec!["java"])],
+        "mvnw" => vec![("java", vec!["java"])],
+        "gradle" => vec![("gradle", vec!["gradle"]), ("java", vec!["java"])],
+        "gradlew" => vec![("java", vec!["java"])],
+        "dotnet" => vec![("dotnet", vec!["dotnet"])],
+        "php" => vec![("php", vec!["php"])],
+        "composer" => vec![("composer", vec!["composer"]), ("php", vec!["php"])],
         _ => Vec::new(),
     }
 }
@@ -4338,6 +5678,11 @@ fn runtime_install_hint(canonical: &str) -> &'static str {
         "go" => "install Go 1.21+ (https://go.dev/dl)",
         "ruby" => "install Ruby 3+ (e.g. `apt-get install -y ruby` or via rbenv)",
         "java" => "install a JDK 17+ (e.g. `apt-get install -y default-jdk`)",
+        "maven" => "install Maven for Java project startup",
+        "gradle" => "install Gradle, or include a runnable Gradle wrapper in the app bundle",
+        "dotnet" => "install the .NET SDK (https://dotnet.microsoft.com/download)",
+        "php" => "install PHP CLI (and Composer when composer.json is present)",
+        "composer" => "install Composer for PHP dependency installation",
         "pnpm" => "enable pnpm via corepack (`corepack enable pnpm`) or `npm i -g pnpm`",
         "yarn" => "enable yarn via corepack (`corepack enable`) or `npm i -g yarn`",
         _ => "install the missing runtime on this host",
@@ -4613,6 +5958,49 @@ async fn read_app_lifecycle_command(app_dir: &Path, key: &str) -> Option<String>
     app_meta_lifecycle_command(&meta, key)
 }
 
+fn output_log_tail(stdout: &[u8], stderr: &[u8], max_chars: usize) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        stdout.trim().to_string()
+    };
+    if detail.chars().count() <= max_chars {
+        detail
+    } else {
+        let mut tail = detail.chars().rev().take(max_chars).collect::<Vec<_>>();
+        tail.reverse();
+        tail.into_iter().collect()
+    }
+}
+
+fn app_lifecycle_failure_error(
+    phase: &str,
+    command: Option<&str>,
+    cwd: &Path,
+    exit_code: Option<i32>,
+    log_tail: impl Into<String>,
+    retryable: bool,
+    hint: &str,
+) -> anyhow::Error {
+    let payload = serde_json::json!({
+        "phase": phase,
+        "command": command,
+        "cwd": cwd.display().to_string(),
+        "exit_code": exit_code,
+        "log_tail": log_tail.into(),
+        "retryable": retryable,
+        "hint": hint,
+    });
+    crate::actions::ActionError::new(
+        crate::actions::ActionErrorDomain::App,
+        crate::actions::ActionErrorReason::Failed,
+        payload.to_string(),
+    )
+    .into_anyhow()
+}
+
 fn build_local_lifecycle_env(app_dir: &Path) -> HashMap<String, String> {
     let mut env = HashMap::new();
     if let Some(path) = with_node_bin_path(app_dir) {
@@ -4650,6 +6038,7 @@ fn build_local_lifecycle_env(app_dir: &Path) -> HashMap<String, String> {
 
 async fn run_container_lifecycle_command(
     container_id: &str,
+    app_dir: &Path,
     command: &str,
     label: &str,
 ) -> Result<()> {
@@ -4658,7 +6047,7 @@ async fn run_container_lifecycle_command(
     let mut docker_args = vec![
         "exec".to_string(),
         "-w".to_string(),
-        "/workspace".to_string(),
+        normalize_mount_path(app_dir),
         container_id.to_string(),
     ];
     docker_args.extend(args);
@@ -4685,7 +6074,7 @@ async fn run_app_stop_command(
     let localized = localize_app_entry_command(command, app_dir);
     let result = if let Some(container_id) = container_id {
         if is_container_running(container_id).await {
-            run_container_lifecycle_command(container_id, &localized, "stop_command").await
+            run_container_lifecycle_command(container_id, app_dir, &localized, "stop_command").await
         } else {
             Ok(())
         }
@@ -4718,6 +6107,7 @@ pub async fn launch_dynamic_container(
     app_dir: &Path,
     entry_command: &str,
     install_command: Option<&str>,
+    build_command: Option<&str>,
     port: u16,
     extra_env: &HashMap<String, String>,
     runtime_image: Option<&str>,
@@ -4731,37 +6121,43 @@ pub async fn launch_dynamic_container(
 
     let mut entry_cmd = validate_app_command(entry_command, "entry_command")?;
     entry_cmd = apply_app_mount_base_to_vite_entry_command(&entry_cmd, app_dir, app_id)?;
-    let mut install_cmd = if let Some(cmd) = install_command {
-        Some(validate_app_command(cmd, "install_command")?)
+    let mut install_cmds = if let Some(cmd) = install_command {
+        split_direct_command_sequence(cmd, "install_command")?
     } else {
-        None
+        Vec::new()
     };
-    if install_cmd
-        .as_deref()
-        .is_some_and(|cmd| should_skip_redundant_install_command(app_dir, cmd))
-    {
-        install_cmd = None;
-    }
+    let build_cmds = if let Some(cmd) = build_command {
+        split_direct_command_sequence(cmd, "build_command")?
+            .into_iter()
+            .map(|cmd| apply_app_mount_base_to_vite_command(&cmd, app_dir, app_id, "build_command"))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    install_cmds.retain(|cmd| !should_skip_redundant_install_command(app_dir, cmd));
     let uses_python_runtime = command_looks_python_related(&entry_cmd)
-        || install_cmd
-            .as_deref()
-            .map(command_looks_python_related)
-            .unwrap_or(false);
+        || install_cmds
+            .iter()
+            .any(|cmd| command_looks_python_related(cmd))
+        || build_cmds
+            .iter()
+            .any(|cmd| command_looks_python_related(cmd));
     if uses_python_runtime {
         entry_cmd = normalize_python_runtime_command_for_container(&entry_cmd);
     }
 
     let mut setup_parts: Vec<String> = Vec::new();
     setup_parts.push("set -e".to_string());
-    setup_parts.push("export PATH=\"/workspace/node_modules/.bin:$PATH\"".to_string());
+    setup_parts.extend(container_runtime_isolation_setup_parts());
+    setup_parts.push("export PATH=\"$PWD/node_modules/.bin:$PATH\"".to_string());
     setup_parts
-        .push("export PYTHONPATH=\"/workspace/_deps${PYTHONPATH:+:$PYTHONPATH}\"".to_string());
+        .push("export PYTHONPATH=\"$PWD/_deps${PYTHONPATH:+:$PYTHONPATH}\"".to_string());
     if uses_python_runtime {
         setup_parts.push(
-            "if [ ! -x /workspace/.venv/bin/python ]; then python3 -m venv /workspace/.venv || python -m venv /workspace/.venv || true; fi".to_string(),
+            "if [ ! -x .venv/bin/python ]; then python3 -m venv .venv || python -m venv .venv || true; fi".to_string(),
         );
         setup_parts.push(
-            "if [ -x /workspace/.venv/bin/python ]; then . /workspace/.venv/bin/activate; fi"
+            "if [ -x .venv/bin/python ]; then . .venv/bin/activate; fi"
                 .to_string(),
         );
         setup_parts.push("export PIP_DISABLE_PIP_VERSION_CHECK=1".to_string());
@@ -4770,8 +6166,9 @@ pub async fn launch_dynamic_container(
     let image = resolve_runtime_image(runtime_image).await;
     let network_container_ref = discover_current_container_ref().await;
     let env_file_path = write_runtime_env_file(app_dir, extra_env).await?;
+    let mount_plan = dynamic_container_mount_plan(app_dir)?;
 
-    if let Some(ref cmd) = install_cmd {
+    for cmd in &install_cmds {
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
             let normalized = if uses_python_runtime {
@@ -4792,6 +6189,7 @@ pub async fn launch_dynamic_container(
             let install_args = build_dynamic_container_install_args(
                 app_id,
                 app_dir,
+                &mount_plan,
                 port,
                 &image,
                 install_container_name,
@@ -4804,19 +6202,95 @@ pub async fn launch_dynamic_container(
                 Ok(output) if output.status.success() => {}
                 Ok(output) => {
                     let _ = env_file_path.as_ref().map(std::fs::remove_file);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let detail = if !stderr.trim().is_empty() {
-                        stderr.trim().to_string()
-                    } else {
-                        stdout.trim().to_string()
-                    };
-                    anyhow::bail!("install_command failed for app {}: {}", app_id, detail);
+                    return Err(app_lifecycle_failure_error(
+                        "install",
+                        Some(trimmed),
+                        app_dir,
+                        output.status.code(),
+                        output_log_tail(
+                            &output.stdout,
+                            &output.stderr,
+                            LOCAL_RUNTIME_LOG_TAIL_BYTES,
+                        ),
+                        false,
+                        "Inspect the install log, then patch dependency manifests or install_command.",
+                    ));
                 }
                 Err(error) => {
                     let _ = env_file_path.as_ref().map(std::fs::remove_file);
-                    return Err(error)
-                        .with_context(|| format!("install_command failed for app {}", app_id));
+                    return Err(app_lifecycle_failure_error(
+                        "install",
+                        Some(trimmed),
+                        app_dir,
+                        None,
+                        error.to_string(),
+                        true,
+                        "The container install command could not be executed; inspect runtime availability and retry after fixing the environment or command.",
+                    ));
+                }
+            }
+        }
+    }
+
+    for cmd in &build_cmds {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            let normalized = if uses_python_runtime {
+                normalize_python_runtime_command_for_container(trimmed)
+            } else {
+                trimmed.to_string()
+            };
+            let mut build_parts = setup_parts.clone();
+            build_parts.push(normalized);
+            let build_script = build_parts
+                .join(" && ")
+                .replace("{PORT}", &port.to_string());
+            let build_container_name = format!(
+                "{}-build-{}",
+                app_container_name(app_id),
+                &uuid::Uuid::new_v4().to_string()[..8]
+            );
+            let build_args = build_dynamic_container_install_args(
+                app_id,
+                app_dir,
+                &mount_plan,
+                port,
+                &image,
+                build_container_name,
+                env_file_path.as_deref(),
+                build_script,
+            );
+            let build_output =
+                run_docker(&build_args, None, dynamic_runtime_install_timeout_secs()).await;
+            match build_output {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    let _ = env_file_path.as_ref().map(std::fs::remove_file);
+                    return Err(app_lifecycle_failure_error(
+                        "build",
+                        Some(trimmed),
+                        app_dir,
+                        output.status.code(),
+                        output_log_tail(
+                            &output.stdout,
+                            &output.stderr,
+                            LOCAL_RUNTIME_LOG_TAIL_BYTES,
+                        ),
+                        false,
+                        "Inspect the build log, then patch source, scripts, dependencies, or build_command.",
+                    ));
+                }
+                Err(error) => {
+                    let _ = env_file_path.as_ref().map(std::fs::remove_file);
+                    return Err(app_lifecycle_failure_error(
+                        "build",
+                        Some(trimmed),
+                        app_dir,
+                        None,
+                        error.to_string(),
+                        true,
+                        "The container build command could not be executed; inspect runtime availability and retry after fixing the environment or command.",
+                    ));
                 }
             }
         }
@@ -4830,6 +6304,7 @@ pub async fn launch_dynamic_container(
     let args = build_dynamic_container_run_args(
         app_id,
         app_dir,
+        &mount_plan,
         port,
         &image,
         container_name,
@@ -4844,8 +6319,15 @@ pub async fn launch_dynamic_container(
     }
     let output = output?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("docker run failed: {}", stderr.trim());
+        return Err(app_lifecycle_failure_error(
+            "start",
+            Some(entry_cmd.trim()),
+            app_dir,
+            output.status.code(),
+            output_log_tail(&output.stdout, &output.stderr, LOCAL_RUNTIME_LOG_TAIL_BYTES),
+            false,
+            "Inspect the runtime launch log, then patch the start command, port binding, or runtime configuration.",
+        ));
     }
     let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if container_id.is_empty() {
@@ -4859,6 +6341,7 @@ pub async fn launch_dynamic_process(
     app_dir: &Path,
     entry_command: &str,
     install_command: Option<&str>,
+    build_command: Option<&str>,
     port: u16,
     extra_env: &HashMap<String, String>,
     stream_tx: Option<Sender<StreamEvent>>,
@@ -4873,25 +6356,26 @@ pub async fn launch_dynamic_process(
         "entry_command",
     )?;
 
-    let mut install_command = if let Some(cmd) = install_command {
-        Some(validate_app_command(
-            &cmd.replace("{PORT}", &port.to_string()),
-            "install_command",
-        )?)
+    let mut install_commands = if let Some(cmd) = install_command {
+        split_direct_command_sequence(&cmd.replace("{PORT}", &port.to_string()), "install_command")?
     } else {
-        None
+        Vec::new()
     };
-    if install_command
-        .as_deref()
-        .is_some_and(|cmd| should_skip_redundant_install_command(app_dir, cmd))
-    {
-        install_command = None;
-    }
+    let build_commands = if let Some(cmd) = build_command {
+        split_direct_command_sequence(&cmd.replace("{PORT}", &port.to_string()), "build_command")?
+            .into_iter()
+            .map(|cmd| apply_app_mount_base_to_vite_command(&cmd, app_dir, app_id, "build_command"))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    install_commands.retain(|cmd| !should_skip_redundant_install_command(app_dir, cmd));
 
     let mut runtime_env: HashMap<String, String> = HashMap::new();
     runtime_env.insert("PORT".to_string(), port.to_string());
     runtime_env.insert("HOST".to_string(), "0.0.0.0".to_string());
     runtime_env.extend(extra_env.clone());
+    install_app_runtime_isolation_env(app_dir, &mut runtime_env)?;
 
     // Legacy: support old --target _deps installs for backward compat.
     let deps_dir = app_dir.join("_deps");
@@ -4919,10 +6403,12 @@ pub async fn launch_dynamic_process(
     // OR when the app declares Python deps even if the entry is something
     // opaque like `make serve`. Pure Node/Bun/Go apps skip this entirely.
     let uses_python_runtime = command_looks_python_related(&entry_command)
-        || install_command
-            .as_deref()
-            .map(command_looks_python_related)
-            .unwrap_or(false)
+        || install_commands
+            .iter()
+            .any(|cmd| command_looks_python_related(cmd))
+        || build_commands
+            .iter()
+            .any(|cmd| command_looks_python_related(cmd))
         || app_declares_python_deps(app_dir);
     if uses_python_runtime {
         match ensure_local_python_venv(app_dir).await {
@@ -4949,7 +6435,7 @@ pub async fn launch_dynamic_process(
         runtime_env.insert("PIP_BREAK_SYSTEM_PACKAGES".to_string(), "1".to_string());
     }
 
-    if let Some(ref cmd) = install_command {
+    for cmd in &install_commands {
         let install_args = split_command_args(cmd, "install_command")?;
         ensure_required_runtimes_available(
             app_id,
@@ -4968,14 +6454,15 @@ pub async fn launch_dynamic_process(
         )
         .await?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                stdout.trim().to_string()
-            };
-            anyhow::bail!("install_command failed for app {}: {}", app_id, detail);
+            return Err(app_lifecycle_failure_error(
+                "install",
+                Some(cmd),
+                app_dir,
+                output.status.code(),
+                output_log_tail(&output.stdout, &output.stderr, LOCAL_RUNTIME_LOG_TAIL_BYTES),
+                false,
+                "Inspect the install log, then patch dependency manifests or install_command.",
+            ));
         }
     }
 
@@ -5007,22 +6494,52 @@ pub async fn launch_dynamic_process(
         )
         .await?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                stdout.trim().to_string()
-            };
-            anyhow::bail!(
-                "auto `{}` failed for app {}: {}",
-                node_install,
-                app_id,
-                detail
-            );
+            return Err(app_lifecycle_failure_error(
+                "install",
+                Some(node_install),
+                app_dir,
+                output.status.code(),
+                output_log_tail(&output.stdout, &output.stderr, LOCAL_RUNTIME_LOG_TAIL_BYTES),
+                false,
+                "Inspect the package-manager install log, then patch package metadata or the selected package manager.",
+            ));
         }
         // Refresh PATH so the freshly populated `node_modules/.bin` is on it
         // for the entry-command spawn that follows.
+        if let Some(path) = with_node_bin_path(app_dir) {
+            runtime_env.insert("PATH".to_string(), path);
+        }
+    }
+
+    for cmd in &build_commands {
+        let build_args = split_command_args(cmd, "build_command")?;
+        ensure_required_runtimes_available(
+            app_id,
+            "build_command",
+            &build_args,
+            runtime_env.get("PATH").map(|v| v.as_str()),
+        )?;
+        let output = run_local_command_with_progress(
+            cmd,
+            "build_command",
+            app_dir,
+            &runtime_env,
+            dynamic_runtime_install_timeout_secs(),
+            &stream_tx,
+            "build",
+        )
+        .await?;
+        if !output.status.success() {
+            return Err(app_lifecycle_failure_error(
+                "build",
+                Some(cmd),
+                app_dir,
+                output.status.code(),
+                output_log_tail(&output.stdout, &output.stderr, LOCAL_RUNTIME_LOG_TAIL_BYTES),
+                false,
+                "Inspect the build log, then patch source, scripts, dependencies, or build_command.",
+            ));
+        }
         if let Some(path) = with_node_bin_path(app_dir) {
             runtime_env.insert("PATH".to_string(), path);
         }
@@ -5056,14 +6573,25 @@ pub async fn launch_dynamic_process(
     {
         let log_tail = read_local_runtime_log_tail(app_dir, LOCAL_RUNTIME_LOG_TAIL_BYTES).await;
         if log_tail.is_empty() {
-            anyhow::bail!("app {} exited immediately with status {}", app_id, status);
+            return Err(app_lifecycle_failure_error(
+                "start",
+                Some(&entry_command),
+                app_dir,
+                status.code(),
+                String::new(),
+                false,
+                "The app process exited before serving HTTP; inspect and patch the entry command or runtime code.",
+            ));
         }
-        anyhow::bail!(
-            "app {} exited immediately with status {}. Recent runtime logs:\n{}",
-            app_id,
-            status,
-            log_tail
-        );
+        return Err(app_lifecycle_failure_error(
+            "start",
+            Some(&entry_command),
+            app_dir,
+            status.code(),
+            log_tail,
+            false,
+            "The app process exited before serving HTTP; inspect runtime logs and patch the entry command or runtime code.",
+        ));
     }
 
     Ok(child)
@@ -5103,6 +6631,7 @@ pub struct DynamicRuntimeLaunch<'a> {
     pub app_dir: &'a Path,
     pub entry_command: &'a str,
     pub install_command: Option<&'a str>,
+    pub build_command: Option<&'a str>,
     pub port: u16,
     pub extra_env: &'a HashMap<String, String>,
     pub runtime_image: Option<&'a str>,
@@ -5118,6 +6647,7 @@ pub async fn launch_dynamic_runtime(
         app_dir,
         entry_command,
         install_command,
+        build_command,
         port,
         extra_env,
         runtime_image,
@@ -5150,6 +6680,7 @@ pub async fn launch_dynamic_runtime(
             app_dir,
             entry_command,
             install_command,
+            build_command,
             port,
             extra_env,
             stream_tx.clone(),
@@ -5168,6 +6699,7 @@ pub async fn launch_dynamic_runtime(
                     app_dir,
                     entry_command,
                     install_command,
+                    build_command,
                     port,
                     extra_env,
                     runtime_image,
@@ -5199,6 +6731,7 @@ pub async fn launch_dynamic_runtime(
         app_dir,
         entry_command,
         install_command,
+        build_command,
         port,
         extra_env,
         runtime_image,
@@ -5220,6 +6753,7 @@ pub async fn launch_dynamic_runtime(
                 app_dir,
                 entry_command,
                 install_command,
+                build_command,
                 port,
                 extra_env,
                 stream_tx.clone(),
@@ -5357,6 +6891,14 @@ async fn write_file_with_progress(
     content: &str,
     stream_tx: &Option<Sender<StreamEvent>>,
 ) -> Result<()> {
+    let write_started = std::time::Instant::now();
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        file = %filename,
+        path = %file_path.display(),
+        bytes = content.len(),
+        "app deploy file write start"
+    );
     if let Some(parent) = file_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -5378,6 +6920,14 @@ async fn write_file_with_progress(
         file.flush().await?;
         drop(file);
         replace_app_file(&temp_path, file_path).await?;
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            file = %filename,
+            path = %file_path.display(),
+            bytes = 0usize,
+            duration_ms = write_started.elapsed().as_millis() as u64,
+            "app deploy file write completed"
+        );
         return Ok(());
     }
 
@@ -5403,15 +6953,37 @@ async fn write_file_with_progress(
             .await;
         }
     }
+    let body_written_ms = write_started.elapsed().as_millis() as u64;
     file.flush().await?;
+    let flushed_ms = write_started.elapsed().as_millis() as u64;
     drop(file);
     replace_app_file(&temp_path, file_path).await?;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        file = %filename,
+        path = %file_path.display(),
+        bytes = content.len(),
+        total_lines,
+        body_written_ms,
+        flushed_ms,
+        duration_ms = write_started.elapsed().as_millis() as u64,
+        "app deploy file write completed"
+    );
     Ok(())
 }
 
 async fn replace_app_file(temp_path: &Path, file_path: &Path) -> Result<()> {
+    let replace_started = std::time::Instant::now();
     match tokio::fs::rename(temp_path, file_path).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            tracing::debug!(
+                target: "agentark.turn_timing",
+                path = %file_path.display(),
+                duration_ms = replace_started.elapsed().as_millis() as u64,
+                "app deploy file replace completed"
+            );
+            Ok(())
+        }
         Err(first_error) => {
             if tokio::fs::try_exists(file_path).await.unwrap_or(false) {
                 tokio::fs::remove_file(file_path)
@@ -5420,6 +6992,13 @@ async fn replace_app_file(temp_path: &Path, file_path: &Path) -> Result<()> {
                 tokio::fs::rename(temp_path, file_path)
                     .await
                     .with_context(|| format!("Failed to install {}", file_path.display()))?;
+                tracing::debug!(
+                    target: "agentark.turn_timing",
+                    path = %file_path.display(),
+                    duration_ms = replace_started.elapsed().as_millis() as u64,
+                    fallback = true,
+                    "app deploy file replace completed"
+                );
                 Ok(())
             } else {
                 let _ = tokio::fs::remove_file(temp_path).await;
@@ -5432,19 +7011,7 @@ async fn replace_app_file(temp_path: &Path, file_path: &Path) -> Result<()> {
 }
 
 fn app_source_workspace_root(data_dir: &Path) -> PathBuf {
-    let fallback = std::env::current_dir()
-        .ok()
-        .unwrap_or_else(|| data_dir.to_path_buf());
-    match std::env::var("AGENTARK_WORKSPACE_ROOT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-    {
-        Some(path) if path.is_absolute() => path,
-        Some(path) => fallback.join(path),
-        None => fallback,
-    }
+    data_dir.join("workspace")
 }
 
 fn remap_app_source_alias_path(data_dir: &Path, raw: &str) -> Option<PathBuf> {
@@ -5467,10 +7034,7 @@ fn remap_app_source_alias_path(data_dir: &Path, raw: &str) -> Option<PathBuf> {
 }
 
 fn canonical_allowed_app_source_roots(data_dir: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![data_dir.to_path_buf(), app_source_workspace_root(data_dir)];
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
+    let roots = vec![data_dir.to_path_buf(), app_source_workspace_root(data_dir)];
     let mut deduped = Vec::new();
     for root in roots {
         let candidate = root.canonicalize().unwrap_or(root);
@@ -5494,10 +7058,7 @@ fn resolve_staged_app_source_dir(data_dir: &Path, raw: &str) -> Result<PathBuf> 
         if path.is_absolute() {
             path
         } else {
-            std::env::current_dir()
-                .ok()
-                .unwrap_or_else(|| data_dir.to_path_buf())
-                .join(path)
+            app_source_workspace_root(data_dir).join(path)
         }
     });
     let resolved = candidate
@@ -5564,6 +7125,216 @@ fn normalize_staged_app_relative_path(raw: &str) -> Result<String> {
     normalize_app_bundle_relative_path(raw, "source_paths")
 }
 
+fn push_unique_path_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn staged_app_source_file_candidates(
+    data_dir: &Path,
+    root: &Path,
+    raw: &str,
+) -> Result<Vec<PathBuf>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("source_paths entries cannot be empty");
+    }
+
+    let relative_path = normalize_staged_app_relative_path(trimmed);
+    let raw_path = PathBuf::from(trimmed);
+    let alias_candidate = remap_app_source_alias_path(data_dir, trimmed);
+    let has_alias_candidate = alias_candidate.is_some();
+    let mut candidates = Vec::new();
+
+    if let Ok(relative_path) = relative_path.as_ref() {
+        push_unique_path_candidate(&mut candidates, root.join(relative_path));
+    }
+    if let Some(candidate) = alias_candidate {
+        push_unique_path_candidate(&mut candidates, candidate);
+    }
+    if raw_path.is_absolute() {
+        push_unique_path_candidate(&mut candidates, raw_path);
+    } else {
+        if relative_path.is_err() && !has_alias_candidate {
+            normalize_staged_app_relative_path(trimmed)?;
+        }
+        for allowed_root in canonical_allowed_app_source_roots(data_dir) {
+            push_unique_path_candidate(&mut candidates, allowed_root.join(&raw_path));
+        }
+        for ancestor in root.ancestors().skip(1) {
+            push_unique_path_candidate(&mut candidates, ancestor.join(&raw_path));
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn app_bundle_path_for_resolved_staged_source(
+    root: &Path,
+    resolved: &Path,
+    raw: &str,
+) -> Result<String> {
+    let relative = resolved
+        .strip_prefix(root)
+        .with_context(|| format!("source path '{}' escapes source_dir", raw.trim()))?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let text = part.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("source path '{}' is not valid UTF-8", raw.trim())
+                })?;
+                parts.push(text.to_string());
+            }
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!("source path '{}' escapes source_dir", raw.trim()),
+        }
+    }
+    normalize_app_bundle_relative_path(&parts.join("/"), "source_paths")
+}
+
+fn resolve_staged_app_source_file(
+    data_dir: &Path,
+    root: &Path,
+    raw: &str,
+) -> Result<(String, PathBuf)> {
+    let candidates = staged_app_source_file_candidates(data_dir, root, raw)?;
+    let mut saw_existing_outside_source_dir = false;
+
+    for candidate in candidates {
+        let Ok(resolved) = candidate.canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(root) {
+            saw_existing_outside_source_dir = true;
+            continue;
+        }
+        let relative_path = app_bundle_path_for_resolved_staged_source(root, &resolved, raw)?;
+        if !resolved.is_file() {
+            anyhow::bail!("source path '{}' is not a file", relative_path);
+        }
+        if staged_app_source_path_looks_sensitive(&resolved) {
+            anyhow::bail!(
+                "Refusing to deploy sensitive staged file '{}'",
+                relative_path
+            );
+        }
+        return Ok((relative_path, resolved));
+    }
+
+    if saw_existing_outside_source_dir {
+        anyhow::bail!("source path '{}' is outside source_dir", raw.trim());
+    }
+    anyhow::bail!(
+        "Staged app source file '{}' was not found under source_dir",
+        raw.trim()
+    );
+}
+
+fn should_descend_staged_app_source_dir(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() == 0 || should_skip_repo_dir(entry)
+}
+
+fn discover_staged_app_source_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
+    let mut total_bytes = 0usize;
+    let max_file_bytes = env_limit_usize(
+        "AGENTARK_STAGED_APP_SOURCE_FILE_BYTES",
+        DEFAULT_STAGED_APP_SOURCE_FILE_BYTES,
+        1024,
+    );
+    let max_total_bytes = env_limit_usize(
+        "AGENTARK_STAGED_APP_SOURCE_TOTAL_BYTES",
+        DEFAULT_STAGED_APP_SOURCE_TOTAL_BYTES,
+        max_file_bytes,
+    );
+    let max_files = env_limit_usize(
+        "AGENTARK_STAGED_APP_SOURCE_FILES",
+        DEFAULT_STAGED_APP_SOURCE_FILES,
+        1,
+    );
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(should_descend_staged_app_source_dir);
+
+    for entry in walker {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to inspect staged app source under '{}'",
+                root.display()
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let resolved = entry.path().canonicalize().with_context(|| {
+            format!(
+                "Failed to resolve staged app source file '{}'",
+                entry.path().display()
+            )
+        })?;
+        if !resolved.starts_with(root) {
+            anyhow::bail!(
+                "Staged app source file '{}' resolved outside source_dir",
+                entry.path().display()
+            );
+        }
+
+        let relative_path = app_bundle_path_for_resolved_staged_source(
+            root,
+            &resolved,
+            &entry.path().display().to_string(),
+        )?;
+        if staged_app_source_path_looks_sensitive(&resolved)
+            || is_app_internal_bundle_path(&relative_path)
+        {
+            continue;
+        }
+
+        let metadata = entry.metadata().with_context(|| {
+            format!(
+                "Failed to inspect staged app source file '{}'",
+                relative_path
+            )
+        })?;
+        let file_bytes = metadata.len() as usize;
+        if file_bytes > max_file_bytes {
+            anyhow::bail!(
+                "Staged app source file '{}' is too large to deploy through source_dir ({} bytes > {} bytes)",
+                relative_path,
+                file_bytes,
+                max_file_bytes
+            );
+        }
+        total_bytes = total_bytes.saturating_add(file_bytes);
+        if total_bytes > max_total_bytes {
+            anyhow::bail!(
+                "Staged app source_dir contains too much text content to deploy ({} bytes > {} bytes)",
+                total_bytes,
+                max_total_bytes
+            );
+        }
+
+        out.push((relative_path, resolved));
+        if out.len() > max_files {
+            anyhow::bail!(
+                "Staged app source_dir contains too many deployable files ({} > {})",
+                out.len(),
+                max_files
+            );
+        }
+    }
+
+    out.sort_by(|left, right| left.0.cmp(&right.0));
+    if out.is_empty() {
+        anyhow::bail!("No deployable source files found under source_dir");
+    }
+    Ok(out)
+}
+
 fn is_app_internal_bundle_path(path: &str) -> bool {
     let normalized = path.trim().replace('\\', "/");
     let mut parts = normalized.split('/').filter(|part| !part.is_empty());
@@ -5622,9 +7393,11 @@ pub struct AppDeployFilePatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppDeployApplyPlan {
     pub mode: AppDeployMode,
+    pub mode_explicit: bool,
     pub file_writes: Vec<AppDeployFileWrite>,
     pub file_patches: Vec<AppDeployFilePatch>,
     pub delete_paths: Vec<String>,
+    pub staging_source_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5691,62 +7464,53 @@ fn parse_app_deploy_file_patches(arguments: &serde_json::Value) -> Result<Vec<Ap
     Ok(out)
 }
 
+#[derive(Debug)]
+struct StagedAppSourceFiles {
+    root: PathBuf,
+    files: serde_json::Map<String, serde_json::Value>,
+}
+
 async fn read_staged_app_source_files(
     data_dir: &Path,
     arguments: &serde_json::Value,
-) -> Result<serde_json::Map<String, serde_json::Value>> {
+) -> Result<StagedAppSourceFiles> {
     let source_dir = arguments
         .get("source_dir")
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing 'files': provide a files object or source_dir with source_paths"
-            )
+            anyhow::anyhow!("Missing 'files': provide a files object or a populated source_dir")
         })?;
-    let source_paths = arguments
-        .get("source_paths")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Missing 'files': source_dir deployments also require source_paths")
-        })?;
-    if source_paths.is_empty() {
-        anyhow::bail!("source_paths must contain at least one app-relative file path");
-    }
 
     let root = resolve_staged_app_source_dir(data_dir, source_dir)?;
-    let mut files = serde_json::Map::new();
-    for raw_path in source_paths {
-        let raw_path = raw_path
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("source_paths entries must be strings"))?;
-        let relative_path = normalize_staged_app_relative_path(raw_path)?;
-        let candidate = root.join(&relative_path);
-        let resolved = candidate.canonicalize().with_context(|| {
-            format!(
-                "Staged app source file '{}' was not found under source_dir",
-                relative_path
-            )
+    let resolved_files = if let Some(source_paths) = arguments.get("source_paths") {
+        let source_paths = source_paths.as_array().ok_or_else(|| {
+            anyhow::anyhow!("source_paths must be an array of app-relative file paths")
         })?;
-        if !resolved.starts_with(&root) {
-            anyhow::bail!("source path '{}' escapes source_dir", relative_path);
+        if source_paths.is_empty() {
+            anyhow::bail!("source_paths must contain at least one app-relative file path");
         }
-        if !resolved.is_file() {
-            anyhow::bail!("source path '{}' is not a file", relative_path);
+        let mut resolved_files = Vec::new();
+        for raw_path in source_paths {
+            let raw_path = raw_path
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("source_paths entries must be strings"))?;
+            resolved_files.push(resolve_staged_app_source_file(data_dir, &root, raw_path)?);
         }
-        if staged_app_source_path_looks_sensitive(&resolved) {
-            anyhow::bail!(
-                "Refusing to deploy sensitive staged file '{}'",
-                relative_path
-            );
-        }
+        resolved_files
+    } else {
+        discover_staged_app_source_files(&root)?
+    };
+
+    let mut files = serde_json::Map::new();
+    for (relative_path, resolved) in resolved_files {
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .with_context(|| format!("Failed to read staged app file '{}'", relative_path))?;
         files.insert(relative_path, serde_json::Value::String(content));
     }
-    Ok(files)
+    Ok(StagedAppSourceFiles { root, files })
 }
 
 async fn app_deploy_apply_plan_from_arguments(
@@ -5754,7 +7518,13 @@ async fn app_deploy_apply_plan_from_arguments(
     arguments: &serde_json::Value,
 ) -> Result<AppDeployApplyPlan> {
     let mode = AppDeployMode::from_arguments(arguments)?;
+    let mode_explicit = arguments
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
     let staged_files: serde_json::Map<String, serde_json::Value>;
+    let mut staging_source_dir = None;
     let files = if let Some(files) = arguments.get("files").and_then(|v| v.as_object()) {
         Some(files)
     } else if arguments
@@ -5763,7 +7533,9 @@ async fn app_deploy_apply_plan_from_arguments(
         .map(str::trim)
         .is_some_and(|value| !value.is_empty())
     {
-        staged_files = read_staged_app_source_files(data_dir, arguments).await?;
+        let staged = read_staged_app_source_files(data_dir, arguments).await?;
+        staging_source_dir = Some(staged.root);
+        staged_files = staged.files;
         Some(&staged_files)
     } else {
         None
@@ -5819,9 +7591,11 @@ async fn app_deploy_apply_plan_from_arguments(
 
     Ok(AppDeployApplyPlan {
         mode,
+        mode_explicit,
         file_writes,
         file_patches,
         delete_paths,
+        staging_source_dir,
     })
 }
 
@@ -6092,6 +7866,64 @@ async fn effective_app_files_for_validation(
     Ok(files)
 }
 
+fn validate_app_bundle_has_file_content(
+    effective_files: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let has_content = effective_files.values().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|content| !content.trim().is_empty())
+    });
+    if !has_content {
+        return Err(crate::actions::structured_action_error(
+            crate::actions::ActionErrorDomain::App,
+            crate::actions::ActionErrorReason::InvalidInput,
+            "No app file content provided; resolved app bundle files are empty. Provide populated files or deploy a populated source_dir.",
+        ));
+    }
+    Ok(())
+}
+
+fn consumed_staging_source_cleanup_target(
+    data_dir: &Path,
+    app_dir: &Path,
+    source_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let source_dir = source_dir?;
+    let source = source_dir
+        .canonicalize()
+        .unwrap_or_else(|_| source_dir.to_path_buf());
+    let staging_root = app_source_workspace_root(data_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| app_source_workspace_root(data_dir));
+    if source == staging_root || !source.starts_with(&staging_root) {
+        return None;
+    }
+
+    let app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.to_path_buf());
+    if source.starts_with(&app_dir) || app_dir.starts_with(&source) {
+        return None;
+    }
+    Some(source)
+}
+
+async fn cleanup_consumed_staging_source_dir(
+    data_dir: &Path,
+    app_dir: &Path,
+    source_dir: Option<&Path>,
+) {
+    let Some(target) = consumed_staging_source_cleanup_target(data_dir, app_dir, source_dir) else {
+        return;
+    };
+    if let Err(error) = tokio::fs::remove_dir_all(&target).await {
+        tracing::warn!(
+            path = %target.display(),
+            "failed to clean consumed app staging source: {}",
+            error
+        );
+    }
+}
+
 fn app_deploy_allows_duplicate(arguments: &serde_json::Value) -> bool {
     arguments
         .get("allow_duplicate")
@@ -6148,6 +7980,7 @@ fn app_deploy_content_fingerprint(
     title: &str,
     entry_command: Option<&str>,
     install_command: Option<&str>,
+    build_command: Option<&str>,
     stop_command: Option<&str>,
     runtime_required: bool,
     runtime_preference: RuntimePreference,
@@ -6157,13 +7990,15 @@ fn app_deploy_content_fingerprint(
     runtime_actions: &[String],
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"agentark-app-content-v1\n");
+    hasher.update(b"agentark-app-content-v2\n");
     hasher.update(b"title\0");
     hasher.update(title.trim().as_bytes());
     hasher.update(b"\nentry\0");
     hasher.update(entry_command.unwrap_or("").trim().as_bytes());
     hasher.update(b"\ninstall\0");
     hasher.update(install_command.unwrap_or("").trim().as_bytes());
+    hasher.update(b"\nbuild\0");
+    hasher.update(build_command.unwrap_or("").trim().as_bytes());
     hasher.update(b"\nstop\0");
     hasher.update(stop_command.unwrap_or("").trim().as_bytes());
     hasher.update(b"\nruntime_required\0");
@@ -6173,9 +8008,17 @@ fn app_deploy_content_fingerprint(
         b"false".as_slice()
     });
     hasher.update(b"\nruntime_preference\0");
-    hasher.update(runtime_preference.as_str().as_bytes());
+    hasher.update(if runtime_required {
+        runtime_preference.as_str().as_bytes()
+    } else {
+        b"".as_slice()
+    });
     hasher.update(b"\nruntime_image\0");
-    hasher.update(runtime_image.unwrap_or("").trim().as_bytes());
+    hasher.update(if runtime_required {
+        runtime_image.unwrap_or("").trim().as_bytes()
+    } else {
+        b"".as_slice()
+    });
 
     let required_inputs_json =
         serde_json::to_value(required_inputs).unwrap_or_else(|_| serde_json::json!([]));
@@ -6427,6 +8270,7 @@ async fn app_deploy_existing_fingerprint(
         .unwrap_or("App");
     let entry_command = app_meta_lifecycle_command(meta, "entry_command");
     let install_command = app_meta_lifecycle_command(meta, "install_command");
+    let build_command = app_meta_lifecycle_command(meta, "build_command");
     let stop_command = app_meta_lifecycle_command(meta, "stop_command");
     let runtime_required = meta
         .get("runtime_required")
@@ -6459,6 +8303,7 @@ async fn app_deploy_existing_fingerprint(
         title,
         entry_command.as_deref(),
         install_command.as_deref(),
+        build_command.as_deref(),
         stop_command.as_deref(),
         runtime_required,
         runtime_preference,
@@ -6636,6 +8481,16 @@ async fn app_deploy_apply(
     previous_meta: &Option<serde_json::Value>,
     stream_tx: &Option<Sender<StreamEvent>>,
 ) -> Result<AppDeployApplyOutcome> {
+    let apply_started = std::time::Instant::now();
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        path = %app_dir.display(),
+        file_writes = plan.file_writes.len(),
+        file_patches = plan.file_patches.len(),
+        delete_paths = plan.delete_paths.len(),
+        mode = ?plan.mode,
+        "app deploy apply start"
+    );
     tokio::fs::create_dir_all(app_dir).await?;
     let previous_managed = app_meta_managed_files(previous_meta);
     let declared_paths = plan
@@ -6699,15 +8554,34 @@ async fn app_deploy_apply(
     }
 
     for patch in &plan.file_patches {
+        let patch_started = std::time::Instant::now();
         let file_path = app_dir.join(&patch.path);
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            file = %patch.path,
+            path = %file_path.display(),
+            patch_bytes = patch.patch.len(),
+            "app deploy patch start"
+        );
         let current = tokio::fs::read_to_string(&file_path)
             .await
             .with_context(|| format!("Cannot patch '{}': file is not readable", patch.path))?;
+        let read_ms = patch_started.elapsed().as_millis() as u64;
         let patched = apply_unified_diff_to_text(&current, &patch.patch)
             .with_context(|| format!("Failed to apply patch for {}", patch.path))?;
+        let patched_ms = patch_started.elapsed().as_millis() as u64;
         write_file_with_progress(&file_path, &patch.path, &patched, stream_tx)
             .await
             .with_context(|| format!("Failed to write patched {}", patch.path))?;
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            file = %patch.path,
+            path = %file_path.display(),
+            read_ms,
+            patched_ms,
+            duration_ms = patch_started.elapsed().as_millis() as u64,
+            "app deploy patch completed"
+        );
         emit_phase_progress(
             stream_tx,
             AppDeployProgressPhase::GeneratingFiles,
@@ -6718,15 +8592,31 @@ async fn app_deploy_apply(
     }
 
     for write in &plan.file_writes {
+        let write_started = std::time::Instant::now();
         let file_path = app_dir.join(&write.path);
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let byte_len = write.content.len();
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            file = %write.path,
+            path = %file_path.display(),
+            bytes = byte_len,
+            "app deploy apply write entry start"
+        );
         write_file_with_progress(&file_path, &write.path, &write.content, stream_tx)
             .await
             .with_context(|| format!("Failed to write {}", write.path))?;
         written_names.push(write.path.clone());
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            file = %write.path,
+            path = %file_path.display(),
+            bytes = byte_len,
+            duration_ms = write_started.elapsed().as_millis() as u64,
+            "app deploy apply write entry completed"
+        );
         emit_phase_progress(
             stream_tx,
             AppDeployProgressPhase::GeneratingFiles,
@@ -6734,10 +8624,19 @@ async fn app_deploy_apply(
         )
         .await;
     }
-    Ok(AppDeployApplyOutcome {
+    let outcome = AppDeployApplyOutcome {
         written_names,
         deleted_names,
-    })
+    };
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        path = %app_dir.display(),
+        written_files = outcome.written_names.len(),
+        deleted_files = outcome.deleted_names.len(),
+        duration_ms = apply_started.elapsed().as_millis() as u64,
+        "app deploy apply completed"
+    );
+    Ok(outcome)
 }
 
 #[allow(dead_code)]
@@ -6819,8 +8718,22 @@ pub async fn app_deploy_preflight(
     if effective_files.is_empty() {
         anyhow::bail!("App bundle would be empty after applying this deploy");
     }
+    validate_app_bundle_has_file_content(&effective_files)?;
     let inferred_lifecycle = infer_generated_bundle_lifecycle(&effective_files);
     if !has_explicit_entry_command && inferred_lifecycle.is_none() {
+        if effective_bundle_has_runtime_manifest(&effective_files)
+            && !effective_bundle_has_html_entrypoint(&effective_files)
+        {
+            return Err(app_lifecycle_failure_error(
+                "plan",
+                None,
+                existing_app_dir.as_deref().unwrap_or(data_dir),
+                None,
+                "A runtime manifest was present, but AgentArk could not infer a runnable entry command and no static index.html entrypoint was present.",
+                false,
+                "Inspect the project files and provide an explicit entry_command, or add the missing static index.html entrypoint.",
+            ));
+        }
         validate_static_app_asset_references(&effective_files)?;
     }
     Ok(())
@@ -6945,6 +8858,139 @@ fn app_unix_now_ts() -> i64 {
 
 fn app_access_secret_name(app_id: &str) -> String {
     format!("app_access_key:{}", app_id)
+}
+
+fn app_secret_scope_is_valid(app_id: &str) -> bool {
+    !app_id.is_empty()
+        && app_id.len() <= 64
+        && app_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn app_env_secret_prefix(app_id: &str) -> Option<String> {
+    let app_id = app_id.trim();
+    if !app_secret_scope_is_valid(app_id) {
+        return None;
+    }
+    Some(format!("app_env:{}:", app_id))
+}
+
+pub fn app_env_secret_storage_key(app_id: &str, key: &str) -> Option<String> {
+    let key = key.trim();
+    if !is_valid_env_key(key) {
+        return None;
+    }
+    Some(format!("{}{}", app_env_secret_prefix(app_id)?, key))
+}
+
+fn app_env_key_from_storage_key(app_id: &str, storage_key: &str) -> Option<String> {
+    let prefix = app_env_secret_prefix(app_id)?;
+    let key = storage_key.strip_prefix(&prefix)?.trim();
+    if is_valid_env_key(key) {
+        Some(key.to_string())
+    } else {
+        None
+    }
+}
+
+pub fn list_app_scoped_env_keys(
+    config_dir: &Path,
+    data_dir: &Path,
+    app_id: &str,
+) -> Result<Vec<String>> {
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
+    let secrets = manager.load_secrets()?;
+    let mut keys = secrets
+        .custom
+        .keys()
+        .filter_map(|storage_key| app_env_key_from_storage_key(app_id, storage_key))
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+pub fn update_app_scoped_env_values(
+    config_dir: &Path,
+    data_dir: &Path,
+    app_id: &str,
+    values: &HashMap<String, String>,
+    delete_keys: &[String],
+    replace: bool,
+) -> Result<Vec<String>> {
+    let prefix = app_env_secret_prefix(app_id)
+        .ok_or_else(|| anyhow::anyhow!("Invalid app_id for app environment scope"))?;
+    let mut normalized_values = BTreeMap::new();
+    for (raw_key, raw_value) in values {
+        let key = raw_key.trim();
+        if !is_valid_env_key(key) {
+            anyhow::bail!(
+                "Invalid environment variable key '{}': use letters, digits, and '_' with a non-digit first character",
+                raw_key
+            );
+        }
+        let value = raw_value.trim_end_matches(['\r', '\n']).to_string();
+        if value.contains('\0') || value.contains('\n') || value.contains('\r') {
+            anyhow::bail!(
+                "Environment value for '{}' contains unsupported control characters",
+                key
+            );
+        }
+        normalized_values.insert(key.to_string(), value);
+    }
+    let mut normalized_delete = HashSet::new();
+    for raw_key in delete_keys {
+        let key = raw_key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if !is_valid_env_key(key) {
+            anyhow::bail!(
+                "Invalid environment variable key '{}': use letters, digits, and '_' with a non-digit first character",
+                raw_key
+            );
+        }
+        normalized_delete.insert(key.to_string());
+    }
+
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
+    manager.update_custom_secrets(|custom| {
+        if replace {
+            custom.retain(|storage_key, _| !storage_key.starts_with(&prefix));
+        }
+        for key in normalized_delete {
+            custom.remove(&format!("{}{}", prefix, key));
+        }
+        for (key, value) in &normalized_values {
+            if value.trim().is_empty() {
+                custom.remove(&format!("{}{}", prefix, key));
+            } else {
+                custom.insert(format!("{}{}", prefix, key), value.clone());
+            }
+        }
+        Ok(())
+    })?;
+    list_app_scoped_env_keys(config_dir, data_dir, app_id)
+}
+
+pub fn remove_app_scoped_env_secrets(
+    config_dir: &Path,
+    data_dir: &Path,
+    app_id: &str,
+) -> Result<usize> {
+    let Some(prefix) = app_env_secret_prefix(app_id) else {
+        return Ok(0);
+    };
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
+    manager.update_custom_secrets(|custom| {
+        let before = custom.len();
+        custom.retain(|storage_key, _| !storage_key.starts_with(&prefix));
+        Ok(before.saturating_sub(custom.len()))
+    })
 }
 
 fn relative_app_root_url(app_id: &str) -> String {
@@ -7139,6 +9185,7 @@ struct RestoreAppCandidate {
     app_dir: PathBuf,
     entry_command: Option<String>,
     install_command: Option<String>,
+    build_command: Option<String>,
     runtime_image: Option<String>,
     runtime_preference: RuntimePreference,
     required_inputs: Vec<AppRequiredInput>,
@@ -7541,6 +9588,9 @@ impl AppRegistry {
             let install_command = read_app_lifecycle_command(&app_dir, "install_command")
                 .await
                 .unwrap_or_default();
+            let build_command = read_app_lifecycle_command(&app_dir, "build_command")
+                .await
+                .unwrap_or_default();
             let stop_command = read_app_lifecycle_command(&app_dir, "stop_command")
                 .await
                 .unwrap_or_default();
@@ -7580,6 +9630,7 @@ impl AppRegistry {
                 "entry_command": start_command.clone(),
                 "start_command": start_command,
                 "install_command": install_command,
+                "build_command": build_command,
                 "stop_command": stop_command,
                 "has_start_command": has_start_command,
                 "has_stop_command": has_stop_command,
@@ -8214,6 +10265,7 @@ impl AppRegistry {
             app_dir,
             entry_command,
             install_command,
+            build_command,
             runtime_image,
             runtime_preference,
             required_inputs,
@@ -8231,6 +10283,7 @@ impl AppRegistry {
         let (resolved_env, missing_sensitive, missing_config) = match resolve_required_env_values(
             config_dir,
             data_dir,
+            Some(&id),
             &required_inputs,
             llm_env,
             &config_values,
@@ -8289,6 +10342,7 @@ impl AppRegistry {
             app_dir: &app_dir,
             entry_command: &entry_cmd,
             install_command: install_command.as_deref(),
+            build_command: build_command.as_deref(),
             port,
             extra_env: &resolved_env,
             runtime_image: runtime_image.as_deref(),
@@ -8319,7 +10373,12 @@ impl AppRegistry {
                 )
                 .await;
                 let no_stream = None;
-                if let Err(e) = wait_for_dynamic_runtime_ready(self, &id, port, &no_stream).await {
+                let proxy_path_mode =
+                    proxy_path_mode_for_entry_command(Some(&entry_cmd), &app_dir, &id);
+                if let Err(e) =
+                    wait_for_dynamic_runtime_ready(self, &id, port, proxy_path_mode, &no_stream)
+                        .await
+                {
                     let detail = format!("Runtime did not become ready: {}", e);
                     tracing::warn!("{} (app={})", detail, id);
                     let _ = self.stop_runtime(&id).await;
@@ -8484,6 +10543,9 @@ impl AppRegistry {
                 let install_command = meta
                     .as_ref()
                     .and_then(|m| app_meta_lifecycle_command(m, "install_command"));
+                let build_command = meta
+                    .as_ref()
+                    .and_then(|m| app_meta_lifecycle_command(m, "build_command"));
                 let runtime_image = meta
                     .as_ref()
                     .and_then(|m| m.get("runtime_image").and_then(|c| c.as_str()))
@@ -8538,6 +10600,7 @@ impl AppRegistry {
                     app_dir: path,
                     entry_command,
                     install_command,
+                    build_command,
                     runtime_image,
                     runtime_preference,
                     required_inputs,
@@ -8729,9 +10792,159 @@ pub async fn runtime_port_accepts_connections(port: u16) -> bool {
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeHttpReadiness {
+    pub ready: bool,
+    pub detail: String,
+}
+
+fn html_body_looks_asset_backed(body: &str, content_type: Option<&str>) -> bool {
+    let body_lower = body.to_ascii_lowercase();
+    content_type
+        .map(|value| value.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+        || body_lower.contains("<script")
+        || body_lower.contains("<link")
+        || body_lower.contains("<html")
+}
+
+fn first_same_origin_html_asset_url(base_url: &str, body: &str) -> Option<String> {
+    let base = url::Url::parse(base_url).ok()?;
+    let selector =
+        Selector::parse("script[src], link[rel=stylesheet][href], link[rel=modulepreload][href], link[rel=preload][href]").ok()?;
+    let document = Html::parse_document(body);
+    for element in document.select(&selector) {
+        let Some(value) = element
+            .value()
+            .attr("src")
+            .or_else(|| element.value().attr("href"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if value.starts_with('#')
+            || value.starts_with("data:")
+            || value.starts_with("mailto:")
+            || value.starts_with("javascript:")
+        {
+            continue;
+        }
+        let Ok(asset_url) = base.join(value) else {
+            continue;
+        };
+        if asset_url.scheme() != base.scheme()
+            || asset_url.host_str() != base.host_str()
+            || asset_url.port_or_known_default() != base.port_or_known_default()
+        {
+            continue;
+        }
+        return Some(asset_url.to_string());
+    }
+    None
+}
+
+pub async fn runtime_http_readiness_check(
+    port: u16,
+    proxy_path_mode: AppProxyPathMode,
+    app_id: &str,
+) -> RuntimeHttpReadiness {
+    let path = dynamic_app_upstream_path(app_id, "", proxy_path_mode);
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return RuntimeHttpReadiness {
+                ready: false,
+                detail: format!("failed to initialize HTTP readiness client: {}", error),
+            };
+        }
+    };
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let status_code = status.as_u16();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = response.text().await.unwrap_or_default();
+            let preview = body
+                .chars()
+                .take(240)
+                .collect::<String>()
+                .replace(['\r', '\n'], " ");
+            if status.is_success() {
+                if body.trim().is_empty() {
+                    return RuntimeHttpReadiness {
+                        ready: false,
+                        detail: format!(
+                            "HTTP readiness returned status {} with an empty response body",
+                            status_code
+                        ),
+                    };
+                }
+                if html_body_looks_asset_backed(&body, content_type.as_deref()) {
+                    if let Some(asset_url) = first_same_origin_html_asset_url(&url, &body) {
+                        match client.get(&asset_url).send().await {
+                            Ok(asset_response) if asset_response.status().is_success() => {}
+                            Ok(asset_response) => {
+                                return RuntimeHttpReadiness {
+                                    ready: false,
+                                    detail: format!(
+                                        "HTTP readiness root succeeded but referenced asset {} returned status {}",
+                                        asset_url,
+                                        asset_response.status().as_u16()
+                                    ),
+                                };
+                            }
+                            Err(error) => {
+                                return RuntimeHttpReadiness {
+                                    ready: false,
+                                    detail: format!(
+                                        "HTTP readiness root succeeded but referenced asset {} failed: {}",
+                                        asset_url, error
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                }
+                RuntimeHttpReadiness {
+                    ready: true,
+                    detail: format!("HTTP readiness succeeded with status {}", status_code),
+                }
+            } else {
+                RuntimeHttpReadiness {
+                    ready: false,
+                    detail: if preview.trim().is_empty() {
+                        format!("HTTP readiness returned status {}", status_code)
+                    } else {
+                        format!(
+                            "HTTP readiness returned status {} with body: {}",
+                            status_code,
+                            preview.trim()
+                        )
+                    },
+                }
+            }
+        }
+        Err(error) => RuntimeHttpReadiness {
+            ready: false,
+            detail: format!("HTTP readiness request failed: {}", error),
+        },
+    }
+}
+
 pub async fn wait_for_runtime_port_open(
     app_id: &str,
     port: u16,
+    proxy_path_mode: AppProxyPathMode,
     stream_tx: &Option<Sender<StreamEvent>>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now()
@@ -8741,12 +10954,23 @@ pub async fn wait_for_runtime_port_open(
 
     loop {
         if runtime_port_accepts_connections(port).await {
-            return Ok(());
+            let readiness = runtime_http_readiness_check(port, proxy_path_mode, app_id).await;
+            if readiness.ready {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "App {} accepted TCP connections on port {} but failed HTTP readiness: {}",
+                    app_id,
+                    port,
+                    readiness.detail
+                );
+            }
         }
 
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "App {} did not accept connections on port {} within {}s",
+                "App {} did not become HTTP-ready on port {} within {}s",
                 app_id,
                 port,
                 dynamic_runtime_ready_timeout_secs()
@@ -8759,7 +10983,7 @@ pub async fn wait_for_runtime_port_open(
             emit_phase_progress(
                 stream_tx,
                 AppDeployProgressPhase::StartingRuntime,
-                format!("Waiting for server readiness on port {}", port),
+                format!("Waiting for HTTP readiness on port {}", port),
             )
             .await;
             last_progress_at = tokio::time::Instant::now();
@@ -8776,6 +11000,7 @@ async fn wait_for_dynamic_runtime_ready(
     registry: &AppRegistry,
     app_id: &str,
     port: u16,
+    proxy_path_mode: AppProxyPathMode,
     stream_tx: &Option<Sender<StreamEvent>>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now()
@@ -8785,11 +11010,22 @@ async fn wait_for_dynamic_runtime_ready(
             anyhow::bail!("App {} stopped before it opened port {}", app_id, port);
         }
         if runtime_port_accepts_connections(port).await {
-            return Ok(());
+            let readiness = runtime_http_readiness_check(port, proxy_path_mode, app_id).await;
+            if readiness.ready {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "App {} accepted TCP connections on port {} but failed HTTP readiness: {}",
+                    app_id,
+                    port,
+                    readiness.detail
+                );
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "App {} did not accept connections on port {} within {}s",
+                "App {} did not become HTTP-ready on port {} within {}s",
                 app_id,
                 port,
                 dynamic_runtime_ready_timeout_secs()
@@ -8798,7 +11034,7 @@ async fn wait_for_dynamic_runtime_ready(
         emit_phase_progress(
             stream_tx,
             AppDeployProgressPhase::StartingRuntime,
-            format!("Waiting for server readiness on port {}", port),
+            format!("Waiting for HTTP readiness on port {}", port),
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(
@@ -8878,8 +11114,9 @@ fn attach_external_deployment_result(
 /// Deploy an app from agent-generated files.
 ///
 /// Arguments (JSON):
-/// - `files`: object mapping filename -> content, or `source_dir` +
-///   `source_paths` pointing at files previously staged with file_write
+/// - `files`: object mapping filename -> content, or `source_dir` pointing at
+///   files previously staged with file_write. `source_paths` is optional when
+///   the whole staged source directory should be deployed.
 /// - `title`: app name (optional, default: "App")
 /// - `entry_command`: command to start the server (optional; if omitted, static)
 /// - `port`: port the server listens on (optional; auto-assigned if dynamic)
@@ -8910,7 +11147,19 @@ pub async fn app_deploy(
     }
 
     let stage_started = std::time::Instant::now();
-    let plan = app_deploy_apply_plan_from_arguments(data_dir, arguments).await?;
+    let mut plan = match app_deploy_apply_plan_from_arguments(data_dir, arguments).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            tracing::debug!(
+                target: "agentark.turn_timing",
+                stage = "app_deploy_parse_plan_failed",
+                duration_ms = stage_started.elapsed().as_millis() as u64,
+                error = %error,
+                "app deploy timing stage failed"
+            );
+            return Err(error);
+        }
+    };
     tracing::debug!(
         target: "agentark.turn_timing",
         stage = "app_deploy_parse_plan",
@@ -9013,6 +11262,14 @@ pub async fn app_deploy(
     if plan.mode == AppDeployMode::Patch && existing_target.is_none() {
         anyhow::bail!("mode='patch' requires app_id for an existing deployed app");
     }
+    if existing_target.is_some() && plan.mode == AppDeployMode::Replace && !plan.mode_explicit {
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_existing_implicit_mode",
+            "existing app update omitted mode; preserving unmentioned managed files"
+        );
+        plan.mode = AppDeployMode::Patch;
+    }
     let title = arguments
         .get("title")
         .and_then(|v| v.as_str())
@@ -9051,6 +11308,23 @@ pub async fn app_deploy(
                     .meta
                     .as_ref()
                     .and_then(|value| app_meta_lifecycle_command(value, "install_command"))
+            })
+        });
+    let mut build_command = arguments
+        .get("build_command")
+        .or_else(|| {
+            arguments
+                .get("commands")
+                .and_then(|value| value.get("build"))
+        })
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string())
+        .or_else(|| {
+            existing_target.as_ref().and_then(|target| {
+                target
+                    .meta
+                    .as_ref()
+                    .and_then(|value| app_meta_lifecycle_command(value, "build_command"))
             })
         });
     let stop_command = arguments
@@ -9227,6 +11501,25 @@ pub async fn app_deploy(
     if effective_files.is_empty() {
         anyhow::bail!("App bundle would be empty after applying this deploy");
     }
+    validate_app_bundle_has_file_content(&effective_files)?;
+    if entry_command.is_none() {
+        if let Some(candidate_dirs) =
+            generated_bundle_requires_explicit_service_selection(&effective_files)
+        {
+            return Err(app_lifecycle_failure_error(
+                "plan",
+                None,
+                &app_dir,
+                None,
+                format!(
+                    "Multiple runnable service manifests were detected ({}), and no root orchestrator or explicit entry_command was provided.",
+                    candidate_dirs.join(", ")
+                ),
+                false,
+                "Inspect the generated service layout and provide an explicit entry_command/build_command/install_command for the intended app service, or add a root orchestrator command.",
+            ));
+        }
+    }
     if let Some(inferred) = infer_generated_bundle_lifecycle(&effective_files) {
         if entry_command.is_none() {
             entry_command = Some(inferred.entry_command.clone());
@@ -9234,9 +11527,25 @@ pub async fn app_deploy(
         if install_command.is_none() {
             install_command = inferred.install_command.clone();
         }
+        if build_command.is_none() {
+            build_command = inferred.build_command.clone();
+        }
         if runtime_reason.is_none() {
             runtime_reason = Some(inferred.runtime_reason.clone());
         }
+    } else if entry_command.is_none()
+        && effective_bundle_has_runtime_manifest(&effective_files)
+        && !effective_bundle_has_html_entrypoint(&effective_files)
+    {
+        return Err(app_lifecycle_failure_error(
+            "plan",
+            None,
+            &app_dir,
+            None,
+            "A runtime manifest was present, but AgentArk could not infer a runnable entry command and no static index.html entrypoint was present.",
+            false,
+            "Inspect the project files and provide an explicit entry_command, or add the missing static index.html entrypoint.",
+        ));
     }
     let mut runtime_required = requested_runtime_required
         .or(persisted_runtime_required)
@@ -9251,6 +11560,7 @@ pub async fn app_deploy(
         )
         .await;
         install_command = None;
+        build_command = None;
         entry_command = None;
     } else if runtime_required_was_inferred {
         emit_phase_progress(
@@ -9280,6 +11590,7 @@ pub async fn app_deploy(
         title,
         entry_command.as_deref(),
         install_command.as_deref(),
+        build_command.as_deref(),
         stop_command.as_deref(),
         runtime_required,
         runtime_preference,
@@ -9428,11 +11739,14 @@ pub async fn app_deploy(
         ),
     )
     .await;
+    cleanup_consumed_staging_source_dir(data_dir, &app_dir, plan.staging_source_dir.as_deref())
+        .await;
 
     let stage_started = std::time::Instant::now();
     let (resolved_env, missing_sensitive, missing_config) = resolve_required_env_values(
         config_dir,
         data_dir,
+        Some(&app_id),
         &required_inputs,
         llm_env,
         &config_values,
@@ -9475,10 +11789,11 @@ pub async fn app_deploy(
     } else if has_requirements {
         Some("pip install -r requirements.txt -q".to_string())
     } else if has_package_json {
-        Some("npm install --omit=dev".to_string())
+        detect_node_install_command(&app_dir).map(ToString::to_string)
     } else {
         None
     };
+    let effective_build_cmd = build_command.clone();
 
     // Save metadata for restore on restart
     let created_at = existing_target
@@ -9512,6 +11827,26 @@ pub async fn app_deploy(
     let mut managed_files = effective_files.keys().cloned().collect::<Vec<_>>();
     managed_files.sort_unstable();
     let artifact_identity = app_deploy_artifact_identity_value(arguments);
+    let request_context = arguments
+        .get("request_context")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let acceptance_criteria = arguments
+        .get("acceptance_criteria")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .take(20)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty());
     let meta = serde_json::json!({
         "title": title,
         "deploy_mode": plan.mode.as_str(),
@@ -9519,9 +11854,11 @@ pub async fn app_deploy(
         "entry_command": entry_command.clone(),
         "start_command": entry_command.clone(),
         "install_command": effective_install_cmd.clone(),
+        "build_command": effective_build_cmd.clone(),
         "stop_command": stop_command.clone(),
         "commands": {
             "install": effective_install_cmd.clone(),
+            "build": effective_build_cmd.clone(),
             "start": entry_command.clone(),
             "stop": stop_command.clone(),
         },
@@ -9546,6 +11883,8 @@ pub async fn app_deploy(
         "public_access_guard_enabled": public_access_guard_enabled,
         "enabled": true,
         "conversation_id": conversation_id,
+        "request_context": request_context,
+        "acceptance_criteria": acceptance_criteria,
         "content_fingerprint": content_fingerprint,
         "artifact_identity_fingerprint": artifact_identity_fingerprint,
         "artifact_identity": artifact_identity,
@@ -9600,7 +11939,7 @@ pub async fn app_deploy(
         emit_phase_progress(
             &stream_tx,
             AppDeployProgressPhase::Completed,
-            format!("Static app ready at {}", url),
+            format!("Static app deployed at {}", url),
         )
         .await;
         let external_deployment = maybe_publish_external_deployment(
@@ -9628,6 +11967,12 @@ pub async fn app_deploy(
             "access_guard_enabled": access_guard_enabled,
             "public_access_guard_enabled": public_access_guard_enabled,
             "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
+            "validation": {
+                "status": "not_run",
+                "scope": "deployment_registration",
+                "blocking": false,
+                "message": "The synchronous deploy confirmed the app files were accepted and the local app route was registered. Browser runtime behavior, client-side data fetches, and user-visible semantics require a separate browser/quality check."
+            },
         });
         attach_external_deployment_result(&mut response, external_deployment);
         tracing::debug!(
@@ -9687,7 +12032,7 @@ pub async fn app_deploy(
         return Ok(serde_json::json!({
             "status": "needs_secrets",
             "type": "dynamic",
-            "app_id": app_id,
+            "app_id": app_id.clone(),
             "title": title,
             "url": format!("/apps/{}/", app_id),
             "updated_existing": updating_existing,
@@ -9700,10 +12045,18 @@ pub async fn app_deploy(
             "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
             "required_inputs": required_inputs,
             "required_secrets": required_secret_keys.clone(),
-            "required_env": required_secret_keys,
+            "required_env": required_secret_keys.clone(),
             "required_config": required_config_keys,
             "missing_env": missing_sensitive,
             "missing_config": missing_config,
+            "credential_request": {
+                "kind": "app_runtime_secret",
+                "app_id": app_id.clone(),
+                "display_name": title,
+                "required_keys": required_secret_keys,
+                "settings_path": format!("/apps/{}/environment", app_id),
+                "secure_input_required": true
+            },
             "message": "Missing required inputs. Sensitive keys must be provided through the secure credential form or Settings for this app; AgentArk model/provider credentials are not inherited by generated apps. For non-sensitive values pass config.{KEY} when deploying/restarting."
         })
         .to_string());
@@ -9732,6 +12085,29 @@ pub async fn app_deploy(
             "Dynamic app files are ready on the control plane; runtime start will be delegated to the executor",
         )
         .await;
+        let stage_started = std::time::Instant::now();
+        let mut response = restart_delegated_runtime(
+            &app_id,
+            title,
+            access_guard_enabled,
+            &access_key,
+            expose_public,
+        )
+        .await
+        .with_context(|| format!("Executor startup failed for app '{}'", title))?;
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_restart_delegated_runtime",
+            app_id = %app_id,
+            duration_ms = stage_started.elapsed().as_millis() as u64,
+            "app deploy timing stage"
+        );
+        emit_phase_progress(
+            &stream_tx,
+            AppDeployProgressPhase::Completed,
+            format!("Dynamic app deployed at /apps/{}/", app_id),
+        )
+        .await;
         let external_deployment = maybe_publish_external_deployment(
             config_dir,
             data_dir,
@@ -9742,29 +12118,35 @@ pub async fn app_deploy(
             &stream_tx,
         )
         .await;
-        let mut response = serde_json::json!({
-            "status": "deployed",
-            "type": "dynamic",
-            "runtime": "delegated",
-            "runtime_delegated": true,
-            "app_id": app_id,
-            "url": format!("/apps/{}/", app_id),
-            "title": title,
-            "updated_existing": updating_existing,
-            "runtime_preference": runtime_preference.as_str(),
-            "expose_public": expose_public,
-            "access_key": access_key,
-            "access_password": access_key,
-            "access_guard_enabled": access_guard_enabled,
-            "public_access_guard_enabled": public_access_guard_enabled,
-            "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
-        });
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "updated_existing".to_string(),
+                serde_json::Value::Bool(updating_existing),
+            );
+            obj.insert(
+                "runtime_preference".to_string(),
+                serde_json::Value::String(runtime_preference.as_str().to_string()),
+            );
+            obj.insert(
+                "public_access_guard_enabled".to_string(),
+                serde_json::Value::Bool(public_access_guard_enabled),
+            );
+            obj.insert(
+                "validation".to_string(),
+                serde_json::json!({
+                    "status": "runtime_started",
+                    "scope": "delegated_executor_startup",
+                    "blocking": false,
+                    "message": "The synchronous deploy confirmed the executor accepted and started the dynamic app runtime. Browser behavior and user-visible semantics require a separate browser/quality check."
+                }),
+            );
+        }
         attach_external_deployment_result(&mut response, external_deployment);
         tracing::debug!(
             target: "agentark.turn_timing",
             stage = "app_deploy_total",
             app_id = %app_id,
-            app_type = "dynamic_delegated",
+            app_type = "dynamic_delegated_started",
             duration_ms = deploy_started.elapsed().as_millis() as u64,
             updated_existing = updating_existing,
             "app deploy timing total"
@@ -9820,6 +12202,15 @@ pub async fn app_deploy(
         .await;
     }
 
+    if effective_build_cmd.is_some() {
+        emit_phase_progress(
+            &stream_tx,
+            AppDeployProgressPhase::PreparingRuntime,
+            "Building app artifacts...",
+        )
+        .await;
+    }
+
     // Start the server process in isolated container
     let entry = entry_command.as_deref().unwrap_or_default();
     tracing::info!(
@@ -9840,6 +12231,7 @@ pub async fn app_deploy(
         app_dir: &app_dir,
         entry_command: entry,
         install_command: effective_install_cmd.as_deref(),
+        build_command: effective_build_cmd.as_deref(),
         port,
         extra_env: &resolved_env,
         runtime_image: runtime_image.as_deref(),
@@ -9854,6 +12246,7 @@ pub async fn app_deploy(
         duration_ms = stage_started.elapsed().as_millis() as u64,
         port,
         has_install_command = effective_install_cmd.is_some(),
+        has_build_command = effective_build_cmd.is_some(),
         "app deploy timing stage"
     );
     let app_dir_for_diagnostics = app_dir.clone();
@@ -9874,7 +12267,9 @@ pub async fn app_deploy(
     )
     .await;
     let stage_started = std::time::Instant::now();
-    if let Err(wait_err) = wait_for_runtime_port_open(&app_id, port, &stream_tx).await {
+    if let Err(wait_err) =
+        wait_for_runtime_port_open(&app_id, port, proxy_path_mode, &stream_tx).await
+    {
         tracing::debug!(
             target: "agentark.turn_timing",
             stage = "app_deploy_wait_runtime_ready",
@@ -9889,10 +12284,19 @@ pub async fn app_deploy(
         let log_tail =
             read_local_runtime_log_tail(&app_dir_for_diagnostics, LOCAL_RUNTIME_LOG_TAIL_BYTES)
                 .await;
-        if log_tail.is_empty() {
-            anyhow::bail!("{}", wait_err);
-        }
-        anyhow::bail!("{}. Recent runtime logs:\n{}", wait_err, log_tail);
+        return Err(app_lifecycle_failure_error(
+            "probe",
+            Some(entry),
+            &app_dir_for_diagnostics,
+            None,
+            if log_tail.is_empty() {
+                wait_err.to_string()
+            } else {
+                format!("{}. Recent runtime logs:\n{}", wait_err, log_tail)
+            },
+            true,
+            "The runtime started but did not become HTTP-ready; inspect logs, route base path, host/port binding, and startup errors before patching or restarting.",
+        ));
     }
     tracing::debug!(
         target: "agentark.turn_timing",
@@ -9961,7 +12365,7 @@ pub async fn app_deploy(
     emit_phase_progress(
         &stream_tx,
         AppDeployProgressPhase::Completed,
-        format!("Dynamic app ready at {}", url),
+        format!("Dynamic app deployed at {}", url),
     )
     .await;
 
@@ -10001,6 +12405,12 @@ pub async fn app_deploy(
         "access_guard_enabled": access_guard_enabled,
         "public_access_guard_enabled": public_access_guard_enabled,
         "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
+        "validation": {
+            "status": "runtime_started",
+            "scope": "process_startup",
+            "blocking": false,
+            "message": "The synchronous deploy confirmed the process started and the local app route was registered. Browser runtime behavior, client-side data fetches, and user-visible semantics require a separate browser/quality check."
+        },
     });
     attach_external_deployment_result(&mut response, external_deployment);
     tracing::debug!(
@@ -10022,6 +12432,19 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_dynamic_container_app_dir() -> &'static Path {
+        Path::new("/app/data/apps/demo")
+    }
+
+    fn test_dynamic_container_mount_plan() -> DynamicContainerMountPlan {
+        dynamic_container_mount_plan_from(
+            test_dynamic_container_app_dir(),
+            Path::new("/app/data"),
+            Some("agentark-data"),
+        )
+        .expect("test mount plan")
+    }
 
     #[test]
     fn deploy_access_guard_defaults_off_for_local_private_apps() {
@@ -10144,6 +12567,298 @@ mod tests {
         files
     }
 
+    struct EnvGuard {
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(values: Vec<(&'static str, String)>) -> Self {
+            let previous = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for (key, value) in values {
+                std::env::set_var(key, value);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_source_dir_relative_paths_resolve_under_data_workspace() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_root = app_source_workspace_root(data_dir.path()).join("expense-tracker");
+        std::fs::create_dir_all(&app_root).expect("create app root");
+        std::fs::write(app_root.join("index.html"), "<html>ok</html>\n").expect("write app");
+
+        let arguments = serde_json::json!({
+            "source_dir": "expense-tracker"
+        });
+
+        let bundle = read_staged_app_source_files(data_dir.path(), &arguments)
+            .await
+            .expect("relative source_dir should use the data-owned app workspace");
+        assert_eq!(bundle.root, app_root.canonicalize().unwrap());
+        assert_eq!(
+            bundle
+                .files
+                .get("index.html")
+                .and_then(|value| value.as_str()),
+            Some("<html>ok</html>\n")
+        );
+    }
+
+    #[test]
+    fn consumed_staging_cleanup_only_targets_workspace_subdirs() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let staging_root = app_source_workspace_root(data_dir.path());
+        let staging_app = staging_root.join("expense-tracker");
+        let app_dir = data_dir.path().join("apps").join("app123");
+        std::fs::create_dir_all(&staging_app).expect("create staging app");
+        std::fs::create_dir_all(&app_dir).expect("create app dir");
+
+        assert_eq!(
+            consumed_staging_source_cleanup_target(data_dir.path(), &app_dir, Some(&staging_app)),
+            Some(staging_app.canonicalize().unwrap())
+        );
+        assert_eq!(
+            consumed_staging_source_cleanup_target(data_dir.path(), &app_dir, Some(&staging_root)),
+            None
+        );
+        assert_eq!(
+            consumed_staging_source_cleanup_target(data_dir.path(), &app_dir, Some(&app_dir)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_source_files_accept_paths_that_include_source_dir_prefix() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_root = data_dir.path().join("expense-tracker");
+        std::fs::create_dir_all(&app_root).expect("create app root");
+        std::fs::write(app_root.join("package.json"), "{}\n").expect("write package");
+        std::fs::write(app_root.join("server.js"), "console.log('ok');\n").expect("write server");
+
+        let arguments = serde_json::json!({
+            "source_dir": app_root.display().to_string(),
+            "source_paths": [
+                "expense-tracker/package.json",
+                app_root.join("server.js").display().to_string()
+            ]
+        });
+
+        let bundle = read_staged_app_source_files(data_dir.path(), &arguments)
+            .await
+            .expect("staged source paths should resolve inside source_dir");
+        let files = bundle.files;
+
+        assert_eq!(
+            files.get("package.json").and_then(|value| value.as_str()),
+            Some("{}\n")
+        );
+        assert_eq!(
+            files.get("server.js").and_then(|value| value.as_str()),
+            Some("console.log('ok');\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_source_files_auto_discover_source_dir_when_paths_are_omitted() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_root = data_dir.path().join("expense-tracker");
+        std::fs::create_dir_all(app_root.join("src")).expect("create src dir");
+        std::fs::create_dir_all(app_root.join("node_modules").join("ignored"))
+            .expect("create ignored dependency dir");
+        std::fs::create_dir_all(app_root.join(".agentark")).expect("create internal dir");
+        std::fs::write(
+            app_root.join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .expect("write package");
+        std::fs::write(app_root.join("src").join("main.js"), "console.log('ok');\n")
+            .expect("write source");
+        std::fs::write(
+            app_root
+                .join("node_modules")
+                .join("ignored")
+                .join("index.js"),
+            "module.exports = {}\n",
+        )
+        .expect("write ignored dependency");
+        std::fs::write(app_root.join(".env"), "SECRET=value\n").expect("write sensitive file");
+        std::fs::write(app_root.join(".agentark").join("meta.json"), "{}\n")
+            .expect("write internal metadata");
+
+        let arguments = serde_json::json!({
+            "source_dir": app_root.display().to_string()
+        });
+
+        let bundle = read_staged_app_source_files(data_dir.path(), &arguments)
+            .await
+            .expect("source_dir without source_paths should discover deployable staged files");
+        let files = bundle.files;
+
+        assert_eq!(
+            files.get("package.json").and_then(|value| value.as_str()),
+            Some(r#"{"scripts":{"start":"node server.js"}}"#)
+        );
+        assert_eq!(
+            files.get("src/main.js").and_then(|value| value.as_str()),
+            Some("console.log('ok');\n")
+        );
+        assert!(!files.contains_key("node_modules/ignored/index.js"));
+        assert!(!files.contains_key(".env"));
+        assert!(!files.contains_key(".agentark/meta.json"));
+    }
+
+    #[tokio::test]
+    async fn staged_source_files_reject_existing_paths_outside_source_dir() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_root = data_dir.path().join("app");
+        std::fs::create_dir_all(&app_root).expect("create app root");
+        let outside = data_dir.path().join("outside.txt");
+        std::fs::write(&outside, "secret\n").expect("write outside file");
+
+        let arguments = serde_json::json!({
+            "source_dir": app_root.display().to_string(),
+            "source_paths": [outside.display().to_string()]
+        });
+
+        let error = read_staged_app_source_files(data_dir.path(), &arguments)
+            .await
+            .expect_err("outside source files must not be deployable")
+            .to_string();
+
+        assert!(
+            error.contains("outside source_dir"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_preflight_rejects_all_empty_resolved_bundles() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let arguments = serde_json::json!({
+            "title": "Empty bundle",
+            "files": {
+                "package.json": "",
+                "index.html": "",
+                "src/main.js": ""
+            }
+        });
+
+        let error = app_deploy_preflight(data_dir.path(), &arguments, &registry)
+            .await
+            .expect_err("all-empty app bundles should be rejected before launch");
+        let text = error.to_string();
+
+        assert!(
+            text.contains("No app file content provided"),
+            "unexpected error: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_rejects_all_empty_bundle_before_creating_app_dir() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+        let arguments = serde_json::json!({
+            "title": "Empty runtime",
+            "entry_command": "node server.js",
+            "files": {
+                "package.json": "",
+                "server.js": ""
+            }
+        });
+
+        let error = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &arguments,
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect_err("empty bundles must fail before app files are written")
+        .to_string();
+
+        assert!(
+            error.contains("No app file content provided"),
+            "unexpected error: {error}"
+        );
+        let apps_dir = data_dir.path().join("apps");
+        let created_entries = std::fs::read_dir(&apps_dir)
+            .ok()
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(created_entries, 0);
+    }
+
+    async fn spawn_executor_restart_mock() -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>,
+    ) {
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let calls_for_handler = calls.clone();
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::any(
+                move |method: axum::http::Method,
+                      uri: axum::http::Uri,
+                      headers: axum::http::HeaderMap| {
+                    let calls = calls_for_handler.clone();
+                    async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(|value| value.to_string());
+                        calls
+                            .lock()
+                            .await
+                            .push((format!("{} {}", method, uri.path()), authorization));
+                        axum::Json(serde_json::json!({
+                            "status": "restarted",
+                            "message": "Restarted generic dynamic app",
+                            "raw": {
+                                "mode": "dynamic",
+                                "title": "Generic Runtime App",
+                                "port": 9137,
+                                "runtime_mode": "isolated_container",
+                                "access_guard_enabled": false,
+                                "expose_public": false
+                            }
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock executor should bind");
+        let address = listener.local_addr().expect("mock executor address");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("mock executor failed: {error}");
+            }
+        });
+        (format!("http://{}", address), calls)
+    }
+
     #[test]
     fn generated_node_server_bundle_infers_dynamic_lifecycle() {
         let inference = infer_generated_bundle_lifecycle(&generated_node_server_bundle_files())
@@ -10154,7 +12869,153 @@ mod tests {
             inference.install_command.as_deref(),
             Some("npm install --omit=dev")
         );
+        assert_eq!(inference.build_command.as_deref(), None);
         assert!(inference.runtime_reason.contains("Node package manifest"));
+    }
+
+    #[test]
+    fn generated_vite_bundle_infers_full_install_build_then_preview() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "package.json".to_string(),
+            serde_json::Value::String(
+                r#"{"scripts":{"build":"vite build","preview":"vite preview"},"dependencies":{"@vitejs/plugin-react":"latest","react":"latest","react-dom":"latest"},"devDependencies":{"vite":"^6.0.0"}}"#
+                    .to_string(),
+            ),
+        );
+        files.insert(
+            "index.html".to_string(),
+            serde_json::Value::String("<!doctype html><div id=\"root\"></div>".to_string()),
+        );
+        files.insert(
+            "src/App.jsx".to_string(),
+            serde_json::Value::String(
+                "export default function App(){return <main/>}\n".to_string(),
+            ),
+        );
+
+        let inference = infer_generated_bundle_lifecycle(&files)
+            .expect("vite bundle should infer a runtime lifecycle");
+
+        assert_eq!(inference.install_command.as_deref(), Some("npm install"));
+        assert_eq!(inference.build_command.as_deref(), Some("npm run build"));
+        assert_eq!(
+            inference.entry_command,
+            "npm run preview -- --host 0.0.0.0 --port {PORT}"
+        );
+        assert!(inference.runtime_reason.contains("Node package manifest"));
+    }
+
+    #[test]
+    fn generated_vite_bundle_without_preview_script_serves_built_output() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "package.json".to_string(),
+            serde_json::Value::String(
+                r#"{"scripts":{"build":"vite build","dev":"vite"},"dependencies":{"vite":"^6.0.0","react":"latest","react-dom":"latest"}}"#
+                    .to_string(),
+            ),
+        );
+        files.insert(
+            "index.html".to_string(),
+            serde_json::Value::String("<!doctype html><div id=\"root\"></div>".to_string()),
+        );
+
+        let inference = infer_generated_bundle_lifecycle(&files)
+            .expect("vite bundle should infer a runtime lifecycle");
+
+        assert_eq!(inference.install_command.as_deref(), Some("npm install"));
+        assert_eq!(inference.build_command.as_deref(), Some("npm run build"));
+        assert_eq!(
+            inference.entry_command,
+            "npm exec vite -- preview --host 0.0.0.0 --port {PORT}"
+        );
+    }
+
+    #[test]
+    fn generated_fullstack_node_bundle_prefers_server_start_over_vite_preview() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "package.json".to_string(),
+            serde_json::Value::String(
+                r#"{
+                    "scripts": {
+                        "build": "vite build",
+                        "start": "node server.js"
+                    },
+                    "dependencies": {
+                        "express": "^4.18.0",
+                        "vite": "^6.0.0",
+                        "react": "latest",
+                        "react-dom": "latest"
+                    },
+                    "devDependencies": {
+                        "@vitejs/plugin-react": "latest"
+                    }
+                }"#
+                .to_string(),
+            ),
+        );
+        files.insert(
+            "server.js".to_string(),
+            serde_json::Value::String(
+                "require('express')().listen(process.env.PORT)\n".to_string(),
+            ),
+        );
+        files.insert(
+            "index.html".to_string(),
+            serde_json::Value::String("<!doctype html><div id=\"root\"></div>".to_string()),
+        );
+        files.insert(
+            "src/App.jsx".to_string(),
+            serde_json::Value::String(
+                "export default function App(){return <main/>}\n".to_string(),
+            ),
+        );
+
+        let inference = infer_generated_bundle_lifecycle(&files)
+            .expect("full-stack Node bundle should infer a runtime lifecycle");
+
+        assert_eq!(inference.install_command.as_deref(), Some("npm install"));
+        assert_eq!(inference.build_command.as_deref(), Some("npm run build"));
+        assert_eq!(inference.entry_command, "npm run start");
+    }
+
+    #[test]
+    fn generated_node_monorepo_without_root_orchestrator_requires_explicit_service_selection() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "frontend/package.json".to_string(),
+            serde_json::Value::String(
+                r#"{"scripts":{"build":"vite build","preview":"vite preview"},"dependencies":{"vite":"^6.0.0","react":"latest"}}"#
+                    .to_string(),
+            ),
+        );
+        files.insert(
+            "frontend/index.html".to_string(),
+            serde_json::Value::String("<!doctype html><div id=\"root\"></div>".to_string()),
+        );
+        files.insert(
+            "backend/package.json".to_string(),
+            serde_json::Value::String(
+                r#"{"scripts":{"start":"node server.js"},"dependencies":{"express":"^4.18.0"}}"#
+                    .to_string(),
+            ),
+        );
+        files.insert(
+            "backend/server.js".to_string(),
+            serde_json::Value::String(
+                "require('express')().listen(process.env.PORT)\n".to_string(),
+            ),
+        );
+
+        let candidates = generated_bundle_requires_explicit_service_selection(&files)
+            .expect("independent services should not be silently collapsed into one");
+
+        assert_eq!(
+            candidates,
+            vec!["backend".to_string(), "frontend".to_string()]
+        );
     }
 
     #[test]
@@ -10169,6 +13030,81 @@ mod tests {
             infer_generated_bundle_lifecycle(&files).is_none(),
             "plain static bundles should stay static"
         );
+    }
+
+    #[test]
+    fn generated_runtime_manifests_infer_non_static_lifecycles_across_ecosystems() {
+        let cases: Vec<(&str, Vec<(&str, &str)>, &str)> = vec![
+            (
+                "go",
+                vec![("go.mod", "module demo\n"), ("main.go", "package main\n")],
+                "go run",
+            ),
+            (
+                "deno",
+                vec![
+                    ("deno.json", "{}"),
+                    ("main.ts", "Deno.serve(() => new Response('ok'))"),
+                ],
+                "deno run",
+            ),
+            (
+                "dotnet",
+                vec![("Demo.csproj", "<Project></Project>")],
+                "dotnet run",
+            ),
+            (
+                "ruby",
+                vec![
+                    ("Gemfile", "source 'https://rubygems.org'\n"),
+                    ("config.ru", "run proc { [200, {}, ['ok']] }\n"),
+                ],
+                "rackup",
+            ),
+            (
+                "php",
+                vec![("public/index.php", "<?php echo 'ok';")],
+                "php -S",
+            ),
+        ];
+
+        for (label, files, expected_command) in cases {
+            let mut bundle = serde_json::Map::new();
+            for (path, body) in files {
+                bundle.insert(
+                    path.to_string(),
+                    serde_json::Value::String(body.to_string()),
+                );
+            }
+            let inference = infer_generated_bundle_lifecycle(&bundle)
+                .unwrap_or_else(|| panic!("{label} should infer a dynamic lifecycle"));
+            assert!(
+                inference.entry_command.contains(expected_command),
+                "{label} command should contain {expected_command}, got {}",
+                inference.entry_command
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn app_deploy_preflight_rejects_manifest_without_entry_or_static_index() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let arguments = serde_json::json!({
+            "title": "Incomplete runtime bundle",
+            "files": {
+                "composer.json": "{\"require\":{}}\n",
+                "README.md": "No entrypoint yet\n"
+            }
+        });
+
+        let error = app_deploy_preflight(data_dir.path(), &arguments, &registry)
+            .await
+            .expect_err("runtime manifests without inferred entry or static index should fail");
+        let text = error.to_string();
+
+        assert!(text.contains("runtime manifest"));
+        assert!(text.contains("entry_command"));
     }
 
     #[tokio::test]
@@ -10186,6 +13122,147 @@ mod tests {
         app_deploy_preflight(data_dir.path(), &arguments, &registry)
             .await
             .expect("dynamic generated bundles should not be rejected as broken static assets");
+    }
+
+    #[tokio::test]
+    async fn app_deploy_starts_delegated_dynamic_runtime_for_explicit_runtime_bundle() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+        let (executor_url, calls) = spawn_executor_restart_mock().await;
+        let _env_guard = EnvGuard::set(vec![
+            ("AGENTARK_CONFIG", config_dir.path().display().to_string()),
+            ("AGENTARK_STACK_ROLE", "control-plane".to_string()),
+            ("AGENTARK_EXECUTOR_URL", executor_url),
+            ("AGENTARK_EXECUTOR_TOKEN", "ak_int_exec_test".to_string()),
+        ]);
+        let arguments = serde_json::json!({
+            "title": "Generic runtime bundle",
+            "entry_command": "runtime-binary serve --port {PORT}",
+            "install_command": "runtime-binary install-deps && runtime-binary build-artifacts",
+            "files": {
+                "runtime.plan": "serve the generated application from these files\n",
+                "app/content.txt": "generic app payload\n"
+            }
+        });
+
+        let result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &arguments,
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("control plane deploy should start delegated runtime");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("deploy result should be json");
+
+        assert_eq!(
+            parsed.get("status").and_then(|value| value.as_str()),
+            Some("deployed")
+        );
+        assert_eq!(
+            parsed.get("type").and_then(|value| value.as_str()),
+            Some("dynamic")
+        );
+        assert_ne!(
+            parsed
+                .get("runtime_delegated")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "deploy should not report a live dynamic app until the delegated runtime is started"
+        );
+        assert_eq!(
+            parsed.get("port").and_then(|value| value.as_u64()),
+            Some(9137)
+        );
+        let app_id = parsed
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .expect("app id should be returned");
+        let meta_raw = tokio::fs::read_to_string(
+            data_dir
+                .path()
+                .join("apps")
+                .join(app_id)
+                .join(".app_meta.json"),
+        )
+        .await
+        .expect("app metadata should be written");
+        let meta: serde_json::Value =
+            serde_json::from_str(&meta_raw).expect("app metadata should be json");
+        assert_eq!(
+            meta.get("entry_command").and_then(|value| value.as_str()),
+            Some("runtime-binary serve --port {PORT}")
+        );
+        assert_eq!(
+            meta.get("install_command").and_then(|value| value.as_str()),
+            Some("runtime-binary install-deps && runtime-binary build-artifacts")
+        );
+
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].0.starts_with("POST /internal/v1/apps/"),
+            "delegated deploy should restart through executor, got {}",
+            calls[0].0
+        );
+        assert!(
+            calls[0].0.ends_with("/restart"),
+            "delegated deploy should call the restart endpoint, got {}",
+            calls[0].0
+        );
+        assert_eq!(calls[0].1.as_deref(), Some("Bearer ak_int_exec_test"));
+    }
+
+    #[test]
+    fn install_command_sequence_splits_direct_setup_steps() {
+        let commands = split_direct_command_sequence(
+            "runtime-binary install-deps && runtime-binary build-artifacts",
+            "install_command",
+        )
+        .expect("direct setup sequence should parse");
+
+        assert_eq!(
+            commands,
+            vec![
+                "runtime-binary install-deps".to_string(),
+                "runtime-binary build-artifacts".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_command_sequence_keeps_quoted_operator_text_in_one_step() {
+        let commands = split_direct_command_sequence(
+            "tool configure \"left && right\" && tool build",
+            "install_command",
+        )
+        .expect("quoted operator text should not split commands");
+
+        assert_eq!(
+            commands,
+            vec![
+                "tool configure \"left && right\"".to_string(),
+                "tool build".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_command_sequence_rejects_shell_snippets_inside_steps() {
+        let error = split_direct_command_sequence(
+            "runtime-binary install-deps && runtime-binary build; rm -rf dist",
+            "install_command",
+        )
+        .expect_err("shell snippets inside setup steps should be rejected")
+        .to_string();
+
+        assert!(error.contains("shell operators"));
     }
 
     #[test]
@@ -10258,6 +13335,64 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn app_runtime_isolation_env_uses_app_local_dependency_caches() {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let mut env = HashMap::new();
+
+        install_app_runtime_isolation_env(app_dir.path(), &mut env)
+            .expect("isolation env should be installed");
+
+        for key in [
+            "HOME",
+            "XDG_CACHE_HOME",
+            "PIP_CACHE_DIR",
+            "UV_CACHE_DIR",
+            "NPM_CONFIG_CACHE",
+            "YARN_CACHE_FOLDER",
+            "PNPM_STORE_DIR",
+            "BUN_INSTALL_CACHE_DIR",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "GOPATH",
+            "GOMODCACHE",
+            "GOCACHE",
+            "DENO_DIR",
+            "GRADLE_USER_HOME",
+            "DOTNET_CLI_HOME",
+            "NUGET_PACKAGES",
+        ] {
+            let value = env.get(key).unwrap_or_else(|| panic!("missing {key}"));
+            assert!(
+                Path::new(value).starts_with(app_dir.path()),
+                "{key} should stay inside the app dir, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_runtime_setup_uses_app_scoped_dependency_caches() {
+        let setup = container_runtime_isolation_setup_parts().join("\n");
+
+        for expected in [
+            "export HOME=\"$PWD/.agentark/home\"",
+            "export NPM_CONFIG_CACHE=\"$PWD/.agentark/cache/npm\"",
+            "export CARGO_HOME=\"$PWD/.agentark/cargo-home\"",
+            "export GOMODCACHE=\"$PWD/.agentark/go/pkg/mod\"",
+            "export DENO_DIR=\"$PWD/.agentark/deno\"",
+            "export DOTNET_CLI_HOME=\"$PWD/.agentark/dotnet\"",
+        ] {
+            assert!(
+                setup.contains(expected),
+                "container setup should include {expected}"
+            );
+        }
+        assert!(
+            !setup.contains("/workspace/.agentark"),
+            "container setup must not write caches under /workspace"
+        );
+    }
+
     #[tokio::test]
     async fn reserved_restoring_dynamic_app_does_not_expose_unready_port() {
         let registry = AppRegistry::new();
@@ -10279,6 +13414,99 @@ mod tests {
             !runtime_port_accepts_connections(port).await,
             "reserved restore port should not be accepting connections"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_http_readiness_rejects_server_errors_after_tcp_accepts() {
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                }),
+            )
+            .route(
+                "/{*path}",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock app should bind");
+        let port = listener.local_addr().expect("mock address").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        assert!(runtime_port_accepts_connections(port).await);
+        let probe =
+            runtime_http_readiness_check(port, AppProxyPathMode::StripAppPrefix, "demo").await;
+
+        assert!(
+            !probe.ready,
+            "HTTP readiness should reject a runtime that only accepts TCP: {}",
+            probe.detail
+        );
+        assert!(probe.detail.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn runtime_http_readiness_rejects_empty_success_body() {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock app should bind");
+        let port = listener.local_addr().expect("mock address").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let probe =
+            runtime_http_readiness_check(port, AppProxyPathMode::StripAppPrefix, "demo").await;
+
+        assert!(
+            !probe.ready,
+            "HTTP readiness should reject empty browser responses"
+        );
+        assert!(probe.detail.contains("empty response body"));
+    }
+
+    #[tokio::test]
+    async fn runtime_http_readiness_rejects_missing_first_party_html_asset() {
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/html")],
+                        "<!doctype html><html><head><script type=\"module\" src=\"/assets/app.js\"></script></head><body></body></html>",
+                    )
+                }),
+            )
+            .route(
+                "/assets/app.js",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::NOT_FOUND, "missing asset")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock app should bind");
+        let port = listener.local_addr().expect("mock address").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let probe =
+            runtime_http_readiness_check(port, AppProxyPathMode::StripAppPrefix, "demo").await;
+
+        assert!(!probe.ready, "readiness should reject blank SPA assets");
+        assert!(probe.detail.contains("/assets/app.js"));
+        assert!(probe.detail.contains("404"));
     }
 
     #[tokio::test]
@@ -10356,6 +13584,25 @@ mod tests {
                 .expect("rewrite command");
 
         assert_eq!(command, "npm run dev -- --base /apps/abc12345/");
+    }
+
+    #[test]
+    fn vite_npm_run_build_command_gets_app_mount_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(
+            temp.path(),
+            r#"{"scripts":{"build":"vite build"},"dependencies":{"vite":"^6.0.0"}}"#,
+        );
+
+        let command = apply_app_mount_base_to_vite_command(
+            "npm run build",
+            temp.path(),
+            "demo1234",
+            "build_command",
+        )
+        .expect("rewrite command");
+
+        assert_eq!(command, "npm run build -- --base /apps/demo1234/");
     }
 
     #[test]
@@ -10464,10 +13711,9 @@ mod tests {
     #[test]
     fn resolve_secret_value_requires_explicit_secret_mapping() {
         let custom = HashMap::new();
-        let llm_env = HashMap::from([("OPENAI_API_KEY".to_string(), "sk-live-secret".to_string())]);
 
         assert_eq!(
-            resolve_secret_value(&custom, &llm_env, "OPENAI_API_KEY"),
+            resolve_secret_value(&custom, Some("app123"), "OPENAI_API_KEY"),
             None
         );
     }
@@ -10532,6 +13778,7 @@ mod tests {
         let (resolved, missing_sensitive, missing_config) = resolve_required_env_values(
             config_dir.path(),
             data_dir.path(),
+            Some("app123"),
             &required,
             &llm_env,
             &HashMap::new(),
@@ -10545,6 +13792,161 @@ mod tests {
         );
         assert!(missing_sensitive.is_empty());
         assert!(missing_config.is_empty());
+    }
+
+    #[tokio::test]
+    async fn app_env_secret_scope_takes_precedence_over_global_and_provider_env() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            config_dir.path(),
+            Some(data_dir.path()),
+        )
+        .expect("secure config");
+        manager
+            .set_custom_secret("env:OPENAI_API_KEY", Some("sk-global".to_string()))
+            .expect("stored global secret");
+        manager
+            .set_custom_secret(
+                &app_env_secret_storage_key("app123", "OPENAI_API_KEY").expect("app env key"),
+                Some("sk-app".to_string()),
+            )
+            .expect("stored app secret");
+
+        let required = vec![AppRequiredInput {
+            key: "OPENAI_API_KEY".to_string(),
+            sensitive: true,
+        }];
+        let llm_env = HashMap::from([(
+            "OPENAI_API_KEY".to_string(),
+            "sk-agentark-internal".to_string(),
+        )]);
+        let (resolved, missing_sensitive, missing_config) = resolve_required_env_values(
+            config_dir.path(),
+            data_dir.path(),
+            Some("app123"),
+            &required,
+            &llm_env,
+            &HashMap::new(),
+        )
+        .await
+        .expect("resolve env");
+
+        assert_eq!(
+            resolved.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-app")
+        );
+        assert!(missing_sensitive.is_empty());
+        assert!(missing_config.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_app_secret_does_not_fall_back_to_provider_env() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let _manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            config_dir.path(),
+            Some(data_dir.path()),
+        )
+        .expect("secure config");
+
+        let required = vec![AppRequiredInput {
+            key: "OPENAI_API_KEY".to_string(),
+            sensitive: true,
+        }];
+        let llm_env = HashMap::from([(
+            "OPENAI_API_KEY".to_string(),
+            "sk-agentark-internal".to_string(),
+        )]);
+        let (resolved, missing_sensitive, missing_config) = resolve_required_env_values(
+            config_dir.path(),
+            data_dir.path(),
+            Some("app123"),
+            &required,
+            &llm_env,
+            &HashMap::new(),
+        )
+        .await
+        .expect("resolve env");
+
+        assert!(resolved.is_empty());
+        assert_eq!(missing_sensitive, vec!["OPENAI_API_KEY".to_string()]);
+        assert!(missing_config.is_empty());
+    }
+
+    #[test]
+    fn parse_config_values_refuses_secret_shaped_keys() {
+        let values = parse_config_values(&serde_json::json!({
+            "config": {
+                "OPENAI_API_KEY": "sk-should-not-persist",
+                "DATABASE_URL": "postgres://secret",
+                "PUBLIC_API_BASE_URL": "https://api.example.test",
+                "CITY": "Pune"
+            }
+        }));
+
+        assert!(!values.contains_key("OPENAI_API_KEY"));
+        assert!(!values.contains_key("DATABASE_URL"));
+        assert_eq!(
+            values.get("PUBLIC_API_BASE_URL").map(String::as_str),
+            Some("https://api.example.test")
+        );
+        assert_eq!(values.get("CITY").map(String::as_str), Some("Pune"));
+    }
+
+    #[test]
+    fn deleting_app_env_secrets_keeps_global_and_other_app_secrets() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            config_dir.path(),
+            Some(data_dir.path()),
+        )
+        .expect("secure config");
+        manager
+            .set_custom_secret(
+                &app_env_secret_storage_key("app1", "OPENAI_API_KEY").expect("app1 key"),
+                Some("sk-app1".to_string()),
+            )
+            .expect("stored app1 secret");
+        manager
+            .set_custom_secret(
+                &app_env_secret_storage_key("app2", "OPENAI_API_KEY").expect("app2 key"),
+                Some("sk-app2".to_string()),
+            )
+            .expect("stored app2 secret");
+        manager
+            .set_custom_secret("env:OPENAI_API_KEY", Some("sk-global".to_string()))
+            .expect("stored global secret");
+
+        let removed = remove_app_scoped_env_secrets(config_dir.path(), data_dir.path(), "app1")
+            .expect("remove app env");
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            manager
+                .get_custom_secret(
+                    &app_env_secret_storage_key("app1", "OPENAI_API_KEY").expect("app1 key")
+                )
+                .expect("read app1"),
+            None
+        );
+        assert_eq!(
+            manager
+                .get_custom_secret(
+                    &app_env_secret_storage_key("app2", "OPENAI_API_KEY").expect("app2 key")
+                )
+                .expect("read app2")
+                .as_deref(),
+            Some("sk-app2")
+        );
+        assert_eq!(
+            manager
+                .get_custom_secret("env:OPENAI_API_KEY")
+                .expect("read global")
+                .as_deref(),
+            Some("sk-global")
+        );
     }
 
     #[test]
@@ -10568,14 +13970,16 @@ mod tests {
 
     #[test]
     fn dynamic_container_run_args_include_hardening_flags() {
-        let app_dir = Path::new("/tmp/agentark-demo");
+        let app_dir = test_dynamic_container_app_dir();
+        let mount_plan = test_dynamic_container_mount_plan();
         let args = build_dynamic_container_run_args(
             "demo",
             app_dir,
+            &mount_plan,
             9123,
             DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
             "agentark-app-demo".to_string(),
-            Some(Path::new("/tmp/agentark-demo/.agentark.env")),
+            Some(Path::new("/app/data/apps/demo/.agentark.env")),
             None,
             "npm run start".to_string(),
         );
@@ -10593,7 +13997,6 @@ mod tests {
             "--cap-drop",
             "ALL",
             "--user",
-            "65532:65532",
             "--tmpfs",
             "/tmp:size=64m,noexec,nosuid,nodev",
         ] {
@@ -10604,14 +14007,76 @@ mod tests {
                 args
             );
         }
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--user" && !pair[1].trim().is_empty()));
+    }
+
+    #[test]
+    fn dynamic_container_args_mount_data_volume_for_app_workdir() {
+        let app_dir = test_dynamic_container_app_dir();
+        let mount_plan = test_dynamic_container_mount_plan();
+        let expected_user = app_dir_container_user(app_dir);
+        let args = build_dynamic_container_run_args(
+            "demo",
+            app_dir,
+            &mount_plan,
+            9123,
+            DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
+            "agentark-app-demo".to_string(),
+            None,
+            None,
+            "npm run start".to_string(),
+        );
+        let install_args = build_dynamic_container_install_args(
+            "demo",
+            app_dir,
+            &mount_plan,
+            9123,
+            DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
+            "agentark-app-demo-install".to_string(),
+            None,
+            "npm install".to_string(),
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--user" && pair[1] == expected_user.as_str()));
+        assert!(install_args
+            .windows(2)
+            .any(|pair| pair[0] == "--user" && pair[1] == expected_user.as_str()));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--mount"
+                && pair[1] == "type=volume,source=agentark-data,target=/app/data"
+        }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-w" && pair[1] == "/app/data/apps/demo"));
+        assert!(
+            !args.iter().any(|arg| arg == "-v"),
+            "app containers must not bind-mount executor-internal or host paths"
+        );
+        assert!(install_args.windows(2).any(|pair| {
+            pair[0] == "--mount"
+                && pair[1] == "type=volume,source=agentark-data,target=/app/data"
+        }));
+        assert!(install_args
+            .windows(2)
+            .any(|pair| pair[0] == "-w" && pair[1] == "/app/data/apps/demo"));
+        assert!(
+            !install_args.iter().any(|arg| arg == "-v"),
+            "install containers must not bind-mount executor-internal or host paths"
+        );
     }
 
     #[test]
     fn dynamic_container_run_args_share_executor_network_without_host_publish() {
-        let app_dir = Path::new("/tmp/agentark-demo");
+        let app_dir = test_dynamic_container_app_dir();
+        let mount_plan = test_dynamic_container_mount_plan();
         let args = build_dynamic_container_run_args(
             "demo",
             app_dir,
+            &mount_plan,
             9123,
             DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
             "agentark-app-demo".to_string(),
@@ -10631,10 +14096,12 @@ mod tests {
 
     #[test]
     fn dynamic_container_commands_bypass_agentark_image_entrypoint() {
-        let app_dir = Path::new("/tmp/agentark-demo");
+        let app_dir = test_dynamic_container_app_dir();
+        let mount_plan = test_dynamic_container_mount_plan();
         let args = build_dynamic_container_run_args(
             "demo",
             app_dir,
+            &mount_plan,
             9123,
             DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
             "agentark-app-demo".to_string(),
@@ -10655,6 +14122,7 @@ mod tests {
         let install_args = build_dynamic_container_install_args(
             "demo",
             app_dir,
+            &mount_plan,
             9123,
             DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
             "agentark-app-demo-install".to_string(),
@@ -11310,6 +14778,136 @@ edition = "2021"
                 .is_some(),
             "updated deployments should stamp updated_at"
         );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_existing_app_implicit_mode_preserves_unmentioned_files() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+
+        let initial_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Patchable App",
+                "files": {
+                    "index.html": "<!doctype html><html><head><link rel=\"stylesheet\" href=\"styles.css\"></head><body>v1</body></html>",
+                    "styles.css": "body { color: white; }"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("initial deploy should succeed");
+        let initial_json: serde_json::Value =
+            serde_json::from_str(&initial_result).expect("initial deploy json");
+        let app_id = initial_json
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .expect("initial app id")
+            .to_string();
+        let app_dir = data_dir.path().join("apps").join(&app_id);
+
+        app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "app_id": app_id,
+                "files": {
+                    "index.html": "<!doctype html><html><head><link rel=\"stylesheet\" href=\"styles.css\"></head><body>v2</body></html>"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("implicit existing-app update should succeed");
+
+        let updated_html = tokio::fs::read_to_string(app_dir.join("index.html"))
+            .await
+            .expect("updated html should remain readable");
+        assert!(updated_html.contains("v2"));
+        let preserved_css = tokio::fs::read_to_string(app_dir.join("styles.css"))
+            .await
+            .expect("unmentioned file should be preserved on implicit update");
+        assert!(preserved_css.contains("color: white"));
+    }
+
+    #[test]
+    fn static_content_fingerprint_ignores_runtime_only_fields() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "index.html".to_string(),
+            serde_json::Value::String("<!doctype html><html><body>same</body></html>".to_string()),
+        );
+        let required_inputs = Vec::new();
+        let config_values = HashMap::new();
+        let runtime_actions = Vec::new();
+
+        let static_local = app_deploy_content_fingerprint(
+            &files,
+            "Duplicate-aware app",
+            None,
+            None,
+            None,
+            None,
+            false,
+            RuntimePreference::Local,
+            None,
+            &required_inputs,
+            &config_values,
+            &runtime_actions,
+        );
+        let static_container = app_deploy_content_fingerprint(
+            &files,
+            "Duplicate-aware app",
+            None,
+            None,
+            None,
+            None,
+            false,
+            RuntimePreference::Container,
+            Some("agentark:alternate"),
+            &required_inputs,
+            &config_values,
+            &runtime_actions,
+        );
+        assert_eq!(static_local, static_container);
+
+        let dynamic_local = app_deploy_content_fingerprint(
+            &files,
+            "Duplicate-aware app",
+            Some("node server.js"),
+            None,
+            None,
+            None,
+            true,
+            RuntimePreference::Local,
+            None,
+            &required_inputs,
+            &config_values,
+            &runtime_actions,
+        );
+        let dynamic_container = app_deploy_content_fingerprint(
+            &files,
+            "Duplicate-aware app",
+            Some("node server.js"),
+            None,
+            None,
+            None,
+            true,
+            RuntimePreference::Container,
+            Some("agentark:alternate"),
+            &required_inputs,
+            &config_values,
+            &runtime_actions,
+        );
+        assert_ne!(dynamic_local, dynamic_container);
     }
 
     #[tokio::test]
