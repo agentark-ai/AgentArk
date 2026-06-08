@@ -14,7 +14,7 @@
   <a href="#install"><img src="https://img.shields.io/badge/INSTALL-Docker_Compose-2ea44f?style=for-the-badge" alt="Install"></a>
   <a href="#what-is-agentark"><img src="https://img.shields.io/badge/WEB_UI-localhost:8990-7C3AED?style=for-the-badge" alt="Web UI"></a>
   <a href="#license"><img src="https://img.shields.io/badge/LICENSE-MIT_%2F_Apache--2.0-orange?style=for-the-badge" alt="License"></a>
-  <a href="#why-rust"><img src="https://img.shields.io/badge/RUST-294K_lines-B7410E?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"></a>
+  <a href="ARCHITECTURE.md#why-rust"><img src="https://img.shields.io/badge/RUST-294K_lines-B7410E?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"></a>
   <a href="#install"><img src="https://img.shields.io/badge/FRONTEND-86K_TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript"></a>
   <a href="https://deepwiki.com/agentark-ai/AgentArk"><img src="https://img.shields.io/badge/DEEPWIKI-Ask_the_codebase-1F6FEB?style=for-the-badge" alt="DeepWiki"></a>
 </p>
@@ -37,8 +37,8 @@
   <a href="#configuration">Configuration</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#security">Security</a> &middot;
-  <a href="#api">API</a> &middot;
-  <a href="#contributing">Contributing</a> &middot;
+  <a href="API.md">API</a> &middot;
+  <a href="CONTRIBUTING.md">Contributing</a> &middot;
   <a href="https://deepwiki.com/agentark-ai/AgentArk">DeepWiki</a>
 </p>
 
@@ -494,7 +494,6 @@ You choose the trade-off at runtime. The core stays the same.
 
 1. Open **http://localhost:8990**
 2. Go to **Settings** → pick your **LLM Provider** → enter credentials
-3. Set **Bot Name** and **Personality** → Save → start chatting
 
 ### LLM providers
 
@@ -559,267 +558,15 @@ Full details: [SECURITY.md](SECURITY.md) and [VERIFY.md](VERIFY.md)
 
 ---
 
-## Design Principles
+## More documentation
 
-- **Secure first** - encrypted secrets, approvals, sandboxing, and verifiable records
-- **Daily by default** - briefs, reminders, follow-up, and messaging delivery are first-class
-- **Memory that compounds** - Memory builds on previous preferences, facts, sources, and reviewed memory changes
-- **Self-evolving** - corrections, tool outcomes, and benchmarks improve local memory, lessons, procedures, prompts, classifiers, specialist prompts, routing, and strategy; skills remain separately designed or installed capabilities
-- **Chat-first** - talk to it naturally, not through config files or flowcharts
-- **Power when needed** - tasks, watchers, apps, integrations, and swarm agents for deeper work
-- **Model-agnostic** - OpenAI, Anthropic, Google, Ollama, or any OpenAI-compatible endpoint
-- **Self-hosted** - your hardware, your data, your rules
+- **[Design principles & internals](ARCHITECTURE.md)** — design principles, why Rust, project structure, and the documentation map for navigating the codebase
+- **[API & Reflect](API.md)** — interactive API reference, Reflect query endpoints, and troubleshooting
+- **[Roadmap](ROADMAP.md)** — what's planned and what's intentionally deferred
+- **[Contributing](CONTRIBUTING.md)** — development setup, repository map, and contribution workflow
+- **[Acknowledgments](ACKNOWLEDGMENTS.md)** — the open-source projects AgentArk is built on
 
 ---
-
-## Why Rust?
-
-|                     |                                                                                   |
-| :------------------ | :-------------------------------------------------------------------------------- |
-| **Performance**     | Tokio async runtime, `Arc<RwLock<T>>` concurrency - no GIL bottleneck             |
-| **Security**        | `Zeroizing` auto-clears secrets from memory; zero `unsafe` blocks in the codebase |
-| **Type Safety**     | Enums, traits, and compile-time guarantees catch bugs before production           |
-| **Single Binary**   | One compiled binary + Docker - no dependency hell                                 |
-| **WASM Sandboxing** | Wasmtime integration is natural in Rust                                           |
-
----
-
-## API
-
-Full interactive API docs available at **http://localhost:8990/docs#/** after starting AgentArk.
-
-### Reflect queries
-
-Reflect is cached-read by default. Normal reads should use `GET /reflect`; heavy source scans, embedding, and refresh work are queued separately so the web UI and backend do not hang while a retrospective is prepared.
-
-```bash
-# Read the cached weekly reflection for an explicit UTC range.
-curl "http://localhost:8990/reflect?period=weekly&from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z"
-
-# Queue a guarded background refresh for that same range.
-curl -X POST "http://localhost:8990/reflect/refresh?period=weekly&from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z"
-
-# Shortcut: read cached data and request a refresh in the same call.
-curl "http://localhost:8990/reflect?period=monthly&from=2026-05-01T00:00:00Z&to=2026-06-01T00:00:00Z&refresh=1"
-```
-
-Supported `period` values are `daily`, `weekly`, and `monthly`. `from` and `to` are RFC3339 timestamps; omit them to use the default window for the selected period. Responses include `clusters`, `source_counts`, `baseline_source_counts`, `embedding_status`, `refresh_status`, `cache_status`, `related_history`, and `unclustered_units`.
-
-Reflect does not store raw per-message chat embeddings. It creates retention-managed `semantic_work_units` from derived summaries and source metadata, embeds those work units, then clusters and compares them across time windows.
-
-Reflect Daily Digest can be enabled in Settings. When enabled, AgentArk prepares a short LLM-written recap after a quiet end-of-day window, stores it in the notification feed, and attempts the selected notification channel. If the structured activity gate finds nothing meaningful, no notification is sent.
-
----
-
-## Troubleshooting
-
-<details>
-<summary>Settings won't save</summary>
-
-- Check that you have a valid API key for non-Ollama providers
-- Ensure the model name is correct
-</details>
-
-<details>
-<summary>Telegram bot not responding</summary>
-
-- Restart after changing Telegram settings
-- Verify your user ID is in Allowed Users
-- Check bot token is correct
-</details>
-
-<details>
-<summary>Data lost after restart</summary>
-
-- Always use Docker volumes - `docker compose` handles this automatically
-- If using `docker run`, add `-v agentark-data:/app/data -v agentark-config:/app/config`
-</details>
-
-<details>
-<summary>Debug logging</summary>
-
-```bash
-AGENTARK_DEBUG=true ./scripts/start.sh              # full debug
-RUST_LOG=info,agentark=debug ./scripts/start.sh     # agent internals only
-```
-
-</details>
-
----
-
-## Roadmap
-
-- Support multiple accounts per provider across integrations, channels, and reasoning, with workspace-level account management and selection. Project-specific selection can be revisited in phase 2.
-- Let users refine an active chat run with extra instructions while AgentArk is still working.
-- Re-enable retry, resume, and cancel controls after they are implemented end to end across chat, tasks, traces, streaming state, and backend execution. These controls are intentionally hidden until the future workflow is reliable and usable.
-- Re-document the native `agentark` CLI as a first-class surface. The binary still ships and the flags (`--chat`, `--pulse`, `--setup`, `--headless`) still work, but test coverage is minimal so the CLI is no longer advertised. Bring it back once it has end-to-end coverage parity with the Web UI for chat, settings, approvals, and integrations.
-- Add external database support through a dedicated Databases page with read-only schema inspection and conversational querying. Planned providers: Postgres, Supabase, MySQL, Snowflake, and Databricks SQL.
-- Add local-only message history querying through user-approved companion devices. Planned flow: a user asks AgentArk to search messages, AgentArk sends a typed `messages.search` command to a paired local companion, the user approves the exact query/scope/time range, and only bounded results return to AgentArk. Initial target is macOS iMessage via a local companion because iOS cannot expose Messages history to browser or app companions; WhatsApp, Telegram, SMS, and other local app stores require separate companion support where the platform permits it.
-- Add voice as a future opt-in capability. The planned direction is two-way local voice with interruption support: microphone audio becomes reviewed transcript input, AgentArk runs through the same chat/spine/conversation history path, and optional spoken output returns through a local voice bridge. Voice is not built, installed, or started by default today.
-- Explore optional Zero toolchain support for small reusable native helper tools. AgentArk would use it only when a task or repo needs Zero, because its structured compiler diagnostics and explicit capability model can help agents repair and permission-check generated tools without making Zero a default runtime dependency.
-- Explore install-time capability selection after the default runtime is stable. The current plan is to keep the one-command install low-friction and ship the full runtime by default, then add plain installer questions for larger or privileged capabilities such as Playwright/browser automation, Google Workspace tooling, private networking, and tunnel support. Recommended capabilities should stay selected by default, non-interactive installs should use the recommended defaults automatically, and AgentArk should show size, credential, privilege, health-check, and restart/recreate implications before changing installed capabilities. Settings should eventually let users add or remove these capability packs later without turning startup into a flag matrix.
-- Add generic chat-driven app setup for external repositories and self-hosted tools. AgentArk should be able to read setup instructions, choose an install strategy such as Docker Compose, Dockerfile, Python venv, Node, Rust, or explicit custom commands, create the needed config from safe templates, request secrets only through secure credential prompts, start the service, health-check it, persist lifecycle controls, and register any discovered API, MCP server, webhook, or custom integration so the user can use the running service from chat without a product-specific installer.
-- ArkOrbit is in development for a future release as a dynamic app and widget deployment surface.
-- Optional GPU-accelerated learning for power users. Entirely opt-in and self-hosted - your data never leaves your machine, and any improvement is gated by AgentArk's existing rollout-and-promotion pipeline so your live agent only changes when a candidate clearly beats it.
-  - Phase 1 (consumer GPU): lightweight on-device learning that makes routine decisions and evaluation faster and cheaper.
-  - Phase 2 (workstation GPU): personalization from your own usage - your local agent gradually adapts to your tasks and preferences.
-  - Phase 3 (multi-GPU / cluster): heavier on-device training and inference acceleration for teams running serious hardware.
-
----
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
-
-### Setup
-
-```bash
-git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
-
-# Backend (Rust 1.75+)
-cargo build && cargo test
-
-# Frontend (Node 20+)
-cd frontend && npm install && npm run dev
-
-# Full stack via Docker
-AGENTARK_IMAGE=agentark:dev ./scripts/start.sh build
-```
-
-### Project structure
-
-```
-src/
-├── core/           # Agent engine, LLM routing, memory, pipeline, self-evolve
-├── actions/        # Tool implementations (SSH, search, apps, research)
-├── channels/       # HTTP API, Telegram, WhatsApp
-├── security/       # Action guard, safety rules
-├── runtime/        # WASM + Docker sandboxing
-├── storage/        # PostgreSQL persistence, entities
-├── integrations/   # GitHub, Notion, Twitter, MCP, etc.
-└── main.rs         # Entrypoint
-
-frontend/src/       # React + MUI + TypeScript web UI
-skills/             # Built-in skill definitions
-```
-
-### Documentation Map
-
-For documentation generators such as DeepWiki, these are the main product concepts and source areas to index first.
-
-| Area                   | Start here                                                                                                                               | Notes                                                                                                                                         |
-| :--------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- |
-| Product shell          | `frontend/src/App.tsx`, `frontend/src/components/NativeWorkspace.tsx`, `frontend/src/styles.css`                                         | Navigation, responsive shell, Mission Control, Chat, Memory, Reflect, Sentinel, Evolve, Pulse, and settings surfaces           |
-| API surface            | `src/channels/http.rs`, `src/channels/http/*`                                                                                            | HTTP routes, settings, integrations, companion devices, model control, webhooks, Reflect, Pulse, Sentinel, and Memory panels      |
-| Agent runtime          | `src/core/agent.rs`, `src/core/agent/*`, `src/runtime/mod.rs`                                                                            | Tool planning, execution loop, approvals, sandboxing, task routing, generated apps, action traces, and response delivery                      |
-| Memory and learning    | `src/core/learning.rs`, `src/core/memory_dedup.rs`, `src/storage/entities/experience_item.rs`                                            | User facts, preferences, Memory views, semantic deduplication, provenance, review, rollback, and consolidation                             |
-| Reflect             | `src/channels/http/reflect_control.rs`, `src/storage/entities/semantic_work_unit.rs`, `frontend/src/components/pages/ArkReflectPage.tsx` | Cached local retrospectives, derived semantic work units, day/week/month clustering, source coverage, related-history lookup, and Panorama UI |
-| Sentinel            | `src/sentinel.rs`, `src/channels/http/sentinel_panel.rs`, `src/core/autonomy.rs`                                                         | Follow-up scanning, routine detection, health findings, proposals, scheduled work, and automation nudges                                      |
-| Evolve              | `src/core/self_evolve/*`, `src/core/agent/tool_execution.rs`                                                                             | Prompt, policy, classifier, and specialist evolution with canaries, replay evaluation, promotion gates, and rollback                          |
-| Pulse               | `src/sentinel.rs`, `src/core/observability.rs`, `src/core/release_updates.rs`                                                            | Runtime health checks, remediation hints, operational findings, update status, and system readiness surfaces                                  |
-| Integrations and packs | `src/extension_packs/mod.rs`, `src/channels/http/integrations.rs`, `frontend/src/components/IntegrationsPanel.tsx`                       | Extension packs, messaging channels, OAuth/setup wizards, custom APIs, MCP, webhooks, install/delete cleanup, and secrets handling            |
-| Companion devices      | `src/core/companion.rs`, `src/channels/http/companion_control.rs`, `frontend/src/components/CompanionDevicesPanel.tsx`                   | Pairing, scoped grants, high-risk approvals, audit trail, device commands, and queued actions                                                 |
-| Storage and secrets    | `src/storage/*`, `src/core/config.rs`, `src/core/secrets.rs`, `src/storage/encrypted.rs`                                                 | Postgres entities, schema setup, encrypted config, secret storage, retention, cleanup, and audit data                                         |
-
-Key flows worth documenting:
-
-- Chat request -> plan/tool loop -> trace -> response -> memory and automation updates.
-- Memory capture -> semantic deduplication -> review and provenance -> rollback when needed.
-- Background session, task, or watcher -> Sentinel follow-up -> approval or scheduled action.
-- Reflect refresh -> bounded source scan -> derived semantic work units -> cached clusters and visual recap.
-- Integration install or delete -> config, secrets, files, and audit cleanup.
-- App generation and deployment -> sandbox/runtime -> private or public access -> Pulse health checks.
-- Evolve review candidate -> past-example test -> approval or rejection -> apply or leave unchanged.
-- Evolve prompt/policy candidate -> benchmark -> limited live rollout or promotion -> stop, disable, or rollback where supported.
-
----
-
-## Acknowledgments
-
-AgentArk stands on the shoulders of a large open-source ecosystem. None of this would exist without the maintainers of these projects:
-
-**Core runtime**
-
-| Project                                                                                                               | Used for                                                         |
-| :-------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- |
-| [Rust](https://www.rust-lang.org/)                                                                                    | Core language - memory safety, performance, fearless concurrency |
-| [Tokio](https://tokio.rs/)                                                                                            | Async runtime powering all concurrent operations                 |
-| [Hyper](https://hyper.rs/) + [Axum](https://github.com/tokio-rs/axum) + [Tower](https://github.com/tower-rs/tower)    | HTTP stack, server, router, middleware                           |
-| [Tokio-Tungstenite](https://github.com/snapview/tokio-tungstenite)                                                    | WebSocket implementation (channels + companion devices)          |
-| [Reqwest](https://github.com/seanmonstar/reqwest)                                                                     | HTTP client for every outbound API call                          |
-| [Futures](https://github.com/rust-lang/futures-rs)                                                                    | Async streams, combinators, and background pipeline plumbing      |
-| [Serde](https://serde.rs/) + [serde_json](https://github.com/serde-rs/json) + [TOML](https://github.com/toml-rs/toml) | Serialization across the entire codebase                         |
-| [Tracing](https://github.com/tokio-rs/tracing)                                                                        | Structured logging and diagnostics                               |
-| [Clap](https://github.com/clap-rs/clap)                                                                               | CLI argument parsing                                             |
-| [Anyhow](https://github.com/dtolnay/anyhow) + [Thiserror](https://github.com/dtolnay/thiserror)                       | Error handling                                                   |
-
-**Storage, data, and scheduling**
-
-| Project                                                                                                              | Used for                                         |
-| :------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
-| [PostgreSQL](https://www.postgresql.org/) + [pgvector](https://github.com/pgvector/pgvector)                         | Primary database and vector embedding store      |
-| [SeaORM](https://www.sea-ql.org/SeaORM/) + [SQLx](https://github.com/launchbadge/sqlx)                               | Database ORM and query layer                     |
-| [Chrono](https://github.com/chronotope/chrono) + [chrono-tz](https://github.com/chronotope/chrono-tz)                | Time and timezone handling                       |
-| [cron](https://github.com/zslayton/cron)                                                                              | Cron expression parsing for scheduled tasks      |
-| [FastEmbed](https://github.com/Anush008/fastembed-rs)                                                                | Local embedding generation for memory and search |
-| [pdf-extract](https://github.com/jrmuizel/pdf-extract)                                                               | PDF text extraction for documents                |
-| [notify](https://github.com/notify-rs/notify) + [walkdir](https://github.com/BurntSushi/walkdir)                     | Filesystem watching and safe directory scans     |
-| [zip](https://github.com/zip-rs/zip2)                                                                                 | Extension-pack, DOCX, and archive handling       |
-
-**Security and cryptography**
-
-| Project                                                                                                                                          | Used for                                       |
-| :----------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------- |
-| [Ring](https://github.com/briansmith/ring) + [Rustls](https://github.com/rustls/rustls)                                                          | TLS and general-purpose cryptography           |
-| [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) + [x25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) | Device pairing and signed identities           |
-| [AES-GCM](https://github.com/RustCrypto/AEADs) + [Argon2](https://github.com/RustCrypto/password-hashes)                                         | Secret-at-rest encryption and password hashing |
-| [SHA-2](https://github.com/RustCrypto/hashes) + [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)                                                  | Hashing for integrity and content addressing   |
-| [Zeroize](https://github.com/iqlusioninc/crates/tree/main/zeroize)                                                                               | Wiping secrets from memory                     |
-
-**Execution, automation, and integrations**
-
-| Project                                                                               | Used for                                            |
-| :------------------------------------------------------------------------------------ | :-------------------------------------------------- |
-| [Wasmtime](https://wasmtime.dev/)                                                     | WebAssembly sandbox for safe code execution         |
-| [Docker](https://www.docker.com/) + [Bollard](https://github.com/fussybeaver/bollard) | Container runtime and Rust Docker client            |
-| [Playwright](https://playwright.dev/)                                                 | Interactive browser automation and operator handoff |
-| [Lightpanda](https://github.com/lightpanda-io/browser)                                | Fast headless browser for content extraction        |
-| [scraper](https://github.com/rust-scraper/scraper)                                   | HTML parsing for search, app inspection, and guards |
-| [russh](https://github.com/warp-tech/russh)                                           | SSH client for remote-action flows                  |
-| [SearXNG](https://github.com/searxng/searxng)                                         | Self-hosted metasearch (optional research backend)  |
-| [Model Context Protocol](https://modelcontextprotocol.io/)                            | Open standard for pluggable tool surfaces           |
-| [Cloudflared](https://github.com/cloudflare/cloudflared)                              | Public-link remote access via Cloudflare Tunnel     |
-| [Tailscale](https://tailscale.com/)                                                   | Private tailnet access with end-to-end encryption   |
-
-**Messaging channels and bots**
-
-| Project                                                                                                                       | Used for                   |
-| :---------------------------------------------------------------------------------------------------------------------------- | :------------------------- |
-| [Teloxide](https://github.com/teloxide/teloxide)                                                                              | Telegram bot framework     |
-| [Baileys](https://github.com/WhiskeySockets/Baileys)                                                                          | Embedded WhatsApp bridge   |
-| Platform HTTP/WebSocket APIs (Slack, Discord, Matrix, Signal, iMessage, Google Chat, Teams, LINE, WeChat, QQ, and others)     | Messaging-channel adapters |
-| [Lettre](https://github.com/lettre/lettre)                                                                                    | SMTP email delivery        |
-
-**Frontend and visualization**
-
-| Project                                                                                                             | Used for                                  |
-| :------------------------------------------------------------------------------------------------------------------ | :---------------------------------------- |
-| [React](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)                                         | Web UI foundation                         |
-| [Vite](https://vitejs.dev/)                                                                                         | Frontend build and dev server             |
-| [MUI](https://mui.com/) + [Emotion](https://emotion.sh/)                                                            | Component library and CSS-in-JS           |
-| [TanStack Query](https://tanstack.com/query)                                                                        | Server-state management and data fetching |
-| [Zustand](https://github.com/pmndrs/zustand)                                                                        | Client-state management                   |
-| [ECharts](https://echarts.apache.org/) + [echarts-for-react](https://github.com/hustcc/echarts-for-react)           | Charts and visualizations                 |
-| [react-markdown](https://github.com/remarkjs/react-markdown) + [remark-gfm](https://github.com/remarkjs/remark-gfm) | Markdown rendering in chat                |
-| [Lucide](https://lucide.dev/)                                                                                       | Icon set                                  |
-
-**Native GUI (optional feature)**
-
-| Project                                                                | Used for                  |
-| :--------------------------------------------------------------------- | :------------------------ |
-| [egui](https://www.egui.rs/) + [eframe](https://github.com/emilk/egui) | Native desktop GUI option |
-
-If we missed a project that's load-bearing for AgentArk, please open a PR - we want to thank everyone.
 
 ## License
 
