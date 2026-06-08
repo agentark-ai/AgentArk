@@ -154,6 +154,10 @@ RUN --mount=type=cache,id=agentark-frontend-npm,target=/root/.npm \
     npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci
 ARG FRONTEND_CACHEBUST=0
 COPY frontend/src ./src
+# public/ carries self-hosted fonts (and any other static passthrough files);
+# Vite copies it into dist/ at build time. Without it the served UI 404s on
+# /fonts/* and silently falls back to system fonts.
+COPY frontend/public ./public
 COPY frontend/index.html frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts ./
 RUN npm run build
 

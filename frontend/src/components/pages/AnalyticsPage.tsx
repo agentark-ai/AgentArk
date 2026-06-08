@@ -7,7 +7,6 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
-  IconButton,
   MenuItem,
   Stack,
   Tab,
@@ -19,10 +18,8 @@ import {
   TableRow,
   TextField,
   Tabs,
-  Tooltip,
   Typography,
 } from "@mui/material";
-import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import ReactECharts from "echarts-for-react";
@@ -122,6 +119,22 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     return bucket === "hour"
       ? formatUiDateTime(value, { fallback: value })
       : formatUiDateOnly(value, { fallback: value });
+  }
+
+  function canonicalBucketKey(value: string): string {
+    const time = Date.parse(value);
+    return Number.isFinite(time) ? `time:${time}` : `raw:${value}`;
+  }
+
+  function compareBucketKeys(a: string, b: string): number {
+    const parseKeyTime = (key: string) =>
+      key.startsWith("time:") ? Number(key.slice("time:".length)) : NaN;
+    const at = parseKeyTime(a);
+    const bt = parseKeyTime(b);
+    if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) {
+      return at - bt;
+    }
+    return a.localeCompare(b);
   }
 
   function formatPolicyVersionLabel(value: string): string {
@@ -291,6 +304,8 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     "#f97316",
   ];
   const analyticsSeries = resp?.series || [];
+  const arkDistillTotals = resp?.arkdistill?.totals;
+  const arkDistillSeries = resp?.arkdistill?.series || [];
   const analyticsBucketLabels = analyticsSeries.map((point) =>
     formatAnalyticsBucketLabel(point.bucket_start, effectiveBucket),
   );
@@ -352,8 +367,6 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
   const spendValue = formatUsd(totals?.cost_usd);
   const requestsValue = compactNumber(num(totals?.request_count, 0));
   const tokensValue = compactNumber(num(totals?.total_tokens, 0));
-  const arkDistillTotals = resp?.arkdistill?.totals;
-  const arkDistillSeries = resp?.arkdistill?.series || [];
   const arkDistillSavedTokens = num(
     arkDistillTotals?.estimated_saved_tokens,
     0,
@@ -378,33 +391,60 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
   const totalTokenBucketSeries = analyticsSeries.map((point) =>
     num(point.total_tokens, 0),
   );
-  const arkDistillSavedTokenBucketSeries = arkDistillSeries.map((point) =>
-    num(point.estimated_saved_tokens, 0),
+  const analyticsPointByBucket = new Map(
+    analyticsSeries.map((point) => [canonicalBucketKey(point.bucket_start), point]),
+  );
+  const arkDistillPointByBucket = new Map(
+    arkDistillSeries.map((point) => [canonicalBucketKey(point.bucket_start), point]),
+  );
+  const savingsBucketLabelByKey = new Map<string, string>();
+  for (const point of analyticsSeries) {
+    savingsBucketLabelByKey.set(
+      canonicalBucketKey(point.bucket_start),
+      point.bucket_start,
+    );
+  }
+  for (const point of arkDistillSeries) {
+    const key = canonicalBucketKey(point.bucket_start);
+    if (!savingsBucketLabelByKey.has(key)) {
+      savingsBucketLabelByKey.set(key, point.bucket_start);
+    }
+  }
+  const savingsBucketKeys = Array.from(savingsBucketLabelByKey.keys()).sort(
+    compareBucketKeys,
+  );
+  const savingsBucketLabels = savingsBucketKeys.map((key) =>
+    formatAnalyticsBucketLabel(
+      savingsBucketLabelByKey.get(key) ?? key,
+      effectiveBucket,
+    ),
+  );
+  const savingsTotalTokenBucketSeries = savingsBucketKeys.map((key) =>
+    num(analyticsPointByBucket.get(key)?.total_tokens, 0),
+  );
+  const arkDistillSavedTokenBucketSeries = savingsBucketKeys.map((key) =>
+    num(arkDistillPointByBucket.get(key)?.estimated_saved_tokens, 0),
   );
   const cachedPromptTokensTotal = num(totals?.cached_prompt_tokens, 0);
   const cacheCreationPromptTokensTotal = num(
     totals?.cache_creation_prompt_tokens,
     0,
   );
-  const promptTokensTotal = num(totals?.prompt_tokens, 0);
   const cachedPromptBucketSeries = analyticsSeries.map((point) =>
     num(point.cached_prompt_tokens, 0),
+  );
+  const savingsCachedPromptBucketSeries = savingsBucketKeys.map((key) =>
+    num(analyticsPointByBucket.get(key)?.cached_prompt_tokens, 0),
   );
   const cacheCreationPromptBucketSeries = analyticsSeries.map((point) =>
     num(point.cache_creation_prompt_tokens, 0),
   );
-  const cacheReadShare =
-    promptTokensTotal > 0 ? cachedPromptTokensTotal / promptTokensTotal : 0;
-  const activeRangeLabel =
-    activeRange === "custom"
-      ? `Custom / ${formatUiDateRange(appliedCustomFrom, appliedCustomTo)}`
-      : RANGE_PRESETS.find((preset) => preset.value === activeRange)?.label ??
-        activeRange;
-  const averageSpendPerBucket =
-    spendBucketSeries.length > 0
-      ? spendBucketSeries.reduce((sum, value) => sum + value, 0) /
-        spendBucketSeries.length
-      : 0;
+  const estimatedWithoutSavingsBucketSeries = savingsBucketKeys.map(
+    (_key, index) =>
+      savingsTotalTokenBucketSeries[index] +
+      arkDistillSavedTokenBucketSeries[index] +
+      savingsCachedPromptBucketSeries[index],
+  );
   let peakSpendPoint: (typeof analyticsSeries)[number] | null = null;
   let peakSpendAmount = 0;
   for (const point of analyticsSeries) {
@@ -425,17 +465,6 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     (sum, point) => sum + num(point.helper_total_tokens, 0),
     0,
   );
-  const helperTokenShare =
-    num(totals?.total_tokens, 0) > 0
-      ? helperTokensTotal / num(totals?.total_tokens, 0)
-      : 0;
-  const dominantModel = (resp?.by_model || [])[0] || null;
-  const dominantModelLabel = dominantModel
-    ? shortVersionLabel(formatBreakdownLabel(dominantModel, "model"), 34)
-    : "No traffic yet";
-  const dominantModelDetail = dominantModel
-    ? `${compactNumber(num(dominantModel.request_count, 0))} requests / ${formatUsd(dominantModel.cost_usd, 4)}`
-    : "Waiting for model activity.";
   const secondaryBreakdownView: BreakdownView =
     (resp?.by_channel || []).length > 0 ? "channel" : "purpose";
   const secondaryBreakdownTitle =
@@ -457,35 +486,6 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
         ? "Which AgentArk surfaces are generating the most LLM traffic."
         : "How traffic is split between response generation and helper passes.";
   const previewBreakdownRows = breakdownRows.slice(0, 24);
-  const heroSummaryCards = [
-    {
-      label: "Peak bucket",
-      value: formatUsd(peakSpendAmount),
-      detail: peakSpendLabel,
-    },
-    {
-      label: "Dominant model",
-      value: dominantModelLabel,
-      detail: dominantModelDetail,
-    },
-    {
-      label: "Helper share",
-      value: `${(helperTokenShare * 100).toFixed(1)}%`,
-      detail: `${compactNumber(helperTokensTotal)} helper tokens in range`,
-    },
-    {
-      label: "Prompt cache",
-      value: `${compactNumber(cachedPromptTokensTotal)} read`,
-      detail: `${compactNumber(cacheCreationPromptTokensTotal)} written / ${(
-        cacheReadShare * 100
-      ).toFixed(1)}% read share`,
-    },
-    {
-      label: "ArkDistill saved",
-      value: `${arkDistillSavingsPercent.toFixed(1)}%`,
-      detail: `${compactNumber(arkDistillSavedTokens)} tokens / ${arkDistillSavedCostLabel}`,
-    },
-  ];
   const railCards = [
     {
       label: "Selected spend",
@@ -535,25 +535,22 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     (max, row) => Math.max(max, num(row.request_count, 0)),
     1,
   );
-  const spendTickStride = Math.max(
-    1,
-    Math.ceil(Math.max(analyticsBucketLabels.length, 1) / 6),
-  );
   const analyticsNeedsDataZoom = analyticsBucketLabels.length > 16;
   const analyticsZoomStart = analyticsNeedsDataZoom
     ? Math.max(0, 100 - (16 / analyticsBucketLabels.length) * 100)
     : 0;
-  const visibleAnalyticsBucketCount = analyticsNeedsDataZoom
-    ? 16
-    : Math.max(analyticsBucketLabels.length, 1);
-  const spendChartBarMaxWidth =
-    visibleAnalyticsBucketCount <= 1
-      ? 44
-      : visibleAnalyticsBucketCount <= 3
-        ? 36
-        : visibleAnalyticsBucketCount <= 8
-          ? 28
-          : 18;
+  const analyticsTickStride = Math.max(
+    1,
+    Math.ceil(Math.max(analyticsBucketLabels.length, 1) / 6),
+  );
+  const savingsNeedsDataZoom = savingsBucketLabels.length > 16;
+  const savingsZoomStart = savingsNeedsDataZoom
+    ? Math.max(0, 100 - (16 / savingsBucketLabels.length) * 100)
+    : 0;
+  const savingsTickStride = Math.max(
+    1,
+    Math.ceil(Math.max(savingsBucketLabels.length, 1) / 6),
+  );
   const sparklineBarMaxWidthForCount = (count: number) =>
     count <= 1 ? 10 : count <= 3 ? 9 : count <= 8 ? 7 : 5;
   const policySummaryCards = [
@@ -750,61 +747,79 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
       },
     ],
   };
+  const rangeSelect = (
+    <TextField
+      select
+      className="workspace-page-select"
+      size="small"
+      value={activeRange}
+      onChange={(e) => {
+        const val = e.target.value as AnalyticsRange | "open_custom";
+        if (val === "open_custom") {
+          handleRangeChange("custom");
+        } else {
+          handleRangeChange(val);
+        }
+      }}
+      sx={{ minWidth: 168, flexShrink: 0 }}
+    >
+      <MenuItem disabled sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}>
+        Hours
+      </MenuItem>
+      <MenuItem value="1h">1 hour</MenuItem>
+      <MenuItem value="2h">2 hours</MenuItem>
+      <MenuItem value="6h">6 hours</MenuItem>
+      <MenuItem value="24h">24 hours</MenuItem>
+      <MenuItem disabled sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}>
+        Days
+      </MenuItem>
+      <MenuItem value="3d">3 days</MenuItem>
+      <MenuItem disabled sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}>
+        Weeks
+      </MenuItem>
+      <MenuItem value="7d">1 week</MenuItem>
+      <MenuItem value="14d">2 weeks</MenuItem>
+      <MenuItem value="21d">3 weeks</MenuItem>
+      <MenuItem disabled sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}>
+        Months
+      </MenuItem>
+      <MenuItem value="30d">1 month</MenuItem>
+      <MenuItem value="45d">45 days</MenuItem>
+      <MenuItem value="60d">2 months</MenuItem>
+      <MenuItem value="90d">3 months</MenuItem>
+      <Divider />
+      {activeRange === "custom" ? (
+        <MenuItem value="custom">
+          Custom ({formatUiDateRange(appliedCustomFrom, appliedCustomTo)})
+        </MenuItem>
+      ) : null}
+      <MenuItem value={"open_custom" as string}>Custom range...</MenuItem>
+    </TextField>
+  );
 
   return (
-    <WorkspacePageShell spacing={1.35}>
+    <WorkspacePageShell spacing={1.1}>
       <WorkspacePageHeader
-        eyebrow="Data"
+        eyebrow="DATA"
         title="Analytics"
-        description="LLM usage, policy performance, and model mix across the selected range."
+        description="LLM usage, prompt cache, ArkDistill savings, routing performance, and model mix."
         actions={
-          <TextField
-            select
-            className="workspace-page-select"
-            size="small"
-            value={activeRange}
-            onChange={(e) => {
-              const val = e.target.value as AnalyticsRange | "open_custom";
-              if (val === "open_custom") {
-                handleRangeChange("custom");
-              } else {
-                handleRangeChange(val);
-              }
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={0.75}
+            sx={{
+              alignItems: { xs: "stretch", sm: "center" },
+              justifyContent: "flex-end",
             }}
-            sx={{ minWidth: 168, flexShrink: 0 }}
           >
-            <MenuItem
-              disabled
-              sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}
+            <Typography
+              variant="caption"
+              sx={{ color: "text.secondary", whiteSpace: "nowrap" }}
             >
-              Hours
-            </MenuItem>
-            <MenuItem value="1h">1 hour</MenuItem>
-            <MenuItem value="2h">2 hours</MenuItem>
-            <MenuItem value="6h">6 hours</MenuItem>
-            <MenuItem value="24h">24 hours</MenuItem>
-            <MenuItem
-              disabled
-              sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}
-            >
-              Days
-            </MenuItem>
-            <MenuItem value="3d">3 days</MenuItem>
-            <MenuItem value="7d">7 days</MenuItem>
-            <MenuItem value="14d">14 days</MenuItem>
-            <MenuItem value="21d">21 days</MenuItem>
-            <MenuItem value="30d">30 days</MenuItem>
-            <MenuItem value="45d">45 days</MenuItem>
-            <MenuItem value="60d">60 days</MenuItem>
-            <MenuItem value="90d">90 days</MenuItem>
-            <Divider />
-            {activeRange === "custom" ? (
-              <MenuItem value="custom">
-                Custom ({formatUiDateRange(appliedCustomFrom, appliedCustomTo)})
-              </MenuItem>
-            ) : null}
-            <MenuItem value={"open_custom" as string}>Custom range...</MenuItem>
-          </TextField>
+              {analyticsRangeLabel}
+            </Typography>
+            {rangeSelect}
+          </Stack>
         }
       />
       {analyticsTruncated ? (
@@ -877,18 +892,382 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
           minWidth: 0,
         }}
       >
+        <Stack
+          spacing={1.5}
+          useFlexGap
+          sx={{ gridColumn: { lg: "1" }, minWidth: 0 }}
+        >
           <Box
             className="list-shell"
             sx={{
-              gridColumn: { lg: "1" },
+              order: 2,
+              p: 1.6,
+              minWidth: 0,
+              overflow: "hidden",
+            }}
+          >
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              sx={{
+                alignItems: { xs: "stretch", sm: "flex-start" },
+                justifyContent: "space-between",
+                mb: 0.75,
+              }}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography
+                  variant="subtitle1"
+                  sx={{ color: "#fff8ed", fontWeight: 600, mb: 0.25 }}
+                >
+                  Token savings
+                </Typography>
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                    display: "block",
+                  }}
+                >
+                  What ArkDistill compaction and prompt caching saved — actual
+                  token load vs. the estimated load without them.
+                </Typography>
+              </Box>
+            </Stack>
+            <ReactECharts
+              style={{ height: 292 }}
+              option={{
+                backgroundColor: "transparent",
+                animationDuration: 420,
+                grid: {
+                  left: 54,
+                  right: 58,
+                  top: 42,
+                  bottom: savingsNeedsDataZoom ? 54 : 34,
+                },
+                dataZoom: savingsNeedsDataZoom
+                  ? [
+                      {
+                        type: "inside",
+                        xAxisIndex: 0,
+                        start: savingsZoomStart,
+                        end: 100,
+                        throttle: 80,
+                      },
+                      {
+                        type: "slider",
+                        xAxisIndex: 0,
+                        start: savingsZoomStart,
+                        end: 100,
+                        height: 18,
+                        bottom: 6,
+                        borderColor: chartTokens.zoomBorder,
+                        fillerColor: chartTokens.zoomFill,
+                        handleStyle: { color: chartTokens.axisLabel },
+                        textStyle: { color: chartTokens.axisLabel },
+                      },
+                    ]
+                  : undefined,
+                legend: {
+                  top: 0,
+                  right: 0,
+                  textStyle: { color: chartTokens.legendText, fontSize: 11 },
+                  itemWidth: 10,
+                  itemHeight: 10,
+                },
+                tooltip: {
+                  trigger: "axis",
+                  backgroundColor: chartTokens.tooltipBg,
+                  borderColor: chartTokens.tooltipBorder,
+                  textStyle: { color: chartTokens.tooltipText },
+                  formatter: (
+                    params: Array<{
+                      axisValue?: string;
+                      dataIndex?: number;
+                      marker?: string;
+                      seriesName?: string;
+                      value?: number | string | null;
+                    }>,
+                  ) => {
+                    const index = params[0]?.dataIndex ?? 0;
+                    const bucket =
+                      savingsBucketLabels[index] || params[0]?.axisValue || "Bucket";
+                    const actual = savingsTotalTokenBucketSeries[index] ?? 0;
+                    const withoutSavings =
+                      estimatedWithoutSavingsBucketSeries[index] ?? actual;
+                    const arkDistillSaved =
+                      arkDistillSavedTokenBucketSeries[index] ?? 0;
+                    const cacheReused =
+                      savingsCachedPromptBucketSeries[index] ?? 0;
+                    return [
+                      bucket,
+                      `With savings: ${compactNumber(actual)} tokens`,
+                      `Without savings: ${compactNumber(withoutSavings)} tokens`,
+                      `ArkDistill saved: ${compactNumber(arkDistillSaved)} tokens`,
+                      `Prompt cache reused: ${compactNumber(cacheReused)} tokens`,
+                    ].join("<br/>");
+                  },
+                },
+                xAxis: {
+                  type: "category",
+                  data: savingsBucketLabels,
+                  axisTick: { show: false },
+                  axisLabel: {
+                    color: chartTokens.axisLabel,
+                    fontSize: 10,
+                    interval: 0,
+                    formatter: (value: string, index: number) =>
+                      index === 0 ||
+                      index === savingsBucketLabels.length - 1 ||
+                      index % savingsTickStride === 0
+                        ? value
+                        : "",
+                  },
+                  axisLine: {
+                    lineStyle: { color: chartTokens.axisLine },
+                  },
+                },
+                yAxis: {
+                  type: "value",
+                  axisLabel: {
+                    color: chartTokens.axisLabel,
+                    formatter: (value: number) => compactNumber(value),
+                  },
+                  splitLine: {
+                    lineStyle: { color: chartTokens.splitLine },
+                  },
+                },
+                series: [
+                  {
+                    type: "line",
+                    name: "Without savings",
+                    data: estimatedWithoutSavingsBucketSeries,
+                    smooth: true,
+                    symbol: "circle",
+                    symbolSize: 6,
+                    lineStyle: { color: "#f0b86a", width: 2, type: "dashed" },
+                    itemStyle: { color: "#f0b86a" },
+                    areaStyle: {
+                      opacity: 0.12,
+                      color: {
+                        type: "linear",
+                        x: 0,
+                        y: 0,
+                        x2: 0,
+                        y2: 1,
+                        colorStops: [
+                          { offset: 0, color: "rgba(240, 184, 106, 0.28)" },
+                          { offset: 1, color: "rgba(240, 184, 106, 0)" },
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    type: "line",
+                    name: "With savings",
+                    data: savingsTotalTokenBucketSeries,
+                    smooth: true,
+                    symbol: "circle",
+                    symbolSize: 6,
+                    lineStyle: { color: "#14f195", width: 2 },
+                    itemStyle: { color: "#14f195" },
+                    areaStyle: {
+                      opacity: 0.12,
+                      color: {
+                        type: "linear",
+                        x: 0,
+                        y: 0,
+                        x2: 0,
+                        y2: 1,
+                        colorStops: [
+                          { offset: 0, color: "rgba(20, 241, 149, 0.28)" },
+                          { offset: 1, color: "rgba(20, 241, 149, 0)" },
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    type: "line",
+                    name: "ArkDistill saved",
+                    data: arkDistillSavedTokenBucketSeries,
+                    smooth: true,
+                    symbol: "circle",
+                    symbolSize: 6,
+                    lineStyle: { color: "#b7a7ff", width: 2, type: "dashed" },
+                    itemStyle: { color: "#b7a7ff" },
+                  },
+                  {
+                    type: "line",
+                    name: "Prompt cache reused",
+                    data: savingsCachedPromptBucketSeries,
+                    smooth: true,
+                    symbol: "circle",
+                    symbolSize: 6,
+                    lineStyle: { color: "#60a5fa", width: 2, type: "dashed" },
+                    itemStyle: { color: "#60a5fa" },
+                  },
+                ],
+              }}
+            />
+          </Box>
+
+
+
+          <Box
+            className="list-shell"
+            sx={{
+              order: 1,
+              p: 1.6,
+              minWidth: 0,
+            }}
+          >
+            <Typography
+              variant="subtitle1"
+              sx={{ color: "#fff8ed", fontWeight: 600, mb: 0.25 }}
+            >
+              Tokens Over Time
+            </Typography>
+            <Typography
+              variant="caption"
+              sx={{
+                color: "text.secondary",
+                display: "block",
+                mb: 0.75,
+              }}
+            >
+              All LLM traffic, split into primary response generation vs
+              helper/classifier passes, with prompt cache reads and writes.
+            </Typography>
+            <ReactECharts
+              style={{ height: 248 }}
+              option={{
+                backgroundColor: "transparent",
+                animationDuration: 400,
+                grid: {
+                  left: 56,
+                  right: 16,
+                  top: 20,
+                  bottom: analyticsNeedsDataZoom ? 54 : 32,
+                },
+                dataZoom: analyticsNeedsDataZoom
+                  ? [
+                      {
+                        type: "inside",
+                        xAxisIndex: 0,
+                        start: analyticsZoomStart,
+                        end: 100,
+                        throttle: 80,
+                      },
+                      {
+                        type: "slider",
+                        xAxisIndex: 0,
+                        start: analyticsZoomStart,
+                        end: 100,
+                        height: 18,
+                        bottom: 6,
+                        borderColor: chartTokens.zoomBorder,
+                        fillerColor: chartTokens.zoomFill,
+                        handleStyle: { color: chartTokens.axisLabel },
+                        textStyle: { color: chartTokens.axisLabel },
+                      },
+                    ]
+                  : undefined,
+                legend: {
+                  top: 0,
+                  textStyle: { color: chartTokens.legendText, fontSize: 11 },
+                },
+                tooltip: {
+                  trigger: "axis",
+                  backgroundColor: chartTokens.tooltipBg,
+                  borderColor: chartTokens.tooltipBorder,
+                  textStyle: { color: chartTokens.tooltipText },
+                },
+                xAxis: {
+                  type: "category",
+                  data: analyticsBucketLabels,
+                  axisLabel: { color: chartTokens.axisLabel, fontSize: 10 },
+                  axisLine: {
+                    lineStyle: { color: chartTokens.axisLine },
+                  },
+                },
+                yAxis: {
+                  type: "value",
+                  axisLabel: { color: chartTokens.axisLabel },
+                  splitLine: {
+                    lineStyle: { color: chartTokens.splitLine },
+                  },
+                },
+                series: [
+                  {
+                    type: "line",
+                    name: "Primary prompt",
+                    data: analyticsSeries.map(
+                      (point) => point.primary_prompt_tokens,
+                    ),
+                    smooth: true,
+                    areaStyle: { opacity: 0.12 },
+                    lineStyle: { color: "#14f195", width: 2 },
+                    itemStyle: { color: "#14f195" },
+                  },
+                  {
+                    type: "line",
+                    name: "Primary completion",
+                    data: analyticsSeries.map(
+                      (point) => point.primary_completion_tokens,
+                    ),
+                    smooth: true,
+                    areaStyle: { opacity: 0.12 },
+                    lineStyle: { color: "#d8ad78", width: 2 },
+                    itemStyle: { color: "#d8ad78" },
+                  },
+                  {
+                    type: "line",
+                    name: "Helper prompt",
+                    data: analyticsSeries.map(
+                      (point) => point.helper_prompt_tokens,
+                    ),
+                    smooth: true,
+                    lineStyle: { color: "#fbbf24", width: 2, type: "dashed" },
+                    itemStyle: { color: "#fbbf24" },
+                  },
+                  {
+                    type: "line",
+                    name: "Helper completion",
+                    data: analyticsSeries.map(
+                      (point) => point.helper_completion_tokens,
+                    ),
+                    smooth: true,
+                    lineStyle: { color: "#c084fc", width: 2, type: "dashed" },
+                    itemStyle: { color: "#c084fc" },
+                  },
+                  {
+                    type: "line",
+                    name: "Prompt cache read",
+                    data: cachedPromptBucketSeries,
+                    smooth: true,
+                    lineStyle: { color: "#60a5fa", width: 2, type: "dashed" },
+                    itemStyle: { color: "#60a5fa" },
+                  },
+                  {
+                    type: "line",
+                    name: "Prompt cache write",
+                    data: cacheCreationPromptBucketSeries,
+                    smooth: true,
+                    lineStyle: { color: "#fb923c", width: 2, type: "dashed" },
+                    itemStyle: { color: "#fb923c" },
+                  },
+                ],
+              }}
+            />
+          </Box>
+
+          <Box
+            className="list-shell"
+            sx={{
+              order: 3,
               minWidth: 0,
               display: "flex",
               flexDirection: "column",
-              gap: 1.1,
-              p: { xs: 1.2, md: 1.55 },
-              overflow: "hidden",
-              background:
-                "radial-gradient(circle at top left, var(--ui-rgba-15-240-179-070), transparent 30%), linear-gradient(180deg, var(--ui-rgba-15-15-18-940), var(--ui-rgba-12-18-28-960))",
             }}
           >
             <Stack
@@ -896,313 +1275,116 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
               spacing={1}
               sx={{
                 justifyContent: "space-between",
-                alignItems: { xs: "flex-start", md: "flex-start" },
+                alignItems: { xs: "flex-start", md: "center" },
+                mb: 1,
               }}
             >
-              <Stack spacing={0.25}>
-                <Typography
-                  variant="overline"
-                  sx={{ color: "text.secondary", letterSpacing: 0 }}
-                >
-                  Usage
-                </Typography>
-                <Typography variant="h4" sx={{ color: "#f6f0e8" }}>
-                  {spendValue}
-                </Typography>
+              <Box>
+                <Typography variant="h6">{breakdownTitle}</Typography>
                 <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  Approximate spend across the selected analytics range.
+                  {breakdownDescription}
                 </Typography>
-              </Stack>
-              <Stack
-                direction="row"
-                spacing={0.75}
-                sx={{
-                  flexWrap: "wrap",
-                  justifyContent: { xs: "flex-start", md: "flex-end" },
-                }}
-              >
-                {[
-                  `Range / ${activeRangeLabel}`,
-                  `Bucket / ${effectiveBucket}`,
-                  analyticsRangeLabel,
-                ].map((pill) => (
-                  <Box
-                    key={pill}
-                    sx={{
-                      px: 1.1,
-                      py: 0.7,
-                      borderRadius: 999,
-                      border: "1px solid rgba(130, 170, 160, 0.18)",
-                      background:
-                        "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
-                    }}
-                  >
-                    <Typography
-                      variant="caption"
-                      sx={{ color: "#fff8ed", whiteSpace: "nowrap" }}
-                    >
-                      {pill}
-                    </Typography>
-                  </Box>
-                ))}
-              </Stack>
-            </Stack>
-
-            <Stack
-              direction="row"
-              spacing={0.45}
-              sx={{ alignItems: "center", color: "text.secondary" }}
-            >
-              <Tooltip
-                title="Actual provider pricing can differ from the amounts shown here. Treat spend and cost figures as rough estimates."
-                arrow
-                placement="top-start"
-              >
-                <IconButton
-                  size="small"
-                  aria-label="Analytics spend estimate details"
-                  sx={{ p: 0.2, color: "text.secondary" }}
-                >
-                  <InfoOutlinedIcon sx={{ fontSize: 16 }} />
-                </IconButton>
-              </Tooltip>
-              <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                Spend is approximate.
+              </Box>
+              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                Range: {analyticsRangeLabel}
               </Typography>
             </Stack>
-
             <Box
               sx={{
-                borderRadius: "12px",
+                mb: 1.1,
+                px: 0.45,
+                borderRadius: 1.2,
                 border: "1px solid rgba(130, 170, 160, 0.12)",
                 background:
-                  "linear-gradient(180deg, var(--ui-rgba-17-17-20-920), var(--ui-rgba-12-18-28-960))",
-                px: { xs: 0.9, md: 1.3 },
-                py: { xs: 0.5, md: 0.8 },
-                minWidth: 0,
+                  "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
               }}
             >
-              <ReactECharts
-                style={{ height: 320 }}
-                option={{
-                  backgroundColor: "transparent",
-                  animationDuration: 450,
-                  grid: {
-                    left: 18,
-                    right: 12,
-                    top: 18,
-                    bottom: analyticsNeedsDataZoom ? 52 : 28,
-                    containLabel: true,
-                  },
-                  dataZoom: analyticsNeedsDataZoom
-                    ? [
-                        {
-                          type: "inside",
-                          xAxisIndex: 0,
-                          start: analyticsZoomStart,
-                          end: 100,
-                          throttle: 80,
-                        },
-                        {
-                          type: "slider",
-                          xAxisIndex: 0,
-                          start: analyticsZoomStart,
-                          end: 100,
-                          height: 18,
-                          bottom: 6,
-                          borderColor: chartTokens.zoomBorder,
-                          fillerColor: chartTokens.zoomFill,
-                          handleStyle: { color: chartTokens.axisLabel },
-                          textStyle: { color: chartTokens.axisLabel },
-                        },
-                      ]
-                    : undefined,
-                  tooltip: {
-                    trigger: "axis",
-                    backgroundColor: chartTokens.tooltipBg,
-                    borderColor: chartTokens.tooltipBorder,
-                    textStyle: { color: chartTokens.tooltipText },
-                    formatter: (
-                      params: Array<{
-                        axisValue?: string;
-                        dataIndex?: number;
-                        value?: number | string | null;
-                      }>,
-                    ) => {
-                      const index = params[0]?.dataIndex ?? 0;
-                      const point = analyticsSeries[index];
-                      const spend = typeof point?.cost_usd === "number" ? point.cost_usd : 0;
-                      return [
-                        analyticsBucketLabels[index] || params[0]?.axisValue || "Bucket",
-                        `Spend: ${formatUsd(spend)}`,
-                        `Requests: ${compactNumber(num(point?.request_count, 0))}`,
-                        `Tokens: ${compactNumber(num(point?.total_tokens, 0))}`,
-                      ].join("<br/>");
-                    },
-                  },
-                  xAxis: {
-                    type: "category",
-                    data: analyticsBucketLabels,
-                    axisTick: { show: false },
-                    axisLabel: {
-                      color: chartTokens.axisLabel,
-                      fontSize: 10,
-                      interval: 0,
-                      formatter: (value: string, index: number) =>
-                        index === 0 ||
-                        index === analyticsBucketLabels.length - 1 ||
-                        index % spendTickStride === 0
-                          ? value
-                          : "",
-                    },
-                    axisLine: {
-                      lineStyle: { color: chartTokens.axisLine },
-                    },
-                  },
-                  yAxis: {
-                    type: "value",
-                    axisLabel: {
-                      color: chartTokens.axisLabel,
-                      formatter: (value: number) => formatUsd(value),
-                    },
-                    splitLine: {
-                      lineStyle: { color: chartTokens.splitLine },
-                    },
-                  },
-                  series: [
-                    {
-                      type: "bar",
-                      data: spendBucketSeries,
-                      barWidth: "42%",
-                      barMaxWidth: spendChartBarMaxWidth,
-                      barMinWidth: 3,
-                      itemStyle: {
-                        borderRadius: [5, 5, 1, 1],
-                        color: {
-                          type: "linear",
-                          x: 0,
-                          y: 0,
-                          x2: 0,
-                          y2: 1,
-                          colorStops: [
-                            { offset: 0, color: "#f1d6ad" },
-                            { offset: 0.36, color: "#d8ad78" },
-                            { offset: 1, color: "#8d6841" },
-                          ],
-                        },
-                      },
-                      emphasis: {
-                        itemStyle: {
-                          color: "#f4ddb9",
-                        },
-                      },
-                      markLine:
-                        averageSpendPerBucket > 0
-                          ? {
-                              silent: true,
-                              symbol: "none",
-                              lineStyle: {
-                                color: "rgba(216, 173, 120, 0.55)",
-                                type: "dashed",
-                              },
-                              label: {
-                                formatter: `avg ${formatUsd(averageSpendPerBucket)}`,
-                                color: "#f1d6ad",
-                                backgroundColor: "rgba(12, 18, 28, 0.92)",
-                                padding: [3, 6],
-                                borderRadius: 999,
-                              },
-                              data: [{ yAxis: averageSpendPerBucket }],
-                            }
-                          : undefined,
-                    },
-                  ],
+              <Tabs
+                value={breakdownView}
+                onChange={(_, value: BreakdownView) => setBreakdownView(value)}
+                variant="scrollable"
+                allowScrollButtonsMobile
+                className="workspace-page-subnav-tabs"
+              >
+                <Tab value="model" label="By model" />
+                <Tab value="channel" label="By channel" />
+                <Tab value="purpose" label="By purpose" />
+              </Tabs>
+            </Box>
+            {previewBreakdownRows.length === 0 ? (
+              <Typography
+                variant="body2"
+                sx={{ color: "text.secondary" }}
+              >
+                No analytics data yet for the selected range.
+              </Typography>
+            ) : (
+              <TableContainer
+                className="table-shell"
+                sx={{
+                  maxHeight: { xs: 360, md: 560 },
+                  overflow: "auto",
                 }}
-              />
-            </Box>
-
-            <Box
-              sx={{
-                display: "grid",
-                gridTemplateColumns: {
-                  xs: "1fr",
-                  md: "repeat(2, minmax(0, 1fr))",
-                  lg: "repeat(5, minmax(0, 1fr))",
-                },
-                gap: 1,
-              }}
-            >
-              {heroSummaryCards.map((card) => (
-                <Box
-                  key={card.label}
-                  sx={{
-                    minWidth: 0,
-                    borderRadius: "10px",
-                    border: "1px solid rgba(130, 170, 160, 0.12)",
-                    background:
-                      "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
-                    px: { xs: 1.15, lg: 1 },
-                    py: 0.9,
-                    minHeight: 72,
-                  }}
-                >
-                  <Typography
-                    variant="overline"
-                    title={card.label}
-                    sx={{
-                      color: "text.secondary",
-                      display: "block",
-                      fontSize: "0.64rem",
-                      letterSpacing: 0,
-                      lineHeight: 1.2,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {card.label}
-                  </Typography>
-                  <Typography
-                    variant="subtitle1"
-                    sx={{
-                      mt: 0.25,
-                      color: "#fff8ed",
-                      fontSize: { xs: "1rem", lg: "0.92rem" },
-                      fontWeight: 700,
-                      lineHeight: 1.2,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={card.value}
-                  >
-                    {card.value}
-                  </Typography>
-                  <Typography
-                    variant="caption"
-                    title={card.detail}
-                    sx={{
-                      color: "text.secondary",
-                      display: "block",
-                      fontSize: "0.68rem",
-                      lineHeight: 1.25,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {card.detail}
-                  </Typography>
-                </Box>
-              ))}
-            </Box>
+              >
+                <Table stickyHeader size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>
+                        {breakdownView === "model"
+                          ? "Model"
+                          : breakdownView === "channel"
+                            ? "Channel"
+                            : "Purpose"}
+                      </TableCell>
+                      <TableCell align="right">Requests</TableCell>
+                      <TableCell align="right">Tokens</TableCell>
+                      <TableCell align="right">Cache read</TableCell>
+                      <TableCell align="right">Cache write</TableCell>
+                      <TableCell align="right">Cost</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {previewBreakdownRows.map((row, idx) => {
+                      const label = formatBreakdownLabel(row, breakdownView);
+                      return (
+                        <TableRow key={`${label}-${idx}`}>
+                          <TableCell sx={{ maxWidth: 340 }}>
+                            <Typography variant="body2" noWrap title={label}>
+                              {label}
+                            </Typography>
+                          </TableCell>
+                          <TableCell align="right">
+                            {num(row.request_count, 0).toLocaleString()}
+                          </TableCell>
+                          <TableCell align="right">
+                            {num(row.total_tokens, 0).toLocaleString()}
+                          </TableCell>
+                          <TableCell align="right">
+                            {num(row.cached_prompt_tokens, 0).toLocaleString()}
+                          </TableCell>
+                          <TableCell align="right">
+                            {num(
+                              row.cache_creation_prompt_tokens,
+                              0,
+                            ).toLocaleString()}
+                          </TableCell>
+                          <TableCell align="right">
+                            {formatUsd(row.cost_usd, 4)}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            )}
           </Box>
+        </Stack>
 
           <Stack
             spacing={1.5}
             sx={{
               gridColumn: { lg: "2" },
-              gridRow: { lg: "1 / span 3" },
               minWidth: 0,
             }}
           >
@@ -1518,269 +1700,6 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
               )}
             </Box>
           </Stack>
-
-          <Box
-            className="list-shell"
-            sx={{ gridColumn: { lg: "1" }, p: 1.6, minWidth: 0 }}
-          >
-            <Typography
-              variant="subtitle1"
-              sx={{ color: "#fff8ed", fontWeight: 600, mb: 0.25 }}
-            >
-              Tokens Over Time
-            </Typography>
-            <Typography
-              variant="caption"
-              sx={{
-                color: "text.secondary",
-                display: "block",
-                mb: 0.75,
-              }}
-            >
-              All LLM traffic, split into primary response generation vs
-              helper/classifier passes, with prompt cache reads and writes.
-            </Typography>
-            <ReactECharts
-              style={{ height: 248 }}
-              option={{
-                backgroundColor: "transparent",
-                animationDuration: 400,
-                grid: {
-                  left: 56,
-                  right: 16,
-                  top: 20,
-                  bottom: analyticsNeedsDataZoom ? 54 : 32,
-                },
-                dataZoom: analyticsNeedsDataZoom
-                  ? [
-                      {
-                        type: "inside",
-                        xAxisIndex: 0,
-                        start: analyticsZoomStart,
-                        end: 100,
-                        throttle: 80,
-                      },
-                      {
-                        type: "slider",
-                        xAxisIndex: 0,
-                        start: analyticsZoomStart,
-                        end: 100,
-                        height: 18,
-                        bottom: 6,
-                        borderColor: chartTokens.zoomBorder,
-                        fillerColor: chartTokens.zoomFill,
-                        handleStyle: { color: chartTokens.axisLabel },
-                        textStyle: { color: chartTokens.axisLabel },
-                      },
-                    ]
-                  : undefined,
-                legend: {
-                  top: 0,
-                  textStyle: { color: chartTokens.legendText, fontSize: 11 },
-                },
-                tooltip: {
-                  trigger: "axis",
-                  backgroundColor: chartTokens.tooltipBg,
-                  borderColor: chartTokens.tooltipBorder,
-                  textStyle: { color: chartTokens.tooltipText },
-                },
-                xAxis: {
-                  type: "category",
-                  data: analyticsBucketLabels,
-                  axisLabel: { color: chartTokens.axisLabel, fontSize: 10 },
-                  axisLine: {
-                    lineStyle: { color: chartTokens.axisLine },
-                  },
-                },
-                yAxis: {
-                  type: "value",
-                  axisLabel: { color: chartTokens.axisLabel },
-                  splitLine: {
-                    lineStyle: { color: chartTokens.splitLine },
-                  },
-                },
-                series: [
-                  {
-                    type: "line",
-                    name: "Primary prompt",
-                    data: analyticsSeries.map(
-                      (point) => point.primary_prompt_tokens,
-                    ),
-                    smooth: true,
-                    areaStyle: { opacity: 0.12 },
-                    lineStyle: { color: "#14f195", width: 2 },
-                    itemStyle: { color: "#14f195" },
-                  },
-                  {
-                    type: "line",
-                    name: "Primary completion",
-                    data: analyticsSeries.map(
-                      (point) => point.primary_completion_tokens,
-                    ),
-                    smooth: true,
-                    areaStyle: { opacity: 0.12 },
-                    lineStyle: { color: "#d8ad78", width: 2 },
-                    itemStyle: { color: "#d8ad78" },
-                  },
-                  {
-                    type: "line",
-                    name: "Helper prompt",
-                    data: analyticsSeries.map(
-                      (point) => point.helper_prompt_tokens,
-                    ),
-                    smooth: true,
-                    lineStyle: { color: "#fbbf24", width: 2, type: "dashed" },
-                    itemStyle: { color: "#fbbf24" },
-                  },
-                  {
-                    type: "line",
-                    name: "Helper completion",
-                    data: analyticsSeries.map(
-                      (point) => point.helper_completion_tokens,
-                    ),
-                    smooth: true,
-                    lineStyle: { color: "#c084fc", width: 2, type: "dashed" },
-                    itemStyle: { color: "#c084fc" },
-                  },
-                  {
-                    type: "line",
-                    name: "Prompt cache read",
-                    data: cachedPromptBucketSeries,
-                    smooth: true,
-                    lineStyle: { color: "#60a5fa", width: 2, type: "dashed" },
-                    itemStyle: { color: "#60a5fa" },
-                  },
-                  {
-                    type: "line",
-                    name: "Prompt cache write",
-                    data: cacheCreationPromptBucketSeries,
-                    smooth: true,
-                    lineStyle: { color: "#fb923c", width: 2, type: "dashed" },
-                    itemStyle: { color: "#fb923c" },
-                  },
-                ],
-              }}
-            />
-          </Box>
-
-          <Box
-            className="list-shell"
-            sx={{
-              gridColumn: { lg: "1" },
-              minWidth: 0,
-              display: "flex",
-              flexDirection: "column",
-            }}
-          >
-            <Stack
-              direction={{ xs: "column", md: "row" }}
-              spacing={1}
-              sx={{
-                justifyContent: "space-between",
-                alignItems: { xs: "flex-start", md: "center" },
-                mb: 1,
-              }}
-            >
-              <Box>
-                <Typography variant="h6">{breakdownTitle}</Typography>
-                <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  {breakdownDescription}
-                </Typography>
-              </Box>
-              <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                Range: {analyticsRangeLabel}
-              </Typography>
-            </Stack>
-            <Box
-              sx={{
-                mb: 1.1,
-                px: 0.45,
-                borderRadius: 1.2,
-                border: "1px solid rgba(130, 170, 160, 0.12)",
-                background:
-                  "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
-              }}
-            >
-              <Tabs
-                value={breakdownView}
-                onChange={(_, value: BreakdownView) => setBreakdownView(value)}
-                variant="scrollable"
-                allowScrollButtonsMobile
-                className="workspace-page-subnav-tabs"
-              >
-                <Tab value="model" label="By model" />
-                <Tab value="channel" label="By channel" />
-                <Tab value="purpose" label="By purpose" />
-              </Tabs>
-            </Box>
-            {previewBreakdownRows.length === 0 ? (
-              <Typography
-                variant="body2"
-                sx={{ color: "text.secondary" }}
-              >
-                No analytics data yet for the selected range.
-              </Typography>
-            ) : (
-              <TableContainer
-                className="table-shell"
-                sx={{
-                  maxHeight: { xs: 360, md: 560 },
-                  overflow: "auto",
-                }}
-              >
-                <Table stickyHeader size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>
-                        {breakdownView === "model"
-                          ? "Model"
-                          : breakdownView === "channel"
-                            ? "Channel"
-                            : "Purpose"}
-                      </TableCell>
-                      <TableCell align="right">Requests</TableCell>
-                      <TableCell align="right">Tokens</TableCell>
-                      <TableCell align="right">Cache read</TableCell>
-                      <TableCell align="right">Cache write</TableCell>
-                      <TableCell align="right">Cost</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {previewBreakdownRows.map((row, idx) => {
-                      const label = formatBreakdownLabel(row, breakdownView);
-                      return (
-                        <TableRow key={`${label}-${idx}`}>
-                          <TableCell sx={{ maxWidth: 340 }}>
-                            <Typography variant="body2" noWrap title={label}>
-                              {label}
-                            </Typography>
-                          </TableCell>
-                          <TableCell align="right">
-                            {num(row.request_count, 0).toLocaleString()}
-                          </TableCell>
-                          <TableCell align="right">
-                            {num(row.total_tokens, 0).toLocaleString()}
-                          </TableCell>
-                          <TableCell align="right">
-                            {num(row.cached_prompt_tokens, 0).toLocaleString()}
-                          </TableCell>
-                          <TableCell align="right">
-                            {num(
-                              row.cache_creation_prompt_tokens,
-                              0,
-                            ).toLocaleString()}
-                          </TableCell>
-                          <TableCell align="right">
-                            {formatUsd(row.cost_usd, 4)}
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            )}
-          </Box>
       </Box>
     </WorkspacePageShell>
   );

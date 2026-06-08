@@ -1189,7 +1189,7 @@ print(json.dumps({
                 },
             )
             .collect::<Vec<_>>();
-        if let Err(error) = crate::core::document_search::embed_document_chunks(
+        if let Err(error) = crate::core::knowledge::document_search::embed_document_chunks(
             self.embedding_client.as_deref(),
             &filename,
             &content_type,

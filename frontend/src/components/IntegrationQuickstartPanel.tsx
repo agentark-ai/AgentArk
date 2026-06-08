@@ -26,7 +26,7 @@ import {
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import type { IntegrationItem } from "../types";
 
@@ -44,16 +44,14 @@ type OperationDraft = {
   parameters: unknown[];
   default_headers: Record<string, string>;
   default_query: Record<string, string>;
+  default_body?: unknown;
 };
 
 type CustomApiForm = {
   name: string;
   description: string;
   base_url: string;
-  source_mode: "openapi_text" | "openapi_url" | "curl";
-  openapi_url: string;
-  openapi_text: string;
-  curl_text: string;
+  source: string;
   auth_mode: string;
   auth_header: string;
   auth_name: string;
@@ -62,6 +60,7 @@ type CustomApiForm = {
   enabled: boolean;
   operations: OperationDraft[];
   notes: string[];
+  confidence: number | null;
 };
 
 type IntegrationQuickstartPanelProps = {
@@ -72,6 +71,8 @@ type IntegrationQuickstartPanelProps = {
   onConfigureIntegration: (integration: IntegrationItem) => void;
   embedded?: boolean;
   mode?: "all" | "custom-apis-only";
+  /** Deep-link target: open this custom API's Configure editor on mount. */
+  focusCustomApiId?: string;
 };
 
 const INTEGRATION_SORT_ORDER: Record<string, number> = {
@@ -108,10 +109,7 @@ function defaultCustomApiForm(): CustomApiForm {
     name: "",
     description: "",
     base_url: "",
-    source_mode: "openapi_text",
-    openapi_url: "",
-    openapi_text: "",
-    curl_text: "",
+    source: "",
     auth_mode: "none",
     auth_header: "",
     auth_name: "",
@@ -119,7 +117,8 @@ function defaultCustomApiForm(): CustomApiForm {
     secret: "",
     enabled: true,
     operations: [],
-    notes: []
+    notes: [],
+    confidence: null
   };
 }
 
@@ -247,7 +246,8 @@ function parseOperationDraft(value: unknown): OperationDraft {
     body_required: toBool(row.body_required),
     parameters: Array.isArray(row.parameters) ? row.parameters : [],
     default_headers: asRecord(row.default_headers) as Record<string, string>,
-    default_query: asRecord(row.default_query) as Record<string, string>
+    default_query: asRecord(row.default_query) as Record<string, string>,
+    default_body: row.default_body
   };
 }
 
@@ -258,7 +258,8 @@ export function IntegrationQuickstartPanel({
   loadError = null,
   onConfigureIntegration,
   embedded = false,
-  mode = "all"
+  mode = "all",
+  focusCustomApiId = ""
 }: IntegrationQuickstartPanelProps) {
   const showCustomApisOnly = mode === "custom-apis-only";
   const queryClient = useQueryClient();
@@ -303,6 +304,27 @@ export function IntegrationQuickstartPanel({
     }
   });
   const customApis = useMemo(() => asRecords(asRecord(customApisQ.data).custom_apis), [customApisQ.data]);
+  // Deep-link: when the hub opens this panel for one specific custom API
+  // tile, open that API's Configure editor directly instead of leaving the
+  // user at the full list. Handled once per focus value; matches by id or
+  // name since hub cards fall back to the name when no id exists.
+  const focusHandledRef = useRef("");
+  useEffect(() => {
+    if (!focusCustomApiId) {
+      focusHandledRef.current = "";
+      return;
+    }
+    if (focusHandledRef.current === focusCustomApiId) return;
+    const target = customApis.find(
+      (config) =>
+        str(config.id) === focusCustomApiId ||
+        str(config.name) === focusCustomApiId,
+    );
+    if (!target) return;
+    focusHandledRef.current = focusCustomApiId;
+    openEditCustomApiDialog(target);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusCustomApiId, customApis]);
   const sortedIntegrations = useMemo(() => {
     return [...integrations]
       .sort((a, b) => {
@@ -361,19 +383,11 @@ export function IntegrationQuickstartPanel({
         await previewCustomApi.mutateAsync({
           name: customApiForm.name.trim() || undefined,
           base_url: customApiForm.base_url.trim() || undefined,
-          openapi_url:
-            customApiForm.source_mode === "openapi_url"
-              ? customApiForm.openapi_url.trim() || undefined
-              : undefined,
-          openapi_text:
-            customApiForm.source_mode === "openapi_text"
-              ? customApiForm.openapi_text
-              : undefined,
-          curl_text:
-            customApiForm.source_mode === "curl" ? customApiForm.curl_text : undefined
+          source: customApiForm.source.trim() || undefined
         })
       );
       const preview = asRecord(response.preview);
+      const confidence = Number(preview.confidence);
       setCustomApiForm((current) => ({
         ...current,
         name: str(preview.suggested_name, current.name),
@@ -383,9 +397,10 @@ export function IntegrationQuickstartPanel({
         auth_name: str(preview.auth_name),
         auth_username: str(preview.auth_username),
         operations: asRecords(preview.operations).map(parseOperationDraft),
-        notes: Array.isArray(preview.notes) ? preview.notes.map((item) => str(item)).filter(Boolean) : []
+        notes: Array.isArray(preview.notes) ? preview.notes.map((item) => str(item)).filter(Boolean) : [],
+        confidence: Number.isFinite(confidence) ? confidence : null
       }));
-      setNotice({ kind: "success", text: "API schema parsed. Review the imported endpoints before saving." });
+      setNotice({ kind: "success", text: "API source analyzed. Review the generated endpoints and auth before saving." });
     } catch (error) {
       setNotice({ kind: "error", text: errMessage(error) });
     }
@@ -413,7 +428,8 @@ export function IntegrationQuickstartPanel({
       auth_username: str(item.auth_username),
       enabled: item.enabled !== false,
       operations: asRecords(item.operations).map(parseOperationDraft),
-      notes: []
+      notes: [],
+      confidence: null
     });
     setCustomApiOpen(true);
   }
@@ -705,35 +721,36 @@ export function IntegrationQuickstartPanel({
         <DialogTitle>{editingCustomApiId ? "Configure Custom API" : "Import Custom API"}</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
-            {!editingCustomApiId ? (
-              <Stack direction="row" spacing={0.75} useFlexGap sx={{
-                flexWrap: "wrap"
-              }}>
-                <Chip label="OpenAPI text" color={customApiForm.source_mode === "openapi_text" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_text" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_text" }))} />
-                <Chip label="OpenAPI URL" color={customApiForm.source_mode === "openapi_url" ? "primary" : "default"} variant={customApiForm.source_mode === "openapi_url" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "openapi_url" }))} />
-                <Chip label="Sample curl" color={customApiForm.source_mode === "curl" ? "primary" : "default"} variant={customApiForm.source_mode === "curl" ? "filled" : "outlined"} onClick={() => setCustomApiForm((current) => ({ ...current, source_mode: "curl" }))} />
-              </Stack>
-            ) : null}
             <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
               <TextField label="Name" fullWidth value={customApiForm.name} onChange={(e) => setCustomApiForm((current) => ({ ...current, name: e.target.value }))} />
               <TextField label="Base URL override" fullWidth value={customApiForm.base_url} onChange={(e) => setCustomApiForm((current) => ({ ...current, base_url: e.target.value }))} />
             </Stack>
-            {!editingCustomApiId && customApiForm.source_mode === "openapi_url" ? (
-              <TextField label="OpenAPI URL" fullWidth value={customApiForm.openapi_url} onChange={(e) => setCustomApiForm((current) => ({ ...current, openapi_url: e.target.value }))} />
-            ) : null}
-            {!editingCustomApiId && customApiForm.source_mode === "openapi_text" ? (
-              <TextField label="OpenAPI Document" fullWidth multiline minRows={10} value={customApiForm.openapi_text} onChange={(e) => setCustomApiForm((current) => ({ ...current, openapi_text: e.target.value }))} />
-            ) : null}
-            {!editingCustomApiId && customApiForm.source_mode === "curl" ? (
-              <TextField label="Sample curl" fullWidth multiline minRows={6} value={customApiForm.curl_text} onChange={(e) => setCustomApiForm((current) => ({ ...current, curl_text: e.target.value }))} />
+            {!editingCustomApiId ? (
+              <TextField
+                label="API source"
+                placeholder="Paste a docs URL, OpenAPI URL/document, or curl example"
+                fullWidth
+                multiline
+                minRows={6}
+                value={customApiForm.source}
+                onChange={(e) => setCustomApiForm((current) => ({ ...current, source: e.target.value }))}
+                helperText="AgentArk fetches URLs, detects OpenAPI or curl structure, and uses model-backed inference for documentation pages."
+              />
             ) : null}
             {!editingCustomApiId ? (
-              <Button variant="contained" onClick={() => void handlePreviewCustomApi()} disabled={previewCustomApi.isPending}>
+              <Button
+                variant="contained"
+                onClick={() => void handlePreviewCustomApi()}
+                disabled={previewCustomApi.isPending || !customApiForm.source.trim()}
+              >
                 {previewCustomApi.isPending ? "Analyzing..." : "Discover Endpoints"}
               </Button>
             ) : null}
             {customApiForm.notes.length > 0 ? (
-              <Alert severity="info">
+              <Alert severity={customApiForm.confidence !== null && customApiForm.confidence < 0.7 ? "warning" : "info"}>
+                {customApiForm.confidence !== null
+                  ? `Confidence ${Math.round(customApiForm.confidence * 100)}%. `
+                  : ""}
                 {customApiForm.notes.join(" ")}
               </Alert>
             ) : null}

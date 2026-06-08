@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::actions::{ActionDef, ActionSource};
-use crate::core::context_budget::{self, HistoryBudgetConfig, HistoryTokenBudget};
+use crate::core::model::context_budget::{self, HistoryBudgetConfig, HistoryTokenBudget};
 use crate::core::{ConversationMessage, LlmClient, LlmResponse, StreamEvent, ToolCall};
 
 use super::models::{Orbit, OrbitChatMessage, OrbitChatMessageStatus, OrbitFileEntry};

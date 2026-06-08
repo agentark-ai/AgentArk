@@ -2271,6 +2271,14 @@
   line-height: 1.58 !important;
 }
 
+/* The bubble supplies its own trailing rhythm; without this the final block's
+   0.55rem margin leaves a dead band under the last line (and under the
+   streaming caret). Restores the .chat-markdown > :last-child intent from
+   20-chat-core, which the p rule above otherwise outranks. */
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown > :last-child {
+  margin-bottom: 0 !important;
+}
+
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h1,
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h2,
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown h3,

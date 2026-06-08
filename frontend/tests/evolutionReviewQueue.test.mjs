@@ -35,12 +35,19 @@ test("prompt optimization rows show priority and estimated savings", () => {
 
 test("prompt optimization proposal modal is visual first with collapsed evidence", () => {
   assert.doesNotMatch(evolutionPageSource, /promptFootprintChartOption/);
-  assert.match(evolutionPageSource, /promptHoldoutLatencyChartOption/);
+  assert.match(evolutionPageSource, /promptHoldoutFootprintChartOption/);
   assert.match(evolutionPageSource, /Target section/);
   assert.match(evolutionPageSource, /Rest of prompt/);
   assert.match(evolutionPageSource, /Validation samples/);
   assert.match(evolutionPageSource, /Evidence details/);
   assert.doesNotMatch(evolutionPageSource, /promptOptimizationReviewEvidence/);
+});
+
+test("prompt optimization validation chart uses readable case labels", () => {
+  assert.doesNotMatch(evolutionPageSource, /`S\$\{idx \+ 1\}`/);
+  assert.match(evolutionPageSource, /promptHoldoutFootprintRows/);
+  assert.match(evolutionPageSource, /Target section chars/);
+  assert.match(evolutionPageSource, /Rest of prompt chars/);
 });
 
 test("dismissed prompt optimization proposals can be approved from past decisions", () => {
@@ -93,6 +100,18 @@ test("rejected GEPA prompt candidates are retryable and not labeled ready", () =
     /canRetryPromptBackgroundTest =[\s\S]{0,360}lifecycleStatus === "candidate_rejected"/,
   );
   assert.match(evolutionPageSource, /Candidate was not promoted/);
+});
+
+test("rejected GEPA prompt candidates are past decisions by default", () => {
+  assert.match(evolutionPageSource, /function promptProposalIsPastDecision/);
+  assert.match(
+    evolutionPageSource,
+    /promptProposalIsPastDecision[\s\S]{0,420}lifecycleStatus === "candidate_rejected"/,
+  );
+  assert.match(
+    evolutionPageSource,
+    /activePromptOptimizationOpportunities =[\s\S]{0,260}promptProposalIsPastDecision\(row\)/,
+  );
 });
 
 test("prompt canary deployment retains live deploy rollback and monitoring controls", () => {

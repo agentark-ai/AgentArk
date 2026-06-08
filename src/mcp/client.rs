@@ -9,7 +9,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use super::{McpResource, McpTool};
-use crate::core::config::{McpServerConfig, McpTransportConfig};
+use crate::core::runtime::config::{McpServerConfig, McpTransportConfig};
 
 #[derive(Debug, Clone)]
 pub enum McpAuth {

@@ -4,6 +4,13 @@
    Reflect - sci-fi visual layer
    ============================================================ */
 
+/* Reflect Topics: black + grey monochrome theme. Desaturating the page root
+   maps every accent (legend, nodes, badges, toggle, glows, ECharts canvas) to
+   grey in one pass, scoped to Reflect only — no other page is affected. */
+.arkreflect-mono {
+  filter: grayscale(1);
+}
+
 .arkreflect-status,
 .arkreflect-narrative,
 .arkreflect-panorama,
@@ -41,8 +48,8 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--green-glow);
-  box-shadow: 0 0 0 2px var(--ui-rgba-57-208-255-040), 0 0 10px var(--green-glow);
+  background: #c7ccd2;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.035), 0 0 8px rgba(199, 204, 210, 0.42);
   animation: arkreflect-live-pulse 1.8s ease-in-out infinite;
 }
 
@@ -72,7 +79,7 @@
   width: 18px;
   height: 18px;
   pointer-events: none;
-  border-color: var(--cyan-glow);
+  border-color: rgba(255, 255, 255, 0.18);
   transition: border-color 220ms ease, width 220ms ease, height 220ms ease;
   z-index: 4;
 }
@@ -109,7 +116,7 @@
 .arkreflect-grid-pane:hover::after,
 .arkreflect-motion-panel:hover::before,
 .arkreflect-motion-panel:hover::after {
-  border-color: var(--green-glow);
+  border-color: rgba(255, 255, 255, 0.26);
   width: 24px;
   height: 24px;
 }
@@ -120,7 +127,7 @@
   font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.18em;
-  color: var(--green-glow);
+  color: rgba(210, 214, 219, 0.76);
   text-transform: uppercase;
   margin-bottom: 6px;
 }
@@ -129,14 +136,14 @@
 
 .arkreflect-status {
   background:
-    linear-gradient(90deg, var(--ui-rgba-57-208-255-040), transparent 70%),
-    linear-gradient(180deg, rgba(7, 13, 18, 0.95), rgba(5, 9, 12, 0.92)) !important;
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025), transparent 70%),
+    linear-gradient(180deg, rgba(15, 15, 17, 0.95), rgba(8, 8, 10, 0.92)) !important;
 }
 
 .arkreflect-narrative {
   background:
-    radial-gradient(circle at 0% 0%, var(--ui-rgba-57-208-255-040), transparent 55%),
-    linear-gradient(180deg, rgba(7, 13, 18, 0.92), rgba(5, 9, 12, 0.96)) !important;
+    radial-gradient(circle at 0% 0%, rgba(255, 255, 255, 0.026), transparent 55%),
+    linear-gradient(180deg, rgba(15, 15, 17, 0.92), rgba(8, 8, 10, 0.96)) !important;
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34) !important;
 }
 
@@ -155,14 +162,14 @@
 }
 
 .arkreflect-narrative-line strong {
-  color: var(--cyan-glow);
+  color: rgba(210, 214, 219, 0.78);
   font-weight: 700;
 }
 
 .arkreflect-panorama {
   background:
-    radial-gradient(ellipse 80% 60% at 50% 40%, rgba(36, 60, 78, 0.32), transparent 70%),
-    linear-gradient(180deg, rgba(6, 11, 16, 0.97), rgba(4, 8, 12, 0.97)) !important;
+    radial-gradient(ellipse 80% 60% at 50% 40%, rgba(255, 255, 255, 0.045), transparent 70%),
+    linear-gradient(180deg, rgba(14, 14, 16, 0.97), rgba(6, 6, 8, 0.97)) !important;
   box-shadow:
     0 22px 60px rgba(0, 0, 0, 0.5),
     inset 0 0 120px rgba(0, 0, 0, 0.55) !important;
@@ -176,8 +183,8 @@
   pointer-events: none;
   z-index: 0;
   background:
-    radial-gradient(ellipse 60% 40% at 30% 35%, rgba(120, 242, 176, 0.10), transparent 70%),
-    radial-gradient(ellipse 55% 38% at 72% 65%, rgba(70, 160, 150, 0.09), transparent 70%);
+    radial-gradient(ellipse 60% 40% at 30% 35%, rgba(255, 255, 255, 0.045), transparent 70%),
+    radial-gradient(ellipse 55% 38% at 72% 65%, rgba(180, 186, 194, 0.035), transparent 70%);
   animation: arkreflect-backdrop-drift 24s ease-in-out infinite alternate;
 }
 
@@ -187,10 +194,10 @@
   pointer-events: none;
   z-index: 0;
   background:
-    repeating-linear-gradient(0deg, transparent, transparent 31px, rgba(130, 170, 160, 0.055) 31px, rgba(130, 170, 160, 0.055) 32px),
-    repeating-linear-gradient(90deg, transparent, transparent 31px, rgba(130, 170, 160, 0.055) 31px, rgba(130, 170, 160, 0.055) 32px),
-    repeating-linear-gradient(0deg, transparent, transparent 127px, rgba(130, 170, 160, 0.13) 127px, rgba(130, 170, 160, 0.13) 128px),
-    repeating-linear-gradient(90deg, transparent, transparent 127px, rgba(130, 170, 160, 0.13) 127px, rgba(130, 170, 160, 0.13) 128px);
+    repeating-linear-gradient(0deg, transparent, transparent 31px, rgba(170, 176, 184, 0.045) 31px, rgba(170, 176, 184, 0.045) 32px),
+    repeating-linear-gradient(90deg, transparent, transparent 31px, rgba(170, 176, 184, 0.045) 31px, rgba(170, 176, 184, 0.045) 32px),
+    repeating-linear-gradient(0deg, transparent, transparent 127px, rgba(170, 176, 184, 0.085) 127px, rgba(170, 176, 184, 0.085) 128px),
+    repeating-linear-gradient(90deg, transparent, transparent 127px, rgba(170, 176, 184, 0.085) 127px, rgba(170, 176, 184, 0.085) 128px);
   opacity: 0.6;
   mask-image: radial-gradient(ellipse 70% 80% at center, #000 40%, transparent 95%);
   -webkit-mask-image: radial-gradient(ellipse 70% 80% at center, #000 40%, transparent 95%);
@@ -228,17 +235,17 @@
   inset: 6px;
   pointer-events: none;
   z-index: 3;
-  border: 1px solid rgba(130, 170, 160, 0.12);
+  border: 1px solid rgba(170, 176, 184, 0.10);
   border-radius: 2px;
   background:
-    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top left / 18px 1px no-repeat,
-    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top left / 1px 18px no-repeat,
-    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top right / 18px 1px no-repeat,
-    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) top right / 1px 18px no-repeat,
-    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom left / 18px 1px no-repeat,
-    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom left / 1px 18px no-repeat,
-    linear-gradient(90deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom right / 18px 1px no-repeat,
-    linear-gradient(0deg, rgba(130, 170, 160, 0.45), rgba(130, 170, 160, 0.45)) bottom right / 1px 18px no-repeat;
+    linear-gradient(90deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) top left / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) top left / 1px 18px no-repeat,
+    linear-gradient(90deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) top right / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) top right / 1px 18px no-repeat,
+    linear-gradient(90deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) bottom left / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) bottom left / 1px 18px no-repeat,
+    linear-gradient(90deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) bottom right / 18px 1px no-repeat,
+    linear-gradient(0deg, rgba(170, 176, 184, 0.28), rgba(170, 176, 184, 0.28)) bottom right / 1px 18px no-repeat;
 }
 
 .arkreflect-panorama-empty {
@@ -247,9 +254,9 @@
 }
 
 .arkreflect-pill.MuiChip-root {
-  background: var(--ui-rgba-57-208-255-040) !important;
-  border: 1px solid var(--ui-rgba-57-208-255-150) !important;
-  color: var(--cyan-glow) !important;
+  background: rgba(255, 255, 255, 0.035) !important;
+  border: 1px solid rgba(255, 255, 255, 0.075) !important;
+  color: rgba(210, 214, 219, 0.66) !important;
   font-family: var(--font-display);
   font-size: 0.7rem;
   letter-spacing: 0.06em;
@@ -268,8 +275,8 @@
   left: -1px;
   width: 6px;
   height: 6px;
-  border-top: 1px solid var(--cyan-glow);
-  border-left: 1px solid var(--cyan-glow);
+  border-top: 1px solid rgba(210, 214, 219, 0.32);
+  border-left: 1px solid rgba(210, 214, 219, 0.32);
   pointer-events: none;
   transition: width 200ms ease, height 200ms ease, border-color 200ms ease;
 }
@@ -281,28 +288,26 @@
   right: -1px;
   width: 6px;
   height: 6px;
-  border-bottom: 1px solid var(--cyan-glow);
-  border-right: 1px solid var(--cyan-glow);
+  border-bottom: 1px solid rgba(210, 214, 219, 0.32);
+  border-right: 1px solid rgba(210, 214, 219, 0.32);
   pointer-events: none;
   transition: width 200ms ease, height 200ms ease, border-color 200ms ease;
 }
 
 .arkreflect-pill.MuiChip-root:hover {
-  border-color: var(--green-glow) !important;
-  box-shadow:
-    0 0 0 1px var(--ui-rgba-57-208-255-080),
-    0 0 14px var(--ui-rgba-57-208-255-150);
+  border-color: rgba(255, 255, 255, 0.14) !important;
+  box-shadow: none;
 }
 
 .arkreflect-pill.MuiChip-root:hover::before,
 .arkreflect-pill.MuiChip-root:hover::after {
-  border-color: var(--green-glow);
+  border-color: rgba(210, 214, 219, 0.42);
   width: 9px;
   height: 9px;
 }
 
 .arkreflect-pill.MuiChip-root .MuiChip-icon {
-  color: var(--green-glow) !important;
+  color: rgba(210, 214, 219, 0.72) !important;
 }
 
 .arkreflect-grid-pane {
@@ -319,11 +324,11 @@
 }
 
 .arkreflect-status .MuiLinearProgress-root {
-  background: var(--ui-rgba-57-208-255-040) !important;
+  background: rgba(255, 255, 255, 0.035) !important;
 }
 .arkreflect-status .MuiLinearProgress-bar {
   background:
-    linear-gradient(90deg, var(--cyan-glow), var(--green-glow), var(--cyan-glow)) !important;
+    linear-gradient(90deg, rgba(180, 186, 194, 0.55), rgba(220, 224, 229, 0.68), rgba(180, 186, 194, 0.55)) !important;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -498,6 +503,16 @@
   box-shadow: none !important;
 }
 
+.arkreflect-mono .MuiTab-root.Mui-selected,
+.arkreflect-mono .arkreflect-tab-strip .MuiButton-contained,
+.arkreflect-mono .arkreflect-motion-panel > .MuiButton-contained,
+.arkreflect-mono .MuiToggleButton-root.Mui-selected {
+  background: rgba(255, 255, 255, 0.09) !important;
+  color: var(--text-primary) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  box-shadow: none !important;
+}
+
 .arkreflect-status::before,
 .arkreflect-status::after,
 .arkreflect-narrative::before,
@@ -546,31 +561,31 @@
 }
 
 .arkreflect-memory-graph {
-  border-color: rgba(101, 139, 255, 0.2) !important;
+  border-color: rgba(255, 255, 255, 0.075) !important;
   background:
-    radial-gradient(ellipse 78% 54% at 48% 46%, rgba(24, 246, 224, 0.14), transparent 42%),
-    radial-gradient(ellipse 44% 30% at 14% 36%, rgba(255, 187, 57, 0.09), transparent 68%),
-    radial-gradient(ellipse 48% 34% at 86% 70%, rgba(98, 168, 255, 0.11), transparent 70%),
-    linear-gradient(180deg, rgba(4, 14, 27, 0.92), rgba(2, 8, 16, 0.96)) !important;
+    radial-gradient(ellipse 78% 54% at 48% 46%, rgba(255, 255, 255, 0.055), transparent 42%),
+    radial-gradient(ellipse 44% 30% at 14% 36%, rgba(190, 196, 204, 0.035), transparent 68%),
+    radial-gradient(ellipse 48% 34% at 86% 70%, rgba(150, 156, 164, 0.038), transparent 70%),
+    linear-gradient(180deg, rgba(13, 13, 15, 0.94), rgba(5, 5, 7, 0.97)) !important;
   box-shadow:
     0 24px 70px rgba(0, 0, 0, 0.38),
-    inset 0 0 120px rgba(3, 8, 18, 0.82),
-    inset 0 0 0 1px rgba(112, 170, 255, 0.08) !important;
+    inset 0 0 120px rgba(0, 0, 0, 0.72),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.035) !important;
 }
 
 .arkreflect-memory-graph .arkreflect-panorama-backdrop {
   background:
-    radial-gradient(circle at 18% 28%, rgba(255, 210, 82, 0.08), transparent 17%),
-    radial-gradient(circle at 74% 30%, rgba(54, 245, 184, 0.08), transparent 18%),
-    radial-gradient(circle at 78% 78%, rgba(98, 168, 255, 0.1), transparent 22%),
-    linear-gradient(rgba(140, 178, 255, 0.038) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(140, 178, 255, 0.038) 1px, transparent 1px);
+    radial-gradient(circle at 18% 28%, rgba(255, 255, 255, 0.032), transparent 17%),
+    radial-gradient(circle at 74% 30%, rgba(190, 196, 204, 0.035), transparent 18%),
+    radial-gradient(circle at 78% 78%, rgba(150, 156, 164, 0.04), transparent 22%),
+    linear-gradient(rgba(255, 255, 255, 0.024) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.024) 1px, transparent 1px);
   background-size: auto, auto, auto, 34px 34px, 34px 34px;
   opacity: 1;
 }
 
 .arkreflect-memory-graph .arkreflect-panorama-grid {
-  background-image: radial-gradient(rgba(150, 190, 255, 0.22) 1px, transparent 1px);
+  background-image: radial-gradient(rgba(174, 180, 187, 0.14) 1px, transparent 1px);
   background-size: 18px 18px;
   opacity: 0.35;
   mask-image: radial-gradient(ellipse 76% 68% at 50% 48%, #000 36%, transparent 96%);
@@ -591,14 +606,14 @@
   display: inline-flex;
   align-items: center;
   gap: 0.42rem;
-  color: rgba(218, 230, 246, 0.68);
+  color: rgba(218, 222, 228, 0.66);
 }
 
 .arkreflect-memory-legend-item > div:first-child {
   width: 12px;
   height: 12px;
   border-radius: 4px;
-  box-shadow: 0 0 12px currentColor;
+  box-shadow: none;
 }
 
 .arkreflect-memory-legend-line {
@@ -618,10 +633,10 @@
 }
 
 .arkreflect-theme-panel {
-  border-color: rgba(101, 139, 255, 0.18) !important;
+  border-color: rgba(255, 255, 255, 0.075) !important;
   background:
-    radial-gradient(ellipse 78% 44% at 18% 0%, rgba(139, 92, 246, 0.12), transparent 58%),
-    linear-gradient(180deg, rgba(5, 15, 29, 0.92), rgba(3, 10, 19, 0.94)) !important;
+    radial-gradient(ellipse 78% 44% at 18% 0%, rgba(255, 255, 255, 0.042), transparent 58%),
+    linear-gradient(180deg, rgba(14, 14, 16, 0.94), rgba(7, 7, 9, 0.96)) !important;
   overflow: hidden !important;
 }
 
@@ -716,8 +731,8 @@
 }
 
 .arkreflect-theme-pager.MuiIconButton-root:hover {
-  border-color: rgba(120, 242, 176, 0.24);
-  background: rgba(120, 242, 176, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.055);
 }
 
 @media (max-width: 720px) {
@@ -816,6 +831,46 @@
 .notification-popover-paper .MuiListItemButton-root {
   background-image: none !important;
   box-shadow: none !important;
+}
+
+/* Neutral (black/grey) controls inside the notifications popover. Applies to
+   the filter chips and EVERY notification row's action buttons — overriding the
+   theme's green primary so the popover reads as one neutral surface. Semantic
+   warning/error chips (input-needed, automation failure) keep their colors. */
+.notification-popover-paper .MuiButton-contained {
+  background: #262c35 !important;
+  background-image: none !important;
+  border: 1px solid #3d4652 !important;
+  color: #f3f6f8 !important;
+  box-shadow: none !important;
+}
+
+.notification-popover-paper .MuiButton-contained:hover {
+  background: #313845 !important;
+  border-color: #4a5462 !important;
+}
+
+.notification-popover-paper .MuiButton-outlined {
+  background: transparent !important;
+  background-image: none !important;
+  border-color: #2a3038 !important;
+  color: #c8d0d8 !important;
+  box-shadow: none !important;
+}
+
+.notification-popover-paper .MuiButton-outlined:hover {
+  border-color: #3d4652 !important;
+  background: #1b2026 !important;
+  color: #f3f6f8 !important;
+}
+
+.notification-popover-paper .MuiButton-text {
+  color: #c8d0d8 !important;
+}
+
+.notification-popover-paper .MuiButton-text:hover {
+  color: #f3f6f8 !important;
+  background: #222831 !important;
 }
 
 /* Orbit canvas must read as space even when no widgets are mounted. This

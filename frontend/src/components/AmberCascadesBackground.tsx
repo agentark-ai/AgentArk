@@ -213,13 +213,13 @@ function initAmberCascades(canvas: HTMLCanvasElement) {
       ctx.translate(fragment.x, fragment.y + bob);
       ctx.rotate(fragment.rotation + Math.sin(t * 0.12 + fragment.phase) * 0.08);
       ctx.font = `500 ${fragment.size}px "IBM Plex Sans", "Inter", "Segoe UI", sans-serif`;
+      // No per-glyph shadowBlur: it was the most expensive 2D op in the loop
+      // (a blur per fragment per frame) for a glow that is imperceptible at
+      // these alphas. The warm tint stays via the fill color.
       ctx.fillStyle = `rgba(230, 214, 190, ${alpha})`;
-      ctx.shadowColor = `rgba(216, 173, 120, ${alpha * 0.55})`;
-      ctx.shadowBlur = 5;
       ctx.fillText(fragment.label, 0, 0);
       ctx.restore();
     }
-    ctx.shadowBlur = 0;
   };
 
   const drawPulses = () => {

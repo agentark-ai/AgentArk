@@ -1,9 +1,6 @@
 export type CognitionStageId = "observe" | "understand" | "plan" | "act" | "reflect" | "learn";
 
 export type AgentCognitionLoopProps = {
-  activeStage: CognitionStageId;
-  iteration: number;
-  modelConfigured: boolean;
   latencyMs?: number | null;
   memoryCount: number;
   skillCount: number;
@@ -54,6 +51,24 @@ function nodeById(id: CognitionStageId): StageNode {
   return STAGES.find((s) => s.id === id) ?? STAGES[0];
 }
 
+// Bow applied to the drawn cycle edges AND the packet's motion path — shared so
+// the packet rides exactly on the visible curves.
+const CYCLE_BOW = 24;
+
+// Seconds for one full orbit of the packet. Must stay equal to the durations of
+// `nw-cog-orbit` and `nw-cog-node-glow` in neural-web.css — the rim flash
+// delays below are fractions of this period.
+const ORBIT_DURATION_S = 7;
+
+function cycleControlPoint(a: StageNode, b: StageNode, bow: number): { cx: number; cy: number } {
+  const mx = (a.x + b.x) / 2;
+  const my = (a.y + b.y) / 2;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return { cx: mx + (-dy / len) * bow, cy: my + (dx / len) * bow };
+}
+
 // One continuous path tracing the full cycle (same bow as the drawn cycle edges,
 // so motion-driven packets ride exactly on the visible curves). Static — STAGES
 // and CYCLE are module constants — so compute it once.
@@ -62,42 +77,58 @@ const CYCLE_RING_PATH: string = (() => {
   CYCLE.forEach(([aId, bId], i) => {
     const a = nodeById(aId);
     const b = nodeById(bId);
-    const mx = (a.x + b.x) / 2;
-    const my = (a.y + b.y) / 2;
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const cx = mx + (-dy / len) * 24;
-    const cy = my + (dx / len) * 24;
+    const { cx, cy } = cycleControlPoint(a, b, CYCLE_BOW);
     if (i === 0) d += `M${a.x},${a.y} `;
     d += `Q${cx.toFixed(1)},${cy.toFixed(1)} ${b.x},${b.y} `;
   });
   return d.trim();
 })();
 
-// SMIL animateMotion can't be stopped by a CSS media query, so gate the orbiting
-// packets here. Evaluated once at import (cheap; the preference rarely changes).
-const PREFERS_REDUCED_MOTION: boolean =
-  typeof window !== "undefined" && typeof window.matchMedia === "function"
-    ? window.matchMedia("(prefers-reduced-motion: reduce)").matches
-    : false;
+// Arc-length fraction of the ring at which the packet ARRIVES at each stage.
+// The packet moves at constant speed (linear offset-distance), and the ring's
+// segments have different lengths, so arrivals are NOT at uniform i/6 marks —
+// the rim flash delays must come from real geometry or the "packet lands,
+// node lights up" beat drifts by up to ~0.25s per node. Quadratic beziers
+// have no closed-form length; sample them once at module scope.
+const STAGE_ARRIVAL_FRACTIONS: Record<CognitionStageId, number> = (() => {
+  const segmentLengths = CYCLE.map(([aId, bId]) => {
+    const a = nodeById(aId);
+    const b = nodeById(bId);
+    const { cx, cy } = cycleControlPoint(a, b, CYCLE_BOW);
+    const STEPS = 64;
+    let length = 0;
+    let prevX = a.x;
+    let prevY = a.y;
+    for (let s = 1; s <= STEPS; s += 1) {
+      const t = s / STEPS;
+      const u = 1 - t;
+      const x = u * u * a.x + 2 * u * t * cx + t * t * b.x;
+      const y = u * u * a.y + 2 * u * t * cy + t * t * b.y;
+      length += Math.hypot(x - prevX, y - prevY);
+      prevX = x;
+      prevY = y;
+    }
+    return length;
+  });
+  const total = segmentLengths.reduce((sum, len) => sum + len, 0) || 1;
+  const fractions = {} as Record<CognitionStageId, number>;
+  let cumulative = 0;
+  CYCLE.forEach(([aId], i) => {
+    fractions[aId] = cumulative / total;
+    cumulative += segmentLengths[i];
+  });
+  return fractions;
+})();
 
 // Quadratic curve between two nodes, bowed perpendicular to the chord for an organic feel.
 function edgePath(aId: CognitionStageId, bId: CognitionStageId, bow: number): string {
   const a = nodeById(aId);
   const b = nodeById(bId);
-  const mx = (a.x + b.x) / 2;
-  const my = (a.y + b.y) / 2;
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const cx = mx + (-dy / len) * bow;
-  const cy = my + (dx / len) * bow;
+  const { cx, cy } = cycleControlPoint(a, b, bow);
   return `M${a.x},${a.y} Q${cx.toFixed(1)},${cy.toFixed(1)} ${b.x},${b.y}`;
 }
 
 export function AgentCognitionLoop({
-  activeStage,
   latencyMs,
   memoryCount,
   skillCount,
@@ -107,8 +138,6 @@ export function AgentCognitionLoop({
   selfEvolveEnabled,
   learningQueueCount,
 }: AgentCognitionLoopProps) {
-  const active = nodeById(activeStage);
-
   // Surface metrics as satellite nodes wired into the nearest stage.
   const surfaces: Array<{
     key: string;
@@ -192,20 +221,6 @@ export function AgentCognitionLoop({
           strokeLinecap="round"
         />
 
-        {/* light packets orbiting the loop via SMIL animateMotion (no rAF, no
-            re-render). Two packets, half-period apart. Glow via a halo+core pair
-            instead of an SVG filter to stay GPU-light. */}
-        {!PREFERS_REDUCED_MOTION && [0, 1].map((i) => (
-          <g key={`packet-${i}`}>
-            <circle r={7} fill="rgba(124,231,255,0.18)">
-              <animateMotion dur="7s" begin={`${i * 3.5}s`} repeatCount="indefinite" path={CYCLE_RING_PATH} />
-            </circle>
-            <circle r={2.6} fill="#cdf6ff">
-              <animateMotion dur="7s" begin={`${i * 3.5}s`} repeatCount="indefinite" path={CYCLE_RING_PATH} />
-            </circle>
-          </g>
-        ))}
-
         {/* satellite nodes */}
         {surfaces.map((s, i) => (
           <g key={`sat-${s.key}`}>
@@ -235,24 +250,29 @@ export function AgentCognitionLoop({
           </g>
         ))}
 
-        {/* stage nodes */}
+        {/* stage nodes — each rim flashes exactly when the packet arrives:
+            delay = the stage's arc-length fraction of the orbit period. */}
         {STAGES.map((s) => {
-          const on = s.id === activeStage;
+          const glowDelay = `${(STAGE_ARRIVAL_FRACTIONS[s.id] * ORBIT_DURATION_S).toFixed(3)}s`;
           return (
             <g key={s.id}>
-              {on ? (
-                <circle cx={s.x} cy={s.y} r={28} fill="none" stroke="#7ce7ff" strokeWidth={1.4} opacity={0.5}>
-                  <animate attributeName="r" values="28;41;28" dur="2.6s" repeatCount="indefinite" />
-                  <animate attributeName="opacity" values="0.5;0;0.5" dur="2.6s" repeatCount="indefinite" />
-                </circle>
-              ) : null}
+              <circle
+                className="nw-cog-node-rim"
+                style={{ animationDelay: glowDelay }}
+                cx={s.x}
+                cy={s.y}
+                r={25}
+                fill="none"
+                stroke="#7ce7ff"
+                strokeWidth={1.6}
+              />
               <circle
                 cx={s.x}
                 cy={s.y}
-                r={on ? 28 : 25}
-                fill={on ? "rgba(124,231,255,0.12)" : "rgba(10,14,18,0.92)"}
-                stroke={on ? "#7ce7ff" : "rgba(124,231,255,0.32)"}
-                strokeWidth={on ? 1.8 : 1.3}
+                r={25}
+                fill="rgba(10,14,18,0.92)"
+                stroke="rgba(124,231,255,0.55)"
+                strokeWidth={1.4}
               />
               <text
                 x={s.x}
@@ -262,7 +282,7 @@ export function AgentCognitionLoop({
                 fontFamily="'JetBrains Mono', monospace"
                 fontSize={12}
                 fontWeight={700}
-                fill={on ? "#7ce7ff" : "rgba(155,159,169,0.85)"}
+                fill="rgba(124,231,255,0.82)"
               >
                 {s.number}
               </text>
@@ -274,19 +294,39 @@ export function AgentCognitionLoop({
                 fontSize={9.5}
                 fontWeight={600}
                 letterSpacing="0.08em"
-                fill={on ? "#ffffff" : "#d8f5ff"}
+                fill="#d8f5ff"
               >
                 {s.title.toUpperCase()}
               </text>
             </g>
           );
         })}
+
+        {/* light packet orbiting the loop. CSS offset-path (not SMIL): SMIL
+            runs on the SVG's own timeline, which Chrome pauses while the tab
+            is hidden — CSS animations keep wall-clock phase — so the packet
+            drifted out of sync with the rim flashes after every tab switch.
+            One clock for both keeps "packet lands -> node lights" locked.
+            Drawn after the stage nodes so the packet visibly travels ONTO
+            each disc as the rim fires. Halo + core pair, no SVG filter. */}
+        <g className="nw-cog-packet" aria-hidden="true">
+          <circle
+            r={7}
+            fill="rgba(124,231,255,0.18)"
+            style={{ offsetPath: `path("${CYCLE_RING_PATH}")` }}
+          />
+          <circle
+            r={2.6}
+            fill="#cdf6ff"
+            style={{ offsetPath: `path("${CYCLE_RING_PATH}")` }}
+          />
+        </g>
       </svg>
 
       <div className="nw-cog-caption">
-        <span className="nw-cog-caption-num">{active.number}</span>
-        <span className="nw-cog-caption-title">{active.title}</span>
-        <span className="nw-cog-caption-detail">{active.detail}</span>
+        <span className="nw-cog-caption-num">01-06</span>
+        <span className="nw-cog-caption-title">Live loop</span>
+        <span className="nw-cog-caption-detail">Observe, understand, plan, act, reflect, learn</span>
       </div>
     </div>
   );

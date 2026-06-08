@@ -341,7 +341,7 @@ fn provider_structurally_configured(provider: &crate::core::LlmProvider) -> bool
             if model.trim().is_empty() {
                 return false;
             }
-            match crate::core::llm_provider::openai_provider_label(base_url.as_deref()) {
+            match crate::core::model::llm_provider::openai_provider_label(base_url.as_deref()) {
                 "openai" => !api_key.trim().is_empty() && api_key != "[ENCRYPTED]",
                 "openrouter" | "openai-subscription" | "huggingface" => {
                     !api_key.trim().is_empty()
@@ -370,10 +370,10 @@ fn provider_safe_summary(provider: &crate::core::LlmProvider) -> serde_json::Val
             model,
             base_url,
         } => serde_json::json!({
-            "provider_id": crate::core::llm_provider::openai_provider_label(base_url.as_deref()),
+            "provider_id": crate::core::model::llm_provider::openai_provider_label(base_url.as_deref()),
             "provider_kind": "openai_compatible",
             "model": model,
-            "base_url": crate::core::llm_provider::display_openai_base_url(base_url.as_ref()),
+            "base_url": crate::core::model::llm_provider::display_openai_base_url(base_url.as_ref()),
             "has_api_key": !api_key.trim().is_empty() && api_key != "[ENCRYPTED]",
             "runtime_configured": provider_structurally_configured(provider),
         }),
@@ -388,16 +388,16 @@ fn provider_safe_summary(provider: &crate::core::LlmProvider) -> serde_json::Val
     }
 }
 
-fn model_slot_runtime_ready(slot: &crate::core::config::ModelSlot) -> bool {
+fn model_slot_runtime_ready(slot: &crate::core::runtime::config::ModelSlot) -> bool {
     slot.enabled && provider_structurally_configured(&slot.provider)
 }
 
-fn model_role_value(role: &crate::core::config::ModelRole) -> serde_json::Value {
+fn model_role_value(role: &crate::core::runtime::config::ModelRole) -> serde_json::Value {
     serde_json::to_value(role).unwrap_or_else(|_| serde_json::json!("unknown"))
 }
 
 fn model_slot_safe_summary(
-    slot: &crate::core::config::ModelSlot,
+    slot: &crate::core::runtime::config::ModelSlot,
     primary_slot_id: Option<&str>,
     selected_slot_id: Option<&str>,
 ) -> serde_json::Value {
@@ -419,15 +419,15 @@ fn model_slot_safe_summary(
 }
 
 fn resolve_primary_model_slot_id_from_config(
-    config: &crate::core::config::AgentConfig,
+    config: &crate::core::runtime::config::AgentConfig,
 ) -> Option<String> {
     let slots = &config.model_pool.slots;
     for role in [
-        crate::core::config::ModelRole::Primary,
-        crate::core::config::ModelRole::Fast,
-        crate::core::config::ModelRole::Code,
-        crate::core::config::ModelRole::Research,
-        crate::core::config::ModelRole::Fallback,
+        crate::core::runtime::config::ModelRole::Primary,
+        crate::core::runtime::config::ModelRole::Fast,
+        crate::core::runtime::config::ModelRole::Code,
+        crate::core::runtime::config::ModelRole::Research,
+        crate::core::runtime::config::ModelRole::Fallback,
     ] {
         if let Some(slot) = slots
             .iter()
@@ -440,9 +440,9 @@ fn resolve_primary_model_slot_id_from_config(
         .iter()
         .find(|slot| model_slot_runtime_ready(slot))
         .or_else(|| {
-            slots
-                .iter()
-                .find(|slot| slot.role == crate::core::config::ModelRole::Primary && slot.enabled)
+            slots.iter().find(|slot| {
+                slot.role == crate::core::runtime::config::ModelRole::Primary && slot.enabled
+            })
         })
         .or_else(|| slots.iter().find(|slot| slot.enabled))
         .or_else(|| slots.first())
@@ -891,14 +891,14 @@ async fn internal_api_get(
         anyhow::bail!("Internal API inspection accepts only AgentArk-relative paths");
     }
 
-    let base_url = crate::core::net::internal_api_base_url();
+    let base_url = crate::core::runtime::net::internal_api_base_url();
     let mut url = reqwest::Url::parse(&base_url)
         .context("failed to parse internal AgentArk base URL")?
         .join(path.trim_start_matches('/'))
         .context("failed to build internal AgentArk API URL")?;
     add_query_pairs(&mut url, &api.query);
 
-    let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+    let manager = crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
         &runtime.config_dir,
         Some(runtime.data_dir()),
     )?;
@@ -908,7 +908,8 @@ async fn internal_api_get(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("AgentArk HTTP API key is not configured"))?;
 
-    let client = crate::core::net::build_internal_control_client(api.timeout_secs.unwrap_or(10))?;
+    let client =
+        crate::core::runtime::net::build_internal_control_client(api.timeout_secs.unwrap_or(10))?;
     let response = client
         .get(url.clone())
         .bearer_auth(key)

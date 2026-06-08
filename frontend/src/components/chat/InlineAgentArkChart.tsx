@@ -1,5 +1,5 @@
 import { Box, Typography } from "@mui/material";
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 
 const AGENTARK_CHART_LANGUAGE = "agentark-chart";
 const MAX_CHART_ROWS = 160;
@@ -779,7 +779,13 @@ export function isAgentArkChartFence(className = ""): boolean {
   return markdownFenceLanguage(className) === AGENTARK_CHART_LANGUAGE;
 }
 
-export function InlineAgentArkChart({ code }: { code: string }) {
+// memo: the chart is a pure function of its fence code; parents re-render
+// far more often than the code changes.
+export const InlineAgentArkChart = memo(function InlineAgentArkChart({
+  code,
+}: {
+  code: string;
+}) {
   const model = useMemo(() => buildChartModel(code), [code]);
 
   if (!model.ok) {
@@ -810,4 +816,4 @@ export function InlineAgentArkChart({ code }: { code: string }) {
       <StaticInlineChart model={model} />
     </Box>
   );
-}
+});

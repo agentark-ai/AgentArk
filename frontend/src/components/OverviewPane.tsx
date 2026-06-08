@@ -39,19 +39,15 @@ import {
   type FocusState,
   NeuralPanel,
   SuggestedStepCard,
-  AutomationPostureCard,
   RuntimeActivityCard,
   RuntimeHealthCard,
   ToolActivityCard,
   AgentCognitionLoop,
-  type CognitionStageId,
   ReflectionNotesCard,
   RecentLearningsCard,
   MemoryStateCard,
   ActiveMissionsCard,
   SafetyGuardrailsCard,
-  SurfaceSummaryCard,
-  NeedsAttentionCard,
 } from "./missionControl";
 import type {
   AutonomyActionExecutionResponse,
@@ -1007,16 +1003,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
       },
     ];
   }, [briefingQ.data, currentTask, serverStatus, showActivityFeed, traces.length]);
-  const cognitionStage = useMemo<CognitionStageId>(() => {
-    const recommended = (briefingQ.data?.recommended_actions || briefingQ.data?.recommended_skills || [])[0];
-    if (currentTask) return "act";
-    if (recommended) return "plan";
-    if (showActivityFeed) return "reflect";
-    if (briefingQ.data) return "understand";
-    return "observe";
-  }, [briefingQ.data, currentTask, showActivityFeed]);
-  const cognitionIteration = Math.max(1, traces.length + activeBackgroundSessions.length + 1);
-
   return (
     <Box
       data-tour-target="overview-dashboard"
@@ -1134,8 +1120,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                 </div>
                 <div className="nw-dashboard-graph">
                   <AgentCognitionLoop
-                    activeStage={cognitionStage}
-                    iteration={cognitionIteration}
                     memoryCount={serverStatus?.status?.memory_entries ?? 0}
                     skillCount={serverStatus?.status?.skills_loaded ?? serverStatus?.status?.actions_loaded ?? 0}
                     appCount={automationCounts.apps}
@@ -1143,7 +1127,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                     traceCount={traces.length}
                     selfEvolveEnabled={Boolean(evolutionStatus.self_evolve_enabled)}
                     learningQueueCount={learningQueueTotal}
-                    modelConfigured={hasLlmConfigured}
                     latencyMs={serverStatus?.rtt_ms ?? null}
                   />
                 </div>
@@ -1179,31 +1162,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                   rttMs={serverStatus?.rtt_ms ?? null}
                 />
                 <ToolActivityCard events={traceEvents} />
-              </div>
-              <div className="nw-dashboard-right-row nw-dashboard-right-row--bottom right-two">
-                {activeIntegrations.length > 0 ? (
-                  <AutomationPostureCard
-                    automationCounts={automationCounts}
-                    activeIntegrations={activeIntegrations}
-                    onOpenInventory={() => setInventoryOpen(true)}
-                  />
-                ) : (
-                  <SurfaceSummaryCard automationCounts={automationCounts} />
-                )}
-                <NeedsAttentionCard
-                  tasks={tasks}
-                  notifications={notifications}
-                  securityLogs={securityLogs}
-                  settingsLoaded={!settingsQ.isLoading}
-                  hasLlmConfigured={hasLlmConfigured}
-                  onApprove={(id) => approveMutation.mutate(id)}
-                  onReject={(id) => rejectMutation.mutate(id)}
-                  onRetry={(id) => retryMutation.mutate(id)}
-                  onNavigate={navigateToView}
-                  approving={approveMutation.isPending}
-                  rejecting={rejectMutation.isPending}
-                  retrying={retryMutation.isPending}
-                />
               </div>
               {showActiveSessionsPanel ? (
                 <Box className="overview-inline-note overview-inline-note--sessions nw-dashboard-sessions nw-dashboard-right-row nw-dashboard-right-row--sessions">

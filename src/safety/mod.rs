@@ -139,10 +139,11 @@ impl SafetyEngine {
     /// Update the set of auto-approved actions from user settings.
     /// Actions in AUTO_APPROVE_BLOCKED are silently ignored.
     pub fn set_auto_approved(&self, actions: &[String]) {
-        let blocked: std::collections::HashSet<&str> = crate::core::config::AUTO_APPROVE_BLOCKED
-            .iter()
-            .copied()
-            .collect();
+        let blocked: std::collections::HashSet<&str> =
+            crate::core::runtime::config::AUTO_APPROVE_BLOCKED
+                .iter()
+                .copied()
+                .collect();
         let approved: std::collections::HashSet<String> = actions
             .iter()
             .map(|s| s.trim().to_string())
@@ -230,15 +231,6 @@ impl SafetyEngine {
         if let Ok(mut rules) = self.rules.write() {
             rules.push(rule);
         }
-    }
-
-    /// Get all rules
-    #[cfg(feature = "gui")]
-    pub fn rules(&self) -> Vec<SafetyRule> {
-        self.rules
-            .read()
-            .map(|rules| rules.clone())
-            .unwrap_or_default()
     }
 
     /// Clear expired pending approvals (older than 1 hour)

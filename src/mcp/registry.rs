@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::actions::ActionDef;
-use crate::core::config::{
+use crate::core::runtime::config::{
     AgentConfig, McpAuthConfig, McpAuthSecret, McpServerConfig, McpTransportConfig, Secrets,
 };
 use crate::runtime::{ActionRuntime, McpBinding, McpBindingKind};
@@ -194,7 +194,7 @@ impl McpRegistry {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                let resolved = crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+                let resolved = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::resolve_http(
                     &self.storage,
                     auth_profile_id,
                 )
@@ -221,11 +221,12 @@ impl McpRegistry {
         let result = client.call_tool(tool_name, &sanitized_arguments).await?;
         if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
             if let Some(auth_profile_id) = state.config.auth_profile_id.as_deref() {
-                let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
-                    &self.storage,
-                    auth_profile_id,
-                )
-                .await;
+                let _ =
+                    crate::core::connectivity::auth_profiles::AuthProfileControlPlane::mark_used(
+                        &self.storage,
+                        auth_profile_id,
+                    )
+                    .await;
             }
         }
         Ok(format_mcp_result(&result))
@@ -249,7 +250,7 @@ impl McpRegistry {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                let resolved = crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+                let resolved = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::resolve_http(
                     &self.storage,
                     auth_profile_id,
                 )
@@ -275,11 +276,12 @@ impl McpRegistry {
         let result = client.read_resource(uri).await?;
         if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
             if let Some(auth_profile_id) = state.config.auth_profile_id.as_deref() {
-                let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
-                    &self.storage,
-                    auth_profile_id,
-                )
-                .await;
+                let _ =
+                    crate::core::connectivity::auth_profiles::AuthProfileControlPlane::mark_used(
+                        &self.storage,
+                        auth_profile_id,
+                    )
+                    .await;
             }
         }
         Ok(format_mcp_result(&result))
@@ -296,7 +298,7 @@ impl McpRegistry {
             return Ok(state.has_auth);
         };
         Ok(
-            crate::core::auth_profiles::AuthProfileControlPlane::get(
+            crate::core::connectivity::auth_profiles::AuthProfileControlPlane::get(
                 &self.storage,
                 auth_profile_id,
             )
@@ -330,7 +332,7 @@ async fn build_server_state(
             let storage = runtime.storage().ok_or_else(|| {
                 anyhow!("Storage is required for auth profile-backed MCP servers")
             })?;
-            match crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+            match crate::core::connectivity::auth_profiles::AuthProfileControlPlane::resolve_http(
                 &storage,
                 auth_profile_id,
             )
@@ -354,7 +356,7 @@ async fn build_server_state(
     warnings.extend(auth_warnings);
     let env = resolve_stdio_env(server, config, secrets);
     if let McpTransportConfig::Http { url } = &server.transport {
-        crate::core::net::validate_external_https_url(url).await?;
+        crate::core::runtime::net::validate_external_https_url(url).await?;
     }
 
     let mut client = McpClient::new(server, auth, env)?;
@@ -493,7 +495,7 @@ fn auth_view(auth: &Option<McpAuthConfig>, has_auth: bool) -> McpAuthView {
 }
 
 fn auth_profile_to_mcp_auth(
-    resolved: &crate::core::auth_profiles::AuthProfileResolution,
+    resolved: &crate::core::connectivity::auth_profiles::AuthProfileResolution,
 ) -> Option<McpAuth> {
     let headers = resolved
         .overlay

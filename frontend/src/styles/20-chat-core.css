@@ -214,10 +214,18 @@
     linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
           mask-composite: exclude;
-  animation: avatarOrbitalRing 11s linear infinite;
   opacity: 0.92;
   pointer-events: none;
   z-index: 0;
+}
+
+/* The orbital ring spins only on the in-flight user turn. Historical avatars
+   keep the static gradient ring: each animated instance is a masked
+   conic-gradient repaint per tick, and one per transcript row accumulated
+   into a measurable idle-fps cost across runs. */
+.chat-avatar-user.chat-avatar-user-live::after {
+  animation: avatarOrbitalRing 11s linear infinite;
+  will-change: transform;
 }
 
 .chat-avatar-user-shell {
@@ -275,6 +283,10 @@
     drop-shadow(0 0 6px rgba(244, 220, 170, 0.6))
     drop-shadow(0 0 10px rgba(139, 92, 246, 0.28));
   stroke-width: 2.15 !important;
+}
+
+/* Sparkle pulses only while the turn is in flight (see ring note above). */
+.chat-avatar-user-live .chat-avatar-user-accent {
   animation: avatarSparklePulse 3.4s ease-in-out infinite;
 }
 
@@ -1565,6 +1577,24 @@
 }
 
 .stream-caret {
+  display: inline-block;
+  width: 8px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -2px;
+  border-radius: 1px;
+  background: var(--ui-rgba-137-244-255-950);
+  animation: caretPulse 0.9s steps(1, end) infinite;
+}
+
+/* Streaming caret rendered inline at the end of the last streamed text block
+   so it rides the text instead of wrapping onto its own empty line. The
+   standalone .stream-caret span remains for tails without a text block
+   (e.g. the research report card). */
+.chat-markdown-streaming > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
+.chat-markdown-streaming > :is(ul, ol):last-child > li:last-child::after,
+.chat-markdown-streaming > blockquote:last-child p:last-child::after {
+  content: "";
   display: inline-block;
   width: 8px;
   height: 1em;

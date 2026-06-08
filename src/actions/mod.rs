@@ -1,16 +1,25 @@
 //! Action system with self-improvement capabilities
 //! Based on arXiv:2512.17102 "SAGE: Self-Improving Agent with Action Library"
 
+#[path = "app/app.rs"]
 pub mod app;
 pub mod arkorbit;
+#[path = "google/calendar.rs"]
 pub mod calendar;
+#[path = "google/gmail.rs"]
 pub mod gmail;
+#[path = "google/google_workspace.rs"]
 pub mod google_workspace;
+#[path = "network/lan.rs"]
 pub mod lan;
+#[path = "research/research.rs"]
 pub mod research;
+#[path = "research/search.rs"]
 pub mod search;
 #[cfg(feature = "ssh")]
+#[path = "network/ssh.rs"]
 pub mod ssh;
+#[path = "deploy/vercel.rs"]
 pub mod vercel;
 
 use serde::{Deserialize, Serialize};
@@ -562,6 +571,10 @@ pub struct ActionAuthorizationContext {
     pub agent_access_scope: Option<crate::core::swarm::AgentAccessScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timezone_offset_minutes: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

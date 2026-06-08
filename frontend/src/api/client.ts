@@ -575,6 +575,8 @@ type ChatStreamPayload = {
   accepted_suggestion_id?: string;
   sentinel_proposal_id?: string;
   browser_profile_context?: Record<string, unknown>;
+  client_timezone?: string;
+  client_timezone_offset_minutes?: number;
 };
 
 type ChatStreamHandlers = {

@@ -1261,6 +1261,39 @@ export type BrowserProfilesResponse = {
   profiles: BrowserProfileRecord[];
 };
 
+export type ModelCapabilityProbe = {
+  pass: boolean;
+  detail: string;
+  latency_ms: number | null;
+};
+
+export type ModelTestVerdict =
+  | "supported"
+  | "degraded"
+  | "unsupported_for_agent_runs";
+
+export type ModelTestCapabilities = {
+  tool_calls: ModelCapabilityProbe;
+  final_response: ModelCapabilityProbe;
+  json_output: ModelCapabilityProbe;
+};
+
+export type ModelTestRoleFitness = {
+  primary_spine: boolean;
+  verifier: boolean;
+  helper_text: boolean;
+};
+
+export type ModelTestResult = {
+  ok: boolean;
+  error: string;
+  capabilities: ModelTestCapabilities | null;
+  verdict: ModelTestVerdict | null;
+  role_fitness: ModelTestRoleFitness | null;
+  warning: string;
+  capabilities_error: string;
+};
+
 export type ModelFailoverResponse = {
   summary?: {
     auth_profiles: number;

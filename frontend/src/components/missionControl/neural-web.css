@@ -702,8 +702,10 @@
 .right-stack {
   grid-column: span 5;
   display: grid;
-  /* Last row flexes so the bottom row fills down to the shared bottom line. */
-  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-row-3) minmax(var(--nw-dashboard-row-4), 1fr);
+  /* Three rows (Automation Surfaces / Needs Attention removed): the runtime
+     health + tool activity row flexes to fill down to the shared bottom line,
+     keeping all three columns the same height. */
+  grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) minmax(var(--nw-dashboard-row-3), 1fr);
   gap: var(--nw-dashboard-gap);
 }
 
@@ -1089,7 +1091,7 @@
 }
 
 /* Cognition loop is alive: data flows along the mesh, the cycle breathes, and
-   satellites twinkle. (The active stage node already pulses via inline SMIL.) */
+   satellites twinkle. */
 @keyframes nw-cog-dash-flow {
   to {
     stroke-dashoffset: -44;
@@ -1137,16 +1139,58 @@
   transform-origin: center;
   transform-box: fill-box;
 }
+/* Travelling packet rides the exact cycle curve via offset-path (set inline
+   from AgentCognitionLoop.tsx). 7s here MUST match nw-cog-node-glow below and
+   ORBIT_DURATION_S in AgentCognitionLoop.tsx — the rim flash delays are
+   computed as arc-length fractions of this period, so the flash fires exactly
+   as the packet lands on each stage. Linear = constant speed along the ring. */
+@keyframes nw-cog-orbit {
+  to {
+    offset-distance: 100%;
+  }
+}
+.nw-cog-packet circle {
+  animation: nw-cog-orbit 7s linear infinite;
+}
+/* The travelling packet owns stage emphasis: each rim flashes briefly as the
+   packet reaches that stage, then returns to the neutral node state. */
+@keyframes nw-cog-node-glow {
+  0% {
+    opacity: 0.95;
+    transform: scale(1.18);
+  }
+  8% {
+    opacity: 0;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+.nw-cog-node-rim {
+  opacity: 0;
+  animation: nw-cog-node-glow 7s ease-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
 @media (prefers-reduced-motion: reduce) {
   .nw-cog-chords path,
   .nw-cog-connectors line,
   .nw-cog-cycle,
   .nw-cog-flow,
+  .nw-cog-node-rim,
+  .nw-cog-packet circle,
   .nw-cog-sat {
     animation: none;
   }
-  /* orbiting packets (SMIL) are not rendered at all under reduced motion —
-     gated in AgentCognitionLoop.tsx via PREFERS_REDUCED_MOTION. */
+  .nw-cog-node-rim {
+    opacity: 0;
+  }
+  /* a frozen packet parked on stage 01 reads as a glitch — hide it. */
+  .nw-cog-packet {
+    display: none;
+  }
 }
 
 .nw-cog-caption {
@@ -2807,7 +2851,9 @@
   .mission-grid .right-stack {
     grid-column: 1 / -1;
     display: grid;
-    grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) var(--nw-dashboard-row-3) var(--nw-dashboard-row-4);
+    /* Three rows (Automation Surfaces / Needs Attention removed); the runtime
+       row flexes to the shared bottom line. */
+    grid-template-rows: var(--nw-dashboard-row-1) var(--nw-dashboard-row-2) minmax(var(--nw-dashboard-row-3), 1fr);
     min-height: var(--nw-dashboard-main-height);
     height: 100%;
     overflow: hidden;
@@ -2816,14 +2862,16 @@
 
 /* Desktop (>=1280px): release the "fit everything in one locked viewport" cap.
    The base rules pin the grid + every stack to a dvh-derived height with
-   overflow:hidden, which clips content and prevents scrolling. Here we let the
-   columns flow to their content height and let the already-scrollable
-   .overview-shell handle vertical scroll naturally. */
+   overflow:hidden, which clips content and prevents scrolling. Here the row
+   height is content-derived (tallest column) and the already-scrollable
+   .overview-shell handles vertical scroll naturally — but the three columns
+   still stretch to that shared row, with one flexing card per column, so all
+   three bottoms meet on the same line. */
 @media (min-width: 1280px) {
   .nw-dashboard-main--mission.mission-grid {
     grid-template-rows: none;
-    grid-auto-rows: max-content;
-    align-items: start;
+    grid-auto-rows: auto;
+    align-items: stretch;
     min-height: 0;
     height: auto;
     overflow: visible;
@@ -2832,13 +2880,27 @@
   .mission-grid .left-stack,
   .mission-grid .center-stack,
   .mission-grid .right-stack {
-    grid-template-rows: none;
-    grid-auto-rows: max-content;
-    align-self: start;
-    align-content: start;
+    display: flex;
+    flex-direction: column;
+    align-self: stretch;
     min-height: 0;
     height: auto;
     overflow: visible;
+  }
+
+  .mission-grid .left-stack > *,
+  .mission-grid .center-stack > *,
+  .mission-grid .right-stack > * {
+    flex: 0 0 auto;
+    min-height: 0;
+  }
+
+  /* One grower per column: Suggested step (left), cognition loop (center),
+     runtime health + tool activity (right). */
+  .mission-grid .left-stack > :last-child,
+  .mission-grid .center-stack > .nw-dashboard-loop-panel,
+  .mission-grid .right-stack > .nw-dashboard-right-row--runtime {
+    flex: 1 1 auto;
   }
 
   .mission-grid .nw-dashboard-right-row {
@@ -2846,7 +2908,16 @@
     min-height: 0;
   }
 
-  /* Cards size to their own content rather than a fixed row height. */
+  /* The grown runtime row passes its height down to both cards. */
+  .mission-grid .nw-dashboard-right-row--runtime.right-two {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .mission-grid .nw-dashboard-right-row--runtime > .nw-panel {
+    height: 100%;
+  }
+
+  /* Other cards size to their own content rather than a fixed row height. */
   .mission-grid .nw-panel,
   .mission-grid .nw-dashboard-graph-panel,
   .mission-grid .overview-inline-note {

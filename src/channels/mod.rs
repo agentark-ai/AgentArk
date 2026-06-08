@@ -1,25 +1,43 @@
 //! Communication channels - HTTP, Telegram, WhatsApp, etc.
 
+#[path = "messaging/discord.rs"]
 pub mod discord;
+#[path = "gateway/gateway.rs"]
 pub mod gateway;
+#[path = "messaging/google_chat.rs"]
 pub mod google_chat;
 pub mod http;
+#[path = "messaging/imessage.rs"]
 pub mod imessage;
+#[path = "messaging/line.rs"]
 pub mod line;
+#[path = "messaging/matrix.rs"]
 pub mod matrix;
+#[path = "dispatch/messaging_dispatch.rs"]
 pub mod messaging_dispatch;
+#[path = "dispatch/messaging_registry.rs"]
 pub mod messaging_registry;
+#[path = "outbound/outbound_rate_limit.rs"]
 pub(crate) mod outbound_rate_limit;
+#[path = "outbound/outbound_split.rs"]
 pub(crate) mod outbound_split;
+#[path = "messaging/qq.rs"]
 pub mod qq;
+#[path = "messaging/signal.rs"]
 pub mod signal;
+#[path = "messaging/slack.rs"]
 pub mod slack;
+#[path = "messaging/teams.rs"]
 pub mod teams;
+#[path = "web/web.rs"]
 pub mod web;
+#[path = "messaging/wechat.rs"]
 pub mod wechat;
+#[path = "messaging/whatsapp.rs"]
 pub mod whatsapp;
 
 #[cfg(feature = "telegram")]
+#[path = "messaging/telegram.rs"]
 pub mod telegram;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, thiserror::Error)]

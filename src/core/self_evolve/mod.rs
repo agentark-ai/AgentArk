@@ -6,16 +6,29 @@
 use anyhow::Result;
 use std::path::Path;
 
+#[path = "gates/deployment_cadence.rs"]
 pub mod deployment_cadence;
+#[path = "optimizer/gepa_bridge.rs"]
 pub mod gepa_bridge;
+#[path = "policies/policy_evolution.rs"]
 pub mod policy_evolution;
+#[path = "gates/promotion_gate.rs"]
 pub mod promotion_gate;
+#[path = "prompts/prompt_evolution.rs"]
 pub mod prompt_evolution;
+#[path = "prompts/prompt_fragment_evolution.rs"]
 pub(crate) mod prompt_fragment_evolution;
+#[path = "gates/replay_gate.rs"]
 pub mod replay_gate;
+#[path = "routing/router_learning.rs"]
 pub mod router_learning;
+#[path = "routing/routing_canonical_evolution.rs"]
 pub mod routing_canonical_evolution;
+#[path = "runtime/self_tune.rs"]
+pub mod self_tune;
+#[path = "prompts/specialist_prompt_evolution.rs"]
 pub mod specialist_prompt_evolution;
+#[path = "runtime/strategy_runtime.rs"]
 pub mod strategy_runtime;
 
 pub use policy_evolution::{

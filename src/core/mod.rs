@@ -1,68 +1,24 @@
 //! Core agent module - the brain of AgentArk
 #![allow(unused_imports)]
 
-pub(crate) mod action_catalog;
-mod agent;
-pub mod agentark_knowledge;
+pub mod agent;
 pub mod arkorbit;
-pub mod artifact_hygiene;
-pub mod auth_profiles;
 pub mod automation;
-pub mod autonomy;
-pub mod background_session;
-pub mod browser_profiles;
-pub mod browser_session;
-pub mod companion;
-pub mod config;
-pub mod connect_flow;
-pub mod connector;
-pub(crate) mod context_budget;
-pub(crate) mod data_contract;
-pub mod data_lifecycle;
-pub(crate) mod document_search;
-pub mod email_delivery;
-pub mod embeddings;
-pub mod execution;
-pub mod gateway;
-pub mod gateway_ops;
-pub mod inline_artifacts;
-pub mod integration_auth;
-pub mod integration_sync;
-pub mod learning;
-pub mod live_run;
-mod llm;
-pub(crate) mod llm_context_sanitizer;
-pub(crate) mod llm_provider;
-pub mod memory_dedup;
-pub mod memory_schema;
-pub mod model_failover;
-pub mod net;
-pub mod nodes;
-pub mod observability;
-pub mod orchestra;
-pub mod pipeline;
-pub mod planner;
-pub(crate) mod prompt_fragments;
-pub mod prompt_memory;
-pub mod prompt_policy;
-pub mod readiness;
-pub mod release_updates;
-pub mod runtime_image;
-pub mod secrets;
+pub mod connectivity;
+pub mod knowledge;
+pub mod model;
+pub mod orchestration;
+pub mod platform;
+pub mod request_contract;
+pub mod runtime;
 pub mod self_evolve;
-pub mod self_tune;
-pub mod sender_verification;
-pub(crate) mod skill_marketplaces;
-pub mod spawn;
 pub mod swarm;
-mod task;
-pub mod task_router;
-pub mod voice;
-pub mod watcher;
 
 #[cfg(test)]
 mod voice_tests {
-    use super::voice::{voice_runtime_config_from_env, VoiceSessionPhase, VoiceSessionRegistry};
+    use super::runtime::voice::{
+        voice_runtime_config_from_env, VoiceSessionPhase, VoiceSessionRegistry,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -163,9 +119,11 @@ mod voice_tests {
 
     #[test]
     fn voice_bridge_stream_url_uses_websocket_scheme_and_encoded_session() {
-        let url =
-            super::voice::voice_bridge_stream_url("http://voice.example.test:3105", "session 1")
-                .expect("valid bridge url");
+        let url = super::runtime::voice::voice_bridge_stream_url(
+            "http://voice.example.test:3105",
+            "session 1",
+        )
+        .expect("valid bridge url");
 
         assert_eq!(
             url.as_str(),
@@ -190,26 +148,37 @@ pub use agent::{
     StreamEvent, UserProfile,
 };
 pub use arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitFileEntry, OrbitManifest};
-pub use automation::{
-    list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
-    AutomationRunStatus, AutomationSupervisorState,
-};
-pub use autonomy::{
+pub use automation::autonomy::{
     score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,
     RiskEnvelope, RiskLevel, TrustPolicy,
 };
-pub use background_session::{
+pub use automation::background_session::{
     background_session_id_from_automation, set_background_session_id_in_automation,
     BackgroundSession, BackgroundSessionCreate, BackgroundSessionEvent, BackgroundSessionManager,
     BackgroundSessionPolicy, BackgroundSessionStatus, BackgroundSessionUpdate,
 };
-pub use browser_profiles::{
+pub use automation::live_run::{LiveRunRegistry, RunEvent, RunEventPriority};
+pub(crate) use automation::task::{
+    one_shot_reminder_is_expired, one_shot_reminder_needs_delay_notice,
+};
+pub use automation::task::{
+    status_for_task_approval, task_requires_explicit_approval, Task, TaskApproval, TaskQueue,
+    TaskStatus,
+};
+pub(crate) use automation::task::{
+    task_is_one_shot_scheduled_reminder, task_is_scheduled_reminder,
+};
+pub use automation::{
+    list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
+    AutomationRunStatus, AutomationSupervisorState,
+};
+pub use connectivity::browser_profiles::{
     BrowserLoginState, BrowserProfileControlPlane, BrowserProfileListResponse,
     BrowserProfileLockRequest, BrowserProfileRecord, BrowserProfileResolveCandidate,
     BrowserProfileResolveOutcome, BrowserProfileSessionRecord, BrowserProfileTargetKind,
     BrowserProfileUpsert,
 };
-pub use companion::{
+pub use connectivity::companion::{
     companion_presets, presets_response as companion_presets_response,
     protocol_document as companion_protocol_document, CompanionAttestationClaim,
     CompanionAuditEvent, CompanionCommand, CompanionCommandCreate, CompanionCommandDescriptor,
@@ -219,18 +188,7 @@ pub use companion::{
     CompanionPresetsResponse, CompanionProtocolDocument, CompanionRiskLevel,
     CompanionTokenRotationRequest, CompanionTokenRotationResult,
 };
-pub use config::{
-    AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
-};
-pub use embeddings::EmbeddingClient;
-pub use execution::{
-    execute_supervised_transport_chat, AttemptPolicy, AttemptRecord, DegradationNote,
-    DelegationStatus, ExecutionCandidateDescriptor, ExecutionCheckpoint, ExecutionOutcome,
-    ExecutionRequest, ExecutionRun, ExecutionRunStatus, ExecutionSupervisor, FailureClass,
-    FailureKind, ModelAttemptRecord, RecoveryAction, RequestState, ToolAttempt, ToolOutcome,
-    ToolOutcomeStatus, UserFacingOutcome, UserFacingOutcomeStatus,
-};
-pub use gateway::{
+pub use connectivity::gateway::{
     create_broadcast_group as create_gateway_broadcast_group,
     delete_channel_account as delete_gateway_channel_account,
     delete_route_rule as delete_gateway_route_rule, load_channels as load_gateway_channels,
@@ -242,33 +200,39 @@ pub use gateway::{
     GatewayRouteRuleUpsert, GatewayRoutingResponse, GatewayRoutingSimulation,
     GatewayRoutingSimulationRequest, GatewayRoutingSummary,
 };
-pub use gateway_ops::{
+pub use connectivity::gateway_ops::{
     GatewayOpsControlPlane, GatewayOpsHighlight, GatewayOpsOperatorCheck, GatewayOpsOverview,
     GatewayOpsServiceSummary,
 };
-pub use live_run::{LiveRunRegistry, RunEvent, RunEventPriority};
-pub use llm::{LlmClient, LlmProvider, LlmResponse, ToolCall};
-pub use model_failover::{
+pub use knowledge::embeddings::EmbeddingClient;
+pub use model::llm::{LlmClient, LlmProvider, LlmResponse, ToolCall};
+pub use model::model_failover::{
     AuthProfileRecord, AuthProfileUpsert, CooldownClearResult, FallbackCandidate,
     FallbackChainRecord, FallbackChainUpsert, ModelFailoverControlPlane, ModelFailoverListResponse,
     ModelFailoverSelectionRequest, ModelFailoverSelectionResult, ModelSessionPin,
     ProviderHealthEvent, ProviderHealthRecord, ProviderHealthUpsert,
 };
-pub use nodes::{
+pub use model::prompt_memory::PromptMemory;
+pub use orchestration::execution::{
+    execute_supervised_transport_chat, AttemptPolicy, AttemptRecord, DegradationNote,
+    DelegationStatus, ExecutionCandidateDescriptor, ExecutionCheckpoint, ExecutionOutcome,
+    ExecutionRequest, ExecutionRun, ExecutionRunStatus, ExecutionSupervisor, FailureClass,
+    FailureKind, ModelAttemptRecord, RecoveryAction, RequestState, ToolAttempt, ToolOutcome,
+    ToolOutcomeStatus, UserFacingOutcome, UserFacingOutcomeStatus,
+};
+pub use orchestration::nodes::{
     NodeCapability, NodeCommandLogEntry, NodeCommandLogRequest, NodeControlPlane,
     NodeControlPlaneStatus, NodeHeartbeat, NodeHeartbeatRequest, NodeState, NodeTransportKind,
     NodeUpsertRequest, PairedNode,
 };
-pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanSubstep};
-pub use prompt_memory::PromptMemory;
-pub use readiness::{DevelopmentalReadiness, ReadinessPolicy};
-pub(crate) use task::{one_shot_reminder_is_expired, one_shot_reminder_needs_delay_notice};
-pub use task::{
-    status_for_task_approval, task_requires_explicit_approval, Task, TaskApproval, TaskQueue,
-    TaskStatus,
+pub use orchestration::planner::{
+    ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanSubstep,
 };
-pub(crate) use task::{task_is_one_shot_scheduled_reminder, task_is_scheduled_reminder};
-pub use voice::{
+pub use runtime::config::{
+    AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
+};
+pub use runtime::readiness::{DevelopmentalReadiness, ReadinessPolicy};
+pub use runtime::voice::{
     voice_runtime_config_from_current_env, voice_runtime_config_from_env, VoiceRuntimeConfig,
     VoiceSession, VoiceSessionPhase, VoiceSessionRegistry,
 };

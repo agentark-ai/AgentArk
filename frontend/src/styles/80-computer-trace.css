@@ -581,8 +581,8 @@
 .computer-pane-files-list {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  max-height: 196px;
+  gap: 1px;
+  max-height: 248px;
   overflow: auto;
   padding-right: 2px;
 }
@@ -590,35 +590,36 @@
 .computer-pane-file-tree-folder {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
 }
 
+/* Compact indented tree (no per-row card chrome) — the indentation conveys
+   hierarchy; a faint guide rail sits at each nesting level. */
 .computer-pane-file-folder {
   width: 100%;
   display: grid;
-  grid-template-columns: 16px 16px minmax(0, 1fr) auto;
+  grid-template-columns: 14px 15px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 7px;
-  min-height: 32px;
-  padding: 5px 8px 5px calc(8px + var(--file-tree-indent, 0px));
-  border: 1px solid rgba(255, 255, 255, 0.045);
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.018);
-  color: rgba(236, 241, 246, 0.78);
+  gap: 6px;
+  min-height: 26px;
+  padding: 2px 8px 2px calc(6px + var(--file-tree-indent, 0px));
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(236, 241, 246, 0.74);
   cursor: pointer;
   text-align: left;
-  transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
+  transition: background 140ms ease, color 140ms ease;
 }
 
 .computer-pane-file-folder:hover,
 .computer-pane-file-tree-folder.is-selected > .computer-pane-file-folder {
-  border-color: rgba(120, 242, 176, 0.28);
-  background: rgba(120, 242, 176, 0.07);
+  background: rgba(255, 255, 255, 0.045);
   color: rgba(248, 251, 255, 0.94);
 }
 
 .computer-pane-file-tree-folder.is-live > .computer-pane-file-folder {
-  border-color: rgba(74, 210, 157, 0.32);
+  color: rgba(122, 237, 190, 0.95);
 }
 
 .computer-pane-file-folder-chevron,
@@ -657,7 +658,7 @@
 .computer-pane-file-folder-children {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
 }
 
 .computer-pane-file-pill {
@@ -678,9 +679,26 @@
 }
 
 .computer-pane-file-pill.is-tree-file {
-  grid-template-columns: 16px minmax(76px, 0.7fr) minmax(92px, 1fr) auto;
-  min-height: 32px;
-  padding-left: calc(8px + var(--file-tree-indent, 0px));
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  min-height: 26px;
+  padding: 2px 8px 2px calc(6px + var(--file-tree-indent, 0px));
+  border: 0;
+  background: transparent;
+}
+
+.computer-pane-file-pill.is-tree-file:hover,
+.computer-pane-file-pill.is-tree-file.is-selected {
+  background: rgba(120, 242, 176, 0.1);
+}
+
+.computer-pane-file-pill.is-tree-file.is-live {
+  background: rgba(74, 210, 157, 0.08);
+}
+
+/* The full path is redundant in the tree (indentation shows location) and lives
+   in the file viewer header + the row's title tooltip. */
+.computer-pane-file-pill.is-tree-file .computer-pane-file-path {
+  display: none;
 }
 
 .computer-pane-file-pill:hover,

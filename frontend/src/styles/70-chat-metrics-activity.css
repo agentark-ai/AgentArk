@@ -896,7 +896,7 @@
 .chat-transcript-command-block {
   border: 1px solid rgba(255, 255, 255, 0.07);
   border-radius: 10px;
-  background: rgba(8, 12, 22, 0.85);
+  background: rgba(10, 11, 13, 0.85);
   overflow: hidden;
 }
 
@@ -918,7 +918,7 @@
   margin: 0;
   padding: 11px 13px;
   overflow: auto;
-  color: rgba(220, 232, 248, 0.9);
+  color: rgba(226, 230, 234, 0.9);
   font-family: var(--font-mono);
   font-size: 0.72rem;
   font-weight: 500;
@@ -1152,6 +1152,15 @@
 .chat-row-interrupted-work .chat-bubble-interrupted-work {
   flex: 0 1 auto;
   max-width: min(100%, 760px) !important;
+}
+
+/* The live row stretches the panel to the 44px avatar; center the collapsed
+   transcript header inside it so the panel reads as one aligned row. No-op
+   once the transcript grows taller than the avatar. */
+.chat-row-live-work .chat-live-work-panel {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
 
 .chat-row-live-work .chat-live-work-panel.has-status-copy {

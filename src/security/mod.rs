@@ -21,18 +21,31 @@
 //!   detector. Retained because it encodes token formats, not anticipated
 //!   wording.
 
+#[path = "abuse/abuse_tracker.rs"]
 pub mod abuse_tracker;
+#[path = "guards/action_guard.rs"]
 pub mod action_guard;
+#[path = "review/capabilities.rs"]
 pub mod capabilities;
+#[path = "classification/embedding_classifier.rs"]
 pub mod embedding_classifier;
+#[path = "classification/intent_classifier.rs"]
 pub mod intent_classifier;
+#[path = "model/model_hardening.rs"]
 pub mod model_hardening;
+#[path = "privacy/model_input.rs"]
 pub mod model_input;
+#[path = "privacy/normalize.rs"]
 pub mod normalize;
+#[path = "guards/outbound.rs"]
 pub mod outbound;
+#[path = "privacy/pii.rs"]
 pub mod pii;
+#[path = "review/skill_review.rs"]
 pub mod skill_review;
+#[path = "guards/tool_args_guard.rs"]
 pub mod tool_args_guard;
+#[path = "boundary/trust_boundary.rs"]
 pub mod trust_boundary;
 
 pub use action_guard::ActionGuard;

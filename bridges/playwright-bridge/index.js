@@ -514,18 +514,34 @@ async function interactiveElementCenter(page, targetIndex) {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     };
-    const labelFor = (el) => (
-      el.innerText ||
-      el.value ||
-      el.getAttribute('aria-label') ||
-      el.getAttribute('placeholder') ||
-      el.getAttribute('name') ||
-      el.id ||
-      el.getAttribute('href') ||
-      el.tagName.toLowerCase() ||
-      ''
-    ).trim().substring(0, 80);
-    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [onclick]';
+    const labelFor = (el) => {
+      const tag = el.tagName.toLowerCase();
+      const role = String(el.getAttribute('role') || '').toLowerCase();
+      const editable = el.isContentEditable || role === 'textbox' || tag === 'input' || tag === 'textarea';
+      const parts = editable
+        ? [
+            el.getAttribute('aria-label'),
+            el.getAttribute('placeholder'),
+            el.getAttribute('name'),
+            el.id,
+            el.innerText,
+            el.value,
+            el.getAttribute('href'),
+            tag,
+          ]
+        : [
+            el.innerText,
+            el.value,
+            el.getAttribute('aria-label'),
+            el.getAttribute('placeholder'),
+            el.getAttribute('name'),
+            el.id,
+            el.getAttribute('href'),
+            tag,
+          ];
+      return (parts.find((part) => String(part || '').trim()) || '').trim().substring(0, 80);
+    };
+    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [contenteditable], [onclick]';
     const els = document.querySelectorAll(interactiveSelectors);
     let visibleIndex = 0;
     for (let i = 0; i < Math.min(els.length, 50); i++) {
@@ -554,7 +570,7 @@ async function readPageSnapshot(page) {
     const body = document.body;
     const bodyText = body ? body.innerText.substring(0, 5000) : '';
     const results = [];
-    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [onclick]';
+    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [contenteditable], [onclick]';
     const els = document.querySelectorAll(interactiveSelectors);
     const visible = (el) => {
       if (!el || !(el instanceof HTMLElement)) return false;
@@ -568,8 +584,13 @@ async function readPageSnapshot(page) {
       const rect = el.getBoundingClientRect();
       if (!visible(el)) continue;
       const tag = el.tagName.toLowerCase();
-      const type = el.getAttribute('type') || '';
-      const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().substring(0, 80);
+      const role = String(el.getAttribute('role') || '').toLowerCase();
+      const editable = el.isContentEditable || role === 'textbox' || tag === 'input' || tag === 'textarea';
+      const type = el.getAttribute('type') || (el.isContentEditable ? 'contenteditable' : role);
+      const labelParts = editable
+        ? [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id, el.innerText, el.value]
+        : [el.innerText, el.value, el.getAttribute('aria-label'), el.getAttribute('placeholder')];
+      const text = (labelParts.find((part) => String(part || '').trim()) || '').trim().substring(0, 80);
       const name = el.getAttribute('name') || '';
       const id = el.id || '';
       const href = el.getAttribute('href') || '';
@@ -602,8 +623,8 @@ async function readPageSnapshotWithRetry(page) {
   throw lastError || new Error('Unable to read page snapshot');
 }
 
-async function focusEditableTarget(page, selector) {
-  return page.evaluate((selector) => {
+async function focusEditableTarget(page, selector, elementIndex) {
+  return page.evaluate(({ selector, elementIndex }) => {
     const visible = (el) => {
       if (!el || !(el instanceof HTMLElement)) return false;
       const style = window.getComputedStyle(el);
@@ -619,7 +640,20 @@ async function focusEditableTarget(page, selector) {
         const type = String(el.getAttribute('type') || 'text').toLowerCase();
         return !el.disabled && !el.readOnly && !['hidden', 'button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image'].includes(type);
       }
-      return el.isContentEditable;
+      return el.isContentEditable || String(el.getAttribute('role') || '').toLowerCase() === 'textbox';
+    };
+    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [contenteditable], [onclick]';
+    const elementByVisibleIndex = (index) => {
+      if (!Number.isInteger(index)) return null;
+      const els = document.querySelectorAll(interactiveSelectors);
+      let visibleIndex = 0;
+      for (let i = 0; i < Math.min(els.length, 50); i++) {
+        const el = els[i];
+        if (!visible(el)) continue;
+        if (visibleIndex === index) return el;
+        visibleIndex += 1;
+      }
+      return null;
     };
     const score = (el, selected) => {
       const tag = el.tagName.toLowerCase();
@@ -643,9 +677,21 @@ async function focusEditableTarget(page, selector) {
         return [];
       }
     };
-    let candidates = collect(selector, true);
+    let candidates = [];
+    if (Number.isInteger(elementIndex)) {
+      const indexed = elementByVisibleIndex(elementIndex);
+      if (!indexed) {
+        return { ok: false, error: `No interactive element ${elementIndex} is visible on the current page.` };
+      }
+      if (!editable(indexed)) {
+        return { ok: false, error: `Interactive element ${elementIndex} is not editable.` };
+      }
+      candidates = [{ el: indexed, selected: true }];
+    } else {
+      candidates = collect(selector, true);
+    }
     if (candidates.length === 0) {
-      candidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
+      candidates = Array.from(document.querySelectorAll('input, textarea, [role="textbox"], [contenteditable]'))
         .filter(editable)
         .map((el) => ({ el, selected: false }));
     }
@@ -666,7 +712,10 @@ async function focusEditableTarget(page, selector) {
       name: target.getAttribute('name') || '',
       selected: Boolean(candidates[0]?.selected),
     };
-  }, selector || null);
+  }, {
+    selector: selector || null,
+    elementIndex: Number.isInteger(elementIndex) ? elementIndex : null,
+  });
 }
 
 function touchSession(session) {
@@ -1191,8 +1240,9 @@ app.post('/session/:id/type', async (req, res) => {
   if (!session) return res.status(404).json({ error: 'Session not found' });
   touchSession(session);
   try {
-    const { selector, text, clear } = req.body;
-    const target = await focusEditableTarget(session.page, selector);
+    const { selector, text, clear, element_index, index } = req.body;
+    const requestedIndex = Number.isInteger(element_index) ? element_index : Number.isInteger(index) ? index : null;
+    const target = await focusEditableTarget(session.page, selector, requestedIndex);
     if (!target.ok) {
       return res.status(422).json({ error: target.error || 'No editable target found' });
     }

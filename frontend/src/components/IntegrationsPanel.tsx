@@ -965,6 +965,9 @@ export function IntegrationsPanel({
   const [sshTestOutput, setSshTestOutput] = useState("");
   const [expandedSection, setExpandedSection] = useState<string | false>("connected");
   const [hubPanelDialog, setHubPanelDialog] = useState<IntegrationHubPanel | null>(null);
+  // Deep-link target for the Custom API Builder: set by clicking one
+  // specific custom-API hub tile, cleared when the hub dialog closes.
+  const [customApiFocusId, setCustomApiFocusId] = useState("");
   const [hubSearch, setHubSearch] = useState("");
   const [hubFilter, setHubFilter] = useState<IntegrationHubFilter>("all");
   const [sshKeyError, setSshKeyError] = useState<string | null>(null);
@@ -2819,7 +2822,12 @@ export function IntegrationsPanel({
           "User-added",
           operationCount > 0 ? `${operationCount} operation${operationCount === 1 ? "" : "s"}` : "API"
         ],
-        onClick: () => openHubPanelForSource("custom_api")
+        onClick: () => {
+          // Deep-link straight to this API's Configure editor — landing on
+          // the full builder list would make the per-API tile meaningless.
+          setCustomApiFocusId(id);
+          openHubPanelForSource("custom_api");
+        }
       };
     }),
     ...webhookSources.map((item): IntegrationHubCard => {
@@ -2857,24 +2865,18 @@ export function IntegrationsPanel({
         tags: ["SDK"],
         onClick: () => openHubPanelForSource("plugin")
       };
-    }),
-    {
-      id: "extension-packs",
-      name: "Extension Packs",
-      detail: "Manifest-based integrations and channel packs installed from external sources.",
-      kind: "Pack-based",
-      source: "extension_pack",
-      category: "platform",
-      status: "info",
-      statusLabel: "Available",
-      actionLabel: "Manage",
-      iconName: "Extension",
-      tags: ["Integrations", "Channels"],
-      onClick: () => openHubPanelForSource("extension_pack")
-    }
+    })
   ];
 
   const hubSearchNeedle = hubSearch.trim().toLowerCase();
+  const integrationHubSourceSortRank = (source: IntegrationHubCardSource): number => {
+    if (source === "builtin_integration") return 0;
+    if (source === "custom_api") return 1;
+    if (source === "webhook") return 2;
+    if (source === "plugin") return 3;
+    if (source === "extension_pack") return 9;
+    return 4;
+  };
   const hubMatches = (item: IntegrationHubCard) => {
     if (hubFilter !== "all" && item.category !== hubFilter) return false;
     if (!hubSearchNeedle) return true;
@@ -2890,11 +2892,16 @@ export function IntegrationsPanel({
   };
   const sortHubCards = (items: IntegrationHubCard[]) =>
     items.sort((a, b) => {
+      const sourceRankDelta =
+        integrationHubSourceSortRank(a.source) -
+        integrationHubSourceSortRank(b.source);
+      if (sourceRankDelta !== 0) return sourceRankDelta;
+
       const rankDelta =
         integrationHubStatusSortRank(a.status) -
         integrationHubStatusSortRank(b.status);
       if (rankDelta !== 0) return rankDelta;
-      return a.name.localeCompare(b.name);
+      return 0;
     });
   const visibleChannelHubCards = sortHubCards(channelHubCards.filter(hubMatches));
   const visibleIntegrationHubCards = sortHubCards(integrationHubCards.filter(hubMatches));
@@ -3230,6 +3237,7 @@ export function IntegrationsPanel({
             embedded
             onConfigureIntegration={() => {}}
             mode="custom-apis-only"
+            focusCustomApiId={customApiFocusId}
           />
         );
       case "webhooks":
@@ -4568,10 +4576,7 @@ export function IntegrationsPanel({
                   }}
                 >
                   <Box>
-                    <Typography variant="subtitle2">Channels</Typography>
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      Places AgentArk can receive messages or deliver updates.
-                    </Typography>
+                    <Typography variant="subtitle2">Messaging Channels</Typography>
                   </Box>
                   <Chip size="small" label={`${visibleChannelHubCards.length} shown`} sx={sectionCountChipSx} />
                 </Stack>
@@ -6447,7 +6452,10 @@ export function IntegrationsPanel({
       ) : null}
       <Dialog
         open={!!hubPanelDialog}
-        onClose={() => setHubPanelDialog(null)}
+        onClose={() => {
+          setHubPanelDialog(null);
+          setCustomApiFocusId("");
+        }}
         maxWidth="lg"
         fullWidth
       >
@@ -6456,7 +6464,14 @@ export function IntegrationsPanel({
           {renderHubPanelDialogContent()}
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setHubPanelDialog(null)} size="small" sx={dialogActionButtonSx}>
+          <Button
+            onClick={() => {
+              setHubPanelDialog(null);
+              setCustomApiFocusId("");
+            }}
+            size="small"
+            sx={dialogActionButtonSx}
+          >
             Close
           </Button>
         </DialogActions>

@@ -5,18 +5,20 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type ChangeEvent,
   type FormEvent,
   type PointerEvent,
 } from "react";
 import {
   Alert,
   Box,
+  Button,
   Dialog,
+  DialogActions,
   DialogContent,
   DialogTitle,
   IconButton,
   Stack,
+  TextField,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -263,7 +265,6 @@ function OrbitHomeDashboard({
   const serifDisplay = "'Playfair Display', Georgia, serif";
   const serifBody = "'EB Garamond', Georgia, serif";
   const accent = "#78f2b0";
-  const warm = "#e8b46d";
   const ink = "#e8eef5";
   const inkSoft = "rgba(232,238,245,0.7)";
   const inkDim = "rgba(232,238,245,0.4)";
@@ -360,163 +361,76 @@ function OrbitHomeDashboard({
       <Dialog
         open={creating}
         onClose={cancelCreating}
-        maxWidth="md"
+        maxWidth="xs"
         fullWidth
-        slotProps={{
-          paper: {
-            sx: {
-              borderRadius: 2,
-              border: "1px solid rgba(120,242,176,0.24)",
-              background: "linear-gradient(180deg, rgba(10,14,20,0.98), rgba(6,8,12,0.98))",
-              color: ink,
-              boxShadow: "0 28px 90px rgba(0,0,0,0.62)",
-            },
-          },
-        }}
       >
+        <DialogTitle>New canvas</DialogTitle>
         <Box
           component="form"
-          onSubmit={(event: FormEvent) => { event.preventDefault(); submit(); }}
+          onSubmit={(event: FormEvent) => {
+            event.preventDefault();
+            submit();
+          }}
           sx={{ m: 0 }}
         >
-          <DialogTitle sx={{ px: 3, pt: 2.5, pb: 0.75, color: ink, fontWeight: 800 }}>
-            New Canvas
-          </DialogTitle>
-          <DialogContent sx={{ px: 3, pb: 2.5 }}>
-          <Box sx={{
-            pt: 1.2,
-            display: "grid",
-            gap: 1.2,
-          }}>
-            <Box component="label" htmlFor="arkorbit-create-name" sx={{ fontFamily: monoFont, fontSize: 10.5, letterSpacing: "0.18em", color: warm, textTransform: "uppercase", fontWeight: 700, pr: 1, flexShrink: 0, alignSelf: { xs: "auto", md: "center" } }}>
-              Name
-            </Box>
-            <Box
-              component="input"
-              id="arkorbit-create-name"
-              ref={nameInputRef}
-              type="text"
-              value={name}
-              onChange={(event: ChangeEvent<HTMLInputElement>) => {
-                setName(event.target.value);
-                setNameError(null);
-              }}
-              placeholder="Morning command center"
-              maxLength={64}
-              autoComplete="off"
-              autoFocus
-              sx={{
-                flex: "0 1 300px", minWidth: 0,
-                width: "100%",
-                boxSizing: "border-box",
-                background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.14)", borderRadius: 1,
-                outline: "none", color: ink, caretColor: accent,
-                fontFamily: "'Inter', system-ui, sans-serif", fontSize: 14, fontWeight: 600, px: 1.25, py: 1.05,
-                cursor: "text", userSelect: "text",
-                "&::placeholder": { color: inkDim },
-                "&:focus": {
-                  borderColor: "rgba(120,242,176,0.7)",
-                  boxShadow: "0 0 0 2px rgba(120,242,176,0.14)",
-                  background: "rgba(255,255,255,0.075)",
-                },
-              }}
-            />
-            {nameError || duplicateName ? (
-              <Typography sx={{ color: "#ffb4b4", fontSize: 12, mt: -0.4 }}>
-                {nameError || "A canvas with this name already exists."}
-              </Typography>
-            ) : null}
-            <Box component="label" htmlFor="arkorbit-create-icon" sx={{ fontFamily: monoFont, fontSize: 10.5, letterSpacing: "0.18em", color: warm, textTransform: "uppercase", fontWeight: 700, pr: 1, flexShrink: 0, alignSelf: { xs: "auto", md: "center" } }}>
-              Glyph
-            </Box>
-            <Box
-              component="input"
-              id="arkorbit-create-icon"
-              type="text"
-              value={icon}
-              onChange={(event: ChangeEvent<HTMLInputElement>) => setIcon(event.target.value)}
-              placeholder="Optional short mark"
-              maxLength={8}
-              sx={{
-                minWidth: 0,
-                width: "100%",
-                boxSizing: "border-box",
-                background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.14)", borderRadius: 1,
-                outline: "none", color: ink, caretColor: accent,
-                fontFamily: "'Inter', system-ui, sans-serif", fontSize: 14, fontWeight: 600, px: 1.25, py: 1.05,
-                cursor: "text", userSelect: "text",
-                "&::placeholder": { color: inkDim },
-                "&:focus": {
-                  borderColor: "rgba(120,242,176,0.7)",
-                  boxShadow: "0 0 0 2px rgba(120,242,176,0.14)",
-                  background: "rgba(255,255,255,0.075)",
-                },
-              }}
-            />
-            <Box component="label" htmlFor="arkorbit-create-color" sx={{ fontFamily: monoFont, fontSize: 10.5, letterSpacing: "0.18em", color: warm, textTransform: "uppercase", fontWeight: 700, pr: 1, flexShrink: 0, alignSelf: { xs: "auto", md: "center" } }}>
-              Color
-            </Box>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-              <Box
-                component="input"
+          <DialogContent>
+            <Stack spacing={2} sx={{ pt: 1 }}>
+              <TextField
+                id="arkorbit-create-name"
+                inputRef={nameInputRef}
+                label="Name"
+                value={name}
+                onChange={(event) => {
+                  setName(event.target.value);
+                  setNameError(null);
+                }}
+                placeholder="Morning command center"
+                autoComplete="off"
+                autoFocus
+                size="small"
+                fullWidth
+                error={Boolean(nameError || duplicateName)}
+                helperText={
+                  nameError ||
+                  (duplicateName ? "A canvas with this name already exists." : " ")
+                }
+                slotProps={{ htmlInput: { maxLength: 64 } }}
+              />
+              <TextField
+                id="arkorbit-create-icon"
+                label="Glyph"
+                value={icon}
+                onChange={(event) => setIcon(event.target.value)}
+                placeholder="Optional short mark"
+                size="small"
+                fullWidth
+                slotProps={{ htmlInput: { maxLength: 8 } }}
+              />
+              <TextField
                 id="arkorbit-create-color"
+                label="Color"
                 type="color"
                 value={color}
-                onChange={(event: ChangeEvent<HTMLInputElement>) => setColor(event.target.value)}
-                sx={{
-                  width: 54,
-                  height: 42,
-                  p: 0.4,
-                  border: "1px solid rgba(255,255,255,0.14)",
-                  borderRadius: 1,
-                  background: "rgba(255,255,255,0.055)",
-                  cursor: "pointer",
-                }}
+                onChange={(event) => setColor(event.target.value)}
+                size="small"
+                fullWidth
+                slotProps={{ inputLabel: { shrink: true } }}
               />
-              <Typography sx={{ color: inkSoft, fontFamily: monoFont, fontSize: 12 }}>
-                {color.toUpperCase()}
-              </Typography>
-            </Box>
-            <Box sx={{ display: "flex", gap: 0.8, alignItems: "center", justifyContent: "flex-end", pt: 0.4 }}>
-              <Box
-                component="button"
-                type="button"
-                onClick={cancelCreating}
-                sx={{
-                  px: 1.6, py: 0.9,
-                  background: "transparent",
-                  border: "1px solid rgba(255,255,255,0.12)",
-                  borderRadius: 0.8,
-                  color: inkDim,
-                  fontFamily: monoFont, fontSize: 10.5, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600,
-                  cursor: "pointer",
-                  "&:hover:not(:disabled)": { color: ink, borderColor: "rgba(255,255,255,0.24)" },
-                  "&:disabled": { opacity: 0.28, cursor: "not-allowed" },
-                }}
-              >
-                Cancel
-              </Box>
-              <Box
-                component="button"
-                type="submit"
-                disabled={!canSubmit}
-                sx={{
-                  px: 1.8, py: 0.9,
-                  background: "rgba(120,242,176,0.14)",
-                  border: "1px solid rgba(120,242,176,0.45)",
-                  borderRadius: 0.8,
-                  color: accent,
-                  fontFamily: monoFont, fontSize: 10.5, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 700,
-                  cursor: "pointer", flexShrink: 0,
-                  "&:hover:not(:disabled)": { background: "rgba(120,242,176,0.24)" },
-                  "&:disabled": { opacity: 0.35, cursor: "not-allowed" },
-                }}
-              >
-                Create -&gt;
-              </Box>
-            </Box>
-          </Box>
+            </Stack>
           </DialogContent>
+          <DialogActions>
+            <Button onClick={cancelCreating} size="small">
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              size="small"
+              disabled={!canSubmit}
+            >
+              Create
+            </Button>
+          </DialogActions>
         </Box>
       </Dialog>
 

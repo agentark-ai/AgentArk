@@ -1568,7 +1568,7 @@ impl ExtensionPackRegistry {
             .timeout(std::time::Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| crate::core::net::build_outgoing_http_client(20));
+            .unwrap_or_else(|_| crate::core::runtime::net::build_outgoing_http_client(20));
         Self {
             storage,
             config_dir,
@@ -2098,7 +2098,7 @@ impl ExtensionPackRegistry {
                 .ensure_connect_auth_profile(pack_id)
                 .await?
                 .ok_or_else(|| anyhow!("OAuth profile could not be prepared for this pack"))?;
-            return crate::core::auth_profiles::AuthProfileControlPlane::oauth_authorization_url(
+            return crate::core::connectivity::auth_profiles::AuthProfileControlPlane::oauth_authorization_url(
                 &self.storage,
                 &profile_id,
                 state_token,
@@ -2528,6 +2528,7 @@ impl ExtensionPackRegistry {
                     Some(request.name.trim().to_string())
                 },
                 base_url: None,
+                source: None,
                 openapi_url: request.openapi_url.clone(),
                 openapi_text: request.openapi_text.clone(),
                 curl_text: request.curl_text.clone(),
@@ -2731,7 +2732,7 @@ impl ExtensionPackRegistry {
                 .as_ref()
                 .and_then(|item| item.auth_profile_id.as_deref())
             {
-                let _ = crate::core::auth_profiles::AuthProfileControlPlane::delete(
+                let _ = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::delete(
                     &self.storage,
                     profile_id,
                 )
@@ -3347,14 +3348,17 @@ impl ExtensionPackRegistry {
         }
         if let Some(profile_id) = connection.auth_profile_id.as_deref() {
             if let Some(profile) =
-                crate::core::auth_profiles::AuthProfileControlPlane::get(&self.storage, profile_id)
-                    .await?
+                crate::core::connectivity::auth_profiles::AuthProfileControlPlane::get(
+                    &self.storage,
+                    profile_id,
+                )
+                .await?
             {
                 return if profile.ready {
                     Ok(ExtensionConnectionState::Ready)
                 } else if matches!(
                     profile.status,
-                    crate::core::auth_profiles::AuthProfileStatus::Error
+                    crate::core::connectivity::auth_profiles::AuthProfileStatus::Error
                 ) {
                     Ok(ExtensionConnectionState::Error)
                 } else {
@@ -3481,7 +3485,7 @@ impl ExtensionPackRegistry {
     }
 
     fn load_connection_secret(&self, pack_id: &str, connection_id: &str) -> Result<Option<Value>> {
-        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+        let manager = crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
             &self.config_dir,
             Some(&self.data_dir),
         )?;
@@ -3501,7 +3505,7 @@ impl ExtensionPackRegistry {
         connection_id: &str,
         value: Option<Value>,
     ) -> Result<()> {
-        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+        let manager = crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
             &self.config_dir,
             Some(&self.data_dir),
         )?;
@@ -3521,7 +3525,7 @@ impl ExtensionPackRegistry {
         secret: Option<&Value>,
         existing_profile_id: Option<&str>,
     ) -> Result<Option<String>> {
-        use crate::core::auth_profiles::{
+        use crate::core::connectivity::auth_profiles::{
             AuthProfileControlPlane, AuthProfileKind, AuthProfileMaterial, AuthProfileScope,
             AuthProfileUpsert, OAuth2ProfileConfigRecord,
         };
@@ -3627,7 +3631,7 @@ impl ExtensionPackRegistry {
         profile_id: &str,
         requested: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, String>> {
-        crate::core::auth_profiles::AuthProfileControlPlane::resolve_env_exports(
+        crate::core::connectivity::auth_profiles::AuthProfileControlPlane::resolve_env_exports(
             &self.storage,
             profile_id,
             requested,
@@ -3639,7 +3643,7 @@ impl ExtensionPackRegistry {
         let Some(profile_id) = connection.and_then(|value| value.auth_profile_id.as_deref()) else {
             return;
         };
-        let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+        let _ = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::mark_used(
             &self.storage,
             profile_id,
         )
@@ -3664,7 +3668,7 @@ impl ExtensionPackRegistry {
 
     fn clear_pack_connection_secrets(&self, pack_id: &str) -> Result<()> {
         let prefix = connection_secret_prefix(pack_id);
-        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+        let manager = crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
             &self.config_dir,
             Some(&self.data_dir),
         )?;
@@ -3720,9 +3724,10 @@ impl ExtensionPackRegistry {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect::<HashSet<_>>();
-        let profiles = crate::core::auth_profiles::AuthProfileControlPlane::list(&self.storage)
-            .await?
-            .profiles;
+        let profiles =
+            crate::core::connectivity::auth_profiles::AuthProfileControlPlane::list(&self.storage)
+                .await?
+                .profiles;
         for profile in profiles {
             let provider_matches = profile
                 .provider
@@ -3739,7 +3744,7 @@ impl ExtensionPackRegistry {
             }
         }
         for profile_id in profile_ids {
-            let _ = crate::core::auth_profiles::AuthProfileControlPlane::delete(
+            let _ = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::delete(
                 &self.storage,
                 &profile_id,
             )
@@ -4385,7 +4390,7 @@ impl ExtensionPackRegistry {
                 url.query_pairs_mut().append_pair(&key, &value);
             }
         }
-        crate::core::net::validate_external_https_url(url.as_str()).await?;
+        crate::core::runtime::net::validate_external_https_url(url.as_str()).await?;
         let mut request = self.http_client.request(method.clone(), url);
         if let Some(headers) = binding
             .config
@@ -4910,8 +4915,8 @@ fn auth_binding_from_preview(
 fn auth_profile_material_for_secret_backed_pack(
     manifest: &ExtensionPackManifest,
     secret: &Value,
-) -> Result<crate::core::auth_profiles::AuthProfileMaterial> {
-    use crate::core::auth_profiles::AuthProfileMaterial;
+) -> Result<crate::core::connectivity::auth_profiles::AuthProfileMaterial> {
+    use crate::core::connectivity::auth_profiles::AuthProfileMaterial;
 
     let secret_field = manifest
         .auth
@@ -5812,7 +5817,7 @@ mod tests {
         ExtensionPackRuntimeStateRecord, ExtensionPackSourceKind, ExtensionPackTrustLevel,
         InstalledExtensionPack, PackFeatureManifest,
     };
-    use crate::core::auth_profiles::{
+    use crate::core::connectivity::auth_profiles::{
         AuthProfileControlPlane, AuthProfileKind, AuthProfileMaterial, AuthProfileScope,
         AuthProfileUpsert,
     };
@@ -5870,6 +5875,7 @@ mod tests {
             }],
             notes: Vec::new(),
             source_kind: "curl".to_string(),
+            confidence: 0.92,
         };
 
         let contract = imported_auth_contract(ExtensionPackAuthMode::ApiKey, &preview);
@@ -6214,7 +6220,7 @@ mod tests {
                 Some(json!({ "access_token": "linear-secret" })),
             )
             .expect("store pack secret");
-        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+        let manager = crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
             dir.path(),
             Some(dir.path()),
         )

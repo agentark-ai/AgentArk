@@ -138,6 +138,7 @@ import {
   formatUiDateTime,
   formatUiDateTimeMeta,
   formatUiRelativeDateTimeMeta,
+  getRequestUiTimeZone,
 } from "../../lib/dateFormat";
 import { humanizeMachineLabel } from "../../lib/displayLabels";
 import {
@@ -925,7 +926,9 @@ function extractMarkdownCodeBlock(
   return null;
 }
 
-function InlineCodePreview({
+// memo: code blocks are pure functions of their props; skipping re-render
+// here avoids re-highlighting every fence whenever a parent re-renders.
+const InlineCodePreview = memo(function InlineCodePreview({
   code,
   languageHint,
   fileName,
@@ -1012,6 +1015,20 @@ function InlineCodePreview({
       </pre>
     </Box>
   );
+});
+
+// Allocation-free newline count; `value.split(/\r?\n/).length` allocates one
+// string per line, which turns per-delta line counting over a growing file
+// into serious GC pressure during code-generation runs.
+function countContentLines(value: string): number {
+  if (!value) return 0;
+  let lines = 1;
+  let idx = value.indexOf("\n");
+  while (idx !== -1) {
+    lines += 1;
+    idx = value.indexOf("\n", idx + 1);
+  }
+  return lines;
 }
 
 function canonicalizeLiveFileWrites(
@@ -8077,13 +8094,23 @@ function handleChatLinkClick(event: React.MouseEvent<HTMLElement>): void {
   });
 }
 
-function MarkdownBody({
+// Hoisted so ReactMarkdown sees a referentially-stable plugin array.
+const CHAT_REMARK_PLUGINS = [remarkGfm];
+
+// React.memo + a memoized components map: the markdown re-parse (the single
+// most expensive render-path operation in chat) now only runs when the text
+// itself changes, not on every parent render. The snippet counter lives in a
+// ref so the stable components map still numbers code fences from 0 on each
+// (re)parse, matching the previous per-render `let blockIndex` behavior.
+const MarkdownBody = memo(function MarkdownBody({
   text,
   snippetNamespace,
   onOpenSnippet,
 }: { text: string } & ChatMarkdownRenderOptions) {
-  let blockIndex = 0;
-  const components: Components = {
+  const blockIndexRef = useRef(0);
+  blockIndexRef.current = 0;
+  const components = useMemo<Components>(() => {
+  const componentMap: Components = {
     a({ href, children }) {
       const normalizedHref = normalizeOutboundHref(href);
       if (!normalizedHref) return <span>{children}</span>;
@@ -8126,7 +8153,7 @@ function MarkdownBody({
       if (isAgentArkChartFence(extracted.className)) {
         return <InlineAgentArkChart code={extracted.code} />;
       }
-      const snippetIndex = blockIndex++;
+      const snippetIndex = blockIndexRef.current++;
       const fileName = inferCodePreviewFileName(
         extracted.className,
         extracted.code,
@@ -8168,7 +8195,10 @@ function MarkdownBody({
             </span>
             <div className="chat-md-callout-body">
               <span className="chat-md-callout-label">{meta.label}</span>
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+              <ReactMarkdown
+                remarkPlugins={CHAT_REMARK_PLUGINS}
+                components={componentMap}
+              >
                 {body}
               </ReactMarkdown>
             </div>
@@ -8178,13 +8208,15 @@ function MarkdownBody({
       return <blockquote>{children}</blockquote>;
     },
   };
+  return componentMap;
+  }, [snippetNamespace, onOpenSnippet]);
 
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+    <ReactMarkdown remarkPlugins={CHAT_REMARK_PLUGINS} components={components}>
       {text}
     </ReactMarkdown>
   );
-}
+});
 
 function extractCodeFences(
   text: string,
@@ -10831,6 +10863,9 @@ function ChatPageInner({
   const [chatCredentialError, setChatCredentialError] = useState<string | null>(
     null,
   );
+  const [chatCredentialDialogOpen, setChatCredentialDialogOpen] =
+    useState(false);
+  const autoOpenedCredentialPromptFingerprintRef = useRef("");
   const [
     dismissedCredentialPromptConversationIds,
     setDismissedCredentialPromptConversationIds,
@@ -10995,9 +11030,12 @@ function ChatPageInner({
   const streamingStepKeySeqRef = useRef(1);
   const queuedStreamingStepsRef = useRef<JsonRecord[] | null>(null);
   const streamingStepsFlushTimerRef = useRef<number | null>(null);
-  const pendingRunSnapshotStoreRef = useRef<ChatPendingRunSnapshot | null>(
-    pendingRunSnapshot,
-  );
+  // Holds either a ready snapshot or a lazy producer; producers let the
+  // per-tick effect skip step compaction entirely — it only runs once, at
+  // debounced flush time, instead of ~12x/sec during streaming.
+  const pendingRunSnapshotStoreRef = useRef<
+    ChatPendingRunSnapshot | (() => ChatPendingRunSnapshot | null) | null
+  >(pendingRunSnapshot);
   const pendingRunSnapshotStoreTimerRef = useRef<number | null>(null);
   const workspaceSnapshotStoreRef = useRef<ChatWorkspaceSnapshot | null>(null);
   const workspaceSnapshotStoreTimerRef = useRef<number | null>(null);
@@ -11029,6 +11067,7 @@ function ChatPageInner({
   const lastWorkspaceRestoreSeedRef = useRef("");
   const lastWorkspaceActivityRestoreSeedRef = useRef("");
   const reattachedRunIdRef = useRef("");
+  const reconciledInterruptedRunIdRef = useRef("");
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
   const queueComposerPrefill = useCallback((prefill: ChatComposerPrefillPayload) => {
     const browserProfileContext = prefill.browser_profile_context ?? null;
@@ -11243,12 +11282,16 @@ function ChatPageInner({
     streamingStepsRef.current = sanitized;
     setStreamingSteps(sanitized);
   };
+  const resolvePendingRunSnapshotSource = (
+    value: ChatPendingRunSnapshot | (() => ChatPendingRunSnapshot | null) | null,
+  ): ChatPendingRunSnapshot | null =>
+    typeof value === "function" ? value() : value;
   const scheduleChatPendingRunSnapshotStore = (
-    snapshot: ChatPendingRunSnapshot | null,
+    snapshot: ChatPendingRunSnapshot | (() => ChatPendingRunSnapshot | null) | null,
   ) => {
     pendingRunSnapshotStoreRef.current = snapshot;
     if (typeof window === "undefined") {
-      storeChatPendingRunSnapshot(snapshot);
+      storeChatPendingRunSnapshot(resolvePendingRunSnapshotSource(snapshot));
       return;
     }
     if (!snapshot) {
@@ -11262,7 +11305,9 @@ function ChatPageInner({
     if (pendingRunSnapshotStoreTimerRef.current !== null) return;
     pendingRunSnapshotStoreTimerRef.current = window.setTimeout(() => {
       pendingRunSnapshotStoreTimerRef.current = null;
-      storeChatPendingRunSnapshot(pendingRunSnapshotStoreRef.current);
+      storeChatPendingRunSnapshot(
+        resolvePendingRunSnapshotSource(pendingRunSnapshotStoreRef.current),
+      );
     }, CHAT_PENDING_RUN_SNAPSHOT_FLUSH_MS);
   };
   const storeChatPendingRunSnapshotNow = (
@@ -11286,7 +11331,9 @@ function ChatPageInner({
       window.clearTimeout(pendingRunSnapshotStoreTimerRef.current);
     }
     pendingRunSnapshotStoreTimerRef.current = null;
-    storeChatPendingRunSnapshot(pendingRunSnapshotStoreRef.current);
+    storeChatPendingRunSnapshot(
+      resolvePendingRunSnapshotSource(pendingRunSnapshotStoreRef.current),
+    );
   };
   const scheduleChatWorkspaceSnapshotStore = (
     snapshot: ChatWorkspaceSnapshot,
@@ -11647,7 +11694,7 @@ function ChatPageInner({
     toBool(chatCredentialPromptPayload.present) &&
     chatCredentialPromptFields.length > 0;
   const chatCredentialPromptFingerprint = chatCredentialPromptVisible
-    ? `${str(chatCredentialPrompt.kind, "")}:${str(chatCredentialPrompt.title, "")}:${chatCredentialPromptFields.map((field) => `${str(field.key, "")}:${toBool(field.required)}`).join("|")}`
+    ? `${conversationId || ""}:${str(chatCredentialPrompt.kind, "")}:${str(chatCredentialPrompt.title, "")}:${chatCredentialPromptFields.map((field) => `${str(field.key, "")}:${toBool(field.required)}`).join("|")}`
     : "";
   const submitChatCredentialPromptMutation = useMutation({
     mutationFn: (values: Record<string, string>) =>
@@ -11660,6 +11707,7 @@ function ChatPageInner({
       const followup = str(payload.followup, "").trim();
       setChatCredentialError(null);
       setChatCredentialValues({});
+      setChatCredentialDialogOpen(false);
       if (conversationId) {
         setDismissedCredentialPromptConversationIds((prev) => {
           if (!prev.has(conversationId)) return prev;
@@ -11690,6 +11738,7 @@ function ChatPageInner({
     onSuccess: async () => {
       setChatCredentialError(null);
       setChatCredentialValues({});
+      setChatCredentialDialogOpen(false);
       if (conversationId) {
         setDismissedCredentialPromptConversationIds((prev) => {
           const next = new Set(prev);
@@ -11708,6 +11757,26 @@ function ChatPageInner({
       setChatCredentialError(normalizeChatError(errMessage(err)));
     },
   });
+  useEffect(() => {
+    // Auto-open the secure credential dialog once per distinct prompt.
+    // Closing it (X / backdrop / Esc) is a local cancel: the compact
+    // in-chat card stays available to reopen, and the same prompt never
+    // force-reopens against the user's choice.
+    if (!chatCredentialPromptVisible) {
+      autoOpenedCredentialPromptFingerprintRef.current = "";
+      setChatCredentialDialogOpen(false);
+      return;
+    }
+    if (
+      autoOpenedCredentialPromptFingerprintRef.current ===
+      chatCredentialPromptFingerprint
+    ) {
+      return;
+    }
+    autoOpenedCredentialPromptFingerprintRef.current =
+      chatCredentialPromptFingerprint;
+    setChatCredentialDialogOpen(true);
+  }, [chatCredentialPromptVisible, chatCredentialPromptFingerprint]);
   const selectedConversationErrorText = errMessage(selectedConversationQ.error)
     .replace(/^error:\s*/i, "")
     .trim()
@@ -11787,23 +11856,25 @@ function ChatPageInner({
       scheduleChatPendingRunSnapshotStore(null);
       return;
     }
-    const snapshotSteps = compactPendingRunStepsForSnapshot(
-      asRecords(streamingSteps),
-    );
-    scheduleChatPendingRunSnapshotStore({
+    // Lazy producer: step compaction + response slicing run once at the
+    // debounced flush, not on every 80ms token / 180ms step tick where the
+    // result was overwritten before ever being persisted.
+    scheduleChatPendingRunSnapshotStore(() => ({
       ...pendingRunSnapshot,
       message: pendingUserMessage ?? pendingRunSnapshot.message,
       streamingResponse: streamingResponse.slice(
         0,
         CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
       ),
-      streamingSteps: snapshotSteps,
+      streamingSteps: compactPendingRunStepsForSnapshot(
+        asRecords(streamingSteps),
+      ),
       failedUserMessage: failedUserMessage ?? "",
       lastRunSeq: Math.max(
         pendingRunSnapshot.lastRunSeq ?? 0,
         latestRunEventSeqRef.current,
       ),
-    });
+    }));
   }, [
     pendingRunSnapshot,
     pendingUserMessage,
@@ -11869,7 +11940,9 @@ function ChatPageInner({
         window.clearTimeout(pendingRunSnapshotStoreTimerRef.current);
       }
       pendingRunSnapshotStoreTimerRef.current = null;
-      storeChatPendingRunSnapshot(pendingRunSnapshotStoreRef.current);
+      storeChatPendingRunSnapshot(
+        resolvePendingRunSnapshotSource(pendingRunSnapshotStoreRef.current),
+      );
       if (
         typeof window !== "undefined" &&
         workspaceSnapshotStoreTimerRef.current !== null
@@ -13850,7 +13923,10 @@ function ChatPageInner({
     };
   };
 
-  const buildStepCard = (
+  // Stable identities matter here: these builders feed the dep arrays of the
+  // transcript memos below — a per-render arrow silently turns those memos
+  // into every-render recomputes across the whole message list.
+  const buildStepCard = useCallback((
     step: JsonRecord,
     index: number,
   ): ActivityTimelineCard => {
@@ -13992,9 +14068,9 @@ function ChatPageInner({
       time,
       surface,
     };
-  };
+  }, []);
 
-  const safeBuildStepCard = (step: unknown, index: number) => {
+  const safeBuildStepCard = useCallback((step: unknown, index: number) => {
     const record = asRecord(step);
     try {
       return buildStepCard(record, index);
@@ -14040,9 +14116,9 @@ function ChatPageInner({
           null,
       };
     }
-  };
+  }, [buildStepCard]);
 
-  const buildChatTranscriptItemsFromSteps = (
+  const buildChatTranscriptItemsFromSteps = useCallback((
     sourceSteps: JsonRecord[],
     keyPrefix: string,
     maxItems = 28,
@@ -14472,7 +14548,7 @@ function ChatPageInner({
     // calls — expanding the group only ever surfaced one — so we render them
     // unmerged in execution order.
     return finalItems.slice(-Math.max(1, maxItems));
-  };
+  }, [safeBuildStepCard]);
 
   const streamingTraceCards = useMemo(
     () =>
@@ -17347,59 +17423,80 @@ function ChatPageInner({
         const delta = str(payloadObj.content_delta, "");
         const done = toBool(payloadObj.done);
         const derivedLines = snapshot
-          ? snapshot.split(/\r?\n/).length
+          ? countContentLines(snapshot)
           : delta
-            ? delta.split(/\r?\n/).length
+            ? countContentLines(delta)
             : 0;
         const lineNo = Math.max(0, num(payloadObj.line, derivedLines));
         const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
-        const currentContentHint = liveFileWrites[fileName]?.content || "";
-        setLiveFileWrites((prev) => {
-          const current = prev[fileName];
-          let nextContent = current?.content ?? "";
-          if (snapshot) {
-            nextContent = choosePreferredWorkspaceFileContent(
+        // Write to the canonical key directly: re-canonicalizing the WHOLE
+        // map per delta re-compacted every file's content on every progress
+        // event (O(files x size) per delta). Invalid names are dropped here,
+        // exactly as canonicalizeLiveFileWrites would have dropped them.
+        const canonicalFileName = normalizeWorkspaceFileName(
+          fileName,
+          workspaceAppDir,
+        );
+        const canonicalFileNameValid =
+          !!canonicalFileName && isLikelyWorkspaceFileName(canonicalFileName);
+        const currentContentHint =
+          (canonicalFileNameValid
+            ? liveFileWrites[canonicalFileName]?.content
+            : liveFileWrites[fileName]?.content) || "";
+        if (canonicalFileNameValid) {
+          setLiveFileWrites((prev) => {
+            const current = prev[canonicalFileName];
+            let nextContent = current?.content ?? "";
+            if (snapshot) {
+              nextContent = choosePreferredWorkspaceFileContent(
+                nextContent,
+                snapshot,
+              );
+            } else if (delta) {
+              nextContent = `${nextContent}${delta}`;
+            }
+            nextContent = compactWorkspacePreviewContent(
               nextContent,
-              snapshot,
+              CHAT_WORKSPACE_UI_MAX_FILE_CHARS,
             );
-          } else if (delta) {
-            nextContent = `${nextContent}${delta}`;
-          }
-          const nextDerivedLines = nextContent
-            ? nextContent.split(/\r?\n/).length
-            : derivedLines;
-          const nextLine = Math.max(
-            current?.line ?? 0,
-            lineNo || nextDerivedLines,
-          );
-          const nextTotalLines =
-            totalLines > 0
-              ? totalLines
-              : Math.max(current?.totalLines ?? 0, nextDerivedLines);
-          const nextDone =
-            done || (nextTotalLines > 0 && nextLine >= nextTotalLines);
-          if (
-            current &&
-            current.content === nextContent &&
-            current.line === nextLine &&
-            current.totalLines === nextTotalLines &&
-            current.done === nextDone
-          ) {
-            return prev;
-          }
-          return canonicalizeLiveFileWrites(
-            {
+            // Counting lines over the whole accumulated file is only needed
+            // when the payload lacks authoritative line/total numbers.
+            const nextDerivedLines =
+              lineNo > 0 && totalLines > 0
+                ? 0
+                : nextContent
+                  ? countContentLines(nextContent)
+                  : derivedLines;
+            const nextLine = Math.max(
+              current?.line ?? 0,
+              lineNo || nextDerivedLines,
+            );
+            const nextTotalLines =
+              totalLines > 0
+                ? totalLines
+                : Math.max(current?.totalLines ?? 0, nextDerivedLines);
+            const nextDone =
+              done || (nextTotalLines > 0 && nextLine >= nextTotalLines);
+            if (
+              current &&
+              current.content === nextContent &&
+              current.line === nextLine &&
+              current.totalLines === nextTotalLines &&
+              current.done === nextDone
+            ) {
+              return prev;
+            }
+            return {
               ...prev,
-              [fileName]: {
+              [canonicalFileName]: {
                 content: nextContent,
                 line: nextLine,
                 totalLines: nextTotalLines,
                 done: nextDone,
               },
-            },
-            workspaceAppDir,
-          );
-        });
+            };
+          });
+        }
         setDeployedFiles((prev) => {
           const existing = prev.find((file) => file.name === fileName);
           const baseContent = currentContentHint || existing?.content || "";
@@ -17811,6 +17908,12 @@ function ChatPageInner({
     setStreamingResponseChoices([]);
     setStreamingRunMetrics(null);
     setStreamingStepsNow(preservedResumeSteps);
+    // Scope the Console to the new run: on a fresh send, clear the previous run's
+    // latched steps so the console doesn't fall back to the prior run during the
+    // window before the new run's first step arrives. Resume keeps its steps.
+    if (!isResumeMode) {
+      setLastRunSteps([]);
+    }
     if (isResumeMode && planOverride) {
       setExecutionPlan(planOverride);
       setExecutionPlanFailure("");
@@ -17879,6 +17982,43 @@ function ChatPageInner({
     let streamError: string | null = null;
     let latestStreamingResponse = preservedResumeResponse;
     const streamStartedAt = Date.now();
+    // Lightweight first-render latency instrumentation. Run-scoped closures only:
+    // no state, no refs, no re-renders, zero behavior change. Each "first" flag
+    // logs exactly once per run via console.debug.
+    const timingSubmittedAt = performance.now();
+    let loggedFirstStreamEvent = false;
+    let loggedFirstReplyText = false;
+    let loggedRunComplete = false;
+    let receivedTokenDeltas = 0;
+    let receivedTokenChars = 0;
+    let appendedTokenChars = 0;
+    const markFirstStreamEventTiming = () => {
+      if (loggedFirstStreamEvent) return;
+      loggedFirstStreamEvent = true;
+      console.debug(
+        `[chat-timing] first stream event: ${Math.round(
+          performance.now() - timingSubmittedAt,
+        )}ms`,
+      );
+    };
+    const markFirstReplyTextTiming = () => {
+      if (loggedFirstReplyText) return;
+      loggedFirstReplyText = true;
+      console.debug(
+        `[chat-timing] first reply text: ${Math.round(
+          performance.now() - timingSubmittedAt,
+        )}ms`,
+      );
+    };
+    const markRunCompleteTiming = () => {
+      if (loggedRunComplete) return;
+      loggedRunComplete = true;
+      console.debug(
+        `[chat-timing] run complete: ${Math.round(
+          performance.now() - timingSubmittedAt,
+        )}ms (token deltas: ${receivedTokenDeltas}, received chars: ${receivedTokenChars}, appended chars: ${appendedTokenChars})`,
+      );
+    };
     const streamDetachedToBackground = () =>
       backgroundDetachGenerationsRef.current.has(streamGeneration);
     const updateDetachedBackgroundSnapshot = (
@@ -18009,6 +18149,7 @@ function ChatPageInner({
       }
     };
     const handlePlanStreamEvent = (eventName: string, payload: unknown) => {
+      markFirstStreamEventTiming();
       recordRunEventSeq(payload);
       absorbConversationId(payload);
       if (streamDetachedToBackground()) return;
@@ -18083,7 +18224,12 @@ function ChatPageInner({
                 if (!isSyntheticStreamTokenPayload(payload)) {
                   markFirstStreamingToken();
                 }
-                latestStreamingResponse += appendStreamingToken(token);
+                markFirstReplyTextTiming();
+                receivedTokenDeltas += 1;
+                receivedTokenChars += token.length;
+                const appended = appendStreamingToken(token);
+                appendedTokenChars += appended.length;
+                latestStreamingResponse += appended;
               },
               onThinking: (step) => {
                 if (streamDetachedToBackground()) return;
@@ -18189,6 +18335,7 @@ function ChatPageInner({
                   str(payload.content, ""),
                 );
                 if (text.trim()) {
+                  markFirstReplyTextTiming();
                   latestStreamingResponse = text;
                   setStreamingResponseNow(text);
                   refreshConversationMessagesFromStreamPayload(
@@ -18203,6 +18350,9 @@ function ChatPageInner({
               },
               onDone: (payload) => {
                 if (streamDetachedToBackground()) return;
+                markRunCompleteTiming();
+                setIsStreaming(false);
+                setLiveRunStreamOpenNow(false);
                 absorbConversationId(payload);
                 refreshConversationMessagesFromStreamPayload(
                   payload,
@@ -18229,6 +18379,12 @@ function ChatPageInner({
               execution_mode: executionMode,
               attachments_present: attachmentPayloads.length > 0,
               attachments: attachmentPayloads,
+              client_timezone: getRequestUiTimeZone(),
+              client_timezone_offset_minutes: Number.isFinite(
+                new Date().getTimezoneOffset(),
+              )
+                ? -new Date().getTimezoneOffset()
+                : undefined,
               accepted_suggestion_id: acceptedSuggestionId || undefined,
               sentinel_proposal_id: sentinelProposalId || undefined,
               browser_profile_context: browserProfileContext || undefined,
@@ -18244,7 +18400,12 @@ function ChatPageInner({
                 if (!isSyntheticStreamTokenPayload(payload)) {
                   markFirstStreamingToken();
                 }
-                latestStreamingResponse += appendStreamingToken(token);
+                markFirstReplyTextTiming();
+                receivedTokenDeltas += 1;
+                receivedTokenChars += token.length;
+                const appended = appendStreamingToken(token);
+                appendedTokenChars += appended.length;
+                latestStreamingResponse += appended;
               },
               onThinking: (step) => {
                 if (streamDetachedToBackground()) return;
@@ -18348,6 +18509,7 @@ function ChatPageInner({
                   str(payload.content, ""),
                 );
                 if (text.trim()) {
+                  markFirstReplyTextTiming();
                   latestStreamingResponse = text;
                   setStreamingResponseNow(text);
                   refreshConversationMessagesFromStreamPayload(
@@ -18362,6 +18524,9 @@ function ChatPageInner({
               },
               onDone: (payload) => {
                 if (streamDetachedToBackground()) return;
+                markRunCompleteTiming();
+                setIsStreaming(false);
+                setLiveRunStreamOpenNow(false);
                 absorbConversationId(payload);
                 refreshConversationMessagesFromStreamPayload(
                   payload,
@@ -18800,13 +18965,46 @@ function ChatPageInner({
     const runId = reattachRunId;
     const pendingConversationId = reattachConversationId;
     if (!runId || !pendingConversationId) return;
-    if (
-      reattachPhase === "interrupted" ||
-      reattachPhase === "awaiting_confirmation"
-    )
-      return;
+    if (reattachPhase === "awaiting_confirmation") return;
     if (!conversationId || conversationId !== pendingConversationId) return;
     if (isStreaming || streamLockRef.current) return;
+    if (reattachPhase === "interrupted") {
+      // "interrupted" is this tab's claim, not the backend's: the stream
+      // detached (page crash, navigation, network drop) but the run may have
+      // finished server-side. Reconcile once per run against the backend's
+      // latest-run record and let the truth win — terminal clears the label
+      // and refreshes messages, a still-active run lifts the label so the
+      // normal reattach path below takes over, and an unknown run keeps the
+      // interrupted presentation untouched.
+      if (reconciledInterruptedRunIdRef.current === runId) return;
+      reconciledInterruptedRunIdRef.current = runId;
+      const snapshot = pendingRunSnapshotRef.current;
+      if (!snapshot || snapshot.conversationId !== pendingConversationId) {
+        return;
+      }
+      void syncPendingRunFromLatestRun(pendingConversationId, snapshot, {
+        expectedRunId: runId,
+        allowTerminalClear: true,
+      })
+        .then((outcome) => {
+          if (outcome !== "active") return;
+          setPendingRunSnapshot((prev) => {
+            if (!prev || str(prev.runId, "").trim() !== runId) return prev;
+            const next: ChatPendingRunSnapshot = {
+              ...prev,
+              phase: "running" as ChatPendingRunPhase,
+            };
+            storeChatPendingRunSnapshotNow(next);
+            return next;
+          });
+        })
+        .catch(() => {
+          // Backend unreachable: keep the interrupted presentation and allow
+          // a retry on a later effect pass.
+          reconciledInterruptedRunIdRef.current = "";
+        });
+      return;
+    }
     if (reattachedRunIdRef.current === runId) return;
 
     reattachedRunIdRef.current = runId;
@@ -19897,9 +20095,40 @@ function ChatPageInner({
     pendingUserMessage,
     pendingUserMessageAlreadyPersisted,
   ]);
-  const visibleStreamingResponse = hasLivePendingThread
-    ? visibleStreamingTranscriptText(streamingResponse)
-    : "";
+  // visibleStreamingTranscriptText runs ~18 full-text scans; memoized so it
+  // costs once per token flush instead of once per render of any state.
+  const visibleStreamingResponse = useMemo(
+    () =>
+      hasLivePendingThread
+        ? visibleStreamingTranscriptText(streamingResponse)
+        : "",
+    [hasLivePendingThread, streamingResponse],
+  );
+  // Low-priority copy for the streaming markdown parse: React can interrupt
+  // and coalesce the expensive ReactMarkdown re-parse under load instead of
+  // blocking input/scroll on every 80ms token flush (mirrors
+  // deferredComputerTokenPreview below).
+  const deferredStreamingMarkdownText = useDeferredValue(
+    visibleStreamingResponse,
+  );
+  const visibleLiveModelEmit = useMemo(() => {
+    if (!hasLivePendingThread || visibleStreamingResponse.trim()) return "";
+    const content = reasoningStream?.content || "";
+    const normalized = content.replace(/\r\n/g, "\n").trim();
+    if (!normalized) return "";
+    const blocks = normalized
+      .split(/\n{2,}/)
+      .map((block) => block.trim())
+      .filter(Boolean);
+    const latestBlock = blocks[blocks.length - 1] || normalized;
+    return latestBlock.length > 1400
+      ? latestBlock.slice(-1400).trim()
+      : latestBlock;
+  }, [hasLivePendingThread, reasoningStream?.content, visibleStreamingResponse]);
+  const deferredLiveModelEmitText = useDeferredValue(visibleLiveModelEmit);
+  const visibleStreamingMarkdownText = visibleStreamingResponse.trim()
+    ? deferredStreamingMarkdownText
+    : deferredLiveModelEmitText;
   const computerTokenPreview = useMemo(() => {
     if (!visibleStreamingResponse) return "";
     return visibleStreamingResponse.length > CHAT_COMPUTER_TOKEN_PREVIEW_MAX_CHARS
@@ -19928,13 +20157,23 @@ function ChatPageInner({
       }
       return "";
     })();
-  const streamingResearchReport = showStreamingAssistant
-    ? parseResearchReportWithContext(visibleStreamingResponse, {
-        deepResearch: isDeepResearchPlanSource(planConfirmation?.source),
-        previousUserPrompt: streamingResearchPrompt,
-        conversationTitle: str(selectedConversation?.title, ""),
-      })
-    : null;
+  const streamingResearchReport = useMemo(
+    () =>
+      showStreamingAssistant
+        ? parseResearchReportWithContext(visibleStreamingResponse, {
+            deepResearch: isDeepResearchPlanSource(planConfirmation?.source),
+            previousUserPrompt: streamingResearchPrompt,
+            conversationTitle: str(selectedConversation?.title, ""),
+          })
+        : null,
+    [
+      showStreamingAssistant,
+      visibleStreamingResponse,
+      planConfirmation?.source,
+      streamingResearchPrompt,
+      selectedConversation?.title,
+    ],
+  );
   const completedProgressSnapshot =
     !hasPendingSnapshotForConversation && conversationId
       ? completedProgressMessagesByConversation[conversationId] || null
@@ -20742,7 +20981,7 @@ function ChatPageInner({
         ),
         "live-transcript",
         8,
-      ).filter((item) => item.kind === "action"),
+      ).filter((item) => item.kind === "action" || item.kind === "prose"),
     [buildChatTranscriptItemsFromSteps, streamingSteps, workspaceStepsSource],
   );
   const livePlanPhaseStatuses = useMemo(() => {
@@ -21026,7 +21265,9 @@ function ChatPageInner({
   );
   const streamingRunMetricItems =
     !currentRunStillActiveForMetrics ? computerRunMetricItems : [];
-  const hasVisibleStreamingReply = Boolean(visibleStreamingResponse.trim());
+  const hasVisibleStreamingReply = Boolean(
+    visibleStreamingResponse.trim() || visibleLiveModelEmit.trim(),
+  );
   const showLiveExecutionPanel = liveChatTranscriptItems.length > 0;
   const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
     activeCodeFile ? liveFileWrites[activeCodeFile.name]?.content || "" : "",
@@ -22561,7 +22802,7 @@ function ChatPageInner({
       actions: Extract<ChatTranscriptItem, { kind: "action" }>[],
       groupId: string,
     ): ReactNode => {
-      const expanded = expandedTranscriptActions.has(groupId);
+      const expanded = isLiveTranscript || expandedTranscriptActions.has(groupId);
       const totalCount = actions.reduce(
         (sum, a) => sum + (a.count ?? 1),
         0,
@@ -22573,6 +22814,20 @@ function ChatPageInner({
         : hasRunning
           ? "running"
           : "done";
+      // Collapsed header carries a one-line tour of the tools used so the row
+      // reads as activity, not a bare count.
+      const distinctTitles: string[] = [];
+      for (const action of actions) {
+        if (action.title && !distinctTitles.includes(action.title)) {
+          distinctTitles.push(action.title);
+        }
+      }
+      const shownTitles = distinctTitles.slice(0, 3);
+      const groupSummary =
+        shownTitles.join(", ") +
+        (distinctTitles.length > shownTitles.length
+          ? ` +${distinctTitles.length - shownTitles.length} more`
+          : "");
       return (
         <Box
           key={groupId}
@@ -22583,11 +22838,21 @@ function ChatPageInner({
             className={`chat-transcript-action-group-header status-${aggregateStatus}`}
             onClick={() => toggleExpandedTranscriptAction(groupId)}
             aria-expanded={expanded}
-            aria-label={`${expanded ? "Collapse" : "Expand"} ${totalCount} ${totalCount === 1 ? "step" : "steps"}`}
+            aria-label={`${expanded ? "Collapse" : "Expand"} ${totalCount} ${totalCount === 1 ? "step" : "steps"}${groupSummary ? `: ${groupSummary}` : ""}`}
           >
+            {aggregateStatus !== "done" ? (
+              <span className="chat-transcript-action-icon" aria-hidden="true">
+                {renderTranscriptStatusIcon(aggregateStatus)}
+              </span>
+            ) : null}
             <span className="chat-transcript-action-group-title">
               {totalCount} {totalCount === 1 ? "step" : "steps"}
             </span>
+            {groupSummary ? (
+              <span className="chat-transcript-action-group-summary">
+                {groupSummary}
+              </span>
+            ) : null}
           </button>
           <Collapse in={expanded} timeout="auto" unmountOnExit>
             <Box className="chat-transcript-action-group-body">
@@ -23007,48 +23272,26 @@ function ChatPageInner({
                     </Box>
                     {CHAT_STARTER_ADVANCED_EXAMPLES.length > 0 ? (
                       <Box className="chat-starter-advanced">
-                        <Box className="chat-starter-advanced-bar">
-                          <span
-                            className="chat-starter-advanced-icon"
-                            aria-hidden="true"
-                          >
-                            <Sparkles size={16} strokeWidth={1.85} />
-                          </span>
-                          <Typography
-                            variant="overline"
-                            className="chat-starter-section-title"
-                          >
-                            {CHAT_STARTER_CATEGORY_META.advanced.label}
-                          </Typography>
-                          <Typography
-                            variant="caption"
-                            className="chat-starter-section-copy"
-                          >
-                            {CHAT_STARTER_CATEGORY_META.advanced.description}
-                          </Typography>
-                          <Button
-                            size="small"
-                            variant="text"
-                            className="chat-starter-toggle"
-                            endIcon={
-                              <ExpandMoreIcon
-                                sx={{
-                                  transform: starterAdvancedExpanded
-                                    ? "rotate(180deg)"
-                                    : "rotate(0deg)",
-                                  transition: "transform 0.16s ease",
-                                }}
-                              />
-                            }
-                            onClick={() =>
-                              setStarterAdvancedExpanded((prev) => !prev)
-                            }
-                          >
-                            {starterAdvancedExpanded
-                              ? "Hide advanced"
-                              : "Show advanced"}
-                          </Button>
-                        </Box>
+                        <Button
+                          size="small"
+                          variant="text"
+                          className="chat-starter-toggle"
+                          endIcon={
+                            <ExpandMoreIcon
+                              sx={{
+                                transform: starterAdvancedExpanded
+                                  ? "rotate(180deg)"
+                                  : "rotate(0deg)",
+                                transition: "transform 0.16s ease",
+                              }}
+                            />
+                          }
+                          onClick={() =>
+                            setStarterAdvancedExpanded((prev) => !prev)
+                          }
+                        >
+                          {starterAdvancedExpanded ? "Hide advanced" : "Advanced"}
+                        </Button>
                         {starterAdvancedExpanded ? (
                           <Box className="chat-starter-grid chat-starter-grid-expanded">
                             {CHAT_STARTER_ADVANCED_EXAMPLES.map(
@@ -23298,7 +23541,7 @@ function ChatPageInner({
                           "pending-user-message",
                         )}
                       </Box>
-                      {renderUserAvatar("chat-avatar-pending")}
+                      {renderUserAvatar("chat-avatar-pending chat-avatar-user-live")}
                     </Box>
                   ) : null}
 
@@ -23471,62 +23714,13 @@ function ChatPageInner({
                         </Box>
                       ) : (
                         <>
-                          {hasVisibleStreamingReply ? (
-                            <Box className="chat-row">
-                              {renderAgentAvatar("chat-avatar-working")}
-                              <Box className="chat-bubble chat-bubble-assistant chat-bubble-streaming chat-bubble-streaming-reply">
-                                <Typography
-                                  variant="caption"
-                                  className="chat-streaming-status"
-                                  sx={{
-                                    color: "text.secondary",
-                                  }}
-                                >
-                                  {streamingResearchReport
-                                    ? "Deep research report is streaming..."
-                                    : nowDoingLabel || streamingActivity}
-                                </Typography>
-                                <Box className="chat-stream-section-reply">
-                                  {streamingResearchReport ? (
-                                    <Box sx={{ position: "relative" }}>
-                                      {renderResearchReportCard({
-                                        report: streamingResearchReport,
-                                        previousUserPrompt: streamingResearchPrompt,
-                                        messageId: "streaming-report",
-                                        isStreaming: true,
-                                      })}
-                                      <span className="stream-caret" />
-                                    </Box>
-                                  ) : (
-                                    <Box sx={{ position: "relative" }}>
-                                      {renderStreamingChatMarkdown(
-                                        visibleStreamingResponse,
-                                        {
-                                          snippetNamespace: "streaming-reply",
-                                          onOpenSnippet: openCodePreviewInWorkspace,
-                                        },
-                                      )}
-                                      <span className="stream-caret" />
-                                    </Box>
-                                  )}
-                                </Box>
-                                {renderClarificationChoiceGroup(
-                                  `streaming-clarification:${str(
-                                    pendingRunSnapshot?.runId,
-                                    visibleStreamingResponse.slice(0, 80),
-                                  )}`,
-                                  streamingResponseChoices,
-                                )}
-                              </Box>
-                            </Box>
-                          ) : null}
+                          {/* Live activity renders ABOVE the streaming reply,
+                              mirroring the persisted-message layout (transcript
+                              before markdown) so nothing dangles under the
+                              caret and the layout doesn't jump on completion. */}
                           {showLiveExecutionPanel ? (
                             <Box className="chat-row chat-row-live-work">
-                              {hasVisibleStreamingReply ? (
-                                <Box className="chat-avatar-spacer" aria-hidden="true" />
-                              ) : (
-                                renderAgentAvatar("chat-avatar-working")
-                              )}
+                              {renderAgentAvatar("chat-avatar-working")}
                               <Box
                                 className={`chat-live-work-panel${
                                   liveChatTranscriptItems.length > 0
@@ -23568,6 +23762,56 @@ function ChatPageInner({
                                     ))}
                                   </Box>
                                 ) : null}
+                              </Box>
+                            </Box>
+                          ) : null}
+                          {hasVisibleStreamingReply ? (
+                            <Box className="chat-row">
+                              {showLiveExecutionPanel ? (
+                                <Box className="chat-avatar-spacer" aria-hidden="true" />
+                              ) : (
+                                renderAgentAvatar("chat-avatar-working")
+                              )}
+                              <Box className="chat-bubble chat-bubble-assistant chat-bubble-streaming chat-bubble-streaming-reply">
+                                <Typography
+                                  variant="caption"
+                                  className="chat-streaming-status"
+                                  sx={{
+                                    color: "text.secondary",
+                                  }}
+                                >
+                                  {streamingResearchReport
+                                    ? "Deep research report is streaming..."
+                                    : nowDoingLabel || streamingActivity}
+                                </Typography>
+                                <Box className="chat-stream-section-reply">
+                                  {streamingResearchReport ? (
+                                    <Box sx={{ position: "relative" }}>
+                                      {renderResearchReportCard({
+                                        report: streamingResearchReport,
+                                        previousUserPrompt: streamingResearchPrompt,
+                                        messageId: "streaming-report",
+                                        isStreaming: true,
+                                      })}
+                                      <span className="stream-caret" />
+                                    </Box>
+                                  ) : (
+                                    renderStreamingChatMarkdown(
+                                      visibleStreamingMarkdownText,
+                                      {
+                                        snippetNamespace: "streaming-reply",
+                                        onOpenSnippet: openCodePreviewInWorkspace,
+                                      },
+                                    )
+                                  )}
+                                </Box>
+                                {renderClarificationChoiceGroup(
+                                  `streaming-clarification:${str(
+                                    pendingRunSnapshot?.runId,
+                                    (visibleStreamingResponse || visibleLiveModelEmit).slice(0, 80),
+                                  )}`,
+                                  streamingResponseChoices,
+                                )}
                               </Box>
                             </Box>
                           ) : null}
@@ -23732,11 +23976,18 @@ function ChatPageInner({
                   alignSelf: "flex-start",
                   borderRadius: 1.5,
                   px: { xs: 1.25, sm: 1.5 },
-                  py: 1.25,
+                  py: 1,
                 }}
               >
-                <Stack spacing={1}>
-                  <Box>
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={1}
+                  sx={{
+                    alignItems: { sm: "center" },
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
                     <Typography variant="subtitle2">
                       {str(
                         chatCredentialPrompt.title,
@@ -23744,37 +23995,97 @@ function ChatPageInner({
                       )}
                     </Typography>
                     <Typography
-                      variant="body2"
-                      sx={{
-                        color: "text.secondary",
-                        mt: 0.4,
-                      }}
+                      variant="caption"
+                      sx={{ color: "text.secondary", display: "block" }}
                     >
-                      {str(chatCredentialPrompt.description, "").trim() ||
-                        "Provide the requested credential values here so AgentArk can store them encrypted and continue."}
+                      Credentials go through a secure form and are stored
+                      encrypted — never through normal chat.
                     </Typography>
                   </Box>
-                  {chatCredentialPromptSettingsPath ? (
-                    <Typography
-                      variant="caption"
-                      sx={{
-                        color: "text.secondary",
-                        display: "block",
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{ flexShrink: 0, alignItems: "center" }}
+                  >
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={dismissChatCredentialPromptMutation.isPending}
+                      onClick={() => setChatCredentialDialogOpen(true)}
+                    >
+                      Open secure form
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={
+                        submitChatCredentialPromptMutation.isPending ||
+                        dismissChatCredentialPromptMutation.isPending
+                      }
+                      onClick={() => {
+                        dismissChatCredentialPromptMutation.mutate();
                       }}
                     >
-                      Use this form, or open{" "}
-                      <Box
-                        component="span"
-                        sx={{
-                          color: "text.primary",
-                          fontWeight: 600,
-                        }}
-                      >
-                        {chatCredentialPromptSettingsPath}
-                      </Box>
-                      .
-                    </Typography>
-                  ) : null}
+                      {dismissChatCredentialPromptMutation.isPending
+                        ? "Dismissing..."
+                        : "Later"}
+                    </Button>
+                  </Stack>
+                </Stack>
+              </Box>
+            ) : null}
+            <Dialog
+              open={chatCredentialPromptVisible && chatCredentialDialogOpen}
+              onClose={() => setChatCredentialDialogOpen(false)}
+              fullWidth
+              maxWidth="sm"
+              slotProps={{
+                paper: {
+                  sx: {
+                    borderRadius: 2.25,
+                    border: "1px solid var(--ui-rgba-255-255-255-080)",
+                    background:
+                      "linear-gradient(160deg, var(--ui-rgba-24-24-28-980), var(--ui-rgba-15-15-18-950))",
+                    backdropFilter: "blur(18px)",
+                    WebkitBackdropFilter: "blur(18px)",
+                  },
+                },
+              }}
+            >
+              <DialogTitle
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  py: 1.25,
+                  px: 2,
+                  minHeight: 48,
+                  borderBottom: "1px solid var(--ui-rgba-255-255-255-080)",
+                }}
+              >
+                <Typography variant="h6" sx={{ lineHeight: 1 }}>
+                  {str(
+                    chatCredentialPrompt.title,
+                    "Secure credentials required",
+                  )}
+                </Typography>
+                <IconButton
+                  size="small"
+                  onClick={() => setChatCredentialDialogOpen(false)}
+                  aria-label="Close secure credential form"
+                >
+                  <CloseIcon fontSize="small" />
+                </IconButton>
+              </DialogTitle>
+              <DialogContent sx={{ pt: 2 }}>
+                <Stack spacing={1.25} sx={{ mt: 0.5 }}>
+                  <Typography
+                    variant="body2"
+                    sx={{ color: "text.secondary" }}
+                  >
+                    {str(chatCredentialPrompt.description, "").trim() ||
+                      "Provide the requested credential values here so AgentArk can store them encrypted and continue."}
+                  </Typography>
                   <Alert
                     severity="warning"
                     variant="outlined"
@@ -23788,22 +24099,6 @@ function ChatPageInner({
                     {str(chatCredentialPrompt.warning, "").trim() ||
                       CHAT_SECRET_WARNING}
                   </Alert>
-                  {chatCredentialPromptDocsUrl ? (
-                    <Typography
-                      variant="caption"
-                      sx={{ color: "text.secondary" }}
-                    >
-                      Where do I get this?{" "}
-                      <a
-                        href={chatCredentialPromptDocsUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={handleChatLinkClick}
-                      >
-                        Open integration docs
-                      </a>
-                    </Typography>
-                  ) : null}
                   {chatCredentialPromptIsOAuthShape ? (
                     <Alert severity="info" sx={{ py: 0.5 }}>
                       This integration uses an OAuth browser handoff. Save any
@@ -23811,7 +24106,7 @@ function ChatPageInner({
                       finish signing in.
                     </Alert>
                   ) : null}
-                  <Grid2 container spacing={1} sx={{ maxWidth: 620 }}>
+                  <Grid2 container spacing={1}>
                     {chatCredentialPromptFields.map((field, index) => {
                       const key = str(field.key, "").trim();
                       if (!key) return null;
@@ -23843,6 +24138,7 @@ function ChatPageInner({
                           <TextField
                             fullWidth
                             size="small"
+                            autoFocus={index === 0}
                             type={isPlainText || isTextarea ? "text" : "password"}
                             multiline={isTextarea}
                             minRows={isTextarea ? 3 : undefined}
@@ -23860,6 +24156,12 @@ function ChatPageInner({
                                 setChatCredentialError(null);
                               }
                             }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && !isTextarea) {
+                                e.preventDefault();
+                                void submitChatCredentialPrompt();
+                              }
+                            }}
                             helperText={helperText}
                           />
                         </Grid2>
@@ -23871,61 +24173,94 @@ function ChatPageInner({
                       {chatCredentialError}
                     </Alert>
                   ) : null}
-                  <Stack
-                    direction={{ xs: "column", md: "row" }}
-                    spacing={1}
-                    sx={{ alignItems: { md: "center" } }}
-                  >
-                    <Button
-                      size="small"
-                      variant="contained"
-                      disabled={
-                        submitChatCredentialPromptMutation.isPending ||
-                        dismissChatCredentialPromptMutation.isPending ||
-                        isStreaming
-                      }
-                      onClick={() => {
-                        void submitChatCredentialPrompt();
+                  {chatCredentialPromptDocsUrl ? (
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary" }}
+                    >
+                      Where do I get this?{" "}
+                      <a
+                        href={chatCredentialPromptDocsUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={handleChatLinkClick}
+                      >
+                        Open integration docs
+                      </a>
+                    </Typography>
+                  ) : null}
+                  {chatCredentialPromptSettingsPath ? (
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "text.secondary",
+                        display: "block",
                       }}
                     >
-                      {submitChatCredentialPromptMutation.isPending
-                        ? "Saving..."
-                        : str(
-                            chatCredentialPrompt.submit_label,
-                            "Save securely",
-                          )}
-                    </Button>
-                    <Button
-                      size="small"
-                      variant="outlined"
-                      disabled={
-                        submitChatCredentialPromptMutation.isPending ||
-                        dismissChatCredentialPromptMutation.isPending
-                      }
-                      onClick={() => {
-                        dismissChatCredentialPromptMutation.mutate();
-                      }}
-                    >
-                      {dismissChatCredentialPromptMutation.isPending
-                        ? "Dismissing..."
-                        : "Fill in Settings later"}
-                    </Button>
-                    {str(chatCredentialPrompt.fallback_command, "").trim() ? (
-                      <Typography
-                        variant="caption"
+                      Prefer Settings? Open{" "}
+                      <Box
+                        component="span"
                         sx={{
-                          color: "text.secondary",
+                          color: "text.primary",
+                          fontWeight: 600,
                         }}
                       >
-                        <code>
-                          {str(chatCredentialPrompt.fallback_command, "")}
-                        </code>
-                      </Typography>
-                    ) : null}
-                  </Stack>
+                        {chatCredentialPromptSettingsPath}
+                      </Box>
+                      .
+                    </Typography>
+                  ) : null}
+                  {str(chatCredentialPrompt.fallback_command, "").trim() ? (
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "text.secondary",
+                      }}
+                    >
+                      <code>
+                        {str(chatCredentialPrompt.fallback_command, "")}
+                      </code>
+                    </Typography>
+                  ) : null}
                 </Stack>
-              </Box>
-            ) : null}
+              </DialogContent>
+              <DialogActions sx={{ px: 2, pb: 1.75, pt: 0.5 }}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  disabled={
+                    submitChatCredentialPromptMutation.isPending ||
+                    dismissChatCredentialPromptMutation.isPending
+                  }
+                  onClick={() => {
+                    dismissChatCredentialPromptMutation.mutate();
+                  }}
+                >
+                  {dismissChatCredentialPromptMutation.isPending
+                    ? "Dismissing..."
+                    : "Fill in Settings later"}
+                </Button>
+                <Button
+                  size="small"
+                  variant="contained"
+                  disabled={
+                    submitChatCredentialPromptMutation.isPending ||
+                    dismissChatCredentialPromptMutation.isPending ||
+                    isStreaming
+                  }
+                  onClick={() => {
+                    void submitChatCredentialPrompt();
+                  }}
+                >
+                  {submitChatCredentialPromptMutation.isPending
+                    ? "Saving..."
+                    : str(
+                        chatCredentialPrompt.submit_label,
+                        "Save securely",
+                      )}
+                </Button>
+              </DialogActions>
+            </Dialog>
             {chatNotice &&
             !visibleConversationListError &&
             !visibleMessagesError &&

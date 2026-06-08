@@ -129,6 +129,13 @@ export function getEffectiveUiTimeZone(): string | undefined {
   return getUiTimeZoneOverride() || undefined;
 }
 
+export function getRequestUiTimeZone(): string | undefined {
+  const override = getUiTimeZoneOverride();
+  if (override) return override;
+  const detected = detectLocalTimeZone();
+  return detected && isValidUiTimeZone(detected) ? detected : undefined;
+}
+
 function withUiTimeZone<T extends Intl.DateTimeFormatOptions>(options: T): T {
   const timezone = getEffectiveUiTimeZone();
   return timezone ? ({ ...options, timeZone: timezone } as T) : options;

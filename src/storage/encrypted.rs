@@ -48,16 +48,16 @@ impl EncryptedStorage {
     ) -> Result<()> {
         const ROTATED_KV_KEYS: &[&str] = &[
             "user_profile",
-            crate::core::observability::OBSERVABILITY_LOG_KEY,
+            crate::core::platform::observability::OBSERVABILITY_LOG_KEY,
             crate::sentinel::PULSE_LOG_KEY,
-            crate::core::config::SETTINGS_CONFIG_KEY,
-            crate::core::config::SETTINGS_SECRETS_KEY,
-            crate::core::config::SETTINGS_SEARCH_KEY,
-            crate::core::config::SETTINGS_RUNTIME_KEY,
-            crate::core::config::SETTINGS_DISABLED_ACTIONS_KEY,
-            crate::core::config::SETTINGS_ACTION_REVIEWS_KEY,
-            crate::core::config::SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY,
-            crate::core::config::SETTINGS_APPROVED_PERMISSIONS_KEY,
+            crate::core::runtime::config::SETTINGS_CONFIG_KEY,
+            crate::core::runtime::config::SETTINGS_SECRETS_KEY,
+            crate::core::runtime::config::SETTINGS_SEARCH_KEY,
+            crate::core::runtime::config::SETTINGS_RUNTIME_KEY,
+            crate::core::runtime::config::SETTINGS_DISABLED_ACTIONS_KEY,
+            crate::core::runtime::config::SETTINGS_ACTION_REVIEWS_KEY,
+            crate::core::runtime::config::SETTINGS_REMOVED_BUNDLED_ACTIONS_KEY,
+            crate::core::runtime::config::SETTINGS_APPROVED_PERMISSIONS_KEY,
         ];
 
         let lineage_record = serde_json::to_vec(&serde_json::json!({
@@ -71,7 +71,7 @@ impl EncryptedStorage {
                 new_key.as_ref(),
                 ROTATED_KV_KEYS,
                 Some((
-                    crate::core::config::SETTINGS_KEY_LINEAGE_KEY.to_string(),
+                    crate::core::runtime::config::SETTINGS_KEY_LINEAGE_KEY.to_string(),
                     lineage_record,
                 )),
             )
@@ -95,9 +95,9 @@ impl EncryptedStorage {
             let value = super::learned_fact_value_from_content(fact.key.as_deref(), &fact.fact);
             if let Some(raw_key) = fact.key.clone() {
                 let allow_value_suffix_repair = fact.memory_category
-                    == crate::core::memory_schema::MEMORY_CATEGORY_PROFILE_FACT;
+                    == crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT;
                 if let Some((key, repaired_value)) =
-                    crate::core::memory_schema::repair_memory_slot_key_and_value(
+                    crate::core::knowledge::memory_schema::repair_memory_slot_key_and_value(
                         &raw_key,
                         &value,
                         allow_value_suffix_repair,
@@ -311,7 +311,7 @@ mod tests {
             .unwrap();
         encrypted_storage
             .set_encrypted(
-                crate::core::observability::OBSERVABILITY_LOG_KEY,
+                crate::core::platform::observability::OBSERVABILITY_LOG_KEY,
                 br#"[{"id":"obs-1","timestamp":"2026-03-19T00:00:00Z","level":"info","event":"test","message":"ok","provider":"langtrace","endpoint":"https://example.com","trace_id":null,"status_code":200}]"#,
             )
             .await
@@ -361,7 +361,7 @@ mod tests {
             br#"{"name":"Ada"}"#.to_vec()
         );
         let lineage_raw = storage
-            .get(crate::core::config::SETTINGS_KEY_LINEAGE_KEY)
+            .get(crate::core::runtime::config::SETTINGS_KEY_LINEAGE_KEY)
             .await
             .unwrap()
             .expect("lineage metadata should be written during re-encryption");
@@ -374,7 +374,7 @@ mod tests {
             new_key.fingerprint()
         );
         let raw_observability = storage
-            .get(crate::core::observability::OBSERVABILITY_LOG_KEY)
+            .get(crate::core::platform::observability::OBSERVABILITY_LOG_KEY)
             .await
             .unwrap()
             .unwrap();

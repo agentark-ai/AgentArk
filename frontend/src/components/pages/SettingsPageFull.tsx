@@ -55,6 +55,10 @@ import {
 } from "../../lib/dateFormat";
 import { humanizeStatusLabel } from "../../lib/displayLabels";
 import type {
+  ModelCapabilityProbe,
+  ModelTestCapabilities,
+  ModelTestRoleFitness,
+  ModelTestVerdict,
   PulseRemediationSpec,
   PulseRunFixRequest,
 } from "../../types";
@@ -2212,6 +2216,11 @@ export default function SettingsPage({
   const [modelConnectionTestResult, setModelConnectionTestResult] = useState<{
     ok: boolean;
     message: string;
+    capabilities: ModelTestCapabilities | null;
+    verdict: ModelTestVerdict | null;
+    roleFitness: ModelTestRoleFitness | null;
+    warning: string;
+    capabilitiesError: string;
   } | null>(null);
   const [modelForm, setModelForm] = useState({
     label: "",
@@ -2639,21 +2648,75 @@ export default function SettingsPage({
           { timeoutMs: 30000 },
         ),
       );
+      const parseProbe = (value: unknown): ModelCapabilityProbe => {
+        const probe = asRecord(value);
+        const latencyRaw = probe.latency_ms;
+        return {
+          pass: toBool(probe.pass),
+          detail: str(probe.detail, "").trim(),
+          latency_ms:
+            latencyRaw === null || latencyRaw === undefined
+              ? null
+              : num(latencyRaw, 0),
+        };
+      };
+      let capabilities: ModelTestCapabilities | null = null;
+      if (isRecord(response.capabilities)) {
+        const caps = response.capabilities;
+        capabilities = {
+          tool_calls: parseProbe(caps.tool_calls),
+          final_response: parseProbe(caps.final_response),
+          json_output: parseProbe(caps.json_output),
+        };
+      }
+      let verdict: ModelTestVerdict | null = null;
+      const verdictRaw = str(response.verdict, "").trim();
+      if (
+        verdictRaw === "supported" ||
+        verdictRaw === "degraded" ||
+        verdictRaw === "unsupported_for_agent_runs"
+      ) {
+        verdict = verdictRaw;
+      }
+      let roleFitness: ModelTestRoleFitness | null = null;
+      if (isRecord(response.role_fitness)) {
+        const fit = response.role_fitness;
+        roleFitness = {
+          primary_spine: toBool(fit.primary_spine),
+          verifier: toBool(fit.verifier),
+          helper_text: toBool(fit.helper_text),
+        };
+      }
       return {
         ok: toBool(response.ok),
         error: str(response.error, "").trim(),
+        capabilities,
+        verdict,
+        roleFitness,
+        warning: str(response.warning, "").trim(),
+        capabilitiesError: str(response.capabilities_error, "").trim(),
       };
     },
-    onSuccess: (result: { ok: boolean; error: string }) => {
+    onSuccess: (result) => {
       setModelConnectionTestResult(
         result.ok
           ? {
               ok: true,
               message: "Connection check passed.",
+              capabilities: result.capabilities,
+              verdict: result.verdict,
+              roleFitness: result.roleFitness,
+              warning: result.warning,
+              capabilitiesError: result.capabilitiesError,
             }
           : {
               ok: false,
               message: result.error || "Connection check failed.",
+              capabilities: null,
+              verdict: null,
+              roleFitness: null,
+              warning: "",
+              capabilitiesError: "",
             },
       );
     },
@@ -2661,6 +2724,11 @@ export default function SettingsPage({
       setModelConnectionTestResult({
         ok: false,
         message: errMessage(e),
+        capabilities: null,
+        verdict: null,
+        roleFitness: null,
+        warning: "",
+        capabilitiesError: "",
       });
     },
   });
@@ -5488,13 +5556,6 @@ export default function SettingsPage({
                     }}
                   >
                     <TextField
-                      label="Bot Name"
-                      value={form.bot_name}
-                      onChange={(e) => setField("bot_name", e.target.value)}
-                      fullWidth
-                      size="small"
-                    />
-                    <TextField
                       label="Personality"
                       select
                       value={form.personality}
@@ -5508,34 +5569,6 @@ export default function SettingsPage({
                       <MenuItem value="technical">Technical</MenuItem>
                       <MenuItem value="creative">Creative</MenuItem>
                       <MenuItem value="concise">Concise</MenuItem>
-                    </TextField>
-                    <TextField
-                      label="Language"
-                      value={form.language}
-                      onChange={(e) => setField("language", e.target.value)}
-                      fullWidth
-                      size="small"
-                      placeholder="e.g. English"
-                    />
-                    <TextField
-                      label="Tone"
-                      select
-                      value={form.tone}
-                      onChange={(e) => setField("tone", e.target.value)}
-                      fullWidth
-                      size="small"
-                      slotProps={{
-                        select: { displayEmpty: true },
-                        inputLabel: { shrink: true },
-                      }}
-                    >
-                      <MenuItem value="">Default</MenuItem>
-                      <MenuItem value="concise">Concise</MenuItem>
-                      <MenuItem value="friendly">Friendly</MenuItem>
-                      <MenuItem value="professional">Professional</MenuItem>
-                      <MenuItem value="casual">Casual</MenuItem>
-                      <MenuItem value="technical">Technical</MenuItem>
-                      <MenuItem value="creative">Creative</MenuItem>
                     </TextField>
                   </Box>
                 </Stack>

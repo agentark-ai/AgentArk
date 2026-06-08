@@ -94,6 +94,10 @@ import {
   promptCanarySafetyStatusColor,
   promptProposalRiskColor,
 } from "./settingsPageHelpers";
+import {
+  promptHoldoutCaseLabel,
+  promptHoldoutFootprintRows,
+} from "./evolutionReviewQueueHelpers";
 
 type ReadinessDialogState = {
   title: string;
@@ -188,6 +192,29 @@ function promptProposalLifecycleColor(status: string) {
     return "error" as const;
   }
   return "default" as const;
+}
+
+function promptProposalIsPastDecision(row: JsonRecord): boolean {
+  const lifecycle = promptProposalLifecycle(row);
+  const lifecycleStatus = promptProposalLifecycleStatus(row);
+  const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
+  const jobStatus = str(lifecycle.job_status, "").trim().toLowerCase();
+  if (reviewStatus === "rejected") return true;
+  if (
+    lifecycleStatus === "candidate_rejected" ||
+    lifecycleStatus === "rolled_back" ||
+    lifecycleStatus === "dismissed" ||
+    lifecycleStatus === "test_stopped"
+  ) {
+    return true;
+  }
+  return (
+    lifecycleStatus === "blocked" &&
+    (jobStatus === "blocked" ||
+      jobStatus === "failed" ||
+      jobStatus === "timed_out" ||
+      jobStatus === "error")
+  );
 }
 
 function promptProposalSampleLabel(lifecycle: JsonRecord): string {
@@ -1018,32 +1045,45 @@ function promptOpportunityIssueChartOption(opportunity: JsonRecord) {
   };
 }
 
-function promptHoldoutLatencyChartOption(cases: JsonRecord[]) {
-  const visibleCases = cases.slice(0, 5);
-  const labels = visibleCases.map((_caseRow, idx) => `S${idx + 1}`);
-  const values = visibleCases.map((caseRow) =>
-    Math.max(0, finiteNumber(caseRow.latency_ms) ?? 0),
-  );
+function promptHoldoutFootprintChartOption(cases: JsonRecord[]) {
+  const rows = promptHoldoutFootprintRows(cases, 5);
+  const labels = rows.map((row) => row.label);
+  const targetValues = rows.map((row) => row.targetChars);
+  const restValues = rows.map((row) => row.restChars);
   return {
     backgroundColor: "transparent",
-    grid: { left: 40, right: 10, top: 12, bottom: 24, containLabel: true },
+    grid: { left: 44, right: 12, top: 12, bottom: 34, containLabel: true },
     tooltip: {
       trigger: "axis",
       backgroundColor: "rgba(14, 18, 14, 0.96)",
       borderColor: "rgba(120, 242, 176, 0.24)",
       textStyle: { color: "#fff8ed" },
-      formatter: (items: Array<{ dataIndex: number; value: number }>) => {
+      formatter: (items: Array<{ dataIndex: number; seriesName: string; value: number }>) => {
         const first = items[0];
-        const caseRow = visibleCases[first?.dataIndex ?? 0] ?? {};
-        const label = humanizeStatusLabel(str(caseRow.outcome, "sample"));
-        const latency = Math.round(Number(first?.value ?? 0)).toLocaleString();
-        return `${label}<br/>${latency} ms`;
+        const row = rows[first?.dataIndex ?? 0];
+        if (!row) return "";
+        const traceLabel = promptHoldoutCaseLabel(row.representative);
+        const tooltipRows = items
+          .map((item) => {
+            const value = Math.round(Number(item.value ?? 0)).toLocaleString();
+            return `${item.seriesName}: ${value} chars`;
+          })
+          .join("<br/>");
+        const total = Math.round(row.totalChars).toLocaleString();
+        const sampleCount = row.count > 1 ? `<br/>Matching samples: ${row.count}` : "";
+        return `${row.label}<br/>${traceLabel}${sampleCount}<br/>${tooltipRows}<br/>Total prompt: ${total} chars`;
       },
     },
     xAxis: {
       type: "category",
       data: labels,
-      axisLabel: { color: "#c8d8c9" },
+      axisLabel: {
+        color: "#c8d8c9",
+        fontSize: 9,
+        interval: 0,
+        width: 72,
+        overflow: "truncate",
+      },
       axisLine: { lineStyle: { color: "rgba(130,170,160,0.22)" } },
     },
     yAxis: {
@@ -1058,30 +1098,26 @@ function promptHoldoutLatencyChartOption(cases: JsonRecord[]) {
     series: [
       {
         type: "bar",
-        data: values,
+        name: "Target section chars",
+        stack: "prompt",
+        data: targetValues,
         itemStyle: {
-          color: (params: { dataIndex: number }) => {
-            const outcome = str(
-              visibleCases[params.dataIndex]?.outcome,
-              "",
-            ).toLowerCase();
-            if (outcome.includes("expensive")) return "#fbbf24";
-            if (outcome.includes("slow")) return "#60a5fa";
-            if (outcome.includes("failed")) return "#fb7185";
-            if (outcome.includes("corrected")) return "#a78bfa";
-            return "#14f195";
-          },
+          color: "#14f195",
+          borderRadius: [0, 0, 4, 4],
+        },
+      },
+      {
+        type: "bar",
+        name: "Rest of prompt chars",
+        stack: "prompt",
+        data: restValues,
+        itemStyle: {
+          color: "rgba(148, 163, 184, 0.48)",
           borderRadius: [4, 4, 0, 0],
         },
       },
     ],
   };
-}
-
-function promptHoldoutCaseLabel(row: JsonRecord): string {
-  const traceId = str(row.trace_id, "").trim();
-  const runId = str(row.run_id, "").trim();
-  return traceId || runId || "Sample";
 }
 
 function PromptDetailSection({
@@ -2071,9 +2107,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   );
   const activePromptOptimizationOpportunities = promptOptimizationOpportunities.filter(
     (row) => {
-      const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
-      const lifecycleStatus = promptProposalLifecycleStatus(row);
-      return reviewStatus !== "rejected" && lifecycleStatus !== "rolled_back";
+      return !promptProposalIsPastDecision(row);
     },
   );
   const visiblePromptCanarySafetyEvents = showSuperseded
@@ -4458,7 +4492,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                         const rowMetrics = promptOptimizationRowMetrics(opportunity);
                         const holdoutCases = pickRecords(opportunity, "holdout_cases");
                         const footprint = promptOptimizationFootprintValues(opportunity);
-                        const holdoutLatencyChartOption = promptHoldoutLatencyChartOption(holdoutCases);
+                        const holdoutFootprintChartOption = promptHoldoutFootprintChartOption(holdoutCases);
                         const promptShare = promptOptimizationShareLabel(opportunity);
                         const changePreview = asRecord(row.change_preview);
                         const previewBefore = stringList(changePreview.before);
@@ -4539,12 +4573,12 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                               onClick={openPromptProposalDialog}
                             sx={{
                                 width: "100%",
-                                border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                borderLeft: `3px solid ${riskRail}`,
+                                border: "1px solid rgba(255, 255, 255, 0.075)",
+                                borderLeft: "3px solid rgba(255, 255, 255, 0.075)",
                                 borderRadius: 1.5,
                                 background:
-                                  "linear-gradient(135deg, rgba(16, 24, 32, 0.55), rgba(8, 12, 18, 0.32))",
-                                boxShadow: `inset 3px 0 16px -7px ${riskRail}`,
+                                  "linear-gradient(135deg, rgba(20, 20, 22, 0.62), rgba(9, 9, 10, 0.42))",
+                                boxShadow: "none",
                                 px: 1.9,
                                 py: 1.4,
                                 appearance: "none",
@@ -4560,12 +4594,10 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                   "background 140ms ease, border-color 140ms ease, box-shadow 140ms ease",
                                 "&:hover": {
                                   background: proposalId
-                                    ? "linear-gradient(135deg, rgba(22, 32, 42, 0.66), rgba(11, 17, 25, 0.42))"
-                                    : "linear-gradient(135deg, rgba(16, 24, 32, 0.55), rgba(8, 12, 18, 0.32))",
-                                  borderColor: "rgba(120, 242, 176, 0.28)",
-                                  boxShadow: proposalId
-                                    ? `inset 3px 0 16px -7px ${riskRail}, 0 10px 34px -20px rgba(20, 241, 149, 0.5)`
-                                    : `inset 3px 0 16px -7px ${riskRail}`,
+                                    ? "linear-gradient(135deg, rgba(26, 26, 28, 0.70), rgba(12, 12, 13, 0.48))"
+                                    : "linear-gradient(135deg, rgba(20, 20, 22, 0.62), rgba(9, 9, 10, 0.42))",
+                                  borderColor: "rgba(255, 255, 255, 0.11)",
+                                  boxShadow: "none",
                                 },
                                 "&:focus-visible": {
                                   outline: "2px solid rgba(120, 242, 176, 0.8)",
@@ -4727,7 +4759,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     height: 7,
                                     borderRadius: "50%",
                                     background: riskRail,
-                                    boxShadow: `0 0 8px ${riskRail}`,
+                                    boxShadow: "none",
                                     flex: "0 0 auto",
                                   }}
                                 />
@@ -4943,7 +4975,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                       </Typography>
                                       {holdoutCases.length > 0 ? (
                                         <ReactECharts
-                                          option={holdoutLatencyChartOption}
+                                          option={holdoutFootprintChartOption}
                                           style={{ height: 160, width: "100%" }}
                                         />
                                       ) : (

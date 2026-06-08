@@ -44,7 +44,7 @@ pub struct ExecutionProof {
 
 impl ExecutionProof {
     /// Compute the hash of this proof (for chaining)
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.id.as_bytes());
@@ -92,7 +92,7 @@ impl Default for ExecutionTrace {
 /// Engine for generating and verifying execution proofs
 pub struct ProofEngine {
     /// Current execution trace (interior mutability for concurrent access)
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    #[allow(dead_code)]
     trace: std::sync::Mutex<ExecutionTrace>,
 }
 
@@ -196,37 +196,5 @@ impl ProofEngine {
         }
 
         candidate
-    }
-
-    /// Get a clone of the current execution trace
-    #[cfg(feature = "gui")]
-    pub fn trace(&self) -> ExecutionTrace {
-        self.trace.lock().map(|t| t.clone()).unwrap_or_default()
-    }
-}
-
-/// Compact proof receipt for sharing
-#[cfg(feature = "gui")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProofReceipt {
-    pub proof_id: Uuid,
-    pub action_summary: String,
-    pub timestamp: DateTime<Utc>,
-    pub agent_did: String,
-    pub proof_hash: String,
-    pub signature: String,
-}
-
-#[cfg(feature = "gui")]
-impl From<&ExecutionProof> for ProofReceipt {
-    fn from(proof: &ExecutionProof) -> Self {
-        Self {
-            proof_id: proof.id,
-            action_summary: format!("Action hash: {}", hex::encode(&proof.action_hash[..8])),
-            timestamp: proof.timestamp,
-            agent_did: proof.agent_did.clone(),
-            proof_hash: hex::encode(proof.hash()),
-            signature: hex::encode(&proof.signature[..32]), // Truncated for display
-        }
     }
 }

@@ -6,7 +6,7 @@
 //! - Secure secrets, approvals, and cryptographic execution proofs
 //! - Sandboxed action execution (WASM + Docker)
 //! - Optional power features like tasks, apps, and sub-agents
-//! - Native GUI (egui) + Telegram integration
+//! - Web UI, CLI, and Telegram integration
 //! - Local-first HTTP API
 
 #![recursion_limit = "256"]
@@ -18,7 +18,7 @@
 )]
 
 mod actions;
-mod branding;
+mod app;
 mod channels;
 mod cli;
 mod clients;
@@ -33,7 +33,6 @@ mod hooks;
 mod identity;
 mod integrations;
 mod mcp;
-mod metrics;
 mod plugins;
 mod proofs;
 mod runtime;
@@ -41,10 +40,11 @@ mod safety;
 mod security;
 mod sentinel;
 mod storage;
+mod telemetry;
 mod workspace;
 
-#[cfg(feature = "gui")]
-mod gui;
+pub(crate) use app::branding;
+pub(crate) use telemetry::metrics;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -59,7 +59,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(name = "agentark")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Run in headless mode (no GUI)
+    /// Run without interactive terminal setup prompts
     #[arg(long)]
     headless: bool,
 
@@ -104,20 +104,20 @@ struct Args {
     command: Option<cli::Command>,
 }
 
-fn startup_deployment_mode(config_dir: &Path) -> core::config::DeploymentMode {
+fn startup_deployment_mode(config_dir: &Path) -> core::runtime::config::DeploymentMode {
     if let Ok(force_mode) = std::env::var("AGENTARK_DEPLOYMENT_MODE") {
         match force_mode.trim().to_ascii_lowercase().as_str() {
             "internet_facing" | "internet-facing" => {
-                return core::config::DeploymentMode::InternetFacing;
+                return core::runtime::config::DeploymentMode::InternetFacing;
             }
             "trusted_local" | "trusted-local" => {
-                return core::config::DeploymentMode::TrustedLocal;
+                return core::runtime::config::DeploymentMode::TrustedLocal;
             }
             _ => {}
         }
     }
 
-    core::config::load_bootstrap_deployment_mode(config_dir)
+    core::runtime::config::load_bootstrap_deployment_mode(config_dir)
 }
 
 fn startup_master_password_secret() -> Result<Option<String>> {
@@ -152,7 +152,7 @@ fn mismatched_install_master_secret_error() -> anyhow::Error {
 fn resolve_background_service_key(
     config_dir: &Path,
     data_dir: &Path,
-    deployment_mode: core::config::DeploymentMode,
+    deployment_mode: core::runtime::config::DeploymentMode,
     _is_first_run: bool,
 ) -> Result<std::sync::Arc<crate::crypto::KeyManager>> {
     let master_mgr = crypto::master::MasterPasswordManager::new(config_dir, data_dir);
@@ -168,7 +168,7 @@ fn resolve_background_service_key(
             tracing::warn!("Startup master password secret did not unlock master key");
         }
 
-        if deployment_mode == core::config::DeploymentMode::InternetFacing
+        if deployment_mode == core::runtime::config::DeploymentMode::InternetFacing
             && master_mgr.is_bootstrap_password_active()?
         {
             return Err(legacy_keyfile_bootstrap_error());
@@ -200,7 +200,9 @@ fn resolve_background_service_key(
         return master_mgr.initialize_startup_password_if_needed(password);
     }
 
-    if deployment_mode == core::config::DeploymentMode::InternetFacing || install_secret_required {
+    if deployment_mode == core::runtime::config::DeploymentMode::InternetFacing
+        || install_secret_required
+    {
         return Err(missing_install_master_secret_error());
     }
 
@@ -214,17 +216,17 @@ fn resolve_background_service_key(
 
 async fn initialize_executor_service_globals(config_dir: &Path, data_dir: &Path) -> Result<()> {
     let deployment_mode = startup_deployment_mode(config_dir);
-    let is_first_run = !core::config::bootstrap_metadata_exists(config_dir);
+    let is_first_run = !core::runtime::config::bootstrap_metadata_exists(config_dir);
     let unified_key =
         resolve_background_service_key(config_dir, data_dir, deployment_mode, is_first_run)?;
-    core::config::set_global_key_manager(unified_key.clone());
+    core::runtime::config::set_global_key_manager(unified_key.clone());
     crate::storage::install_storage_key_manager(unified_key);
 
     let database_config = storage::DatabaseConfig::from_env().map_err(|_| {
         anyhow::anyhow!("AGENTARK_DATABASE_URL is required for split-service executor startup")
     })?;
     let storage = storage::Storage::connect(database_config).await?;
-    core::config::set_global_settings_storage(storage);
+    core::runtime::config::set_global_settings_storage(storage);
     Ok(())
 }
 
@@ -240,7 +242,7 @@ pub(crate) struct CliChatReadiness {
     pub configured_model_count: usize,
 }
 
-pub(crate) fn cli_chat_readiness(config: &core::config::AgentConfig) -> CliChatReadiness {
+pub(crate) fn cli_chat_readiness(config: &core::runtime::config::AgentConfig) -> CliChatReadiness {
     let configured_model_count = if !config.model_pool.slots.is_empty() {
         config
             .model_pool
@@ -307,6 +309,8 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         execution_profile: None,
         arkorbit_context: None,
         browser_profile_context: None,
+        client_timezone: None,
+        client_timezone_offset_minutes: None,
         recent_actionable_artifacts: Vec::new(),
     }
 }
@@ -456,7 +460,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Check if this is first run (no bootstrap metadata exists yet)
-    let is_first_run = !core::config::bootstrap_metadata_exists(&config_dir);
+    let is_first_run = !core::runtime::config::bootstrap_metadata_exists(&config_dir);
     let deployment_mode = startup_deployment_mode(&config_dir);
 
     if is_first_run && !requested_setup {
@@ -532,7 +536,7 @@ pub async fn run() -> Result<()> {
         }
 
         if unlocked_key.is_none() {
-            if deployment_mode == core::config::DeploymentMode::InternetFacing
+            if deployment_mode == core::runtime::config::DeploymentMode::InternetFacing
                 && master_mgr.is_bootstrap_password_active()?
             {
                 return Err(legacy_keyfile_bootstrap_error());
@@ -562,7 +566,9 @@ pub async fn run() -> Result<()> {
         }
 
         if unlocked_key.is_none() {
-            if deployment_mode == core::config::DeploymentMode::InternetFacing && args.headless {
+            if deployment_mode == core::runtime::config::DeploymentMode::InternetFacing
+                && args.headless
+            {
                 return Err(missing_install_master_secret_error());
             }
             if !args.headless {
@@ -584,7 +590,7 @@ pub async fn run() -> Result<()> {
     } else if let Some(password) = startup_master_password.as_deref() {
         tracing::info!("Initializing master password from install-managed startup secret");
         Some(master_mgr.initialize_startup_password_if_needed(password)?)
-    } else if deployment_mode == core::config::DeploymentMode::InternetFacing
+    } else if deployment_mode == core::runtime::config::DeploymentMode::InternetFacing
         || install_secret_required
     {
         return Err(missing_install_master_secret_error());
@@ -619,7 +625,7 @@ pub async fn run() -> Result<()> {
     };
     // Set global key manager so all SecureConfigManager instances use the same key
     if let Some(ref key) = unified_key {
-        core::config::set_global_key_manager(key.clone());
+        core::runtime::config::set_global_key_manager(key.clone());
     }
 
     // Initialize core systems
@@ -641,13 +647,6 @@ pub async fn run() -> Result<()> {
             // Config already has defaults, just save it
             agent.config.save(&config_dir, Some(&data_dir))?;
         } else {
-            #[cfg(feature = "gui")]
-            if !args.headless {
-                println!("Launching setup wizard...");
-                gui::run_setup_wizard(agent).await?;
-                return Ok(());
-            }
-
             // CLI setup for explicit --setup flag
             run_cli_setup(&config_dir, &agent).await?;
 
@@ -722,19 +721,7 @@ pub async fn run() -> Result<()> {
         return run_cli_pulse(agent).await;
     }
 
-    if args.headless {
-        run_headless(agent).await
-    } else {
-        #[cfg(feature = "gui")]
-        {
-            gui::run(agent).await
-        }
-        #[cfg(not(feature = "gui"))]
-        {
-            tracing::warn!("GUI feature not enabled, running headless");
-            run_headless(agent).await
-        }
-    }
+    run_headless(agent).await
 }
 
 async fn run_service_mode(
@@ -1615,7 +1602,7 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
             .filter_map(|s| s.trim().parse().ok())
             .collect();
 
-        Some(core::config::TelegramConfig {
+        Some(core::runtime::config::TelegramConfig {
             bot_token: token.trim().to_string(),
             allowed_users,
             dm_policy: "pairing".to_string(),
@@ -1636,8 +1623,8 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     println!("Configuration saved to: {}", config_dir.display());
     println!();
     println!("To start your agent:");
-    println!("  Headless mode: agentark --headless");
-    println!("  Native GUI:    build with --features gui, then run agentark");
+    println!("  Web UI service: agentark --headless");
+    println!("  CLI chat:       agentark --chat");
     println!();
     println!("HTTP API will be available at: http://127.0.0.1:8990");
     println!();
@@ -1840,7 +1827,7 @@ mod tests {
         should_launch_cli_setup, CliChatReadiness, CLI_SETTINGS_URL, CLI_SETUP_COMMAND,
         CLI_SETUP_PROMPT,
     };
-    use crate::core::config::{
+    use crate::core::runtime::config::{
         AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
     };
     use crate::core::LlmProvider;

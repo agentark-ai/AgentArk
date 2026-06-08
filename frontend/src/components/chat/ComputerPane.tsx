@@ -60,6 +60,7 @@ import {
   type ReadablePayloadTone,
 } from "./readablePayload";
 import { buildRunPayloadViewFromSources } from "./runPayloadView";
+import { buildReadableToolPresentation } from "./computerViews/presentation";
 import {
   FileView,
   SurfaceRenderer,
@@ -120,6 +121,72 @@ function pickActiveCard(
     if (!pool[i].isHeartbeat) return pool[i];
   }
   return pool[pool.length - 1] ?? null;
+}
+
+// Pick a terminal glyph + tone for a console story line from the card's renderer
+// and status. Tones map to AgentArk accents: run=green, info=signal-blue,
+// ask=orange, err=red, reason=dim.
+function storyGlyphMeta(card: ChatStepCard, isReasoning: boolean): { glyph: string; tone: string } {
+  if (isReasoning) return { glyph: "~", tone: "reason" };
+  const rid = rendererIdForCard(card);
+  const hay = `${card.kind} ${card.stepType} ${card.label}`.toLowerCase();
+  let glyph = "·";
+  let tone = "info";
+  if (/deploy|app_deploy|publish|\bapp\b/.test(hay)) {
+    glyph = "▣";
+    tone = "run";
+  } else if (rid === AGENTARK_RENDERERS.SEARCH) {
+    glyph = "*";
+    tone = "info";
+  } else if (rid === AGENTARK_RENDERERS.FILE) {
+    glyph = "→";
+    tone = "info";
+  } else if (rid === AGENTARK_RENDERERS.BROWSER) {
+    glyph = "◇";
+    tone = "info";
+  } else if (rid === AGENTARK_RENDERERS.TERMINAL) {
+    glyph = "$";
+    tone = "run";
+  } else if (/model|turn|reply|respond|complete|generat/.test(hay)) {
+    glyph = "●";
+    tone = "run";
+  } else if (/ask|clarify|question|await|waiting|approval/.test(hay)) {
+    glyph = "~";
+    tone = "ask";
+  } else if (rid === AGENTARK_RENDERERS.WORKING) {
+    glyph = "~";
+    tone = "run";
+  }
+  const status = surfaceStatus(card);
+  if (status === "error") {
+    glyph = "✕";
+    tone = "err";
+  } else if (status === "done" && glyph === "·") {
+    glyph = "✓";
+    tone = "run";
+  }
+  return { glyph, tone };
+}
+
+function truncateStorySub(text: string, limit = 96): string {
+  const trimmed = (text || "").replace(/\s+/g, " ").trim();
+  return trimmed.length > limit ? `${trimmed.slice(0, limit - 1)}…` : trimmed;
+}
+
+// Readable one-line subtitle for a story line. Never surface raw JSON: if the
+// best candidate is a JSON blob, pull its activity_label, otherwise show nothing
+// (the glyph + label already carry the line; the expanded detail has the rest).
+function storySubText(
+  presentation: { query: string; summary: string },
+  card: ChatStepCard,
+): string {
+  const raw = (presentation.query || presentation.summary || card.summary || "").trim();
+  if (!raw) return "";
+  if (raw[0] === "{" || raw[0] === "[") {
+    const match = raw.match(/"activity_label"\s*:\s*"([^"]+)"/);
+    return match ? match[1] : "";
+  }
+  return raw;
 }
 
 function looksLikeStructuredPanePayload(text: string): boolean {
@@ -606,18 +673,24 @@ function reasoningCardMetadataContent(card: ChatStepCard): string {
 function reasoningCardContent(card: ChatStepCard): string {
   const record = structuredCardRecord(card);
   const data = paneRecordFromMaybeJson(record?.data);
+  // Prefer the full streamed chain-of-thought (content_snapshot/content/delta)
+  // over a possibly-short plain-text detail, so the Thinking step shows the real
+  // reasoning rather than a one-line phase summary. directDetail stays as a
+  // fallback for cards whose reasoning lives only in plain text.
+  const snapshot =
+    str(record?.content_snapshot, "") ||
+    str(data.content_snapshot, "") ||
+    str(record?.content, "") ||
+    str(data.content, "") ||
+    str(record?.content_delta, "") ||
+    str(data.content_delta, "");
+  if (snapshot.trim()) return snapshot;
   const directDetail =
     [card.rawDetailFull, card.detailFull].find(
       (value) => value.trim() && !looksLikeStructuredPanePayload(value),
     ) || "";
   if (directDetail) return directDetail;
   return (
-    str(record?.content_snapshot, "") ||
-    str(data.content_snapshot, "") ||
-    str(record?.content, "") ||
-    str(data.content, "") ||
-    str(record?.content_delta, "") ||
-    str(data.content_delta, "") ||
     card.rawDetailFull ||
     card.detailFull ||
     reasoningCardMetadataContent(card) ||
@@ -631,11 +704,22 @@ function reasoningCardContent(card: ChatStepCard): string {
   );
 }
 
+// Phases that denote genuine model chain-of-thought. A card only counts as
+// reasoning via the heuristic branch if its phase is one of these AND it carries
+// no tool/phase identity — so phase/tool steps (e.g. inbound_precheck) can never
+// be mistaken for reasoning just because their payload happens to carry content.
+const VISIBLE_REASONING_PHASES = new Set([
+  "model",
+  "model_summary",
+  "reasoning",
+  "reasoning_summary",
+]);
+
 function isReasoningOnlyCard(card: ChatStepCard): boolean {
   const record = structuredCardRecord(card);
   const data = paneRecordFromMaybeJson(record?.data);
   const kind = str(record?.kind, str(data.kind, "")).trim().toLowerCase();
-  const phase = str(record?.phase, str(data.phase, "")).trim();
+  const phase = str(record?.phase, str(data.phase, "")).trim().toLowerCase();
   const stepType = (card.stepType || "").trim().toLowerCase();
   const recordStepType = str(record?.step_type, str(data.step_type, ""))
     .trim()
@@ -647,17 +731,57 @@ function isReasoningOnlyCard(card: ChatStepCard): boolean {
   ) {
     return true;
   }
+  // A tool/phase step carries an identity (tool_name/name/file/path or a `stage`,
+  // e.g. inbound_precheck) — never reasoning, even if its payload has `content`.
+  const stage = str(record?.stage, str(data.stage, "")).trim();
+  const hasToolOrPhaseIdentity =
+    Boolean(str(record?.tool_name, "")) ||
+    Boolean(str(record?.name, "")) ||
+    Boolean(str(record?.file, "")) ||
+    Boolean(str(record?.path, "")) ||
+    Boolean(stage);
   return Boolean(
-    phase &&
-      record &&
-      !str(record.tool_name, "") &&
-      !str(record.name, "") &&
-      !str(record.file, "") &&
-      !str(record.path, "") &&
+    record &&
+      !hasToolOrPhaseIdentity &&
+      VISIBLE_REASONING_PHASES.has(phase) &&
       (str(record.content, "") ||
         str(record.content_delta, "") ||
         str(record.content_snapshot, "")),
   );
+}
+
+// A reasoning row only earns a place in the story when it carries actual
+// chain-of-thought. Placeholder steps whose entire body is empty or merely
+// restates the row's own label ("Thinking") are structural noise — they appear
+// while a reasoning stream is still warming up or when the runtime emits a
+// phase marker with no content. Filtering is content-based, so the same card
+// appears as soon as real reasoning text arrives.
+function reasoningCardHasMeaningfulContent(card: ChatStepCard): boolean {
+  const normalize = (value: string) =>
+    value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const body = normalize(reasoningCardContent(card));
+  if (!body) return false;
+  const label = normalize(card.label || card.rawTitle || card.stepType || "");
+  return body !== label;
+}
+
+// Wider than isReasoningOnlyCard: identifies every card that PRESENTS as a
+// "Thinking" row — including contentless phase markers and synthetic thinking
+// steps that the strict classifier (which requires content) misses. Cards with
+// a tool/stage identity are never reasoning-shaped.
+function isReasoningShapedCard(card: ChatStepCard): boolean {
+  if (isReasoningOnlyCard(card)) return true;
+  const stepType = (card.stepType || "").trim().toLowerCase();
+  if (stepType === "thinking" || stepType === "reasoning_delta") return true;
+  const record = structuredCardRecord(card);
+  const data = paneRecordFromMaybeJson(record?.data);
+  const phase = str(record?.phase, str(data.phase, "")).trim().toLowerCase();
+  const stage = str(record?.stage, str(data.stage, "")).trim();
+  const hasToolOrPhaseIdentity =
+    Boolean(str(record?.tool_name, "")) ||
+    Boolean(str(record?.name, "")) ||
+    Boolean(stage);
+  return !hasToolOrPhaseIdentity && VISIBLE_REASONING_PHASES.has(phase);
 }
 
 // The agent runtime wraps every progress / streaming step in an envelope
@@ -1937,7 +2061,15 @@ function ComputerPaneInner({
     () => activityCards.filter((card) => !reasoningCardIds.has(card.id)),
     [activityCards, reasoningCardIds],
   );
-  const navPool = useMemo(() => activityCards, [activityCards]);
+  const navPool = useMemo(
+    () =>
+      activityCards.filter(
+        (card) =>
+          !isReasoningShapedCard(card) ||
+          reasoningCardHasMeaningfulContent(card),
+      ),
+    [activityCards],
+  );
   const headerFilePath =
     followedLiveWritePath ||
     selectedDeployFilePath ||
@@ -1985,12 +2117,13 @@ function ComputerPaneInner({
     [primaryActivityCards, activeStepId],
   );
 
+  // Index of the pinned step (−1 in follow mode); used by progress + live-surface
+  // checks. The story is the navigation now, so there is no prev/next chrome.
   const activeIndex = useMemo(
-    () => (activeCard ? navPool.findIndex((c) => c.id === activeCard.id) : -1),
-    [navPool, activeCard],
+    () => (activeStepId != null ? navPool.findIndex((c) => c.id === activeStepId) : -1),
+    [navPool, activeStepId],
   );
-  const canPrev = activeIndex > 0;
-  const canNext = activeIndex >= 0 && activeIndex < navPool.length - 1;
+
   const view = activeCard ? pickComputerView(activeCard) : AGENTARK_RENDERERS.GENERIC;
   const activeCardIsReasoning = activeCard
     ? reasoningCardIds.has(activeCard.id) || isReasoningOnlyCard(activeCard)
@@ -2222,9 +2355,42 @@ function ComputerPaneInner({
           snippetPath || "Code",
         )
       : null;
+  const copyStepText = useCallback((text: string) => {
+    const value = (text || "").trim();
+    if (!value) return;
+    try {
+      void navigator.clipboard?.writeText(value);
+    } catch {
+      /* clipboard unavailable — ignore */
+    }
+  }, []);
+  // Scroll container for the console story; auto-follows the newest step while
+  // streaming and not pinned to a specific step.
+  const storyScrollRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (activeStepId != null || !isStreaming) return;
+    const el = storyScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    // Re-pin on streamed-text growth (reasoning/now-doing), not just new cards.
+  }, [
+    activeStepId,
+    isStreaming,
+    navPool.length,
+    reasoningPreview,
+    nowDoingLabel,
+    latestActivityCard?.detail,
+  ]);
+
+  // Activity is folded into the Console story; the pane is Console + Files only.
   const visibleTabs: ComputerPaneTab[] = hasFileTab
-    ? ["computer", "files", "activity"]
-    : ["computer", "activity"];
+    ? ["computer", "files"]
+    : ["computer"];
+  // Only treat the active step as "expanded" when it is genuinely in the pool, so
+  // expansion and the trailing live indicator stay mutually exclusive (never blank).
+  const storyExpandedId =
+    activeStepId != null && navPool.some((card) => card.id === activeStepId)
+      ? activeStepId
+      : null;
   const headerModeLabel =
     tab === "files" && hasFileTab
       ? "Live files"
@@ -2409,75 +2575,12 @@ function ComputerPaneInner({
             overflow: "hidden",
           }}
         >
-          <Stack
-            direction="row"
-            spacing={0.5}
-            className="computer-pane-nav"
-            sx={{ alignItems: "center" }}
-          >
-            <IconButton
-              size="small"
-              disabled={!canPrev}
-              aria-label="Previous artifact"
-              onClick={() => {
-                if (!canPrev) return;
-                setDeployFilePath(null);
-                onActivate(navPool[activeIndex - 1].id);
-              }}
-            >
-              <ChevronLeftRoundedIcon fontSize="small" />
-            </IconButton>
-            <Typography variant="caption" className="computer-pane-nav-pos">
-              {activeIndex >= 0 ? `${activeIndex + 1} / ${navPool.length}` : "working"}
-            </Typography>
-            <IconButton
-              size="small"
-              disabled={!canNext}
-              aria-label="Next artifact"
-              onClick={() => {
-                if (!canNext) return;
-                setDeployFilePath(null);
-                onActivate(navPool[activeIndex + 1].id);
-              }}
-            >
-              <ChevronRightRoundedIcon fontSize="small" />
-            </IconButton>
-            <Box sx={{ flex: 1 }} />
-            {isStreaming ? (
-              <Stack
-                direction="row"
-                spacing={0.4}
-                sx={{ alignItems: "center" }}
-                className="computer-pane-live"
-              >
-                <FiberManualRecordRoundedIcon
-                  fontSize="inherit"
-                  className="computer-pane-live-dot"
-                />
-                <Typography variant="caption" className="computer-pane-live-label">
-                  live
-                </Typography>
-              </Stack>
-            ) : null}
-            {activeStepId ? (
-              <button
-                type="button"
-                className="computer-pane-follow-button"
-                onClick={() => {
-                  setDeployFilePath(null);
-                  onActivate(null);
-                }}
-                title="Resume following the latest step"
-              >
-                Follow latest
-              </button>
-            ) : null}
-          </Stack>
           <Box
+            ref={storyScrollRef}
             className="computer-pane-stage"
             sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
           >
-            {!activeCard ? (
+            {navPool.length === 0 ? (
               isStreaming || latestActivityCard || reasoningPreview ? (
                 <WorkingView
                   phaseLabel={nowDoingLabel || "Working..."}
@@ -2493,44 +2596,100 @@ function ComputerPaneInner({
                   detail="When AgentArk runs a tool, its live output will land here."
                 />
               )
-            ) : activeCardIsReasoning ? (
-              <WorkingView
-                phaseLabel={activeCard.label || "Thinking"}
-                detail={activeCard.summary || activeCard.detail || ""}
-                startedAt={activeCard.time || startedAt}
-                reasoningPreview={reasoningCardContent(activeCard)}
-                reasoningPhase={reasoningCardPhase(activeCard)}
-                persisted
-              />
-            ) : activeCardHasDelegation ? (
-              <DelegationRunView
-                cards={
-                  delegationCardsForActiveRun.length > 0
-                    ? delegationCardsForActiveRun
-                    : [activeCard]
-                }
-                activeRunId={activeDelegationRunId}
-              />
             ) : (
-              <SurfaceRenderer
-                card={activeCard}
-                live={activeSurfaceLive}
-                snippetPath={activeFilePath || snippetPath}
-                snippetContent={activeFileContent}
-                workspaceFiles={workspaceFiles}
-                deployFilePath={null}
-                deployFileContent=""
-                deployFileCard={null}
-                deployFileLive={false}
-                onOpenDeployFile={(path) => {
-                  setUserPickedDeployFile(
-                    !filePathsMatch(path, liveWritePath || ""),
+              <div className="term-story">
+                {navPool.map((card) => {
+                  const expanded = storyExpandedId != null && card.id === storyExpandedId;
+                  const isReasoning = reasoningCardIds.has(card.id);
+                  const meta = storyGlyphMeta(card, isReasoning);
+                  const presentation = buildReadableToolPresentation(card);
+                  const lineLabel = card.label || presentation.title || "Step";
+                  const lineSub = isReasoning ? "" : storySubText(presentation, card);
+                  const copyText =
+                    presentation.body || card.detailFull || card.summary || lineLabel;
+                  return (
+                    <div key={card.id} className="term-story-item">
+                      <button
+                        type="button"
+                        className={`term-story-line is-${meta.tone}${expanded ? " is-active" : ""}`}
+                        aria-expanded={expanded}
+                        aria-label={lineLabel}
+                        onClick={() => onActivate(expanded ? null : card.id)}
+                      >
+                        <span className={`term-story-glyph tg-${meta.tone}`} aria-hidden="true">
+                          {meta.glyph}
+                        </span>
+                        <span className="term-story-main">
+                          <span className="term-story-label">{lineLabel}</span>
+                          {lineSub ? (
+                            <span className="term-story-sub"> · {truncateStorySub(lineSub)}</span>
+                          ) : null}
+                          <span className="term-story-caret" aria-hidden="true">
+                            {expanded ? "▾" : "▸"}
+                          </span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        className="term-story-copy"
+                        aria-label="Copy step output"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          copyStepText(copyText);
+                        }}
+                      >
+                        <ContentCopyRoundedIcon sx={{ fontSize: 13 }} />
+                      </button>
+                      {expanded ? (
+                        <div className="term-story-detail">
+                          {activeCardIsReasoning && activeCard ? (
+                            <WorkingView
+                              phaseLabel={activeCard.label || "Thinking"}
+                              detail={activeCard.summary || activeCard.detail || ""}
+                              startedAt={activeCard.time || startedAt}
+                              reasoningPreview={reasoningCardContent(activeCard)}
+                              reasoningPhase={reasoningCardPhase(activeCard)}
+                              persisted
+                            />
+                          ) : activeCardHasDelegation && activeCard ? (
+                            <DelegationRunView
+                              cards={
+                                delegationCardsForActiveRun.length > 0
+                                  ? delegationCardsForActiveRun
+                                  : [activeCard]
+                              }
+                              activeRunId={activeDelegationRunId}
+                            />
+                          ) : activeCard ? (
+                            <SurfaceRenderer
+                              card={activeCard}
+                              live={activeSurfaceLive}
+                              snippetPath={activeFilePath || snippetPath}
+                              snippetContent={activeFileContent}
+                              workspaceFiles={workspaceFiles}
+                              deployFilePath={null}
+                              deployFileContent=""
+                              deployFileCard={null}
+                              deployFileLive={false}
+                              onOpenDeployFile={(path) => {
+                                setUserPickedDeployFile(
+                                  !filePathsMatch(path, liveWritePath || ""),
+                                );
+                                setDeployFilePath(path);
+                                setTab("files");
+                                onActivate(null);
+                              }}
+                            />
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
                   );
-                  setDeployFilePath(path);
-                  setTab("files");
-                  onActivate(null);
-                }}
-              />
+                })}
+                {/* No trailing "now doing" panel: the story lines + the header
+                    status already convey the live run, and a pinned working
+                    block reads as a stray duplicate of the Thinking step. */}
+              </div>
             )}
           </Box>
         </Box>

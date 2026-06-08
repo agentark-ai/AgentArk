@@ -947,6 +947,195 @@
 .swarm-agent-update {
   line-height: 1.45 !important;
 }
+/* ── Console "story": narration-led terminal log of every step ──────────
+   Bright label / dim detail hierarchy, glyph-prefixed lines, click to expand
+   the step's detail inline. Reasoning collapsed by default. AgentArk tokens. */
+.computer-pane-stage .term-story {
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-mono);
+  padding: 6px 4px 10px;
+}
+.term-story-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+/* The line itself is the toggle <button>; the copy control is an absolutely
+   positioned sibling (not nested) to avoid interactive-in-interactive nesting. */
+.term-story-line {
+  appearance: none;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 7px 34px 7px 10px;
+  margin: 1px 0;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-family: var(--font-mono);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.term-story-line:hover {
+  background: var(--ui-rgba-255-255-255-020);
+}
+.term-story-line:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: -2px;
+}
+.term-story-line.is-active {
+  background: var(--ui-rgba-255-255-255-030);
+  box-shadow: inset 2px 0 0 var(--green);
+}
+.term-story-glyph {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-align: center;
+  line-height: 1.55;
+  user-select: none;
+}
+.term-story-glyph.tg-run {
+  color: var(--green);
+}
+.term-story-glyph.tg-info {
+  color: rgb(57, 208, 255);
+}
+.term-story-glyph.tg-ask {
+  color: var(--orange);
+}
+.term-story-glyph.tg-err {
+  color: var(--red);
+}
+.term-story-glyph.tg-reason {
+  color: var(--text-dim);
+}
+.term-story-main {
+  min-width: 0;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.term-story-label {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+.term-story-line.is-reason .term-story-label {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.term-story-sub {
+  color: var(--text-dim);
+  font-size: 0.76rem;
+}
+/* Disclosure caret: hidden by default for a clean log, revealed on
+   hover/focus/active (and always on reasoning) so the affordance matches the
+   unconditional aria-expanded without cluttering the resting view. */
+.term-story-caret {
+  margin-left: 6px;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.term-story-line:hover .term-story-caret,
+.term-story-line:focus-visible .term-story-caret,
+.term-story-line.is-active .term-story-caret,
+.term-story-line.is-reason .term-story-caret {
+  opacity: 0.8;
+}
+.term-story-copy {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.term-story-item:hover .term-story-copy,
+.term-story-item:focus-within .term-story-copy {
+  opacity: 1;
+  pointer-events: auto;
+}
+.term-story-copy:hover {
+  color: var(--green);
+  background: var(--ui-rgba-255-255-255-040);
+}
+.term-story-copy:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+  outline: 1px solid var(--green);
+}
+.term-story-detail {
+  margin: 2px 0 10px 8px;
+  padding: 6px 0 2px 22px;
+  border-left: 1px solid var(--surface-border);
+}
+/* The story line already names the step, so flatten the expanded surface: drop
+   the nested card boxes and the title headers they repeat 3x; keep the data
+   (key-value fields, body) and any pager/copy controls. */
+.term-story-detail .cview,
+.term-story-detail .cview-generic,
+.term-story-detail .cview-trace-shell,
+.term-story-detail .cview-generic-items,
+.term-story-detail .cview-generic-pager,
+.term-story-detail .cview-generic > .cview-generic-pager,
+.term-story-detail .cview-readable-payload {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
+.term-story-detail .cview-generic-head,
+.term-story-detail .cview-generic-page-title,
+.term-story-detail .cview-readable-head {
+  display: none;
+}
+.term-story-detail .cview-generic-page-head {
+  min-height: 0;
+  padding: 0 0 6px;
+  border: 0;
+  background: transparent;
+  justify-content: flex-end;
+}
+.term-story-detail .cview-readable-fields {
+  margin: 0;
+}
+/* Cap long reasoning/CoT inside an expanded step so it scrolls internally
+   instead of pushing the rest of the story off-screen (scoped to the story
+   expansion; the live right-pane stage is unaffected). The fade overlay assumes
+   an overflow:hidden parent, so hide it here where we scroll instead. */
+.term-story-detail .cview-working-preview,
+.term-story-detail .cview-working-preview pre,
+.term-story-detail .cview-trace-reasoning-text {
+  max-height: 320px;
+  overflow: auto;
+}
+.term-story-detail .cview-working-preview-fade {
+  display: none;
+}
+.term-story-now {
+  margin-top: 4px;
+  padding-top: 4px;
+}
+
 .term-text {
   color: var(--ui-rgba-180-220-200-700);
   word-break: break-word;

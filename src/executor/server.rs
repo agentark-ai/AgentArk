@@ -367,7 +367,7 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
         std::env::vars().collect(),
     );
     let mut runtime = ActionRuntime::new(&config.config_dir, &config.data_dir).await?;
-    if let Some(storage) = crate::core::config::global_settings_storage() {
+    if let Some(storage) = crate::core::runtime::config::global_settings_storage() {
         runtime.set_storage(storage);
     }
     match crate::identity::IdentityManager::load_or_create(&config.data_dir).await {
@@ -382,30 +382,33 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
             {
                 Ok(guard) => {
                     tracing::info!("Executor action security guard initialized");
-                    let guard = match crate::core::config::SecureConfigManager::new_with_data_dir(
-                        &config.config_dir,
-                        Some(&config.data_dir),
-                    )
-                    .and_then(|manager| manager.load())
-                    {
-                        Ok(agent_config) => match crate::core::LlmClient::new(&agent_config.llm) {
-                            Ok(llm) => guard.with_semantic_reviewer(llm),
-                            Err(error) => {
-                                tracing::warn!(
+                    let guard =
+                        match crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
+                            &config.config_dir,
+                            Some(&config.data_dir),
+                        )
+                        .and_then(|manager| manager.load())
+                        {
+                            Ok(agent_config) => {
+                                match crate::core::LlmClient::new(&agent_config.llm) {
+                                    Ok(llm) => guard.with_semantic_reviewer(llm),
+                                    Err(error) => {
+                                        tracing::warn!(
                                     "Executor semantic action reviewer unavailable: {} - user-added skills will remain blocked until a model is configured",
                                     error
                                 );
-                                guard
+                                        guard
+                                    }
+                                }
                             }
-                        },
-                        Err(error) => {
-                            tracing::warn!(
+                            Err(error) => {
+                                tracing::warn!(
                                 "Executor semantic action reviewer unavailable: {} - user-added skills will remain blocked until settings can be loaded",
                                 error
                             );
-                            guard
-                        }
-                    };
+                                guard
+                            }
+                        };
                     runtime.set_action_guard(Arc::new(guard));
                 }
                 Err(error) => {

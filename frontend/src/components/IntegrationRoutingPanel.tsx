@@ -62,7 +62,7 @@ export function IntegrationRoutingPanel({ autoRefresh }: { autoRefresh: boolean 
 
   const routingQ = useQuery({
     queryKey: ["gateway-routing"],
-    queryFn: () => api.rawGet("/integrations/routing"),
+    queryFn: () => api.getRouting(),
     refetchInterval: interval
   });
   const channelsQ = useQuery({
@@ -198,9 +198,9 @@ export function IntegrationRoutingPanel({ autoRefresh }: { autoRefresh: boolean 
         notes: str(merged.description, str(merged.notes)) || undefined
       };
       if (routeId) {
-        await api.rawPut(`/integrations/routing/rules/${encodeURIComponent(routeId)}`, payloadForSave);
+        await api.updateRoutingRule(routeId, payloadForSave);
       } else {
-        await api.rawPost("/integrations/routing/rules", payloadForSave);
+        await api.createRoutingRule(payloadForSave);
       }
     },
     onSuccess: async (_, partial) => {
@@ -211,7 +211,7 @@ export function IntegrationRoutingPanel({ autoRefresh }: { autoRefresh: boolean 
   });
 
   const deleteRoute = useMutation({
-    mutationFn: (routeId: string) => api.rawDelete(`/integrations/routing/rules/${encodeURIComponent(routeId)}`),
+    mutationFn: (routeId: string) => api.deleteRoutingRule(routeId),
     onSuccess: async () => {
       await refresh();
       setNotice({ kind: "success", text: "Route deleted." });
@@ -220,7 +220,7 @@ export function IntegrationRoutingPanel({ autoRefresh }: { autoRefresh: boolean 
   });
 
   const createGroup = useMutation({
-    mutationFn: (name: string) => api.rawPost("/integrations/routing/broadcast-groups", { name, targets: [] }),
+    mutationFn: (name: string) => api.createBroadcastGroup({ name, targets: [] }),
     onSuccess: async () => {
       await refresh();
       setNotice({ kind: "success", text: "Broadcast group created." });

@@ -1231,9 +1231,9 @@
 
 .live-console-empty {
   padding: 14px;
-  border: 1px dashed var(--ui-rgba-104-162-221-220);
+  border: 1px dashed rgba(255, 255, 255, 0.16);
   border-radius: 8px;
-  background: var(--ui-rgba-8-17-31-660);
+  background: rgba(16, 18, 21, 0.66);
 }
 
 .live-console-empty-title {
@@ -1908,14 +1908,14 @@
 }
 
 .diagnostics-dialog-close {
-  color: var(--ui-rgba-178-214-245-780) !important;
-  background: var(--ui-rgba-8-17-31-560) !important;
-  border: 1px solid var(--ui-rgba-95-154-214-160) !important;
+  color: rgba(200, 208, 216, 0.85) !important;
+  background: rgba(20, 23, 27, 0.6) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
 }
 
 .diagnostics-dialog-close:hover {
-  background: var(--ui-rgba-13-29-50-860) !important;
-  color: var(--ui-rgba-224-239-255-960) !important;
+  background: rgba(34, 40, 49, 0.86) !important;
+  color: rgba(243, 246, 248, 0.96) !important;
 }
 
 .diagnostics-dialog-actions {
@@ -1978,7 +1978,7 @@
 
 .diagnostics-subcard {
   padding: 12px;
-  border: 1px solid var(--ui-rgba-95-154-214-140);
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
   background: var(--ui-rgba-255-255-255-025);
 }
@@ -1995,11 +1995,11 @@
 
 .diagnostics-step-item {
   padding: 12px 14px;
-  border: 1px solid var(--ui-rgba-95-154-214-120);
+  border: 1px solid rgba(255, 255, 255, 0.07);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, var(--ui-rgba-7-17-32-880), var(--ui-rgba-5-11-22-820)),
-    radial-gradient(circle at top left, var(--ui-rgba-56-190-255-050), transparent 34%);
+    linear-gradient(180deg, rgba(16, 18, 21, 0.88), rgba(11, 12, 15, 0.82)),
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.03), transparent 34%);
 }
 
 .diagnostics-step-head {
@@ -2032,9 +2032,9 @@
   word-break: break-word;
   font-size: 11px;
   border-radius: 8px;
-  border: 1px solid var(--ui-rgba-95-154-214-140);
-  background: var(--ui-rgba-3-8-18-780);
-  color: var(--ui-rgba-202-227-252-920);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(10, 11, 13, 0.8);
+  color: rgba(226, 230, 234, 0.92);
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   overflow: auto;
 }
@@ -2148,7 +2148,7 @@
   top: 0;
   bottom: 0;
   width: 2px;
-  background: var(--ui-rgba-95-154-214-140);
+  background: rgba(255, 255, 255, 0.14);
   border-radius: 1px;
 }
 

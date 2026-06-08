@@ -14,9 +14,14 @@ import {
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import ReactECharts from "echarts-for-react";
+import { forceCollide, forceManyBody, forceX, forceY } from "d3-force";
 import { Check, RefreshCw, Search, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ForceGraph2D, {
+  type ForceGraphMethods,
+  type LinkObject,
+  type NodeObject,
+} from "react-force-graph-2d";
 import { api } from "../../api/client";
 import { humanizeMachineLabel } from "../../lib/displayLabels";
 import {
@@ -34,14 +39,37 @@ import { asRecord, errMessage, num, str, type JsonRecord } from "./pageHelpers";
 const GRAPH_MEMORY_STATUSES = ["active", "stale", "deprecated"];
 const GRAPH_RELATION_STATUSES = ["candidate", "confirmed"];
 
+const TWO_PI = Math.PI * 2;
+
+// Node fields we derive once at merge time and stash on the simulation object so
+// the per-frame paint never recomputes them.
+type MemoryNodeExtra = MemoryGraphNode & {
+  __color?: string;
+  __r?: number;
+  __label?: string;
+  __degree?: number;
+};
+
+// The simulation augments these objects in place with x/y/vx/vy/fx/fy.
+type GNode = NodeObject<MemoryNodeExtra>;
+type GLink = LinkObject<MemoryNodeExtra, MemoryGraphEdge>;
+
 type MemoryGraphPanelProps = {
   focusMemoryId?: string | null;
 };
 
-type ChartClickParams = {
-  dataType?: string;
-  data?: unknown;
-};
+function clamp(value: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, value));
+}
+
+// A link endpoint is an id string before the first tick, a resolved node object after.
+function idOf(endpoint: unknown): string {
+  if (endpoint && typeof endpoint === "object") {
+    const id = (endpoint as { id?: string | number }).id;
+    return id == null ? "" : String(id);
+  }
+  return endpoint == null ? "" : String(endpoint);
+}
 
 function graphNodeCategory(node: MemoryGraphNode): string {
   const type = str(node.node_type, "memory");
@@ -57,6 +85,11 @@ function graphNodeSize(node: MemoryGraphNode): number {
   const confidence = num(node.confidence, 0.7);
   const support = Math.min(5, Math.max(0, num(node.support_count, 0)));
   return 15 + confidence * 8 + support;
+}
+
+// Convert the legacy symbol diameter into a force-graph world-unit radius.
+function nodeRadius(node: MemoryGraphNode): number {
+  return graphNodeSize(node) / 2.6;
 }
 
 function graphNodeColor(node: MemoryGraphNode): string {
@@ -107,6 +140,12 @@ function inspectorEvidence(edge: MemoryGraphEdge): JsonRecord[] {
   const values = Array.isArray(metadata.evidence) ? metadata.evidence : [];
   return values.map(asRecord).filter((item) => Object.keys(item).length > 0);
 }
+
+const GRAPH_LEGEND: Array<{ label: string; color: string }> = [
+  { label: "Memory", color: "#6ea8ff" },
+  { label: "Entity", color: "#25b99a" },
+  { label: "Source", color: "#a8b0b8" },
+];
 
 export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProps) {
   const queryClient = useQueryClient();
@@ -161,115 +200,311 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
   const nodes = payload.nodes || [];
   const edges = payload.edges || [];
   const summary = memoryGraphVisibleSummary(payload);
-  const inputSx = {
-    height: 34,
-    borderRadius: 1,
-    border: "1px solid rgba(148, 163, 184, 0.26)",
-    background: "rgba(15, 23, 32, 0.72)",
-    color: "text.primary",
-    px: 1,
-    font: "inherit",
-    fontSize: 13,
-  } as const;
 
-  const option = useMemo(() => {
-    const categoriesForChart = [
-      { name: "Memory" },
-      { name: "Entity" },
-      { name: "Source" },
-    ];
-    const data = nodes.map((node) => ({
-      ...node,
-      name: str(node.label, node.id),
-      value: str(node.detail, ""),
-      category: categoriesForChart.findIndex(
-        (category) => category.name === graphNodeCategory(node),
-      ),
-      symbolSize: graphNodeSize(node),
-      itemStyle: { color: graphNodeColor(node) },
-      label: {
-        show: Boolean(node.pinned || node.node_type === "entity"),
-      },
-    }));
-    const links = edges.map((edge) => ({
-      ...edge,
-      source: edge.source,
-      target: edge.target,
-      value: memoryGraphEdgeLabel(edge),
-      lineStyle: {
-        color: edgeColor(edge),
-        width: edge.edge_type === "knowledge_relation" ? 1.5 : 0.85,
-        opacity: edge.semantic ? 0.32 : 0.46,
-        curveness: edge.edge_type === "knowledge_relation" ? 0.12 : 0.04,
-      },
-    }));
-    return {
-      backgroundColor: "transparent",
-      animationDurationUpdate: 350,
-      tooltip: {
-        trigger: "item",
-        backgroundColor: "rgba(15, 18, 22, 0.96)",
-        borderColor: "rgba(148, 163, 184, 0.24)",
-        textStyle: { color: "#f8fafc", fontSize: 12 },
-        formatter: graphTooltip,
-      },
-      legend: [
-        {
-          top: 2,
-          right: 8,
-          itemWidth: 8,
-          itemHeight: 8,
-          textStyle: { color: "#b8c3cf", fontSize: 11 },
-          data: categoriesForChart.map((category) => category.name),
-        },
-      ],
-      series: [
-        {
-          type: "graph",
-          layout: "force",
-          roam: true,
-          draggable: false,
-          top: 28,
-          bottom: 8,
-          left: 8,
-          right: 8,
-          scaleLimit: { min: 0.35, max: 5 },
-          categories: categoriesForChart,
-          data,
-          links,
-          label: {
-            position: "right",
-            color: "#edf2f7",
-            fontSize: 10,
-            overflow: "truncate",
-            width: 160,
-          },
-          edgeLabel: { show: false },
-          focusNodeAdjacency: true,
-          force: {
-            repulsion: 130,
-            edgeLength: [58, 132],
-            gravity: 0.06,
-            friction: 0.58,
-          },
-          emphasis: {
-            focus: "adjacency",
-            label: { show: true },
-            itemStyle: { borderColor: "#f8fafc", borderWidth: 1.5 },
-            lineStyle: { opacity: 0.9, width: 1.6 },
-          },
-          blur: {
-            itemStyle: { opacity: 0.28 },
-            lineStyle: { opacity: 0.06 },
-          },
-          itemStyle: {
-            borderColor: "#0f1720",
-            borderWidth: 1.2,
-          },
-        },
-      ],
+  // --- Force-graph plumbing (refs so hover/selection never trigger React re-renders) ---
+  const fgRef = useRef<ForceGraphMethods<GNode, GLink> | undefined>(undefined);
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  const nodesByIdRef = useRef<Map<string, GNode>>(new Map());
+  const neighborsRef = useRef<Map<string, Set<string>>>(new Map());
+  const linksByNodeRef = useRef<Map<string, Set<GLink>>>(new Map());
+  const hoverRef = useRef<string | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  const highlightNodesRef = useRef<Set<string>>(new Set());
+  const highlightLinksRef = useRef<Set<GLink>>(new Set());
+  const didFitRef = useRef(false);
+  const prevIdsKeyRef = useRef("");
+  const prevEdgeKeyRef = useRef("");
+  const lastGraphDataRef = useRef<{ nodes: GNode[]; links: GLink[] } | null>(null);
+
+  // Keep the paint callback's view of the selection current without re-creating it.
+  useEffect(() => {
+    selectedIdRef.current = selectedNode?.id ?? null;
+  }, [selectedNode]);
+
+  // Build graphData by MERGING into the existing node objects: the engine mutates
+  // x/y/vx/vy in place and diffs by identity, so reusing objects keeps positions
+  // stable across refetches instead of re-laying-out the whole graph every poll.
+  const graphData = useMemo(() => {
+    const byId = nodesByIdRef.current;
+    const incomingIds = new Set<string>();
+
+    const degree = new Map<string, number>();
+    const links: GLink[] = [];
+    for (const edge of edges) {
+      const s = edge.source;
+      const t = edge.target;
+      if (!s || !t) continue;
+      degree.set(s, (degree.get(s) ?? 0) + 1);
+      degree.set(t, (degree.get(t) ?? 0) + 1);
+      links.push({ ...edge } as GLink);
+    }
+
+    const outNodes: GNode[] = [];
+    for (const node of nodes) {
+      incomingIds.add(node.id);
+      let obj = byId.get(node.id);
+      if (obj) {
+        Object.assign(obj, node); // refresh payload fields, preserve x/y/vx/vy
+      } else {
+        obj = { ...node } as GNode;
+        byId.set(node.id, obj);
+      }
+      const rawLabel = str(node.label, node.id);
+      obj.__color = graphNodeColor(node);
+      obj.__r = nodeRadius(node);
+      // Cap the on-canvas label length (the previous renderer truncated to ~160px).
+      // The full text still shows in the hover tooltip and the inspector panel.
+      obj.__label = rawLabel.length > 30 ? `${rawLabel.slice(0, 29)}…` : rawLabel;
+      obj.__degree = degree.get(node.id) ?? 0;
+      outNodes.push(obj);
+    }
+    // Drop nodes that left the result so the cache can't grow unbounded or revive stale positions.
+    for (const id of Array.from(byId.keys())) {
+      if (!incomingIds.has(id)) byId.delete(id);
+    }
+
+    const idKey = outNodes
+      .map((n) => String(n.id))
+      .sort()
+      .join("|");
+    const edgeKey = links
+      .map((l) => `${idOf(l.source)}>${idOf(l.target)}:${str(l.edge_type, "")}`)
+      .sort()
+      .join("|");
+
+    // Same node + edge set as last time (a field-only refresh): return the SAME
+    // graphData reference so the engine does not re-heat — no jitter, the camera
+    // holds, and the existing adjacency/highlight Sets stay valid (they key links
+    // by identity). The node objects were already refreshed in place above.
+    if (
+      lastGraphDataRef.current &&
+      idKey === prevIdsKeyRef.current &&
+      edgeKey === prevEdgeKeyRef.current
+    ) {
+      return lastGraphDataRef.current;
+    }
+
+    // Structural change (mode/focus switch, added/removed memory or relation):
+    // rebuild adjacency, allow exactly one re-fit, and publish a fresh reference
+    // (which intentionally lets the engine re-heat and re-settle).
+    const neighbors = new Map<string, Set<string>>();
+    const linksByNode = new Map<string, Set<GLink>>();
+    const bucket = <V,>(map: Map<string, Set<V>>, key: string): Set<V> => {
+      let set = map.get(key);
+      if (!set) {
+        set = new Set<V>();
+        map.set(key, set);
+      }
+      return set;
     };
-  }, [edges, nodes]);
+    for (const link of links) {
+      const s = idOf(link.source);
+      const t = idOf(link.target);
+      if (!s || !t) continue;
+      bucket(neighbors, s).add(t);
+      bucket(neighbors, t).add(s);
+      bucket(linksByNode, s).add(link);
+      bucket(linksByNode, t).add(link);
+    }
+    neighborsRef.current = neighbors;
+    linksByNodeRef.current = linksByNode;
+
+    prevIdsKeyRef.current = idKey;
+    prevEdgeKeyRef.current = edgeKey;
+    didFitRef.current = false;
+
+    const next = { nodes: outNodes, links };
+    lastGraphDataRef.current = next;
+    return next;
+  }, [nodes, edges]);
+
+  // Callback ref: (re)attach the ResizeObserver every time the canvas wrapper
+  // mounts. It unmounts on the empty state, so a one-time effect would observe a
+  // detached node forever and never re-observe the remounted div. The canvas needs
+  // explicit pixel width/height — it does not auto-fit its parent.
+  const setWrap = useCallback((el: HTMLDivElement | null) => {
+    observerRef.current?.disconnect();
+    if (!el) {
+      observerRef.current = null;
+      setSize({ width: 0, height: 0 });
+      return;
+    }
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setSize((prev) =>
+        prev.width === width && prev.height === height ? prev : { width, height },
+      );
+    });
+    observer.observe(el);
+    observerRef.current = observer;
+  }, []);
+
+  // Configure the simulation once the imperative handle exists (re-applied on resize).
+  useEffect(() => {
+    const fg = fgRef.current;
+    if (!fg) return;
+    const setForce = fg.d3Force.bind(fg) as (name: string, force?: unknown) => unknown;
+    // Repulsion is the spread driver; cap its range so far nodes stay cheap.
+    setForce("charge", forceManyBody<GNode>().strength(-140).distanceMax(500).theta(0.9));
+    // Keep d3's degree-aware default link strength (1/min(deg)) so hubs don't explode — only set distance.
+    const linkForce = fg.d3Force("link") as { distance?: (d: number) => unknown } | undefined;
+    linkForce?.distance?.(48);
+    // Positioning forces toward origin (viewport centre) give a bounded, airy cloud.
+    setForce("center", null);
+    setForce("x", forceX<GNode>(0).strength(0.06));
+    setForce("y", forceY<GNode>(0).strength(0.06));
+    setForce(
+      "collide",
+      forceCollide<GNode>()
+        .radius((n) => (n.__r ?? 6) + 2)
+        .strength(0.85),
+    );
+    // The canvas dimensions changed, so re-fit once after this reheat settles
+    // (onEngineStop is otherwise guarded against re-fitting and would leave the
+    // graph framed to the old size).
+    didFitRef.current = false;
+    fg.d3ReheatSimulation();
+  }, [size.width, size.height]);
+
+  // Pause the render loop on unmount so it can't leak a rAF after route change.
+  useEffect(() => {
+    return () => {
+      (fgRef.current as { pauseAnimation?: () => void } | undefined)?.pauseAnimation?.();
+    };
+  }, []);
+
+  const paintNode = useCallback(
+    (node: GNode, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const x = node.x ?? 0;
+      const y = node.y ?? 0;
+      const r = node.__r ?? 6;
+      const baseColor = node.__color ?? "#6ea8ff";
+      const selId = selectedIdRef.current;
+      const isSel = selId != null && String(node.id) === selId;
+      const hovActive = hoverRef.current != null;
+      const inHot = highlightNodesRef.current.has(String(node.id));
+      // The active selection stays fully lit even while hovering an unrelated node.
+      const isHot = !hovActive || inHot || isSel;
+
+      ctx.save();
+      ctx.globalAlpha = isHot ? 1 : 0.12;
+      const glow = hovActive && inHot;
+      if (glow) {
+        ctx.shadowColor = baseColor;
+        ctx.shadowBlur = (isSel ? 14 : 9) / globalScale;
+      }
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, TWO_PI);
+      ctx.fillStyle = baseColor;
+      ctx.fill();
+      // Always clear the shadow before stroke/label so it can't bleed into the next node.
+      ctx.shadowBlur = 0;
+      ctx.shadowColor = "transparent";
+      ctx.lineWidth = 1.2 / globalScale;
+      ctx.strokeStyle = "rgba(15,23,32,0.9)";
+      ctx.stroke();
+
+      if (isSel) {
+        ctx.beginPath();
+        ctx.arc(x, y, r * 1.5, 0, TWO_PI);
+        ctx.lineWidth = 1.5 / globalScale;
+        ctx.strokeStyle = "#78f2b0";
+        ctx.stroke();
+      }
+
+      const deg = node.__degree ?? 0;
+      const degreeBoost = Math.min(deg / 10, 1);
+      const effThreshold = 1.6 * (1 - 0.6 * degreeBoost); // hubs label sooner
+      const alwaysLabel = Boolean(node.pinned) || node.node_type === "entity";
+      let labelAlpha: number;
+      if (isSel || (isHot && hovActive)) labelAlpha = 1;
+      else if (alwaysLabel) labelAlpha = 1;
+      else labelAlpha = clamp((globalScale - effThreshold) / 0.8, 0, 1);
+
+      if (labelAlpha > 0.02 && isHot && node.__label) {
+        const fontSize = 11 / globalScale;
+        ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.globalAlpha = labelAlpha;
+        ctx.fillStyle = "#edf2f7";
+        ctx.fillText(node.__label, x, y + r + 2 / globalScale);
+      }
+      ctx.restore();
+    },
+    [],
+  );
+
+  const paintPointerArea = useCallback(
+    (node: GNode, color: string, ctx: CanvasRenderingContext2D) => {
+      const x = node.x ?? 0;
+      const y = node.y ?? 0;
+      const r = (node.__r ?? 6) + 2;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, TWO_PI);
+      ctx.fill();
+    },
+    [],
+  );
+
+  const linkColorFn = useCallback((link: GLink) => {
+    if (hoverRef.current != null && !highlightLinksRef.current.has(link)) {
+      return "rgba(140,160,200,0.06)";
+    }
+    return edgeColor(link as unknown as MemoryGraphEdge);
+  }, []);
+
+  const linkWidthFn = useCallback((link: GLink) => {
+    const base = link.edge_type === "knowledge_relation" ? 1.5 : 0.85;
+    return highlightLinksRef.current.has(link) ? base + 1.5 : base;
+  }, []);
+
+  const linkCurvatureFn = useCallback(
+    (link: GLink) => (link.edge_type === "knowledge_relation" ? 0.12 : 0.04),
+    [],
+  );
+
+  const handleNodeHover = useCallback((node: GNode | null) => {
+    const hot = highlightNodesRef.current;
+    const hotLinks = highlightLinksRef.current;
+    hot.clear();
+    hotLinks.clear();
+    if (node && node.id != null) {
+      const id = String(node.id);
+      hot.add(id);
+      neighborsRef.current.get(id)?.forEach((n) => hot.add(n));
+      linksByNodeRef.current.get(id)?.forEach((l) => hotLinks.add(l));
+      hoverRef.current = id;
+    } else {
+      hoverRef.current = null;
+    }
+  }, []);
+
+  const handleNodeClick = useCallback((node: GNode) => {
+    setSelectedNode(node as unknown as MemoryGraphNode);
+    setSelectedEdge(null);
+  }, []);
+
+  const handleLinkClick = useCallback((link: GLink) => {
+    setSelectedEdge(link as unknown as MemoryGraphEdge);
+    setSelectedNode(null);
+  }, []);
+
+  // Release the drag pin so the node eases back into a physics-natural spot.
+  const handleNodeDragEnd = useCallback((node: GNode) => {
+    node.fx = undefined;
+    node.fy = undefined;
+  }, []);
+
+  const handleEngineStop = useCallback(() => {
+    if (!didFitRef.current) {
+      didFitRef.current = true;
+      fgRef.current?.zoomToFit(400, 40);
+    }
+  }, []);
 
   const relationId = str(asRecord(selectedEdge?.metadata).relation_id, "");
   const evidence = selectedEdge ? inspectorEvidence(selectedEdge) : [];
@@ -300,7 +535,17 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
               value={focusId}
               onChange={(event) => setFocusId(event.currentTarget.value)}
               placeholder="Paste memory id"
-              sx={{ ...inputSx, minWidth: 240 }}
+              sx={{
+                height: 34,
+                borderRadius: 1,
+                border: "1px solid rgba(148, 163, 184, 0.26)",
+                background: "rgba(15, 23, 32, 0.72)",
+                color: "text.primary",
+                px: 1,
+                font: "inherit",
+                fontSize: 13,
+                minWidth: 240,
+              }}
             />
           ) : null}
           <Tooltip title="Show embedding-nearby memories">
@@ -328,6 +573,7 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
         <Stack direction={{ xs: "column", lg: "row" }} spacing={1.25}>
           <Box
             sx={{
+              position: "relative",
               minHeight: { xs: 520, lg: 640 },
               height: { xs: 520, lg: 640 },
               flex: 1,
@@ -351,24 +597,70 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
                 <Typography variant="body2">No memories to show yet.</Typography>
               </Stack>
             ) : (
-              <ReactECharts
-                option={option}
-                style={{ height: "100%", width: "100%" }}
-                notMerge
-                lazyUpdate
-                onEvents={{
-                  click: (params: ChartClickParams) => {
-                    const data = asRecord(params.data);
-                    if (params.dataType === "edge") {
-                      setSelectedEdge(data as MemoryGraphEdge);
-                      setSelectedNode(null);
-                    } else {
-                      setSelectedNode(data as MemoryGraphNode);
-                      setSelectedEdge(null);
-                    }
-                  },
-                }}
-              />
+              <div ref={setWrap} style={{ position: "absolute", inset: 0 }}>
+                <Stack
+                  direction="row"
+                  spacing={1.25}
+                  sx={{
+                    position: "absolute",
+                    top: 8,
+                    right: 12,
+                    zIndex: 2,
+                    pointerEvents: "none",
+                    alignItems: "center",
+                  }}
+                >
+                  {GRAPH_LEGEND.map((entry) => (
+                    <Stack
+                      key={entry.label}
+                      direction="row"
+                      spacing={0.5}
+                      sx={{ alignItems: "center" }}
+                    >
+                      <Box
+                        sx={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: "50%",
+                          background: entry.color,
+                        }}
+                      />
+                      <Typography variant="caption" sx={{ color: "#b8c3cf", fontSize: 11 }}>
+                        {entry.label}
+                      </Typography>
+                    </Stack>
+                  ))}
+                </Stack>
+                {size.width > 0 && size.height > 0 ? (
+                  <ForceGraph2D<MemoryNodeExtra, MemoryGraphEdge>
+                    ref={fgRef}
+                    width={size.width}
+                    height={size.height}
+                    graphData={graphData}
+                    backgroundColor="rgba(0,0,0,0)"
+                    nodeCanvasObject={paintNode}
+                    nodeCanvasObjectMode={() => "replace"}
+                    nodePointerAreaPaint={paintPointerArea}
+                    nodeLabel={(node: GNode) => graphTooltip({ data: node })}
+                    linkLabel={(link: GLink) => graphTooltip({ dataType: "edge", data: link })}
+                    linkColor={linkColorFn}
+                    linkWidth={linkWidthFn}
+                    linkCurvature={linkCurvatureFn}
+                    linkDirectionalParticles={0}
+                    onNodeHover={handleNodeHover}
+                    onNodeClick={handleNodeClick}
+                    onLinkClick={handleLinkClick}
+                    onNodeDragEnd={handleNodeDragEnd}
+                    onEngineStop={handleEngineStop}
+                    cooldownTicks={120}
+                    d3VelocityDecay={0.4}
+                    d3AlphaDecay={0.0182}
+                    minZoom={0.1}
+                    maxZoom={8}
+                    autoPauseRedraw={false}
+                  />
+                ) : null}
+              </div>
             )}
           </Box>
 

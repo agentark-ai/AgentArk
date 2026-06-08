@@ -32,6 +32,22 @@ function isEchartsVendor(id: string): boolean {
   );
 }
 
+function isForceGraphVendor(id: string): boolean {
+  const normalized = normalizeModuleId(id);
+  return (
+    normalized.includes("/react-force-graph-2d/") ||
+    normalized.includes("/force-graph/") ||
+    normalized.includes("/d3-force/") ||
+    normalized.includes("/d3-quadtree/") ||
+    normalized.includes("/d3-dispatch/") ||
+    normalized.includes("/d3-timer/") ||
+    normalized.includes("/d3-binarytree/") ||
+    normalized.includes("/d3-zoom/") ||
+    normalized.includes("/d3-drag/") ||
+    normalized.includes("/d3-selection/")
+  );
+}
+
 export default defineConfig({
   plugins: [react()],
   build: {
@@ -62,9 +78,20 @@ export default defineConfig({
               priority: 10,
               minSize: 0,
             },
+            {
+              name: "vendor-forcegraph",
+              test: (id: string) => isNodeModule(id) && isForceGraphVendor(id),
+              priority: 10,
+              minSize: 0,
+            },
           ],
         },
       },
     },
+  },
+  optimizeDeps: {
+    // Pre-bundle the canvas force-graph + d3-* (CommonJS) dependency chain into a
+    // single ESM module so the dev server doesn't choke on the interop seam.
+    include: ["react-force-graph-2d"],
   },
 });

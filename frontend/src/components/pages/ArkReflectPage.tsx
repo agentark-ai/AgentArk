@@ -48,6 +48,15 @@ import {
 import { humanizeStatusLabel } from "../../lib/displayLabels";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { asRecord, errMessage, num, pickRecords, str } from "./pageHelpers";
+import {
+  followupHasSourceEvidence as reflectFollowupHasSourceEvidence,
+  isOpportunitySettlementActive,
+  isDisplayableOpportunity as reflectIsDisplayableOpportunity,
+  latestDevelopmentSummary as reflectLatestDevelopmentSummary,
+  latestUpdateTitle as reflectLatestUpdateTitle,
+  shouldPollForOpportunitySettlement,
+  shouldStartOpportunitySettlementPoll,
+} from "./arkReflectOpportunityHelpers";
 
 type ReflectPageProps = {
   autoRefresh: boolean;
@@ -132,6 +141,7 @@ type ReflectSuggestedFollowup = {
   latest_summary?: string | null;
   latest_summary_generated_at?: string | null;
   latest_summary_error?: string | null;
+  latest_summary_evidence_supported?: boolean | null;
   feedback?: ReflectFollowupFeedbackState | null;
   feedback_keys: string[];
 };
@@ -165,6 +175,8 @@ type ChatPendingLaunch = {
 
 const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
 const OPPORTUNITY_PAGE_SIZE = 6;
+const OPPORTUNITY_SETTLE_POLL_MS = 5000;
+const OPPORTUNITY_SETTLE_WINDOW_MS = 90000;
 const TOPIC_PAGE_SIZE = 6;
 
 type ReflectResponse = {
@@ -231,17 +243,17 @@ const PERIOD_OPTIONS: { value: ReflectPeriod; label: string }[] = [
 ];
 
 const SOURCE_DISPLAY: Record<string, { label: string; group: string; color: string }> = {
-  conversation: { label: "Chat", group: "Conversation work", color: "#78F2B0" },
-  orbit_chat: { label: "ArkOrbit", group: "Orbit conversations", color: "#B7A7FF" },
-  experience_item: { label: "Memory", group: "What AgentArk learned", color: "#21B573" },
-  procedural_pattern: { label: "Workflows", group: "Working patterns", color: "#E6A93D" },
-  app: { label: "Apps", group: "Apps built", color: "#00A8A8" },
-  goal: { label: "Goals", group: "Goals and progress", color: "#FF7A45" },
-  watcher: { label: "Watchers", group: "Background watchers", color: "#D94F70" },
-  sentinel: { label: "Sentinel", group: "Safety and checks", color: "#A96DFF" },
-  arkpulse: { label: "Pulse", group: "System health", color: "#78F2B0" },
-  arkevolve: { label: "Evolve", group: "Agent improvements", color: "#C58A00" },
-  llm_usage: { label: "Usage", group: "Agent usage", color: "#C8D8C9" },
+  conversation: { label: "Chat", group: "Conversation work", color: "#B7BCC2" },
+  orbit_chat: { label: "ArkOrbit", group: "Orbit conversations", color: "#AAB0B7" },
+  experience_item: { label: "Memory", group: "What AgentArk learned", color: "#9EA5AC" },
+  procedural_pattern: { label: "Workflows", group: "Working patterns", color: "#C1C5CA" },
+  app: { label: "Apps", group: "Apps built", color: "#949BA3" },
+  goal: { label: "Goals", group: "Goals and progress", color: "#A5ABB2" },
+  watcher: { label: "Watchers", group: "Background watchers", color: "#868E96" },
+  sentinel: { label: "Sentinel", group: "Safety and checks", color: "#9AA1A9" },
+  arkpulse: { label: "Pulse", group: "System health", color: "#AEB4BB" },
+  arkevolve: { label: "Evolve", group: "Agent improvements", color: "#A1A8AF" },
+  llm_usage: { label: "Usage", group: "Agent usage", color: "#C9CDD2" },
 };
 
 const SOURCE_ORDER = [
@@ -396,6 +408,10 @@ function asSuggestedFollowup(value: unknown): ReflectSuggestedFollowup | null {
     latest_summary: str(raw.latest_summary, "") || null,
     latest_summary_generated_at: str(raw.latest_summary_generated_at, "") || null,
     latest_summary_error: str(raw.latest_summary_error, "") || null,
+    latest_summary_evidence_supported:
+      typeof raw.latest_summary_evidence_supported === "boolean"
+        ? raw.latest_summary_evidence_supported
+        : null,
     feedback: asFollowupFeedback(raw.feedback),
     feedback_keys: Array.isArray(raw.feedback_keys)
       ? raw.feedback_keys.map((key) => String(key).trim()).filter(Boolean)
@@ -432,7 +448,7 @@ function asReflectCluster(value: unknown): ReflectCluster | null {
     unit_count: num(raw.unit_count, 0),
     message_count: num(raw.message_count, 0),
     source_mix,
-    color: str(raw.color, "#78F2B0"),
+    color: str(raw.color, "#AEB4BB"),
     related_history: asRelatedHistory(raw.related_history),
     units: pickRecords(raw, "units")
       .map(asReflectUnit)
@@ -713,12 +729,11 @@ function clusterHasUserFacingSignal(cluster: ReflectCluster): boolean {
 }
 
 function followupHasSourceEvidence(item: ReflectSuggestedFollowup): boolean {
-  return Boolean(item.latest_summary?.trim()) || item.search_results.length > 0;
+  return reflectFollowupHasSourceEvidence(item);
 }
 
 function isDisplayableOpportunity(item: ReflectSuggestedFollowup): boolean {
-  if (item.kind === "latest_developments") return true;
-  return false;
+  return reflectIsDisplayableOpportunity(item);
 }
 
 function isReviewThreadFollowup(item: ReflectSuggestedFollowup): boolean {
@@ -767,8 +782,8 @@ function hslToHex(h: number, s: number, l: number): string {
 
 function tacticalAccent(hex: string): string {
   const hsl = hexToHsl(hex);
-  if (!hsl) return hex;
-  return hslToHex(hsl.h, Math.min(0.7, hsl.s * 0.78), Math.min(0.78, hsl.l * 0.95 + 0.18));
+  if (!hsl) return "#AEB4BB";
+  return hslToHex(0, 0, Math.min(0.82, Math.max(0.42, hsl.l * 0.9 + 0.14)));
 }
 
 function tacticalSymbol(source: string): string {
@@ -802,7 +817,7 @@ function tacticalCode(source: string): string {
 
 function hexToRgba(hex: string, opacity: number): string {
   const m = hex.match(/^#([0-9a-f]{6})$/i);
-  if (!m) return `rgba(120, 242, 176, ${opacity})`;
+  if (!m) return `rgba(174, 180, 187, ${opacity})`;
   const n = parseInt(m[1], 16);
   const r = (n >> 16) & 0xff;
   const g = (n >> 8) & 0xff;
@@ -832,9 +847,9 @@ function topicStrength(cluster: ReflectCluster, maxUnits: number): { label: "Hig
 }
 
 function topicStrengthColor(label: "High" | "Medium" | "Low"): string {
-  if (label === "High") return "#36F5B8";
-  if (label === "Medium") return "#62A8FF";
-  return "#FFB24C";
+  if (label === "High") return "#D2D6DB";
+  if (label === "Medium") return "#AEB4BB";
+  return "#858D96";
 }
 
 function clusterDisplayLabel(cluster: ReflectCluster): string {
@@ -1039,19 +1054,11 @@ function clusterTopicDetail(cluster: ReflectCluster): string {
 }
 
 function latestUpdateTitle(item: ReflectSuggestedFollowup): string {
-  return compactText(stripInlineMarkup(item.title || "Reflected topic"), 110);
+  return reflectLatestUpdateTitle(item);
 }
 
 function latestDevelopmentSummary(item: ReflectSuggestedFollowup): string {
-  const generated = compactMultilineText(item.latest_summary || "", 640);
-  if (generated) return generated;
-  if (item.latest_summary_error && item.search_results.length > 0) {
-    return "Sources are cached, but AgentArk could not finish the plain-language insight yet. The sources remain available below.";
-  }
-  if (item.search_error) return compactText(item.search_error, 180);
-  return item.search_results.length > 0
-    ? "Sources are cached. The plain-language insight will appear after the background synthesis worker finishes."
-    : compactText(item.detail || "Next step queued for source checking.", 180);
+  return reflectLatestDevelopmentSummary(item);
 }
 
 function latestUpdateSummary(item: ReflectSuggestedFollowup): string {
@@ -1075,6 +1082,9 @@ function followupWhatThisIs(item: ReflectSuggestedFollowup): string {
       return `Renewed source-backed interest from ${origin}; this reappeared after earlier feedback.`;
     }
     if (item.latest_summary) return `Source-backed insight inferred from ${origin}.`;
+    if (item.latest_summary_error && item.search_results.length > 0) {
+      return `Current-source check inferred from ${origin}; source documents are available below.`;
+    }
     if (item.search_results.length > 0) return `Current-source check inferred from ${origin}; summary worker pending.`;
     if (item.status === "failed") return `Current-source check inferred from ${origin}; source fetch failed.`;
     return `Next step from ${origin}; source check is queued.`;
@@ -1230,6 +1240,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   const [opportunityPage, setOpportunityPage] = useState(0);
   const [localRefreshRunning, setLocalRefreshRunning] = useState(false);
   const [refreshNotice, setRefreshNotice] = useState("");
+  const [opportunitySettleUntil, setOpportunitySettleUntil] = useState<Record<string, number>>({});
   const bounds = useMemo(() => periodBounds(period, anchor), [period, anchor]);
   const fromIso = bounds.from.toISOString();
   const toIso = bounds.to.toISOString();
@@ -1582,11 +1593,11 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
       x: 0,
       y: 0,
       itemStyle: {
-        color: "rgba(16, 255, 214, 0.12)",
-        borderColor: "#34F7DD",
+        color: "rgba(174, 180, 187, 0.12)",
+        borderColor: "#B7BCC2",
         borderWidth: 2,
-        shadowBlur: 34,
-        shadowColor: "rgba(52, 247, 221, 0.86)",
+        shadowBlur: 18,
+        shadowColor: "rgba(174, 180, 187, 0.38)",
       },
       label: {
         show: true,
@@ -1602,12 +1613,12 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             lineHeight: 22,
           },
           count: {
-            color: "#34F7DD",
+            color: "#C6CAD0",
             fontSize: 10,
             fontWeight: 700,
             fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
             lineHeight: 16,
-            backgroundColor: "rgba(9, 219, 200, 0.12)",
+            backgroundColor: "rgba(255, 255, 255, 0.075)",
             padding: [3, 7, 3, 7],
             borderRadius: 4,
           },
@@ -1616,8 +1627,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
       emphasis: {
         scale: 1.08,
         itemStyle: {
-          shadowBlur: 44,
-          shadowColor: "rgba(52, 247, 221, 0.95)",
+          shadowBlur: 24,
+          shadowColor: "rgba(174, 180, 187, 0.46)",
         },
       },
     });
@@ -1651,8 +1662,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           color: hexToRgba(stroke, 0.12),
           borderColor: stroke,
           borderWidth: 2,
-          shadowBlur: 24,
-          shadowColor: hexToRgba(stroke, 0.72),
+          shadowBlur: 14,
+          shadowColor: hexToRgba(stroke, 0.28),
         },
         label: {
           show: true,
@@ -1691,8 +1702,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           itemStyle: {
             borderColor: stroke,
             borderWidth: 2.4,
-            shadowBlur: 32,
-            shadowColor: hexToRgba(stroke, 0.92),
+            shadowBlur: 18,
+            shadowColor: hexToRgba(stroke, 0.36),
           },
           label: {
             rich: {
@@ -1714,7 +1725,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           opacity: 0.72,
           curveness: index % 2 === 0 ? 0.18 : -0.18,
           shadowBlur: 12,
-          shadowColor: hexToRgba(stroke, 0.64),
+          shadowColor: hexToRgba(stroke, 0.28),
         },
       });
       cluster.related_history.items.slice(0, 2).forEach((item, itemIndex) => {
@@ -1745,8 +1756,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
               color: hexToRgba(stroke, 0.18),
               borderColor: hexToRgba(stroke, 0.62),
               borderWidth: 1.2,
-              shadowBlur: 8,
-              shadowColor: hexToRgba(stroke, 0.45),
+              shadowBlur: 4,
+              shadowColor: hexToRgba(stroke, 0.24),
             },
             label: { show: false },
             x: x + Math.cos(satAngle) * satOffset,
@@ -1824,7 +1835,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             left: "center",
             top: "middle",
             shape: { cx: 0, cy: 0, r: 82 },
-            style: { fill: "transparent", stroke: "rgba(52,247,221,0.18)", lineWidth: 1 },
+            style: { fill: "transparent", stroke: "rgba(174,180,187,0.16)", lineWidth: 1 },
             silent: true,
           },
           {
@@ -1832,7 +1843,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             left: "center",
             top: "middle",
             shape: { cx: 0, cy: 0, r: 132 },
-            style: { fill: "transparent", stroke: "rgba(52,247,221,0.11)", lineWidth: 1 },
+            style: { fill: "transparent", stroke: "rgba(174,180,187,0.11)", lineWidth: 1 },
             silent: true,
           },
           {
@@ -1840,7 +1851,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             left: "center",
             top: "middle",
             shape: { cx: 0, cy: 0, r: 184 },
-            style: { fill: "transparent", stroke: "rgba(98,168,255,0.08)", lineWidth: 1 },
+            style: { fill: "transparent", stroke: "rgba(174,180,187,0.08)", lineWidth: 1 },
             silent: true,
           },
           {
@@ -1849,7 +1860,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             top: 12,
             style: {
               text: `MEMORY GRAPH - ${topicRows.length.toString().padStart(2, "0")} THEMES`,
-              fill: "rgba(165, 184, 255, 0.64)",
+              fill: "rgba(184, 190, 198, 0.64)",
               font: "700 10px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
             },
           },
@@ -1859,7 +1870,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             bottom: 12,
             style: {
               text: `${allUnits.length.toString().padStart(2, "0")} SOURCED TRACES`,
-              fill: "rgba(130, 170, 220, 0.5)",
+              fill: "rgba(170, 176, 184, 0.54)",
               font: "700 10px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
               textAlign: "right",
             },
@@ -2002,11 +2013,75 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   const latestReadyCount = sourceBackedLatestFollowups.filter((item) => item.status === "ready").length;
   const latestQueuedCount = latestFollowups.filter((item) => item.status === "queued").length;
   const latestFailedCount = latestFollowups.filter((item) => item.status === "failed" && followupHasSourceEvidence(item)).length;
+  const opportunitySettleRefreshKey =
+    response?.refresh_status.completed_at ||
+    response?.refresh_status.started_at ||
+    response?.refresh_status.requested_at ||
+    "initial";
+  const opportunitySettleKey = `${period}:${fromIso}:${toIso}:${opportunitySettleRefreshKey}`;
+  const shouldSettleOpportunityPoll = shouldPollForOpportunitySettlement({
+    sourceCounts: response?.source_counts,
+    opportunityCount: opportunityFollowups.length,
+    queuedSourceCheckCount: latestQueuedCount,
+    refreshRunning: isReflectRunning,
+  });
+  const isOpportunitySettling = isOpportunitySettlementActive({
+    shouldPoll: shouldSettleOpportunityPoll,
+    currentUntil: opportunitySettleUntil[opportunitySettleKey],
+    now: Date.now(),
+  });
   const opportunityPageCount = Math.max(1, Math.ceil(opportunityFollowups.length / OPPORTUNITY_PAGE_SIZE));
   const visibleOpportunityFollowups = opportunityFollowups.slice(
     opportunityPage * OPPORTUNITY_PAGE_SIZE,
     opportunityPage * OPPORTUNITY_PAGE_SIZE + OPPORTUNITY_PAGE_SIZE,
   );
+
+  useEffect(() => {
+    if (!shouldSettleOpportunityPoll) return;
+    const now = Date.now();
+    setOpportunitySettleUntil((current) => {
+      if (
+        !shouldStartOpportunitySettlementPoll({
+          shouldPoll: shouldSettleOpportunityPoll,
+          currentUntil: current[opportunitySettleKey],
+          now,
+        })
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        [opportunitySettleKey]: now + OPPORTUNITY_SETTLE_WINDOW_MS,
+      };
+    });
+  }, [opportunitySettleKey, shouldSettleOpportunityPoll]);
+
+  useEffect(() => {
+    if (!shouldSettleOpportunityPoll) return undefined;
+    const until = opportunitySettleUntil[opportunitySettleKey] ?? 0;
+    if (until <= Date.now()) return undefined;
+    const id = window.setInterval(() => {
+      if (Date.now() >= until) {
+        setOpportunitySettleUntil((current) => {
+          if (current[opportunitySettleKey] === -1) return current;
+          return {
+            ...current,
+            [opportunitySettleKey]: -1,
+          };
+        });
+        return;
+      }
+      void queryClient.invalidateQueries({ queryKey: reflectQueryKey });
+    }, OPPORTUNITY_SETTLE_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [
+    opportunitySettleKey,
+    opportunitySettleUntil,
+    queryClient,
+    reflectQueryKey,
+    shouldSettleOpportunityPoll,
+  ]);
+
   const sourceMixOption = useMemo(
     () => ({
       backgroundColor: "transparent",
@@ -2104,7 +2179,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
       label: "Topics found",
       value: `${topicRows.length}`,
       detail: `${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} grouped into evidence-backed work themes.`,
-      tone: "var(--green)",
+      tone: "rgba(210, 214, 219, 0.82)",
     },
     {
       label: "Source checks",
@@ -2115,7 +2190,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           : latestFollowups.length > 0
             ? `${latestFollowups.length} opportunit${latestFollowups.length === 1 ? "y is" : "ies are"} queued for source checking.`
             : "No opportunities are queued yet.",
-      tone: "var(--cyan)",
+      tone: "rgba(190, 196, 204, 0.78)",
     },
     ...(hasProblems
       ? [
@@ -2162,7 +2237,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
       border: "1px solid var(--surface-border)",
       borderRadius: "8px",
       background:
-        "radial-gradient(circle at top left, var(--ui-rgba-57-208-255-040), transparent 38%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
+        "radial-gradient(circle at top left, rgba(255, 255, 255, 0.026), transparent 38%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
       boxShadow: "var(--surface-shadow-soft)",
     };
     const labelSx = {
@@ -2216,12 +2291,12 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                 sx={{
                   minHeight: 34,
                   borderRadius: "8px",
-                  color: active ? "#06100d" : "var(--button-text)",
-                  bgcolor: active ? "var(--green)" : "transparent",
-                  borderColor: active ? "var(--green)" : "var(--surface-border)",
+                  color: active ? "var(--text-primary)" : "var(--button-text)",
+                  bgcolor: active ? "rgba(255, 255, 255, 0.09)" : "transparent",
+                  borderColor: active ? "rgba(255, 255, 255, 0.12)" : "var(--surface-border)",
                   "&:hover": {
-                    bgcolor: active ? "var(--green)" : "var(--ui-rgba-57-208-255-060)",
-                    borderColor: "var(--surface-border-strong)",
+                    bgcolor: active ? "rgba(255, 255, 255, 0.11)" : "rgba(255, 255, 255, 0.045)",
+                    borderColor: "rgba(255, 255, 255, 0.14)",
                   },
                 }}
               >
@@ -2465,8 +2540,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                     },
                     "& .Mui-selected": {
                       color: "var(--text-primary) !important",
-                      background: "rgba(138, 92, 246, 0.22) !important",
-                      boxShadow: "inset 0 0 0 1px rgba(167, 139, 250, 0.3)",
+                      background: "rgba(255, 255, 255, 0.09) !important",
+                      boxShadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.12)",
                     },
                   }}
                 >
@@ -2489,27 +2564,26 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                       key={cluster.id}
                       className="arkreflect-theme-card"
                       sx={{
-                        borderColor: hexToRgba(accent, displayIndex === 0 ? 0.42 : 0.22),
+                        borderColor: displayIndex === 0
+                          ? "rgba(255, 255, 255, 0.16)"
+                          : "rgba(255, 255, 255, 0.09)",
                         background:
                           displayIndex === 0
-                            ? `linear-gradient(90deg, ${hexToRgba(accent, 0.16)}, rgba(11, 24, 36, 0.82))`
-                            : `linear-gradient(90deg, ${hexToRgba(accent, 0.08)}, rgba(8, 18, 28, 0.68))`,
-                        boxShadow:
-                          displayIndex === 0
-                            ? `inset 3px 0 0 ${accent}, 0 0 28px ${hexToRgba(accent, 0.13)}`
-                            : `inset 2px 0 0 ${hexToRgba(accent, 0.45)}`,
+                            ? "linear-gradient(90deg, rgba(255, 255, 255, 0.055), rgba(18, 18, 20, 0.82))"
+                            : "linear-gradient(90deg, rgba(255, 255, 255, 0.026), rgba(12, 12, 14, 0.72))",
+                        boxShadow: "none",
                       }}
                     >
-                      <Typography className="arkreflect-theme-rank" sx={{ color: accent }}>
+                      <Typography className="arkreflect-theme-rank" sx={{ color: "rgba(210, 214, 219, 0.92)" }}>
                         {String(displayIndex + 1).padStart(2, "0")}
                       </Typography>
                       <Box
                         className="arkreflect-theme-icon"
                         sx={{
                           color: accent,
-                          borderColor: hexToRgba(accent, 0.58),
-                          background: hexToRgba(accent, 0.12),
-                          boxShadow: `0 0 24px ${hexToRgba(accent, 0.34)}`,
+                          borderColor: "rgba(255, 255, 255, 0.16)",
+                          background: "rgba(255, 255, 255, 0.045)",
+                          boxShadow: "none",
                         }}
                       >
                         {sourceIcon(source.label)}
@@ -2525,7 +2599,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                       </Box>
                       <Stack className="arkreflect-theme-score" spacing={0.5}>
                         <Stack direction="row" spacing={0.55} sx={{ alignItems: "center", justifyContent: "flex-end" }}>
-                          <Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: strengthColor, boxShadow: `0 0 10px ${hexToRgba(strengthColor, 0.78)}` }} />
+                          <Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: strengthColor, boxShadow: "none" }} />
                           <Typography variant="caption" sx={{ color: strengthColor, fontWeight: 800 }}>
                             {strength.label}
                           </Typography>
@@ -2601,7 +2675,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                 What to do after this recap
               </Typography>
               <Typography sx={{ ...bodySx, mt: 0.55, maxWidth: 720 }}>
-                These are actionable opportunities Reflect can open in Chat, with source checks shown when current information is useful.
+                Actionable next steps Reflect can open in Chat, with source checks where current info helps.
               </Typography>
             </Box>
             <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
@@ -2609,7 +2683,13 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
               {sourceBackedLatestFollowups.length > 0 ? (
                 <Chip className="arkreflect-pill" icon={<SearchRoundedIcon />} label={`${latestSourceCount || sourceBackedLatestFollowups.length} source-backed`} />
               ) : null}
-              {latestQueuedCount > 0 ? <Chip size="small" variant="outlined" label={`${latestQueuedCount} checking`} /> : null}
+              {latestQueuedCount > 0 || isOpportunitySettling ? (
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={latestQueuedCount > 0 ? `${latestQueuedCount} checking` : "checking"}
+                />
+              ) : null}
               {latestReadyCount > 0 ? <Chip size="small" variant="outlined" label={`${latestReadyCount} ready`} /> : null}
               {latestFailedCount > 0 ? <Chip size="small" variant="outlined" label={`${latestFailedCount} failed`} /> : null}
             </Stack>
@@ -2618,30 +2698,37 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             {opportunityFollowups.length === 0 ? (
               <Box
                 sx={{
-                  p: { xs: 1.4, md: 1.8 },
-                  minHeight: 220,
+                  p: 2.5,
+                  minHeight: 176,
                   border: "1px solid var(--surface-border)",
                   borderRadius: "8px",
                   background: "var(--ui-rgba-255-255-255-020)",
                   display: "grid",
-                  alignItems: "center",
+                  placeItems: "center",
+                  textAlign: "center",
                 }}
               >
-                <Stack spacing={1.1} sx={{ maxWidth: 720 }}>
-                  <Box sx={{ color: "var(--cyan)" }}>
-                    <SearchRoundedIcon />
-                  </Box>
-                  <Typography sx={{ ...titleSx, fontSize: { xs: "1.15rem", md: "1.35rem" } }}>
-                    {isReflectRunning
+                <Stack spacing={1.05} sx={{ maxWidth: 400, alignItems: "center" }}>
+                  {isReflectRunning || isOpportunitySettling ? (
+                    <span className="arkreflect-live-dot" aria-hidden="true" />
+                  ) : (
+                    <Box sx={{ color: "rgba(210, 214, 219, 0.7)", display: "flex" }}>
+                      <SearchRoundedIcon sx={{ fontSize: 26 }} />
+                    </Box>
+                  )}
+                  <Typography sx={{ ...titleSx, fontSize: "1rem" }}>
+                    {isReflectRunning || isOpportunitySettling
                       ? "Looking for useful opportunities"
-                      : "No opportunities ready for this range yet"}
+                      : "No opportunities for this range yet"}
                   </Typography>
-                  <Typography sx={bodySx}>
+                  <Typography sx={{ ...bodySx, fontSize: "0.78rem" }}>
                     {isReflectRunning
-                      ? "Reflect is refreshing this range. Useful opportunities will appear here when there is something worth acting on."
+                      ? "Reflect is refreshing this range — anything worth acting on shows up here."
+                      : isOpportunitySettling
+                        ? "Waiting for source checks to finish. Updates automatically."
                       : totalUnits > 0
-                        ? "This range has activity, but nothing has been promoted into a clear opportunity yet. The header action can re-check the range."
-                        : "No activity is cached for this range yet. This tab stays available so users always know where opportunities will appear."}
+                        ? "There's activity here, but nothing's been promoted yet. Use Run Reflect to re-check."
+                        : "No activity cached for this range yet."}
                   </Typography>
                 </Stack>
               </Box>
@@ -2679,17 +2766,17 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                     cursor: "pointer",
                     background:
                       isLatest && item.search_results.length > 0
-                        ? "linear-gradient(90deg, rgba(120, 242, 176, 0.08), rgba(255,255,255,0.02))"
+                        ? "linear-gradient(90deg, rgba(255, 255, 255, 0.055), rgba(255,255,255,0.02))"
                         : "var(--ui-rgba-255-255-255-020)",
                     transition: "border-color 180ms ease, background 180ms ease, transform 180ms ease",
                     "&:hover": {
-                      borderColor: "rgba(120, 242, 176, 0.34)",
-                      background: "rgba(120, 242, 176, 0.055)",
+                      borderColor: "rgba(255, 255, 255, 0.12)",
+                      background: "rgba(255, 255, 255, 0.04)",
                       transform: "translateY(-1px)",
                     },
                   }}
                 >
-                  <Box sx={{ color: isLatest ? "var(--cyan)" : item.kind === "recovery_advice" ? "var(--red)" : "var(--green)", pt: 0.25 }}>
+                  <Box sx={{ color: isLatest ? "rgba(210, 214, 219, 0.8)" : item.kind === "recovery_advice" ? "var(--red)" : "rgba(210, 214, 219, 0.72)", pt: 0.25 }}>
                     {itemIcon}
                   </Box>
                   <Box sx={{ minWidth: 0 }}>
@@ -2797,13 +2884,13 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                       background: "var(--ui-rgba-255-255-255-020)",
                       transition: "border-color 180ms ease, background 180ms ease, transform 180ms ease",
                       "&:hover": {
-                        borderColor: "rgba(120, 242, 176, 0.34)",
-                        background: "rgba(120, 242, 176, 0.055)",
+                        borderColor: "rgba(255, 255, 255, 0.12)",
+                        background: "rgba(255, 255, 255, 0.04)",
                         transform: "translateY(-1px)",
                       },
                     }}
                   >
-                    <Box sx={{ color: item.kind === "recovery_advice" ? "var(--red)" : "var(--green)", pt: 0.25 }}>
+                    <Box sx={{ color: item.kind === "recovery_advice" ? "var(--red)" : "rgba(210, 214, 219, 0.72)", pt: 0.25 }}>
                       {itemIcon}
                     </Box>
                     <Box sx={{ minWidth: 0 }}>
@@ -2835,7 +2922,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   };
 
   return (
-    <WorkspacePageShell spacing={1.4}>
+    <WorkspacePageShell spacing={1.4} className="arkreflect-mono">
       <WorkspacePageHeader
         eyebrow="ARK CORE"
         title="Reflect"
@@ -2885,8 +2972,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                   borderColor: "rgba(255,255,255,0.12)",
                 },
                 "& .Mui-selected": {
-                  color: "primary.contrastText",
-                  bgcolor: "primary.main",
+                  color: "var(--text-primary)",
+                  bgcolor: "rgba(255, 255, 255, 0.09)",
                 },
               }}
             >
@@ -2936,7 +3023,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           icon={<RefreshRoundedIcon fontSize="inherit" />}
           sx={{
             border: "1px solid var(--surface-border)",
-            bgcolor: "var(--ui-rgba-57-208-255-060)",
+            bgcolor: "rgba(255, 255, 255, 0.045)",
           }}
         >
           <Stack spacing={1}>
@@ -3140,7 +3227,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                 {selectedFollowup.kind === "latest_developments" || selectedFollowup.search_results.length > 0 || selectedFollowup.search_error ? (
                 <Box>
                   <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "0.68rem", letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--text-dim)", mb: 0.8 }}>
-                    Sources
+                    Source documents
                   </Typography>
                   <Stack spacing={0.85}>
                     {selectedFollowup.search_results.length > 0 ? (

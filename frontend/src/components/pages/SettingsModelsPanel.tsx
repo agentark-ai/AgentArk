@@ -1,4 +1,6 @@
+import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import ErrorOutlineRoundedIcon from "@mui/icons-material/ErrorOutlineRounded";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import {
@@ -44,6 +46,24 @@ import {
 
 const LOCAL_EMBEDDINGS_MODEL = "BAAI/bge-small-en-v1.5";
 const MODEL_ROLE_OPTIONS = ["primary", "fast", "code", "research", "fallback"];
+
+const MODEL_CAPABILITY_ROWS: Array<{ key: string; label: string }> = [
+  { key: "tool_calls", label: "Tool calls" },
+  { key: "final_response", label: "Final response" },
+  { key: "json_output", label: "JSON output" },
+];
+
+const MODEL_VERDICT_META: Record<
+  string,
+  { label: string; color: "success" | "warning" | "error" }
+> = {
+  supported: { label: "Supported", color: "success" },
+  degraded: { label: "Degraded", color: "warning" },
+  unsupported_for_agent_runs: {
+    label: "Unsupported for agent runs",
+    color: "error",
+  },
+};
 
 function modelOptionLabel(value: unknown): string {
   const normalized = str(value, "").replace(/[_-]+/g, " ").trim();
@@ -884,13 +904,134 @@ export function SettingsModelsPanel({
                         label="Enabled"
                       />
                       {modelConnectionTestResult ? (
-                        <Alert
-                          severity={
-                            modelConnectionTestResult.ok ? "success" : "warning"
-                          }
-                        >
-                          {modelConnectionTestResult.message}
-                        </Alert>
+                        <Stack spacing={1}>
+                          <Alert
+                            severity={
+                              modelConnectionTestResult.ok
+                                ? "success"
+                                : "warning"
+                            }
+                          >
+                            {modelConnectionTestResult.message}
+                          </Alert>
+                          {modelConnectionTestResult.capabilities ? (
+                            <Box
+                              sx={{
+                                border: 1,
+                                borderColor: "divider",
+                                borderRadius: 1,
+                                p: 1.5,
+                              }}
+                            >
+                              <Stack spacing={1}>
+                                {modelConnectionTestResult.verdict &&
+                                MODEL_VERDICT_META[
+                                  modelConnectionTestResult.verdict
+                                ] ? (
+                                  <Stack
+                                    direction="row"
+                                    spacing={1}
+                                    sx={{ alignItems: "center" }}
+                                  >
+                                    <Typography
+                                      variant="caption"
+                                      sx={{ color: "text.secondary" }}
+                                    >
+                                      Agent verdict
+                                    </Typography>
+                                    <Chip
+                                      size="small"
+                                      color={
+                                        MODEL_VERDICT_META[
+                                          modelConnectionTestResult.verdict
+                                        ].color
+                                      }
+                                      label={
+                                        MODEL_VERDICT_META[
+                                          modelConnectionTestResult.verdict
+                                        ].label
+                                      }
+                                    />
+                                  </Stack>
+                                ) : null}
+                                <Stack spacing={0.75}>
+                                  {MODEL_CAPABILITY_ROWS.map((row) => {
+                                    const probe =
+                                      modelConnectionTestResult.capabilities[
+                                        row.key
+                                      ];
+                                    if (!probe) return null;
+                                    const pass = toBool(probe.pass);
+                                    const detail = str(
+                                      probe.detail,
+                                      "",
+                                    ).trim();
+                                    return (
+                                      <Stack
+                                        key={row.key}
+                                        direction="row"
+                                        spacing={1}
+                                        sx={{ alignItems: "flex-start" }}
+                                      >
+                                        {pass ? (
+                                          <CheckCircleRoundedIcon
+                                            fontSize="small"
+                                            color="success"
+                                            sx={{ mt: "1px" }}
+                                          />
+                                        ) : (
+                                          <ErrorOutlineRoundedIcon
+                                            fontSize="small"
+                                            color="warning"
+                                            sx={{ mt: "1px" }}
+                                          />
+                                        )}
+                                        <Box sx={{ minWidth: 0 }}>
+                                          <Typography variant="body2">
+                                            {row.label}
+                                          </Typography>
+                                          {!pass && detail ? (
+                                            <Typography
+                                              variant="caption"
+                                              sx={{
+                                                color: "text.secondary",
+                                                display: "block",
+                                              }}
+                                            >
+                                              {detail}
+                                            </Typography>
+                                          ) : null}
+                                        </Box>
+                                      </Stack>
+                                    );
+                                  })}
+                                </Stack>
+                              </Stack>
+                            </Box>
+                          ) : null}
+                          {modelConnectionTestResult.verdict ===
+                            "unsupported_for_agent_runs" &&
+                          str(
+                            modelConnectionTestResult.warning,
+                            "",
+                          ).trim() ? (
+                            <Alert severity="warning">
+                              {modelConnectionTestResult.warning}
+                            </Alert>
+                          ) : null}
+                          {str(
+                            modelConnectionTestResult.capabilitiesError,
+                            "",
+                          ).trim() ? (
+                            <Typography
+                              variant="caption"
+                              sx={{ color: "text.secondary" }}
+                            >
+                              Capability probes did not complete:{" "}
+                              {modelConnectionTestResult.capabilitiesError}
+                            </Typography>
+                          ) : null}
+                        </Stack>
                       ) : null}
                       {modelTestConnectionHint ? (
                         <Typography

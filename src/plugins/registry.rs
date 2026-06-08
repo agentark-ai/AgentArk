@@ -166,7 +166,7 @@ impl PluginRegistry {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| {
-                crate::core::net::build_outgoing_http_client(PLUGIN_REQUEST_TIMEOUT_SECS)
+                crate::core::runtime::net::build_outgoing_http_client(PLUGIN_REQUEST_TIMEOUT_SECS)
             });
         Self {
             storage,
@@ -280,9 +280,12 @@ impl PluginRegistry {
         };
 
         if let Some(profile_id) = auth_profile_id.as_deref() {
-            if crate::core::auth_profiles::AuthProfileControlPlane::get(&self.storage, profile_id)
-                .await?
-                .is_none()
+            if crate::core::connectivity::auth_profiles::AuthProfileControlPlane::get(
+                &self.storage,
+                profile_id,
+            )
+            .await?
+            .is_none()
             {
                 anyhow::bail!("Auth profile '{}' was not found.", profile_id);
             }
@@ -639,7 +642,7 @@ impl PluginRegistry {
         )
         .await?;
         if let Some(auth_profile_id) = plugin.auth_profile_id.as_deref() {
-            let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+            let _ = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::mark_used(
                 &self.storage,
                 auth_profile_id,
             )
@@ -710,7 +713,7 @@ impl PluginRegistry {
                 Ok(resp) if resp.status().is_success() => {
                     self.set_plugin_last_error(&plugin.id, None).await?;
                     if let Some(auth_profile_id) = plugin.auth_profile_id.as_deref() {
-                        let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                        let _ = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::mark_used(
                             &self.storage,
                             auth_profile_id,
                         )
@@ -813,7 +816,7 @@ impl PluginRegistry {
         )
         .await?;
         if let Some(auth_profile_id) = plugin.auth_profile_id.as_deref() {
-            let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+            let _ = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::mark_used(
                 &self.storage,
                 auth_profile_id,
             )
@@ -842,7 +845,7 @@ impl PluginRegistry {
     async fn auth_profile_overlay(
         &self,
         auth_profile_id: Option<&str>,
-    ) -> Result<Option<crate::core::auth_profiles::HttpAuthOverlay>> {
+    ) -> Result<Option<crate::core::connectivity::auth_profiles::HttpAuthOverlay>> {
         let Some(auth_profile_id) = auth_profile_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -850,7 +853,7 @@ impl PluginRegistry {
             return Ok(None);
         };
         Ok(Some(
-            crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+            crate::core::connectivity::auth_profiles::AuthProfileControlPlane::resolve_http(
                 &self.storage,
                 auth_profile_id,
             )
@@ -866,12 +869,14 @@ impl PluginRegistry {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            Ok(crate::core::auth_profiles::AuthProfileControlPlane::get(
-                &self.storage,
-                auth_profile_id,
+            Ok(
+                crate::core::connectivity::auth_profiles::AuthProfileControlPlane::get(
+                    &self.storage,
+                    auth_profile_id,
+                )
+                .await?
+                .is_some_and(|profile| profile.ready),
             )
-            .await?
-            .is_some_and(|profile| profile.ready))
         } else {
             self.plugin_secret_present(&plugin.id)
         }
@@ -901,10 +906,10 @@ impl PluginRegistry {
         auth_profile_id: Option<&str>,
     ) -> Result<reqwest::RequestBuilder> {
         let mut parsed = reqwest::Url::parse(url).context("invalid plugin endpoint URL")?;
-        crate::core::net::validate_external_https_url(parsed.as_str()).await?;
+        crate::core::runtime::net::validate_external_https_url(parsed.as_str()).await?;
         if let Some(overlay) = self.auth_profile_overlay(auth_profile_id).await? {
             overlay.apply_to_url(&mut parsed);
-            crate::core::net::validate_external_https_url(parsed.as_str()).await?;
+            crate::core::runtime::net::validate_external_https_url(parsed.as_str()).await?;
             let request = self.http_client.request(method, parsed);
             return overlay.apply_to_request_builder(request);
         }
@@ -1045,7 +1050,7 @@ impl PluginRegistry {
     }
 
     fn load_plugin_secret(&self, plugin_id: &str) -> Result<Option<String>> {
-        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+        let manager = crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
             &self.config_dir,
             Some(&self.data_dir),
         )?;
@@ -1053,7 +1058,7 @@ impl PluginRegistry {
     }
 
     fn set_plugin_secret(&self, plugin_id: &str, value: Option<String>) -> Result<()> {
-        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+        let manager = crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
             &self.config_dir,
             Some(&self.data_dir),
         )?;
@@ -1201,7 +1206,7 @@ async fn normalize_base_url(value: &str) -> Result<String> {
     if trimmed.is_empty() {
         anyhow::bail!("Base URL is required");
     }
-    let parsed = crate::core::net::validate_external_https_url(trimmed).await?;
+    let parsed = crate::core::runtime::net::validate_external_https_url(trimmed).await?;
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 

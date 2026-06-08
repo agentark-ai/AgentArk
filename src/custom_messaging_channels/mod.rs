@@ -8,11 +8,11 @@ use crate::channels::messaging_dispatch::{
     dispatch_pack_channel_with_overlay, extract_secret_references, rewrite_send_spec_secret_refs,
     DispatchInputs,
 };
-use crate::core::config::SecureConfigManager;
-use crate::core::integration_auth::{
+use crate::core::connectivity::integration_auth::{
     AuthField, AuthMode, FieldInputType, IntegrationAuthManifest, OAuth2CodeFlow, OAuth2DeviceFlow,
     PostSubmitAction, PostSubmitAfter, SecretSlot,
 };
+use crate::core::runtime::config::SecureConfigManager;
 use crate::extension_packs::{AuthTransportBinding, MessagingHeaderSpec, MessagingSendSpec};
 use crate::storage::Storage;
 
@@ -242,8 +242,10 @@ pub async fn upsert_custom_messaging_channel(
             .and_then(|item| item.auth_profile_id.clone())
     });
     if let Some(profile_id) = auth_profile_id.as_deref() {
-        let profile =
-            crate::core::auth_profiles::AuthProfileControlPlane::get(storage, profile_id).await?;
+        let profile = crate::core::connectivity::auth_profiles::AuthProfileControlPlane::get(
+            storage, profile_id,
+        )
+        .await?;
         if profile.is_none() {
             bail!("Auth profile '{}' was not found.", profile_id);
         }
@@ -381,9 +383,11 @@ pub async fn test_custom_messaging_channel(
     };
     let overlay = if let Some(profile_id) = config.auth_profile_id.as_deref() {
         Some(
-            crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(storage, profile_id)
-                .await?
-                .overlay,
+            crate::core::connectivity::auth_profiles::AuthProfileControlPlane::resolve_http(
+                storage, profile_id,
+            )
+            .await?
+            .overlay,
         )
     } else {
         None
@@ -440,7 +444,7 @@ pub async fn view_for_config(
     config: CustomMessagingChannelConfig,
 ) -> Result<CustomMessagingChannelView> {
     let auth_profile_ready = if let Some(profile_id) = config.auth_profile_id.as_deref() {
-        crate::core::auth_profiles::AuthProfileControlPlane::get(storage, profile_id)
+        crate::core::connectivity::auth_profiles::AuthProfileControlPlane::get(storage, profile_id)
             .await?
             .is_some_and(|profile| profile.ready)
     } else {
@@ -777,7 +781,9 @@ fn clear_manifest_secrets(
     manager: &SecureConfigManager,
     manifest: &IntegrationAuthManifest,
 ) -> Result<()> {
-    for target in crate::core::integration_auth::manifest_all_storage_targets(manifest) {
+    for target in
+        crate::core::connectivity::integration_auth::manifest_all_storage_targets(manifest)
+    {
         manager.set_custom_secret(&target, None)?;
     }
     Ok(())
@@ -1102,7 +1108,8 @@ mod tests {
         )
         .expect("manifest")
         .expect("auth");
-        let targets = crate::core::integration_auth::manifest_form_storage_targets(&manifest);
+        let targets =
+            crate::core::connectivity::integration_auth::manifest_form_storage_targets(&manifest);
         assert_eq!(
             targets,
             vec!["custom_messaging_channel:discord_hook:webhook_url".to_string()]

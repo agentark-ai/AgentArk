@@ -3,26 +3,47 @@
 //! Connects AgentArk to external services like Google Calendar, WhatsApp, etc.
 //! Each integration implements the `Integration` trait for unified handling.
 
+#[path = "browser/browser.rs"]
 pub mod browser;
+#[path = "google/calendar.rs"]
 pub mod calendar;
+#[path = "google/ga4.rs"]
 pub mod ga4;
+#[path = "devices/garmin.rs"]
 pub mod garmin;
+#[path = "productivity/github.rs"]
 pub mod github;
+#[path = "google/gsc.rs"]
 pub mod gsc;
+#[path = "devices/home_assistant.rs"]
 pub mod home_assistant;
+#[path = "browser/lightpanda.rs"]
 pub mod lightpanda;
+#[path = "media/media_gen.rs"]
 pub mod media_gen;
+#[path = "knowledge/moltbook.rs"]
 pub mod moltbook;
+#[path = "productivity/notion.rs"]
 pub mod notion;
+#[path = "auth/oauth.rs"]
 pub mod oauth;
+#[path = "productivity/onepassword.rs"]
 pub mod onepassword;
+#[path = "commerce/ordering.rs"]
 pub mod ordering;
+#[path = "google/places.rs"]
 pub mod places;
+#[path = "media/social_analytics.rs"]
 pub mod social_analytics;
+#[path = "messaging/twilio.rs"]
 pub mod twilio;
+#[path = "messaging/twitter.rs"]
 pub mod twitter;
+#[path = "productivity/vercel.rs"]
 pub mod vercel;
+#[path = "messaging/whatsapp.rs"]
 pub mod whatsapp;
+#[path = "devices/whoop.rs"]
 pub mod whoop;
 
 use anyhow::Result;
@@ -108,7 +129,7 @@ pub fn integration_user_disabled_key(id: &str) -> String {
 }
 
 fn stored_bool_secret(
-    manager: &crate::core::config::SecureConfigManager,
+    manager: &crate::core::runtime::config::SecureConfigManager,
     key: &str,
 ) -> Option<bool> {
     manager
@@ -120,7 +141,7 @@ fn stored_bool_secret(
 
 fn builtin_integration_is_connected(
     config_dir: &Path,
-    _manager: &crate::core::config::SecureConfigManager,
+    _manager: &crate::core::runtime::config::SecureConfigManager,
     integration_id: &str,
 ) -> bool {
     match integration_id {
@@ -142,7 +163,7 @@ fn builtin_integration_is_connected(
 }
 
 fn configured_secret_present(
-    manager: &crate::core::config::SecureConfigManager,
+    manager: &crate::core::runtime::config::SecureConfigManager,
     user_key: &str,
 ) -> bool {
     if std::env::var(user_key)
@@ -152,7 +173,7 @@ fn configured_secret_present(
         return true;
     }
 
-    crate::core::secrets::storage_keys_for_user_key(user_key)
+    crate::core::runtime::secrets::storage_keys_for_user_key(user_key)
         .into_iter()
         .any(|key| {
             manager
@@ -165,7 +186,7 @@ fn configured_secret_present(
 
 fn external_integration_is_connected(
     _config_dir: &Path,
-    manager: &crate::core::config::SecureConfigManager,
+    manager: &crate::core::runtime::config::SecureConfigManager,
     integration_id: &str,
 ) -> Option<bool> {
     if integration_id == "vercel" {
@@ -196,14 +217,14 @@ fn external_integration_is_connected(
         );
     }
 
-    let spec = crate::core::connect_flow::spec_by_id(integration_id)?;
+    let spec = crate::core::connectivity::connect_flow::spec_by_id(integration_id)?;
     let connected = match spec.required.kind {
-        crate::core::connect_flow::SecretRequirementKind::All => spec
+        crate::core::connectivity::connect_flow::SecretRequirementKind::All => spec
             .required
             .keys
             .iter()
             .all(|key| configured_secret_present(manager, key)),
-        crate::core::connect_flow::SecretRequirementKind::Any => spec
+        crate::core::connectivity::connect_flow::SecretRequirementKind::Any => spec
             .required
             .keys
             .iter()
@@ -213,7 +234,7 @@ fn external_integration_is_connected(
 }
 
 pub fn effective_integration_enabled(config_dir: &Path, integration_id: &str) -> bool {
-    let Ok(manager) = crate::core::config::SecureConfigManager::new(config_dir) else {
+    let Ok(manager) = crate::core::runtime::config::SecureConfigManager::new(config_dir) else {
         return false;
     };
 
@@ -599,8 +620,8 @@ mod tests {
     #[test]
     fn effective_integration_enabled_autoheals_connected_google_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let manager =
-            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        let manager = crate::core::runtime::config::SecureConfigManager::new(dir.path())
+            .expect("secure manager");
         manager
             .set_custom_secret(
                 crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
@@ -649,8 +670,8 @@ mod tests {
     #[test]
     fn effective_integration_enabled_respects_manual_disable_marker() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let manager =
-            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        let manager = crate::core::runtime::config::SecureConfigManager::new(dir.path())
+            .expect("secure manager");
         manager
             .set_custom_secret(
                 crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
@@ -721,8 +742,8 @@ mod tests {
     #[test]
     fn effective_integration_enabled_requires_ready_external_config() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let manager =
-            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        let manager = crate::core::runtime::config::SecureConfigManager::new(dir.path())
+            .expect("secure manager");
         manager
             .set_custom_secret("google_places_api_key", Some("test-key".to_string()))
             .expect("places key saved");
@@ -746,8 +767,8 @@ mod tests {
         let ready = manager.ready_ids().await;
         assert!(!ready.iter().any(|id| id == "google_places"));
 
-        let secure =
-            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        let secure = crate::core::runtime::config::SecureConfigManager::new(dir.path())
+            .expect("secure manager");
         secure
             .set_custom_secret("google_places_api_key", Some("test-key".to_string()))
             .expect("places key saved");
@@ -760,8 +781,8 @@ mod tests {
     #[tokio::test]
     async fn is_ready_accepts_connected_google_workspace_surfaces() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let manager =
-            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        let manager = crate::core::runtime::config::SecureConfigManager::new(dir.path())
+            .expect("secure manager");
         manager
             .set_custom_secret(
                 crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
