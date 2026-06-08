@@ -507,9 +507,12 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
       chartType: "line" as const,
     },
     {
-      label: "Prompt cache",
-      value: `${compactNumber(cachedPromptTokensTotal)} read`,
-      detail: `${compactNumber(cacheCreationPromptTokensTotal)} cache-write tokens`,
+      label: "Prompt cache savings",
+      value: `${compactNumber(cachedPromptTokensTotal)} reused`,
+      detail:
+        cacheCreationPromptTokensTotal > 0
+          ? `${compactNumber(cacheCreationPromptTokensTotal)} written this range`
+          : undefined,
       values: cachedPromptBucketSeries,
       color: "#60a5fa",
       chartType: "line" as const,
@@ -1423,16 +1426,18 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                       >
                         {card.value}
                       </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                          display: "block",
-                          lineHeight: 1.45,
-                        }}
-                      >
-                        {card.detail}
-                      </Typography>
+                      {card.detail ? (
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            display: "block",
+                            lineHeight: 1.45,
+                          }}
+                        >
+                          {card.detail}
+                        </Typography>
+                      ) : null}
                     </Box>
                     <Box sx={{ width: 96, flex: "0 0 auto" }}>
                       <ReactECharts
