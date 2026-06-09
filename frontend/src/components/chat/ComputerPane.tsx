@@ -2508,32 +2508,9 @@ function ComputerPaneInner({
               AgentArk's Console
             </Typography>
           </Box>
-          <Stack
-            direction="row"
-            spacing={0.8}
-            className="computer-pane-progress-row"
-            sx={{ alignItems: "center" }}
-          >
-            <FiberManualRecordRoundedIcon
-              fontSize="inherit"
-              className={`computer-pane-status-dot tone-${statusTone(liveWriteActive ? "running" : activeSurfaceStatus)}`}
-            />
-            <Typography variant="caption" className="computer-pane-progress">
-              {progressText}
-            </Typography>
-            <span className="computer-pane-step-sep">|</span>
-            <Typography variant="caption" className="computer-pane-current-step">
-              {headerText}
-            </Typography>
-            {headerModeLabel ? (
-              <>
-                <span className="computer-pane-step-sep">|</span>
-                <Typography variant="caption" className="computer-pane-current-step">
-                  {headerModeLabel}
-                </Typography>
-              </>
-            ) : null}
-          </Stack>
+          {/* Progress/status subtitle removed: the
+              "Task Progress X/Y | Run Completed | Artifact" line was
+              inaccurate and not useful. */}
         </Box>
         <Box sx={{ flex: 1 }} />
         <Box className="computer-pane-tabs" role="tablist" aria-label="Console pane view">

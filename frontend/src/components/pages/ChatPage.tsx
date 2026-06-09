@@ -10921,12 +10921,17 @@ function ChatPageInner({
       : CHAT_INLINE_ACTIVITY_MIN_WIDTH,
   );
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  // True once the user explicitly closes the console mid-run; suppresses the
+  // stream-driven auto-open (revealLiveFilesConsole / delegation progress) for
+  // the rest of the current run. Reset at run start so the next run can auto-open.
+  const workspaceUserClosedRef = useRef(false);
   const [activeStepId, setActiveStepId] = useState<string | null>(null);
   const handleActivateStep = useCallback((id: string | null) => {
     setActiveStepId(id);
     if (id) setWorkspaceOpen(true);
   }, []);
   const closeWorkspacePanel = useCallback(() => {
+    workspaceUserClosedRef.current = true;
     setWorkspaceOpen(false);
   }, []);
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
@@ -12505,6 +12510,8 @@ function ChatPageInner({
   };
 
   const revealLiveFilesConsole = () => {
+    // Respect an explicit mid-run user dismissal for the rest of this run.
+    if (workspaceUserClosedRef.current) return;
     setWorkspaceOpen(true);
     setActiveStepId(null);
     setSelectedSnippetId(null);
@@ -17373,7 +17380,10 @@ function ChatPageInner({
     if (progressKind === "turn_completed") {
       return;
     }
-    if (progressKind.startsWith("delegation_")) {
+    if (
+      progressKind.startsWith("delegation_") &&
+      !workspaceUserClosedRef.current
+    ) {
       setWorkspaceOpen(true);
     }
     // Backward compatibility for older streams that carried reasoning deltas
@@ -17942,6 +17952,8 @@ function ChatPageInner({
     setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
     setIsStreaming(true);
+    // New run: clear any prior user dismissal so first activity can auto-open.
+    workspaceUserClosedRef.current = false;
     pendingFileReadPathRef.current = "";
     pendingFileWritePathRef.current = "";
 
@@ -20125,6 +20137,18 @@ function ChatPageInner({
       ? latestBlock.slice(-1400).trim()
       : latestBlock;
   }, [hasLivePendingThread, reasoningStream?.content, visibleStreamingResponse]);
+  // Latest interleaved model narration (model_prose ToolProgress) for live
+  // display in the work panel during a tool-using run. Rendered directly in the
+  // panel branch (which is proven to mount during the run) rather than via the
+  // reply-bubble path, which doesn't flip for tool turns.
+  const liveModelProseText = useMemo(() => {
+    if (!hasLivePendingThread) return "";
+    for (let i = streamingSteps.length - 1; i >= 0; i -= 1) {
+      const t = modelProseTextFromActivityStep(streamingSteps[i] as JsonRecord);
+      if (t && t.trim()) return t.trim();
+    }
+    return "";
+  }, [hasLivePendingThread, streamingSteps]);
   const deferredLiveModelEmitText = useDeferredValue(visibleLiveModelEmit);
   const visibleStreamingMarkdownText = visibleStreamingResponse.trim()
     ? deferredStreamingMarkdownText
@@ -22120,7 +22144,10 @@ function ChatPageInner({
           <IconButton
             size="small"
             aria-label="Close AgentArk Console"
-            onClick={() => setWorkspaceOpen(false)}
+            onClick={() => {
+              workspaceUserClosedRef.current = true;
+              setWorkspaceOpen(false);
+            }}
           >
             <CloseIcon fontSize="small" />
           </IconButton>
@@ -22802,13 +22829,20 @@ function ChatPageInner({
       actions: Extract<ChatTranscriptItem, { kind: "action" }>[],
       groupId: string,
     ): ReactNode => {
-      const expanded = isLiveTranscript || expandedTranscriptActions.has(groupId);
       const totalCount = actions.reduce(
         (sum, a) => sum + (a.count ?? 1),
         0,
       );
       const hasIssue = actions.some((a) => a.status === "issue");
       const hasRunning = actions.some((a) => a.status === "running");
+      // Force-expand the live step group only while a step is actually in
+      // flight, then auto-collapse once all steps finish. Manual expand
+      // (expandedTranscriptActions) still wins. Gate on hasRunning — NOT
+      // streaming-reply presence — so the card stays open through interleaved
+      // prose-then-more-tools runs.
+      const expanded =
+        (isLiveTranscript && hasRunning) ||
+        expandedTranscriptActions.has(groupId);
       const aggregateStatus: ChatTranscriptActionStatus = hasIssue
         ? "issue"
         : hasRunning
@@ -23138,8 +23172,15 @@ function ChatPageInner({
                 className={`activity-toggle-pill${showWorkspacePanelInline || showWorkspacePanelDrawer ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
                 onClick={() => {
                   if (canInlineWorkspacePanel) {
-                    setWorkspaceOpen((prev) => !prev);
+                    setWorkspaceOpen((prev) => {
+                      const next = !prev;
+                      // Opening via the pill re-enables stream auto-open;
+                      // closing suppresses it for the rest of the run.
+                      workspaceUserClosedRef.current = !next;
+                      return next;
+                    });
                   } else {
+                    workspaceUserClosedRef.current = false;
                     setWorkspaceOpen(true);
                   }
                 }}
@@ -23728,6 +23769,24 @@ function ChatPageInner({
                                     : " has-status-copy"
                                 }${CHAT_LAYOUT_MODE === "split" ? " is-split" : ""}`}
                               >
+                                {liveModelProseText ? (
+                                  <Typography
+                                    variant="body2"
+                                    className="chat-live-model-prose"
+                                    sx={{
+                                      color: "#e9e2d6",
+                                      fontSize: "0.9rem",
+                                      lineHeight: 1.55,
+                                      whiteSpace: "pre-wrap",
+                                      mb:
+                                        liveChatTranscriptItems.length > 0
+                                          ? 1
+                                          : 0.5,
+                                    }}
+                                  >
+                                    {liveModelProseText}
+                                  </Typography>
+                                ) : null}
                                 {liveChatTranscriptItems.length > 0 ? (
                                   renderChatTranscriptItems(
                                     liveChatTranscriptItems,

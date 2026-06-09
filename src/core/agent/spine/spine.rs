@@ -295,6 +295,8 @@ const RESOURCE_ACTION_CONTRACTS: &[ResourceActionContract] = &[
 const LLM_NATIVE_IMAGE_ATTACHMENT_LIMIT: usize = 4;
 const LLM_NATIVE_IMAGE_ATTACHMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SPINE_MODEL_STREAM_RETRY_ATTEMPTS_PER_CANDIDATE: usize = 2;
+const TERMINAL_AUDIT_MAX_OUTPUT_TOKENS: u32 = 512;
+const TERMINAL_AUDIT_SYSTEM_PROMPT: &str = "You are a bounded terminal audit judge. Return only the requested JSON object. Judge from structured evidence and semantic task completion, not wording.";
 
 #[derive(Debug, Clone)]
 pub struct SpineChatResponse {
@@ -319,6 +321,19 @@ pub trait SpineLlmServer: Send + Sync {
         streaming: bool,
         visual_attachments: Vec<ChatAttachmentHint>,
     ) -> Result<SpineChatResponse, SpineError>;
+
+    async fn terminal_audit_completion(
+        &self,
+        prompt: String,
+    ) -> Result<SpineChatResponse, SpineError> {
+        self.chat_completion(
+            vec![SpineMessage::User { content: prompt }],
+            Vec::new(),
+            false,
+            Vec::new(),
+        )
+        .await
+    }
 }
 
 fn spine_response_is_empty_terminal(text: &str, tool_call_count: usize) -> bool {
@@ -1951,6 +1966,8 @@ pub async fn run_spine(
     let mut completion_reprompts = 0usize;
     let current_turn_evidence_start = messages.len();
     let mut freshness_refresh_attempted = false;
+    let mut capability_readiness_generation_seen = request.capability_readiness_generation;
+    let mut capability_readiness_reloops = 0usize;
 
     for turn in 0..max_turns {
         if request.cancel_token.is_cancelled() {
@@ -2035,24 +2052,72 @@ pub async fn run_spine(
                 &normalize_final_response_artifact_links(&visible_response_text, &messages),
                 TerminalTextProvenance::ModelAuthored,
             );
+            if matches!(request.caller_kind, CallerKind::Chat)
+                && capability_readiness_reloops == 0
+                && turn + 1 < max_turns
+            {
+                let current_generation = cx.agent.capability_readiness_generation().await;
+                let previous_generation = capability_readiness_generation_seen.unwrap_or(0);
+                if current_generation > previous_generation {
+                    if let Some(readiness_context) =
+                        cx.agent.capability_readiness_context_message().await
+                    {
+                        capability_readiness_generation_seen = Some(current_generation);
+                        capability_readiness_reloops += 1;
+                        messages.push(SpineMessage::System {
+                            content: readiness_context,
+                        });
+                        messages.push(SpineMessage::User {
+                            content: "Capability readiness state changed during this turn. Re-evaluate the answer using the updated readiness context. Treat AgentArk-managed capability readiness from that context as authoritative; do not claim a capability is ready unless it is connected and enabled there. If a requested capability is not ready, explain the readiness blocker in user-facing terms.".to_string(),
+                        });
+                        tracing::info!(
+                            turn,
+                            previous_generation,
+                            current_generation,
+                            "Spine re-looping after capability readiness changed during turn"
+                        );
+                        continue;
+                    }
+                }
+            }
             // Freshness is established structurally when this turn already
-            // produced successful tool evidence (status "ok" in the
-            // normalized envelope) or a refresh already ran — no LLM
-            // freshness judgment needed. When both judgments are still
-            // required, ONE merged verifier call replaces the former two
-            // sequential round-trips.
+            // produced successful tool evidence, when a refresh already ran,
+            // or when AgentArk-managed capability readiness was supplied via
+            // the typed registry context. No user wording participates in
+            // this decision.
             let terminal_gate_started = std::time::Instant::now();
-            let needs_completion_verification = terminal_kind_requires_completion_verification(
+            let audit_decision = terminal_audit_decision(
                 SpineTerminalTextKind::Completed,
                 TerminalTextProvenance::ModelAuthored,
                 request.caller_kind,
+                &messages,
+                current_turn_evidence_start,
+                completion_reprompts,
+                capability_readiness_reloops,
             );
+            let managed_capability_readiness_established =
+                has_capability_readiness_context_evidence(&messages);
             let freshness_established = freshness_refresh_attempted
+                || managed_capability_readiness_established
                 || current_turn_has_successful_tool_evidence(
                     &messages,
                     current_turn_evidence_start,
                 );
-            let (freshness_verdict, completion_verdict) = if freshness_established {
+            let (freshness_verdict, completion_verdict) = if audit_decision
+                == TerminalAuditDecision::Skip
+            {
+                tracing::info!(
+                    turn,
+                    "spine_terminal_audit_skipped: structural no-action terminal"
+                );
+                (FreshnessVerdict::Fresh, CompletionVerdict::Complete)
+            } else if freshness_established {
+                if managed_capability_readiness_established {
+                    tracing::debug!(
+                        turn,
+                        "Spine skipped LLM freshness verdict using capability readiness registry evidence"
+                    );
+                }
                 let completion = verification_verdict_for_terminal_candidate(
                     server,
                     &cx,
@@ -2066,7 +2131,7 @@ pub async fn run_spine(
                 )
                 .await;
                 (FreshnessVerdict::Fresh, completion)
-            } else if needs_completion_verification {
+            } else {
                 combined_terminal_verdicts(
                     server,
                     &cx,
@@ -2077,16 +2142,6 @@ pub async fn run_spine(
                     &final_text,
                 )
                 .await
-            } else {
-                let freshness = freshness_verdict_for_terminal_candidate(
-                    server,
-                    &current_user_request,
-                    &messages,
-                    current_turn_evidence_start,
-                    &final_text,
-                )
-                .await;
-                (freshness, CompletionVerdict::Complete)
             };
             if let Some(refresh_call) = freshness_refresh_tool_call(&freshness_verdict) {
                 // The merged completion verdict (if any) is intentionally
@@ -2291,18 +2346,31 @@ pub async fn run_spine(
                 TerminalTextProvenance::SystemAuthored,
             );
             let terminal_gate_started = std::time::Instant::now();
-            let completion_verdict = verification_verdict_for_terminal_candidate(
-                server,
-                &cx,
-                &current_user_request,
-                &messages,
-                request.caller_kind,
+            let audit_decision = terminal_audit_decision(
                 SpineTerminalTextKind::Blocked,
                 TerminalTextProvenance::SystemAuthored,
-                turn,
-                &final_text,
-            )
-            .await;
+                request.caller_kind,
+                &messages,
+                current_turn_evidence_start,
+                completion_reprompts,
+                capability_readiness_reloops,
+            );
+            let completion_verdict = if audit_decision == TerminalAuditDecision::Skip {
+                CompletionVerdict::Complete
+            } else {
+                verification_verdict_for_terminal_candidate(
+                    server,
+                    &cx,
+                    &current_user_request,
+                    &messages,
+                    request.caller_kind,
+                    SpineTerminalTextKind::Blocked,
+                    TerminalTextProvenance::SystemAuthored,
+                    turn,
+                    &final_text,
+                )
+                .await
+            };
             match next_completion_step(completion_verdict, completion_reprompts, turn, max_turns) {
                 CompletionStep::Accept => {}
                 CompletionStep::Reprompt { prompt } => {
@@ -3117,6 +3185,14 @@ pub struct AgentSpineLlmServer {
     trace: Arc<SpineTraceRecorder>,
     caller_kind: CallerKind,
     long_running: bool,
+    ordered_primary_candidates: tokio::sync::Mutex<Option<Vec<LlmAttemptCandidate>>>,
+    prompt_profiles: tokio::sync::Mutex<Option<AgentSpinePromptProfiles>>,
+}
+
+#[derive(Clone)]
+struct AgentSpinePromptProfiles {
+    primary_response: crate::core::self_evolve::PromptBundleProfile,
+    fragments: crate::core::model::prompt_fragments::PromptFragmentBundleProfile,
 }
 
 impl AgentSpineLlmServer {
@@ -3135,7 +3211,62 @@ impl AgentSpineLlmServer {
             trace,
             caller_kind,
             long_running,
+            ordered_primary_candidates: tokio::sync::Mutex::new(None),
+            prompt_profiles: tokio::sync::Mutex::new(None),
         }
+    }
+
+    async fn ordered_primary_candidates(&self) -> Vec<LlmAttemptCandidate> {
+        if let Some(cached) = self.ordered_primary_candidates.lock().await.clone() {
+            return cached;
+        }
+
+        let mut candidates = self.agent.llm_candidates_for_role(&ModelRole::Primary);
+        if candidates.is_empty() {
+            candidates.push(self.agent.primary_llm_candidate());
+        }
+        let ordered = self
+            .agent
+            .reorder_candidates_with_failover(candidates, None)
+            .await;
+
+        let mut guard = self.ordered_primary_candidates.lock().await;
+        if guard.is_none() {
+            *guard = Some(ordered);
+        }
+        guard.clone().unwrap_or_default()
+    }
+
+    async fn clear_ordered_primary_candidates(&self) {
+        *self.ordered_primary_candidates.lock().await = None;
+    }
+
+    async fn active_prompt_profiles(&self, seed_user_message: &str) -> AgentSpinePromptProfiles {
+        if let Some(cached) = self.prompt_profiles.lock().await.clone() {
+            return cached;
+        }
+
+        let primary_response = self
+            .agent
+            .active_prompt_bundle_for_message(seed_user_message)
+            .await;
+        let fragments = self
+            .agent
+            .active_prompt_fragment_bundle_for_message(seed_user_message)
+            .await;
+        let profiles = AgentSpinePromptProfiles {
+            primary_response,
+            fragments,
+        };
+
+        let mut guard = self.prompt_profiles.lock().await;
+        if guard.is_none() {
+            *guard = Some(profiles);
+        }
+        guard.clone().unwrap_or_else(|| AgentSpinePromptProfiles {
+            primary_response: crate::core::self_evolve::PromptBundleProfile::default(),
+            fragments: crate::core::model::prompt_fragments::default_prompt_fragment_bundle(),
+        })
     }
 
     async fn load_llm_image_attachments(
@@ -3401,22 +3532,10 @@ impl SpineLlmServer for AgentSpineLlmServer {
         } else {
             self.load_llm_image_attachments(&visual_attachments).await
         };
-        let mut candidates = self.agent.llm_candidates_for_role(&ModelRole::Primary);
-        if candidates.is_empty() {
-            candidates.push(self.agent.primary_llm_candidate());
-        }
-        let candidates = self
-            .agent
-            .reorder_candidates_with_failover(candidates, None)
-            .await;
-        let active_prompt_bundle = self
-            .agent
-            .active_prompt_bundle_for_message(&prepared.user_message)
-            .await;
-        let active_prompt_fragment_bundle = self
-            .agent
-            .active_prompt_fragment_bundle_for_message(&prepared.user_message)
-            .await;
+        let candidates = self.ordered_primary_candidates().await;
+        let active_prompt_profiles = self.active_prompt_profiles(&prepared.user_message).await;
+        let active_prompt_bundle = active_prompt_profiles.primary_response;
+        let active_prompt_fragment_bundle = active_prompt_profiles.fragments;
         let system_prompt = build_spine_system_prompt(
             &prepared.system_prompt,
             Some(&active_prompt_bundle),
@@ -3496,6 +3615,7 @@ impl SpineLlmServer for AgentSpineLlmServer {
                                     None,
                                 )
                                 .await;
+                            self.clear_ordered_primary_candidates().await;
                             if attempt_idx + 1 < max_attempts {
                                 tracing::warn!(
                                     slot_id = %candidate.slot_id,
@@ -3576,6 +3696,7 @@ impl SpineLlmServer for AgentSpineLlmServer {
                                 None,
                             )
                             .await;
+                        self.clear_ordered_primary_candidates().await;
                         if retryable_stream_error && attempt_idx + 1 < max_attempts {
                             tracing::warn!(
                                 slot_id = %candidate.slot_id,
@@ -3598,6 +3719,85 @@ impl SpineLlmServer for AgentSpineLlmServer {
             "provider_exhausted",
             last_error.unwrap_or_else(|| {
                 "No configured model could complete the spine turn.".to_string()
+            }),
+        ))
+    }
+
+    async fn terminal_audit_completion(
+        &self,
+        prompt: String,
+    ) -> Result<SpineChatResponse, SpineError> {
+        let candidates = self.ordered_primary_candidates().await;
+
+        let mut last_error: Option<String> = None;
+        for candidate in candidates.iter().take(3) {
+            let started = std::time::Instant::now();
+            match candidate
+                .client
+                .chat_terminal_audit_bounded(
+                    TERMINAL_AUDIT_SYSTEM_PROMPT,
+                    &prompt,
+                    TERMINAL_AUDIT_MAX_OUTPUT_TOKENS,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let provider_latency_ms = started.elapsed().as_millis() as u64;
+                    let usage = resp.usage.clone();
+                    let usage_resp = resp.clone();
+                    let usage_agent = self.agent.clone();
+                    let usage_channel = self.channel.clone();
+                    tokio::spawn(async move {
+                        usage_agent
+                            .record_llm_usage(&usage_channel, "spine_terminal_audit", &usage_resp)
+                            .await;
+                    });
+                    tracing::info!(
+                        provider_latency_ms,
+                        model = %candidate.client.model_name(),
+                        provider = %candidate.client.provider_name(),
+                        "Spine terminal audit model call completed"
+                    );
+                    return Ok(SpineChatResponse {
+                        provider_latency_ms,
+                        text: resp.content.clone(),
+                        partial_text: if resp.content.trim().is_empty() {
+                            None
+                        } else {
+                            Some(resp.content.clone())
+                        },
+                        tool_calls: Vec::new(),
+                        completion_tokens: usage
+                            .as_ref()
+                            .map(|usage| usage.completion_tokens as usize)
+                            .unwrap_or_default(),
+                        cache_read_tokens: usage
+                            .as_ref()
+                            .map(|usage| usage.cached_prompt_tokens as usize)
+                            .unwrap_or_default(),
+                        cache_creation_tokens: usage
+                            .as_ref()
+                            .map(|usage| usage.cache_creation_prompt_tokens as usize)
+                            .unwrap_or_default(),
+                    });
+                }
+                Err(error) => {
+                    let error_text = error.to_string();
+                    tracing::debug!(
+                        model = %candidate.client.model_name(),
+                        provider = %candidate.client.provider_name(),
+                        error = %safe_truncate(&error_text, 320),
+                        "Spine terminal audit candidate failed"
+                    );
+                    last_error = Some(error_text);
+                }
+            }
+        }
+
+        Err(SpineError::new(
+            "terminal_audit_failed",
+            last_error.unwrap_or_else(|| {
+                "No configured model could complete the terminal audit.".to_string()
             }),
         ))
     }
@@ -3932,6 +4132,12 @@ impl Agent {
                 content: request_context,
             });
         }
+        let capability_readiness_generation = self.capability_readiness_generation().await;
+        if let Some(readiness_context) = self.capability_readiness_context_message().await {
+            spine_messages.push(SpineMessage::System {
+                content: readiness_context,
+            });
+        }
         spine_messages.push(SpineMessage::User {
             content: message.to_string(),
         });
@@ -3943,6 +4149,7 @@ impl Agent {
         request.long_running =
             execution_profile_requests_long_running(request.execution_profile.as_ref());
         request.browser_profile_context = request_hints.browser_profile_context.clone();
+        request.capability_readiness_generation = Some(capability_readiness_generation);
         request.visual_attachments = request_hints
             .attachments
             .iter()
@@ -4002,11 +4209,7 @@ impl Agent {
                 messages,
                 turns_used: _,
             } => Ok(ProcessedMessage {
-                response: spine_narrated_final_text(
-                    request.messages.len(),
-                    &messages,
-                    &final_text,
-                ),
+                response: spine_narrated_final_text(request.messages.len(), &messages, &final_text),
                 conversation_id: conversation_id.map(str::to_string),
                 conversation_title: None,
                 run_id: None,
@@ -5018,11 +5221,11 @@ fn resource_rw_content_properties() -> serde_json::Map<String, serde_json::Value
             "Resource path, API path, operation path, or managed file path depending on the selected resource kind.",
         ),
         ("task_id", "Existing scheduled task id for updates."),
-        ("cron", "Five-field recurring schedule at minute granularity."),
         (
-            "at",
-            "ISO 8601 timestamp for one-time scheduled work.",
+            "cron",
+            "Five-field recurring schedule at minute granularity.",
         ),
+        ("at", "ISO 8601 timestamp for one-time scheduled work."),
         (
             "scheduled_for",
             "Alias for an ISO 8601 one-time scheduled timestamp.",
@@ -5141,17 +5344,10 @@ fn resource_rw_content_properties() -> serde_json::Map<String, serde_json::Value
             "Watcher follow-up instructions executed only when the condition is met.",
         ),
     ] {
-        insert_schema_property(
-            &mut properties,
-            key,
-            schema_property("string", description),
-        );
+        insert_schema_property(&mut properties, key, schema_property("string", description));
     }
     for (key, description) in [
-        (
-            "action_arguments",
-            "Arguments for the scheduled action.",
-        ),
+        ("action_arguments", "Arguments for the scheduled action."),
         (
             "default_headers",
             "Default non-secret headers for custom API operation definitions.",
@@ -5186,11 +5382,7 @@ fn resource_rw_content_properties() -> serde_json::Map<String, serde_json::Value
             "Advanced durable automation execution policy.",
         ),
     ] {
-        insert_schema_property(
-            &mut properties,
-            key,
-            schema_property("object", description),
-        );
+        insert_schema_property(&mut properties, key, schema_property("object", description));
     }
     for (key, description) in [
         (
@@ -8680,6 +8872,20 @@ enum CompletionStep {
     AcceptWithCaveat { message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalAuditReason {
+    CurrentTurnToolEvidence,
+    BlockedTerminal,
+    CompletionReprompt,
+    CapabilityReadinessReloop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalAuditDecision {
+    Skip,
+    Audit { reason: TerminalAuditReason },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FreshnessVerdict {
     Fresh,
@@ -8701,6 +8907,51 @@ fn completion_guarded_max_turns(request_max_turns: usize) -> usize {
 
 fn completion_reprompts_after_tool_evidence(_completion_reprompts: usize) -> usize {
     0
+}
+
+fn current_turn_has_tool_evidence(
+    messages: &[SpineMessage],
+    current_turn_evidence_start: usize,
+) -> bool {
+    messages
+        .iter()
+        .skip(current_turn_evidence_start)
+        .any(|message| matches!(message, SpineMessage::Tool { .. }))
+}
+
+fn terminal_audit_decision(
+    kind: SpineTerminalTextKind,
+    provenance: TerminalTextProvenance,
+    caller_kind: CallerKind,
+    messages: &[SpineMessage],
+    current_turn_evidence_start: usize,
+    completion_reprompts: usize,
+    capability_readiness_reloops: usize,
+) -> TerminalAuditDecision {
+    if !terminal_kind_requires_completion_verification(kind, provenance, caller_kind) {
+        return TerminalAuditDecision::Skip;
+    }
+    if kind == SpineTerminalTextKind::Blocked {
+        return TerminalAuditDecision::Audit {
+            reason: TerminalAuditReason::BlockedTerminal,
+        };
+    }
+    if current_turn_has_tool_evidence(messages, current_turn_evidence_start) {
+        return TerminalAuditDecision::Audit {
+            reason: TerminalAuditReason::CurrentTurnToolEvidence,
+        };
+    }
+    if completion_reprompts > 0 {
+        return TerminalAuditDecision::Audit {
+            reason: TerminalAuditReason::CompletionReprompt,
+        };
+    }
+    if capability_readiness_reloops > 0 {
+        return TerminalAuditDecision::Audit {
+            reason: TerminalAuditReason::CapabilityReadinessReloop,
+        };
+    }
+    TerminalAuditDecision::Skip
 }
 
 fn current_turn_tool_evidence_text(messages: &[SpineMessage], start_index: usize) -> String {
@@ -8733,35 +8984,6 @@ fn current_turn_tool_evidence_text(messages: &[SpineMessage], start_index: usize
     selected.join("\n---\n")
 }
 
-async fn freshness_verdict_for_terminal_candidate(
-    server: &dyn SpineLlmServer,
-    current_user_request: &str,
-    messages: &[SpineMessage],
-    current_turn_evidence_start: usize,
-    proposed_answer: &str,
-) -> FreshnessVerdict {
-    let prompt = build_freshness_prompt(
-        current_user_request,
-        proposed_answer,
-        &current_turn_tool_evidence_text(messages, current_turn_evidence_start),
-    );
-    let verify_messages = vec![SpineMessage::User { content: prompt }];
-    let started = std::time::Instant::now();
-    let verdict = match server
-        .chat_completion(verify_messages, Vec::new(), false, Vec::new())
-        .await
-    {
-        Ok(response) => parse_freshness_verdict(&response.text),
-        Err(_) => FreshnessVerdict::Fresh,
-    };
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        requires_refresh = matches!(verdict, FreshnessVerdict::RefreshRequired { .. }),
-        "Spine freshness verifier completed"
-    );
-    verdict
-}
-
 /// Structural grounding: true when the current turn produced at least one
 /// tool result whose normalized evidence envelope reports status "ok"
 /// (normalize_tool_evidence_envelope writes that top-level status into every
@@ -8791,6 +9013,30 @@ fn current_turn_has_successful_tool_evidence(
         })
 }
 
+const CAPABILITY_READINESS_CONTEXT_PREFIX: &str = "Capability readiness context:\n";
+
+fn has_capability_readiness_context_evidence(messages: &[SpineMessage]) -> bool {
+    messages.iter().any(|message| {
+        let SpineMessage::System { content } = message else {
+            return false;
+        };
+        let Some(raw_json) = content.strip_prefix(CAPABILITY_READINESS_CONTEXT_PREFIX) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+            return false;
+        };
+        value
+            .get("generation")
+            .and_then(|value| value.as_u64())
+            .is_some()
+            && value
+                .get("entries")
+                .and_then(|value| value.as_array())
+                .is_some()
+    })
+}
+
 /// ONE verifier round-trip producing BOTH terminal judgments (freshness +
 /// completion) over the same inputs, replacing two sequential LLM calls.
 async fn combined_terminal_verdicts(
@@ -8810,16 +9056,19 @@ async fn combined_terminal_verdicts(
     let prompt = build_combined_verification_prompt(
         current_user_request,
         proposed_answer,
+        &recent_user_context_text(messages),
         &current_turn_tool_evidence_text(messages, current_turn_evidence_start),
         &recent_tool_evidence_text(messages),
     );
-    let verify_messages = vec![SpineMessage::User { content: prompt }];
     let started = std::time::Instant::now();
-    let (freshness, completion) = match server
-        .chat_completion(verify_messages, Vec::new(), false, Vec::new())
-        .await
-    {
-        Ok(response) => parse_combined_verdicts(&response.text),
+    let (freshness, completion) = match server.terminal_audit_completion(prompt).await {
+        Ok(response) => {
+            tracing::debug!(
+                response_preview = %safe_truncate(&response.text, 320),
+                "Spine merged terminal verifier raw response"
+            );
+            parse_combined_verdicts(&response.text)
+        }
         Err(_) => (FreshnessVerdict::Fresh, CompletionVerdict::Complete),
     };
     tracing::info!(
@@ -8839,12 +9088,14 @@ async fn combined_terminal_verdicts(
 fn build_combined_verification_prompt(
     user_goal: &str,
     proposed_answer: &str,
+    recent_user_context: &str,
     current_turn_evidence: &str,
     recent_evidence: &str,
 ) -> String {
     format!(
         "You are the terminal verifier for an agent answer. Make TWO independent judgments from underlying meaning, not wording, casing, grammar, punctuation, order, or style.\n\n\
          USER REQUEST:\n{user_goal}\n\n\
+         RECENT USER CONTEXT:\n{recent_user_context}\n\n\
          PROPOSED FINAL ANSWER:\n{proposed_answer}\n\n\
          CURRENT-TURN LIVE EVIDENCE:\n{current_turn_evidence}\n\n\
          EVIDENCE PRODUCED SO FAR:\n{recent_evidence}\n\n\
@@ -8908,6 +9159,7 @@ fn parse_combined_verdicts(text: &str) -> (FreshnessVerdict, CompletionVerdict) 
     (freshness, completion)
 }
 
+#[cfg(test)]
 fn parse_freshness_verdict(text: &str) -> FreshnessVerdict {
     let Some(object_text) = extract_first_json_object(text) else {
         return FreshnessVerdict::Fresh;
@@ -8938,6 +9190,7 @@ fn parse_freshness_verdict(text: &str) -> FreshnessVerdict {
     FreshnessVerdict::RefreshRequired { reason, query }
 }
 
+#[cfg(test)]
 fn build_freshness_prompt(
     user_goal: &str,
     proposed_answer: &str,
@@ -9207,11 +9460,13 @@ fn parse_verification_verdict(text: &str) -> CompletionVerdict {
 fn build_verification_prompt(
     user_goal: &str,
     proposed_answer: &str,
+    recent_user_context: &str,
     tool_evidence: &str,
 ) -> String {
     format!(
         "You are a completion verifier. Decide whether the user's request has actually been fulfilled using the produced evidence, not merely announced or intended.\n\n\
          USER REQUEST:\n{user_goal}\n\n\
+         RECENT USER CONTEXT:\n{recent_user_context}\n\n\
          PROPOSED FINAL ANSWER:\n{proposed_answer}\n\n\
          EVIDENCE PRODUCED SO FAR:\n{tool_evidence}\n\n\
          Reply with only a JSON object. Use {{\"complete\": true}} when every meaningful part of the request is genuinely done. Use {{\"complete\": false, \"evidence_gap\": \"<concrete missing user-visible outcome and how to tell>\"}} when the outcome is not yet evidenced. The evidence may contain internal traces, but evidence_gap must describe the missing user-visible outcome and visible proof, not internal procedure, tool names, function names, JSON keys, exact route names, or a prescribed implementation mechanism. Judge the outcome by the user's intent and the evidence, without assuming any particular task category, tool, wording, or response shape."
@@ -9439,6 +9694,7 @@ fn current_user_request_text(messages: &[SpineMessage]) -> String {
 }
 
 const COMPLETION_VERIFIER_EVIDENCE_CHAR_BUDGET: usize = 12_000;
+const COMPLETION_VERIFIER_USER_CONTEXT_CHAR_BUDGET: usize = 2_000;
 
 fn tail_chars(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
@@ -9478,24 +9734,57 @@ fn recent_tool_evidence_text(messages: &[SpineMessage]) -> String {
     selected.join("\n---\n")
 }
 
+fn recent_user_context_text(messages: &[SpineMessage]) -> String {
+    let mut remaining = COMPLETION_VERIFIER_USER_CONTEXT_CHAR_BUDGET;
+    let mut selected = Vec::new();
+
+    for content in messages.iter().rev().filter_map(|message| match message {
+        SpineMessage::User { content } => Some(content.trim()),
+        _ => None,
+    }) {
+        if remaining == 0 {
+            break;
+        }
+        if content.is_empty() {
+            continue;
+        }
+        let content_chars = content.chars().count();
+        if content_chars <= remaining {
+            selected.push(content.to_string());
+            remaining -= content_chars;
+        } else {
+            selected.push(tail_chars(content, remaining));
+            break;
+        }
+    }
+
+    selected.reverse();
+    selected.join("\n---\n")
+}
+
 async fn verify_completion(
     server: &dyn SpineLlmServer,
     current_user_request: &str,
     messages: &[SpineMessage],
     proposed_answer: &str,
 ) -> CompletionVerdict {
+    let recent_user_context = recent_user_context_text(messages);
+    let tool_evidence = recent_tool_evidence_text(messages);
     let prompt = build_verification_prompt(
         current_user_request,
         proposed_answer,
-        &recent_tool_evidence_text(messages),
+        &recent_user_context,
+        &tool_evidence,
     );
-    let verify_messages = vec![SpineMessage::User { content: prompt }];
     let started = std::time::Instant::now();
-    let verdict = match server
-        .chat_completion(verify_messages, Vec::new(), false, Vec::new())
-        .await
-    {
-        Ok(response) => parse_verification_verdict(&response.text),
+    let verdict = match server.terminal_audit_completion(prompt).await {
+        Ok(response) => {
+            tracing::debug!(
+                response_preview = %safe_truncate(&response.text, 320),
+                "Spine completion verifier raw response"
+            );
+            parse_verification_verdict(&response.text)
+        }
         Err(_) => CompletionVerdict::Complete,
     };
     tracing::info!(
@@ -9747,6 +10036,41 @@ mod tests {
     }
 
     #[test]
+    fn terminal_audit_prompt_carries_recent_user_context_for_followups() {
+        let messages = vec![
+            SpineMessage::User {
+                content: "install a public data API".to_string(),
+            },
+            SpineMessage::Assistant {
+                content: Some("Installed.".to_string()),
+                tool_calls: Vec::new(),
+            },
+            SpineMessage::User {
+                content: "list examples with attributes".to_string(),
+            },
+            SpineMessage::Assistant {
+                content: Some("Here are examples.".to_string()),
+                tool_calls: Vec::new(),
+            },
+            SpineMessage::User {
+                content: "same category subset".to_string(),
+            },
+        ];
+
+        let context = recent_user_context_text(&messages);
+        let prompt = build_verification_prompt(
+            "same category subset",
+            "I found the API id. I will retrieve the subset now.",
+            &context,
+            r#"{"status":"ok","data":{"id":"public-api"}}"#,
+        );
+
+        assert!(prompt.contains("RECENT USER CONTEXT"));
+        assert!(prompt.contains("list examples with attributes"));
+        assert!(prompt.contains("same category subset"));
+    }
+
+    #[test]
     fn parse_freshness_verdict_requests_live_integration_refresh_semantically() {
         let verdict = parse_freshness_verdict(
             r#"{"requires_refresh":true,"reason":"the answer depends on current integration credential state without live evidence","query":"Linear"}"#,
@@ -9979,6 +10303,7 @@ mod tests {
             "That provider is not ready yet.",
             "",
             "",
+            "",
         )
         .to_ascii_lowercase();
 
@@ -10040,6 +10365,172 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_no_tool_terminal_chat_skips_completion_audit_structurally() {
+        let messages = vec![SpineMessage::User {
+            content: "arbitrary user wording must not matter".to_string(),
+        }];
+
+        let decision = terminal_audit_decision(
+            SpineTerminalTextKind::Completed,
+            TerminalTextProvenance::ModelAuthored,
+            CallerKind::Chat,
+            &messages,
+            0,
+            0,
+            0,
+        );
+
+        assert_eq!(decision, TerminalAuditDecision::Skip);
+    }
+
+    #[test]
+    fn current_turn_tool_evidence_requires_completion_audit_structurally() {
+        let messages = vec![
+            SpineMessage::User {
+                content: "same arbitrary wording".to_string(),
+            },
+            SpineMessage::Tool {
+                tool_call_id: "call-1".to_string(),
+                content: r#"{"status":"ok","data":{"id":"work-1"}}"#.to_string(),
+            },
+        ];
+
+        let decision = terminal_audit_decision(
+            SpineTerminalTextKind::Completed,
+            TerminalTextProvenance::ModelAuthored,
+            CallerKind::Chat,
+            &messages,
+            1,
+            0,
+            0,
+        );
+
+        assert_eq!(
+            decision,
+            TerminalAuditDecision::Audit {
+                reason: TerminalAuditReason::CurrentTurnToolEvidence
+            }
+        );
+    }
+
+    #[derive(Default)]
+    struct AuditTransportTestServer {
+        chat_calls: std::sync::atomic::AtomicUsize,
+        audit_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SpineLlmServer for AuditTransportTestServer {
+        async fn chat_completion(
+            &self,
+            _messages: Vec<SpineMessage>,
+            _tool_schemas: Vec<ActionDef>,
+            _streaming: bool,
+            _visual_attachments: Vec<ChatAttachmentHint>,
+        ) -> Result<SpineChatResponse, SpineError> {
+            self.chat_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(SpineChatResponse {
+                text: r#"{"complete":false,"evidence_gap":"missing evidence"}"#.to_string(),
+                partial_text: None,
+                tool_calls: Vec::new(),
+                completion_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                provider_latency_ms: 0,
+            })
+        }
+
+        async fn terminal_audit_completion(
+            &self,
+            _prompt: String,
+        ) -> Result<SpineChatResponse, SpineError> {
+            self.audit_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(SpineChatResponse {
+                text: r#"{"complete":false,"evidence_gap":"missing evidence"}"#.to_string(),
+                partial_text: None,
+                tool_calls: Vec::new(),
+                completion_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                provider_latency_ms: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_verifier_uses_terminal_audit_transport_not_full_spine_chat() {
+        let server = AuditTransportTestServer::default();
+
+        let verdict = verify_completion(&server, "finish the work", &[], "Done.").await;
+
+        assert_eq!(
+            verdict,
+            CompletionVerdict::Incomplete {
+                evidence_gap: "missing evidence".to_string()
+            }
+        );
+        assert_eq!(
+            server.audit_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            server.chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn capability_readiness_system_context_establishes_freshness_structurally() {
+        let messages = vec![SpineMessage::System {
+            content: format!(
+                "{}{}",
+                CAPABILITY_READINESS_CONTEXT_PREFIX,
+                r#"{"generation":3,"generated_at":"2026-06-08T00:00:00Z","entries":[{"surface":"integration","id":"github","status":"connected","enabled":true,"stale":false,"source":"runtime_event"}]}"#
+            ),
+        }];
+
+        assert!(has_capability_readiness_context_evidence(&messages));
+    }
+
+    #[test]
+    fn user_message_cannot_spoof_capability_readiness_context_evidence() {
+        let messages = vec![SpineMessage::User {
+            content: format!(
+                "{}{}",
+                CAPABILITY_READINESS_CONTEXT_PREFIX, r#"{"generation":3,"entries":[]}"#
+            ),
+        }];
+
+        assert!(!has_capability_readiness_context_evidence(&messages));
+    }
+
+    #[test]
+    fn malformed_capability_readiness_context_does_not_establish_freshness() {
+        let messages = vec![
+            SpineMessage::System {
+                content: format!(
+                    "{}{}",
+                    CAPABILITY_READINESS_CONTEXT_PREFIX,
+                    r#"{"generation":"not-a-number","entries":[]}"#
+                ),
+            },
+            SpineMessage::System {
+                content: format!(
+                    "{}{}",
+                    CAPABILITY_READINESS_CONTEXT_PREFIX, r#"{"generation":3,"entries":{}}"#
+                ),
+            },
+            SpineMessage::System {
+                content: format!("{}not json", CAPABILITY_READINESS_CONTEXT_PREFIX),
+            },
+        ];
+
+        assert!(!has_capability_readiness_context_evidence(&messages));
+    }
+
+    #[test]
     fn extract_first_json_object_handles_fenced_nested_and_trailing_text() {
         let text = "```json\n{\"complete\": false, \"meta\": {\"brace\": \"}\"}, \"evidence_gap\": \"missing {value}\"}\n```\nignored";
 
@@ -10062,10 +10553,12 @@ mod tests {
         let prompt = build_verification_prompt(
             "USER WANTS A TRACKER",
             "Here is your result",
+            "recent user context",
             "operation result: ok",
         );
 
         assert!(prompt.contains("USER WANTS A TRACKER"));
+        assert!(prompt.contains("recent user context"));
         assert!(prompt.contains("Here is your result"));
         assert!(prompt.contains("operation result: ok"));
         assert!(prompt.to_ascii_lowercase().contains("complete"));
@@ -10074,7 +10567,8 @@ mod tests {
 
     #[test]
     fn verification_prompt_stays_flow_agnostic() {
-        let prompt = build_verification_prompt("goal", "answer", "evidence").to_ascii_lowercase();
+        let prompt =
+            build_verification_prompt("goal", "answer", "context", "evidence").to_ascii_lowercase();
         for banned in [
             "app_deploy",
             "app_restart",
@@ -10101,7 +10595,8 @@ mod tests {
 
     #[test]
     fn verifier_prompt_requires_user_visible_gaps_not_internal_procedure() {
-        let prompt = build_verification_prompt("goal", "answer", "evidence").to_ascii_lowercase();
+        let prompt =
+            build_verification_prompt("goal", "answer", "context", "evidence").to_ascii_lowercase();
 
         assert!(prompt.contains("user-visible outcome"));
         assert!(prompt.contains("visible proof"));

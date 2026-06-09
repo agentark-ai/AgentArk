@@ -36,7 +36,15 @@ pub(super) async fn create_plugin(
     let plugins = agent.plugins.clone();
     let mut guard = plugins.write().await;
     match guard.upsert_plugin(&agent.runtime, None, request).await {
-        Ok(plugin) => Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response(),
+        Ok(plugin) => {
+            drop(guard);
+            agent
+                .refresh_plugin_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -53,7 +61,15 @@ pub(super) async fn update_plugin(
         .upsert_plugin(&agent.runtime, Some(plugin_id.as_str()), request)
         .await
     {
-        Ok(plugin) => Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response(),
+        Ok(plugin) => {
+            drop(guard);
+            agent
+                .refresh_plugin_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response()
+        }
         Err(error) if error.to_string().contains("not found") => {
             error_response(StatusCode::NOT_FOUND, error)
         }
@@ -72,7 +88,15 @@ pub(super) async fn delete_plugin(
         .delete_plugin(&agent.runtime, plugin_id.as_str())
         .await
     {
-        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Ok(()) => {
+            drop(guard);
+            agent
+                .refresh_plugin_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            Json(serde_json::json!({ "status": "ok" })).into_response()
+        }
         Err(error) if error.to_string().contains("not found") => {
             error_response(StatusCode::NOT_FOUND, error)
         }
@@ -91,7 +115,15 @@ pub(super) async fn refresh_plugin(
         .refresh_plugin(&agent.runtime, plugin_id.as_str())
         .await
     {
-        Ok(plugin) => Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response(),
+        Ok(plugin) => {
+            drop(guard);
+            agent
+                .refresh_plugin_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response()
+        }
         Err(error) if error.to_string().contains("not found") => {
             error_response(StatusCode::NOT_FOUND, error)
         }
@@ -103,17 +135,34 @@ pub(super) async fn test_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
 ) -> Response {
-    let plugins = {
+    let (plugins, agent_for_readiness) = {
         let agent = state.agent.read().await;
-        agent.plugins.clone()
+        (agent.plugins.clone(), agent.clone())
     };
     let mut guard = plugins.write().await;
     match guard.ping_plugin(plugin_id.as_str()).await {
-        Ok(result) => Json(serde_json::json!({ "status": "ok", "result": result })).into_response(),
+        Ok(result) => {
+            drop(guard);
+            agent_for_readiness
+                .refresh_plugin_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            Json(serde_json::json!({ "status": "ok", "result": result })).into_response()
+        }
         Err(error) if error.to_string().contains("not found") => {
             error_response(StatusCode::NOT_FOUND, error)
         }
-        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+        Err(error) => {
+            let message = error.to_string();
+            drop(guard);
+            agent_for_readiness
+                .refresh_plugin_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::UseTimeFailure,
+                )
+                .await;
+            error_response(StatusCode::BAD_REQUEST, message)
+        }
     }
 }
 

@@ -88,6 +88,8 @@ pub(crate) mod ark_distill;
 mod automation_helpers;
 #[path = "operations/background_sessions.rs"]
 mod background_sessions;
+#[path = "operations/capability_readiness.rs"]
+pub mod capability_readiness;
 #[path = "conversation/chat_approvals.rs"]
 mod chat_approvals;
 #[path = "conversation/conversation_context.rs"]
@@ -1513,6 +1515,12 @@ pub struct Agent {
     /// Conversation history per channel, trimmed by the active model's token budget.
     pub conversation_history:
         Arc<RwLock<std::collections::HashMap<String, Vec<ConversationMessage>>>>,
+
+    /// Canonical readiness state for AgentArk-managed capabilities.
+    pub capability_readiness: Arc<RwLock<capability_readiness::CapabilityReadinessRegistry>>,
+
+    /// Readiness invalidation stream for mid-turn and UI consumers.
+    capability_readiness_events: broadcast::Sender<capability_readiness::CapabilityReadinessEvent>,
 
     /// Multi-turn chat flow state for integration onboarding ("connect <integration> ...").
     integration_connect_flows: Arc<

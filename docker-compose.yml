@@ -237,9 +237,10 @@ services:
     image: ${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
     container_name: agentark-embeddings
     restart: unless-stopped
-    # Embedding model load is memory-bound, not CPU-bound — keep the
-    # 768 MB headroom but tighten CPU since scoring runs in bursts.
-    cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.2}"
+    # Hot-path semantic checks share this sidecar with background embedding
+    # work, so keep enough CPU for short requests to complete inside chat
+    # grace windows even while bulk requests are active.
+    cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.5}"
     mem_limit: "${AGENTARK_EMBEDDINGS_MEMORY:-768M}"
     security_opt:
       - no-new-privileges:true
@@ -276,10 +277,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.2}"
+          cpus: "${AGENTARK_EMBEDDINGS_CPUS:-0.5}"
           memory: "${AGENTARK_EMBEDDINGS_MEMORY:-768M}"
         reservations:
-          cpus: "0.1"
+          cpus: "0.2"
           memory: 128M
     logging:
       driver: json-file

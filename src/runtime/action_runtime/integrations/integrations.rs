@@ -2081,7 +2081,10 @@ impl ActionRuntime {
             None
         };
         let message = if needs_credentials {
-            format!("MCP server configuration saved. Credentials are still required through the secure credential form or {}.", settings_path)
+            format!(
+                "MCP server configuration saved. Credentials are still required through the secure credential form or {}.",
+                settings_path
+            )
         } else {
             "MCP server configuration saved.".to_string()
         };
@@ -2989,9 +2992,14 @@ impl ActionRuntime {
                 .and_then(|value| value.as_array())
                 .cloned()
                 .unwrap_or_default();
-            for record in
-                Self::integration_scan_matches(&mut scan, "companion_devices", devices, id, &query_terms, 8)
-            {
+            for record in Self::integration_scan_matches(
+                &mut scan,
+                "companion_devices",
+                devices,
+                id,
+                &query_terms,
+                8,
+            ) {
                 matches.push(serde_json::json!({
                     "surface": "companion_devices",
                     "record": record,
@@ -3014,9 +3022,14 @@ impl ActionRuntime {
                 .and_then(|value| value.as_array())
                 .cloned()
                 .unwrap_or_default();
-            for record in
-                Self::integration_scan_matches(&mut scan, "integrations", integrations, id, &query_terms, 8)
-            {
+            for record in Self::integration_scan_matches(
+                &mut scan,
+                "integrations",
+                integrations,
+                id,
+                &query_terms,
+                8,
+            ) {
                 let integration_id = record.get("id").and_then(|value| value.as_str());
                 if integration_id.is_none() {
                     continue;
@@ -3060,9 +3073,14 @@ impl ActionRuntime {
                 .and_then(|value| value.as_array())
                 .cloned()
                 .unwrap_or_default();
-            for record in
-                Self::integration_scan_matches(&mut scan, "gateway_channels", channels, id, &query_terms, 8)
-            {
+            for record in Self::integration_scan_matches(
+                &mut scan,
+                "gateway_channels",
+                channels,
+                id,
+                &query_terms,
+                8,
+            ) {
                 matches.push(serde_json::json!({
                     "surface": "gateway_channels",
                     "record": record,
@@ -3086,9 +3104,14 @@ impl ActionRuntime {
                 .and_then(|value| value.as_array())
                 .cloned()
                 .unwrap_or_default();
-            for record in
-                Self::integration_scan_matches(&mut scan, "notification_channels", channels, id, &query_terms, 8)
-            {
+            for record in Self::integration_scan_matches(
+                &mut scan,
+                "notification_channels",
+                channels,
+                id,
+                &query_terms,
+                8,
+            ) {
                 matches.push(serde_json::json!({
                     "surface": "notification_channels",
                     "record": record,
@@ -3170,9 +3193,14 @@ impl ActionRuntime {
                 .and_then(|value| value.as_array())
                 .cloned()
                 .unwrap_or_default();
-            for record in
-                Self::integration_scan_matches(&mut scan, "webhook_sources", sources, id, &query_terms, 8)
-            {
+            for record in Self::integration_scan_matches(
+                &mut scan,
+                "webhook_sources",
+                sources,
+                id,
+                &query_terms,
+                8,
+            ) {
                 matches.push(serde_json::json!({
                     "surface": "webhook_sources",
                     "record": record,
@@ -3195,9 +3223,14 @@ impl ActionRuntime {
                     .into_iter()
                     .map(serde_json::to_value)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                for record in
-                    Self::integration_scan_matches(&mut scan, "extension_packs", installed, id, &query_terms, 8)
-                {
+                for record in Self::integration_scan_matches(
+                    &mut scan,
+                    "extension_packs",
+                    installed,
+                    id,
+                    &query_terms,
+                    8,
+                ) {
                     let pack_id = record
                         .get("manifest")
                         .and_then(|manifest| manifest.get("id"))
@@ -3237,9 +3270,14 @@ impl ActionRuntime {
                     .into_iter()
                     .map(serde_json::to_value)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                for record in
-                    Self::integration_scan_matches(&mut scan, "plugins", plugins, id, &query_terms, 8)
-                {
+                for record in Self::integration_scan_matches(
+                    &mut scan,
+                    "plugins",
+                    plugins,
+                    id,
+                    &query_terms,
+                    8,
+                ) {
                     matches.push(serde_json::json!({
                         "surface": "plugins",
                         "record": record,
@@ -3263,9 +3301,14 @@ impl ActionRuntime {
                     .into_iter()
                     .map(serde_json::to_value)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                for record in
-                    Self::integration_scan_matches(&mut scan, "mcp_servers", servers, id, &query_terms, 8)
-                {
+                for record in Self::integration_scan_matches(
+                    &mut scan,
+                    "mcp_servers",
+                    servers,
+                    id,
+                    &query_terms,
+                    8,
+                ) {
                     matches.push(serde_json::json!({
                         "surface": "mcp_servers",
                         "record": record,

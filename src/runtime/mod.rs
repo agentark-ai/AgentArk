@@ -589,6 +589,8 @@ pub struct ActionScopeHint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_api_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integration_ids: Vec<String>,
@@ -598,6 +600,43 @@ pub struct ActionScopeHint {
     pub requires_ssh_connection: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channel_targets: Vec<crate::actions::ActionChannelTarget>,
+}
+
+impl ActionRuntime {
+    pub async fn action_scope_hint(&self, action_name: &str) -> Option<ActionScopeHint> {
+        let actions = self.actions.read().await;
+        let action = actions.get(action_name)?;
+        let access = &action.info.authorization.access;
+        let mut hint = ActionScopeHint {
+            mcp_server_id: action
+                .mcp_binding
+                .as_ref()
+                .map(|binding| binding.server_id.clone()),
+            plugin_id: action
+                .plugin_binding
+                .as_ref()
+                .map(|binding| binding.plugin_id.clone()),
+            custom_api_id: action
+                .custom_api_binding
+                .as_ref()
+                .map(|binding| binding.api_id.clone()),
+            integration_ids: access.integration_ids.clone(),
+            extension_pack_ids: access.extension_pack_ids.clone(),
+            requires_ssh_connection: access.requires_ssh_connection,
+            channel_targets: access.channel_targets.clone(),
+        };
+        if let Some(binding) = action.extension_pack_binding.as_ref() {
+            if !binding.pack_id.trim().is_empty()
+                && !hint
+                    .extension_pack_ids
+                    .iter()
+                    .any(|id| id == &binding.pack_id)
+            {
+                hint.extension_pack_ids.push(binding.pack_id.clone());
+            }
+        }
+        Some(hint)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

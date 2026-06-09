@@ -6509,6 +6509,7 @@ impl Agent {
         .await;
 
         let action_catalog_before = self.runtime_action_catalog_fingerprint().await;
+        let capability_scope_hint = self.runtime.action_scope_hint(action_name).await;
         let execution = if action_name.eq_ignore_ascii_case("notify_user")
             && notification_tool_should_dispatch_for_surface(channel, authorization)
         {
@@ -6664,6 +6665,11 @@ impl Agent {
                     &event_id,
                 )
                 .await;
+                self.spawn_capability_readiness_refresh_for_action_scope(
+                    capability_scope_hint.clone(),
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                    None,
+                );
                 self.refresh_action_catalog_after_runtime_change(action_catalog_before)
                     .await;
                 Ok(result)
@@ -6691,6 +6697,11 @@ impl Agent {
                     &event_id,
                 )
                 .await;
+                self.spawn_capability_readiness_refresh_for_action_scope(
+                    capability_scope_hint.clone(),
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::UseTimeFailure,
+                    Some(err_text.clone()),
+                );
                 if typed_error.is_some() {
                     Err(e)
                 } else if let Some(error) =

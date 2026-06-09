@@ -60,6 +60,16 @@ async fn sync_extension_pack_runtime(
         agent_for_catalog
             .refresh_action_catalog_index("extension_pack_runtime_sync")
             .await;
+        agent_for_catalog
+            .refresh_extension_pack_capability_readiness_snapshot(
+                crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+            )
+            .await;
+        agent_for_catalog
+            .refresh_messaging_channel_capability_readiness_snapshot(
+                crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+            )
+            .await;
     }
     warning
 }
@@ -931,12 +941,13 @@ pub(super) async fn test_extension_pack_connection(
     State(state): State<AppState>,
     Path((pack_id, connection_id)): Path<(String, String)>,
 ) -> Response {
-    let (registry, mcp, plugins) = {
+    let (registry, mcp, plugins, agent_for_readiness) = {
         let agent = state.agent.read().await;
         (
             agent.extension_packs.clone(),
             agent.mcp.clone(),
             agent.plugins.clone(),
+            agent.clone(),
         )
     };
     let mut guard = registry.write().await;
@@ -949,7 +960,20 @@ pub(super) async fn test_extension_pack_connection(
         )
         .await
     {
-        Ok(result) => Json(serde_json::json!({ "status": "ok", "result": result })).into_response(),
+        Ok(result) => {
+            drop(guard);
+            agent_for_readiness
+                .refresh_extension_pack_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            agent_for_readiness
+                .refresh_messaging_channel_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            Json(serde_json::json!({ "status": "ok", "result": result })).into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }

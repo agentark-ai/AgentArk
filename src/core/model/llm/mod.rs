@@ -447,11 +447,12 @@ fn tool_argument_phase(tool_name: &str) -> (&'static str, &'static str) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelRequestMode {
     Helper,
     LongRunningTool,
     Classifier,
+    TerminalAudit,
 }
 
 fn sanitize_model_request_bundle(
@@ -543,7 +544,9 @@ fn attach_runtime_identity_contract(mode: ModelRequestMode, system_prompt: &str)
     }
     let contract = match mode {
         ModelRequestMode::Helper | ModelRequestMode::LongRunningTool => runtime_identity_contract(),
-        ModelRequestMode::Classifier => classifier_runtime_identity_contract(),
+        ModelRequestMode::Classifier | ModelRequestMode::TerminalAudit => {
+            classifier_runtime_identity_contract()
+        }
     };
     format!("{}\n\n{}", system_prompt.trim_end(), contract)
 }
@@ -1421,17 +1424,31 @@ fn openai_compatible_uses_minimax_reasoning_split(
 
 fn openai_compatible_reasoning_request(
     request_config: &ResolvedOpenAiRequestConfig,
+    mode: ModelRequestMode,
 ) -> Option<serde_json::Value> {
     if request_config.is_openrouter {
-        return Some(serde_json::json!({ "exclude": false }));
+        return Some(match mode {
+            ModelRequestMode::Classifier => {
+                serde_json::json!({ "effort": "low", "exclude": true })
+            }
+            ModelRequestMode::TerminalAudit => {
+                serde_json::json!({ "effort": "medium", "exclude": false })
+            }
+            ModelRequestMode::Helper | ModelRequestMode::LongRunningTool => {
+                serde_json::json!({ "exclude": false })
+            }
+        });
     }
     None
 }
 
 fn openai_compatible_include_reasoning(
     request_config: &ResolvedOpenAiRequestConfig,
+    mode: ModelRequestMode,
 ) -> Option<bool> {
-    request_config.is_openrouter.then_some(true)
+    request_config
+        .is_openrouter
+        .then_some(!matches!(mode, ModelRequestMode::Classifier))
 }
 
 fn openai_compatible_thinking_request(
@@ -2856,9 +2873,13 @@ mod tests {
             None,
         );
 
-        assert!(user_message.contains("[EMAIL]"));
-        assert!(!user_message.contains("jane@example.com"));
-        assert!(!user_message.contains("192.168.1.20"));
+        // Default posture is now SecretsOnly: the user's own addressable data
+        // (email/phone/IP) reaches the agent in the user message so it can act
+        // on it; only secret-class values (the card number) are still redacted.
+        assert!(user_message.contains("jane@example.com"));
+        assert!(user_message.contains("+1 555 123 4567"));
+        assert!(user_message.contains("192.168.1.20"));
+        assert!(!user_message.contains("4111 1111 1111 1111"));
         assert!(system_prompt.contains("<agentark_current_turn_execution_targets>"));
         assert!(system_prompt.contains("jane@example.com"));
         assert!(system_prompt.contains("+1 555 123 4567"));
@@ -3581,10 +3602,55 @@ mod tests {
         };
 
         assert_eq!(
-            openai_compatible_reasoning_request(&routed),
+            openai_compatible_reasoning_request(&routed, ModelRequestMode::Helper),
             Some(serde_json::json!({ "exclude": false }))
         );
-        assert_eq!(openai_compatible_include_reasoning(&routed), Some(true));
+        assert_eq!(
+            openai_compatible_include_reasoning(&routed, ModelRequestMode::Helper),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn openrouter_classifier_request_uses_low_effort_without_reasoning_output() {
+        let routed = ResolvedOpenAiRequestConfig {
+            api_key: String::new(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_label: OPENROUTER_PROVIDER_ID,
+            is_openrouter: true,
+            uses_codex_cli_oauth: false,
+            prompt_cache_capability: PromptCacheCapability::OpenRouterProviderSpecific,
+        };
+
+        assert_eq!(
+            openai_compatible_reasoning_request(&routed, ModelRequestMode::Classifier),
+            Some(serde_json::json!({ "effort": "low", "exclude": true }))
+        );
+        assert_eq!(
+            openai_compatible_include_reasoning(&routed, ModelRequestMode::Classifier),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn openrouter_terminal_audit_request_keeps_reasoning_for_completion_judgment() {
+        let routed = ResolvedOpenAiRequestConfig {
+            api_key: String::new(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_label: OPENROUTER_PROVIDER_ID,
+            is_openrouter: true,
+            uses_codex_cli_oauth: false,
+            prompt_cache_capability: PromptCacheCapability::OpenRouterProviderSpecific,
+        };
+
+        assert_eq!(
+            openai_compatible_reasoning_request(&routed, ModelRequestMode::TerminalAudit),
+            Some(serde_json::json!({ "effort": "medium", "exclude": false }))
+        );
+        assert_eq!(
+            openai_compatible_include_reasoning(&routed, ModelRequestMode::TerminalAudit),
+            Some(true)
+        );
     }
 
     #[test]
@@ -4042,6 +4108,7 @@ pub struct LlmClient {
 }
 
 struct OpenAiChatParams<'a> {
+    mode: ModelRequestMode,
     api_key: &'a str,
     model: &'a str,
     base_url: Option<&'a str>,
@@ -4382,6 +4449,7 @@ fn model_request_mode_label(mode: ModelRequestMode) -> &'static str {
         ModelRequestMode::Helper => "helper",
         ModelRequestMode::LongRunningTool => "long_running_tool",
         ModelRequestMode::Classifier => "classifier",
+        ModelRequestMode::TerminalAudit => "terminal_audit",
     }
 }
 
@@ -4506,6 +4574,30 @@ impl LlmClient {
     ) -> Result<LlmResponse> {
         self.chat_with_history_in_mode(
             ModelRequestMode::Classifier,
+            system_prompt,
+            user_message,
+            &[],
+            &[],
+            &[],
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+            &[],
+            Some(max_output_tokens),
+        )
+        .await
+    }
+
+    /// Bounded semantic completion audit. This is intentionally separate from
+    /// cheap classifiers: it returns tiny JSON but still needs reasoning
+    /// quality to catch announced-but-not-done terminal answers.
+    pub async fn chat_terminal_audit_bounded(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_output_tokens: u32,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_in_mode(
+            ModelRequestMode::TerminalAudit,
             system_prompt,
             user_message,
             &[],
@@ -4758,6 +4850,7 @@ impl LlmClient {
                     base_url,
                 } => {
                     self.chat_openai_with_history(OpenAiChatParams {
+                        mode,
                         api_key,
                         model,
                         base_url: base_url.as_deref(),
@@ -5102,6 +5195,7 @@ impl LlmClient {
         let api_key = params.api_key;
         let model = params.model;
         let base_url = params.base_url;
+        let mode = params.mode;
         let system_prompt = params.system_prompt;
         let user_message = params.user_message;
         let history = params.history;
@@ -5318,8 +5412,8 @@ impl LlmClient {
             ),
             messages,
             max_tokens: max_output_tokens,
-            reasoning: openai_compatible_reasoning_request(&request_config),
-            include_reasoning: openai_compatible_include_reasoning(&request_config),
+            reasoning: openai_compatible_reasoning_request(&request_config, mode),
+            include_reasoning: openai_compatible_include_reasoning(&request_config, mode),
             reasoning_split: openai_compatible_uses_minimax_reasoning_split(&request_config, model)
                 .then_some(true),
             thinking: openai_compatible_thinking_request(&request_config, model),
@@ -6807,8 +6901,8 @@ impl LlmClient {
             ),
             messages,
             max_tokens: None,
-            reasoning: openai_compatible_reasoning_request(&request_config),
-            include_reasoning: openai_compatible_include_reasoning(&request_config),
+            reasoning: openai_compatible_reasoning_request(&request_config, params.mode),
+            include_reasoning: openai_compatible_include_reasoning(&request_config, params.mode),
             reasoning_split: openai_compatible_uses_minimax_reasoning_split(&request_config, model)
                 .then_some(true),
             thinking: openai_compatible_thinking_request(&request_config, model),

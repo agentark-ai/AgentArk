@@ -46,6 +46,10 @@ impl ActionRuntime {
                 .mcp_binding
                 .as_ref()
                 .map(|binding| binding.server_id.clone()),
+            plugin_id: loaded
+                .plugin_binding
+                .as_ref()
+                .map(|binding| binding.plugin_id.clone()),
             custom_api_id: loaded
                 .custom_api_binding
                 .as_ref()

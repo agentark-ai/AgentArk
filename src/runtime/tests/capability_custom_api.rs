@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 #[test]
 
@@ -1250,7 +1250,6 @@ async fn read_only_graphql_custom_api_rejects_mutation_body_before_network() {
         .contains("Read-only GraphQL custom API actions only accept GraphQL query"));
 }
 
-
 #[tokio::test]
 async fn capability_acquire_reports_whole_contract_on_missing_fields() {
     let temp = tempfile::tempdir().unwrap();
@@ -1352,7 +1351,6 @@ async fn capability_acquire_persists_amendable_draft_and_completes_from_delta_re
     assert!(parsed["data"]["credential_request"].is_object());
 }
 
-
 #[test]
 fn protocol_defined_request_fallback_scaffolds_post_query_contract() {
     let (request, operation_count) = ActionRuntime::protocol_defined_request_fallback(
@@ -1374,7 +1372,10 @@ fn protocol_defined_request_fallback_scaffolds_post_query_contract() {
     assert_eq!(request.enabled, Some(true));
     let operation = &request.operations[0];
     assert_eq!(operation.method, "POST");
-    assert!(operation.body_required, "generic GraphQL op must require a body");
+    assert!(
+        operation.body_required,
+        "generic GraphQL op must require a body"
+    );
     assert_eq!(
         operation
             .default_headers
@@ -1393,7 +1394,6 @@ fn protocol_defined_request_fallback_scaffolds_post_query_contract() {
     )
     .is_none());
 }
-
 
 #[tokio::test]
 async fn capability_acquire_scaffolds_graphql_endpoint_in_one_shot_without_source() {
@@ -1431,4 +1431,3 @@ async fn capability_acquire_scaffolds_graphql_endpoint_in_one_shot_without_sourc
         }
     }
 }
-

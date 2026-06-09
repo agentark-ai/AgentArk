@@ -183,16 +183,25 @@ impl ActionRuntime {
                     .clamp(1, 100) as usize;
                 let mut watchers = storage.list_watchers().await?;
                 watchers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-                let status_label = |status: &crate::core::automation::watcher::WatcherStatus| -> &'static str {
-                    match status {
-                        crate::core::automation::watcher::WatcherStatus::Active => "active",
-                        crate::core::automation::watcher::WatcherStatus::Paused => "paused",
-                        crate::core::automation::watcher::WatcherStatus::Triggered => "triggered",
-                        crate::core::automation::watcher::WatcherStatus::TimedOut => "timed_out",
-                        crate::core::automation::watcher::WatcherStatus::Cancelled => "cancelled",
-                        crate::core::automation::watcher::WatcherStatus::Failed { .. } => "failed",
-                    }
-                };
+                let status_label =
+                    |status: &crate::core::automation::watcher::WatcherStatus| -> &'static str {
+                        match status {
+                            crate::core::automation::watcher::WatcherStatus::Active => "active",
+                            crate::core::automation::watcher::WatcherStatus::Paused => "paused",
+                            crate::core::automation::watcher::WatcherStatus::Triggered => {
+                                "triggered"
+                            }
+                            crate::core::automation::watcher::WatcherStatus::TimedOut => {
+                                "timed_out"
+                            }
+                            crate::core::automation::watcher::WatcherStatus::Cancelled => {
+                                "cancelled"
+                            }
+                            crate::core::automation::watcher::WatcherStatus::Failed { .. } => {
+                                "failed"
+                            }
+                        }
+                    };
                 let rows = watchers
                     .into_iter()
                     .filter(|watcher| filter == "all" || status_label(&watcher.status) == filter)

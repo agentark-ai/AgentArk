@@ -293,34 +293,18 @@ async fn watch_schema_advertises_semantic_contract_without_low_level_poll_fields
         .expect("watch schema should expose oneOf alternatives");
 
     assert!(
-
-            one_of.iter().any(|alternative| {
-
-                alternative["required"]
-
-                    .as_array()
-
-                    .is_some_and(|required| {
-
-                        required
-
-                            == &vec![
-
-                                serde_json::Value::String("description".to_string()),
-
-                                serde_json::Value::String("condition".to_string()),
-
-                                serde_json::Value::String("on_trigger".to_string()),
-
-                            ]
-
-                    })
-
-            }),
-
-            "watch schema should allow semantic description+condition+on_trigger without poll_action/script"
-
-        );
+        one_of.iter().any(|alternative| {
+            alternative["required"].as_array().is_some_and(|required| {
+                required
+                    == &vec![
+                        serde_json::Value::String("description".to_string()),
+                        serde_json::Value::String("condition".to_string()),
+                        serde_json::Value::String("on_trigger".to_string()),
+                    ]
+            })
+        }),
+        "watch schema should allow semantic description+condition+on_trigger without poll_action/script"
+    );
 }
 
 #[derive(Debug)]
@@ -379,12 +363,9 @@ fn assert_schema_field_is_described(
         .unwrap_or_default();
 
     assert!(
-
-            !description.is_empty(),
-
-            "{action} {scope} required field `{field}` must exist in schema properties with a description"
-
-        );
+        !description.is_empty(),
+        "{action} {scope} required field `{field}` must exist in schema properties with a description"
+    );
 }
 
 fn assert_schema_exposes_required_alternative(

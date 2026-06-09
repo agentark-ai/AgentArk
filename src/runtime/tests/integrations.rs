@@ -1157,10 +1157,8 @@ async fn mcp_server_manage_saves_http_config_without_plain_secret() {
         "mcp_server_manage",
         output.clone(),
     );
-    let rendered = crate::runtime::ActionRuntime::render_tool_payload_for_legacy(
-        "mcp_server_manage",
-        payload,
-    );
+    let rendered =
+        crate::runtime::ActionRuntime::render_tool_payload_for_legacy("mcp_server_manage", payload);
     let parsed = parse_tool_completion_output(&rendered);
     assert_eq!(parsed["status"], "needs_credentials");
     assert_eq!(parsed["tool"], "mcp_server_manage");
@@ -1214,7 +1212,6 @@ async fn mcp_server_manage_accepts_install_as_create_alias() {
     assert_eq!(parsed["data"]["server_id"], "example-mcp");
 }
 
-
 #[test]
 fn integration_matcher_resolves_human_phrasing_to_slug_identity() {
     // Round-4 regression: inspect and execution must resolve the SAME record
@@ -1234,7 +1231,12 @@ fn integration_matcher_resolves_human_phrasing_to_slug_identity() {
             "id selector {id:?} must resolve the record"
         );
     }
-    for query in ["linear", "Linear GraphQL", "Linear GraphQL API", "linear integration"] {
+    for query in [
+        "linear",
+        "Linear GraphQL",
+        "Linear GraphQL API",
+        "linear integration",
+    ] {
         assert!(
             ActionRuntime::integration_value_matches(&record, None, &terms(query)),
             "query {query:?} must resolve the record"
@@ -1272,7 +1274,10 @@ async fn inspect_no_match_reports_query_miss_not_absence() {
             "a query miss over real records must not read as absence"
         );
         assert!(
-            parsed["guidance"].as_str().unwrap_or_default().contains("not evidence"),
+            parsed["guidance"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not evidence"),
             "guidance must teach that a miss is not absence"
         );
     } else {

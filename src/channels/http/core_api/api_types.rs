@@ -1072,13 +1072,17 @@ pub(super) fn parse_model_input_privacy_mode(
     value: &str,
 ) -> std::result::Result<crate::security::ModelInputPrivacyMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "default_redact" | "default-redact" => {
+        "default_redact" | "default-redact" => {
             Ok(crate::security::ModelInputPrivacyMode::DefaultRedact)
         }
         "zero_exposure" | "zero-exposure" => {
             Ok(crate::security::ModelInputPrivacyMode::ZeroExposure)
         }
-        "secrets_only" | "secrets-only" => Ok(crate::security::ModelInputPrivacyMode::SecretsOnly),
+        // Empty (unset) follows the struct Default (SecretsOnly) so a blank
+        // settings submit does not silently re-enable PII masking.
+        "" | "secrets_only" | "secrets-only" => {
+            Ok(crate::security::ModelInputPrivacyMode::SecretsOnly)
+        }
         other => Err(format!(
             "default_model_input_mode must be one of default_redact, zero_exposure, or secrets_only (got '{other}')"
         )),

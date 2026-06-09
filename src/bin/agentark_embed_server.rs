@@ -36,7 +36,8 @@ mod non_windows {
     struct AppState {
         cache_dir: PathBuf,
         default_model: String,
-        runtime: Arc<Mutex<RuntimeState>>,
+        standard_runtime: Arc<Mutex<RuntimeState>>,
+        hot_runtime: Arc<Mutex<RuntimeState>>,
         request_counter: Arc<AtomicU64>,
     }
 
@@ -45,6 +46,23 @@ mod non_windows {
         model_name: Option<String>,
         model: Option<TextEmbedding>,
         last_error: Option<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum EmbedPriority {
+        #[default]
+        Standard,
+        HotPath,
+    }
+
+    impl EmbedPriority {
+        fn lane_name(self) -> &'static str {
+            match self {
+                Self::Standard => "standard",
+                Self::HotPath => "hot_path",
+            }
+        }
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +80,8 @@ mod non_windows {
         model: Option<String>,
         #[serde(default)]
         texts: Vec<String>,
+        #[serde(default)]
+        priority: EmbedPriority,
     }
 
     #[derive(Serialize)]
@@ -73,6 +93,9 @@ mod non_windows {
     struct HealthResponse {
         ok: bool,
         ready: bool,
+        standard_ready: bool,
+        hot_ready: bool,
+        busy: bool,
         model: Option<String>,
         error: Option<String>,
     }
@@ -235,30 +258,55 @@ mod non_windows {
             .ok_or_else(|| anyhow!("local embeddings runtime was not initialized"))
     }
 
-    async fn health(State(state): State<AppState>) -> impl IntoResponse {
-        match state.runtime.try_lock() {
-            Ok(runtime) => Json(HealthResponse {
-                ok: true,
-                ready: runtime.model.is_some(),
-                model: runtime
-                    .model_name
-                    .clone()
-                    .or_else(|| Some(state.default_model.clone())),
-                error: runtime.last_error.clone(),
-            })
-            .into_response(),
-            Err(std::sync::TryLockError::WouldBlock) => Json(HealthResponse {
-                ok: true,
-                ready: false,
-                model: Some(state.default_model.clone()),
-                error: Some("embedding runtime is busy".to_string()),
-            })
-            .into_response(),
-            Err(std::sync::TryLockError::Poisoned(_)) => json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "local embeddings runtime lock poisoned",
+    fn runtime_health_snapshot(
+        runtime: &Arc<Mutex<RuntimeState>>,
+    ) -> (bool, bool, Option<String>, Option<String>) {
+        match runtime.try_lock() {
+            Ok(runtime) => (
+                false,
+                runtime.model.is_some(),
+                runtime.model_name.clone(),
+                runtime.last_error.clone(),
+            ),
+            Err(std::sync::TryLockError::WouldBlock) => (
+                true,
+                false,
+                None,
+                Some("embedding runtime is busy".to_string()),
+            ),
+            Err(std::sync::TryLockError::Poisoned(_)) => (
+                false,
+                false,
+                None,
+                Some("local embeddings runtime lock poisoned".to_string()),
             ),
         }
+    }
+
+    async fn health(State(state): State<AppState>) -> impl IntoResponse {
+        let (standard_busy, standard_ready, standard_model, standard_error) =
+            runtime_health_snapshot(&state.standard_runtime);
+        let (hot_busy, hot_ready, hot_model, hot_error) =
+            runtime_health_snapshot(&state.hot_runtime);
+        let error = standard_error.or(hot_error);
+        if error
+            .as_deref()
+            .is_some_and(|value| value.contains("lock poisoned"))
+        {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.unwrap());
+        }
+        Json(HealthResponse {
+            ok: true,
+            ready: standard_ready || hot_ready,
+            standard_ready,
+            hot_ready,
+            busy: standard_busy || hot_busy,
+            model: standard_model
+                .or(hot_model)
+                .or_else(|| Some(state.default_model.clone())),
+            error,
+        })
+        .into_response()
     }
 
     async fn embed(
@@ -294,6 +342,7 @@ mod non_windows {
         tracing::info!(
             request_id,
             model = %model_name,
+            lane = request.priority.lane_name(),
             text_count = metrics.text_count,
             empty_text_count = metrics.empty_text_count,
             total_text_chars = metrics.total_text_chars,
@@ -306,6 +355,7 @@ mod non_windows {
             tracing::warn!(
                 request_id,
                 model = %model_name,
+                lane = request.priority.lane_name(),
                 text_count = metrics.text_count,
                 max_texts = MAX_TEXTS_PER_REQUEST,
                 status = StatusCode::BAD_REQUEST.as_u16(),
@@ -325,6 +375,7 @@ mod non_windows {
             tracing::info!(
                 request_id,
                 model = %model_name,
+                lane = request.priority.lane_name(),
                 status = StatusCode::OK.as_u16(),
                 embeddings_count = 0usize,
                 embedding_dimensions = 0usize,
@@ -338,7 +389,11 @@ mod non_windows {
         }
 
         let cache_dir = state.cache_dir.clone();
-        let runtime = Arc::clone(&state.runtime);
+        let lane = request.priority;
+        let runtime = match lane {
+            EmbedPriority::Standard => Arc::clone(&state.standard_runtime),
+            EmbedPriority::HotPath => Arc::clone(&state.hot_runtime),
+        };
         let worker_model_name = model_name.clone();
         let texts = request.texts;
 
@@ -369,6 +424,7 @@ mod non_windows {
                 tracing::info!(
                     request_id,
                     model = %model_name,
+                    lane = lane.lane_name(),
                     status = StatusCode::OK.as_u16(),
                     embeddings_count = embeddings.len(),
                     embedding_dimensions,
@@ -381,6 +437,7 @@ mod non_windows {
                 tracing::warn!(
                     request_id,
                     model = %model_name,
+                    lane = lane.lane_name(),
                     status = StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     elapsed_ms = started.elapsed().as_millis(),
                     error = %error,
@@ -392,6 +449,7 @@ mod non_windows {
                 tracing::warn!(
                     request_id,
                     model = %model_name,
+                    lane = lane.lane_name(),
                     status = StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     elapsed_ms = started.elapsed().as_millis(),
                     error = %error,
@@ -405,6 +463,40 @@ mod non_windows {
         }
     }
 
+    fn spawn_hot_lane_warmup(state: AppState) {
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let model_name = state.default_model.clone();
+            let result = state
+                .hot_runtime
+                .lock()
+                .map_err(|_| anyhow!("local embeddings hot runtime lock poisoned"))
+                .and_then(|mut guard| {
+                    ensure_runtime(&mut guard, &state.cache_dir, &model_name).and_then(|model| {
+                        model
+                            .embed(vec!["agentark hot path embedding warmup"], None)
+                            .map(|_| ())
+                            .map_err(|error| {
+                                anyhow!("local embeddings hot warmup failed: {}", error)
+                            })
+                    })
+                });
+            match result {
+                Ok(()) => tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    model = %model_name,
+                    "embedding hot lane warmup completed"
+                ),
+                Err(error) => tracing::warn!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    model = %model_name,
+                    error = %error,
+                    "embedding hot lane warmup failed"
+                ),
+            }
+        });
+    }
+
     #[tokio::main]
     pub(crate) async fn run() -> Result<()> {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -415,7 +507,8 @@ mod non_windows {
         let state = AppState {
             cache_dir: configured_cache_dir(),
             default_model: configured_model(),
-            runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            standard_runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            hot_runtime: Arc::new(Mutex::new(RuntimeState::default())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
 
@@ -424,6 +517,7 @@ mod non_windows {
             bind,
             state.default_model
         );
+        spawn_hot_lane_warmup(state.clone());
 
         let app = Router::new()
             .route("/health", get(health))

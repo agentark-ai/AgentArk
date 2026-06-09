@@ -927,7 +927,10 @@
   --ui-rgba-8-17-31-560: rgb(8 17 31 / 0.56);
   --ui-rgba-8-17-31-660: rgb(8 17 31 / 0.66);
   --ui-rgba-8-18-32-450: rgb(8 18 32 / 0.45);
-  --ui-rgba-8-18-32-460: rgb(8 18 32 / 0.46);
+  /* Neutral dark card fill. Was navy rgb(8 18 32), which read as an off-brand
+     "blue theme" on the Google Workspace setup guide / integration cards; the
+     app theme is green/amber, so keep this neutral. */
+  --ui-rgba-8-18-32-460: rgb(18 18 20 / 0.46);
   --ui-rgba-8-18-33-740: rgb(8 18 33 / 0.74);
   --ui-rgba-8-18-34-700: rgb(8 18 34 / 0.7);
   --ui-rgba-8-20-38-600: rgb(8 20 38 / 0.6);

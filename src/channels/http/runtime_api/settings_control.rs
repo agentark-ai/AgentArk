@@ -6219,6 +6219,12 @@ pub(super) async fn add_model(
 
     match save_agent_config_snapshot(config_snapshot, config_dir, data_dir).await {
         Ok(()) => {
+            let agent = state.agent.read().await;
+            agent
+                .refresh_model_provider_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
             tracing::debug!(
                 "Vector memory backend retains its current configuration after model add."
             );
@@ -6429,6 +6435,12 @@ pub(super) async fn update_model(
 
     match save_agent_config_snapshot(config_snapshot, config_dir, data_dir).await {
         Ok(()) => {
+            let agent = state.agent.read().await;
+            agent
+                .refresh_model_provider_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
             tracing::debug!(
                 "Vector memory backend retains its current configuration after model update."
             );
@@ -6524,11 +6536,19 @@ pub(super) async fn delete_model(
     }
 
     match save_agent_config_snapshot(config_snapshot, config_dir, data_dir).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "ok", "message": "Model removed"})),
-        )
-            .into_response(),
+        Ok(()) => {
+            let agent = state.agent.read().await;
+            agent
+                .refresh_model_provider_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ok", "message": "Model removed"})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

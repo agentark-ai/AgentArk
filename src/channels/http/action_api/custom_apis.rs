@@ -69,9 +69,7 @@ pub(super) async fn create_custom_api(
             .await
             {
                 Ok(existing) => {
-                    let prior = existing
-                        .iter()
-                        .find(|api| api.config.id == candidate_id);
+                    let prior = existing.iter().find(|api| api.config.id == candidate_id);
                     prior_ready = prior.map(custom_api_view_is_ready).unwrap_or(false);
                     prior.map(|_| candidate_id)
                 }
@@ -93,6 +91,11 @@ pub(super) async fn create_custom_api(
         Ok(api) => {
             agent
                 .refresh_action_catalog_index("custom_api_upsert")
+                .await;
+            agent
+                .refresh_custom_api_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
                 .await;
             // Reconcile only on a credential-ready EDGE (became ready, or a
             // secret was saved in this request) — editing metadata on an
@@ -164,6 +167,11 @@ pub(super) async fn update_custom_api(
             agent
                 .refresh_action_catalog_index("custom_api_upsert")
                 .await;
+            agent
+                .refresh_custom_api_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
             // Credential-ready EDGE only (see create_custom_api): metadata
             // edits on a connected API must not re-probe and re-notify.
             if custom_api_view_is_ready(&api) && (request_saves_secret || !prior_ready) {
@@ -199,6 +207,11 @@ pub(super) async fn delete_custom_api(
             agent
                 .refresh_action_catalog_index("custom_api_delete")
                 .await;
+            agent
+                .refresh_custom_api_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
             Json(serde_json::json!({ "status": "ok" })).into_response()
         }
         Err(error) if error.to_string().contains("not found") => {
@@ -222,7 +235,14 @@ pub(super) async fn test_custom_api(
     )
     .await
     {
-        Ok(result) => Json(serde_json::json!({ "status": "ok", "result": result })).into_response(),
+        Ok(result) => {
+            agent
+                .refresh_custom_api_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+            Json(serde_json::json!({ "status": "ok", "result": result })).into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }

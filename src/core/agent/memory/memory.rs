@@ -1455,7 +1455,7 @@ pub(super) async fn build_saved_user_facts_context_from_storage(
             } else {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(saved_memory_hot_path_embed_timeout_ms()),
-                    embedder.embed_texts(&[safe_truncate(query, 1_200)]),
+                    embedder.embed_texts_hot_path(&[safe_truncate(query, 1_200)]),
                 )
                 .await
                 {

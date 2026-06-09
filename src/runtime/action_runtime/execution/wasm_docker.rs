@@ -382,9 +382,9 @@ impl ActionRuntime {
             }
             if let Err(error) = self.prune_stale_code_execute_artifacts().await {
                 tracing::warn!(
-                "Failed to prune stale code execution artifacts during runtime reconciliation: {}",
-                error
-            );
+                    "Failed to prune stale code execution artifacts during runtime reconciliation: {}",
+                    error
+                );
             }
             self.update_container_reaper_status(removed, None).await;
             crate::metrics::record_container_sweeper_run("ok", removed);
@@ -507,9 +507,9 @@ impl ActionRuntime {
             "executor_server" | "remote_executor" => Ok(RuntimeBackend::RemoteExecutor),
             "wasm" => Ok(RuntimeBackend::Wasm),
             other => anyhow::bail!(
-            "Unsupported code_execute backend '{}'. Use auto, docker, native, or executor_server.",
-            other
-        ),
+                "Unsupported code_execute backend '{}'. Use auto, docker, native, or executor_server.",
+                other
+            ),
         }
     }
 

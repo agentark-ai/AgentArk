@@ -79,8 +79,17 @@ fn default_true() -> bool {
 impl Default for ModelPrivacyConfig {
     fn default() -> Self {
         Self {
-            default_model_input_mode: ModelInputPrivacyMode::DefaultRedact,
-            current_chat_pii_policy: CurrentChatPiiPolicy::MaskChatPii,
+            // Redact by SINK, not by data TYPE. Internal model-input / agent-reasoning
+            // is inside the user's self-hosted trust boundary, so the agent must see
+            // the user's own data (emails, phones, names, addresses, account numbers,
+            // order IDs, …) to act on it. SecretsOnly keeps the unconditional
+            // secret/API-key layer (redact_secret_input) while skipping PII redaction
+            // for those internal contexts; genuine external-leak sinks (outbound guard,
+            // webhooks) keep their own PII redaction. RawCurrentTurn covers the
+            // CurrentUserMessage path for the same reason. This is non-enumerated:
+            // it removes the PII step for internal sinks rather than toggling per type.
+            default_model_input_mode: ModelInputPrivacyMode::SecretsOnly,
+            current_chat_pii_policy: CurrentChatPiiPolicy::RawCurrentTurn,
             request_scoped_sensitive_approval_enabled: true,
         }
     }
@@ -641,7 +650,10 @@ mod tests {
     }
 
     #[test]
-    fn default_current_turn_masks_pii_and_redacts_secrets() {
+    fn default_current_turn_keeps_pii_and_redacts_secrets() {
+        // Default posture now passes the user's own PII to the agent (so it can
+        // act on what the user typed, e.g. an email recipient) while STILL
+        // redacting secrets/API keys via the unconditional secret layer.
         let result = sanitize_model_input_text(
             &format!(
                 "My email is jane@example.com and key is {}",
@@ -652,7 +664,8 @@ mod tests {
             false,
         );
         assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
-        assert!(result.sanitized_text.contains("[EMAIL]"));
+        assert!(result.sanitized_text.contains("jane@example.com"));
+        assert!(!result.sanitized_text.contains("[EMAIL]"));
         assert!(result.sanitized_text.contains("[REDACTED_API_KEY]"));
     }
 

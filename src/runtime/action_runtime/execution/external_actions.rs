@@ -376,10 +376,8 @@ impl ActionRuntime {
                     )
                     .await;
                 }
-                let settings_path = format!(
-                    "Settings > Integrations > Custom APIs > {}",
-                    binding.api_id
-                );
+                let settings_path =
+                    format!("Settings > Integrations > Custom APIs > {}", binding.api_id);
                 return Ok(structured_tool_completion_output(
                     "custom_api",
                     "needs_credentials",

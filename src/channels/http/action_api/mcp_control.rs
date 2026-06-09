@@ -939,6 +939,11 @@ pub(super) async fn sync_mcp_registry(
             agent
                 .refresh_action_catalog_index("mcp_registry_sync")
                 .await;
+            agent
+                .refresh_mcp_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
         }
         Err(error) => {
             tracing::warn!("MCP registry sync failed: {}", error);
@@ -1016,6 +1021,11 @@ pub(super) fn schedule_mcp_server_refresh(agent_ref: SharedAgent, id: String) {
                 tracing::info!("MCP server refresh succeeded for {}", id);
                 agent
                     .refresh_action_catalog_index("mcp_server_refresh")
+                    .await;
+                agent
+                    .refresh_mcp_capability_readiness_snapshot(
+                        crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                    )
                     .await;
             }
             Ok(Err(e)) => tracing::warn!("MCP server refresh failed for {}: {}", id, e),

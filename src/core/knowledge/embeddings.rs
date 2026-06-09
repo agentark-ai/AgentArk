@@ -19,6 +19,26 @@ const DEFAULT_LOCAL_EMBEDDINGS_DOCKER_URL: &str = "http://agentark-embeddings:89
 const DEFAULT_LOCAL_EMBEDDINGS_LOCAL_URL: &str = "http://127.0.0.1:8993";
 const DEFAULT_OPENAI_EMBEDDINGS_BASE_URL: &str = "https://api.openai.com/v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingRequestPriority {
+    Standard,
+    HotPath,
+}
+
+impl Default for EmbeddingRequestPriority {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+#[derive(Serialize)]
+struct LocalHfEmbedRequest<'a> {
+    model: &'a str,
+    texts: &'a [String],
+    priority: EmbeddingRequestPriority,
+}
+
 #[derive(Clone)]
 enum EmbeddingProvider {
     LocalHf {
@@ -307,6 +327,20 @@ impl EmbeddingClient {
     }
 
     pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<PgVector>> {
+        self.embed_texts_with_priority(texts, EmbeddingRequestPriority::Standard)
+            .await
+    }
+
+    pub async fn embed_texts_hot_path(&self, texts: &[String]) -> Result<Vec<PgVector>> {
+        self.embed_texts_with_priority(texts, EmbeddingRequestPriority::HotPath)
+            .await
+    }
+
+    pub async fn embed_texts_with_priority(
+        &self,
+        texts: &[String],
+        priority: EmbeddingRequestPriority,
+    ) -> Result<Vec<PgVector>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -318,7 +352,7 @@ impl EmbeddingClient {
         for chunk in texts.chunks(batch_texts) {
             let chunk_embeddings = match &self.provider {
                 EmbeddingProvider::LocalHf { base_url } => {
-                    self.embed_local_hf(base_url, chunk).await
+                    self.embed_local_hf(base_url, chunk, priority).await
                 }
                 EmbeddingProvider::OpenAICompatible { api_key, base_url } => {
                     self.embed_openai(api_key, base_url.as_deref(), chunk).await
@@ -371,13 +405,12 @@ impl EmbeddingClient {
             .collect())
     }
 
-    async fn embed_local_hf(&self, base_url: &str, texts: &[String]) -> Result<Vec<PgVector>> {
-        #[derive(Serialize)]
-        struct LocalHfEmbedRequest<'a> {
-            model: &'a str,
-            texts: &'a [String],
-        }
-
+    async fn embed_local_hf(
+        &self,
+        base_url: &str,
+        texts: &[String],
+        priority: EmbeddingRequestPriority,
+    ) -> Result<Vec<PgVector>> {
         #[derive(Deserialize)]
         struct LocalHfEmbedResponse {
             embeddings: Vec<Vec<f32>>,
@@ -389,6 +422,7 @@ impl EmbeddingClient {
             .json(&LocalHfEmbedRequest {
                 model: &self.model,
                 texts,
+                priority,
             })
             .send()
             .await?;
@@ -541,5 +575,32 @@ mod tests {
     #[test]
     fn normalize_embedding_rejects_empty_vectors() {
         assert!(normalize_embedding(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn local_hf_request_serializes_hot_path_priority() {
+        let texts = vec!["hi".to_string()];
+        let value = serde_json::to_value(LocalHfEmbedRequest {
+            model: "BAAI/bge-small-en-v1.5",
+            texts: &texts,
+            priority: EmbeddingRequestPriority::HotPath,
+        })
+        .expect("request should serialize");
+
+        assert_eq!(value["priority"], "hot_path");
+        assert_eq!(value["texts"][0], "hi");
+    }
+
+    #[test]
+    fn local_hf_request_serializes_standard_priority() {
+        let texts = vec!["background document chunk".to_string()];
+        let value = serde_json::to_value(LocalHfEmbedRequest {
+            model: "BAAI/bge-small-en-v1.5",
+            texts: &texts,
+            priority: EmbeddingRequestPriority::Standard,
+        })
+        .expect("request should serialize");
+
+        assert_eq!(value["priority"], "standard");
     }
 }

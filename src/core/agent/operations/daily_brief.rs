@@ -1270,7 +1270,8 @@ impl Agent {
             + security_snapshot.auth_failures
             + security_snapshot.rate_limit_hits
             + security_snapshot.unauthorized_channel_attempts;
-        let arkcore_items = [format!(
+        let arkcore_items = [
+            format!(
                 "Ark Core: {} open task(s), {} active background session(s), and {} active browser session(s).",
                 counts.open(),
                 background_sessions
@@ -1316,7 +1317,8 @@ impl Agent {
             format!(
                 "Pulse: {} stored run(s); latest status is {}.",
                 arkpulse_total, arkpulse_summary
-            )];
+            ),
+        ];
 
         let mut detail_lines = vec![format!(
             "- Tasks: {} open task(s), {} pending, {} in progress, {} awaiting approval, {} paused, and {} failed.",

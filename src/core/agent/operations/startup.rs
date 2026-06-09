@@ -78,6 +78,11 @@ async fn reconcile_custom_api_auth_ready(agent: Agent, api_ids: Vec<String>, rea
     }
 
     agent.refresh_action_catalog_index(reason).await;
+    agent
+        .refresh_custom_api_capability_readiness_snapshot(
+            capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+        )
+        .await;
 
     let views = match crate::custom_apis::list_custom_apis(
         &agent.storage,
@@ -748,6 +753,10 @@ impl Agent {
 
         // Initialize integration manager
         let integrations = Arc::new(crate::integrations::IntegrationManager::new(config_dir));
+        let capability_readiness = Arc::new(RwLock::new(
+            capability_readiness::load_capability_readiness_registry(&storage).await,
+        ));
+        let (capability_readiness_events, _) = broadcast::channel(256);
 
         // Configure media generation providers from saved config
         if !config.media_gen.provider_api_keys.is_empty() {
@@ -917,6 +926,8 @@ impl Agent {
             swarm_activity: Arc::new(crate::core::swarm::SwarmActivityTracker::new(200)),
             security,
             conversation_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            capability_readiness,
+            capability_readiness_events,
             integration_connect_flows: Arc::new(RwLock::new(HashMap::new())),
             pending_skill_imports: Arc::new(RwLock::new(HashMap::new())),
             pending_secret_followups: Arc::new(RwLock::new(HashMap::new())),
@@ -950,6 +961,7 @@ impl Agent {
 
         agent.spawn_gepa_idle_worker();
         agent.spawn_curator_idle_worker();
+        agent.spawn_capability_readiness_boot_probe();
         {
             let agent_for_memory_backfill = agent.clone();
             crate::spawn_logged!(

@@ -478,6 +478,19 @@ fn embedding_security_quick_accepts(category: SecurityCategory, score: f32, marg
     }
 }
 
+fn context_security_block_supported_by_current_message(
+    current_message_best: &BTreeMap<SecurityCategory, ScoredCanonical>,
+) -> bool {
+    let Some(top) = current_message_best.values().max_by(|left, right| {
+        left.score
+            .partial_cmp(&right.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return false;
+    };
+    top.category == SecurityCategory::SecurityBlock && top.score >= FAST_BORDERLINE_BLOCK_SCORE
+}
+
 fn canonical_embedding_cache_key(
     embedding_client: &EmbeddingClient,
     canonicals: &[SecurityCanonical],
@@ -573,7 +586,7 @@ pub async fn classify_inbound_embedding_fast(
     let memory_canonicals = memory_capture_canonicals();
     let turn_texts = vec![classification_text_for_embedding, memory_text_for_embedding];
     let (turn_embeddings, cached_embeddings) = tokio::try_join!(
-        embedding_client.embed_texts(&turn_texts),
+        embedding_client.embed_texts_hot_path(&turn_texts),
         load_or_embed_canonical_embeddings(embedding_client, &canonicals, &memory_canonicals),
     )?;
     let Some(message_embedding) = turn_embeddings.first() else {
@@ -592,6 +605,23 @@ pub async fn classify_inbound_embedding_fast(
             normalized_embedding_similarity(message_embedding.as_slice(), embedding.as_slice())
                 .unwrap_or(0.0);
         scored.push(ScoredCanonical {
+            category: canonical.category,
+            concept: canonical.concept.clone(),
+            score,
+            advisory: canonical.advisory.clone(),
+        });
+    }
+    let mut current_message_scored = Vec::new();
+    for (canonical, embedding) in canonicals
+        .iter()
+        .zip(cached_embeddings.canonical_embeddings.iter())
+    {
+        let score = normalized_embedding_similarity(
+            memory_message_embedding.as_slice(),
+            embedding.as_slice(),
+        )
+        .unwrap_or(0.0);
+        current_message_scored.push(ScoredCanonical {
             category: canonical.category,
             concept: canonical.concept.clone(),
             score,
@@ -625,10 +655,17 @@ pub async fn classify_inbound_embedding_fast(
         return Ok(None);
     };
     let margin = category_margin(&best, top.category, top.score);
+    let current_message_best = best_by_category(&current_message_scored);
 
     let accepted = embedding_security_quick_accepts(top.category, top.score, margin);
 
     let context_present = !context.is_empty();
+    if context_present
+        && top.category == SecurityCategory::SecurityBlock
+        && !context_security_block_supported_by_current_message(&current_message_best)
+    {
+        return Ok(None);
+    }
     // Context-bearing turns may depend on earlier objects, sources, or
     // subjects. Let the structured classifier inspect that context instead of
     // relying on an embedding-only decision. Security blocks remain eligible
@@ -737,5 +774,60 @@ mod tests {
         ]);
 
         assert!(!signal.should_capture);
+    }
+
+    #[test]
+    fn context_security_block_requires_current_message_security_signal() {
+        let mut current_message_best = BTreeMap::new();
+        current_message_best.insert(
+            SecurityCategory::SecurityBlock,
+            ScoredCanonical {
+                category: SecurityCategory::SecurityBlock,
+                concept: "credential_exfiltration".to_string(),
+                score: FAST_BORDERLINE_BLOCK_SCORE + 0.1,
+                advisory: InboundAdvisorySignal::default(),
+            },
+        );
+        current_message_best.insert(
+            SecurityCategory::ToolUse,
+            ScoredCanonical {
+                category: SecurityCategory::ToolUse,
+                concept: "live_state_or_external_lookup".to_string(),
+                score: FAST_BORDERLINE_BLOCK_SCORE + 0.2,
+                advisory: InboundAdvisorySignal::default(),
+            },
+        );
+
+        assert!(!context_security_block_supported_by_current_message(
+            &current_message_best
+        ));
+
+        current_message_best.insert(
+            SecurityCategory::SecurityBlock,
+            ScoredCanonical {
+                category: SecurityCategory::SecurityBlock,
+                concept: "credential_exfiltration".to_string(),
+                score: FAST_BORDERLINE_BLOCK_SCORE + 0.3,
+                advisory: InboundAdvisorySignal::default(),
+            },
+        );
+
+        assert!(context_security_block_supported_by_current_message(
+            &current_message_best
+        ));
+
+        current_message_best.insert(
+            SecurityCategory::SecurityBlock,
+            ScoredCanonical {
+                category: SecurityCategory::SecurityBlock,
+                concept: "credential_exfiltration".to_string(),
+                score: FAST_BORDERLINE_BLOCK_SCORE - 0.01,
+                advisory: InboundAdvisorySignal::default(),
+            },
+        );
+
+        assert!(!context_security_block_supported_by_current_message(
+            &current_message_best
+        ));
     }
 }

@@ -21,6 +21,7 @@ const MAX_ITERATIONS: u32 = 30;
 const MAX_LIVE_BROWSER_SESSIONS: usize = 3;
 const CONTENT_SNAPSHOT_ATTEMPTS: usize = 5;
 const MAX_PERSISTED_ACTION_HISTORY: usize = 80;
+const MAX_NO_VISIBLE_PROGRESS_INTERACTIONS: u32 = 4;
 const OPERATOR_HANDOFF_TIMEOUT_SECS: u64 = 30 * 60;
 const LIVE_SESSION_IDLE_TIMEOUT_SECS: i64 = 5 * 60;
 const LIVE_SESSION_IDLE_WARNING_SECS: i64 = LIVE_SESSION_IDLE_TIMEOUT_SECS - 60;
@@ -2019,14 +2020,16 @@ async fn validate_browser_ask_user_resolution(
 You are validating the next outcome for a browser automation run.
 Return exactly one JSON object with:
 - action: \"complete\", \"ask_user\", or \"continue\"
+- requires_human: boolean; required and true only when action is \"ask_user\"
 - summary: concise user-facing answer when action is complete; this must contain the actual visible facts requested, not a status line
 - message: fuller user-facing answer when action is complete
 - guidance: next browser-loop guidance when action is continue
 
 Judge the underlying requested outcome and the visible page state, not surface wording.
-Use action \"complete\" when the user asked for information, extraction, listing, comparison, or summarization and the current page snapshot already contains enough visible facts to answer. In that case, include the page-derived answer directly.
-Use action \"ask_user\" only when a human decision or site operation is genuinely required.
+Use action \"complete\" when the requested outcome is information-delivery and the current page snapshot already contains enough visible facts to answer. In that case, include the page-derived answer directly.
+Use action \"ask_user\" only when a human decision or site operation is genuinely required; in that case set requires_human=true.
 Use action \"continue\" when more browser work is needed before either answering or asking the user.
+If the page is incomplete, still loading, stale, or otherwise not enough to answer but no human action is required, use action \"continue\".
 Do not ask whether the visible snapshot is sufficient when the original task was to report visible facts.";
     let user = format!(
         "Original task:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nPage text:\n{}\n\nInteractive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}\n\nProposed ask_user question:\n{}",
@@ -2053,171 +2056,33 @@ Do not ask whether the visible snapshot is sufficient when the original task was
                         response = %truncate_browser_text(response_text, 500),
                         "Browser ask_user validation returned invalid JSON"
                     );
-                    BrowserAskUserResolution::AskUser
+                    browser_ask_user_resolution_when_verdict_unavailable(question)
                 }
             }
         }
         Err(error) => {
             tracing::debug!(error = %error, "Browser ask_user validation failed");
-            BrowserAskUserResolution::AskUser
-        }
-    }
-}
-
-async fn classify_browser_access_blocker(
-    ctx: &BrowserLoopContext<'_>,
-    content: &PageContent,
-    history: &[String],
-) -> Option<String> {
-    if !browser_snapshot_has_visible_state(content) {
-        return None;
-    }
-    let element_preview = content
-        .elements
-        .iter()
-        .take(20)
-        .map(format_browser_loop_element)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let history_preview = history
-        .iter()
-        .rev()
-        .take(8)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let body_preview = truncate_browser_text(&content.body_text, 4_000);
-    let downloads = format_browser_downloads(content);
-    let system = "\
-You are a semantic browser-state classifier.
-Return exactly one JSON object with:
-- blocked: boolean
-- reason: concise user-facing explanation when blocked is true
-
-Set blocked to true only when the current page is an access, authentication, account-selection, permission, verification, security challenge, policy, paywall, or bot-protection gate that prevents completing the user's requested browser outcome without a human account/security action.
-Infer this from the user's underlying intent and the visible page state. Do not rely on exact wording, casing, order, punctuation, or anticipated phrases.
-Set blocked to false when the requested outcome is already visible, when normal navigation can still proceed, or when the user's actual intent is to open or inspect the gate itself.
-When blocked is true, the reason must state the visible blocking condition and the practical consequence. Do not claim hidden account state that is not visible.";
-    let user = format!(
-        "Requested browser outcome:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nVisible page text:\n{}\n\nVisible interactive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}",
-        ctx.task,
-        content.url,
-        content.title,
-        body_preview,
-        element_preview,
-        downloads,
-        history_preview
-    );
-    match ctx.llm.chat_classifier_bounded(system, &user, 700).await {
-        Ok(response) => {
-            let response_text = response.content.trim();
-            let json_text = extract_first_json_object(response_text)
-                .map(|(json, _)| json)
-                .unwrap_or(response_text);
-            match serde_json::from_str::<serde_json::Value>(json_text) {
-                Ok(value) => browser_access_blocker_reason_from_value(&value),
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        response = %truncate_browser_text(response_text, 500),
-                        "Browser access-blocker classifier returned invalid JSON"
-                    );
-                    None
-                }
-            }
-        }
-        Err(error) => {
-            tracing::debug!(error = %error, "Browser access-blocker classifier failed");
-            None
+            browser_ask_user_resolution_when_verdict_unavailable(question)
         }
     }
 }
 
 async fn validate_browser_done_answer(
-    ctx: &BrowserLoopContext<'_>,
+    _ctx: &BrowserLoopContext<'_>,
+    action: &serde_json::Value,
     content: &PageContent,
-    history: &[String],
+    page_changed_since_last_interaction: bool,
+    _history: &[String],
     summary: &str,
     message: &str,
 ) -> BrowserDoneAnswerValidation {
-    let element_preview = content
-        .elements
-        .iter()
-        .take(20)
-        .map(format_browser_loop_element)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let history_preview = history
-        .iter()
-        .rev()
-        .take(8)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let body_preview = truncate_browser_text(&content.body_text, 4_000);
-    let downloads = format_browser_downloads(content);
-    let system = "\
-You are validating a proposed final answer from a browser automation run.
-Return exactly one JSON object with:
-- action: \"complete\" or \"continue\"
-- summary: concise user-facing answer when action is complete
-- message: fuller user-facing answer when action is complete
-- guidance: next browser-loop guidance when action is continue
-
-Judge the user's underlying browser objective and the visible page evidence, not surface wording.
-Use action \"complete\" only when the proposed answer, or a corrected answer you can write from the current visible page snapshot and downloaded file records, satisfies the requested outcome.
-For page-reading, checking, extraction, listing, comparison, or summarization outcomes, the completed answer must include the actual requested visible facts, not merely a status line that the page loaded or the information is visible.
-For file download outcomes, the completed answer must include the downloaded file records or enough information for the outer agent to use those artifacts.
-If the current page snapshot contains enough evidence but the proposed answer omitted it, return action \"complete\" with corrected summary and message containing the page-derived facts.
-Use action \"continue\" when more browser navigation or interaction is needed before the requested outcome can be answered from visible evidence.
-Do not introduce browser instructions for the user; this validator is for autonomous browser continuation.";
-    let user = format!(
-        "Requested browser outcome:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nVisible page text:\n{}\n\nVisible interactive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}\n\nProposed summary:\n{}\n\nProposed message:\n{}",
-        ctx.task,
-        content.url,
-        content.title,
-        body_preview,
-        element_preview,
-        downloads,
-        history_preview,
+    browser_done_answer_local_validation(
+        action,
+        content,
+        page_changed_since_last_interaction,
         summary,
-        message
-    );
-    match ctx.llm.chat_classifier_bounded(system, &user, 900).await {
-        Ok(response) => {
-            let response_text = response.content.trim();
-            let json_text = extract_first_json_object(response_text)
-                .map(|(json, _)| json)
-                .unwrap_or(response_text);
-            match serde_json::from_str::<serde_json::Value>(json_text) {
-                Ok(value) => browser_done_answer_validation_from_value(&value, summary, message),
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        response = %truncate_browser_text(response_text, 500),
-                        "Browser done-answer validator returned invalid JSON"
-                    );
-                    BrowserDoneAnswerValidation::Complete {
-                        summary: summary.to_string(),
-                        message: message.to_string(),
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            tracing::debug!(error = %error, "Browser done-answer validation failed");
-            BrowserDoneAnswerValidation::Complete {
-                summary: summary.to_string(),
-                message: message.to_string(),
-            }
-        }
-    }
+        message,
+    )
 }
 
 async fn validate_browser_snapshot_completion(
@@ -2258,7 +2123,7 @@ Return exactly one JSON object with:
 
 Judge the user's underlying browser objective and the visible page evidence, not surface wording.
 Use action \"complete\" only when the current visible page snapshot or downloaded file records contain enough evidence to satisfy the requested outcome.
-For page-reading, checking, extraction, listing, comparison, or summarization outcomes, the completed answer must include the actual requested visible facts, not merely say the page loaded or the information is visible.
+For information-delivery outcomes, the completed answer must include the actual requested visible facts, not merely say the page loaded or the information is visible.
 Use action \"continue\" when the snapshot is not enough to answer, when a human site operation is needed, or when completing would require hidden state not visible in the snapshot.";
     let user = format!(
         "Requested browser outcome:\n{}\n\nNo-progress condition:\n{}\n\nCurrent page:\nURL: {}\nTitle: {}\n\nVisible page text:\n{}\n\nVisible interactive elements:\n{}\n\nDownloaded files:\n{}\n\nRecent browser history:\n{}",
@@ -2332,7 +2197,7 @@ Return exactly one JSON object with:
 - keep_open: boolean
 - reason: concise explanation
 
-Set keep_open to false for ordinary completed browser work where the user asked for information, extraction, checking, summarization, navigation as a means to answer, or any outcome that has already been delivered in chat.
+Set keep_open to false for ordinary completed browser work where the requested outcome has already been delivered in chat.
 Set keep_open to true only when the user's underlying requested outcome is itself an ongoing browser state that should remain available for the user to inspect or control after the assistant stops.
 Infer intent from meaning and current page state. Do not rely on exact wording, casing, order, punctuation, or anticipated phrases.
 If unsure, choose keep_open=false so browser processes and profile locks are cleaned up.";
@@ -3022,8 +2887,20 @@ enum BrowserDoneFinalization {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrowserDoneAnswerValidation {
-    Complete { summary: String, message: String },
-    Continue { guidance: String },
+    Complete {
+        summary: String,
+        message: String,
+    },
+    Continue {
+        guidance: String,
+    },
+    /// The proposed answer claims an action effect that the visible browser
+    /// evidence does not confirm. Rather than report fabricated success, hand
+    /// the live browser back to the user to verify or finish it.
+    /// `question` is the user-facing prompt.
+    HandBack {
+        question: String,
+    },
 }
 
 fn browser_loop_success_status(outcome: BrowserLoopOutcome) -> (SessionStatus, bool) {
@@ -3047,12 +2924,107 @@ fn browser_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<Strin
     })
 }
 
+fn browser_json_bool(value: &serde_json::Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(|inner| inner.as_bool())
+}
+
+fn default_browser_continue_guidance() -> String {
+    "Continue browser work from the current page until the requested outcome is either answered from visible page facts or genuinely needs user input."
+        .to_string()
+}
+
+fn browser_done_unconfirmed_action_question() -> String {
+    "I could not confirm from the visible browser page that the requested action/result actually completed. Please verify or finish it in the live browser, then tell me how to proceed."
+        .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserDoneOutcomeKind {
+    InformationDelivery,
+    ActionEffect,
+    LiveBrowserState,
+    Download,
+}
+
+fn browser_done_outcome_kind_from_action(
+    action: &serde_json::Value,
+) -> Option<BrowserDoneOutcomeKind> {
+    match action.get("outcome_kind")?.as_str()?.trim() {
+        "information_delivery" => Some(BrowserDoneOutcomeKind::InformationDelivery),
+        "action_effect" => Some(BrowserDoneOutcomeKind::ActionEffect),
+        "live_browser_state" => Some(BrowserDoneOutcomeKind::LiveBrowserState),
+        "download" => Some(BrowserDoneOutcomeKind::Download),
+        _ => None,
+    }
+}
+
+fn browser_done_evidence_from_action(action: &serde_json::Value) -> Option<String> {
+    action
+        .get("evidence")
+        .and_then(|inner| inner.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn browser_done_evidence_is_structural(
+    kind: BrowserDoneOutcomeKind,
+    content: &PageContent,
+    _page_changed_since_last_interaction: bool,
+) -> bool {
+    match kind {
+        BrowserDoneOutcomeKind::ActionEffect => false,
+        BrowserDoneOutcomeKind::Download => !content.downloads.is_empty(),
+        BrowserDoneOutcomeKind::InformationDelivery | BrowserDoneOutcomeKind::LiveBrowserState => {
+            browser_snapshot_has_visible_state(content)
+        }
+    }
+}
+
+fn browser_done_answer_local_validation(
+    action: &serde_json::Value,
+    content: &PageContent,
+    page_changed_since_last_interaction: bool,
+    summary: &str,
+    message: &str,
+) -> BrowserDoneAnswerValidation {
+    let Some(kind) = browser_done_outcome_kind_from_action(action) else {
+        return BrowserDoneAnswerValidation::Continue {
+            guidance: "Return done only with an outcome_kind and evidence that match the completed browser outcome."
+                .to_string(),
+        };
+    };
+
+    if kind == BrowserDoneOutcomeKind::ActionEffect
+        && !browser_done_evidence_is_structural(kind, content, page_changed_since_last_interaction)
+    {
+        return BrowserDoneAnswerValidation::HandBack {
+            question: browser_done_unconfirmed_action_question(),
+        };
+    }
+
+    let has_declared_evidence = browser_done_evidence_from_action(action).is_some();
+    let has_structural_evidence =
+        browser_done_evidence_is_structural(kind, content, page_changed_since_last_interaction);
+    if has_declared_evidence && has_structural_evidence {
+        BrowserDoneAnswerValidation::Complete {
+            summary: summary.to_string(),
+            message: message.to_string(),
+        }
+    } else {
+        BrowserDoneAnswerValidation::Continue {
+            guidance: "Return done only after the current visible browser state provides evidence for the selected outcome_kind, and include that evidence in the done action."
+                .to_string(),
+        }
+    }
+}
+
 fn browser_ask_user_resolution_from_value(
     value: &serde_json::Value,
     fallback_question: &str,
 ) -> BrowserAskUserResolution {
     let action = browser_json_string(value, &["action", "decision", "outcome"])
-        .unwrap_or_else(|| "ask_user".to_string())
+        .unwrap_or_else(|| "continue".to_string())
         .to_ascii_lowercase();
     match action.as_str() {
         "complete" | "done" => {
@@ -3064,41 +3036,32 @@ fn browser_ask_user_resolution_from_value(
         }
         "continue" | "continue_browser" | "keep_working" => {
             let guidance = browser_json_string(value, &["guidance", "reason", "next_step"])
-                .unwrap_or_else(|| {
-                    "Continue browser work from the current page until the requested outcome is either answered from visible page facts or genuinely needs user input."
-                        .to_string()
-                });
+                .unwrap_or_else(default_browser_continue_guidance);
             BrowserAskUserResolution::Continue { guidance }
         }
-        _ => BrowserAskUserResolution::AskUser,
+        "ask_user" => {
+            let requires_human = browser_json_bool(value, "requires_human").unwrap_or(false);
+            if requires_human {
+                BrowserAskUserResolution::AskUser
+            } else {
+                let guidance = browser_json_string(value, &["guidance", "next_step"])
+                    .unwrap_or_else(default_browser_continue_guidance);
+                BrowserAskUserResolution::Continue { guidance }
+            }
+        }
+        _ => BrowserAskUserResolution::Continue {
+            guidance: default_browser_continue_guidance(),
+        },
     }
 }
 
-fn browser_done_answer_validation_from_value(
-    value: &serde_json::Value,
-    fallback_summary: &str,
-    fallback_message: &str,
-) -> BrowserDoneAnswerValidation {
-    let action = browser_json_string(value, &["action", "decision", "outcome"])
-        .unwrap_or_else(|| "complete".to_string())
-        .to_ascii_lowercase();
-    match action.as_str() {
-        "continue" | "continue_browser" | "keep_working" => {
-            let guidance = browser_json_string(value, &["guidance", "reason", "next_step"])
-                .unwrap_or_else(|| {
-                    "Continue browser work until the requested outcome is backed by visible page evidence."
-                        .to_string()
-                });
-            BrowserDoneAnswerValidation::Continue { guidance }
-        }
-        _ => {
-            let summary = browser_json_string(value, &["summary", "answer", "message"])
-                .unwrap_or_else(|| fallback_summary.trim().to_string());
-            let message = browser_json_string(value, &["message", "answer"])
-                .unwrap_or_else(|| fallback_message.trim().to_string());
-            BrowserDoneAnswerValidation::Complete { summary, message }
-        }
-    }
+fn browser_ask_user_resolution_when_verdict_unavailable(
+    _question: &str,
+) -> BrowserAskUserResolution {
+    // A proposed user checkpoint may be overridden only by a valid structured
+    // verifier verdict. If the verifier is unavailable or emits no JSON, keep
+    // the browser loop's handoff rather than continuing autonomous actions.
+    BrowserAskUserResolution::AskUser
 }
 
 fn browser_snapshot_completion_from_value(
@@ -3156,6 +3119,31 @@ fn browser_snapshot_has_visible_state(content: &PageContent) -> bool {
         return false;
     }
     !url.is_empty() || !title.is_empty() || !body.is_empty() || !content.elements.is_empty()
+}
+
+/// True when a navigated real page's snapshot is still an un-hydrated shell: a
+/// non-blank URL but empty body text AND no interactive elements. JS apps (SPAs
+/// like Gmail, Notion, Linear, etc.) render exactly this shell at
+/// `domcontentloaded`, before their content mounts via XHR. A snapshot taken
+/// then makes downstream deciders (access-blocker / ask_user) wrongly read an
+/// empty page as "not signed in" / blocked. Generic by construction: keys only
+/// on emptiness + a real URL — never on site, selector, or wording.
+fn browser_snapshot_is_unhydrated(content: &PageContent) -> bool {
+    let url = content.url.trim();
+    if url.is_empty() || url.eq_ignore_ascii_case("about:blank") {
+        return false;
+    }
+    content.body_text.trim().is_empty() && content.elements.is_empty()
+}
+
+fn browser_snapshot_has_structural_access_gate(content: &PageContent) -> bool {
+    if !browser_snapshot_has_visible_state(content) || browser_snapshot_is_unhydrated(content) {
+        return false;
+    }
+    content
+        .elements
+        .iter()
+        .any(|element| element.r#type.eq_ignore_ascii_case("password"))
 }
 
 fn browser_access_blocker_reason_from_value(value: &serde_json::Value) -> Option<String> {
@@ -3221,6 +3209,38 @@ impl BrowserLoopProgressTracker {
         }
         self.repeat_count
     }
+}
+
+#[derive(Debug, Clone)]
+struct BrowserInteractionProgressProbe {
+    before_page_key: String,
+    expects_visible_progress: bool,
+}
+
+impl BrowserInteractionProgressProbe {
+    fn new(before_page_key: String, expects_visible_progress: bool) -> Self {
+        Self {
+            before_page_key,
+            expects_visible_progress,
+        }
+    }
+}
+
+fn browser_observe_interaction_progress(
+    progress_probe: BrowserInteractionProgressProbe,
+    current_page_key: &str,
+    no_visible_progress_interaction_count: &mut u32,
+) -> bool {
+    let page_changed_since_last_interaction = progress_probe.before_page_key != current_page_key;
+    if progress_probe.expects_visible_progress {
+        if page_changed_since_last_interaction {
+            *no_visible_progress_interaction_count = 0;
+        } else {
+            *no_visible_progress_interaction_count =
+                no_visible_progress_interaction_count.saturating_add(1);
+        }
+    }
+    page_changed_since_last_interaction
 }
 
 fn browser_page_progress_key(content: &PageContent) -> String {
@@ -3347,7 +3367,26 @@ async fn browser_content_snapshot(
     let mut last_error = None;
     for attempt in 0..CONTENT_SNAPSHOT_ATTEMPTS {
         match integration.get_content(sidecar_id).await {
-            Ok(content) => return Ok(content),
+            Ok(content) => {
+                // Re-poll an un-hydrated SPA shell (real URL, empty body + no
+                // elements) before returning, so no downstream decider — for
+                // ANY browser flow ever classifies a transient empty page as
+                // blocked / requiring access.
+                // Reuses the same bounded budget + backoff as transport errors,
+                // stops the instant content hydrates, and returns the snapshot
+                // on the final attempt regardless so a genuinely-sparse page
+                // still resolves.
+                if attempt + 1 < CONTENT_SNAPSHOT_ATTEMPTS
+                    && browser_snapshot_is_unhydrated(&content)
+                {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        250 + (attempt as u64 * 250),
+                    ))
+                    .await;
+                    continue;
+                }
+                return Ok(content);
+            }
             Err(error) => {
                 last_error = Some(error);
                 if attempt + 1 < CONTENT_SNAPSHOT_ATTEMPTS {
@@ -3396,14 +3435,46 @@ async fn wait_for_browser_operator_input(
 
 fn stalled_browser_question(content: &PageContent, reason: &str) -> String {
     let title = content.title.trim();
+    let url = content.url.trim();
     let location = if title.is_empty() {
-        content.url.trim()
+        url
     } else {
         title
     };
+    let page_status = browser_visible_page_status(content);
     format!(
-        "The browser is on {location}, but the automation stopped making progress because {reason}. What should I do next from this page?"
+        "The browser automation paused because {reason}. Current page: {location}. {page_status} Please verify or finish the next step in the live browser, then tell me how to proceed."
     )
+}
+
+fn browser_visible_page_status(content: &PageContent) -> String {
+    let mut parts = Vec::new();
+    let url = content.url.trim();
+    if !url.is_empty() {
+        parts.push(format!("URL: {url}."));
+    }
+    let body = content.body_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !body.is_empty() {
+        parts.push(format!(
+            "Visible text starts: {}.",
+            truncate_browser_text(&body, 240)
+        ));
+    }
+    if content.elements.is_empty() {
+        parts.push("No visible interactive elements were reported.".to_string());
+    } else {
+        parts.push(format!(
+            "{} visible interactive elements were reported.",
+            content.elements.len()
+        ));
+    }
+    if !content.downloads.is_empty() {
+        parts.push(format!(
+            "{} download records were reported.",
+            content.downloads.len()
+        ));
+    }
+    parts.join(" ")
 }
 
 async fn run_browser_loop(
@@ -3433,29 +3504,29 @@ async fn run_browser_loop(
          - {{\"action\":\"type_text\",\"text\":\"...\",\"selector\":\"...\",\"clear\":false}}\n\
          - {{\"action\":\"scroll\",\"direction\":\"down\"}}\n\
          - {{\"action\":\"press_key\",\"key\":\"Enter\"}}\n\
-         - {{\"action\":\"ask_user\",\"question\":\"...\"}} when the task asks you to pause for the user, when the next step depends on a user decision, or when the site needs a real human to take over the live browser for login, MFA, CAPTCHA, or other sensitive steps. For decision checkpoints and user choices, the user may answer in chat. For login, MFA, CAPTCHA, and other site operations, the user may use live browser handoff. Do not ask the user to paste website passwords or one-time codes into chat when live browser handoff will work.\n\
+         - {{\"action\":\"ask_user\",\"question\":\"...\"}} when the task asks you to pause for the user, when the next step depends on a user decision, or when the site needs a real human to take over the live browser for sensitive account/security operations. For decision checkpoints and user choices, the user may answer in chat. For sensitive site operations, the user may use live browser handoff. Do not ask the user to paste secret authentication material into chat when live browser handoff will work.\n\
          - {{\"action\":\"notify\",\"message\":\"...\"}}\n\
-         - {{\"action\":\"done\",\"summary\":\"...\",\"message\":\"...\"}}\n\n\
+         - {{\"action\":\"done\",\"outcome_kind\":\"information_delivery|action_effect|live_browser_state|download\",\"summary\":\"...\",\"message\":\"...\",\"evidence\":\"...\"}}\n\n\
          Guardrails:\n\
          {}\
-         - Treat the task as a multi-step objective. If it includes a gated step such as login plus later explicit website work, use live handoff only for the gated step, then continue the remaining task yourself after the handoff resumes.\n\
+         - Treat the task as a multi-step objective. If it includes a gated access step plus later explicit website work, use live handoff only for the gated step, then continue the remaining task yourself after the handoff resumes.\n\
          - Decompose the objective into ordered milestones internally, but output only the next single browser action. Never output multiple JSON objects, arrays of actions, numbered steps, or prose around the action.\n\
          - Base every decision on the current page snapshot shown in the latest step.\n\
          - Prefer element_index for visible interactive elements listed as `element N` when clicking or typing; do not turn `element N` into a CSS selector.\n\
          - Use the current page snapshot and previous action history to decide the next incomplete milestone. Do not restart earlier milestones that the current page already proves complete.\n\
-         - When a form, dialog, compose box, editor, or checkout panel is already open, continue filling and submitting its visible fields/buttons instead of opening a duplicate panel.\n\
+         - When the visible page already contains the active workflow surface, continue operating that surface instead of opening a duplicate one.\n\
          - Treat any operator note from a live handoff as an unverified hint, never as proof.\n\
          - After a live handoff resumes, inspect the fresh page state before deciding what changed.\n\
-         - Internally distinguish the requested outcome before choosing ask_user or done: human-input checkpoints require a user decision or site operation; live-browser state checkpoints require leaving the browser open for the user to inspect/control; information-delivery outcomes require reporting facts that are visible in the current page snapshot.\n\
+         - Internally distinguish the requested outcome before choosing ask_user or done: human-input checkpoints require a user decision or site operation; live-browser state checkpoints require leaving the browser open for the user to inspect/control; information-delivery outcomes require reporting facts that are visible in the current page snapshot; action-effect outcomes require direct visible confirmation or destination evidence in the current page/download records. A successful browser control result or generic page change is not enough to prove an external action effect.\n\
          - For information-delivery outcomes, keep using the current page snapshot until the requested visible facts are available, then return done with those facts in summary/message. Do not use ask_user as a substitute for the final answer, and do not merely say the information is visible.\n\
          - For download outcomes, use the browser until the download record appears in the current page snapshot. If the task also asks to use the file elsewhere in AgentArk, finish with the downloaded file record so the outer agent can call the appropriate file or document tool.\n\
          - For live-browser state checkpoints, return ask_user only when the user needs to inspect/control the browser next or the task explicitly asked you to pause at that state.\n\
-         - If the task already states what should happen after login, MFA, CAPTCHA, or another gated checkpoint, continue directly instead of asking for confirmation.\n\
+         - If the task already states what should happen after a gated checkpoint, continue directly instead of asking for confirmation.\n\
          - Use ask_user only when a real human must operate the site, when the user explicitly requested a checkpoint, or when the task is genuinely underspecified even after considering the task text and current page.\n\
          - Only claim a gated checkpoint succeeded when the current page directly supports that claim.\n\
          - If the requested checkpoint cannot be directly verified from the current page, summarize the visible state conservatively instead of inventing hidden state.\n\
-         - Use done when the requested outcome is completed. For page-reading, listing, comparison, extraction, or summarization outcomes, done must include the observed page-derived answer.\n\
-         - Only stop and ask what to do next when the explicit task is complete and no further action is implied by the task itself.",
+         - Use done when the requested outcome is completed. Always set outcome_kind to exactly one of information_delivery, action_effect, live_browser_state, or download. Always include evidence: for information_delivery/download, cite the visible page facts or download record used; for live_browser_state, describe the visible state now left for the user; for action_effect, cite the direct visible confirmation or destination evidence. For information-delivery outcomes, done must include the observed page-derived answer.\n\
+         - Only stop for user input when the explicit task is complete with no further implied action, a real human must operate the site, or browser controls have stopped making visible progress.",
         ctx.task, site_constraint_instruction
     );
 
@@ -3465,19 +3536,54 @@ async fn run_browser_loop(
     let mut navigation_progress = BrowserNavigationProgress::default();
     let mut stall_tracker = BrowserLoopStallTracker::default();
     let mut progress_tracker = BrowserLoopProgressTracker::default();
+    let mut last_interaction_progress_probe: Option<BrowserInteractionProgressProbe> = None;
+    let mut no_visible_progress_interaction_count = 0u32;
 
     for iteration in 0..MAX_ITERATIONS {
         let content = browser_loop_content_snapshot(&ctx).await?;
+        let current_page_key = browser_page_progress_key(&content);
+        let mut page_changed_since_last_interaction = false;
+        if let Some(progress_probe) = last_interaction_progress_probe.take() {
+            page_changed_since_last_interaction = browser_observe_interaction_progress(
+                progress_probe,
+                &current_page_key,
+                &mut no_visible_progress_interaction_count,
+            );
+        }
         navigation_progress.observe_page_url(&content.url);
         last_content = Some(content.clone());
-        if let Some(reason) = classify_browser_access_blocker(&ctx, &content, &history).await {
+        if no_visible_progress_interaction_count >= MAX_NO_VISIBLE_PROGRESS_INTERACTIONS {
+            let reason = "recent browser control actions did not produce visible page progress";
             history.push(format!(
-                "Step {}: Access blocker detected - {}",
-                iteration + 1,
-                reason
+                "Step {}: Browser controls are no longer producing visible progress",
+                iteration + 1
             ));
-            sync_session_history(ctx.sessions, ctx.storage.as_ref(), session_id, &history).await;
-            return Err(anyhow!(reason));
+            let question = stalled_browser_question(&content, reason);
+            history.push(format!(
+                "Step {}: Asking user after repeated no-progress browser controls",
+                iteration + 1
+            ));
+            match wait_for_browser_operator_input(
+                session_id,
+                &ctx,
+                &question,
+                &content,
+                &mut history,
+            )
+            .await?
+            {
+                BrowserOperatorWaitResult::ReturnToChat { outcome } => {
+                    return Ok(outcome);
+                }
+                BrowserOperatorWaitResult::Continue {
+                    pending_resume_context: resume_context,
+                } => {
+                    pending_resume_context = Some(resume_context);
+                    no_visible_progress_interaction_count = 0;
+                    stall_tracker.reset();
+                }
+            }
+            continue;
         }
         let elements_str = content
             .elements
@@ -3576,6 +3682,15 @@ async fn run_browser_loop(
                         guidance
                     ));
                 }
+                BrowserDoneAnswerValidation::HandBack { question } => {
+                    // Snapshot-completion never emits HandBack today; treat it
+                    // like Continue and fall through to the user handoff below.
+                    history.push(format!(
+                        "Step {}: No-progress snapshot validation could not confirm completion - {}",
+                        iteration + 1,
+                        question
+                    ));
+                }
             }
             let question = stalled_browser_question(&content, reason);
             history.push(format!(
@@ -3667,6 +3782,11 @@ async fn run_browser_loop(
                             BrowserNavigationDecision::Allow => {
                                 let (final_url, title) =
                                     ctx.integration.navigate(ctx.sidecar_id, url).await?;
+                                last_interaction_progress_probe =
+                                    Some(BrowserInteractionProgressProbe::new(
+                                        current_page_key.clone(),
+                                        true,
+                                    ));
                                 navigation_progress.observe_page_url(&final_url);
                                 stall_tracker.reset();
                                 history.push(format!(
@@ -3750,6 +3870,11 @@ async fn run_browser_loop(
                     .await
                 {
                     Ok(()) => {
+                        last_interaction_progress_probe =
+                            Some(BrowserInteractionProgressProbe::new(
+                                current_page_key.clone(),
+                                true,
+                            ));
                         stall_tracker.reset();
                         history.push(format!("Step {}: Clicked '{}'", iteration + 1, label));
                     }
@@ -3810,6 +3935,11 @@ async fn run_browser_loop(
                     .await
                 {
                     Ok(()) => {
+                        last_interaction_progress_probe =
+                            Some(BrowserInteractionProgressProbe::new(
+                                current_page_key.clone(),
+                                false,
+                            ));
                         stall_tracker.reset();
                         history.push(format!(
                             "Step {}: Typed {} chars",
@@ -3874,6 +4004,10 @@ async fn run_browser_loop(
                     .and_then(|v| v.as_i64())
                     .map(|v| v as i32);
                 ctx.integration.scroll(ctx.sidecar_id, dir, amount).await?;
+                last_interaction_progress_probe = Some(BrowserInteractionProgressProbe::new(
+                    current_page_key.clone(),
+                    true,
+                ));
                 stall_tracker.reset();
                 history.push(format!("Step {}: Scrolled {}", iteration + 1, dir));
             }
@@ -3884,6 +4018,11 @@ async fn run_browser_loop(
                     .unwrap_or("Enter");
                 match ctx.integration.press_key(ctx.sidecar_id, key).await {
                     Ok(()) => {
+                        last_interaction_progress_probe =
+                            Some(BrowserInteractionProgressProbe::new(
+                                current_page_key.clone(),
+                                true,
+                            ));
                         stall_tracker.reset();
                         history.push(format!("Step {}: Pressed {}", iteration + 1, key));
                     }
@@ -3973,31 +4112,69 @@ async fn run_browser_loop(
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or(summary);
-                let (summary, message) =
-                    match validate_browser_done_answer(&ctx, &content, &history, summary, message)
-                        .await
-                    {
-                        BrowserDoneAnswerValidation::Complete { summary, message } => {
-                            (summary, message)
-                        }
-                        BrowserDoneAnswerValidation::Continue { guidance } => {
-                            history.push(format!(
-                                "Step {}: Completion validator requested more browser work - {}",
+                let (summary, message) = match validate_browser_done_answer(
+                    &ctx,
+                    &action,
+                    &content,
+                    page_changed_since_last_interaction,
+                    &history,
+                    summary,
+                    message,
+                )
+                .await
+                {
+                    BrowserDoneAnswerValidation::Complete { summary, message } => {
+                        (summary, message)
+                    }
+                    BrowserDoneAnswerValidation::Continue { guidance } => {
+                        history.push(format!(
+                            "Step {}: Completion evidence check requested more browser work - {}",
+                            iteration + 1,
+                            guidance
+                        ));
+                        sync_session_history(
+                            ctx.sessions,
+                            ctx.storage.as_ref(),
+                            session_id,
+                            &history,
+                        )
+                        .await;
+                        pending_resume_context = Some(guidance);
+                        stall_tracker.reset();
+                        continue;
+                    }
+                    BrowserDoneAnswerValidation::HandBack { question } => {
+                        // The answer claimed an action effect the page did not
+                        // confirm. Hand the live browser back to the user to
+                        // verify/finish, instead of reporting fabricated success.
+                        history.push(format!(
+                                "Step {}: Completion evidence check could not confirm the claimed action effect; handing the live browser back to the user - {}",
                                 iteration + 1,
-                                guidance
+                                question
                             ));
-                            sync_session_history(
-                                ctx.sessions,
-                                ctx.storage.as_ref(),
-                                session_id,
-                                &history,
-                            )
-                            .await;
-                            pending_resume_context = Some(guidance);
-                            stall_tracker.reset();
-                            continue;
-                        }
-                    };
+                        sync_session_history(
+                            ctx.sessions,
+                            ctx.storage.as_ref(),
+                            session_id,
+                            &history,
+                        )
+                        .await;
+                        let screenshot = ctx.integration.screenshot(ctx.sidecar_id).await.ok();
+                        set_awaiting_chat_input(
+                            ctx.sessions,
+                            ctx.storage.as_ref(),
+                            session_id,
+                            &question,
+                        )
+                        .await;
+                        (ctx.notify)(BrowserSessionNotification::needs_input(
+                            session_id,
+                            question.clone(),
+                            screenshot,
+                        ));
+                        return Ok(BrowserLoopOutcome::NeedsChatInput { question });
+                    }
+                };
                 let screenshot = ctx.integration.screenshot(ctx.sidecar_id).await.ok();
                 history.push(format!(
                     "Step {}: DONE (closing browser session) - {}",
@@ -4306,6 +4483,7 @@ mod tests {
     fn browser_ask_user_resolution_preserves_true_user_checkpoints() {
         let value = serde_json::json!({
             "action": "ask_user",
+            "requires_human": true,
             "reason": "The page requires a user choice."
         });
 
@@ -4313,6 +4491,24 @@ mod tests {
             browser_ask_user_resolution_from_value(&value, "Which account should I use?");
 
         assert_eq!(resolution, BrowserAskUserResolution::AskUser);
+    }
+
+    #[test]
+    fn browser_ask_user_resolution_requires_typed_human_need() {
+        let value = serde_json::json!({
+            "action": "ask_user",
+            "requires_human": false,
+            "reason": "The page has not produced the requested evidence yet."
+        });
+
+        let resolution = browser_ask_user_resolution_from_value(&value, "Should I keep going?");
+
+        match resolution {
+            BrowserAskUserResolution::Continue { guidance } => {
+                assert!(guidance.contains("Continue browser work"));
+            }
+            other => panic!("ambiguous ask_user should continue, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4333,6 +4529,14 @@ mod tests {
     }
 
     #[test]
+    fn browser_ask_user_resolution_preserves_checkpoint_when_verdict_unavailable() {
+        let resolution =
+            browser_ask_user_resolution_when_verdict_unavailable("The live page needs help.");
+
+        assert_eq!(resolution, BrowserAskUserResolution::AskUser);
+    }
+
+    #[test]
     fn browser_access_blocker_resolution_requires_classifier_block_flag() {
         let blocked = serde_json::json!({
             "blocked": true,
@@ -4348,6 +4552,156 @@ mod tests {
             Some("The page requires account access before the requested inbox content is visible.")
         );
         assert!(browser_access_blocker_reason_from_value(&clear).is_none());
+    }
+
+    #[test]
+    fn browser_access_blocker_classifier_is_gated_by_structural_sensitive_controls() {
+        let inbox = PageContent {
+            title: "Inbox".to_string(),
+            url: "https://mail.example.test/inbox".to_string(),
+            body_text: "Suno Your receipt from Suno\nKrea Welcome to Krea".to_string(),
+            elements: vec![PageElement {
+                index: 1,
+                tag: "button".to_string(),
+                r#type: "button".to_string(),
+                text: "Refresh".to_string(),
+                name: String::new(),
+                id: String::new(),
+                href: String::new(),
+                x: 10,
+                y: 10,
+            }],
+            diagnostics: Vec::new(),
+            downloads: Vec::new(),
+            download_dir: None,
+        };
+        let sensitive_form = PageContent {
+            elements: vec![PageElement {
+                index: 2,
+                tag: "input".to_string(),
+                r#type: "password".to_string(),
+                text: String::new(),
+                name: String::new(),
+                id: String::new(),
+                href: String::new(),
+                x: 10,
+                y: 40,
+            }],
+            ..inbox.clone()
+        };
+
+        assert!(!browser_snapshot_has_structural_access_gate(&inbox));
+        assert!(browser_snapshot_has_structural_access_gate(&sensitive_form));
+    }
+
+    #[test]
+    fn browser_done_local_validation_accepts_page_grounded_information() {
+        let content = PageContent {
+            title: "Inbox".to_string(),
+            url: "https://mail.example.test/inbox".to_string(),
+            body_text: "Suno Your receipt from Suno\nKrea Welcome to Krea".to_string(),
+            elements: Vec::new(),
+            diagnostics: Vec::new(),
+            downloads: Vec::new(),
+            download_dir: None,
+        };
+        let action = serde_json::json!({
+            "action": "done",
+            "outcome_kind": "information_delivery",
+            "evidence": "Suno Your receipt from Suno"
+        });
+
+        let validation = browser_done_answer_local_validation(
+            &action,
+            &content,
+            false,
+            "Latest emails found",
+            "Suno sent Your receipt from Suno. Krea sent Welcome to Krea.",
+        );
+
+        assert_eq!(
+            validation,
+            BrowserDoneAnswerValidation::Complete {
+                summary: "Latest emails found".to_string(),
+                message: "Suno sent Your receipt from Suno. Krea sent Welcome to Krea.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn browser_done_local_validation_hands_back_ungrounded_action_effect() {
+        let content = PageContent {
+            title: "Compose".to_string(),
+            url: "https://mail.example.test/compose".to_string(),
+            body_text: "Compose\nTo\nSubject\nBody\nSend".to_string(),
+            elements: vec![PageElement {
+                index: 7,
+                tag: "button".to_string(),
+                r#type: "button".to_string(),
+                text: "Send".to_string(),
+                name: String::new(),
+                id: String::new(),
+                href: String::new(),
+                x: 100,
+                y: 100,
+            }],
+            diagnostics: Vec::new(),
+            downloads: Vec::new(),
+            download_dir: None,
+        };
+        let action = serde_json::json!({
+            "action": "done",
+            "outcome_kind": "action_effect",
+            "evidence": "The requested action completed."
+        });
+
+        let validation = browser_done_answer_local_validation(
+            &action,
+            &content,
+            false,
+            "Done",
+            "The email has been sent.",
+        );
+
+        match validation {
+            BrowserDoneAnswerValidation::HandBack { question } => {
+                assert!(question.contains("could not confirm"));
+            }
+            other => panic!("ungrounded action-effect completion should hand back, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn browser_done_local_validation_does_not_treat_page_change_as_action_effect_proof() {
+        let content = PageContent {
+            title: "Result page".to_string(),
+            url: "https://app.example.test/items".to_string(),
+            body_text: "The visible page changed after the last control action.".to_string(),
+            elements: Vec::new(),
+            diagnostics: Vec::new(),
+            downloads: Vec::new(),
+            download_dir: None,
+        };
+        let action = serde_json::json!({
+            "action": "done",
+            "outcome_kind": "action_effect",
+            "evidence": "The page changed after the final browser interaction."
+        });
+
+        let validation = browser_done_answer_local_validation(
+            &action,
+            &content,
+            true,
+            "Done",
+            "The requested action completed.",
+        );
+
+        match validation {
+            BrowserDoneAnswerValidation::HandBack { question } => {
+                assert!(question.contains("could not confirm"));
+            }
+            other => panic!("page change alone should not confirm action effect, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4961,6 +5315,69 @@ mod tests {
         assert_eq!(tracker.record_action(&content, &action), 2);
         assert_eq!(tracker.record_action(&changed_content, &action), 1);
         assert_eq!(tracker.record_action(&changed_content, &changed_action), 1);
+    }
+
+    #[test]
+    fn browser_interaction_progress_counts_only_expected_unchanged_states() {
+        let mut no_progress_count = 0;
+
+        let changed = browser_observe_interaction_progress(
+            BrowserInteractionProgressProbe::new("before".to_string(), true),
+            "before",
+            &mut no_progress_count,
+        );
+        assert!(!changed);
+        assert_eq!(no_progress_count, 1);
+
+        let changed = browser_observe_interaction_progress(
+            BrowserInteractionProgressProbe::new("before".to_string(), true),
+            "after",
+            &mut no_progress_count,
+        );
+        assert!(changed);
+        assert_eq!(no_progress_count, 0);
+
+        let changed = browser_observe_interaction_progress(
+            BrowserInteractionProgressProbe::new("after".to_string(), false),
+            "after",
+            &mut no_progress_count,
+        );
+        assert!(!changed);
+        assert_eq!(no_progress_count, 0);
+    }
+
+    #[test]
+    fn stalled_browser_question_reports_current_page_status() {
+        let content = PageContent {
+            title: "Current workflow".to_string(),
+            url: "https://app.example.test/workflow".to_string(),
+            body_text: "A visible panel is still open and waiting for the next site operation."
+                .to_string(),
+            elements: vec![PageElement {
+                index: 4,
+                tag: "button".to_string(),
+                r#type: "button".to_string(),
+                text: "Continue".to_string(),
+                name: String::new(),
+                id: String::new(),
+                href: String::new(),
+                x: 10,
+                y: 20,
+            }],
+            diagnostics: Vec::new(),
+            downloads: Vec::new(),
+            download_dir: None,
+        };
+
+        let question =
+            stalled_browser_question(&content, "recent browser controls did not change the page");
+
+        assert!(question.contains("automation paused"));
+        assert!(question.contains("Current workflow"));
+        assert!(question.contains("https://app.example.test/workflow"));
+        assert!(question.contains("Visible text starts"));
+        assert!(question.contains("1 visible interactive elements"));
+        assert!(!question.contains("What should I do next"));
     }
 
     #[test]

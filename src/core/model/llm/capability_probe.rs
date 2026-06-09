@@ -84,7 +84,10 @@ pub fn evaluate_tool_call_probe(response: &super::LlmResponse) -> (bool, String)
     if call.name != PROBE_TOOL_NAME {
         return (
             false,
-            format!("tool call targeted '{}' instead of '{PROBE_TOOL_NAME}'", call.name),
+            format!(
+                "tool call targeted '{}' instead of '{PROBE_TOOL_NAME}'",
+                call.name
+            ),
         );
     }
     let arguments = match &call.arguments {
@@ -109,7 +112,9 @@ pub fn evaluate_tool_call_probe(response: &super::LlmResponse) -> (bool, String)
         .get("text")
         .and_then(|value| value.as_str())
         .is_some_and(|value| !value.trim().is_empty());
-    let count_ok = arguments.get("count").is_some_and(|value| value.is_i64() || value.is_u64());
+    let count_ok = arguments
+        .get("count")
+        .is_some_and(|value| value.is_i64() || value.is_u64());
     if !text_ok || !count_ok {
         let mut missing = Vec::new();
         if !text_ok {
@@ -126,7 +131,10 @@ pub fn evaluate_tool_call_probe(response: &super::LlmResponse) -> (bool, String)
             ),
         );
     }
-    (true, "well-formed tool call with complete required arguments".to_string())
+    (
+        true,
+        "well-formed tool call with complete required arguments".to_string(),
+    )
 }
 
 /// Judge a JSON-discipline probe response: content (after stripping markdown

@@ -4612,10 +4612,10 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         let target = Self::json_value_at_watch_condition_path(payload, &predicate.path);
         match predicate.operator {
             crate::core::automation::watcher::WatchConditionOperator::Exists => {
-                return Ok(target.is_some())
+                return Ok(target.is_some());
             }
             crate::core::automation::watcher::WatchConditionOperator::NotExists => {
-                return Ok(target.is_none())
+                return Ok(target.is_none());
             }
             _ => {}
         }

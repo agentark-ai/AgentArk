@@ -113,9 +113,9 @@ impl ActionRuntime {
                     ActionErrorDomain::Integration,
                     ActionErrorReason::NotConnected,
                     format!(
-                    "Action '{}' is unavailable because required integration '{}' is not ready.",
-                    action_name, integration_id
-                ),
+                        "Action '{}' is unavailable because required integration '{}' is not ready.",
+                        action_name, integration_id
+                    ),
                 ));
             }
         }
@@ -281,9 +281,9 @@ impl ActionRuntime {
                     ActionErrorDomain::Integration,
                     ActionErrorReason::NotConnected,
                     format!(
-                    "Action '{}' is unavailable because required integration '{}' is not ready.",
-                    action_name, integration_id
-                ),
+                        "Action '{}' is unavailable because required integration '{}' is not ready.",
+                        action_name, integration_id
+                    ),
                 ));
             }
         }

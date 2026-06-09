@@ -376,6 +376,11 @@ pub(super) fn integration_user_disabled_key(id: &str) -> String {
 pub(super) async fn refresh_connected_action_surfaces(state: &AppState, reason: &'static str) {
     let agent = { state.agent.read().await.clone() };
     agent.refresh_action_catalog_index(reason).await;
+    agent
+        .refresh_capability_readiness_snapshot(
+            crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+        )
+        .await;
 }
 
 fn set_builtin_integration_enabled(
@@ -1515,6 +1520,11 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
             agent_for_catalog
                 .refresh_action_catalog_index("oauth_connection_state_changed")
                 .await;
+            agent_for_catalog
+                .refresh_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::OAuthCallback,
+                )
+                .await;
             if let PendingOAuthTarget::AuthProfile { profile_id } = &oauth_target {
                 agent_for_catalog.spawn_custom_api_auth_profile_ready_reconcile(
                     profile_id.clone(),
@@ -1885,9 +1895,13 @@ pub(super) async fn disconnect_integration(
     // Token/config based integrations don't implement a runtime "disconnect" action.
     // Disconnect here means clearing stored secrets, which updates status immediately.
     if external_integration_config(&id).is_some() {
-        let (config_dir, data_dir) = {
+        let (config_dir, data_dir, agent_for_readiness) = {
             let agent = state.agent.read().await;
-            (agent.config_dir.clone(), agent.data_dir.clone())
+            (
+                agent.config_dir.clone(),
+                agent.data_dir.clone(),
+                agent.clone(),
+            )
         };
         let manager = match crate::core::runtime::config::SecureConfigManager::new_with_data_dir(
             &config_dir,
@@ -1962,6 +1976,11 @@ pub(super) async fn disconnect_integration(
             &integration_user_disabled_key(&id),
             Some("false".to_string()),
         );
+        agent_for_readiness
+            .refresh_capability_readiness_snapshot(
+                crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+            )
+            .await;
 
         return (
             StatusCode::OK,
@@ -1998,6 +2017,14 @@ pub(super) async fn disconnect_integration(
                 &integration_user_disabled_key("vercel"),
                 Some("false".to_string()),
             );
+            {
+                let agent = state.agent.read().await.clone();
+                agent
+                    .refresh_capability_readiness_snapshot(
+                        crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                    )
+                    .await;
+            }
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"status":"ok","enabled":true,"connected":true})),
@@ -2008,6 +2035,14 @@ pub(super) async fn disconnect_integration(
             &integration_enabled_key("vercel"),
             Some("false".to_string()),
         );
+        {
+            let agent = state.agent.read().await.clone();
+            agent
+                .refresh_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
+        }
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2020,6 +2055,7 @@ pub(super) async fn disconnect_integration(
     }
 
     let agent = state.agent.read().await;
+    let agent_for_readiness = agent.clone();
 
     match agent.integrations.get(&id) {
         Some(integration) => {
@@ -2027,11 +2063,18 @@ pub(super) async fn disconnect_integration(
                 .execute("disconnect", &serde_json::json!({}))
                 .await
             {
-                Ok(_) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"status": "ok", "message": "Disconnected"})),
-                )
-                    .into_response(),
+                Ok(_) => {
+                    agent_for_readiness
+                        .refresh_capability_readiness_snapshot(
+                            crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                        )
+                        .await;
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"status": "ok", "message": "Disconnected"})),
+                    )
+                        .into_response()
+                }
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -2521,6 +2564,11 @@ pub(super) async fn configure_integration(
                         agent
                             .refresh_action_catalog_index("prebuilt_integration_connected")
                             .await;
+                        agent
+                            .refresh_capability_readiness_snapshot(
+                                crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                            )
+                            .await;
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({
@@ -2553,6 +2601,11 @@ pub(super) async fn configure_integration(
                         agent
                             .refresh_action_catalog_index("prebuilt_integration_disabled")
                             .await;
+                        agent
+                            .refresh_capability_readiness_snapshot(
+                                crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                            )
+                            .await;
                         (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
@@ -2580,6 +2633,11 @@ pub(super) async fn configure_integration(
                         }
                         agent
                             .refresh_action_catalog_index("prebuilt_integration_disabled")
+                            .await;
+                        agent
+                            .refresh_capability_readiness_snapshot(
+                                crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                            )
                             .await;
                         (
                             StatusCode::BAD_REQUEST,
@@ -2780,6 +2838,11 @@ pub(super) async fn enable_integration(
             agent
                 .refresh_action_catalog_index("prebuilt_integration_enabled")
                 .await;
+            agent
+                .refresh_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -2809,6 +2872,11 @@ pub(super) async fn enable_integration(
             agent
                 .refresh_action_catalog_index("prebuilt_integration_disabled")
                 .await;
+            agent
+                .refresh_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
+                .await;
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -2833,6 +2901,11 @@ pub(super) async fn enable_integration(
             }
             agent
                 .refresh_action_catalog_index("prebuilt_integration_disabled")
+                .await;
+            agent
+                .refresh_capability_readiness_snapshot(
+                    crate::core::agent::capability_readiness::CapabilityReadinessSource::RuntimeEvent,
+                )
                 .await;
             (
                 StatusCode::BAD_REQUEST,

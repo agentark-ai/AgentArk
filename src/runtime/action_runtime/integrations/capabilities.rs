@@ -295,8 +295,7 @@ impl ActionRuntime {
         if normalized_name.is_none() || !has_endpoint {
             let mut violations: Vec<String> = Vec::new();
             if raw_name.is_none() {
-                violations
-                    .push("Missing `name` (or `id`) for the integration record.".to_string());
+                violations.push("Missing `name` (or `id`) for the integration record.".to_string());
             } else if normalized_name.is_none() {
                 violations.push(
                     "The provided `name`/`id` normalizes to an empty action name; provide a name with at least one alphanumeric character."
@@ -863,32 +862,30 @@ impl ActionRuntime {
         let url_path = parsed.path().to_string();
         let no_headers = std::collections::BTreeMap::new();
         let argument_path = Self::capability_string_argument(arguments, "path");
-        let (root, graphql_path) = if crate::core::request_contract::endpoint_has_graphql_signal(
-            &url_path,
-            &no_headers,
-        ) {
-            let mut root = parsed.clone();
-            root.set_path("");
-            root.set_query(None);
-            (root.as_str().trim_end_matches('/').to_string(), url_path)
-        } else if argument_path.as_deref().is_some_and(|path| {
-            crate::core::request_contract::endpoint_has_graphql_signal(path, &no_headers)
-        }) {
-            (
-                raw_base.trim().trim_end_matches('/').to_string(),
-                argument_path.unwrap_or_default(),
-            )
-        } else {
-            return None;
-        };
+        let (root, graphql_path) =
+            if crate::core::request_contract::endpoint_has_graphql_signal(&url_path, &no_headers) {
+                let mut root = parsed.clone();
+                root.set_path("");
+                root.set_query(None);
+                (root.as_str().trim_end_matches('/').to_string(), url_path)
+            } else if argument_path.as_deref().is_some_and(|path| {
+                crate::core::request_contract::endpoint_has_graphql_signal(path, &no_headers)
+            }) {
+                (
+                    raw_base.trim().trim_end_matches('/').to_string(),
+                    argument_path.unwrap_or_default(),
+                )
+            } else {
+                return None;
+            };
         let draft_arguments = serde_json::json!({
             "base_url": root,
             "method": "post",
             "path": graphql_path,
         });
         Some(
-            Self::capability_operation_draft(&draft_arguments, target_id, request_description)
-                .map(|(base_url, operation, _)| {
+            Self::capability_operation_draft(&draft_arguments, target_id, request_description).map(
+                |(base_url, operation, _)| {
                     let (auth_mode, auth_header, auth_name, auth_username) =
                         Self::capability_auth_fields(arguments);
                     (
@@ -898,8 +895,7 @@ impl ActionRuntime {
                             description: Some(request_description.to_string()),
                             base_url,
                             enabled: Some(true),
-                            auth_mode: auth_mode
-                                .or(existing_config.map(|config| config.auth_mode)),
+                            auth_mode: auth_mode.or(existing_config.map(|config| config.auth_mode)),
                             auth_profile_id: None,
                             auth_header,
                             auth_name,
@@ -911,7 +907,8 @@ impl ActionRuntime {
                         },
                         1usize,
                     )
-                }),
+                },
+            ),
         )
     }
 
@@ -1477,11 +1474,10 @@ impl ActionRuntime {
         let (mut request, operation_count) = if let Some(prebuilt) = graphql_request_without_source
         {
             prebuilt
-        } else if let Some(preview_request) =
-            Self::custom_api_preview_request_from_source_contract(
-                &effective_arguments,
-                request_name.clone(),
-            ) {
+        } else if let Some(preview_request) = Self::custom_api_preview_request_from_source_contract(
+            &effective_arguments,
+            request_name.clone(),
+        ) {
             match crate::custom_apis::preview_custom_api(preview_request).await {
                 Ok(preview) => {
                     let auth_mode = Self::capability_auth_mode(&effective_arguments)
@@ -1540,9 +1536,8 @@ impl ActionRuntime {
                         &request_description,
                     ) {
                         fallback?
-                    } else if Self::capability_arguments_have_operation_shape(
-                        &effective_arguments,
-                    ) {
+                    } else if Self::capability_arguments_have_operation_shape(&effective_arguments)
+                    {
                         let (base_url, operations) = Self::capability_operation_drafts(
                             &effective_arguments,
                             name,

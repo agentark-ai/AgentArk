@@ -107,6 +107,7 @@ pub struct SpineRequest {
     pub project_id: Option<String>,
     pub execution_profile: Option<serde_json::Value>,
     pub browser_profile_context: Option<serde_json::Value>,
+    pub capability_readiness_generation: Option<u64>,
     pub visual_attachments: Vec<ChatAttachmentHint>,
     pub authorization: ActionAuthorizationContext,
 }
@@ -137,6 +138,7 @@ impl SpineRequest {
             project_id: None,
             execution_profile: None,
             browser_profile_context: None,
+            capability_readiness_generation: None,
             visual_attachments: Vec::new(),
             authorization,
         }

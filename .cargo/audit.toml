@@ -12,6 +12,8 @@ ignore = [
     "RUSTSEC-2025-0134",
     # scraper/selectors and wasmtime's internal TOML stack retain fxhash transitively.
     "RUSTSEC-2025-0057",
+    # sea-orm 1.1.20 -> sea-bae 0.2.1; SeaORM 2 is still RC and raises MSRV.
+    "RUSTSEC-2026-0173",
     # sqlx 0.8.6 retains sqlx-mysql/rsa in Cargo.lock; AgentArk enables Postgres only.
     "RUSTSEC-2023-0071",
 ]

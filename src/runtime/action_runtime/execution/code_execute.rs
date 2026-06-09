@@ -1077,9 +1077,9 @@ impl ActionRuntime {
             "perl" | "pl" => ("perl", vec!["-e".to_string(), code.to_string()]),
             _ => {
                 return Err(anyhow::anyhow!(
-                "Native fallback only supports interpreted languages. Docker required for '{}'.",
-                language
-            ));
+                    "Native fallback only supports interpreted languages. Docker required for '{}'.",
+                    language
+                ));
             }
         };
 
