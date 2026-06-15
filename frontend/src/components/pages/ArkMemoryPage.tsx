@@ -568,46 +568,6 @@ export default function MemoryPage({
             : `${failedCaptureCount} memory captures need attention.`}
         </Alert>
       ) : null}
-      {healthFindings.length > 0 ? (
-        <Box className="list-shell">
-          <Stack
-            direction={{ xs: "column", sm: "row" }}
-            spacing={1}
-            useFlexGap
-            sx={{
-              alignItems: { xs: "stretch", sm: "center" },
-              justifyContent: "space-between",
-            }}
-          >
-            <Stack
-              direction="row"
-              spacing={1}
-              useFlexGap
-              sx={{ alignItems: "center", flexWrap: "wrap" }}
-            >
-              <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                Memory Health
-              </Typography>
-              <Chip
-                size="small"
-                variant="outlined"
-                color="warning"
-                label={`${healthFindings.length} finding${
-                  healthFindings.length === 1 ? "" : "s"
-                }`}
-              />
-            </Stack>
-            <Button
-              size="small"
-              variant="outlined"
-              color="warning"
-              onClick={openHealthDetails}
-            >
-              Review findings
-            </Button>
-          </Stack>
-        </Box>
-      ) : null}
 
       {/* Stat chips removed: counts for Current Memory / History already
           render inside their tabs immediately below this header, and

@@ -88,9 +88,11 @@ test("live chat transcript keeps model prose progress alongside tool actions", (
     'kind === "model_prose"',
     "chat transcript builder should recognize model_prose progress events",
   );
-  assertSourceIncludes(
-    chatPageSource,
-    'item.kind === "action" || item.kind === "prose"',
+  assert.equal(
+    /item\.kind === "action"[\s\S]{0,120}item\.kind === "prose"/.test(
+      chatPageSource,
+    ),
+    true,
     "live transcript should keep model prose rows instead of filtering to actions only",
   );
   assert.equal(
@@ -106,7 +108,7 @@ test("live chat transcript preserves model prose across active step limiting", (
   assertSourceIncludes(
     chatPageSource,
     "function isTranscriptPreservedActivityStep",
-    "step limiting should have a shared predicate for chat-visible prose/reasoning rows",
+    "step limiting should have a shared predicate for chat-visible prose rows",
   );
   assertSourceIncludes(
     chatPageSource,
@@ -162,5 +164,156 @@ test("live chat transcript item cap preserves model prose rows", () => {
     chatPageSource,
     "preserveProse: true",
     "live transcript should keep model emits visible while actions continue streaming",
+  );
+});
+
+test("main chat transcript shows thinking content without JSON audit blocks", () => {
+  const preservedSource = functionSource(
+    chatPageSource,
+    "isTranscriptPreservedActivityStep",
+  );
+  assert.equal(
+    preservedSource.includes("isMainChatReasoningStep(step)"),
+    true,
+    "reasoning_delta steps should survive transcript limiting so Thinking content can render",
+  );
+  const internalReasoningIndex = chatPageSource.indexOf(
+    "const internalReasoningText = modelInternalReasoningTextFromActivityStep(step);",
+  );
+  assert.notEqual(
+    internalReasoningIndex,
+    -1,
+    "transcript builder should inspect internal reasoning",
+  );
+  const proseIndex = chatPageSource.indexOf(
+    "const proseText = modelNarrationTextFromActivityStep(step);",
+    internalReasoningIndex,
+  );
+  assert.notEqual(
+    proseIndex,
+    -1,
+    "transcript builder should handle public prose after internal reasoning",
+  );
+  const reasoningGuardSource = chatPageSource.slice(
+    internalReasoningIndex,
+    proseIndex,
+  );
+  assertSourceIncludes(
+    reasoningGuardSource,
+    "if (internalReasoningText)",
+    "transcript builder should guard internal reasoning",
+  );
+  assertSourceIncludes(
+    reasoningGuardSource,
+    "appendThinkingRow(",
+    "transcript builder should surface internal reasoning as a Thinking content row",
+  );
+  assertSourceIncludes(
+    reasoningGuardSource,
+    "continue;",
+    "transcript builder should stop internal reasoning before tool-action handling",
+  );
+  assert.equal(
+    reasoningGuardSource.includes("appendReasoningDetail"),
+    false,
+    "internal reasoning guard should not append a main-chat row",
+  );
+  assert.equal(
+    chatPageSource.includes("fullReasoningDetail"),
+    false,
+    "chat transcript should not use the removed fullReasoningDetail variable",
+  );
+  assert.equal(
+    chatPageSource.includes('kind: "reasoning";'),
+    false,
+    "main chat transcript items should not include a stale reasoning row variant",
+  );
+  assertSourceIncludes(
+    chatPageSource,
+    'kind: "thinking";',
+    "main chat transcript items should include a thinking row variant",
+  );
+  assertSourceIncludes(
+    chatPageSource,
+    "details: ChatTranscriptActionDetail[];",
+    "Thinking rows should carry plain text detail entries",
+  );
+  assertSourceIncludes(
+    chatPageSource,
+    'title: "Thinking"',
+    "main chat transcript should label internal reasoning activity as Thinking",
+  );
+  assert.equal(
+    chatPageSource.includes("renderReasoning"),
+    false,
+    "main chat transcript renderer should not keep a stale reasoning preview branch",
+  );
+  assertSourceIncludes(
+    chatPageSource,
+    "renderThinking",
+    "main chat transcript renderer should keep a Thinking content branch",
+  );
+  const renderThinkingIndex = chatPageSource.indexOf("const renderThinking = (");
+  assert.notEqual(
+    renderThinkingIndex,
+    -1,
+    "Thinking renderer should exist",
+  );
+  const renderThinkingEnd = chatPageSource.indexOf(
+    "// Walk items, grouping consecutive action items into runs.",
+    renderThinkingIndex,
+  );
+  assert.notEqual(
+    renderThinkingEnd,
+    -1,
+    "Thinking renderer source should be bounded before item grouping",
+  );
+  const renderThinkingSource = chatPageSource.slice(
+    renderThinkingIndex,
+    renderThinkingEnd,
+  );
+  assert.equal(
+    renderThinkingSource.includes("item.detail ?"),
+    false,
+    "collapsed Thinking row should not show an inline reasoning preview",
+  );
+  assert.equal(
+    renderThinkingSource.includes("chat-transcript-action-separator"),
+    false,
+    "collapsed Thinking row should not render the preview separator",
+  );
+  assertSourceIncludes(
+    chatPageSource,
+    "renderTranscriptActionDetail(item.id, entry, entryIdx,",
+    "Thinking rows should render their text details",
+  );
+  assertSourceIncludes(
+    chatPageSource,
+    "showAudit: false",
+    "Thinking rows should suppress JSON command/output audit blocks",
+  );
+  assert.equal(
+    /item\.kind === "action"[\s\S]{0,180}item\.kind === "prose"[\s\S]{0,180}item\.kind === "reasoning"/.test(
+      chatPageSource,
+    ),
+    false,
+    "live transcript filter should not keep reasoning-detail rows in the main chat",
+  );
+  assert.equal(
+    /item\.kind === "action"[\s\S]{0,180}item\.kind === "prose"[\s\S]{0,180}item\.kind === "thinking"/.test(
+      chatPageSource,
+    ),
+    true,
+    "live transcript filter should keep Thinking rows in the main chat",
+  );
+  assert.equal(
+    chatPageSource.includes('item.kind === "action" || item.kind === "reasoning"'),
+    false,
+    "completed run transcript filter should not keep reasoning-detail rows in the main chat",
+  );
+  assertSourceIncludes(
+    chatPageSource,
+    'item.kind === "action" || item.kind === "thinking"',
+    "completed run transcript filter should keep Thinking rows in the main chat",
   );
 });

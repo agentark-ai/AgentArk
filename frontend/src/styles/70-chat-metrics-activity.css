@@ -490,7 +490,7 @@
   width: min(100%, 720px);
 }
 
-.chat-transcript-reasoning-shell {
+.chat-transcript-thinking-shell {
   width: min(100%, 560px);
 }
 
@@ -542,21 +542,12 @@
   color: rgba(120, 242, 176, 0.7);
 }
 
-.chat-transcript-reasoning-row {
-  border-color: rgba(120, 242, 176, 0.18);
-  background:
-    linear-gradient(180deg, rgba(120, 242, 176, 0.035), rgba(255, 255, 255, 0.006)),
-    rgba(9, 10, 14, 0.54);
+.chat-transcript-thinking-row .chat-transcript-action-title {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
-.chat-transcript-reasoning-row:hover {
-  border-color: rgba(120, 242, 176, 0.32);
-  background:
-    linear-gradient(180deg, rgba(120, 242, 176, 0.055), rgba(255, 255, 255, 0.012)),
-    rgba(14, 16, 22, 0.66);
-}
-
-.chat-transcript-reasoning-row .chat-transcript-action-icon {
+.chat-transcript-thinking-row .chat-transcript-action-icon {
   color: rgba(120, 242, 176, 0.78);
 }
 
@@ -589,12 +580,6 @@
   border-top-color: rgba(120, 242, 176, 0.92);
   box-shadow: 0 0 10px rgba(120, 242, 176, 0.16);
   animation: chat-transcript-spin 820ms linear infinite;
-}
-
-.chat-transcript-reasoning-row .chat-transcript-running-indicator {
-  border-color: rgba(120, 242, 176, 0.18);
-  border-top-color: rgba(120, 242, 176, 0.92);
-  box-shadow: 0 0 10px rgba(120, 242, 176, 0.16);
 }
 
 @keyframes chat-transcript-spin {
@@ -688,8 +673,15 @@
   gap: 5px;
 }
 
-.chat-transcript-reasoning-details {
+.chat-transcript-thinking-details {
   border-left-color: rgba(120, 242, 176, 0.18);
+}
+
+.chat-transcript-thinking-details .chat-transcript-action-detail-text {
+  max-height: min(36vh, 320px);
+  overflow: auto;
+  padding-right: 4px;
+  white-space: pre-wrap;
 }
 
 .chat-transcript-action-detail-row {

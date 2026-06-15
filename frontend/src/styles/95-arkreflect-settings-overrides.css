@@ -926,18 +926,19 @@
   opacity: 0.55;
 }
 
-/* Settings uses the AgentArk mascot palette: purple surfaces, cyan controls,
-   and amber only for caution states. */
+/* Settings uses the AgentArk runtime palette: green-neutral surfaces and
+   amber only for caution states. The sidebar active highlight is preserved
+   below because it is a navigation affordance, not a content surface. */
 .MuiDialog-paper:has(.settings-shell-layout),
 .settings-shell-layout {
-  --settings-accent-text: rgba(103, 232, 249, 0.92);
-  --settings-accent-strong: rgba(167, 139, 250, 0.9);
-  --settings-accent-border: rgba(103, 232, 249, 0.2);
-  --settings-accent-border-strong: rgba(167, 139, 250, 0.34);
-  --settings-accent-bg: rgba(124, 58, 237, 0.14);
-  --settings-accent-bg-hover: rgba(0, 212, 255, 0.12);
-  --settings-accent-bg-soft: rgba(124, 58, 237, 0.07);
-  --settings-accent-glow: rgba(0, 212, 255, 0.18);
+  --settings-accent-text: rgba(120, 242, 176, 0.9);
+  --settings-accent-strong: rgba(120, 242, 176, 0.78);
+  --settings-accent-border: rgba(120, 242, 176, 0.18);
+  --settings-accent-border-strong: rgba(120, 242, 176, 0.34);
+  --settings-accent-bg: rgba(120, 242, 176, 0.095);
+  --settings-accent-bg-hover: rgba(120, 242, 176, 0.12);
+  --settings-accent-bg-soft: rgba(120, 242, 176, 0.055);
+  --settings-accent-glow: rgba(120, 242, 176, 0.18);
   --settings-caution-text: rgba(253, 230, 138, 0.9);
   --settings-caution-border: rgba(245, 158, 11, 0.3);
   --settings-caution-bg: rgba(245, 158, 11, 0.08);
@@ -958,24 +959,30 @@
 .settings-shell-layout .settings-nav-btn:hover:not(.active),
 .settings-shell-layout .settings-nav-btn.active,
 .MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn:hover:not(.active),
-.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active {
+  background:
+    radial-gradient(circle at left center, rgba(124, 58, 237, 0.14), transparent 72%),
+    linear-gradient(90deg, rgba(124, 58, 237, 0.16), rgba(0, 212, 255, 0.055)) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+}
+
 .settings-shell-layout .MuiTab-root.Mui-selected {
   background:
     radial-gradient(circle at left center, var(--settings-accent-bg), transparent 72%),
-    linear-gradient(90deg, rgba(124, 58, 237, 0.16), rgba(0, 212, 255, 0.055)) !important;
+    linear-gradient(90deg, rgba(120, 242, 176, 0.11), rgba(120, 242, 176, 0.035)) !important;
   color: var(--ui-rgba-244-245-247-950) !important;
 }
 
 .settings-shell-layout .settings-nav-btn.active,
 .MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active {
   box-shadow:
-    inset 2px 0 0 var(--settings-accent-text),
+    inset 2px 0 0 rgba(103, 232, 249, 0.92),
     0 0 18px rgba(124, 58, 237, 0.12) !important;
 }
 
 .settings-shell-layout .settings-nav-btn.active::before,
 .MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active::before {
-  background: linear-gradient(180deg, var(--settings-accent-text), var(--settings-accent-strong)) !important;
+  background: linear-gradient(180deg, rgba(103, 232, 249, 0.92), rgba(167, 139, 250, 0.9)) !important;
 }
 
 .settings-shell-layout .MuiTabs-indicator {
@@ -983,21 +990,27 @@
   box-shadow: 0 0 10px var(--settings-accent-border) !important;
 }
 
+.settings-shell-layout .settings-page-header.workspace-page-hero-shell,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-page-header.workspace-page-hero-shell {
+  border-color: var(--ui-rgba-255-255-255-080) !important;
+  background: linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
+}
+
 .settings-shell-layout .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled),
 .MuiDialog-paper:has(.settings-shell-layout) .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled) {
   border-color: var(--settings-accent-border-strong) !important;
   background:
-    linear-gradient(180deg, rgba(0, 212, 255, 0.16), rgba(124, 58, 237, 0.16)),
+    linear-gradient(180deg, rgba(120, 242, 176, 0.16), rgba(120, 242, 176, 0.07)),
     var(--ui-rgba-255-255-255-020) !important;
   color: var(--ui-rgba-244-245-247-950) !important;
-  box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.08), 0 12px 26px var(--ui-rgba-0-0-0-300) !important;
+  box-shadow: 0 0 0 1px rgba(120, 242, 176, 0.08), 0 12px 26px var(--ui-rgba-0-0-0-300) !important;
 }
 
 .settings-shell-layout .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled):hover,
 .MuiDialog-paper:has(.settings-shell-layout) .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled):hover {
   border-color: var(--settings-accent-strong) !important;
   background:
-    linear-gradient(180deg, rgba(0, 212, 255, 0.2), rgba(124, 58, 237, 0.18)),
+    linear-gradient(180deg, rgba(120, 242, 176, 0.2), rgba(120, 242, 176, 0.09)),
     var(--ui-rgba-255-255-255-035) !important;
 }
 
@@ -1011,7 +1024,7 @@
 .MuiDialog-paper:has(.settings-shell-layout) .settings-page-shell .MuiCard-root:hover {
   border-color: var(--settings-accent-border) !important;
   background:
-    linear-gradient(180deg, rgba(124, 58, 237, 0.075), var(--ui-rgba-255-255-255-010)),
+    linear-gradient(180deg, rgba(120, 242, 176, 0.07), var(--ui-rgba-255-255-255-010)),
     var(--ui-rgba-13-14-17-580) !important;
 }
 
@@ -1048,7 +1061,7 @@
 .MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorPrimary.MuiChip-outlined {
   border-color: var(--settings-accent-border) !important;
   background:
-    linear-gradient(90deg, rgba(124, 58, 237, 0.14), rgba(0, 212, 255, 0.075)) !important;
+    linear-gradient(90deg, rgba(120, 242, 176, 0.13), rgba(120, 242, 176, 0.055)) !important;
   color: var(--ui-rgba-244-245-247-950) !important;
   box-shadow: none !important;
 }
@@ -1062,10 +1075,7 @@
 
 .settings-shell-layout .settings-inline-card.tone-warning {
   border-color: var(--settings-caution-border) !important;
-  background:
-    radial-gradient(circle at top left, var(--settings-caution-bg), transparent 38%),
-    radial-gradient(circle at 92% 0%, rgba(124, 58, 237, 0.09), transparent 34%),
-    linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
+  background: linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
 }
 
 .settings-shell-layout .settings-inline-card.tone-warning .settings-inline-card-kicker,
@@ -1076,27 +1086,22 @@
 .settings-shell-layout .settings-inline-card.tone-info,
 .settings-shell-layout .security-basics-panel,
 .settings-shell-layout .adv-group {
-  border-color: rgba(167, 139, 250, 0.16) !important;
-  background:
-    radial-gradient(circle at top left, rgba(124, 58, 237, 0.09), transparent 38%),
-    radial-gradient(circle at 88% 0%, rgba(0, 212, 255, 0.045), transparent 34%),
-    linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
+  border-color: var(--ui-rgba-255-255-255-080) !important;
+  background: linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
 }
 
 .settings-shell-layout .adv-group:hover {
-  border-color: rgba(103, 232, 249, 0.2) !important;
+  border-color: var(--ui-rgba-255-255-255-120) !important;
 }
 
 .settings-shell-layout .adv-group-header {
-  border-bottom-color: rgba(103, 232, 249, 0.1) !important;
+  border-bottom-color: var(--ui-rgba-255-255-255-060) !important;
 }
 
 .settings-shell-layout .adv-group-header-icon {
-  border-color: rgba(167, 139, 250, 0.2) !important;
-  background:
-    radial-gradient(circle at 50% 22%, rgba(103, 232, 249, 0.12), transparent 54%),
-    rgba(124, 58, 237, 0.1) !important;
-  color: rgba(216, 180, 254, 0.9) !important;
+  border-color: var(--ui-rgba-255-255-255-080) !important;
+  background: var(--ui-rgba-255-255-255-040) !important;
+  color: var(--ui-rgba-244-245-247-820) !important;
 }
 
 .settings-shell-layout .adv-row,
@@ -1110,10 +1115,8 @@
 .settings-shell-layout .adv-row:hover,
 .settings-shell-layout .adv-skill-pill:hover,
 .settings-shell-layout .adv-skill-pill.active {
-  border-color: rgba(103, 232, 249, 0.16) !important;
-  background:
-    linear-gradient(180deg, rgba(124, 58, 237, 0.07), rgba(0, 212, 255, 0.035)),
-    rgba(10, 10, 12, 0.5) !important;
+  border-color: var(--ui-rgba-255-255-255-100) !important;
+  background: var(--ui-rgba-255-255-255-040) !important;
 }
 
 .settings-shell-layout .companion-step-index {

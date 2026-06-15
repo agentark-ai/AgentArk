@@ -495,21 +495,157 @@ fn gepa_prompt_optimization_confidence_sample_target(
         .filter(|value| *value > 0)
 }
 
+fn gepa_prompt_optimization_context_f64(
+    opportunity_context: Option<&serde_json::Value>,
+    parent: &str,
+    key: &str,
+) -> Option<f64> {
+    opportunity_context
+        .and_then(|context| context.get(parent))
+        .and_then(|parent| parent.get(key))
+        .and_then(|value| value.as_f64())
+        .filter(|value| value.is_finite())
+}
+
+fn gepa_prompt_optimization_holdout_signal(
+    opportunity_context: Option<&serde_json::Value>,
+) -> (usize, usize) {
+    let Some(cases) = opportunity_context
+        .and_then(|context| context.get("holdout_cases"))
+        .and_then(|value| value.as_array())
+    else {
+        return (0, 0);
+    };
+    let mut unique_cases = std::collections::BTreeSet::new();
+    let mut matching_samples = 0usize;
+    for case in cases {
+        let matching = case
+            .get("matching_samples")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.min(20_000) as usize)
+            .unwrap_or(1)
+            .max(1);
+        matching_samples = matching_samples.saturating_add(matching);
+        let trace_id = case
+            .get("trace_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let run_id = case
+            .get("run_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let key = if !trace_id.trim().is_empty() || !run_id.trim().is_empty() {
+            format!("{}:{}", trace_id.trim(), run_id.trim())
+        } else {
+            format!(
+                "{}:{}:{}:{}",
+                case.get("outcome")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                case.get("section_chars")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                case.get("final_prompt_chars")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                case.get("estimated_total_request_chars")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+            )
+        };
+        unique_cases.insert(key);
+    }
+    (unique_cases.len(), matching_samples.max(unique_cases.len()))
+}
+
+fn gepa_prompt_optimization_canary_min_samples(
+    opportunity_context: Option<&serde_json::Value>,
+) -> usize {
+    const MIN_PROMPT_OPTIMIZATION_CANARY_SAMPLES: usize = 64;
+    const MAX_PROMPT_OPTIMIZATION_CANARY_SAMPLES: usize = 20_000;
+
+    let confidence_target = gepa_prompt_optimization_confidence_sample_target(opportunity_context)
+        .unwrap_or(MIN_PROMPT_OPTIMIZATION_CANARY_SAMPLES)
+        .clamp(
+            MIN_PROMPT_OPTIMIZATION_CANARY_SAMPLES,
+            MAX_PROMPT_OPTIMIZATION_CANARY_SAMPLES,
+        );
+    let mut target = confidence_target;
+    let sample_confidence = gepa_prompt_optimization_context_f64(
+        opportunity_context,
+        "confidence",
+        "sample_confidence_score",
+    )
+    .unwrap_or(1.0)
+    .clamp(0.0, 1.0);
+    let risk_confidence = gepa_prompt_optimization_context_f64(
+        opportunity_context,
+        "confidence",
+        "risk_confidence_score",
+    )
+    .unwrap_or(1.0)
+    .clamp(0.0, 1.0);
+    let confidence_gap = 1.0 - sample_confidence.min(risk_confidence);
+    if confidence_gap > 0.0 {
+        target = target.saturating_add((confidence_target as f64 * confidence_gap).ceil() as usize);
+    }
+
+    let issue_rate =
+        gepa_prompt_optimization_context_f64(opportunity_context, "outcome", "issue_rate")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+    let quality_issue_rate =
+        gepa_prompt_optimization_context_f64(opportunity_context, "outcome", "quality_issue_rate")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+    let risk_pressure = issue_rate.max(quality_issue_rate);
+    if risk_pressure > 0.0 {
+        target = target.max(confidence_target.saturating_add(
+            (MIN_PROMPT_OPTIMIZATION_CANARY_SAMPLES as f64 * risk_pressure).ceil() as usize,
+        ));
+    }
+
+    let (unique_holdouts, matching_holdouts) =
+        gepa_prompt_optimization_holdout_signal(opportunity_context);
+    if unique_holdouts > 0 && matching_holdouts > unique_holdouts {
+        let diversity_gap =
+            1.0 - (unique_holdouts as f64 / matching_holdouts.max(1) as f64).clamp(0.0, 1.0);
+        target = target.max(confidence_target.saturating_add(
+            (MIN_PROMPT_OPTIMIZATION_CANARY_SAMPLES as f64 * diversity_gap).ceil() as usize,
+        ));
+    }
+    if unique_holdouts > 0 && unique_holdouts < 4 && risk_pressure >= 0.20 {
+        target =
+            target.max(confidence_target.saturating_add(MIN_PROMPT_OPTIMIZATION_CANARY_SAMPLES));
+    }
+
+    target.clamp(
+        MIN_PROMPT_OPTIMIZATION_CANARY_SAMPLES,
+        MAX_PROMPT_OPTIMIZATION_CANARY_SAMPLES,
+    )
+}
+
 fn gepa_prompt_optimization_promotion_settings(
     opportunity_context: Option<&serde_json::Value>,
 ) -> crate::core::self_evolve::gepa_bridge::GepaPromotionSettings {
     crate::core::self_evolve::gepa_bridge::GepaPromotionSettings {
         apply_promotion: true,
         canary_rollout_percent: 20,
-        canary_min_samples_per_version: gepa_prompt_optimization_confidence_sample_target(
+        canary_min_samples_per_version: gepa_prompt_optimization_canary_min_samples(
             opportunity_context,
-        )
-        .unwrap_or(25)
-        .max(25),
+        ),
         canary_min_success_gain: 0.03,
         canary_max_sign_test_p_value: 0.10,
         replay_log_limit: 160,
     }
+}
+
+fn gepa_prompt_optimization_timeout_seconds(
+    _opportunity_context: Option<&serde_json::Value>,
+) -> u64 {
+    const PROMPT_OPTIMIZATION_BACKGROUND_TIMEOUT_SECONDS: u64 = 20 * 60;
+    crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds()
+        .max(PROMPT_OPTIMIZATION_BACKGROUND_TIMEOUT_SECONDS)
 }
 
 fn typed_tool_error_fields(error: &anyhow::Error) -> Option<TypedToolErrorFields> {
@@ -9712,6 +9848,8 @@ impl Agent {
     ) -> Result<String> {
         let promotion_settings =
             gepa_prompt_optimization_promotion_settings(opportunity_context.as_ref());
+        let optimizer_timeout_seconds =
+            gepa_prompt_optimization_timeout_seconds(opportunity_context.as_ref());
         self.queue_gepa_job(
             crate::core::self_evolve::gepa_bridge::GepaJobKind::Run,
             request,
@@ -9721,7 +9859,7 @@ impl Agent {
             None,
             quiet_window_seconds,
             promotion_settings,
-            crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds(),
+            optimizer_timeout_seconds,
             true,
         )
         .await
@@ -12512,15 +12650,78 @@ mod tests {
     #[test]
     fn gepa_prompt_optimization_promotion_uses_opportunity_confidence_target() {
         let default_settings = gepa_prompt_optimization_promotion_settings(None);
-        assert_eq!(default_settings.canary_min_samples_per_version, 25);
+        assert_eq!(default_settings.canary_min_samples_per_version, 64);
 
         let profiled_settings = gepa_prompt_optimization_promotion_settings(Some(&json!({
             "confidence": {
-                "confidence_sample_target": 64
+                "confidence_sample_target": 128,
+                "sample_confidence_score": 1.0,
+                "risk_confidence_score": 1.0
+            },
+            "outcome": {
+                "issue_rate": 0.0,
+                "quality_issue_rate": 0.0
             }
         })));
 
-        assert_eq!(profiled_settings.canary_min_samples_per_version, 64);
+        assert_eq!(profiled_settings.canary_min_samples_per_version, 128);
+
+        let uncertain_settings = gepa_prompt_optimization_promotion_settings(Some(&json!({
+            "confidence": {
+                "confidence_sample_target": 128,
+                "sample_confidence_score": 0.45,
+                "risk_confidence_score": 0.35
+            },
+            "outcome": {
+                "issue_rate": 0.50,
+                "quality_issue_rate": 0.35
+            },
+            "holdout_cases": [
+                {
+                    "trace_id": "trace-a",
+                    "run_id": "run-a",
+                    "outcome": "slow",
+                    "matching_samples": 8,
+                    "section_chars": 3000,
+                    "final_prompt_chars": 9000,
+                    "estimated_total_request_chars": 12000
+                },
+                {
+                    "trace_id": "trace-b",
+                    "run_id": "run-b",
+                    "outcome": "expensive",
+                    "matching_samples": 6,
+                    "section_chars": 2800,
+                    "final_prompt_chars": 8800,
+                    "estimated_total_request_chars": 11800
+                }
+            ]
+        })));
+
+        assert!(
+            uncertain_settings.canary_min_samples_per_version
+                > profiled_settings.canary_min_samples_per_version
+        );
+    }
+
+    #[test]
+    fn gepa_prompt_optimization_uses_longer_background_timeout() {
+        let timeout = gepa_prompt_optimization_timeout_seconds(Some(&json!({
+            "samples": 672,
+            "prompt_weight": {
+                "p95_total_request_chars": 139593
+            },
+            "outcome": {
+                "issue_rate": 0.4524,
+                "quality_issue_rate": 0.0
+            }
+        })));
+
+        assert!(
+            timeout
+                > crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds()
+        );
+        assert_eq!(timeout, 20 * 60);
     }
 
     #[test]

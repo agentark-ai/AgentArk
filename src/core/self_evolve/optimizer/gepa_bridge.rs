@@ -2059,9 +2059,9 @@ fn default_gepa_enabled() -> bool {
 }
 
 fn default_gepa_max_metric_calls() -> u32 {
-    // Floor for a real search: 2 made every run a single-shot rubber stamp.
-    // Still bounded by the per-run/daily budget guards either way.
-    24
+    // Keep background optimization bounded enough to finish inside the
+    // process timeout; promotion gates still decide whether output is safe.
+    8
 }
 
 fn default_gepa_daily_budget_usd() -> f64 {
@@ -2267,7 +2267,7 @@ mod tests {
     #[test]
     fn gepa_default_metric_call_budget_keeps_background_runs_bounded() {
         // Non-degenerate search floor; budget guards still bound spend.
-        assert_eq!(GepaOptimizerConfig::default().max_metric_calls, 24);
+        assert_eq!(GepaOptimizerConfig::default().max_metric_calls, 8);
     }
 
     #[test]

@@ -9,8 +9,8 @@ export type RuntimeMetricSample = {
 export const RUNTIME_METRIC_HISTORY_EVENT = "agentark-runtime-metric-history";
 
 const STORAGE_KEY = "agentark.runtimeMetricHistory.v1";
-const WINDOW_MS = 2 * 60 * 60 * 1000;
-const MAX_SAMPLES = 960;
+const WINDOW_MS = 6 * 60 * 60 * 1000;
+const MAX_SAMPLES = 3000;
 const PERSIST_INTERVAL_MS = 60_000;
 
 let cacheLoaded = false;

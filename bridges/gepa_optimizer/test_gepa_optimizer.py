@@ -1,3 +1,6 @@
+import json
+import sys
+import types
 import unittest
 
 from bridges.gepa_optimizer import __main__ as gepa_main
@@ -7,6 +10,7 @@ from bridges.gepa_optimizer.__main__ import (
     _gepa_lm_runtime_kwargs,
     _gepa_memory_limit_bytes,
     _gepa_optimizer_resource_kwargs,
+    _examples_from_export,
     _gepa_thread_count,
     _gepa_validation_set,
     _fallback_candidate_records,
@@ -20,27 +24,62 @@ except Exception:  # pragma: no cover - depends on local GEPA runtime
     dspy = None
 
 
+class _FakeDspyExample:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def with_inputs(self, *_inputs):
+        return self
+
+
+def _examples_with_fake_dspy(export: dict, env: dict | None = None):
+    previous = sys.modules.get("dspy")
+    sys.modules["dspy"] = types.SimpleNamespace(Example=_FakeDspyExample)
+    try:
+        return _examples_from_export(export, env or {})
+    finally:
+        if previous is None:
+            del sys.modules["dspy"]
+        else:
+            sys.modules["dspy"] = previous
+
+
 class GepaControlKwargsTests(unittest.TestCase):
+    def test_metric_call_budget_defaults_to_bounded_background_search(self) -> None:
+        kwargs = _gepa_control_kwargs({}, {"auto", "max_metric_calls"})
+
+        self.assertEqual(kwargs, {"max_metric_calls": 8})
+        self.assertNotIn("auto", kwargs)
+
     def test_max_metric_calls_excludes_auto_when_supported(self) -> None:
         kwargs = _gepa_control_kwargs(
             {
                 "AGENTARK_GEPA_AUTO": "light",
-                "AGENTARK_GEPA_MAX_METRIC_CALLS": "24",
+                "AGENTARK_GEPA_MAX_METRIC_CALLS": "6",
             },
             {"auto", "max_metric_calls"},
         )
 
-        self.assertEqual(kwargs, {"max_metric_calls": 24})
+        self.assertEqual(kwargs, {"max_metric_calls": 6})
         self.assertNotIn("auto", kwargs)
 
-    def test_auto_is_used_when_max_metric_calls_is_absent(self) -> None:
+    def test_max_metric_calls_override_is_capped_for_background_runtime(self) -> None:
+        kwargs = _gepa_control_kwargs(
+            {"AGENTARK_GEPA_MAX_METRIC_CALLS": "24"},
+            {"auto", "max_metric_calls"},
+        )
+
+        self.assertEqual(kwargs, {"max_metric_calls": 8})
+        self.assertNotIn("auto", kwargs)
+
+    def test_auto_is_not_used_when_default_metric_call_budget_is_supported(self) -> None:
         kwargs = _gepa_control_kwargs(
             {"AGENTARK_GEPA_AUTO": "medium"},
             {"auto", "max_metric_calls"},
         )
 
-        self.assertEqual(kwargs, {"auto": "medium"})
-        self.assertNotIn("max_metric_calls", kwargs)
+        self.assertEqual(kwargs, {"max_metric_calls": 8})
+        self.assertNotIn("auto", kwargs)
 
     def test_auto_is_used_when_gepa_does_not_support_max_metric_calls(self) -> None:
         kwargs = _gepa_control_kwargs(
@@ -57,13 +96,16 @@ class GepaControlKwargsTests(unittest.TestCase):
     def test_thread_count_defaults_to_single_threaded_execution(self) -> None:
         self.assertEqual(_gepa_thread_count({}), 1)
 
-    def test_thread_count_can_be_overridden(self) -> None:
-        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_THREADS": "3"}), 3)
+    def test_thread_count_can_be_overridden_within_background_cap(self) -> None:
+        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_THREADS": "2"}), 2)
+
+    def test_thread_count_override_is_capped_for_background_cpu(self) -> None:
+        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_THREADS": "99"}), 2)
 
     def test_lm_runtime_defaults_bound_slow_model_calls(self) -> None:
         self.assertEqual(
             _gepa_lm_runtime_kwargs({}),
-            {"timeout": 60, "max_tokens": 2048, "num_retries": 0},
+            {"timeout": 60, "max_tokens": 8192, "num_retries": 0},
         )
 
     def test_lm_runtime_limits_can_be_overridden(self) -> None:
@@ -79,7 +121,7 @@ class GepaControlKwargsTests(unittest.TestCase):
         )
 
     def test_memory_limit_defaults_to_bounded_worker_size(self) -> None:
-        self.assertEqual(_gepa_memory_limit_bytes({}), 1536 * 1024 * 1024)
+        self.assertEqual(_gepa_memory_limit_bytes({}), 1024 * 1024 * 1024)
 
     def test_memory_limit_can_be_overridden_within_bounds(self) -> None:
         self.assertEqual(
@@ -103,7 +145,7 @@ class GepaControlKwargsTests(unittest.TestCase):
             kwargs,
             {
                 "reflection_minibatch_size": 1,
-                "candidate_selection_strategy": "current_best",
+                "candidate_selection_strategy": "pareto",
                 "add_format_failure_as_feedback": True,
                 "use_merge": False,
                 "max_merge_invocations": 0,
@@ -114,7 +156,7 @@ class GepaControlKwargsTests(unittest.TestCase):
         kwargs = _gepa_optimizer_resource_kwargs(
             {
                 "AGENTARK_GEPA_REFLECTION_MINIBATCH_SIZE": "2",
-                "AGENTARK_GEPA_MAX_MERGE_INVOCATIONS": "3",
+                "AGENTARK_GEPA_MAX_MERGE_INVOCATIONS": "2",
             },
             {
                 "reflection_minibatch_size",
@@ -129,21 +171,184 @@ class GepaControlKwargsTests(unittest.TestCase):
             kwargs,
             {
                 "reflection_minibatch_size": 2,
-                "candidate_selection_strategy": "current_best",
+                "candidate_selection_strategy": "pareto",
                 "add_format_failure_as_feedback": True,
                 "use_merge": True,
-                "max_merge_invocations": 3,
+                "max_merge_invocations": 2,
             },
         )
 
-    def test_gepa_example_defaults_keep_background_runs_small(self) -> None:
-        examples = list(range(8))
+    def test_gepa_example_defaults_scale_with_available_evidence(self) -> None:
+        examples = list(range(40))
 
         limited = _limited_gepa_examples(examples, {})
         valset = _gepa_validation_set(limited, {})
 
-        self.assertEqual(limited, [0])
-        self.assertEqual(valset, [0])
+        self.assertEqual(limited, list(range(8)))
+        self.assertEqual(valset, list(range(2)))
+
+    def test_gepa_example_defaults_keep_a_safety_cap(self) -> None:
+        examples = list(range(200))
+
+        limited = _limited_gepa_examples(examples, {})
+        valset = _gepa_validation_set(limited, {})
+
+        self.assertEqual(limited, list(range(8)))
+        self.assertEqual(valset, list(range(2)))
+
+    def test_gepa_example_override_has_a_hard_count_cap(self) -> None:
+        examples = list(range(700))
+
+        limited = _limited_gepa_examples(
+            examples,
+            {"AGENTARK_GEPA_MAX_EXAMPLES": "999"},
+        )
+
+        self.assertEqual(limited, list(range(64)))
+
+    def test_examples_from_export_compacts_training_payload_without_losing_contract_context(
+        self,
+    ) -> None:
+        large_prompt = "runtime-access-summary " * 12_000
+        export = {
+            "schema_version": 1,
+            "run_id": "run-compact",
+            "generated_at": "2026-06-12T11:35:17Z",
+            "request": "Reduce Runtime Access Summary prompt weight",
+            "opportunity_context": {
+                "label": "Reduce Runtime Access Summary prompt weight",
+                "section": "runtime_access_summary",
+                "prompt_weight": {"p95_total_request_chars": 139593},
+                "outcome": {"issue_rate": 0.25, "quality_issue_rate": 0.05},
+                "holdout_cases": [
+                    {
+                        "trace_id": f"holdout-{index}",
+                        "outcome": "slow_prompt",
+                        "section_chars": 7000 + index,
+                        "final_prompt_chars": 91000 + index,
+                        "matching_samples": 3,
+                    }
+                    for index in range(20)
+                ],
+            },
+            "surfaces": {
+                "prompt_bundle": {
+                    "version": "prompt-v1",
+                    "router": {
+                        "system_prompt": large_prompt,
+                        "policy_block": "policy",
+                        "instruction_template": "route {message}",
+                    },
+                    "primary_response": {
+                        "system_prompt": large_prompt,
+                        "policy_block": "policy",
+                        "instruction_template": "answer {message}",
+                    },
+                },
+                "prompt_fragment_bundle": {
+                    "version": "fragments-v1",
+                    "fragments": [
+                        {
+                            "id": "runtime_access_summary",
+                            "surface": "prompt_bundle",
+                            "body": large_prompt,
+                            "enabled": True,
+                        }
+                    ],
+                },
+            },
+            "benchmarks": {"giant": large_prompt},
+            "recent_lineage": {"entries": [{"notes": large_prompt}] * 8},
+            "candidate_contract": {
+                "surfaces": ["prompt_bundle", "prompt_fragment_bundle"],
+                "required_fields": ["run_id", "surface", "candidate"],
+            },
+            "experience_runs": [
+                {
+                    "trace_id": f"trace-{index}",
+                    "success_state": "failed",
+                    "correction_state": "needed",
+                    "outcome_summary": f"Runtime prompt overweight sample {index}",
+                    "failure_reason": "Large Runtime Access Summary prompt section",
+                }
+                for index in range(24)
+            ],
+        }
+
+        examples = _examples_with_fake_dspy(export)
+        payloads = [json.loads(example.export_json) for example in examples]
+        encoded_total = sum(len(example.export_json.encode("utf-8")) for example in examples)
+        first = payloads[0]
+
+        self.assertEqual(len(examples), 8)
+        self.assertLess(encoded_total, 256 * 1024)
+        self.assertNotIn(large_prompt, examples[0].export_json)
+        self.assertEqual(
+            first["candidate_contract"]["surfaces"],
+            ["prompt_bundle", "prompt_fragment_bundle"],
+        )
+        self.assertEqual(
+            first["surfaces"]["prompt_bundle"]["version"],
+            "prompt-v1",
+        )
+        self.assertIn(
+            "system_prompt",
+            first["surfaces"]["prompt_bundle"]["sections"]["router"]["fields"],
+        )
+        self.assertEqual(
+            first["surfaces"]["prompt_fragment_bundle"]["fragments"][0]["id"],
+            "runtime_access_summary",
+        )
+        self.assertEqual(len(first["opportunity_context"]["holdout_cases"]), 8)
+        self.assertEqual(first["experience_runs"][0]["trace_id"], "trace-0")
+        self.assertEqual(
+            first["focus"]["failure_reason"],
+            "Large Runtime Access Summary prompt section",
+        )
+
+    @unittest.skipIf(dspy is None, "DSPy is only installed in the GEPA runtime")
+    def test_examples_from_export_preserves_all_available_runs_before_limit(self) -> None:
+        export = {
+            "schema_version": 1,
+            "run_id": "run-1",
+            "experience_runs": [
+                {
+                    "trace_id": f"trace-{index}",
+                    "success_state": "success",
+                    "correction_state": None,
+                    "outcome_summary": f"run {index}",
+                    "failure_reason": None,
+                }
+                for index in range(12)
+            ],
+        }
+
+        self.assertEqual(len(_examples_from_export(export)), 8)
+
+    @unittest.skipIf(dspy is None, "DSPy is only installed in the GEPA runtime")
+    def test_examples_from_export_respects_serialized_byte_budget(self) -> None:
+        export = {
+            "schema_version": 1,
+            "run_id": "run-1",
+            "experience_runs": [
+                {
+                    "trace_id": f"trace-{index}",
+                    "success_state": "success",
+                    "correction_state": None,
+                    "outcome_summary": "x" * 20_000,
+                    "failure_reason": None,
+                }
+                for index in range(12)
+            ],
+        }
+
+        examples = _examples_from_export(
+            export,
+            {"AGENTARK_GEPA_MAX_EXAMPLE_BYTES": "8192"},
+        )
+
+        self.assertGreaterEqual(len(examples), 1)
+        self.assertLess(len(examples), 12)
 
     def test_records_from_text_extracts_candidate_jsonl_from_wrapped_output(self) -> None:
         raw = """

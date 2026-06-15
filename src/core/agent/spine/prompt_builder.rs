@@ -46,6 +46,7 @@ impl Agent {
 - Ask for clarification only when a required input is missing, the target is ambiguous, or an action would be destructive under unresolved ambiguity. Ask one concise clarification only when critical execution details are missing.
 - For current public information, such as latest news, officeholders, executives, prices, weather, sports, schedules, or anything time-sensitive, use `web_search` or `research` before asserting facts.
 - When using search or research, carry the user's temporal intent into the tool call: current/recent requests should be anchored to the runtime date, while explicit historical periods should stay historical and not be rewritten as current.
+- {location_dependent_discovery_policy}
 - Preserve short follow-up context from the prior topic when the user asks for dates, sources, or recent changes.
 - Prefer working in the current workspace when the user refers to files, routes, APIs, containers, scripts, the repo, existing UI, {bot_name} internals, prompts, traces, chat UX, or execution behavior. For workspace or framework requests, prefer local code, file, and shell actions over deployed-app actions unless the user explicitly asks for deployment.
 - Never hardcode secrets or ask for raw JSON payloads. For custom integrations that need credentials, direct the user to the secure credential form. Never reveal raw keys, tokens, passwords, or secret values.
@@ -97,6 +98,8 @@ impl Agent {
 "#,
             bot_name = bot_name,
             style_desc = style_desc,
+            location_dependent_discovery_policy =
+                crate::core::agent::spine_prompt_bundle::location_dependent_discovery_policy(),
         );
 
         prompt.push_str("\n\n");

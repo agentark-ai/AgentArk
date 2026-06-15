@@ -225,6 +225,46 @@ mod tests {
         assert_eq!(delta.cache_creation_prompt_tokens, 5);
         assert!((delta.cost_usd - 0.02).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn streamed_direct_chat_keeps_memory_mutation_triage_until_source_message_exists() {
+        let hints = RequestExecutionHints {
+            execution_surface: ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            memory_capture: Default::default(),
+            recorded_user_message_id: None,
+            ..Default::default()
+        };
+
+        assert!(memory_capture_triage_requested(&hints));
+        assert!(memory_capture_triage_after_persistence_allowed(
+            &hints, false
+        ));
+        assert!(!memory_capture_triage_after_persistence_allowed(
+            &hints, true
+        ));
+    }
+
+    #[test]
+    fn explicit_memory_capture_uses_queue_path_not_post_persistence_triage() {
+        let hints = RequestExecutionHints {
+            execution_surface: ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            memory_capture: crate::security::intent_classifier::InboundMemoryCaptureSignal {
+                should_capture: true,
+                confidence: Some(0.8),
+                concept: Some("durable_private_self_context".to_string()),
+                reason: Some("semantic memory signal".to_string()),
+            },
+            recorded_user_message_id: None,
+            ..Default::default()
+        };
+
+        assert!(!memory_capture_triage_requested(&hints));
+        assert!(!memory_capture_triage_after_persistence_allowed(
+            &hints, false
+        ));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -272,6 +312,8 @@ struct DeferredExchangePersistence {
     user_message_already_recorded: bool,
     recorded_user_message_id: Option<String>,
     memory_capture_allowed: bool,
+    memory_capture_triage_allowed: bool,
+    memory_capture_signal: Option<crate::security::intent_classifier::InboundMemoryCaptureSignal>,
     memory_capture_source: Option<String>,
     user_message_for_link_capture: Option<String>,
     user_message_id: String,
@@ -282,6 +324,22 @@ struct DeferredExchangePersistence {
     conversation_title: Option<String>,
     user_outcome: crate::core::UserFacingOutcome,
     choices: Vec<ClarificationChoice>,
+}
+
+fn memory_capture_triage_requested(request_hints: &RequestExecutionHints) -> bool {
+    !request_hints.memory_capture.should_capture
+        && request_hints.direct_user_intent
+        && matches!(
+            &request_hints.execution_surface,
+            ActionExecutionSurface::Chat
+        )
+}
+
+fn memory_capture_triage_after_persistence_allowed(
+    request_hints: &RequestExecutionHints,
+    triage_spawned_before_persistence: bool,
+) -> bool {
+    memory_capture_triage_requested(request_hints) && !triage_spawned_before_persistence
 }
 
 fn trace_duration_ms(trace: &ExecutionTrace) -> Option<u64> {
@@ -596,6 +654,8 @@ impl Agent {
                             user_message_already_recorded,
                             recorded_user_message_id: None,
                             memory_capture_allowed: false,
+                            memory_capture_triage_allowed: false,
+                            memory_capture_signal: None,
                             memory_capture_source: None,
                             user_message_for_link_capture: Some(stored_user_message),
                         },
@@ -816,6 +876,9 @@ impl Agent {
         conversation_key: &str,
         project_id: Option<&str>,
         source_message_id: Option<&str>,
+        memory_capture_signal: Option<
+            &crate::security::intent_classifier::InboundMemoryCaptureSignal,
+        >,
     ) -> bool {
         let queued = self
             .mark_user_memory_capture_candidate(
@@ -825,6 +888,7 @@ impl Agent {
                 Some(conversation_key),
                 project_id,
                 source_message_id,
+                memory_capture_signal,
             )
             .await;
         if queued {
@@ -843,16 +907,16 @@ impl Agent {
         source_message_id: Option<&str>,
         is_new_conversation: bool,
         user_message_already_recorded: bool,
-    ) {
+    ) -> bool {
         let Some(source_message_id) = source_message_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
         else {
-            return;
+            return false;
         };
         if message.trim().is_empty() {
-            return;
+            return false;
         }
         let agent = self.clone();
         let message = message.to_string();
@@ -920,11 +984,13 @@ impl Agent {
                             &conversation_key,
                             project_id.as_deref(),
                             Some(&source_message_id),
+                            Some(&decision.memory_capture),
                         )
                         .await;
                 }
             }
         );
+        true
     }
 
     #[expect(
@@ -1075,6 +1141,8 @@ impl Agent {
                                 .recorded_user_message_id
                                 .clone(),
                             memory_capture_allowed: false,
+                            memory_capture_triage_allowed: false,
+                            memory_capture_signal: None,
                             memory_capture_source: None,
                             user_message_for_link_capture: Some(message_storage.as_str()),
                         },
@@ -1120,6 +1188,8 @@ impl Agent {
                                 .recorded_user_message_id
                                 .clone(),
                             memory_capture_allowed: false,
+                            memory_capture_triage_allowed: false,
+                            memory_capture_signal: None,
                             memory_capture_source: None,
                             user_message_for_link_capture: Some(message_storage.as_str()),
                         },
@@ -1164,28 +1234,32 @@ impl Agent {
                     &conversation_key,
                     project_id,
                     request_hints.recorded_user_message_id.as_deref(),
+                    Some(&request_hints.memory_capture),
                 )
                 .await
             } else {
-                if request_hints.direct_user_intent
-                    && matches!(
-                        &request_hints.execution_surface,
-                        ActionExecutionSurface::Chat
-                    )
-                {
-                    self.spawn_deferred_user_memory_capture_triage(
-                        message_storage.as_str(),
-                        message_storage.as_str(),
-                        channel,
-                        &conversation_key,
-                        project_id,
-                        request_hints.recorded_user_message_id.as_deref(),
-                        is_new_conversation,
-                        user_message_already_recorded,
-                    );
-                }
                 false
             };
+        let memory_capture_triage_spawned_before_persistence =
+            if memory_capture_triage_requested(&request_hints) {
+                self.spawn_deferred_user_memory_capture_triage(
+                    message_storage.as_str(),
+                    message_storage.as_str(),
+                    channel,
+                    &conversation_key,
+                    project_id,
+                    request_hints.recorded_user_message_id.as_deref(),
+                    is_new_conversation,
+                    user_message_already_recorded,
+                )
+            } else {
+                false
+            };
+        let memory_capture_triage_allowed_after_persistence =
+            memory_capture_triage_after_persistence_allowed(
+                &request_hints,
+                memory_capture_triage_spawned_before_persistence,
+            );
 
         if is_new_conversation && !user_message_already_recorded && !conversation_key.is_empty() {
             self.ensure_conversation_row_for_turn(
@@ -1234,6 +1308,12 @@ impl Agent {
                         recorded_user_message_id: request_hints.recorded_user_message_id.clone(),
                         memory_capture_allowed: request_hints.memory_capture.should_capture
                             && !memory_capture_queued_before_persistence,
+                        memory_capture_triage_allowed:
+                            memory_capture_triage_allowed_after_persistence,
+                        memory_capture_signal: request_hints
+                            .memory_capture
+                            .should_capture
+                            .then_some(&request_hints.memory_capture),
                         memory_capture_source: None,
                         user_message_for_link_capture: Some(message_storage.as_str()),
                     },
@@ -1256,10 +1336,7 @@ impl Agent {
                     channel,
                     error
                 );
-                let response = format!(
-                    "The model-routed spine hit a framework-level failure before execution could complete, so I did not run any action. Please retry after checking the server logs. Error: {}",
-                    error
-                );
+                let response = user_visible_platform_failure_message(&error.to_string());
                 let usage_delta = self
                     .turn_pipeline_usage_snapshot()
                     .await
@@ -1277,6 +1354,12 @@ impl Agent {
                         recorded_user_message_id: request_hints.recorded_user_message_id.clone(),
                         memory_capture_allowed: request_hints.memory_capture.should_capture
                             && !memory_capture_queued_before_persistence,
+                        memory_capture_triage_allowed:
+                            memory_capture_triage_allowed_after_persistence,
+                        memory_capture_signal: request_hints
+                            .memory_capture
+                            .should_capture
+                            .then_some(&request_hints.memory_capture),
                         memory_capture_source: None,
                         user_message_for_link_capture: Some(message_storage.as_str()),
                     },
@@ -1964,11 +2047,32 @@ impl Agent {
                         Some(&job.conversation_key),
                         job.project_id.as_deref(),
                         persisted_user_message_id.as_deref(),
+                        job.memory_capture_signal.as_ref(),
                     )
                     .await;
                 if queued_memory_capture {
                     self.kick_deferred_user_memory_capture_processing();
                 }
+            }
+            if job.memory_capture_triage_allowed {
+                let memory_source = job
+                    .memory_capture_source
+                    .as_deref()
+                    .unwrap_or(job.message.as_str());
+                let user_message_for_link_capture = job
+                    .user_message_for_link_capture
+                    .as_deref()
+                    .unwrap_or(job.message.as_str());
+                self.spawn_deferred_user_memory_capture_triage(
+                    memory_source,
+                    user_message_for_link_capture,
+                    &job.channel,
+                    &job.conversation_key,
+                    job.project_id.as_deref(),
+                    persisted_user_message_id.as_deref(),
+                    job.is_new_conversation,
+                    true,
+                );
             }
 
             self.sync_background_session_after_response(
@@ -2151,6 +2255,8 @@ impl Agent {
             user_message_already_recorded: context.user_message_already_recorded,
             recorded_user_message_id: context.recorded_user_message_id.clone(),
             memory_capture_allowed: context.memory_capture_allowed,
+            memory_capture_triage_allowed: context.memory_capture_triage_allowed,
+            memory_capture_signal: context.memory_capture_signal.cloned(),
             memory_capture_source: context.memory_capture_source.map(str::to_string),
             user_message_for_link_capture: context
                 .user_message_for_link_capture
@@ -2456,6 +2562,8 @@ impl Agent {
                             user_message_already_recorded,
                             recorded_user_message_id: None,
                             memory_capture_allowed: false,
+                            memory_capture_triage_allowed: false,
+                            memory_capture_signal: None,
                             memory_capture_source: None,
                             user_message_for_link_capture: Some(stored_user_message),
                         },
@@ -2671,6 +2779,8 @@ impl Agent {
                                         user_message_already_recorded,
                                         recorded_user_message_id: None,
                                         memory_capture_allowed: false,
+                                        memory_capture_triage_allowed: false,
+                                        memory_capture_signal: None,
                                         memory_capture_source: None,
                                         user_message_for_link_capture: Some(stored_user_message),
                                     },
@@ -2950,6 +3060,8 @@ impl Agent {
             user_message_already_recorded: context.user_message_already_recorded,
             recorded_user_message_id: context.recorded_user_message_id.clone(),
             memory_capture_allowed: context.memory_capture_allowed,
+            memory_capture_triage_allowed: context.memory_capture_triage_allowed,
+            memory_capture_signal: context.memory_capture_signal.cloned(),
             memory_capture_source: context.memory_capture_source.map(str::to_string),
             user_message_for_link_capture: context
                 .user_message_for_link_capture

@@ -3137,9 +3137,9 @@ type ChatTranscriptItem =
       text: string;
     }
   | {
-      kind: "reasoning";
+      kind: "thinking";
       id: string;
-      title: string;
+      title: "Thinking";
       detail: string;
       status: ChatTranscriptActionStatus;
       details: ChatTranscriptActionDetail[];
@@ -4770,7 +4770,9 @@ function isMainChatReasoningStep(step: JsonRecord): boolean {
 }
 
 function isTranscriptPreservedActivityStep(step: JsonRecord): boolean {
-  return Boolean(modelNarrationTextFromActivityStep(step));
+  return Boolean(
+    modelNarrationTextFromActivityStep(step) || isMainChatReasoningStep(step),
+  );
 }
 
 function normalizeReasoningPhase(raw: unknown): string {
@@ -14206,7 +14208,7 @@ function ChatPageInner({
     const items: ChatTranscriptItem[] = [];
     const proseSeen = new Set<string>();
     const actionIndicesByTool = new Map<string, number[]>();
-    let reasoningItemIndex = -1;
+    let thinkingItemIndex = -1;
     let latestAgentLoopActionKey = "";
     let pendingProse: Extract<ChatTranscriptItem, { kind: "prose" }> | null =
       null;
@@ -14272,63 +14274,70 @@ function ChatPageInner({
       action.details = [...action.details.slice(-7), detail];
     };
 
-    const buildReasoningDetail = (
+    const buildThinkingDetail = (
       type: string,
       card: ActivityTimelineCard,
       fallbackDetail: string,
+      reasoningText = "",
     ): ChatTranscriptActionDetail | null => {
-      const detail = compactTranscriptDetail(
-        card.summary || card.detail || fallbackDetail,
+      const detail = stripAgentInternalReasoningLeaks(
+        reasoningText ||
+          card.rawDetailFull ||
+          card.summary ||
+          card.detail ||
+          fallbackDetail,
       );
       if (!detail) return null;
       return {
-        id: `${card.id}:${type}:reasoning`,
-        label: card.label || detailLabel(type, card),
+        id: `${card.id}:${type}:thinking`,
+        label: "Thinking",
         detail,
         status: transcriptStatusFromCard(card),
         card,
       };
     };
 
-    const appendReasoningDetail = (
+    const appendThinkingRow = (
+      card: ActivityTimelineCard,
       detail: ChatTranscriptActionDetail | null,
     ) => {
-      if (!detail) return;
-      let item =
-        reasoningItemIndex >= 0 ? items[reasoningItemIndex] : undefined;
-      if (!item || item.kind !== "reasoning") {
-        const nextItem: ChatTranscriptItem = {
-          kind: "reasoning",
-          id: `${keyPrefix}:reasoning`,
-          title: "Reasoning",
-          detail: detail.detail,
-          status: detail.status,
-          details: [detail],
-        };
-        reasoningItemIndex = items.length;
-        items.push(nextItem);
+      const status = transcriptStatusFromCard(card);
+      const existing =
+        thinkingItemIndex >= 0 ? items[thinkingItemIndex] : undefined;
+      if (!existing || existing.kind !== "thinking") {
+        thinkingItemIndex = items.length;
+        items.push({
+          kind: "thinking",
+          id: `${keyPrefix}:thinking`,
+          title: "Thinking",
+          detail: detail ? compactTranscriptDetail(detail.detail) : "",
+          status: detail?.status || status,
+          details: detail ? [detail] : [],
+        });
         return;
       }
-      const duplicate = item.details.some(
-        (entry) =>
-          entry.label === detail.label &&
-          entry.detail === detail.detail &&
-          entry.status === detail.status,
-      );
-      item = {
-        ...item,
-        detail: detail.detail || item.detail,
+      const duplicate =
+        detail &&
+        existing.details.some(
+          (entry) =>
+            entry.label === detail.label &&
+            entry.detail === detail.detail &&
+            entry.status === detail.status,
+        );
+      items[thinkingItemIndex] = {
+        ...existing,
+        detail: detail ? compactTranscriptDetail(detail.detail) : existing.detail,
         status:
-          detail.status === "issue"
+          detail?.status === "issue"
             ? "issue"
-            : item.status === "running"
-              ? detail.status
-              : item.status,
-        details: duplicate
-          ? item.details
-          : [...item.details.slice(-14), detail],
+            : existing.status === "issue"
+              ? "issue"
+              : detail?.status || status,
+        details:
+          detail && !duplicate
+            ? [...existing.details.slice(-14), detail]
+            : existing.details,
       };
-      items[reasoningItemIndex] = item;
     };
 
     const pushPendingProse = () => {
@@ -14374,8 +14383,19 @@ function ChatPageInner({
 
     const completeTranscriptItems = (value: ChatTranscriptItem[]) =>
       value.map((item) => {
-        if (item.kind !== "action" && item.kind !== "reasoning") return item;
+        if (item.kind === "prose") return item;
         if (item.status === "issue") return item;
+        if (item.kind === "thinking") {
+          return {
+            ...item,
+            status: "done" as ChatTranscriptActionStatus,
+            details: item.details.map((detail) =>
+              detail.status === "issue"
+                ? detail
+                : { ...detail, status: "done" as ChatTranscriptActionStatus },
+            ),
+          };
+        }
         return {
           ...item,
           status: "done" as ChatTranscriptActionStatus,
@@ -14396,7 +14416,7 @@ function ChatPageInner({
       const keepIndexes = new Set<number>();
       let remainingNonProse = normalizedLimit;
       for (let idx = value.length - 1; idx >= 0; idx -= 1) {
-        if (value[idx].kind === "prose") {
+        if (value[idx].kind === "prose" || value[idx].kind === "thinking") {
           keepIndexes.add(idx);
           continue;
         }
@@ -14416,8 +14436,30 @@ function ChatPageInner({
       const card = safeBuildStepCard(step, idx);
       const internalReasoningText = modelInternalReasoningTextFromActivityStep(step);
       if (internalReasoningText) {
-        // Internal reasoning belongs in Run Details / Computer, not as a
-        // transient chat transcript row that disappears when streaming ends.
+        pushPendingProse();
+        appendThinkingRow(
+          card,
+          buildThinkingDetail(
+            stepType || "reasoning_delta",
+            card,
+            str(step.detail, ""),
+            internalReasoningText,
+          ),
+        );
+        continue;
+      }
+      if (isMainChatReasoningStep(step)) {
+        pushPendingProse();
+        appendThinkingRow(
+          card,
+          buildThinkingDetail(
+            stepType || "reasoning_delta",
+            card,
+            str(step.detail, ""),
+            streamedStepText(step) ||
+              extractStepDetailText(step, Number.MAX_SAFE_INTEGER),
+          ),
+        );
         continue;
       }
       const proseText = modelNarrationTextFromActivityStep(step);
@@ -21146,7 +21188,12 @@ function ChatPageInner({
         "live-transcript",
         8,
         { preserveProse: true },
-      ).filter((item) => item.kind === "action" || item.kind === "prose"),
+      ).filter(
+        (item) =>
+          item.kind === "action" ||
+          item.kind === "prose" ||
+          item.kind === "thinking",
+      ),
     [buildChatTranscriptItemsFromSteps, liveTranscriptSourceSteps],
   );
   const liveChatTranscriptHasProse = liveChatTranscriptItems.some(
@@ -21331,7 +21378,7 @@ function ChatPageInner({
         "completed-run-transcript",
         8,
         { complete: true },
-      ).filter((item) => item.kind === "action"),
+      ).filter((item) => item.kind === "action" || item.kind === "thinking"),
     [buildChatTranscriptItemsFromSteps, completedLastRunSteps],
   );
   const latestWorkspaceCard = pickPrimaryActivityCard(workspaceCards);
@@ -22835,8 +22882,10 @@ function ChatPageInner({
     parentId: string,
     entry: ChatTranscriptActionDetail,
     entryIdx: number,
+    options?: { showAudit?: boolean },
   ) => {
-    const audit = transcriptCommandAuditFromCard(entry.card);
+    const audit =
+      options?.showAudit === false ? null : transcriptCommandAuditFromCard(entry.card);
     return (
       <Box
         key={`${parentId}:detail:${entry.id}:${entryIdx}`}
@@ -23054,8 +23103,8 @@ function ChatPageInner({
       </Typography>
     );
 
-    const renderReasoning = (
-      item: Extract<ChatTranscriptItem, { kind: "reasoning" }>,
+    const renderThinking = (
+      item: Extract<ChatTranscriptItem, { kind: "thinking" }>,
       key: string,
     ): ReactNode => {
       const expanded = expandedTranscriptActions.has(item.id);
@@ -23063,11 +23112,11 @@ function ChatPageInner({
       return (
         <Box
           key={key}
-          className={`chat-transcript-action-shell chat-transcript-reasoning-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
+          className={`chat-transcript-action-shell chat-transcript-thinking-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
         >
           <button
             type="button"
-            className={`chat-transcript-action-row chat-transcript-reasoning-row status-${item.status}`}
+            className={`chat-transcript-action-row chat-transcript-thinking-row status-${item.status}`}
             onClick={() => toggleExpandedTranscriptAction(item.id)}
             aria-expanded={expanded}
             aria-label={`${expanded ? "Collapse" : "Expand"} ${item.title}`}
@@ -23077,19 +23126,6 @@ function ChatPageInner({
             </span>
             <span className="chat-transcript-action-main">
               <span className="chat-transcript-action-title">{item.title}</span>
-              {item.detail ? (
-                <>
-                  <span
-                    className="chat-transcript-action-separator"
-                    aria-hidden="true"
-                  >
-                    |
-                  </span>
-                  <span className="chat-transcript-action-detail">
-                    {item.detail}
-                  </span>
-                </>
-              ) : null}
             </span>
             <ExpandMoreIcon
               className="chat-transcript-action-chevron"
@@ -23098,9 +23134,11 @@ function ChatPageInner({
             />
           </button>
           <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
-            <Box className="chat-transcript-action-details chat-transcript-reasoning-details">
+            <Box className="chat-transcript-action-details chat-transcript-thinking-details">
               {item.details.map((entry, entryIdx) =>
-                renderTranscriptActionDetail(item.id, entry, entryIdx)
+                renderTranscriptActionDetail(item.id, entry, entryIdx, {
+                  showAudit: false,
+                })
               )}
             </Box>
           </Collapse>
@@ -23130,7 +23168,7 @@ function ChatPageInner({
         if (item.kind === "prose") {
           nodes.push(renderProse(item, key));
         } else {
-          nodes.push(renderReasoning(item, key));
+          nodes.push(renderThinking(item, key));
         }
       }
     });

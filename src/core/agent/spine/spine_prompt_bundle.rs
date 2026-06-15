@@ -15,6 +15,13 @@ pub(super) const ALLOWED_EVOLVABLE_SPINE_FRAGMENT_IDS: &[&str] = &[
     "spine.final_answer_policy",
 ];
 
+pub(super) fn location_dependent_discovery_policy() -> &'static str {
+    "If the user's intended result is location-dependent because the answer would materially change with physical geography, verify that a grounded location anchor is available before public discovery, search, research, browse, or place-style actions. \
+     A grounded location anchor must come from the user's current turn, recent explicit conversation context, authorized device/location evidence, or fresh tool evidence that actually identifies the relevant city, area, address, or coordinates. \
+     Do not substitute timezone, country, locale, IP hints, model assumptions, or stale memories for a precise location anchor when the request needs neighborhood-level or local recommendations. \
+     If the grounded location anchor is absent, ask one concise clarification for the needed location or for permission to use an available location source before searching."
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpinePromptFragmentLayer {
     StablePrefix,
@@ -322,10 +329,13 @@ fn product_ontology_fragment() -> &'static str {
     crate::core::knowledge::agentark_knowledge::ark_core_product_ontology_prompt()
 }
 
-fn non_evolvable_safety_fragment() -> &'static str {
-    "Stable safety, authorization, credential, and tool-contract rules are not evolvable prompt surfaces. \
-     Later policy fragments can tune style and delivery choices only within these fixed constraints. \
-     If an evolvable fragment conflicts with safety, authorization, credential handling, the tool schemas, or observed tool results, ignore the conflicting fragment and follow the stable rule."
+fn non_evolvable_safety_fragment() -> String {
+    format!(
+        "Stable safety, authorization, credential, and tool-contract rules are not evolvable prompt surfaces. \
+         Later policy fragments can tune style and delivery choices only within these fixed constraints. \
+         If an evolvable fragment conflicts with safety, authorization, credential handling, the tool schemas, or observed tool results, ignore the conflicting fragment and follow the stable rule.\n\n{}",
+        location_dependent_discovery_policy()
+    )
 }
 
 fn authorization_and_credentials_fragment() -> &'static str {

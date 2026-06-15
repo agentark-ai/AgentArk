@@ -414,8 +414,9 @@ pub fn build_equivalence_prompt(a: &str, b: &str) -> String {
          Newer candidate memory B:\n{b}\n\n\
          Answer with a single JSON object of the form {{\"equivalent\": true|false, \"rationale\": \"...\"}}.\n\
          Rules:\n\
-         - Return true when both memories are about the same user attribute, preference, identity, location, workflow, or relationship — even when one refines, corrects, or updates the other, and even when one is more specific than the other. The point is whether they belong on the same canonical row.\n\
+         - Return true when both memories are about the same singleton user attribute, preference, identity, location, workflow, or relationship — even when one refines, corrects, or updates the other, and even when one is more specific than the other. The point is whether they belong on the same canonical row.\n\
          - Return true for paraphrases, clarifications, and value updates of the same underlying fact, including later polarity changes for the same preference or attribute.\n\
+         - Return false when both memories share a broad repeatable slot but name different concrete members that can coexist, such as separate goals, interests, projects, tools, places, relationships, examples, or saved items. Same generic category is not enough.\n\
          - Return false when the subjects or attributes differ (e.g. the user's name vs the user's location vs the user's employer).\n\
          - Return false when the two memories directly negate each other in a way the user is asserting at the same time rather than as an update.\n\
          - Decide on meaning, not on shared words. Different wording about the same attribute is still the same attribute; similar wording about different attributes is not.\n\
@@ -704,6 +705,8 @@ mod tests {
         assert!(prompt.contains("newer candidate"));
         assert!(prompt.contains("later polarity changes"));
         assert!(prompt.contains("same preference or attribute"));
+        assert!(prompt.contains("broad repeatable slot"));
+        assert!(prompt.contains("different concrete members"));
     }
 
     #[tokio::test]

@@ -175,6 +175,61 @@ mod saved_memory_sensitivity_tests {
     }
 
     #[test]
+    fn collection_memory_identity_keeps_generic_key_and_distinguishes_values() {
+        let (antarctica_id, antarctica_key) = learned_user_memory_keys_for_slot(
+            "travel_interest",
+            "wants to visit Antarctica someday",
+            "situational",
+            None,
+            None,
+            UserMemorySlotCardinality::Collection,
+        );
+        let (switzerland_id, switzerland_key) = learned_user_memory_keys_for_slot(
+            "travel_interest",
+            "wants to visit Switzerland someday",
+            "situational",
+            None,
+            None,
+            UserMemorySlotCardinality::Collection,
+        );
+
+        assert_ne!(antarctica_id, switzerland_id);
+        assert_ne!(antarctica_key, switzerland_key);
+        assert!(antarctica_key.starts_with("user_memory::travel_interest::item_"));
+        assert!(switzerland_key.starts_with("user_memory::travel_interest::item_"));
+        assert!(antarctica_key.ends_with("::situational"));
+        assert!(switzerland_key.ends_with("::situational"));
+        assert!(!antarctica_key.contains("antarctica"));
+        assert!(!switzerland_key.contains("switzerland"));
+    }
+
+    #[test]
+    fn singleton_memory_identity_remains_slot_based_across_value_updates() {
+        let first = learned_user_memory_keys_for_slot(
+            "user_location",
+            "Kolkata",
+            "permanent",
+            None,
+            None,
+            UserMemorySlotCardinality::Singleton,
+        );
+        let second = learned_user_memory_keys_for_slot(
+            "user_location",
+            "Zurich",
+            "permanent",
+            None,
+            None,
+            UserMemorySlotCardinality::Singleton,
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.1,
+            learned_user_memory_keys("user_location", "permanent", None, None).1
+        );
+    }
+
+    #[test]
     fn memory_key_normalization_removes_trailing_value_suffix() {
         assert_eq!(
             normalize_user_fact_key_and_value("user name Alex", "The user's name is Alex.", true),
@@ -344,6 +399,277 @@ mod saved_memory_sensitivity_tests {
                 .map(Vec::len),
             Some(0)
         );
+    }
+
+    #[test]
+    fn memory_capture_payload_salvages_complete_items_from_truncated_memory_array() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{"memories":[{"key":"user_name","value":"Indrani"},{"key":"user_location","value":"Kolakta 700130"}"#,
+        )
+        .expect("complete memory objects should survive a truncated array response");
+
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::ShapeRecovered
+        );
+        let memories = parsed
+            .payload
+            .get("memories")
+            .and_then(|value| value.as_array())
+            .expect("memories should be recovered as an array");
+        assert_eq!(memories.len(), 2);
+        assert_eq!(
+            memories
+                .get(1)
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("Kolakta 700130")
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("retractions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn memory_capture_prefers_compact_primary_prompt_when_available() {
+        let full_prompt = "full extraction prompt with many detailed validation rules";
+        let compact_prompt = "compact extraction prompt";
+
+        assert_eq!(
+            user_memory_capture_primary_extraction_prompt(full_prompt, compact_prompt),
+            compact_prompt
+        );
+        assert_eq!(
+            user_memory_capture_primary_extraction_prompt(full_prompt, "   "),
+            full_prompt
+        );
+    }
+
+    #[test]
+    fn memory_capture_prompts_keep_current_work_requirements_out_of_memory() {
+        let response_shape = r#"{"memories":[],"retractions":[]}"#;
+        let full = build_user_memory_capture_prompt(
+            "UTC now: 2026-06-13T00:00:00Z",
+            "(none)",
+            "Build a dashboard with local storage and a printable report.",
+            "## Saved User Facts\n(none)",
+            response_shape,
+        );
+        let compact = build_user_memory_capture_compact_prompt(
+            "UTC now: 2026-06-13T00:00:00Z",
+            "(none)",
+            "Build a dashboard with local storage and a printable report.",
+            "## Saved User Facts\n(none)",
+            response_shape,
+        );
+        let review = build_user_memory_candidate_semantic_review_prompt(
+            "Build a dashboard with local storage and a printable report.",
+            "(none)",
+            &serde_json::json!({
+                "key": "current_project_requirements",
+                "value": "dashboard with local storage and a printable report",
+            }),
+        );
+
+        for prompt in [full, compact, review] {
+            assert!(prompt.contains("artifact"));
+            assert!(prompt.contains("work/task context"));
+            assert!(prompt.contains("reusable preference"));
+        }
+    }
+
+    #[test]
+    fn memory_capture_source_fallback_extracts_explicit_profile_facts() {
+        let payload = user_memory_capture_source_fallback_payload(
+            "my name is indrani and i live in Kolakta 700130",
+            None,
+        )
+        .expect("explicit self-profile facts should produce a fallback payload");
+        let memories = payload
+            .get("memories")
+            .and_then(|value| value.as_array())
+            .expect("fallback payload should include memories");
+
+        assert_eq!(
+            memories
+                .iter()
+                .find(|item| item.get("key").and_then(|value| value.as_str()) == Some("user_name"))
+                .and_then(|item| item.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("indrani")
+        );
+        assert_eq!(
+            memories
+                .iter()
+                .find(|item| {
+                    item.get("key").and_then(|value| value.as_str()) == Some("user_location")
+                })
+                .and_then(|item| item.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("Kolakta 700130")
+        );
+    }
+
+    #[test]
+    fn memory_capture_source_fallback_handles_paraphrased_profile_clauses() {
+        let payload = user_memory_capture_source_fallback_payload(
+            "Preferred name: Riya; I am based near Salt Lake",
+            None,
+        )
+        .expect("profile-like clauses should not depend on exact wording");
+        let memories = payload
+            .get("memories")
+            .and_then(|value| value.as_array())
+            .expect("fallback payload should include memories");
+
+        assert_eq!(
+            memories
+                .iter()
+                .find(|item| item.get("key").and_then(|value| value.as_str()) == Some("user_name"))
+                .and_then(|item| item.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("Riya")
+        );
+        assert_eq!(
+            memories
+                .iter()
+                .find(|item| {
+                    item.get("key").and_then(|value| value.as_str()) == Some("user_location")
+                })
+                .and_then(|item| item.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("Salt Lake")
+        );
+    }
+
+    #[test]
+    fn memory_capture_source_fallback_ignores_non_user_profile_mentions() {
+        assert!(user_memory_capture_source_fallback_payload(
+            "the project name is AgentArk and the office is in Kolkata",
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn memory_capture_source_fallback_preserves_private_self_context_from_semantic_signal() {
+        let signal = crate::security::intent_classifier::InboundMemoryCaptureSignal {
+            should_capture: true,
+            confidence: Some(0.86),
+            concept: Some("durable_private_self_context".to_string()),
+            reason: Some("private self-context that may affect future assistance".to_string()),
+        };
+
+        let payload =
+            user_memory_capture_source_fallback_payload("i have anxiety issues", Some(&signal))
+                .expect("eligible semantic self-context should produce a fallback payload");
+        let item = payload
+            .get("memories")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .expect("fallback payload should include a memory");
+
+        assert_eq!(
+            item.get("key").and_then(|value| value.as_str()),
+            Some("private_self_context")
+        );
+        assert_eq!(
+            item.get("value").and_then(|value| value.as_str()),
+            Some("i have anxiety issues")
+        );
+        assert_eq!(
+            item.get("slot_cardinality")
+                .and_then(|value| value.as_str()),
+            Some("collection")
+        );
+        assert_eq!(
+            item.get("sensitivity").and_then(|value| value.as_str()),
+            Some("sensitive")
+        );
+    }
+
+    #[test]
+    fn memory_capture_source_fallback_preserves_personal_goal_from_semantic_signal() {
+        let signal = crate::security::intent_classifier::InboundMemoryCaptureSignal {
+            should_capture: true,
+            confidence: Some(0.86),
+            concept: Some("durable_personal_goal_or_interest".to_string()),
+            reason: Some("personal future interest".to_string()),
+        };
+
+        let payload = user_memory_capture_source_fallback_payload(
+            "i would love to visit Switzerland some day",
+            Some(&signal),
+        )
+        .expect("eligible semantic goal should produce a fallback payload");
+        let item = payload
+            .get("memories")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .expect("fallback payload should include a memory");
+
+        assert_eq!(
+            item.get("key").and_then(|value| value.as_str()),
+            Some("personal_goal_or_interest")
+        );
+        assert_eq!(
+            item.get("value").and_then(|value| value.as_str()),
+            Some("i would love to visit Switzerland some day")
+        );
+        assert_eq!(
+            item.get("slot_cardinality")
+                .and_then(|value| value.as_str()),
+            Some("collection")
+        );
+    }
+
+    #[test]
+    fn memory_capture_source_fallback_does_not_broaden_without_semantic_signal() {
+        assert!(user_memory_capture_source_fallback_payload(
+            "i have a question about anxiety issues",
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn memory_capture_provider_payload_is_not_reported_as_schema_failure() {
+        let raw = r#"Provider API error: {"error":{"message":"This request requires more credits or fewer tokens. Visit https://provider.example/settings/credits. You requested up to 65536 tokens, but can only afford 13902.","code":402}}"#;
+        let (outcome, attempt_error) = user_memory_capture_payload_error_outcome(
+            raw,
+            UserMemoryCapturePayloadError::IncompleteShape,
+        );
+
+        assert_eq!(outcome, "provider_error");
+        let attempt_error = attempt_error.expect("provider error should be summarized");
+        assert!(attempt_error.contains("model provider"));
+        assert!(attempt_error.contains("quota"));
+        assert!(!attempt_error.contains('{'));
+        assert!(!attempt_error.contains("provider.example"));
+        assert!(!attempt_error.contains("65536"));
+
+        let attempts = vec![UserMemoryCaptureAttemptRecord {
+            slot_id: "primary".to_string(),
+            slot_label: "Primary".to_string(),
+            role: "primary".to_string(),
+            provider: Some("openrouter".to_string()),
+            model: Some("example".to_string()),
+            stage: "extract".to_string(),
+            request_kind: "user_fact_memory_capture".to_string(),
+            outcome: outcome.to_string(),
+            error: Some(attempt_error),
+        }];
+
+        assert_eq!(
+            user_memory_capture_terminal_error_code(&attempts),
+            "provider_failure"
+        );
+        assert!(user_memory_capture_terminal_error(&attempts, 1, 30_000).contains("quota"));
     }
 
     fn memory_operation_with_type(operation_type: &str) -> crate::storage::memory_operation::Model {
@@ -1600,6 +1926,9 @@ pub(super) fn build_user_memory_capture_prompt(
     );
     prompt.push_str("\n- The `key` is a stable semantic slot identifier, not prose and not the concrete stored value. Do not include the extracted value inside the key.");
     prompt.push_str("\n- The `value` is the content for that slot. For attribute-like facts, return only the attribute value without repeating the subject or key; for preferences, rules, or domain memories that are not scalar attributes, use a concise reusable statement.");
+    prompt.push_str("\n- Set `slot_cardinality` from meaning. Use `singleton` when the slot has one active canonical value that later corrections should replace. Use `collection` when the slot can hold multiple active entries under the same generic key; keep each concrete item in `value`, not in `key`.");
+    prompt.push_str("\n- A shared generic key does not mean two collection entries should overwrite each other. Different concrete collection members belong in separate rows unless the new value is the same member restated, refined, or corrected.");
+    prompt.push_str("\n- Do not turn requirements of the current requested artifact, app, document, automation, analysis, or work item into user memory. Store them in the work/task context instead unless the source message explicitly states a reusable preference, standing rule, or durable project/domain fact that should outlive that specific request.");
     prompt
 }
 
@@ -1611,13 +1940,25 @@ pub(super) fn build_user_memory_capture_compact_prompt(
     response_shape: &str,
 ) -> String {
     format!(
-        "Extract reviewable user-memory operations from the source message.\n\nCurrent time:\n{time_context}\n\nRecent dialogue, context only:\n{recent_dialogue}\n\nSource user message, authoritative:\n{message}\n\nCurrent saved user facts:\n{saved_facts}\n\nReturn JSON only with this exact top-level shape:\n{response_shape}\n\nSemantic contract:\n- Always include both top-level arrays: memories and retractions.\n- Use memories for new, updated, corrected, or superseding user-authored memory candidates. Use stable semantic keys so updates replace stale facts instead of creating duplicate slots.\n- Use retractions when the user asks to delete, forget, stop retaining, undo, or negate a stored fact/preference/constraint.\n- Store only information useful beyond the current turn: profile facts, assistant preferences, durable work preferences, reusable project/domain context, reusable knowledge, temporary/situational self-context, or explicit memory operations.\n- Do not store one-off requests, assistant claims, tool output, operational state, integration setup/auth state, task/watch/schedule configuration, transient errors, or credentials.\n- For every emitted item, source_support must be explicit_source_message and source_evidence must be a short exact quote from the source user message supporting the same operation. If this cannot be done, omit the item.\n- Decide from meaning and context, not exact wording, keyword lists, regexes, casing, punctuation, order, or anticipated phrases.\n- Return empty arrays only when there is genuinely no saveable memory operation.",
+        "Extract reviewable user-memory operations from the source message.\n\nCurrent time:\n{time_context}\n\nRecent dialogue, context only:\n{recent_dialogue}\n\nSource user message, authoritative:\n{message}\n\nCurrent saved user facts:\n{saved_facts}\n\nReturn JSON only with this exact top-level shape:\n{response_shape}\n\nSemantic contract:\n- Always include both top-level arrays: memories and retractions.\n- Use memories for new, updated, corrected, or superseding user-authored memory candidates. Use stable semantic keys so updates replace stale facts instead of creating duplicate slots.\n- Keep keys generic and value-free. When a generic slot can hold more than one active member, set slot_cardinality=collection and put the concrete member in value.\n- Set slot_cardinality=singleton only when later values for the same slot should replace the prior active row; set slot_cardinality=collection when different concrete members should coexist under the same key.\n- Use retractions when the user asks to delete, forget, stop retaining, undo, or negate a stored fact/preference/constraint.\n- Store only information useful beyond the current turn: profile facts, assistant preferences, durable work preferences, reusable project/domain context, reusable knowledge, temporary/situational self-context, or explicit memory operations.\n- Do not store requirements of the current requested artifact, app, document, automation, analysis, or work item as user memory. Store those in the work/task context unless the source explicitly states a reusable preference, standing rule, or durable project/domain fact that should outlive this request.\n- Do not store one-off requests, assistant claims, tool output, operational state, integration setup/auth state, task/watch/schedule configuration, transient errors, or credentials.\n- For every emitted item, source_support must be explicit_source_message and source_evidence must be a short exact quote from the source user message supporting the same operation. If this cannot be done, omit the item.\n- Decide from meaning and context, not exact wording, keyword lists, regexes, casing, punctuation, order, or anticipated phrases.\n- Return empty arrays only when there is genuinely no saveable memory operation.",
         time_context = time_context,
         recent_dialogue = recent_dialogue,
         message = message,
         saved_facts = saved_facts,
         response_shape = response_shape
     )
+}
+
+pub(super) fn user_memory_capture_primary_extraction_prompt<'a>(
+    original_prompt: &'a str,
+    compact_prompt: &'a str,
+) -> &'a str {
+    let compact = compact_prompt.trim();
+    if !compact.is_empty() && compact.len() < original_prompt.trim().len() {
+        compact_prompt
+    } else {
+        original_prompt
+    }
 }
 
 pub(super) fn build_user_memory_candidate_semantic_review_prompt(
@@ -1627,7 +1968,7 @@ pub(super) fn build_user_memory_candidate_semantic_review_prompt(
 ) -> String {
     let candidate_json = serde_json::to_string(candidate).unwrap_or_else(|_| "{}".to_string());
     format!(
-        "Review one proposed Memory candidate before it can be saved.\n\nRecent dialogue, context only:\n{recent_dialogue}\n\nSource user message, authoritative:\n{source_message}\n\nProposed memory candidate:\n{candidate_json}\n\nReturn JSON only with this shape:\n{{\"store\":false,\"source_support\":\"unsupported|context_only|explicit_source_message\",\"evidence\":\"short exact quote from the source user message, or empty\",\"confidence\":0.0,\"reason\":\"brief semantic rationale\"}}\n\nRules:\n- Decide from the user's underlying intent and the candidate's meaning, not wording, keyword presence, formatting, casing, grammar, or word order.\n- Set store=true only when the candidate is saveable user memory: a reusable user fact, durable preference, operating constraint, reusable project/domain fact, explicit memory retraction signal, or temporary/situational self-context that should remain useful after the current task/session/work item is complete until they expire or need review.\n- Set store=true for explicit future personal plans or commitments when the candidate is user-authored, supported by the source message, and bounded enough to be temporary/situational memory until they expire or need review.\n- Set source_support=explicit_source_message only when the source user message itself explicitly asserts the same fact, preference, correction, retraction, bounded self-context, or request to remember it. Use evidence for a short exact user-authored quote from that source message.\n- Set source_support=context_only when the candidate depends on recent dialogue, assistant-authored text, tool output, UI labels, history rows, model world knowledge, or a prior topic rather than the current source user message.\n- Set source_support=unsupported when the candidate is inferred, guessed, or merely plausible.\n- A candidate about what a term, name, acronym, module, product, or label means for the user needs an explicit definition or correction in the source user message. Mere mention or prior discussion is context_only or unsupported.\n- Set store=false unless source_support=explicit_source_message.\n- Set store=false when the candidate mainly belongs in operational state instead of Memory: task state, watcher or automation configuration, automation scheduling or trigger/condition details, notification routing for a particular work item, integration setup/auth state, tool-run state, execution status, retry/pending state, or a one-off request.\n- A general durable preference or bounded personal context can still be stored even if the source turn also asks for work. A work item configuration should not become memory just because it mentions a preferred tool, channel, source, destination, time, or trigger.\n- If the candidate would become stale when the specific requested task, watcher, automation, or setup record is changed, completed, or deleted, set store=false; do not apply this to temporary/situational personal context whose staleness is handled by expires_at or review_at.\n- When support is genuinely unclear, set source_support=unsupported and store=false rather than saving a guessed memory.\n- confidence must describe confidence in the store decision and must be between 0.0 and 1.0.",
+        "Review one proposed Memory candidate before it can be saved.\n\nRecent dialogue, context only:\n{recent_dialogue}\n\nSource user message, authoritative:\n{source_message}\n\nProposed memory candidate:\n{candidate_json}\n\nReturn JSON only with this shape:\n{{\"store\":false,\"source_support\":\"unsupported|context_only|explicit_source_message\",\"evidence\":\"short exact quote from the source user message, or empty\",\"confidence\":0.0,\"reason\":\"brief semantic rationale\"}}\n\nRules:\n- Decide from the user's underlying intent and the candidate's meaning, not wording, keyword presence, formatting, casing, grammar, or word order.\n- Set store=true only when the candidate is saveable user memory: a reusable user fact, durable preference, operating constraint, reusable project/domain fact, explicit memory retraction signal, or temporary/situational self-context that should remain useful after the current task/session/work item is complete until they expire or need review.\n- Set store=false when the candidate is only a requirement, implementation detail, technology choice, object description, or success criterion for the artifact, app, document, automation, analysis, or task the user is currently requesting. Those details belong to the work/task context unless the source explicitly states they are a reusable preference, standing rule, or durable project/domain fact beyond this request.\n- Set store=true for explicit future personal plans or commitments when the candidate is user-authored, supported by the source message, and bounded enough to be temporary/situational memory until they expire or need review.\n- Set source_support=explicit_source_message only when the source user message itself explicitly asserts the same fact, preference, correction, retraction, bounded self-context, or request to remember it. Use evidence for a short exact user-authored quote from that source message.\n- Set source_support=context_only when the candidate depends on recent dialogue, assistant-authored text, tool output, UI labels, history rows, model world knowledge, or a prior topic rather than the current source user message.\n- Set source_support=unsupported when the candidate is inferred, guessed, or merely plausible.\n- A candidate about what a term, name, acronym, module, product, or label means for the user needs an explicit definition or correction in the source user message. Mere mention or prior discussion is context_only or unsupported.\n- Set store=false unless source_support=explicit_source_message.\n- Set store=false when the candidate mainly belongs in operational state instead of Memory: task state, watcher or automation configuration, automation scheduling or trigger/condition details, notification routing for a particular work item, integration setup/auth state, tool-run state, execution status, retry/pending state, or a one-off request.\n- A general durable preference or bounded personal context can still be stored even if the source turn also asks for work. A work item configuration should not become memory just because it mentions a preferred tool, channel, source, destination, time, or trigger.\n- If the candidate would become stale when the specific requested task, watcher, automation, or setup record is changed, completed, or deleted, set store=false; do not apply this to temporary/situational personal context whose staleness is handled by expires_at or review_at.\n- When support is genuinely unclear, set source_support=unsupported and store=false rather than saving a guessed memory.\n- confidence must describe confidence in the store decision and must be between 0.0 and 1.0.",
         recent_dialogue = recent_dialogue,
         source_message = source_message,
         candidate_json = candidate_json
@@ -1670,6 +2011,45 @@ pub(super) enum UserMemoryCapturePayloadDisposition {
 pub(super) struct ParsedUserMemoryCapturePayload {
     pub(super) payload: serde_json::Value,
     pub(super) disposition: UserMemoryCapturePayloadDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceMemoryProfileSlot {
+    key: &'static str,
+    kind: &'static str,
+    category: &'static str,
+    sensitivity: &'static str,
+    topic: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceMemoryToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn user_memory_capture_signal_metadata(
+    signal: Option<&crate::security::intent_classifier::InboundMemoryCaptureSignal>,
+) -> Option<serde_json::Value> {
+    signal.map(|signal| {
+        serde_json::json!({
+            "should_capture": signal.should_capture,
+            "confidence": signal.confidence,
+            "concept": signal.concept.as_deref(),
+            "reason": signal.reason.as_deref(),
+        })
+    })
+}
+
+fn user_memory_capture_signal_from_metadata(
+    metadata: &serde_json::Value,
+) -> Option<crate::security::intent_classifier::InboundMemoryCaptureSignal> {
+    metadata
+        .get("memory_capture_signal")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2010,6 +2390,164 @@ fn repair_truncated_user_memory_capture_object(raw: &str) -> Option<serde_json::
         .filter(|value| value.is_object())
 }
 
+fn parse_json_string_literal_at(raw: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = raw.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut escaped = false;
+    for index in start + 1..bytes.len() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match bytes[index] {
+            b'\\' => escaped = true,
+            b'"' => {
+                let literal = &raw[start..=index];
+                let value = serde_json::from_str::<String>(literal).ok()?;
+                return Some((value, index + 1));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn skip_json_whitespace(raw: &str, mut index: usize) -> usize {
+    let bytes = raw.as_bytes();
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\n' | b'\r' | b'\t') {
+        index += 1;
+    }
+    index
+}
+
+fn top_level_json_field_value_start(raw: &str, field: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = raw.find('{')?;
+    let mut stack: Vec<u8> = Vec::new();
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let top_level_object = stack.len() == 1 && stack.last() == Some(&b'}');
+                let Some((key, end)) = parse_json_string_literal_at(raw, index) else {
+                    return None;
+                };
+                if top_level_object && key == field {
+                    let colon = skip_json_whitespace(raw, end);
+                    if bytes.get(colon) == Some(&b':') {
+                        return Some(skip_json_whitespace(raw, colon + 1));
+                    }
+                }
+                index = end;
+            }
+            b'{' => {
+                stack.push(b'}');
+                index += 1;
+            }
+            b'[' => {
+                stack.push(b']');
+                index += 1;
+            }
+            b'}' | b']' => {
+                if stack.last() == Some(&bytes[index]) {
+                    stack.pop();
+                }
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    None
+}
+
+fn complete_json_objects_from_array_value(
+    raw: &str,
+    value_start: usize,
+) -> Option<Vec<serde_json::Value>> {
+    let bytes = raw.as_bytes();
+    let array_start = skip_json_whitespace(raw, value_start);
+    if bytes.get(array_start) != Some(&b'[') {
+        return None;
+    }
+
+    let mut items = Vec::new();
+    let mut index = array_start + 1;
+    let mut item_start = None::<usize>;
+    let mut item_stack: Vec<u8> = Vec::new();
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let Some((_, end)) = parse_json_string_literal_at(raw, index) else {
+                    return Some(items);
+                };
+                index = end;
+            }
+            b'{' if item_start.is_none() => {
+                item_start = Some(index);
+                item_stack.push(b'}');
+                index += 1;
+            }
+            b'{' if item_start.is_some() => {
+                item_stack.push(b'}');
+                index += 1;
+            }
+            b'[' if item_start.is_some() => {
+                item_stack.push(b']');
+                index += 1;
+            }
+            b'}' | b']' if item_start.is_some() => {
+                if item_stack.last() == Some(&bytes[index]) {
+                    item_stack.pop();
+                    if item_stack.is_empty() && bytes[index] == b'}' {
+                        if let Some(start) = item_start.take() {
+                            let candidate = &raw[start..=index];
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate)
+                            {
+                                if value.is_object() {
+                                    items.push(value);
+                                }
+                            }
+                        }
+                    }
+                }
+                index += 1;
+            }
+            b']' if item_start.is_none() => return Some(items),
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    Some(items)
+}
+
+fn recover_truncated_user_memory_capture_arrays(raw: &str) -> Option<serde_json::Value> {
+    let mut recovered = serde_json::Map::new();
+    let mut recovered_any_item = false;
+    let mut saw_known_field = false;
+
+    for field in ["memories", "retractions"] {
+        let items = top_level_json_field_value_start(raw, field)
+            .and_then(|value_start| complete_json_objects_from_array_value(raw, value_start));
+        if let Some(items) = items {
+            saw_known_field = true;
+            recovered_any_item |= !items.is_empty();
+            recovered.insert(field.to_string(), serde_json::Value::Array(items));
+        } else {
+            recovered.insert(field.to_string(), serde_json::Value::Array(Vec::new()));
+        }
+    }
+
+    (saw_known_field && recovered_any_item).then_some(serde_json::Value::Object(recovered))
+}
+
 fn extract_user_memory_capture_json_object(raw: &str) -> Option<serde_json::Value> {
     extract_json_object_from_text(raw).or_else(|| repair_truncated_user_memory_capture_object(raw))
 }
@@ -2017,21 +2555,520 @@ fn extract_user_memory_capture_json_object(raw: &str) -> Option<serde_json::Valu
 pub(super) fn parse_user_memory_capture_payload(
     raw: &str,
 ) -> Result<ParsedUserMemoryCapturePayload, UserMemoryCapturePayloadError> {
-    let Some(payload) = extract_user_memory_capture_json_object(raw) else {
-        return Err(UserMemoryCapturePayloadError::Unparseable);
-    };
-    if user_memory_capture_payload_has_required_shape(&payload) {
+    if let Some(payload) = extract_user_memory_capture_json_object(raw) {
+        if user_memory_capture_payload_has_required_shape(&payload) {
+            return Ok(ParsedUserMemoryCapturePayload {
+                payload,
+                disposition: UserMemoryCapturePayloadDisposition::Exact,
+            });
+        }
+        let Some(payload) = recover_user_memory_capture_payload_shape(&payload) else {
+            return Err(UserMemoryCapturePayloadError::IncompleteShape);
+        };
         return Ok(ParsedUserMemoryCapturePayload {
             payload,
-            disposition: UserMemoryCapturePayloadDisposition::Exact,
+            disposition: UserMemoryCapturePayloadDisposition::ShapeRecovered,
         });
     }
-    let Some(payload) = recover_user_memory_capture_payload_shape(&payload) else {
-        return Err(UserMemoryCapturePayloadError::IncompleteShape);
+
+    if let Some(payload) = recover_truncated_user_memory_capture_arrays(raw) {
+        return Ok(ParsedUserMemoryCapturePayload {
+            payload,
+            disposition: UserMemoryCapturePayloadDisposition::ShapeRecovered,
+        });
+    }
+
+    Err(UserMemoryCapturePayloadError::Unparseable)
+}
+
+fn user_memory_capture_source_fallback_attempt(
+    outcome: &'static str,
+) -> UserMemoryCaptureAttemptRecord {
+    UserMemoryCaptureAttemptRecord {
+        slot_id: "local_source_message".to_string(),
+        slot_label: "source-message profile extractor".to_string(),
+        role: "Local".to_string(),
+        provider: Some("local".to_string()),
+        model: Some("source-message-profile-extractor".to_string()),
+        stage: "source_fallback".to_string(),
+        request_kind: "user_fact_memory_capture_source_fallback".to_string(),
+        outcome: outcome.to_string(),
+        error: None,
+    }
+}
+
+fn source_memory_profile_slot_from_attribute(
+    attribute_tokens: &[&str],
+) -> Option<SourceMemoryProfileSlot> {
+    let has = |needle: &str| attribute_tokens.iter().any(|token| *token == needle);
+    let has_any = |needles: &[&str]| needles.iter().any(|needle| has(needle));
+
+    if has("name") && !has_any(&["project", "app", "application", "repo", "repository"]) {
+        return Some(SourceMemoryProfileSlot {
+            key: "user_name",
+            kind: "identity",
+            category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+            sensitivity: "personal_identifier",
+            topic: "identity",
+            reason: "The source message explicitly states the user's name.",
+        });
+    }
+    if has_any(&[
+        "location",
+        "city",
+        "address",
+        "area",
+        "place",
+        "home",
+        "residence",
+        "postcode",
+        "zipcode",
+        "zip",
+        "pin",
+        "pincode",
+    ]) && !has_any(&["project", "app", "application", "repo", "repository"])
+    {
+        return Some(SourceMemoryProfileSlot {
+            key: "user_location",
+            kind: "location",
+            category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+            sensitivity: "personal_identifier",
+            topic: "location",
+            reason: "The source message explicitly states the user's location.",
+        });
+    }
+    if has("email") || has_any(&["e-mail", "mail"]) && has_any(&["address", "contact"]) {
+        return Some(SourceMemoryProfileSlot {
+            key: "user_email",
+            kind: "contact",
+            category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+            sensitivity: "personal_identifier",
+            topic: "contact",
+            reason: "The source message explicitly states the user's contact detail.",
+        });
+    }
+    if has_any(&["phone", "mobile", "telephone"]) {
+        return Some(SourceMemoryProfileSlot {
+            key: "user_phone",
+            kind: "contact",
+            category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+            sensitivity: "personal_identifier",
+            topic: "contact",
+            reason: "The source message explicitly states the user's contact detail.",
+        });
+    }
+    if has_any(&[
+        "employer",
+        "workplace",
+        "company",
+        "organization",
+        "organisation",
+    ]) {
+        return Some(SourceMemoryProfileSlot {
+            key: "user_employer",
+            kind: "personal_fact",
+            category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+            sensitivity: "personal_identifier",
+            topic: "work",
+            reason: "The source message explicitly states the user's employer or workplace.",
+        });
+    }
+
+    None
+}
+
+fn source_memory_profile_location_slot() -> SourceMemoryProfileSlot {
+    SourceMemoryProfileSlot {
+        key: "user_location",
+        kind: "location",
+        category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+        sensitivity: "personal_identifier",
+        topic: "location",
+        reason: "The source message explicitly states where the user lives or is based.",
+    }
+}
+
+fn source_memory_profile_employer_slot() -> SourceMemoryProfileSlot {
+    SourceMemoryProfileSlot {
+        key: "user_employer",
+        kind: "personal_fact",
+        category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+        sensitivity: "personal_identifier",
+        topic: "work",
+        reason: "The source message explicitly states where the user works.",
+    }
+}
+
+fn source_memory_token_text(raw: &str) -> String {
+    raw.trim_matches('\'')
+        .trim_matches('`')
+        .to_ascii_lowercase()
+}
+
+fn source_memory_tokens(raw: &str) -> Vec<SourceMemoryToken> {
+    let mut tokens = Vec::new();
+    let mut start = None::<usize>;
+    for (index, ch) in raw.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '\'' || ch == '-' {
+            if start.is_none() {
+                start = Some(index);
+            }
+        } else if let Some(token_start) = start.take() {
+            let text = source_memory_token_text(&raw[token_start..index]);
+            if !text.is_empty() {
+                tokens.push(SourceMemoryToken {
+                    text,
+                    start: token_start,
+                    end: index,
+                });
+            }
+        }
+    }
+    if let Some(token_start) = start {
+        let text = source_memory_token_text(&raw[token_start..]);
+        if !text.is_empty() {
+            tokens.push(SourceMemoryToken {
+                text,
+                start: token_start,
+                end: raw.len(),
+            });
+        }
+    }
+    tokens
+}
+
+fn source_memory_starts_independent_self_clause(raw: &str) -> bool {
+    let tokens = source_memory_tokens(raw);
+    let Some(first) = tokens.first().map(|token| token.text.as_str()) else {
+        return false;
     };
-    Ok(ParsedUserMemoryCapturePayload {
-        payload,
-        disposition: UserMemoryCapturePayloadDisposition::ShapeRecovered,
+    matches!(
+        first,
+        "i" | "im" | "i'm" | "my" | "mine" | "preferred" | "display"
+    )
+}
+
+fn split_source_memory_independent_conjunctions(raw: &str) -> Vec<String> {
+    let mut clauses = Vec::new();
+    let mut start = 0usize;
+    let mut scan = 0usize;
+    let lower = raw.to_ascii_lowercase();
+    while let Some(relative) = lower[scan..].find(" and ") {
+        let and_start = scan + relative;
+        let next_start = and_start + " and ".len();
+        let next = &raw[next_start..];
+        if source_memory_starts_independent_self_clause(next) {
+            let segment = raw[start..and_start].trim();
+            if !segment.is_empty() {
+                clauses.push(segment.to_string());
+            }
+            start = next_start;
+        }
+        scan = next_start;
+    }
+    let tail = raw[start..].trim();
+    if !tail.is_empty() {
+        clauses.push(tail.to_string());
+    }
+    clauses
+}
+
+fn source_memory_clauses(raw: &str) -> Vec<String> {
+    let mut clauses = Vec::new();
+    let mut start = 0usize;
+    for (index, ch) in raw.char_indices() {
+        if matches!(ch, '.' | ';' | '!' | '?' | '\n' | '\r') {
+            let segment = raw[start..index].trim();
+            if !segment.is_empty() {
+                clauses.extend(split_source_memory_independent_conjunctions(segment));
+            }
+            start = index + ch.len_utf8();
+        }
+    }
+    let tail = raw[start..].trim();
+    if !tail.is_empty() {
+        clauses.extend(split_source_memory_independent_conjunctions(tail));
+    }
+    clauses
+}
+
+fn trim_source_memory_value(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | ';' | '.' | ':' | '-'));
+    normalize_user_memory_text(trimmed, 320)
+}
+
+fn source_memory_item_json(
+    slot: SourceMemoryProfileSlot,
+    value: String,
+    evidence: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key": slot.key,
+        "value": value,
+        "category": slot.category,
+        "topics": [slot.topic],
+        "kind": slot.kind,
+        "slot_cardinality": "singleton",
+        "durability": "permanent",
+        "scope": "global",
+        "sensitivity": slot.sensitivity,
+        "source_support": "explicit_source_message",
+        "source_evidence": evidence,
+        "valid_from": null,
+        "expires_at": null,
+        "review_at": null,
+        "confidence": 0.95,
+        "reason": slot.reason,
+        "looks_sensitive": false,
+        "sensitive_reason": "",
+    })
+}
+
+fn source_memory_semantic_fallback_slot(
+    signal: Option<&crate::security::intent_classifier::InboundMemoryCaptureSignal>,
+) -> Option<SourceMemoryProfileSlot> {
+    let signal = signal?;
+    if !signal.should_capture {
+        return None;
+    }
+    match signal.concept.as_deref()? {
+        "durable_private_self_context" => Some(SourceMemoryProfileSlot {
+            key: "private_self_context",
+            kind: "personal_fact",
+            category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+            sensitivity: "sensitive",
+            topic: "private_self_context",
+            reason: "The source message explicitly shares private self-context that may affect future assistance.",
+        }),
+        "durable_personal_goal_or_interest" => Some(SourceMemoryProfileSlot {
+            key: "personal_goal_or_interest",
+            kind: "personal_fact",
+            category: crate::core::knowledge::memory_schema::MEMORY_CATEGORY_PROFILE_FACT,
+            sensitivity: "prompt_safe",
+            topic: "personal_goals_interests",
+            reason: "The source message explicitly shares a personal goal, aspiration, or durable interest.",
+        }),
+        _ => None,
+    }
+}
+
+fn source_memory_starts_first_person_self_reference(raw: &str) -> bool {
+    let tokens = source_memory_tokens(raw);
+    let Some(first) = tokens.first().map(|token| token.text.as_str()) else {
+        return false;
+    };
+    matches!(first, "i" | "im" | "i'm" | "my" | "mine")
+}
+
+fn source_memory_semantic_fallback_item_json(
+    slot: SourceMemoryProfileSlot,
+    value: String,
+    evidence: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key": slot.key,
+        "value": value,
+        "category": slot.category,
+        "topics": [slot.topic],
+        "kind": slot.kind,
+        "slot_cardinality": "collection",
+        "durability": "situational",
+        "scope": "global",
+        "sensitivity": slot.sensitivity,
+        "source_support": "explicit_source_message",
+        "source_evidence": evidence,
+        "valid_from": null,
+        "expires_at": null,
+        "review_at": null,
+        "confidence": 0.78,
+        "reason": slot.reason,
+        "looks_sensitive": false,
+        "sensitive_reason": "",
+    })
+}
+
+fn source_memory_extract_semantic_self_context_clause(
+    clause: &str,
+    memory_capture_signal: Option<&crate::security::intent_classifier::InboundMemoryCaptureSignal>,
+) -> Option<serde_json::Value> {
+    let clause = clause.trim();
+    if clause.is_empty()
+        || clause.ends_with('?')
+        || !source_memory_starts_first_person_self_reference(clause)
+    {
+        return None;
+    }
+    let slot = source_memory_semantic_fallback_slot(memory_capture_signal)?;
+    let value = trim_source_memory_value(clause)?;
+    Some(source_memory_semantic_fallback_item_json(
+        slot, value, clause,
+    ))
+}
+
+fn source_memory_extract_attribute_clause(clause: &str) -> Option<serde_json::Value> {
+    let tokens = source_memory_tokens(clause);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    if let Some((raw_attribute, raw_value)) = clause.split_once(':') {
+        let attribute_tokens = source_memory_tokens(raw_attribute);
+        let attribute_words = attribute_tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        let has_self_qualifier = attribute_words
+            .iter()
+            .any(|token| matches!(*token, "my" | "preferred" | "display"));
+        if has_self_qualifier {
+            let slot = source_memory_profile_slot_from_attribute(&attribute_words)?;
+            let value = trim_source_memory_value(raw_value)?;
+            return Some(source_memory_item_json(slot, value, clause.trim()));
+        }
+    }
+
+    let copula_index = tokens
+        .iter()
+        .position(|token| matches!(token.text.as_str(), "is" | "are" | "was" | "equals"))?;
+    let my_index = tokens
+        .iter()
+        .take(copula_index)
+        .position(|token| token.text == "my" || token.text == "mine")?;
+    if my_index + 1 >= copula_index {
+        return None;
+    }
+    let attribute_words = tokens[my_index + 1..copula_index]
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect::<Vec<_>>();
+    let slot = source_memory_profile_slot_from_attribute(&attribute_words)?;
+    let value_start = tokens.get(copula_index)?.end;
+    let value = trim_source_memory_value(&clause[value_start..])?;
+    Some(source_memory_item_json(slot, value, clause.trim()))
+}
+
+fn source_memory_value_after_preposition<'a>(
+    clause: &'a str,
+    tokens: &'a [SourceMemoryToken],
+    search_from: usize,
+    prepositions: &[&str],
+) -> Option<&'a str> {
+    tokens
+        .iter()
+        .enumerate()
+        .skip(search_from)
+        .find(|(_, token)| prepositions.iter().any(|prep| token.text == *prep))
+        .map(|(_, token)| &clause[token.end..])
+}
+
+fn source_memory_extract_first_person_predicate_clause(clause: &str) -> Option<serde_json::Value> {
+    let tokens = source_memory_tokens(clause);
+    let subject_index = tokens
+        .iter()
+        .position(|token| matches!(token.text.as_str(), "i" | "im" | "i'm"))?;
+    let next = tokens
+        .get(subject_index + 1)
+        .map(|token| token.text.as_str());
+    let after_next = tokens
+        .get(subject_index + 2)
+        .map(|token| token.text.as_str());
+
+    let location_value = match (next, after_next) {
+        (Some("live" | "reside" | "stay"), _) => source_memory_value_after_preposition(
+            clause,
+            &tokens,
+            subject_index + 2,
+            &["in", "at", "near", "around"],
+        ),
+        (Some("am" | "m"), Some("based" | "located")) => source_memory_value_after_preposition(
+            clause,
+            &tokens,
+            subject_index + 3,
+            &["in", "at", "near", "around"],
+        ),
+        (Some("based" | "located"), _) => source_memory_value_after_preposition(
+            clause,
+            &tokens,
+            subject_index + 2,
+            &["in", "at", "near", "around"],
+        ),
+        _ => None,
+    };
+    if let Some(raw_value) = location_value {
+        let value = trim_source_memory_value(raw_value)?;
+        return Some(source_memory_item_json(
+            source_memory_profile_location_slot(),
+            value,
+            clause.trim(),
+        ));
+    }
+
+    let employer_value = match (next, after_next) {
+        (Some("work"), _) => source_memory_value_after_preposition(
+            clause,
+            &tokens,
+            subject_index + 2,
+            &["at", "for", "with"],
+        ),
+        (Some("am" | "m"), Some("employed")) => source_memory_value_after_preposition(
+            clause,
+            &tokens,
+            subject_index + 3,
+            &["at", "by", "with"],
+        ),
+        _ => None,
+    };
+    if let Some(raw_value) = employer_value {
+        let value = trim_source_memory_value(raw_value)?;
+        return Some(source_memory_item_json(
+            source_memory_profile_employer_slot(),
+            value,
+            clause.trim(),
+        ));
+    }
+
+    None
+}
+
+pub(super) fn user_memory_capture_source_fallback_payload(
+    source_message: &str,
+    memory_capture_signal: Option<&crate::security::intent_classifier::InboundMemoryCaptureSignal>,
+) -> Option<serde_json::Value> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::<(String, String)>::new();
+
+    for clause in source_memory_clauses(source_message) {
+        let extracted = source_memory_extract_attribute_clause(&clause)
+            .or_else(|| source_memory_extract_first_person_predicate_clause(&clause))
+            .or_else(|| {
+                source_memory_extract_semantic_self_context_clause(&clause, memory_capture_signal)
+            });
+        let Some(item) = extracted else {
+            continue;
+        };
+        let key = item
+            .get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let value = item
+            .get("value")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if key.is_empty() || value.is_empty() || !seen.insert((key, value)) {
+            continue;
+        }
+        items.push(item);
+    }
+
+    (!items.is_empty()).then(|| {
+        serde_json::json!({
+            "memories": items,
+            "retractions": [],
+        })
     })
 }
 
@@ -2075,11 +3112,60 @@ pub(super) fn user_memory_capture_attempts_timed_out(
     })
 }
 
+pub(super) fn user_memory_capture_provider_error_message(raw: &str) -> Option<String> {
+    (!provider_error_status_codes(raw).is_empty())
+        .then(|| user_visible_platform_failure_message(raw))
+}
+
+pub(super) fn user_memory_capture_payload_error_outcome(
+    raw: &str,
+    error: UserMemoryCapturePayloadError,
+) -> (&'static str, Option<String>) {
+    if let Some(message) = user_memory_capture_provider_error_message(raw) {
+        return ("provider_error", Some(message));
+    }
+    match error {
+        UserMemoryCapturePayloadError::Unparseable => {
+            ("unparseable", Some("unparseable".to_string()))
+        }
+        UserMemoryCapturePayloadError::IncompleteShape => {
+            ("incomplete_shape", Some("incomplete_shape".to_string()))
+        }
+    }
+}
+
+pub(super) fn user_memory_capture_attempt_provider_error(
+    attempts: &[UserMemoryCaptureAttemptRecord],
+) -> Option<String> {
+    attempts.iter().find_map(|attempt| {
+        let error = attempt.error.as_deref()?;
+        if attempt.outcome == "provider_error" {
+            return Some(error.to_string());
+        }
+        user_memory_capture_provider_error_message(error)
+    })
+}
+
+pub(super) fn user_memory_capture_terminal_error_code(
+    attempts: &[UserMemoryCaptureAttemptRecord],
+) -> &'static str {
+    if user_memory_capture_attempt_provider_error(attempts).is_some() {
+        "provider_failure"
+    } else if user_memory_capture_attempts_all_transport_failed(attempts) {
+        "transport_failed"
+    } else {
+        "schema_recovery_failed"
+    }
+}
+
 pub(super) fn user_memory_capture_terminal_error(
     attempts: &[UserMemoryCaptureAttemptRecord],
     attempted_candidates: usize,
     timeout_ms: u64,
 ) -> String {
+    if let Some(provider_error) = user_memory_capture_attempt_provider_error(attempts) {
+        return provider_error;
+    }
     if user_memory_capture_attempts_all_transport_failed(attempts) {
         if user_memory_capture_attempts_timed_out(attempts) {
             return format!(
@@ -2231,6 +3317,58 @@ pub(super) fn learned_user_memory_scope_ids<'a>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UserMemorySlotCardinality {
+    Singleton,
+    Collection,
+}
+
+impl UserMemorySlotCardinality {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Singleton => "singleton",
+            Self::Collection => "collection",
+        }
+    }
+}
+
+pub(super) fn normalize_user_memory_slot_cardinality(
+    raw: Option<&str>,
+) -> UserMemorySlotCardinality {
+    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "singleton" | "single" | "single_value" | "scalar" | "replace" | "canonical" => {
+            UserMemorySlotCardinality::Singleton
+        }
+        "collection" | "multi" | "multiple" | "multi_value" | "repeatable" | "set" | "list"
+        | "append" => UserMemorySlotCardinality::Collection,
+        _ => UserMemorySlotCardinality::Collection,
+    }
+}
+
+pub(super) fn user_memory_capture_item_slot_cardinality(
+    item: &serde_json::Value,
+) -> UserMemorySlotCardinality {
+    normalize_user_memory_slot_cardinality(
+        item.get("slot_cardinality")
+            .or_else(|| item.get("cardinality"))
+            .or_else(|| item.get("value_cardinality"))
+            .and_then(|value| value.as_str()),
+    )
+}
+
+pub(super) fn user_memory_operation_slot_cardinality(
+    operation: &crate::storage::memory_operation::Model,
+) -> UserMemorySlotCardinality {
+    normalize_user_memory_slot_cardinality(
+        operation
+            .model_metadata
+            .get("slot_cardinality")
+            .or_else(|| operation.model_metadata.get("cardinality"))
+            .or_else(|| operation.model_metadata.get("value_cardinality"))
+            .and_then(|value| value.as_str()),
+    )
+}
+
 pub(super) fn learned_user_memory_keys(
     key: &str,
     durability: &str,
@@ -2247,6 +3385,43 @@ pub(super) fn learned_user_memory_keys(
         format!("user-memory-{}", hash),
         format!("user_memory::{}::{}", key.trim(), durability.trim()),
     )
+}
+
+pub(super) fn learned_user_memory_keys_for_slot(
+    key: &str,
+    value: &str,
+    durability: &str,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+    cardinality: UserMemorySlotCardinality,
+) -> (String, String) {
+    if cardinality == UserMemorySlotCardinality::Singleton {
+        return learned_user_memory_keys(key, durability, project_id, conversation_id);
+    }
+
+    let normalized_value = normalize_user_memory_equivalence_text(value)
+        .unwrap_or_else(|| value.trim().to_ascii_lowercase());
+    let instance_hash = ambient_stable_hash(&[
+        key.trim(),
+        normalized_value.as_str(),
+        durability.trim(),
+        project_id.unwrap_or_default(),
+        conversation_id.unwrap_or_default(),
+    ]);
+    let normalized_key = format!(
+        "user_memory::{}::item_{}::{}",
+        key.trim(),
+        instance_hash,
+        durability.trim()
+    );
+    let id_hash = ambient_stable_hash(&[
+        key.trim(),
+        instance_hash.as_str(),
+        durability.trim(),
+        project_id.unwrap_or_default(),
+        conversation_id.unwrap_or_default(),
+    ]);
+    (format!("user-memory-{}", id_hash), normalized_key)
 }
 
 pub(super) fn user_memory_capture_error_entry(
@@ -2948,6 +4123,9 @@ impl UserMemoryCaptureWorker {
         conversation_id: Option<&str>,
         project_id: Option<&str>,
         source_message_id: Option<&str>,
+        memory_capture_signal: Option<
+            &crate::security::intent_classifier::InboundMemoryCaptureSignal,
+        >,
     ) {
         self.capture_user_links_as_user_data(user_message, channel, conversation_id, project_id)
             .await;
@@ -2957,6 +4135,7 @@ impl UserMemoryCaptureWorker {
             conversation_id,
             project_id,
             source_message_id,
+            memory_capture_signal,
         )
         .await;
     }
@@ -2994,6 +4173,7 @@ impl UserMemoryCaptureWorker {
         semantic_kind: &str,
         project_id: Option<&str>,
         conversation_id: Option<&str>,
+        slot_cardinality: UserMemorySlotCardinality,
         target_memory_id: Option<&str>,
     ) -> Option<String> {
         let active_items = self
@@ -3034,14 +4214,20 @@ impl UserMemoryCaptureWorker {
         if candidates.is_empty() {
             return None;
         }
-        self.existing_equivalent_user_memory_id_with_llm(value, semantic_kind, &candidates)
-            .await
+        self.existing_equivalent_user_memory_id_with_llm(
+            value,
+            semantic_kind,
+            slot_cardinality,
+            &candidates,
+        )
+        .await
     }
 
     async fn existing_equivalent_user_memory_id_with_llm(
         &self,
         value: &str,
         semantic_kind: &str,
+        slot_cardinality: UserMemorySlotCardinality,
         candidates: &[crate::storage::experience_item::Model],
     ) -> Option<String> {
         let candidate = self
@@ -3056,6 +4242,8 @@ impl UserMemoryCaptureWorker {
                     "id": item.id.clone(),
                     "kind": learned_user_memory_lookup_kind(item),
                     "category": learned_user_memory_category(item),
+                    "slot_cardinality": ambient_metadata_text_field(item, "slot_cardinality", 32)
+                        .unwrap_or_else(|| "singleton".to_string()),
                     "content": learned_user_memory_value(item)?,
                     "scope": item.scope.clone(),
                 }))
@@ -3068,6 +4256,7 @@ impl UserMemoryCaptureWorker {
             "candidate": {
                 "kind": semantic_kind,
                 "category": crate::core::knowledge::memory_schema::normalize_memory_category(None, Some(semantic_kind)),
+                "slot_cardinality": slot_cardinality.as_str(),
                 "content": safe_truncate(value, 320),
             },
             "existing_memories": existing,
@@ -3081,6 +4270,7 @@ impl UserMemoryCaptureWorker {
             "You are a strict semantic duplicate checker for stored user memories. ",
             "Decide whether the candidate memory would add materially new durable information. ",
             "Ignore wording, key names, punctuation, and formatting. Compare subject, polarity, specificity, scope, and meaning. ",
+            "For collection slots, broad category or generic-key overlap is not a duplicate; only the same concrete collection member already represented should return a duplicate id. ",
             "Return JSON only. If no existing memory is equivalent or already covers the candidate, use duplicate_id=null."
         );
         let response = tokio::time::timeout(
@@ -3124,6 +4314,7 @@ impl UserMemoryCaptureWorker {
         scope: &str,
         project_id: Option<&str>,
         conversation_id: Option<&str>,
+        slot_cardinality: UserMemorySlotCardinality,
         target_memory_id: Option<&str>,
     ) -> Option<String> {
         let active_items = self
@@ -3152,7 +4343,9 @@ impl UserMemoryCaptureWorker {
             if normalize_user_memory_durability(Some(item_durability.as_str())) != durability {
                 continue;
             }
-            if learned_user_memory_key_matches(&item, key) {
+            if slot_cardinality == UserMemorySlotCardinality::Singleton
+                && learned_user_memory_key_matches(&item, key)
+            {
                 return Some(item.id);
             }
             candidates.push(item);
@@ -3188,6 +4381,7 @@ impl UserMemoryCaptureWorker {
                     "key": key,
                     "kind": semantic_kind,
                     "category": crate::core::knowledge::memory_schema::normalize_memory_category(None, Some(semantic_kind)),
+                    "slot_cardinality": slot_cardinality.as_str(),
                     "durability": durability,
                     "scope": scope,
                     "content": safe_truncate(&candidate_content, 320),
@@ -3197,6 +4391,8 @@ impl UserMemoryCaptureWorker {
                     "key": existing_key,
                     "kind": learned_user_memory_lookup_kind(&item),
                     "category": learned_user_memory_category(&item),
+                    "slot_cardinality": ambient_metadata_text_field(&item, "slot_cardinality", 32)
+                        .unwrap_or_else(|| "singleton".to_string()),
                     "durability": learned_user_memory_durability(&item),
                     "scope": item.scope.clone(),
                     "content": safe_truncate(&existing_value, 320),
@@ -3217,7 +4413,10 @@ impl UserMemoryCaptureWorker {
                         "candidate corrects or supersedes the old one. Do not match wording, key ",
                         "names, punctuation, casing, or value equality. Compare the underlying ",
                         "subject, scope, specificity, and whether keeping both active would conflict ",
-                        "or duplicate the profile. Return JSON only."
+                        "or duplicate the profile. For collection slots, the same generic key or ",
+                        "same slot type is not enough: return same_subject=true only when the ",
+                        "candidate is the same concrete collection member restated, refined, or ",
+                        "corrected. Return JSON only."
                     ),
                     &serde_json::to_string(&payload).unwrap_or_default(),
                     256,
@@ -3328,6 +4527,9 @@ impl UserMemoryCaptureWorker {
         conversation_id: Option<&str>,
         project_id: Option<&str>,
         source_message_id: Option<&str>,
+        memory_capture_signal: Option<
+            &crate::security::intent_classifier::InboundMemoryCaptureSignal,
+        >,
     ) {
         let trimmed = message.trim();
         if trimmed.is_empty() {
@@ -3362,6 +4564,8 @@ impl UserMemoryCaptureWorker {
             .saturating_add(1)
             .min(i32::MAX as u64) as i32;
         let event_id = format!("memory-capture-{}", uuid::Uuid::new_v4());
+        let memory_capture_signal_metadata =
+            user_memory_capture_signal_metadata(memory_capture_signal);
         let mut capture_event = crate::storage::memory_capture_event::Model {
             id: event_id.clone(),
             source_message_id: source_message_id.map(str::to_string),
@@ -3384,6 +4588,7 @@ impl UserMemoryCaptureWorker {
             "message_chars": trimmed.chars().count(),
             "semantic_capture_key": source_hash.clone(),
             "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+            "memory_capture_signal": memory_capture_signal_metadata.clone(),
         });
         capture_event.error_history = serde_json::json!([]);
         if let Err(error) = self
@@ -3475,7 +4680,7 @@ impl UserMemoryCaptureWorker {
             .map(|value| value.text)
             .unwrap_or_else(|| "## Saved User Facts\n[REDACTED_SECRET]".to_string());
         let time_context = self.build_ambient_time_context().await;
-        let response_shape = r#"{"memories":[{"key":"stable_snake_case_semantic_slot_without_value","value":"slot value or concise reusable memory text","category":"profile_fact|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|other","topics":["semantic_topic_or_domain"],"kind":"identity|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|preference|location|workflow|constraint|personal_fact|other","durability":"permanent|temporary|situational","scope":"global|project|conversation","sensitivity":"prompt_safe|personal_identifier|sensitive|crisis_sensitive","source_support":"explicit_source_message|context_only|unsupported","source_evidence":"short exact quote from the source user message, or empty","valid_from":"RFC3339 UTC timestamp or null","expires_at":"RFC3339 UTC timestamp or null","review_at":"RFC3339 UTC timestamp or null","confidence":0.95,"reason":"brief semantic rationale","looks_sensitive":false,"sensitive_reason":"brief reason or empty"}],"retractions":[{"key":"stable_snake_case_semantic_key","kind":"identity|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|preference|location|workflow|constraint|personal_fact|other or null","scope":"global|project|conversation","source_support":"explicit_source_message|context_only|unsupported","source_evidence":"short exact quote from the source user message, or empty","confidence":0.95,"reason":"brief semantic rationale"}]}"#;
+        let response_shape = r#"{"memories":[{"key":"stable_snake_case_semantic_slot_without_value","value":"slot value or concise reusable memory text","category":"profile_fact|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|other","topics":["semantic_topic_or_domain"],"kind":"identity|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|preference|location|workflow|constraint|personal_fact|other","slot_cardinality":"singleton|collection","durability":"permanent|temporary|situational","scope":"global|project|conversation","sensitivity":"prompt_safe|personal_identifier|sensitive|crisis_sensitive","source_support":"explicit_source_message|context_only|unsupported","source_evidence":"short exact quote from the source user message, or empty","valid_from":"RFC3339 UTC timestamp or null","expires_at":"RFC3339 UTC timestamp or null","review_at":"RFC3339 UTC timestamp or null","confidence":0.95,"reason":"brief semantic rationale","looks_sensitive":false,"sensitive_reason":"brief reason or empty"}],"retractions":[{"key":"stable_snake_case_semantic_key","kind":"identity|assistant_preference|work_preference|project_domain_memory|ephemeral_context|knowledge|preference|location|workflow|constraint|personal_fact|other or null","scope":"global|project|conversation","source_support":"explicit_source_message|context_only|unsupported","source_evidence":"short exact quote from the source user message, or empty","confidence":0.95,"reason":"brief semantic rationale"}]}"#;
         let prompt = build_user_memory_capture_prompt(
             &time_context,
             &recent_dialogue,
@@ -3490,37 +4695,55 @@ impl UserMemoryCaptureWorker {
             &saved_facts,
             response_shape,
         );
+        let source_fallback_payload =
+            user_memory_capture_source_fallback_payload(&prompt_message, memory_capture_signal);
 
         let memory_capture_candidates = self.user_memory_capture_llm_candidates();
         let memory_capture_candidate_count = memory_capture_candidates.len();
-        if memory_capture_candidates.is_empty() {
-            tracing::debug!(
-                "Skipping user fact memory extraction because no chat model is configured"
-            );
-            capture_event.status = "failed".to_string();
-            capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
-            capture_event.updated_at = chrono::Utc::now().to_rfc3339();
-            capture_event.attempt_metadata = serde_json::json!({
-                "schema_version": 1,
-                "message_chars": trimmed.chars().count(),
-                "candidate_count": 0,
-                "semantic_capture_key": source_hash.clone(),
-                "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
-            });
-            capture_event.error_history = serde_json::json!([user_memory_capture_error_entry(
-                "no_model_configured",
-                "Skipped user memory capture because no chat model was configured.",
-            )]);
-            let _ = self
-                .storage
-                .upsert_memory_capture_event(&capture_event)
-                .await;
-            return;
-        }
-        let memory_capture_timeout_ms =
-            self.user_memory_capture_timeout_ms(&memory_capture_candidates);
-        let capture_outcome = self
-            .run_memory_capture_with_schema_recovery(
+        let memory_capture_timeout_ms = if memory_capture_candidates.is_empty() {
+            0
+        } else {
+            self.user_memory_capture_timeout_ms(&memory_capture_candidates)
+        };
+        let mut capture_outcome = if memory_capture_candidates.is_empty() {
+            if let Some(payload) = source_fallback_payload.clone() {
+                UserMemoryCaptureRunOutcome {
+                    payload: Some(payload),
+                    attempts: vec![user_memory_capture_source_fallback_attempt("ok")],
+                    selected_slot_id: Some("local_source_message".to_string()),
+                    selected_slot_label: Some("source-message profile extractor".to_string()),
+                    selected_provider: Some("local".to_string()),
+                    selected_model: Some("source-message-profile-extractor".to_string()),
+                    selected_stage: Some("source_fallback".to_string()),
+                    terminal_error: None,
+                }
+            } else {
+                tracing::debug!(
+                    "Skipping user fact memory extraction because no chat model is configured"
+                );
+                capture_event.status = "failed".to_string();
+                capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+                capture_event.attempt_metadata = serde_json::json!({
+                    "schema_version": 1,
+                    "message_chars": trimmed.chars().count(),
+                    "candidate_count": 0,
+                    "semantic_capture_key": source_hash.clone(),
+                    "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+                    "memory_capture_signal": memory_capture_signal_metadata.clone(),
+                });
+                capture_event.error_history = serde_json::json!([user_memory_capture_error_entry(
+                    "no_model_configured",
+                    "Skipped user memory capture because no chat model was configured.",
+                )]);
+                let _ = self
+                    .storage
+                    .upsert_memory_capture_event(&capture_event)
+                    .await;
+                return;
+            }
+        } else {
+            self.run_memory_capture_with_schema_recovery(
                 channel,
                 conversation_id,
                 &prompt,
@@ -3529,7 +4752,30 @@ impl UserMemoryCaptureWorker {
                 memory_capture_candidates,
                 memory_capture_timeout_ms,
             )
-            .await;
+            .await
+        };
+        if let Some(payload) = source_fallback_payload {
+            let model_payload_empty = capture_outcome
+                .payload
+                .as_ref()
+                .is_some_and(user_memory_capture_payload_is_empty_decision);
+            if capture_outcome.payload.is_none() || model_payload_empty {
+                capture_outcome.payload = Some(payload);
+                capture_outcome
+                    .attempts
+                    .push(user_memory_capture_source_fallback_attempt(
+                        "ok_after_model_failure",
+                    ));
+                capture_outcome.selected_slot_id = Some("local_source_message".to_string());
+                capture_outcome.selected_slot_label =
+                    Some("source-message profile extractor".to_string());
+                capture_outcome.selected_provider = Some("local".to_string());
+                capture_outcome.selected_model =
+                    Some("source-message-profile-extractor".to_string());
+                capture_outcome.selected_stage = Some("source_fallback".to_string());
+                capture_outcome.terminal_error = None;
+            }
+        }
         let capture_attempts_json = serde_json::to_value(&capture_outcome.attempts)
             .unwrap_or_else(|_| serde_json::json!([]));
         let selected_slot_id = capture_outcome.selected_slot_id.clone();
@@ -3550,13 +4796,16 @@ impl UserMemoryCaptureWorker {
             "selected_model": selected_model.clone(),
             "selected_stage": selected_stage.clone(),
             "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+            "memory_capture_signal": memory_capture_signal_metadata.clone(),
         });
         let Some(payload) = capture_outcome.payload.clone() else {
             capture_event.status = "failed".to_string();
             capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
             capture_event.updated_at = chrono::Utc::now().to_rfc3339();
+            let terminal_error_code =
+                user_memory_capture_terminal_error_code(&capture_outcome.attempts);
             capture_event.error_history = serde_json::json!([user_memory_capture_error_entry(
-                "schema_recovery_failed",
+                terminal_error_code,
                 capture_outcome.terminal_error.clone().unwrap_or_else(|| {
                     "Memory capture failed to produce a schema-compliant payload.".to_string()
                 }),
@@ -3861,6 +5110,7 @@ impl UserMemoryCaptureWorker {
                 Some(semantic_kind),
             )
             .to_string();
+            let slot_cardinality = user_memory_capture_item_slot_cardinality(item);
             let topics = crate::core::knowledge::memory_schema::normalize_memory_topics(
                 item.get("topics"),
                 8,
@@ -3872,6 +5122,7 @@ impl UserMemoryCaptureWorker {
                 "value": value,
                 "kind": raw_kind,
                 "category": category,
+                "slot_cardinality": slot_cardinality.as_str(),
                 "topics": topics,
                 "durability": durability,
                 "scope": scope,
@@ -3938,11 +5189,13 @@ impl UserMemoryCaptureWorker {
             }
             let (resolved_scope, resolved_project_id, resolved_conversation_id) =
                 learned_user_memory_scope_ids(Some(&scope), project_id, conversation_id);
-            let (exact_target_memory_id, _) = learned_user_memory_keys(
+            let (exact_target_memory_id, _) = learned_user_memory_keys_for_slot(
                 &key,
+                &value,
                 &durability,
                 resolved_project_id,
                 resolved_conversation_id,
+                slot_cardinality,
             );
             let target_memory_id = if looks_sensitive {
                 exact_target_memory_id.clone()
@@ -3955,6 +5208,7 @@ impl UserMemoryCaptureWorker {
                     resolved_scope,
                     resolved_project_id,
                     resolved_conversation_id,
+                    slot_cardinality,
                     Some(&exact_target_memory_id),
                 )
                 .await
@@ -3967,6 +5221,7 @@ impl UserMemoryCaptureWorker {
                     semantic_kind,
                     resolved_project_id,
                     resolved_conversation_id,
+                    slot_cardinality,
                     Some(&target_memory_id),
                 )
                 .await
@@ -4011,6 +5266,10 @@ impl UserMemoryCaptureWorker {
                 object.insert(
                     "memory_category".to_string(),
                     serde_json::Value::String(category.clone()),
+                );
+                object.insert(
+                    "slot_cardinality".to_string(),
+                    serde_json::Value::String(slot_cardinality.as_str().to_string()),
                 );
                 object.insert(
                     "topics".to_string(),
@@ -4401,6 +5660,7 @@ impl UserMemoryCaptureWorker {
                                 .get("memory_category")
                                 .and_then(|value| value.as_str()),
                             &operation_topics,
+                            Some(user_memory_operation_slot_cardinality(operation).as_str()),
                             explicit_target_memory_id,
                         )
                         .await?;
@@ -4635,6 +5895,7 @@ impl UserMemoryCaptureWorker {
         sensitivity: Option<&str>,
         category: Option<&str>,
         topics: &[String],
+        slot_cardinality: Option<&str>,
         target_memory_id: Option<&str>,
     ) -> Result<String> {
         let allow_value_suffix_repair = user_memory_key_allows_value_suffix_repair(kind, category);
@@ -4682,6 +5943,7 @@ impl UserMemoryCaptureWorker {
         let normalized_kind = normalize_user_memory_kind(kind);
         let semantic_kind = learned_user_memory_semantic_kind(Some(&key), kind);
         let memory_category = normalize_learned_user_memory_category(category, Some(semantic_kind));
+        let slot_cardinality = normalize_user_memory_slot_cardinality(slot_cardinality);
         let memory_topics = topics
             .iter()
             .map(|topic| serde_json::Value::String(topic.clone()))
@@ -4694,8 +5956,14 @@ impl UserMemoryCaptureWorker {
         );
         let (scope, scoped_project_id, scoped_conversation_id) =
             learned_user_memory_scope_ids(scope, project_id, conversation_id);
-        let (default_id, normalized_key) =
-            learned_user_memory_keys(&key, &durability, scoped_project_id, scoped_conversation_id);
+        let (default_id, normalized_key) = learned_user_memory_keys_for_slot(
+            &key,
+            &value,
+            &durability,
+            scoped_project_id,
+            scoped_conversation_id,
+            slot_cardinality,
+        );
         let explicit_target_id = target_memory_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -4709,6 +5977,7 @@ impl UserMemoryCaptureWorker {
                 scope,
                 scoped_project_id,
                 scoped_conversation_id,
+                slot_cardinality,
                 Some(&default_id),
             )
             .await
@@ -4725,6 +5994,7 @@ impl UserMemoryCaptureWorker {
                 semantic_kind,
                 scoped_project_id,
                 scoped_conversation_id,
+                slot_cardinality,
                 Some(&id),
             )
             .await
@@ -4817,6 +6087,10 @@ impl UserMemoryCaptureWorker {
         metadata.insert(
             "memory_category".to_string(),
             serde_json::Value::String(memory_category.to_string()),
+        );
+        metadata.insert(
+            "slot_cardinality".to_string(),
+            serde_json::Value::String(slot_cardinality.as_str().to_string()),
         );
         metadata.insert(
             "topics".to_string(),
@@ -5648,10 +6922,8 @@ impl UserMemoryCaptureWorker {
                     }
                 }
                 Err(error) => {
-                    let outcome = match error {
-                        UserMemoryCapturePayloadError::Unparseable => "unparseable",
-                        UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
-                    };
+                    let (outcome, attempt_error) =
+                        user_memory_capture_payload_error_outcome(&focused_recovery.content, error);
                     attempts.push(UserMemoryCaptureAttemptRecord {
                         slot_id: candidate.slot_id.clone(),
                         slot_label: candidate.slot_label.clone(),
@@ -5661,7 +6933,7 @@ impl UserMemoryCaptureWorker {
                         stage: "focused_recovery".to_string(),
                         request_kind: "user_fact_memory_capture_focused_recovery".to_string(),
                         outcome: outcome.to_string(),
-                        error: Some(outcome.to_string()),
+                        error: attempt_error,
                     });
                     log_user_memory_capture_payload_error(
                         "memory capture focused recovery",
@@ -5741,10 +7013,8 @@ impl UserMemoryCaptureWorker {
                 })
             }
             Err(error) => {
-                let outcome = match error {
-                    UserMemoryCapturePayloadError::Unparseable => "unparseable",
-                    UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
-                };
+                let (outcome, attempt_error) =
+                    user_memory_capture_payload_error_outcome(&compact_recovery.content, error);
                 attempts.push(UserMemoryCaptureAttemptRecord {
                     slot_id: candidate.slot_id.clone(),
                     slot_label: candidate.slot_label.clone(),
@@ -5754,7 +7024,7 @@ impl UserMemoryCaptureWorker {
                     stage: "compact_recovery".to_string(),
                     request_kind: "user_fact_memory_capture_compact_recovery".to_string(),
                     outcome: outcome.to_string(),
-                    error: Some(outcome.to_string()),
+                    error: attempt_error,
                 });
                 log_user_memory_capture_payload_error(
                     "memory capture compact recovery",
@@ -5795,6 +7065,8 @@ impl UserMemoryCaptureWorker {
             .iter()
             .take(USER_FACT_MEMORY_CAPTURE_MAX_CANDIDATES.max(1))
             .collect::<Vec<_>>();
+        let primary_prompt =
+            user_memory_capture_primary_extraction_prompt(original_prompt, compact_prompt);
         let mut attempted_candidates = 0usize;
         for (idx, candidate) in limited_candidates.iter().copied().enumerate() {
             attempted_candidates += 1;
@@ -5804,7 +7076,7 @@ impl UserMemoryCaptureWorker {
                     channel,
                     conversation_id,
                     "user_fact_memory_capture",
-                    original_prompt,
+                    primary_prompt,
                     candidate,
                     timeout_ms,
                 )
@@ -5857,7 +7129,7 @@ impl UserMemoryCaptureWorker {
                     }
 
                     let empty_retry_prompt = build_user_memory_capture_empty_retry_prompt(
-                        original_prompt,
+                        primary_prompt,
                         &user_memory_capture_response_preview(&resp.content, 240),
                         response_shape,
                     );
@@ -5938,7 +7210,7 @@ impl UserMemoryCaptureWorker {
                                     .recover_terminal_empty_user_memory_capture_payload(
                                         channel,
                                         conversation_id,
-                                        original_prompt,
+                                        primary_prompt,
                                         response_shape,
                                         &user_memory_capture_response_preview(
                                             &empty_retry.content,
@@ -5974,12 +7246,11 @@ impl UserMemoryCaptureWorker {
                             };
                         }
                         Err(error) => {
-                            let outcome = match error {
-                                UserMemoryCapturePayloadError::Unparseable => "unparseable",
-                                UserMemoryCapturePayloadError::IncompleteShape => {
-                                    "incomplete_shape"
-                                }
-                            };
+                            let (outcome, attempt_error) =
+                                user_memory_capture_payload_error_outcome(
+                                    &empty_retry.content,
+                                    error,
+                                );
                             attempts.push(UserMemoryCaptureAttemptRecord {
                                 slot_id: candidate.slot_id.clone(),
                                 slot_label: candidate.slot_label.clone(),
@@ -5989,7 +7260,7 @@ impl UserMemoryCaptureWorker {
                                 stage: "empty_retry".to_string(),
                                 request_kind: "user_fact_memory_capture_empty_retry".to_string(),
                                 outcome: outcome.to_string(),
-                                error: Some(outcome.to_string()),
+                                error: attempt_error,
                             });
                             log_user_memory_capture_payload_error(
                                 "memory capture empty retry",
@@ -6014,10 +7285,8 @@ impl UserMemoryCaptureWorker {
                     }
                 }
                 Err(error) => {
-                    let outcome = match error {
-                        UserMemoryCapturePayloadError::Unparseable => "unparseable",
-                        UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
-                    };
+                    let (outcome, attempt_error) =
+                        user_memory_capture_payload_error_outcome(&resp.content, error);
                     attempts.push(UserMemoryCaptureAttemptRecord {
                         slot_id: candidate.slot_id.clone(),
                         slot_label: candidate.slot_label.clone(),
@@ -6027,7 +7296,7 @@ impl UserMemoryCaptureWorker {
                         stage: "extract".to_string(),
                         request_kind: "user_fact_memory_capture".to_string(),
                         outcome: outcome.to_string(),
-                        error: Some(outcome.to_string()),
+                        error: attempt_error,
                     });
                     log_user_memory_capture_payload_error(
                         "memory capture",
@@ -6040,7 +7309,7 @@ impl UserMemoryCaptureWorker {
 
             let invalid_preview = user_memory_capture_response_preview(&resp.content, 240);
             let repair_prompt = build_user_memory_capture_repair_prompt(
-                original_prompt,
+                primary_prompt,
                 &invalid_preview,
                 response_shape,
             );
@@ -6131,7 +7400,7 @@ impl UserMemoryCaptureWorker {
                     }
 
                     let empty_retry_prompt = build_user_memory_capture_empty_retry_prompt(
-                        original_prompt,
+                        primary_prompt,
                         &user_memory_capture_response_preview(&repaired.content, 240),
                         response_shape,
                     );
@@ -6212,7 +7481,7 @@ impl UserMemoryCaptureWorker {
                                     .recover_terminal_empty_user_memory_capture_payload(
                                         channel,
                                         conversation_id,
-                                        original_prompt,
+                                        primary_prompt,
                                         response_shape,
                                         &user_memory_capture_response_preview(
                                             &empty_retry.content,
@@ -6248,12 +7517,11 @@ impl UserMemoryCaptureWorker {
                             };
                         }
                         Err(error) => {
-                            let outcome = match error {
-                                UserMemoryCapturePayloadError::Unparseable => "unparseable",
-                                UserMemoryCapturePayloadError::IncompleteShape => {
-                                    "incomplete_shape"
-                                }
-                            };
+                            let (outcome, attempt_error) =
+                                user_memory_capture_payload_error_outcome(
+                                    &empty_retry.content,
+                                    error,
+                                );
                             attempts.push(UserMemoryCaptureAttemptRecord {
                                 slot_id: candidate.slot_id.clone(),
                                 slot_label: candidate.slot_label.clone(),
@@ -6263,7 +7531,7 @@ impl UserMemoryCaptureWorker {
                                 stage: "empty_retry".to_string(),
                                 request_kind: "user_fact_memory_capture_empty_retry".to_string(),
                                 outcome: outcome.to_string(),
-                                error: Some(outcome.to_string()),
+                                error: attempt_error,
                             });
                             log_user_memory_capture_payload_error(
                                 "memory capture empty retry",
@@ -6292,10 +7560,8 @@ impl UserMemoryCaptureWorker {
                     }
                 }
                 Err(error) => {
-                    let outcome = match error {
-                        UserMemoryCapturePayloadError::Unparseable => "unparseable",
-                        UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
-                    };
+                    let (outcome, attempt_error) =
+                        user_memory_capture_payload_error_outcome(&repaired.content, error);
                     attempts.push(UserMemoryCaptureAttemptRecord {
                         slot_id: candidate.slot_id.clone(),
                         slot_label: candidate.slot_label.clone(),
@@ -6305,7 +7571,7 @@ impl UserMemoryCaptureWorker {
                         stage: "schema_repair".to_string(),
                         request_kind: "user_fact_memory_capture_schema_repair".to_string(),
                         outcome: outcome.to_string(),
-                        error: Some(outcome.to_string()),
+                        error: attempt_error,
                     });
                     log_user_memory_capture_payload_error(
                         "memory capture schema repair",
@@ -6449,6 +7715,7 @@ impl Agent {
         sensitivity: Option<&str>,
         category: Option<&str>,
         topics: &[String],
+        slot_cardinality: Option<&str>,
         target_memory_id: Option<&str>,
     ) -> Result<String> {
         UserMemoryCaptureWorker::from_agent(self)
@@ -6470,6 +7737,7 @@ impl Agent {
                 sensitivity,
                 category,
                 topics,
+                slot_cardinality,
                 target_memory_id,
             )
             .await
@@ -6506,6 +7774,9 @@ impl Agent {
         conversation_id: Option<&str>,
         project_id: Option<&str>,
         source_message_id: Option<&str>,
+        memory_capture_signal: Option<
+            &crate::security::intent_classifier::InboundMemoryCaptureSignal,
+        >,
     ) -> bool {
         let trimmed = message.trim();
         if trimmed.is_empty() || source_message_id.unwrap_or_default().trim().is_empty() {
@@ -6563,6 +7834,7 @@ impl Agent {
         }
         let now = chrono::Utc::now().to_rfc3339();
         let pending_event_id = format!("memory-capture-pending-{}", semantic_capture_key);
+        let memory_capture_signal = user_memory_capture_signal_metadata(memory_capture_signal);
         let event = crate::storage::memory_capture_event::Model {
             id: pending_event_id,
             source_message_id: source_message_id.map(str::to_string),
@@ -6578,6 +7850,7 @@ impl Agent {
                 "semantic_capture_key": semantic_capture_key,
                 "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
                 "deferred": true,
+                "memory_capture_signal": memory_capture_signal,
                 "user_message_for_link_capture": safe_truncate(user_message_for_link_capture, 4000),
             }),
             error_history: serde_json::json!([]),
@@ -6598,7 +7871,7 @@ impl Agent {
         true
     }
 
-    pub(super) fn kick_deferred_user_memory_capture_processing(&self) {
+    pub(crate) fn kick_deferred_user_memory_capture_processing(&self) {
         USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
         let semaphore = USER_MEMORY_CAPTURE_DRAIN_SEMAPHORE.clone();
         let Ok(permit) = semaphore.try_acquire_owned() else {
@@ -6667,7 +7940,7 @@ impl Agent {
                     channel
                 }
             };
-            let should_capture = match self.embedding_client.as_deref() {
+            let memory_capture = match self.embedding_client.as_deref() {
                 Some(embedder) => {
                     crate::security::embedding_classifier::classify_inbound_embedding_fast(
                         embedder,
@@ -6678,11 +7951,12 @@ impl Agent {
                     .await
                     .ok()
                     .flatten()
-                    .is_some_and(|decision| decision.decision.memory_capture.should_capture)
+                    .map(|decision| decision.decision.memory_capture)
+                    .unwrap_or_default()
                 }
-                None => false,
+                None => crate::security::intent_classifier::InboundMemoryCaptureSignal::default(),
             };
-            if !should_capture {
+            if !memory_capture.should_capture {
                 continue;
             }
             if self
@@ -6693,6 +7967,7 @@ impl Agent {
                     Some(conversation_id),
                     None,
                     Some(&message.id),
+                    Some(&memory_capture),
                 )
                 .await
             {
@@ -6856,6 +8131,8 @@ impl Agent {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(source_message.content.as_str());
+            let memory_capture_signal =
+                user_memory_capture_signal_from_metadata(&event.attempt_metadata);
             worker
                 .capture_user_memory_hints(
                     &source_message.content,
@@ -6864,6 +8141,7 @@ impl Agent {
                     event.conversation_id.as_deref(),
                     event.project_id.as_deref(),
                     event.source_message_id.as_deref(),
+                    memory_capture_signal.as_ref(),
                 )
                 .await;
 

@@ -51,6 +51,13 @@
       "expected_tool_names": [],
       "required_phrases": ["tests", "canary"],
       "forbidden_phrases": ["agent", "internal", "system prompt"]
+    },
+    {
+      "message": "Tell the user the background optimizer is blocked because fresh telemetry is missing, and give the next safe step.",
+      "allowed_actions": [],
+      "expected_tool_names": [],
+      "required_phrases": ["blocked", "telemetry"],
+      "forbidden_phrases": ["deploy", "production", "ignore the gate", "as an ai"]
     }
   ],
   "synthesis_cases": [
@@ -99,6 +106,51 @@
       "required_phrases": ["completed", "follow-up"],
       "forbidden_phrases": ["agent", "synthesis"],
       "expect_followup_note": true
+    },
+    {
+      "original_task": "Prepare the release note after implementation and verification.",
+      "agent_results": [
+        {
+          "agent_type": "Coder",
+          "task": "Implement the backend fix.",
+          "content": "The backend patch was applied and committed to the workspace.",
+          "status": "completed"
+        },
+        {
+          "agent_type": "Verifier",
+          "task": "Run the focused tests.",
+          "content": "The focused Rust test passed. The broader suite was not run yet.",
+          "status": "completed"
+        }
+      ],
+      "allowed_actions": [],
+      "expected_tool_names": [],
+      "required_phrases": ["passed", "not run"],
+      "forbidden_phrases": ["agent", "synthesis", "guaranteed"],
+      "expect_followup_note": true
+    },
+    {
+      "original_task": "Update the file and preserve the generated patch action from delegated work.",
+      "agent_results": [
+        {
+          "agent_type": "Planner",
+          "task": "Identify the target file.",
+          "content": "The target file is src/core/evolve.rs and the change is limited to the gate helper.",
+          "status": "completed"
+        },
+        {
+          "agent_type": "Coder",
+          "task": "Prepare the patch.",
+          "content": "Prepared a patch action for src/core/evolve.rs.",
+          "status": "completed",
+          "tool_calls": ["file_write"]
+        }
+      ],
+      "allowed_actions": ["file_write"],
+      "expected_tool_names": ["file_write"],
+      "required_phrases": ["patch"],
+      "forbidden_phrases": ["agent", "synthesis"],
+      "expect_followup_note": false
     }
   ]
 }

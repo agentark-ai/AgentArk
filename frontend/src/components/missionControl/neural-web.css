@@ -407,6 +407,11 @@
   vector-effect: non-scaling-stroke;
   filter: drop-shadow(0 0 4px rgba(124, 231, 255, 0.35));
 }
+.nw-metric-spark line {
+  stroke: rgba(216, 245, 255, 0.14);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
 
 .nw-dashboard-titlebar {
   display: grid;
@@ -1252,46 +1257,6 @@
     display: none;
   }
 }
-
-.nw-syn-caption {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex: 0 0 auto;
-  min-width: 0;
-  padding: 8px 4px 2px;
-  border-top: 1px solid var(--nw-line);
-  margin-top: 4px;
-}
-
-.nw-syn-caption-num {
-  flex: 0 0 auto;
-  color: var(--nw-green);
-  font-family: var(--nw-mono);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.nw-syn-caption-title {
-  flex: 0 0 auto;
-  color: #fff;
-  font-family: var(--nw-mono);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-
-.nw-syn-caption-detail {
-  overflow: hidden;
-  min-width: 0;
-  color: var(--nw-dim);
-  font-size: 11px;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 
 /* =================================================================
  *  COGNITION LOOP — NEURAL GRAPH (replaces the vertical stage list)
@@ -3397,6 +3362,47 @@
   color: var(--nw-dim-strong);
   line-height: 1.45;
 }
+.nw-tooltip-spark {
+  margin-top: 9px;
+}
+.nw-tooltip-spark-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-family: var(--nw-mono);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--nw-dim);
+  text-transform: uppercase;
+}
+.nw-tooltip-spark-head b {
+  color: var(--nw-green);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.nw-tooltip-spark svg {
+  display: block;
+  width: 100%;
+  height: 34px;
+  margin-top: 5px;
+  overflow: visible;
+}
+.nw-tooltip-spark polyline {
+  fill: none;
+  stroke: var(--nw-green);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 5px rgba(120, 242, 176, 0.55));
+}
+.nw-tooltip-spark line {
+  stroke: var(--nw-line-strong);
+  stroke-width: 1;
+}
+.nw-tooltip-spark--empty .nw-tooltip-spark-head b {
+  color: var(--nw-dim);
+}
 .nw-tooltip-meta {
   margin-top: 8px;
   padding-top: 6px;
@@ -3967,6 +3973,7 @@
   text-shadow: 0 0 16px rgba(120, 242, 176, 0.35);
 }
 .nw-syn-stat-v--sm { font-size: 20px; }
+.nw-syn-stat-v--push { margin-left: auto; }
 .nw-syn-stat-lab {
   font: 500 9px var(--nw-mono);
   letter-spacing: 0.2em;
@@ -4037,6 +4044,52 @@
   white-space: nowrap;
 }
 .nw-syn-kv-v--mint { color: var(--cyan, #78f2b0); }
+
+.nw-syn-trends {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+.nw-syn-trend {
+  min-width: 0;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(216, 245, 255, 0.07);
+}
+.nw-syn-trend:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.nw-syn-trend-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+  font: 600 9px var(--nw-mono);
+  letter-spacing: 0.16em;
+  color: rgba(216, 245, 255, 0.34);
+  text-transform: uppercase;
+}
+.nw-syn-trend-head b {
+  color: var(--cyan, #78f2b0);
+  font: 700 10px var(--nw-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.nw-syn-trend .nw-metric-spark {
+  display: block;
+  width: 100%;
+  height: 28px;
+  min-width: 0;
+  overflow: visible;
+}
+.nw-syn-trend .nw-metric-spark polyline {
+  stroke: var(--cyan, #78f2b0);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 5px rgba(120, 242, 176, 0.45));
+}
 
 .nw-syn-foot {
   margin-top: auto;

@@ -760,6 +760,40 @@ mod memory_control_tests {
     }
 
     #[test]
+    fn missing_embedding_health_finding_is_repairable_not_dismiss_only() {
+        let item = memory_fact_test_item(
+            "user_first_name: Alex",
+            serde_json::json!({
+                "key": "user_first_name",
+                "memory_kind": "identity",
+                "memory_category": "profile_fact",
+                "topics": ["identity"],
+            }),
+        );
+
+        let finding = arkmemory_missing_embedding_finding(&item, None);
+
+        assert_eq!(
+            finding.get("kind").and_then(|value| value.as_str()),
+            Some("missing_embedding")
+        );
+        assert_eq!(
+            finding.get("action").and_then(|value| value.as_str()),
+            Some("refresh_embedding")
+        );
+        assert_eq!(
+            finding
+                .get("review_action_label")
+                .and_then(|value| value.as_str()),
+            Some("Refresh")
+        );
+        assert_eq!(
+            finding.get("dismissible").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn expired_memory_cleanup_candidate_requires_temporary_metadata_expiry() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
             .expect("valid timestamp")
@@ -910,6 +944,36 @@ mod memory_control_tests {
     fn stale_processing_recovery_is_not_a_failed_capture_health_status() {
         assert!(!ARKMEMORY_FAILED_CAPTURE_STATUSES.contains(&"failed_stale_processing"));
         assert!(!ARKMEMORY_FAILED_CAPTURE_STATUSES.contains(&"retired_stale_processing"));
+    }
+
+    #[test]
+    fn schema_failed_capture_finding_is_retryable() {
+        let mut event = memory_capture_event_with_status("failed");
+        event.error_history = serde_json::json!([{
+            "code": "schema_recovery_failed",
+            "detail": "Memory capture failed to produce schema-compliant JSON."
+        }]);
+
+        let finding = arkmemory_capture_event_finding(event, None, serde_json::json!({}));
+
+        assert_eq!(
+            finding.get("kind").and_then(|value| value.as_str()),
+            Some("capture_failed")
+        );
+        assert_eq!(
+            finding.get("action").and_then(|value| value.as_str()),
+            Some("retry_capture")
+        );
+        assert_eq!(
+            finding
+                .get("review_action_label")
+                .and_then(|value| value.as_str()),
+            Some("Retry capture")
+        );
+        assert_eq!(
+            finding.get("dismissible").and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 
     fn memory_capture_event_with_status(
@@ -1474,6 +1538,7 @@ const ARKMEMORY_LEARNED_REVIEW_MAX_EXAMPLES: usize = 6;
 const ARKMEMORY_LEARNED_REVIEW_MIN_CONFIDENCE: f64 = 0.82;
 const ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS: u64 = 8;
 const ARKMEMORY_LEARNED_REVIEW_MAX_OUTPUT_TOKENS: u32 = 360;
+const ARKMEMORY_EMBEDDING_REFRESH_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct MemoryHealthReviewRequest {
@@ -1602,6 +1667,82 @@ fn arkmemory_capture_event_error_summary(
         .map(|value| arkmemory_truncate_chars(&value, 240))
         .filter(|value| !value.is_empty());
     (code, detail)
+}
+
+fn arkmemory_capture_event_retryable(event: &crate::storage::memory_capture_event::Model) -> bool {
+    event.status.trim() != "rejected_sensitive_input"
+        && event
+            .source_message_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        && event
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn arkmemory_prepare_capture_event_retry(
+    event: &mut crate::storage::memory_capture_event::Model,
+    now: &str,
+) -> serde_json::Value {
+    let previous_status = event.status.trim().to_string();
+    let previous_source_hash = event.source_hash.clone();
+    let semantic_key = arkmemory_capture_event_semantic_key(event);
+    let retry_source_hash = if semantic_key.starts_with("pending:") {
+        semantic_key.clone()
+    } else {
+        format!("pending:{}", semantic_key)
+    };
+    let previous_metadata = std::mem::take(&mut event.attempt_metadata);
+    let mut metadata = match previous_metadata {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null => serde_json::Map::new(),
+        value => {
+            let mut map = serde_json::Map::new();
+            map.insert("previous_metadata".to_string(), value);
+            map
+        }
+    };
+    metadata.insert(
+        "retry_requested_at".to_string(),
+        serde_json::Value::String(now.to_string()),
+    );
+    metadata.insert(
+        "retry_from_status".to_string(),
+        serde_json::Value::String(previous_status.clone()),
+    );
+    metadata.insert(
+        "retry_previous_source_hash".to_string(),
+        serde_json::Value::String(previous_source_hash.clone()),
+    );
+    metadata.insert(
+        "semantic_capture_key".to_string(),
+        serde_json::Value::String(semantic_key),
+    );
+
+    event.status = "pending_consolidation".to_string();
+    event.source_hash = retry_source_hash;
+    event.completed_at = None;
+    event.next_retry_at = None;
+    event.replay_count = event.replay_count.saturating_add(1);
+    event.updated_at = now.to_string();
+    event.attempt_metadata = serde_json::Value::Object(metadata);
+    event.error_history = serde_json::json!([{
+        "code": "retry_requested",
+        "detail": "Queued failed memory capture for retry from Memory health.",
+        "at": now,
+    }]);
+
+    serde_json::json!({
+        "capture_event_id": event.id.clone(),
+        "previous_status": previous_status,
+        "previous_source_hash": previous_source_hash,
+        "status": event.status.clone(),
+        "source_hash": event.source_hash.clone(),
+        "outcome": "retry_queued",
+    })
 }
 
 fn arkmemory_known_capture_review_outcome(raw: &str) -> Option<&'static str> {
@@ -2299,6 +2440,7 @@ fn arkmemory_capture_event_finding(
     let capture_event_id = event.id.clone();
     let (last_error_code, last_error_detail) = arkmemory_capture_event_error_summary(&event);
     let is_sensitive_rejection = event.status.trim() == "rejected_sensitive_input";
+    let retryable = arkmemory_capture_event_retryable(&event);
     let title = if is_sensitive_rejection {
         "Memory capture skipped for secret-like input"
     } else {
@@ -2308,6 +2450,16 @@ fn arkmemory_capture_event_finding(
         "AgentArk did not turn this chat message into memory because the source looked like credential or token material. No memory was stored from that message."
     } else {
         "A user-memory capture event ended before it could produce an auditable operation. Review model/provider health and the recorded error before marking it reviewed."
+    };
+    let action = if retryable {
+        "retry_capture"
+    } else {
+        "review_capture_pipeline"
+    };
+    let review_action_label = if retryable {
+        "Retry capture"
+    } else {
+        "Mark reviewed"
     };
     serde_json::json!({
         "id": format!("capture_failed:{}", capture_event_id),
@@ -2325,7 +2477,9 @@ fn arkmemory_capture_event_finding(
         "source_context": source_context,
         "title": title,
         "detail": detail,
-        "action": "review_capture_pipeline",
+        "action": action,
+        "review_action_label": review_action_label,
+        "dismissible": !retryable,
         "created_at": event.updated_at,
     })
 }
@@ -2919,6 +3073,74 @@ async fn arkmemory_health_finding_is_acknowledged(
     Ok(storage.get_recall_event(&event_id).await?.is_some())
 }
 
+fn arkmemory_missing_embedding_finding(
+    item: &crate::storage::experience_item::Model,
+    refresh_error: Option<&str>,
+) -> serde_json::Value {
+    let blocked = refresh_error
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let detail = blocked
+        .map(|error| {
+            format!(
+                "This memory still has no semantic vector because the refresh failed: {}",
+                arkmemory_truncate_chars(error, 180)
+            )
+        })
+        .unwrap_or_else(|| {
+            "This memory has no semantic vector yet. Refresh it so retrieval and dedup use the semantic index."
+                .to_string()
+        });
+    serde_json::json!({
+        "id": format!("embedding:{}", item.id),
+        "kind": "missing_embedding",
+        "severity": if blocked.is_some() { "warning" } else { "info" },
+        "memory_id": item.id.clone(),
+        "title": item.title.clone(),
+        "detail": detail,
+        "action": "refresh_embedding",
+        "dismissible": false,
+        "review_action_label": if blocked.is_some() { "Retry refresh" } else { "Refresh" },
+        "created_at": item.updated_at.clone(),
+    })
+}
+
+async fn arkmemory_refresh_missing_embedding(
+    storage: &crate::storage::Storage,
+    embedder: &crate::core::knowledge::embeddings::EmbeddingClient,
+    project_id: Option<&str>,
+    item: &crate::storage::experience_item::Model,
+) -> Result<Option<crate::storage::experience_item::Model>> {
+    if item.embedding.is_some() {
+        return Ok(None);
+    }
+    if !arkmemory_item_is_memory(item) || !arkmemory_item_visible_for_project(item, project_id) {
+        anyhow::bail!("Memory item is outside the active memory scope.");
+    }
+    let embed_text =
+        crate::core::knowledge::memory_dedup::embeddable_text_from_content(&item.content)
+            .to_string();
+    let embeddings = tokio::time::timeout(
+        std::time::Duration::from_secs(ARKMEMORY_EMBEDDING_REFRESH_TIMEOUT_SECS),
+        embedder.embed_texts(&[embed_text]),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "embedding refresh timed out after {}s",
+            ARKMEMORY_EMBEDDING_REFRESH_TIMEOUT_SECS
+        )
+    })??;
+    let Some(embedding) = embeddings.into_iter().next() else {
+        anyhow::bail!("embedding refresh returned no vector");
+    };
+    let mut updated = item.clone();
+    updated.embedding = Some(embedding);
+    updated.updated_at = chrono::Utc::now().to_rfc3339();
+    storage.upsert_experience_item(&updated).await?;
+    Ok(Some(updated))
+}
+
 pub(super) fn arkmemory_candidate_payload(
     candidate: &crate::storage::learning_candidate::Model,
     replay_gate: Option<&crate::core::self_evolve::replay_gate::CandidateReplayGateResult>,
@@ -3373,6 +3595,7 @@ pub(crate) async fn run_arkmemory_learned_review_pass(
 
 pub(super) async fn arkmemory_build_health_findings(
     storage: &crate::storage::Storage,
+    embedder: Option<&crate::core::knowledge::embeddings::EmbeddingClient>,
     project_id: Option<&str>,
     limit: u64,
 ) -> Result<Vec<serde_json::Value>> {
@@ -3444,25 +3667,45 @@ pub(super) async fn arkmemory_build_health_findings(
     let memory_items = storage
         .list_active_experience_items(&["personal_fact", "constraint"], project_id, None, limit)
         .await?;
-    for item in memory_items {
+    let mut embedding_refresh_blocker = if embedder.is_none() {
+        Some("embedding backend is not configured".to_string())
+    } else {
+        None
+    };
+    for mut item in memory_items {
         let item_id = item.id.clone();
-        let item_title = item.title.clone();
-        let item_updated_at = item.updated_at.clone();
         if item.embedding.is_none() {
             let finding_id = format!("embedding:{}", item_id);
-            if !arkmemory_health_finding_is_acknowledged(storage, project_id, &finding_id).await? {
-                findings.push(serde_json::json!({
-                    "id": finding_id,
-                    "kind": "missing_embedding",
-                    "severity": "info",
-                    "memory_id": item_id.clone(),
-                    "title": item_title.clone(),
-                    "detail": "This memory has no semantic vector yet, so retrieval and dedup quality can be lower until it is refreshed.",
-                    "action": "refresh_on_next_write",
-                    "dismissible": true,
-                    "review_action_label": "Dismiss",
-                    "created_at": item_updated_at.clone(),
-                }));
+            let mut refresh_error = embedding_refresh_blocker.clone();
+            if refresh_error.is_none() {
+                if let Some(embedder) = embedder {
+                    match arkmemory_refresh_missing_embedding(storage, embedder, project_id, &item)
+                        .await
+                    {
+                        Ok(Some(updated)) => {
+                            item = updated;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            refresh_error = Some(error.to_string());
+                            tracing::warn!(
+                                memory_id = %item_id,
+                                "Failed to refresh Memory embedding during health scan: {}",
+                                error
+                            );
+                            embedding_refresh_blocker = refresh_error.clone();
+                        }
+                    }
+                }
+            }
+            if item.embedding.is_none()
+                && !arkmemory_health_finding_is_acknowledged(storage, project_id, &finding_id)
+                    .await?
+            {
+                findings.push(arkmemory_missing_embedding_finding(
+                    &item,
+                    refresh_error.as_deref(),
+                ));
             }
         }
         if item.confidence < 0.55 {
@@ -3473,12 +3716,12 @@ pub(super) async fn arkmemory_build_health_findings(
                     "kind": "low_confidence",
                     "severity": "review",
                     "memory_id": item_id.clone(),
-                    "title": item_title.clone(),
+                    "title": item.title.clone(),
                     "detail": "This memory is below the normal confidence floor and should be reviewed before it shapes future answers.",
                     "action": "review_memory",
                     "dismissible": true,
                     "review_action_label": "Dismiss",
-                    "created_at": item_updated_at.clone(),
+                    "created_at": item.updated_at.clone(),
                 }));
             }
         }
@@ -3980,9 +4223,14 @@ pub(super) async fn arkmemory_summary(
             .await
             .unwrap_or_default();
     let pending_capture = pending_capture_signals.len();
-    let health_findings = arkmemory_build_health_findings(storage, project_id, 200)
-        .await
-        .unwrap_or_default();
+    let health_findings = arkmemory_build_health_findings(
+        storage,
+        agent.embedding_client.as_deref(),
+        project_id,
+        200,
+    )
+    .await
+    .unwrap_or_default();
     let failed_capture = health_findings
         .iter()
         .filter(|finding| {
@@ -6411,7 +6659,14 @@ pub(super) async fn arkmemory_health(
     let project_id = arkmemory_project_param(&params);
     let limit = arkmemory_limit(&params, 80);
     let agent = state.agent.read().await;
-    match arkmemory_build_health_findings(&agent.storage, project_id, limit).await {
+    match arkmemory_build_health_findings(
+        &agent.storage,
+        agent.embedding_client.as_deref(),
+        project_id,
+        limit,
+    )
+    .await
+    {
         Ok(findings) => (
             StatusCode::OK,
             Json(serde_json::json!({ "findings": findings })),
@@ -6437,11 +6692,17 @@ pub(super) async fn arkmemory_apply_health(
     let agent = state.agent.read().await;
     let result = async {
         let active_findings =
-            arkmemory_build_health_findings(&agent.storage, project_id, 200).await?;
+            arkmemory_build_health_findings(&agent.storage, None, project_id, 200).await?;
         let finding = active_findings
             .iter()
             .find(|finding| finding.get("id").and_then(|value| value.as_str()) == Some(id.as_str()))
             .ok_or_else(|| anyhow::anyhow!("Memory health finding is no longer active."))?;
+        let finding_kind = finding
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
         let capture_event_id = finding
             .get("capture_event_id")
             .and_then(|value| value.as_str())
@@ -6536,6 +6797,34 @@ pub(super) async fn arkmemory_apply_health(
         } else {
             operation_context.unwrap_or_default()
         };
+        let embedding_resolution = if finding_kind == "missing_embedding" {
+            let memory_id = memory_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Memory health finding has no memory id."))?;
+            let item = agent
+                .storage
+                .get_experience_item(memory_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Memory item not found."))?;
+            let embedder = agent
+                .embedding_client
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Embedding backend is not configured."))?;
+            match arkmemory_refresh_missing_embedding(&agent.storage, embedder, project_id, &item)
+                .await?
+            {
+                Some(updated) => Some(serde_json::json!({
+                    "memory_id": updated.id,
+                    "status": "refreshed",
+                })),
+                None => Some(serde_json::json!({
+                    "memory_id": item.id,
+                    "status": "already_current",
+                })),
+            }
+        } else {
+            None
+        };
         let capture_resolution = if let Some(capture_event_id) = capture_event_id.as_deref() {
             let mut event = agent
                 .storage
@@ -6552,85 +6841,98 @@ pub(super) async fn arkmemory_apply_health(
                 &event,
             );
             let previous_status = event.status.trim().to_string();
-            let reviewed_status =
-                arkmemory_capture_event_reviewed_status(&event, review_outcome).to_string();
-            let mut final_status = previous_status.clone();
-            let finding_kind = finding
-                .get("kind")
+            let finding_action = finding
+                .get("action")
                 .and_then(|value| value.as_str())
                 .map(str::trim)
                 .unwrap_or_default();
-            let is_reviewable_capture = ARKMEMORY_FAILED_CAPTURE_STATUSES
-                .contains(&previous_status.as_str())
-                || (finding_kind == "auto_reviewed_capture"
-                    && ARKMEMORY_REVIEWED_CAPTURE_STATUSES.contains(&previous_status.as_str()));
-            if is_reviewable_capture {
+            if finding_action == "retry_capture" && arkmemory_capture_event_retryable(&event) {
                 let now = chrono::Utc::now().to_rfc3339();
-                let failure_signature = arkmemory_capture_review_failure_signature(&event);
-                let review_context = arkmemory_capture_review_context(&agent.storage, &event)
-                    .await
-                    .map(|context| arkmemory_capture_review_context_json(&context));
-                let previous_metadata = std::mem::take(&mut event.attempt_metadata);
-                let mut metadata = match previous_metadata {
-                    serde_json::Value::Object(map) => map,
-                    serde_json::Value::Null => serde_json::Map::new(),
-                    value => {
-                        let mut map = serde_json::Map::new();
-                        map.insert("previous_metadata".to_string(), value);
-                        map
-                    }
-                };
-                let previous_user_review = metadata.get("user_review").cloned();
-                let previous_learned_review = metadata.get("learned_review").cloned();
-                metadata.insert(
-                    "reviewed_at".to_string(),
-                    serde_json::Value::String(now.clone()),
-                );
-                metadata.insert(
-                    "reviewed_from".to_string(),
-                    serde_json::Value::String("arkmemory_health".to_string()),
-                );
-                metadata.insert(
-                    "previous_status".to_string(),
-                    serde_json::Value::String(previous_status.clone()),
-                );
-                if let Some(previous_user_review) = previous_user_review {
-                    metadata.insert("previous_user_review".to_string(), previous_user_review);
-                }
-                if let Some(previous_learned_review) = previous_learned_review {
-                    metadata.insert(
-                        "superseded_learned_review".to_string(),
-                        previous_learned_review,
-                    );
-                }
-                metadata.insert(
-                    "user_review".to_string(),
-                    serde_json::json!({
-                        "outcome": review_outcome,
-                        "outcome_label": arkmemory_capture_review_outcome_label(review_outcome),
-                        "reviewed_at": now.clone(),
-                        "failure_signature": failure_signature,
-                        "review_context": review_context,
-                        "learned": false,
-                        "reviewed_from": "arkmemory_health",
-                        "corrected_auto_review": finding_kind == "auto_reviewed_capture",
-                    }),
-                );
-                event.status = reviewed_status.clone();
-                final_status = reviewed_status;
-                event.attempt_metadata = serde_json::Value::Object(metadata);
-                if event.completed_at.is_none() {
-                    event.completed_at = Some(now.clone());
-                }
-                event.updated_at = now;
+                let retry_resolution = arkmemory_prepare_capture_event_retry(&mut event, &now);
                 agent.storage.upsert_memory_capture_event(&event).await?;
+                agent.kick_deferred_user_memory_capture_processing();
+                Some(retry_resolution)
+            } else {
+                let reviewed_status =
+                    arkmemory_capture_event_reviewed_status(&event, review_outcome).to_string();
+                let mut final_status = previous_status.clone();
+                let finding_kind = finding
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default();
+                let is_reviewable_capture = ARKMEMORY_FAILED_CAPTURE_STATUSES
+                    .contains(&previous_status.as_str())
+                    || (finding_kind == "auto_reviewed_capture"
+                        && ARKMEMORY_REVIEWED_CAPTURE_STATUSES.contains(&previous_status.as_str()));
+                if is_reviewable_capture {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let failure_signature = arkmemory_capture_review_failure_signature(&event);
+                    let review_context = arkmemory_capture_review_context(&agent.storage, &event)
+                        .await
+                        .map(|context| arkmemory_capture_review_context_json(&context));
+                    let previous_metadata = std::mem::take(&mut event.attempt_metadata);
+                    let mut metadata = match previous_metadata {
+                        serde_json::Value::Object(map) => map,
+                        serde_json::Value::Null => serde_json::Map::new(),
+                        value => {
+                            let mut map = serde_json::Map::new();
+                            map.insert("previous_metadata".to_string(), value);
+                            map
+                        }
+                    };
+                    let previous_user_review = metadata.get("user_review").cloned();
+                    let previous_learned_review = metadata.get("learned_review").cloned();
+                    metadata.insert(
+                        "reviewed_at".to_string(),
+                        serde_json::Value::String(now.clone()),
+                    );
+                    metadata.insert(
+                        "reviewed_from".to_string(),
+                        serde_json::Value::String("arkmemory_health".to_string()),
+                    );
+                    metadata.insert(
+                        "previous_status".to_string(),
+                        serde_json::Value::String(previous_status.clone()),
+                    );
+                    if let Some(previous_user_review) = previous_user_review {
+                        metadata.insert("previous_user_review".to_string(), previous_user_review);
+                    }
+                    if let Some(previous_learned_review) = previous_learned_review {
+                        metadata.insert(
+                            "superseded_learned_review".to_string(),
+                            previous_learned_review,
+                        );
+                    }
+                    metadata.insert(
+                        "user_review".to_string(),
+                        serde_json::json!({
+                            "outcome": review_outcome,
+                            "outcome_label": arkmemory_capture_review_outcome_label(review_outcome),
+                            "reviewed_at": now.clone(),
+                            "failure_signature": failure_signature,
+                            "review_context": review_context,
+                            "learned": false,
+                            "reviewed_from": "arkmemory_health",
+                            "corrected_auto_review": finding_kind == "auto_reviewed_capture",
+                        }),
+                    );
+                    event.status = reviewed_status.clone();
+                    final_status = reviewed_status;
+                    event.attempt_metadata = serde_json::Value::Object(metadata);
+                    if event.completed_at.is_none() {
+                        event.completed_at = Some(now.clone());
+                    }
+                    event.updated_at = now;
+                    agent.storage.upsert_memory_capture_event(&event).await?;
+                }
+                Some(serde_json::json!({
+                    "capture_event_id": capture_event_id,
+                    "previous_status": previous_status,
+                    "status": final_status,
+                    "outcome": review_outcome,
+                }))
             }
-            Some(serde_json::json!({
-                "capture_event_id": capture_event_id,
-                "previous_status": previous_status,
-                "status": final_status,
-                "outcome": review_outcome,
-            }))
         } else {
             None
         };
@@ -6646,6 +6948,7 @@ pub(super) async fn arkmemory_apply_health(
                 "finding_id": id,
                 "capture_resolution": capture_resolution,
                 "operation_resolution": operation_resolution,
+                "embedding_resolution": embedding_resolution,
             }),
             context,
         )

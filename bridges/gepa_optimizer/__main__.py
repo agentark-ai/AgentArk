@@ -19,17 +19,24 @@ MAX_CANDIDATE_RECORDS = 64
 MAX_CANDIDATE_RECORD_BYTES = 768 * 1024
 MAX_EXPORT_BYTES = 12 * 1024 * 1024
 DEFAULT_GEPA_LM_TIMEOUT_SECONDS = 60
-DEFAULT_GEPA_LM_MAX_TOKENS = 2048
+DEFAULT_GEPA_LM_MAX_TOKENS = 8192
 DEFAULT_GEPA_LM_RETRIES = 0
-# Non-degenerate search floor (was 1/1/current_best/no-merge, which made the
-# optimizer a single-shot rubber stamp). Env vars still override via
+DEFAULT_GEPA_MAX_METRIC_CALLS = 8
+# Non-degenerate but bounded search defaults. Env vars still override via
 # _bounded_int within their min/max bounds.
 DEFAULT_GEPA_MAX_EXAMPLES = 8
-DEFAULT_GEPA_VALSET_SIZE = 4
-DEFAULT_GEPA_MAX_MEMORY_MB = 1536
-DEFAULT_GEPA_REFLECTION_MINIBATCH_SIZE = 2
-DEFAULT_GEPA_MAX_MERGE_INVOCATIONS = 1
+DEFAULT_GEPA_VALSET_SIZE = 0
+DEFAULT_GEPA_MAX_EXAMPLE_BYTES = 256 * 1024
+DEFAULT_GEPA_MAX_MEMORY_MB = 1024
+DEFAULT_GEPA_REFLECTION_MINIBATCH_SIZE = 1
+DEFAULT_GEPA_MAX_MERGE_INVOCATIONS = 0
 DEFAULT_GEPA_CANDIDATE_SELECTION_STRATEGY = "pareto"
+MAX_GEPA_BACKGROUND_THREADS = 2
+MAX_GEPA_TRAINING_EXAMPLES = 64
+MAX_GEPA_METRIC_CALLS = 8
+MAX_GEPA_TRAINING_VALSET_SIZE = 16
+MAX_GEPA_TRAINING_TEXT_CHARS = 480
+MAX_GEPA_TRAINING_COLLECTION_ITEMS = 8
 
 
 def _bounded_int(
@@ -280,19 +287,23 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 def _gepa_control_kwargs(env: Mapping[str, str], gepa_parameters: set[str]) -> dict:
-    max_metric_calls = str(env.get("AGENTARK_GEPA_MAX_METRIC_CALLS") or "").strip()
-    if max_metric_calls and "max_metric_calls" in gepa_parameters:
-        return {"max_metric_calls": int(max_metric_calls)}
+    if "max_metric_calls" in gepa_parameters:
+        return {
+            "max_metric_calls": _bounded_int(
+                env,
+                "AGENTARK_GEPA_MAX_METRIC_CALLS",
+                DEFAULT_GEPA_MAX_METRIC_CALLS,
+                1,
+                MAX_GEPA_METRIC_CALLS,
+            )
+        }
 
     auto = str(env.get("AGENTARK_GEPA_AUTO") or "light").strip() or "light"
     return {"auto": auto}
 
 
 def _gepa_thread_count(env: Mapping[str, str]) -> int:
-    raw = str(env.get("AGENTARK_GEPA_THREADS") or "").strip()
-    if not raw:
-        return 1
-    return max(1, int(raw))
+    return _bounded_int(env, "AGENTARK_GEPA_THREADS", 1, 1, MAX_GEPA_BACKGROUND_THREADS)
 
 
 def _gepa_lm_runtime_kwargs(env: Mapping[str, str]) -> dict:
@@ -327,7 +338,7 @@ def _gepa_memory_limit_bytes(env: Mapping[str, str]) -> int:
         "AGENTARK_GEPA_MAX_MEMORY_MB",
         DEFAULT_GEPA_MAX_MEMORY_MB,
         512,
-        8192,
+        4096,
     )
     return memory_mb * 1024 * 1024
 
@@ -355,7 +366,7 @@ def _gepa_optimizer_resource_kwargs(env: Mapping[str, str], gepa_parameters: set
             "AGENTARK_GEPA_REFLECTION_MINIBATCH_SIZE",
             DEFAULT_GEPA_REFLECTION_MINIBATCH_SIZE,
             1,
-            8,
+            4,
         )
     if "candidate_selection_strategy" in gepa_parameters:
         kwargs["candidate_selection_strategy"] = str(
@@ -370,7 +381,7 @@ def _gepa_optimizer_resource_kwargs(env: Mapping[str, str], gepa_parameters: set
             "AGENTARK_GEPA_MAX_MERGE_INVOCATIONS",
             DEFAULT_GEPA_MAX_MERGE_INVOCATIONS,
             0,
-            10,
+            2,
         )
         kwargs["max_merge_invocations"] = max_merge_invocations
         if "use_merge" in gepa_parameters:
@@ -434,7 +445,7 @@ def _limited_gepa_examples(examples, env: Mapping[str, str]):
         "AGENTARK_GEPA_MAX_EXAMPLES",
         DEFAULT_GEPA_MAX_EXAMPLES,
         1,
-        32,
+        MAX_GEPA_TRAINING_EXAMPLES,
     )
     return list(examples)[:max_examples]
 
@@ -444,9 +455,9 @@ def _gepa_validation_set(examples, env: Mapping[str, str]):
     valset_size = _bounded_int(
         env,
         "AGENTARK_GEPA_VALSET_SIZE",
-        DEFAULT_GEPA_VALSET_SIZE,
-        1,
-        32,
+        max(1, min(2, (len(items) + 3) // 4)),
+        0,
+        MAX_GEPA_TRAINING_VALSET_SIZE,
     )
     return items[: max(1, min(valset_size, len(items)))]
 
@@ -546,49 +557,267 @@ def _surface_candidate_quality(record: dict) -> tuple[float, list[str]]:
     return min(1.0, score), notes
 
 
-def _examples_from_export(export: dict):
+def _training_text(value, limit: int = MAX_GEPA_TRAINING_TEXT_CHARS) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}... [truncated {omitted} chars]"
+
+
+def _is_json_scalar(value) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _compact_training_value(value, depth: int = 0):
+    if isinstance(value, str):
+        return _training_text(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        keys = [str(key) for key in value.keys()]
+        if depth >= 3:
+            return {
+                "type": "object",
+                "keys": keys[:MAX_GEPA_TRAINING_COLLECTION_ITEMS],
+                "omitted_keys": max(0, len(keys) - MAX_GEPA_TRAINING_COLLECTION_ITEMS),
+            }
+        compact = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= MAX_GEPA_TRAINING_COLLECTION_ITEMS:
+                compact["omitted_keys"] = len(value) - index
+                break
+            compact[str(key)] = _compact_training_value(item, depth + 1)
+        return compact
+    if isinstance(value, list):
+        if depth >= 3:
+            return {
+                "type": "array",
+                "count": len(value),
+                "sample_count": min(len(value), MAX_GEPA_TRAINING_COLLECTION_ITEMS),
+            }
+        return [
+            _compact_training_value(item, depth + 1)
+            for item in value[:MAX_GEPA_TRAINING_COLLECTION_ITEMS]
+        ]
+    return _training_text(value)
+
+
+def _compact_surface_section(section: dict) -> dict:
+    summary = {"fields": [str(key) for key in section.keys()]}
+    previews = {}
+    nested = {}
+    collections = {}
+    scalars = {}
+    for key, value in section.items():
+        key = str(key)
+        if isinstance(value, str):
+            previews[key] = {"chars": len(value), "preview": _training_text(value)}
+        elif _is_json_scalar(value):
+            scalars[key] = value
+        elif isinstance(value, dict):
+            nested[key] = {"keys": [str(nested_key) for nested_key in value.keys()]}
+        elif isinstance(value, list):
+            collections[key] = {
+                "count": len(value),
+                "sample": _compact_training_value(
+                    value[:MAX_GEPA_TRAINING_COLLECTION_ITEMS], 2
+                ),
+            }
+    if previews:
+        summary["previews"] = previews
+    if scalars:
+        summary["scalars"] = scalars
+    if nested:
+        summary["nested"] = nested
+    if collections:
+        summary["collections"] = collections
+    return summary
+
+
+def _compact_fragment(fragment: dict) -> dict:
+    compact = {"fields": [str(key) for key in fragment.keys()]}
+    for key in (
+        "id",
+        "surface",
+        "role",
+        "section",
+        "target",
+        "target_key",
+        "enabled",
+        "priority",
+    ):
+        if key in fragment and _is_json_scalar(fragment.get(key)):
+            compact[key] = _compact_training_value(fragment.get(key))
+    previews = {}
+    for key, value in fragment.items():
+        key = str(key)
+        if isinstance(value, str) and key not in compact:
+            previews[key] = {"chars": len(value), "preview": _training_text(value)}
+    if previews:
+        compact["previews"] = previews
+    return compact
+
+
+def _compact_surface_context(surfaces) -> dict:
+    if not isinstance(surfaces, dict):
+        return {}
+    compact = {}
+    for surface, candidate in surfaces.items():
+        surface = str(surface)
+        if surface not in SUPPORTED_SURFACES or not isinstance(candidate, dict):
+            continue
+        summary = {"top_level_keys": [str(key) for key in candidate.keys()]}
+        version = candidate.get("version")
+        if isinstance(version, str) and version.strip():
+            summary["version"] = version
+        sections = {}
+        collections = {}
+        scalars = {}
+        for key, value in candidate.items():
+            key = str(key)
+            if key == "version":
+                continue
+            if key == "fragments" and isinstance(value, list):
+                summary["fragments"] = [
+                    _compact_fragment(item)
+                    for item in value[:MAX_GEPA_TRAINING_COLLECTION_ITEMS]
+                    if isinstance(item, dict)
+                ]
+            elif isinstance(value, dict):
+                sections[key] = _compact_surface_section(value)
+            elif isinstance(value, list):
+                collections[key] = {
+                    "count": len(value),
+                    "sample": _compact_training_value(
+                        value[:MAX_GEPA_TRAINING_COLLECTION_ITEMS], 2
+                    ),
+                }
+            elif _is_json_scalar(value):
+                scalars[key] = _compact_training_value(value)
+        if sections:
+            summary["sections"] = sections
+        if collections:
+            summary["collections"] = collections
+        if scalars:
+            summary["fields"] = scalars
+        compact[surface] = summary
+    return compact
+
+
+def _compact_opportunity_context(context):
+    if not isinstance(context, dict):
+        return _compact_training_value(context)
+    compact = {}
+    for key, value in context.items():
+        key = str(key)
+        if key == "holdout_cases":
+            continue
+        compact[key] = _compact_training_value(value)
+    cases = context.get("holdout_cases")
+    if isinstance(cases, list):
+        compact["holdout_cases"] = [
+            _compact_training_value(case)
+            for case in cases[:MAX_GEPA_TRAINING_COLLECTION_ITEMS]
+            if isinstance(case, dict)
+        ]
+    return compact
+
+
+def _compact_experience_run(run: dict) -> dict:
+    preferred_keys = (
+        "trace_id",
+        "id",
+        "run_id",
+        "success_state",
+        "correction_state",
+        "outcome_summary",
+        "failure_reason",
+        "tool_name",
+        "action_name",
+        "error",
+        "started_at",
+        "completed_at",
+    )
+    compact = {}
+    for key in preferred_keys:
+        if key in run:
+            compact[key] = _compact_training_value(run.get(key))
+    if compact:
+        return compact
+    return _compact_training_value(run)
+
+
+def _gepa_training_payloads_from_export(
+    export: dict, env: Mapping[str, str] | None = None
+) -> list[str]:
+    env = os.environ if env is None else env
+    max_examples = _bounded_int(
+        env,
+        "AGENTARK_GEPA_MAX_EXAMPLES",
+        DEFAULT_GEPA_MAX_EXAMPLES,
+        1,
+        MAX_GEPA_TRAINING_EXAMPLES,
+    )
+    max_example_bytes = _bounded_int(
+        env,
+        "AGENTARK_GEPA_MAX_EXAMPLE_BYTES",
+        DEFAULT_GEPA_MAX_EXAMPLE_BYTES,
+        8 * 1024,
+        2 * 1024 * 1024,
+    )
+    base = {
+        "schema_version": export.get("schema_version"),
+        "run_id": export.get("run_id"),
+        "generated_at": export.get("generated_at"),
+        "request": _compact_training_value(export.get("request")),
+        "opportunity_context": _compact_opportunity_context(
+            export.get("opportunity_context")
+        ),
+        "surfaces": _compact_surface_context(export.get("surfaces")),
+        "benchmarks": _compact_training_value(export.get("benchmarks")),
+        "recent_lineage": _compact_training_value(export.get("recent_lineage")),
+        "candidate_contract": _compact_training_value(export.get("candidate_contract")),
+    }
+    runs = export.get("experience_runs")
+    payloads: list[str] = []
+    used_example_bytes = 0
+    if isinstance(runs, list) and runs:
+        for run in runs:
+            if len(payloads) >= max_examples:
+                break
+            if not isinstance(run, dict):
+                continue
+            compact_run = _compact_experience_run(run)
+            payload = dict(base)
+            payload["experience_runs"] = [compact_run]
+            payload["focus"] = {
+                "success_state": compact_run.get("success_state"),
+                "correction_state": compact_run.get("correction_state"),
+                "outcome_summary": compact_run.get("outcome_summary"),
+                "failure_reason": compact_run.get("failure_reason"),
+            }
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            encoded_bytes = len(encoded.encode("utf-8"))
+            if payloads and used_example_bytes + encoded_bytes > max_example_bytes:
+                break
+            payloads.append(encoded)
+            used_example_bytes += encoded_bytes
+    if not payloads:
+        payloads.append(json.dumps(base, ensure_ascii=False, separators=(",", ":")))
+    return payloads
+
+
+def _examples_from_export(export: dict, env: Mapping[str, str] | None = None):
     try:
         import dspy  # type: ignore
     except Exception as exc:  # pragma: no cover - already checked by caller
         raise RuntimeError("DSPy is not available while building GEPA examples") from exc
 
-    base = {
-        "schema_version": export.get("schema_version"),
-        "run_id": export.get("run_id"),
-        "generated_at": export.get("generated_at"),
-        "request": export.get("request"),
-        "opportunity_context": export.get("opportunity_context"),
-        "surfaces": export.get("surfaces", {}),
-        "benchmarks": export.get("benchmarks", {}),
-        "recent_lineage": export.get("recent_lineage", {}),
-        "candidate_contract": export.get("candidate_contract", {}),
-    }
-    runs = export.get("experience_runs")
-    examples = []
-    if isinstance(runs, list) and runs:
-        for run in runs[:8]:
-            if not isinstance(run, dict):
-                continue
-            payload = dict(base)
-            payload["experience_runs"] = [run]
-            payload["focus"] = {
-                "success_state": run.get("success_state"),
-                "correction_state": run.get("correction_state"),
-                "outcome_summary": run.get("outcome_summary"),
-                "failure_reason": run.get("failure_reason"),
-            }
-            examples.append(
-                dspy.Example(export_json=json.dumps(payload, ensure_ascii=False)).with_inputs(
-                    "export_json"
-                )
-            )
-    if not examples:
-        examples.append(
-            dspy.Example(export_json=json.dumps(export, ensure_ascii=False)).with_inputs(
-                "export_json"
-            )
-        )
-    return examples
+    return [
+        dspy.Example(export_json=payload).with_inputs("export_json")
+        for payload in _gepa_training_payloads_from_export(export, env)
+    ]
 
 
 def _run_dspy_gepa(export: dict) -> str:
@@ -651,7 +880,7 @@ def _run_dspy_gepa(export: dict) -> str:
         return _score_with_feedback(dspy, score, feedback)
 
     program = dspy.Predict(AgentArkCandidateSignature)
-    examples = _limited_gepa_examples(_examples_from_export(export), os.environ)
+    examples = _limited_gepa_examples(_examples_from_export(export, os.environ), os.environ)
     valset = _gepa_validation_set(examples, os.environ)
 
     optimizer = dspy.GEPA(**_gepa_optimizer_kwargs(dspy, lm, metric))

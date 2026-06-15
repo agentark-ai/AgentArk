@@ -48,6 +48,7 @@ import type {
 
 const REFRESH_MS = 8000;
 const ACTIVE_TASK_STALE_MS = 24 * 60 * 60 * 1000;
+const RUNTIME_TREND_WINDOW_MS = 6 * 60 * 60 * 1000;
 type JsonRecord = Record<string, unknown>;
 type AutomationObject = {
   id: string;
@@ -204,11 +205,6 @@ function formatCompactNumber(value: number): string {
   return Math.round(value).toLocaleString();
 }
 
-function formatSmallCurrency(value?: number | null): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "pricing n/a";
-  return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
-}
-
 function sparklinePoints(values: number[], width = 132, height = 30): string {
   const step = Math.max(1, Math.ceil(values.length / 120));
   const compactValues = values.length > 120 ? values.filter((_, index) => index % step === 0).slice(-120) : values;
@@ -253,8 +249,13 @@ function traceStatusBadge(status: string): { label: string; cls: string } {
 function MetricSparkline({ values }: { values: number[] }) {
   const points = sparklinePoints(values);
   return (
-    <svg className="nw-metric-spark" viewBox="0 0 132 30" preserveAspectRatio="none" aria-hidden="true">
-      <polyline points={points} />
+    <svg
+      className={`nw-metric-spark${points ? "" : " nw-metric-spark--empty"}`}
+      viewBox="0 0 132 30"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
+      {points ? <polyline points={points} /> : <line x1="0" y1="15" x2="132" y2="15" />}
     </svg>
   );
 }
@@ -531,8 +532,18 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
   const memoryPressureValue = runtimeHealth?.memory_pressure_percent ?? runtimeHealth?.ram_percent;
   const modelDisplay = useMemo(() => pickModelDisplay(settingsQ.data), [settingsQ.data]);
   const [runtimeMetricHistory, setRuntimeMetricHistory] = useState<RuntimeMetricSample[]>(() => readRuntimeMetricHistory());
-  const memoryPressureHistory = useMemo(() => metricValues(runtimeMetricHistory, "memoryPressure"), [runtimeMetricHistory]);
-  const latencyHistory = useMemo(() => metricValues(runtimeMetricHistory, "latencyMs"), [runtimeMetricHistory]);
+  const runtimeTrendHistory = useMemo(() => {
+    const cutoff = Date.now() - RUNTIME_TREND_WINDOW_MS;
+    return runtimeMetricHistory.filter((sample) => sample.t >= cutoff);
+  }, [runtimeMetricHistory]);
+  const memoryPressureHistory = useMemo(
+    () => metricValues(runtimeTrendHistory, "memoryPressure"),
+    [runtimeTrendHistory]
+  );
+  const latencyHistory = useMemo(
+    () => metricValues(runtimeTrendHistory, "latencyMs"),
+    [runtimeTrendHistory]
+  );
   const notifications = Array.isArray(notificationsQ.data) ? notificationsQ.data : [];
   const securityLogs = (securityQ.data as { logs?: Array<{ event_type: string; severity: string; message: string }> })?.logs || [];
   const suggestionTrace = asRecord(suggestionTraceQ.data);
@@ -921,20 +932,20 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
   const showActivityFeed = traces.length > 0;
   const arkDistillAnalytics = arkDistillAnalyticsQ.data as LlmAnalyticsResponse | undefined;
   const arkDistillTotals = arkDistillAnalytics?.arkdistill?.totals;
-  const arkDistillHasData = Boolean(
-    arkDistillTotals &&
-      ((finiteNumber(arkDistillTotals.result_count) ?? 0) > 0 ||
-        (finiteNumber(arkDistillTotals.estimated_saved_tokens) ?? 0) > 0 ||
-        (finiteNumber(arkDistillTotals.saved_chars) ?? 0) > 0)
-  );
-  const arkDistillSavingsPercent = arkDistillHasData
-    ? typeof arkDistillTotals?.savings_percent === "number"
-      ? arkDistillTotals.savings_percent
-      : (finiteNumber(arkDistillTotals?.average_reduction_ratio) ?? 0) * 100
-    : null;
+  const promptTokens = finiteNumber(arkDistillAnalytics?.totals?.prompt_tokens) ?? 0;
+  const cachedPromptTokens = finiteNumber(arkDistillAnalytics?.totals?.cached_prompt_tokens) ?? 0;
   const arkDistillSavedTokens = finiteNumber(arkDistillTotals?.estimated_saved_tokens) ?? 0;
-  const arkDistillSavedCostLabel = formatSmallCurrency(
-    arkDistillTotals?.estimated_prompt_cost_saved_usd
+  const combinedInputSavedTokens = cachedPromptTokens + arkDistillSavedTokens;
+  const combinedInputBaselineTokens = promptTokens + arkDistillSavedTokens;
+  const combinedInputSavingsPercent =
+    combinedInputBaselineTokens > 0
+      ? (combinedInputSavedTokens / combinedInputBaselineTokens) * 100
+      : null;
+  const arkDistillHasData = Boolean(
+    combinedInputSavedTokens > 0 ||
+      (arkDistillTotals &&
+        ((finiteNumber(arkDistillTotals.result_count) ?? 0) > 0 ||
+          (finiteNumber(arkDistillTotals.saved_chars) ?? 0) > 0))
   );
   const missionPlanSteps = useMemo(() => {
     const recommended = (briefingQ.data?.recommended_actions || briefingQ.data?.recommended_skills || [])[0];
@@ -1065,22 +1076,23 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                 <span className="nw-syn-kicker">ArkDistill saved</span>
                 <span className="nw-syn-rule" />
               </div>
-              {arkDistillHasData && arkDistillSavingsPercent != null ? (
+              {arkDistillHasData && combinedInputSavingsPercent != null ? (
                 <>
                   <div className="nw-syn-stat-vrow">
-                    <span className="nw-syn-stat-v nw-syn-stat-v--mint">
-                      {formatCompactNumber(arkDistillSavedTokens)}
+                    <span className="nw-syn-stat-v nw-syn-stat-v--mint nw-syn-stat-v--sm">
+                      {formatCompactNumber(combinedInputSavedTokens)}
                     </span>
-                    <span className="nw-syn-stat-lab">Tokens</span>
-                    <span className="nw-syn-stat-tail">{arkDistillSavedCostLabel}</span>
+                    <span className="nw-syn-stat-lab">Tokens saved</span>
+                    <span className="nw-syn-stat-v nw-syn-stat-v--mint nw-syn-stat-v--sm nw-syn-stat-v--push">
+                      {combinedInputSavingsPercent.toFixed(1)}%
+                    </span>
+                    <span className="nw-syn-stat-lab">Input saved</span>
                   </div>
                   <div className="nw-syn-meter">
-                    <i style={{ width: `${Math.max(2, Math.min(100, arkDistillSavingsPercent))}%` }} />
+                    <i style={{ width: `${Math.max(2, Math.min(100, combinedInputSavingsPercent))}%` }} />
                   </div>
                   <div className="nw-syn-msub">
-                    <span>
-                      prompt-cache <b>{arkDistillSavingsPercent.toFixed(1)}%</b>
-                    </span>
+                    <span>prompt cache + ArkDistill</span>
                     <span>30 days</span>
                   </div>
                 </>
@@ -1134,6 +1146,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
                 selfEvolveEnabled={Boolean(evolutionStatus.self_evolve_enabled)}
                 learningQueueCount={learningQueueTotal}
                 latencyMs={serverStatus?.rtt_ms ?? null}
+                memoryPressureHistory={memoryPressureHistory}
+                latencyHistory={latencyHistory}
                 running={Boolean(currentTask)}
               />
             </div>
@@ -1213,27 +1227,25 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
 
               <div className="nw-syn-div" />
               <div className="nw-syn-shead">
-                <span className="nw-syn-kicker">Supervision</span>
+                <span className="nw-syn-kicker">Runtime trends</span>
                 <span className="nw-syn-rule" />
               </div>
-              {activeBackgroundSessions.length > 0 ? (
-                <div className="nw-syn-supv">
-                  <div className="nw-syn-supv-h">
-                    <i className="nw-syn-lamp nw-syn-lamp--amber" />
-                    {activeBackgroundSessions.length} SESSION{activeBackgroundSessions.length === 1 ? "" : "S"} FLAGGED
+              <div className="nw-syn-trends" aria-label="Runtime metric trends">
+                <div className="nw-syn-trend">
+                  <div className="nw-syn-trend-head">
+                    <span>Latency</span>
+                    <b>{serverStatus?.rtt_ms != null ? `${Math.round(serverStatus.rtt_ms)}ms` : "-"}</b>
                   </div>
-                  <p>
-                    {activeBackgroundSessions.length === 1
-                      ? "1 background session needs supervision before it can continue."
-                      : `${activeBackgroundSessions.length} background sessions need supervision before they can continue.`}
-                  </p>
-                  <button type="button" className="nw-syn-supv-act" onClick={() => navigateToView("status")}>
-                    Review session{activeBackgroundSessions.length === 1 ? "" : "s"} -&gt;
-                  </button>
+                  <MetricSparkline values={latencyHistory} />
                 </div>
-              ) : (
-                <p className="nw-syn-copy">No background sessions need review.</p>
-              )}
+                <div className="nw-syn-trend">
+                  <div className="nw-syn-trend-head">
+                    <span>Mem pressure</span>
+                    <b>{formatCompactPercent(memoryPressureValue)}</b>
+                  </div>
+                  <MetricSparkline values={memoryPressureHistory} />
+                </div>
+              </div>
             </aside>
           </div>
 

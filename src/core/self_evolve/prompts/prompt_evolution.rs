@@ -2727,4 +2727,37 @@ mod tests {
             PromptPromotionCheck::PromptEfficiencyNotMateriallyWorse,
         ));
     }
+
+    #[test]
+    fn embedded_prompt_benchmark_surfaces_can_independently_clear_sign_test_gate() {
+        let config = PromptEvolutionConfig::default();
+        let profile: PromptBenchmarkProfile =
+            serde_json::from_str(embedded_prompt_benchmark_profile_json())
+                .expect("embedded prompt benchmark should parse");
+        let min_perfect_wins = (1..=32)
+            .find(|wins| one_sided_sign_test_p_value(*wins, 0) <= config.max_sign_test_p_value)
+            .expect("sign-test threshold should be reachable");
+
+        assert!(
+            profile.router_cases.len() >= min_perfect_wins,
+            "router benchmark has {} cases but needs at least {} perfect wins to pass p<={}",
+            profile.router_cases.len(),
+            min_perfect_wins,
+            config.max_sign_test_p_value,
+        );
+        assert!(
+            profile.primary_response_cases.len() >= min_perfect_wins,
+            "primary-response benchmark has {} cases but needs at least {} perfect wins to pass p<={}",
+            profile.primary_response_cases.len(),
+            min_perfect_wins,
+            config.max_sign_test_p_value,
+        );
+        assert!(
+            profile.synthesis_cases.len() >= min_perfect_wins,
+            "synthesis benchmark has {} cases but needs at least {} perfect wins to pass p<={}",
+            profile.synthesis_cases.len(),
+            min_perfect_wins,
+            config.max_sign_test_p_value,
+        );
+    }
 }

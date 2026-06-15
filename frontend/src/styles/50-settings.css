@@ -100,13 +100,9 @@
     linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880));
 }
 
-/* Warning cards stay on the green-neutral AgentArk surface instead of the
-   older warm-brown treatment. */
 .settings-inline-card.tone-warning {
-  border-color: rgba(120, 242, 176, 0.16);
-  background:
-    radial-gradient(circle at top left, rgba(120, 242, 176, 0.055), transparent 38%),
-    linear-gradient(160deg, var(--cyber-panel-raised, #121316), var(--cyber-panel, #0d0e10));
+  border-color: rgba(216, 173, 120, 0.28);
+  background: linear-gradient(160deg, var(--cyber-panel-raised, #121316), var(--cyber-panel, #0d0e10));
 }
 
 .settings-security-panel {
@@ -114,11 +110,9 @@
 }
 
 .security-basics-panel {
-  border: 1px solid rgba(120, 242, 176, 0.14);
+  border: 1px solid var(--ui-rgba-255-255-255-080);
   border-radius: 8px;
-  background:
-    radial-gradient(circle at top left, rgba(120, 242, 176, 0.055), transparent 36%),
-    linear-gradient(180deg, rgba(20, 21, 23, 0.82), rgba(10, 11, 12, 0.68));
+  background: linear-gradient(180deg, rgba(20, 21, 23, 0.82), rgba(10, 11, 12, 0.68));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
   padding: 14px;
 }

@@ -202,8 +202,12 @@ function promptProposalIsPastDecision(row: JsonRecord): boolean {
   const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
   const jobStatus = str(lifecycle.job_status, "").trim().toLowerCase();
   if (reviewStatus === "rejected") return true;
+  if (lifecycleStatus === "candidate_rejected") {
+    const samples = num(lifecycle.sample_count, 0);
+    const required = num(lifecycle.required_samples, 0);
+    return required > 0 && samples < required;
+  }
   if (
-    lifecycleStatus === "candidate_rejected" ||
     lifecycleStatus === "rolled_back" ||
     lifecycleStatus === "dismissed" ||
     lifecycleStatus === "test_stopped"
@@ -305,6 +309,76 @@ function formatPromptLifecycleReason(reason: string): string {
       formatMachineReasonCode(token),
     )
     .replace(/\s+\./g, ".");
+}
+
+type PromptLifecycleReasonCopy = {
+  title: string;
+  summary: string;
+  detail?: string;
+  nextStep?: string;
+};
+
+function promptLifecycleOptimizerFailure(reason: string, jobStatus: string): boolean {
+  const normalizedJobStatus = jobStatus.trim().toLowerCase();
+  if (["failed", "timed_out", "blocked", "error"].includes(normalizedJobStatus)) {
+    return true;
+  }
+  const normalizedReason = reason.trim().toLowerCase();
+  return (
+    normalizedReason.includes("gepa optimizer timed out") ||
+    normalizedReason.includes("optimizer timed out") ||
+    normalizedReason.includes("gepa run failed") ||
+    normalizedReason.includes("background optimization job is no longer in the gepa queue")
+  );
+}
+
+function promptLifecycleReasonCopy(
+  formattedReason: string,
+  lifecycleStatus: string,
+  jobStatus: string,
+  sampleCount = 0,
+  requiredSamples = 0,
+): PromptLifecycleReasonCopy | null {
+  const reason = formattedReason.trim();
+  const optimizerFailure = promptLifecycleOptimizerFailure(reason, jobStatus);
+  if (!reason && !optimizerFailure) return null;
+  if (optimizerFailure) {
+    const freshSampleGap = Math.max(0, Math.ceil(requiredSamples - sampleCount));
+    return {
+      title: "Background optimization did not finish",
+      summary:
+        reason || "Background optimization did not finish. ArkEvolve could not complete the background test.",
+      detail:
+        "No prompt candidate was promoted or rolled out. The current stable prompt is still serving users.",
+      nextStep:
+        freshSampleGap > 0
+          ? `Collect ${freshSampleGap.toLocaleString()} fresh prompt telemetry sample${freshSampleGap === 1 ? "" : "s"}, then retry the background test.`
+          : "Fix the optimizer timeout or runtime issue, then rerun the background test.",
+    };
+  }
+  if (lifecycleStatus === "candidate_rejected") {
+    return {
+      title: "Why it stayed out of production",
+      summary:
+        "The background test finished, but ArkEvolve did not have enough evidence to safely replace the stable prompt.",
+      detail:
+        "Nothing was rolled out. The current stable prompt is still serving users while this candidate stays available for review. This failed test is not deployable, but the idea can be tested again after new examples are collected.",
+      nextStep:
+        "Wait for more examples, then rerun the background test if the idea still looks useful.",
+    };
+  }
+  if (lifecycleStatus === "blocked") {
+    return {
+      title: "Why it is blocked",
+      summary: reason,
+      nextStep:
+        "Fix the setup or wait for the blocking work to finish, then retry the background test.",
+    };
+  }
+  return {
+    title: "Reason",
+    summary: reason,
+  };
 }
 
 type ExperimentSurfaceItem = {
@@ -4665,10 +4739,17 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                         const lifecycleLabel = promptProposalLifecycleLabel(lifecycleStatus);
                         const lifecycleReason = str(lifecycle.reason, "");
                         const formattedLifecycleReason = formatPromptLifecycleReason(lifecycleReason);
-                        const reasonAccent =
-                          lifecycleStatus === "candidate_rejected" ? "#78f2b0" : "#ffbe63";
                         const lifecycleSamples = num(lifecycle.sample_count, 0);
                         const lifecycleRequiredSamples = num(lifecycle.required_samples, 0);
+                        const lifecycleReasonCopy = promptLifecycleReasonCopy(
+                          formattedLifecycleReason,
+                          lifecycleStatus,
+                          str(lifecycle.job_status, ""),
+                          lifecycleSamples,
+                          lifecycleRequiredSamples,
+                        );
+                        const reasonAccent =
+                          lifecycleStatus === "candidate_rejected" ? "#78f2b0" : "#ffbe63";
                         const monitoringSummary = stringList(lifecycle.monitoring_summary);
                         const monitoringRegressions = stringList(lifecycle.monitoring_regressions);
                         const rollbackRecommended = toBool(lifecycle.rollback_recommended);
@@ -4734,7 +4815,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                           : canApprove
                             ? "Nothing changes until you approve it."
                             : lifecycleStatus === "candidate_rejected"
-                              ? "Candidate was not promoted by the background evaluation gates."
+                              ? "Background test finished; stable stayed live because the candidate was not proven better."
                             : "State is tracked through the lifecycle.";
                         const canManagePromptCanary =
                           !!proposalId &&
@@ -4926,7 +5007,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                       fontSize: "0.72rem",
                                     }}
                                   >
-                                    {formattedLifecycleReason ||
+                                    {lifecycleReasonCopy?.summary ||
+                                      formattedLifecycleReason ||
                                       "Monitoring found a regression; rollback is recommended."}
                                   </Typography>
                                 ) : null}
@@ -5278,7 +5360,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                         <Typography variant="body2" sx={{ color: "text.secondary" }}>
                                           Samples: {promptProposalSampleLabel(lifecycle)}
                                         </Typography>
-                                        {formattedLifecycleReason ? (
+                                        {lifecycleReasonCopy ? (
                                           <Box
                                             sx={{
                                               mt: 1,
@@ -5301,11 +5383,21 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                                 mb: 0.35,
                                               }}
                                             >
-                                              Reason
+                                              {lifecycleReasonCopy.title}
                                             </Typography>
-                                            <Typography variant="body2" sx={{ color: "#e8f4ff" }}>
-                                              {formattedLifecycleReason}
+                                            <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 650 }}>
+                                              {lifecycleReasonCopy.summary}
                                             </Typography>
+                                            {lifecycleReasonCopy.detail ? (
+                                              <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.45 }}>
+                                                {lifecycleReasonCopy.detail}
+                                              </Typography>
+                                            ) : null}
+                                            {lifecycleReasonCopy.nextStep ? (
+                                              <Typography variant="caption" sx={{ color: "var(--text-faint)", display: "block", mt: 0.7 }}>
+                                                Next: {lifecycleReasonCopy.nextStep}
+                                              </Typography>
+                                            ) : null}
                                           </Box>
                                         ) : null}
                                       </Box>
@@ -5470,19 +5562,27 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                   </Box>
                                   {(lifecycleStatus === "blocked" ||
                                     lifecycleStatus === "candidate_rejected") &&
-                                  formattedLifecycleReason ? (
+                                  lifecycleReasonCopy ? (
                                     <Alert
                                       severity={lifecycleStatus === "candidate_rejected" ? "info" : "warning"}
                                       sx={{ borderRadius: 1 }}
                                     >
                                       <Typography variant="body2" sx={{ fontWeight: 650, mb: 0.35 }}>
-                                        {lifecycleStatus === "candidate_rejected"
-                                          ? "Candidate was not promoted"
-                                          : "Block reason"}
+                                        {lifecycleReasonCopy.title}
                                       </Typography>
                                       <Typography variant="body2">
-                                        {formattedLifecycleReason}
+                                        {lifecycleReasonCopy.summary}
                                       </Typography>
+                                      {lifecycleReasonCopy.detail ? (
+                                        <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.45 }}>
+                                          {lifecycleReasonCopy.detail}
+                                        </Typography>
+                                      ) : null}
+                                      {lifecycleReasonCopy.nextStep ? (
+                                        <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 0.65 }}>
+                                          Next: {lifecycleReasonCopy.nextStep}
+                                        </Typography>
+                                      ) : null}
                                     </Alert>
                                   ) : null}
                                 </PromptDetailSection>

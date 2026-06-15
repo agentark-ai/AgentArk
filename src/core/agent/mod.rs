@@ -316,6 +316,53 @@ fn safe_truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn provider_error_status_codes(raw: &str) -> Vec<u16> {
+    let mut codes = Vec::new();
+    let mut digits = String::new();
+    let flush = |digits: &mut String, codes: &mut Vec<u16>| {
+        if digits.len() == 3 {
+            if let Ok(code) = digits.parse::<u16>() {
+                if (400..=599).contains(&code) && !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
+        digits.clear();
+    };
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            flush(&mut digits, &mut codes);
+        }
+    }
+    flush(&mut digits, &mut codes);
+    codes
+}
+
+fn user_visible_platform_failure_message(raw_error: &str) -> String {
+    let codes = provider_error_status_codes(raw_error);
+    let reason = if codes.iter().any(|code| *code == 402) {
+        "The provider reported an account quota, credits, or billing limit."
+    } else if codes.iter().any(|code| *code == 401 || *code == 403) {
+        "The provider rejected the configured credentials or model access."
+    } else if codes.iter().any(|code| *code == 429) {
+        "The provider reported a rate limit or temporary capacity limit."
+    } else if codes.iter().any(|code| matches!(*code, 408 | 504 | 524)) {
+        "The provider timed out before returning a usable response."
+    } else if codes.iter().any(|code| (500..=599).contains(code)) {
+        "The provider reported a temporary service failure."
+    } else if codes.iter().any(|code| matches!(*code, 400 | 413 | 422)) {
+        "The provider rejected the request as invalid or outside the model's limits."
+    } else {
+        "The provider returned an error before a usable response was available."
+    };
+    format!(
+        "I couldn't complete the request because the configured model provider failed before returning a usable response. {} Check the provider settings or switch to another configured model, then retry.",
+        reason
+    )
+}
+
 fn internal_llm_timeout_ms(env_key: &str, default_ms: u64) -> u64 {
     const MIN_INTERNAL_LLM_TIMEOUT_MS: u64 = 5_000;
     const MAX_INTERNAL_LLM_TIMEOUT_MS: u64 = 300_000;
@@ -1288,6 +1335,9 @@ struct ImmediateExchangeContext<'a> {
     user_message_already_recorded: bool,
     recorded_user_message_id: Option<String>,
     memory_capture_allowed: bool,
+    memory_capture_triage_allowed: bool,
+    memory_capture_signal:
+        Option<&'a crate::security::intent_classifier::InboundMemoryCaptureSignal>,
     memory_capture_source: Option<&'a str>,
     user_message_for_link_capture: Option<&'a str>,
 }

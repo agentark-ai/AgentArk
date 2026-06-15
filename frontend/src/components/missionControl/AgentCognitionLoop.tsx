@@ -1,7 +1,11 @@
+import { useMemo, useState, type CSSProperties } from "react";
+
 export type CognitionStageId = "observe" | "understand" | "plan" | "act" | "reflect" | "learn";
 
 export type AgentCognitionLoopProps = {
   latencyMs?: number | null;
+  memoryPressureHistory?: number[];
+  latencyHistory?: number[];
   memoryCount: number;
   skillCount: number;
   appCount: number;
@@ -73,13 +77,41 @@ const JUNCTIONS: Array<[number, number]> = [
 ];
 
 type CapabilityNode = {
-  key: string;
+  key: CapabilityKey;
   code: string;
   sub: string;
   x: number;
   y: number;
   anchor: "start" | "end";
   dendrite: string;
+};
+
+type CapabilityKey =
+  | "memory"
+  | "skills"
+  | "apps"
+  | "integrations"
+  | "trace"
+  | "evolve"
+  | "learning"
+  | "pulse";
+
+type HoverNodeId = `stage:${CognitionStageId}` | `cap:${CapabilityKey}`;
+type TooltipTone = "green" | "cyan" | "amber" | "crit";
+
+type TooltipSpark = {
+  label: string;
+  values: number[];
+  formatValue?: (value: number) => string;
+};
+
+type TooltipData = {
+  title: string;
+  value: string;
+  detail: string;
+  meta?: string;
+  tone: TooltipTone;
+  spark?: TooltipSpark;
 };
 
 // Capability orbit r=262 (nodes), dendrites curve to the stage ring.
@@ -125,8 +157,77 @@ const PULSES: Pulse[] = [
   { path: `M ${CX},43 A 262 262 0 1 1 ${CX - 0.01},43 Z`, cls: "nw-syn-pulse--violet", dur: 24, delay: -8 },
 ];
 
+function compactValue(value: number): string {
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(abs >= 10_000_000 ? 1 : 2).replace(/\.0+$/, "")}M`;
+  if (abs >= 1_000) return `${(value / 1_000).toFixed(abs >= 10_000 ? 1 : 2).replace(/\.0+$/, "")}K`;
+  return `${Math.round(value)}`;
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value)}%`;
+}
+
+function formatLatency(value: number): string {
+  return `${Math.round(value)}ms`;
+}
+
+function sparklinePoints(values: number[], width = 184, height = 34): string {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (finite.length < 2) return "";
+  const step = Math.max(1, Math.ceil(finite.length / 80));
+  const compact = finite.filter((_, index) => index % step === 0).slice(-80);
+  const min = Math.min(...compact);
+  const max = Math.max(...compact);
+  const range = Math.max(1, max - min);
+  return compact
+    .map((value, index) => {
+      const x = (index / Math.max(1, compact.length - 1)) * width;
+      const y = height - ((value - min) / range) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
+function TooltipSparkline({ spark }: { spark: TooltipSpark }) {
+  const values = spark.values.filter((value) => Number.isFinite(value));
+  const points = sparklinePoints(values);
+  const latest = values.length > 0 ? values[values.length - 1] : null;
+  return (
+    <div className={`nw-tooltip-spark${points ? "" : " nw-tooltip-spark--empty"}`}>
+      <div className="nw-tooltip-spark-head">
+        <span>{spark.label}</span>
+        <b>{latest == null ? "pending" : spark.formatValue ? spark.formatValue(latest) : compactValue(latest)}</b>
+      </div>
+      <svg viewBox="0 0 184 34" preserveAspectRatio="none" aria-hidden="true">
+        {points ? <polyline points={points} /> : <line x1="0" y1="17" x2="184" y2="17" />}
+      </svg>
+    </div>
+  );
+}
+
+function tooltipTransform(x: number, y: number): { tx: string; ty: string } {
+  if (x < CX - 120) return { tx: "18px", ty: "-50%" };
+  if (x > CX + 120) return { tx: "calc(-100% - 18px)", ty: "-50%" };
+  if (y < CY) return { tx: "-50%", ty: "18px" };
+  return { tx: "-50%", ty: "calc(-100% - 18px)" };
+}
+
+function tooltipStyle(x: number, y: number): CSSProperties {
+  const { tx, ty } = tooltipTransform(x, y);
+  return {
+    left: `${((x - 150) / 760) * 100}%`,
+    top: `${(y / 610) * 100}%`,
+    transform: `translate(${tx}, ${ty})`,
+    "--tx": tx,
+    "--ty": ty,
+  } as CSSProperties;
+}
+
 export function AgentCognitionLoop({
   latencyMs,
+  memoryPressureHistory = [],
+  latencyHistory = [],
   memoryCount,
   skillCount,
   appCount,
@@ -153,6 +254,133 @@ export function AgentCognitionLoop({
   const activeStage: CognitionStageId = running ? "act" : "observe";
   const activeWord = running ? "FIRING" : "WATCHING";
   const active = STAGES.find((s) => s.id === activeStage) ?? STAGES[0];
+  const [hovered, setHovered] = useState<HoverNodeId | null>(null);
+  const tooltipByNode = useMemo<Record<HoverNodeId, TooltipData>>(
+    () => ({
+      "stage:observe": {
+        title: "Observe",
+        value: running ? "Watching run" : "Watching system",
+        detail: "Live status, latency, memory pressure, and queue signals are being sampled.",
+        meta: "Stage 01",
+        tone: "green",
+        spark: { label: "Last 1h pulse", values: latencyHistory, formatValue: formatLatency },
+      },
+      "stage:understand": {
+        title: "Understand",
+        value: `${skillCount} skills`,
+        detail: "Loaded skills and current signals shape request understanding.",
+        meta: "Stage 02 · current signal",
+        tone: "cyan",
+      },
+      "stage:plan": {
+        title: "Plan",
+        value: `${appCount + integrationCount} routes`,
+        detail: "Apps and integrations available for planning the next action.",
+        meta: "Stage 03 · current signal",
+        tone: "cyan",
+      },
+      "stage:act": {
+        title: "Act",
+        value: running ? "Active" : "Idle",
+        detail: running ? "A mission is currently in progress." : "No active mission is pinned right now.",
+        meta: "Stage 04 · current signal",
+        tone: running ? "green" : "cyan",
+      },
+      "stage:reflect": {
+        title: "Reflect",
+        value: `${traceCount} traces`,
+        detail: "Recent traces are available for reflection and outcome review.",
+        meta: "Stage 05 · current signal",
+        tone: traceCount > 0 ? "green" : "cyan",
+      },
+      "stage:learn": {
+        title: "Learn",
+        value: `${learningQueueCount} queued`,
+        detail: "Learning queue items waiting for consolidation or review.",
+        meta: "Stage 06 · current signal",
+        tone: learningQueueCount > 0 ? "green" : "cyan",
+      },
+      "cap:memory": {
+        title: "Memory",
+        value: `${memoryCount} entries`,
+        detail: "Durable memory entries available to the agent.",
+        meta: "Last-hour graph uses memory pressure when available",
+        tone: "green",
+        spark: { label: "Last 1h pressure", values: memoryPressureHistory, formatValue: formatPercent },
+      },
+      "cap:skills": {
+        title: "Skills",
+        value: `${skillCount} loaded`,
+        detail: "Callable skills loaded into the current runtime.",
+        meta: "Current count",
+        tone: "cyan",
+      },
+      "cap:apps": {
+        title: "Apps",
+        value: `${appCount} apps`,
+        detail: "Registered apps available for automation and action routing.",
+        meta: "Current count",
+        tone: "cyan",
+      },
+      "cap:integrations": {
+        title: "Integrations",
+        value: `${integrationCount} active`,
+        detail: "Active external integrations available to AgentArk.",
+        meta: "Current count",
+        tone: integrationCount > 0 ? "green" : "cyan",
+      },
+      "cap:trace": {
+        title: "Trace",
+        value: `${traceCount} traces`,
+        detail: "Recent execution traces available for review.",
+        meta: "Current count",
+        tone: traceCount > 0 ? "green" : "cyan",
+      },
+      "cap:evolve": {
+        title: "Self-Evolve",
+        value: selfEvolveEnabled ? "ON" : "OFF",
+        detail: selfEvolveEnabled
+          ? "Reviewed improvements and background learning are enabled."
+          : "Self-evolve is disabled.",
+        meta: "Current setting",
+        tone: selfEvolveEnabled ? "green" : "amber",
+      },
+      "cap:learning": {
+        title: "Learning Queue",
+        value: `${learningQueueCount} queued`,
+        detail: "Candidate learnings, provisional runs, and pending reflection items.",
+        meta: "Current count",
+        tone: learningQueueCount > 0 ? "green" : "cyan",
+      },
+      "cap:pulse": {
+        title: "Pulse",
+        value: latencyMs == null ? "No pulse" : formatLatency(latencyMs),
+        detail: "Round-trip status pulse from the runtime.",
+        meta: "Last-hour graph uses latency samples when available",
+        tone: latencyMs == null ? "amber" : "green",
+        spark: { label: "Last 1h latency", values: latencyHistory, formatValue: formatLatency },
+      },
+    }),
+    [
+      appCount,
+      integrationCount,
+      latencyHistory,
+      latencyMs,
+      learningQueueCount,
+      memoryCount,
+      memoryPressureHistory,
+      running,
+      selfEvolveEnabled,
+      skillCount,
+      traceCount,
+    ]
+  );
+  const hoveredPosition = hovered
+    ? hovered.startsWith("stage:")
+      ? STAGES.find((node) => `stage:${node.id}` === hovered)
+      : CAPABILITIES.find((node) => `cap:${node.key}` === hovered)
+    : null;
+  const hoveredTooltip = hovered ? tooltipByNode[hovered] : null;
 
   return (
     <div className="nw-syn">
@@ -232,8 +460,21 @@ export function AgentCognitionLoop({
           {/* stage nodes */}
           {STAGES.map((s) => {
             const isActive = s.id === activeStage;
+            const nodeId = `stage:${s.id}` as HoverNodeId;
             return (
-              <g key={s.id}>
+              <g
+                key={s.id}
+                className="nw-node-hover"
+                role="button"
+                tabIndex={0}
+                aria-label={`${s.title.toLowerCase()} stage details`}
+                aria-expanded={hovered === nodeId}
+                onMouseEnter={() => setHovered(nodeId)}
+                onMouseLeave={() => setHovered(null)}
+                onFocus={() => setHovered(nodeId)}
+                onBlur={() => setHovered(null)}
+              >
+                <circle cx={s.x} cy={s.y} r={24} fill="transparent" pointerEvents="all" />
                 <circle
                   className={`nw-syn-stg${isActive ? " nw-syn-stg--act" : ""}`}
                   cx={s.x}
@@ -272,8 +513,21 @@ export function AgentCognitionLoop({
           {CAPABILITIES.map((c) => {
             const v = values[c.key];
             const textX = c.anchor === "end" ? c.x - 16 : c.x + 16;
+            const nodeId = `cap:${c.key}` as HoverNodeId;
             return (
-              <g key={c.key} className={v.dim ? "nw-syn-cap nw-syn-cap--dim" : "nw-syn-cap"}>
+              <g
+                key={c.key}
+                className={`${v.dim ? "nw-syn-cap nw-syn-cap--dim" : "nw-syn-cap"} nw-node-hover`}
+                role="button"
+                tabIndex={0}
+                aria-label={`${c.code} ${c.sub} details`}
+                aria-expanded={hovered === nodeId}
+                onMouseEnter={() => setHovered(nodeId)}
+                onMouseLeave={() => setHovered(null)}
+                onFocus={() => setHovered(nodeId)}
+                onBlur={() => setHovered(null)}
+              >
+                <circle cx={c.x} cy={c.y} r={18} fill="transparent" pointerEvents="all" />
                 <circle className="nw-syn-capn" cx={c.x} cy={c.y} r={6} />
                 <circle className="nw-syn-capcore" cx={c.x} cy={c.y} r={1.8} />
                 <text className="nw-syn-capval" x={textX} y={c.y - 2} textAnchor={c.anchor}>
@@ -291,13 +545,21 @@ export function AgentCognitionLoop({
         <div className="nw-syn-aura" aria-hidden="true" />
         <div className="nw-syn-coremask" aria-hidden="true" />
         <img className="nw-syn-logo" src="/logo.svg" alt="" aria-hidden="true" />
+        {hoveredPosition && hoveredTooltip ? (
+          <div
+            className={`nw-tooltip nw-tooltip--${hoveredTooltip.tone}`}
+            role="tooltip"
+            style={tooltipStyle(hoveredPosition.x, hoveredPosition.y)}
+          >
+            <div className="nw-tooltip-title">{hoveredTooltip.title}</div>
+            <div className="nw-tooltip-value">{hoveredTooltip.value}</div>
+            <div className="nw-tooltip-detail">{hoveredTooltip.detail}</div>
+            {hoveredTooltip.spark ? <TooltipSparkline spark={hoveredTooltip.spark} /> : null}
+            {hoveredTooltip.meta ? <div className="nw-tooltip-meta">{hoveredTooltip.meta}</div> : null}
+          </div>
+        ) : null}
       </div>
 
-      <div className="nw-syn-caption">
-        <span className="nw-syn-caption-num">01-06</span>
-        <span className="nw-syn-caption-title">Cognition loop</span>
-        <span className="nw-syn-caption-detail">Observe, understand, plan, act, reflect, learn</span>
-      </div>
     </div>
   );
 }

@@ -106,6 +106,16 @@ fn memory_capture_canonicals() -> Vec<MemoryCaptureCanonical> {
         },
         MemoryCaptureCanonical {
             should_capture: true,
+            concept: "durable_personal_goal_or_interest",
+            text: "The message shares a personal goal, aspiration, durable interest, or future hope about a place, activity, experience, habit, or life direction that may be useful later, not as a task payload, reminder, schedule, or automation request.",
+        },
+        MemoryCaptureCanonical {
+            should_capture: true,
+            concept: "durable_private_self_context",
+            text: "The message shares private or sensitive self-context, recurring personal constraints, support needs, limitations, vulnerabilities, wellbeing context, or other user-authored facts about the user's condition or situation that may affect future assistance, not a credential, secret, or one-off task payload.",
+        },
+        MemoryCaptureCanonical {
+            should_capture: true,
             concept: "artifact_outcome_feedback",
             text: "The message gives feedback about whether prior work, an app, a deployed artifact, a bug fix, or a completed run succeeded, failed, is acceptable, or still needs attention.",
         },
@@ -463,6 +473,7 @@ fn memory_capture_signal_from_scores(
     InboundMemoryCaptureSignal {
         should_capture: true,
         confidence: Some(best_capture.score.clamp(0.0, 1.0)),
+        concept: Some(best_capture.concept.to_string()),
         reason: Some(best_capture.concept.to_string()),
     }
 }
@@ -794,6 +805,32 @@ mod tests {
     }
 
     #[test]
+    fn memory_canonicals_include_personal_future_interest_capture_neighbor() {
+        let canonicals = memory_capture_canonicals();
+
+        assert!(canonicals.iter().any(|canonical| {
+            canonical.should_capture
+                && canonical.concept == "durable_personal_goal_or_interest"
+                && canonical.text.contains("personal")
+                && canonical.text.contains("aspiration")
+                && canonical.text.contains("not as a task")
+        }));
+    }
+
+    #[test]
+    fn memory_canonicals_include_private_self_context_capture_neighbor() {
+        let canonicals = memory_capture_canonicals();
+
+        assert!(canonicals.iter().any(|canonical| {
+            canonical.should_capture
+                && canonical.concept == "durable_private_self_context"
+                && canonical.text.contains("private or sensitive self-context")
+                && canonical.text.contains("future assistance")
+                && canonical.text.contains("not a credential")
+        }));
+    }
+
+    #[test]
     fn memory_capture_scores_reject_operational_schedule_payloads() {
         let signal = memory_capture_signal_from_scores(&[
             ScoredMemoryCaptureCanonical {
@@ -822,6 +859,7 @@ mod tests {
         let memory_capture = InboundMemoryCaptureSignal {
             should_capture: true,
             confidence: Some(0.82),
+            concept: Some("durable_user_preference_constraint".to_string()),
             reason: Some("durable_user_preference_constraint".to_string()),
         };
 

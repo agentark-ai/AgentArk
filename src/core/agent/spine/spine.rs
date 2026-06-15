@@ -636,6 +636,7 @@ impl ToolRegistry {
                 value,
                 kind,
                 scope,
+                slot_cardinality,
                 confidence,
                 reason,
                 intent_summary,
@@ -659,6 +660,7 @@ impl ToolRegistry {
                     None,
                     None,
                     &[],
+                    slot_cardinality.as_deref(),
                     None,
                 )
                 .await
@@ -1165,6 +1167,7 @@ enum MemoryPrimitiveOp {
         value: String,
         kind: Option<String>,
         scope: Option<String>,
+        slot_cardinality: Option<String>,
         confidence: Option<f32>,
         reason: Option<String>,
         intent_summary: Option<String>,
@@ -4557,10 +4560,7 @@ impl Agent {
             )),
             SpineResult::PlatformFailed { error, .. } => Ok(spine_blocked_processed_message(
                 conversation_id,
-                &format!(
-                    "The spine hit a platform failure before it could complete: {}.",
-                    error.message
-                ),
+                &user_visible_platform_failure_message(&error.message),
                 crate::core::ExecutionRunStatus::PlatformFailed.as_str(),
                 trace_steps,
                 turn_records,
@@ -5794,6 +5794,11 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
                             "scope": {
                                 "type": "string",
                                 "description": "Optional memory scope metadata."
+                            },
+                            "slot_cardinality": {
+                                "type": "string",
+                                "enum": ["singleton", "collection"],
+                                "description": "Use singleton when later values should replace one active row; use collection when multiple concrete values should coexist under this generic key."
                             }
                         },
                         "additionalProperties": true
@@ -8079,6 +8084,8 @@ fn plan_memory_rw_for_caller(
                 kind: json_text_path(arguments, &["metadata", "kind"])
                     .or_else(|| json_text_path(arguments, &["content", "kind"])),
                 scope: json_text_path(arguments, &["metadata", "scope"]),
+                slot_cardinality: json_text_path(arguments, &["metadata", "slot_cardinality"])
+                    .or_else(|| json_text_path(arguments, &["content", "slot_cardinality"])),
                 confidence: json_f32_path(arguments, &["metadata", "confidence"]),
                 reason: json_text_path(arguments, &["metadata", "reason"]),
                 intent_summary: json_text(arguments, "intent_summary"),
@@ -10191,6 +10198,34 @@ mod tests {
     }
 
     #[test]
+    fn provider_platform_failure_message_redacts_nested_provider_payload() {
+        let raw = r#"Provider API error: {"error":{"message":"This request requires more credits or fewer tokens. Visit https://provider.example/settings/credits. You requested up to 65536 tokens, but can only afford 13902.","code":402,"metadata":{"raw":"nested provider payload"}}}"#;
+
+        let message = user_visible_platform_failure_message(raw);
+
+        assert!(message.contains("model provider"));
+        assert!(message.contains("quota"));
+        assert!(message.contains("billing"));
+        assert!(!message.contains('{'));
+        assert!(!message.contains("provider.example"));
+        assert!(!message.contains("65536"));
+        assert!(message.chars().count() <= 360);
+    }
+
+    #[test]
+    fn provider_platform_failure_message_handles_rate_limit_without_raw_error_dump() {
+        let raw = r#"upstream failed: {"error":{"message":"Too many requests for this model","status":429,"details":["retry later","burst limit"]}}"#;
+
+        let message = user_visible_platform_failure_message(raw);
+
+        assert!(message.contains("model provider"));
+        assert!(message.contains("rate limit"));
+        assert!(!message.contains('{'));
+        assert!(!message.contains("Too many requests"));
+        assert!(message.chars().count() <= 360);
+    }
+
+    #[test]
     fn primitive_registry_matches_declared_spine_primitives() {
         let registry = ToolRegistry::new();
         let names = registry
@@ -10433,6 +10468,17 @@ mod tests {
         assert!(prompt.contains("user-visible progress prose"));
         assert!(prompt.contains("separate from `_describe`"));
         assert!(prompt.contains("tool-call metadata only"));
+    }
+
+    #[test]
+    fn spine_prompt_requires_clarification_for_location_dependent_discovery_without_location() {
+        let prompt = build_spine_system_prompt("", None, None);
+
+        assert!(prompt.contains("location-dependent"));
+        assert!(prompt.contains("grounded location anchor"));
+        assert!(prompt.contains("ask one concise clarification"));
+        assert!(prompt.contains("Do not substitute timezone"));
+        assert!(prompt.contains("stale memories"));
     }
 
     #[test]
