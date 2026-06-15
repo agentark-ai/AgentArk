@@ -50,7 +50,7 @@ const MAX_EXPORT_FILE_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_CANDIDATE_RECORDS: usize = 64;
 const MAX_EXPORTED_EXPERIENCE_RUNS: u64 = 500;
 const DEFAULT_GEPA_QUIET_WINDOW_SECONDS: i64 = 60;
-const DEFAULT_GEPA_OPTIMIZER_TIMEOUT_SECONDS: u64 = 5 * 60;
+const DEFAULT_GEPA_OPTIMIZER_TIMEOUT_SECONDS: u64 = 30 * 60; // 1800s; background, idle-gated, single-flight
 const DEFAULT_GEPA_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_GEPA_RETENTION_DAYS: u64 = 30;
 const DEFAULT_GEPA_MAX_RUN_DIRS: usize = 80;
@@ -75,6 +75,10 @@ pub struct GepaOptimizerConfig {
     pub max_runs_per_day: u32,
     #[serde(default = "default_true")]
     pub auto_setup: bool,
+    #[serde(default = "default_gepa_optimizer_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_gepa_num_threads")]
+    pub num_threads: u32,
 }
 
 impl Default for GepaOptimizerConfig {
@@ -87,6 +91,8 @@ impl Default for GepaOptimizerConfig {
             per_run_budget_usd: default_gepa_per_run_budget_usd(),
             max_runs_per_day: default_gepa_max_runs_per_day(),
             auto_setup: true,
+            timeout_seconds: default_gepa_optimizer_timeout_seconds(),
+            num_threads: default_gepa_num_threads(),
         }
     }
 }
@@ -162,6 +168,8 @@ pub struct GepaOptimizerRuntime {
     pub auto_mode: String,
     pub max_metric_calls: u32,
     pub per_run_budget_usd: f64,
+    pub num_threads: u32,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,6 +690,8 @@ pub async fn gepa_optimizer_runtime(
         auto_mode: config.auto_mode,
         max_metric_calls: config.max_metric_calls,
         per_run_budget_usd: config.per_run_budget_usd,
+        num_threads: config.num_threads,
+        timeout_seconds: config.timeout_seconds,
     })
 }
 
@@ -1181,6 +1191,7 @@ fn apply_gepa_optimizer_env(command: &mut tokio::process::Command, runtime: &Gep
         "AGENTARK_GEPA_MAX_METRIC_CALLS",
         runtime.max_metric_calls.to_string(),
     );
+    command.env("AGENTARK_GEPA_THREADS", runtime.num_threads.to_string());
     command.env(
         "AGENTARK_GEPA_COST_BUDGET_USD",
         format!("{:.4}", runtime.per_run_budget_usd.max(0.0)),
@@ -2064,6 +2075,12 @@ fn default_gepa_max_metric_calls() -> u32 {
     8
 }
 
+fn default_gepa_num_threads() -> u32 {
+    // GEPA evaluates metrics concurrently; 2 is the bridge cap
+    // (MAX_GEPA_BACKGROUND_THREADS). Keeps load bounded on small machines.
+    2
+}
+
 fn default_gepa_daily_budget_usd() -> f64 {
     1.0
 }
@@ -2112,6 +2129,8 @@ mod tests {
             per_run_budget_usd: 999.0,
             max_runs_per_day: 999,
             auto_setup: true,
+            timeout_seconds: 1800,
+            num_threads: 2,
         });
 
         assert!(!config.enabled);
@@ -2313,5 +2332,42 @@ mod tests {
         assert!(experience_run_export_safe(&run));
         run.metadata = serde_json::json!({ "contains_sensitive_data": true });
         assert!(!experience_run_export_safe(&run));
+    }
+
+    #[test]
+    fn gepa_timeout_and_threads_defaults() {
+        assert_eq!(default_gepa_optimizer_timeout_seconds(), 1800);
+        assert_eq!(default_gepa_num_threads(), 2);
+    }
+
+    #[test]
+    fn gepa_config_deserializes_new_fields_with_defaults() {
+        let c: GepaOptimizerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.timeout_seconds, 1800);
+        assert_eq!(c.num_threads, 2);
+        let d = GepaOptimizerConfig::default();
+        assert_eq!(d.timeout_seconds, 1800);
+        assert_eq!(d.num_threads, 2);
+    }
+
+    #[test]
+    fn apply_env_sets_thread_count() {
+        let runtime = GepaOptimizerRuntime {
+            python_path: std::path::PathBuf::from("python3"),
+            model: "anthropic/x".to_string(),
+            env: std::collections::HashMap::new(),
+            auto_mode: "light".to_string(),
+            max_metric_calls: 8,
+            per_run_budget_usd: 0.5,
+            num_threads: 2,
+            timeout_seconds: 1800,
+        };
+        let mut cmd = tokio::process::Command::new("python3");
+        apply_gepa_optimizer_env(&mut cmd, &runtime);
+        let found = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == "AGENTARK_GEPA_THREADS" && v == Some("2".as_ref()));
+        assert!(found, "AGENTARK_GEPA_THREADS should be set to 2");
     }
 }
