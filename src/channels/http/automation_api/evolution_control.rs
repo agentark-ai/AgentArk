@@ -5548,6 +5548,14 @@ pub(super) async fn update_evolution_settings(
         gepa_config.max_metric_calls = value;
         gepa_config_changed = true;
     }
+    if let Some(value) = request.gepa_timeout_seconds {
+        gepa_config.timeout_seconds = value.clamp(60, 6 * 60 * 60);
+        gepa_config_changed = true;
+    }
+    if let Some(value) = request.gepa_num_threads {
+        gepa_config.num_threads = value.clamp(1, 2);
+        gepa_config_changed = true;
+    }
     if gepa_config_changed {
         if let Err(e) = crate::core::self_evolve::gepa_bridge::save_gepa_optimizer_config(
             &storage,

@@ -1295,6 +1295,8 @@ pub(super) struct EvolutionSettingsUpdateRequest {
     pub(super) gepa_per_run_budget_usd: Option<f64>,
     pub(super) gepa_max_runs_per_day: Option<u32>,
     pub(super) gepa_max_metric_calls: Option<u32>,
+    pub(super) gepa_timeout_seconds: Option<u64>,
+    pub(super) gepa_num_threads: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
