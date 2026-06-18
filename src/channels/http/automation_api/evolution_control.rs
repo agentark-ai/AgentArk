@@ -1194,6 +1194,7 @@ pub(super) fn format_char_count(value: usize) -> String {
 
 const PROMPT_OPTIMIZATION_PROFILE_LIMIT: usize = 24;
 const PROMPT_OPTIMIZATION_HOLDOUT_LIMIT: usize = 8;
+const PROMPT_OPTIMIZATION_RUNTIME_CONTEXT_TARGET_PROMPT_PERCENT: usize = 25;
 
 struct PromptOptimizationOpportunityDraft {
     id: String,
@@ -1272,6 +1273,64 @@ fn prompt_optimization_section_slug(section: &str) -> String {
     } else {
         slug
     }
+}
+
+fn prompt_optimization_proposal_id_for_section(section: &str) -> String {
+    if prompt_optimization_runtime_request_context_section(section) {
+        return "prompt-opt-section-request-context".to_string();
+    }
+    format!(
+        "prompt-opt-section-{}",
+        prompt_optimization_section_slug(section)
+    )
+}
+
+fn prompt_optimization_runtime_request_context_section(section: &str) -> bool {
+    let section = section.trim();
+    if section == "request_context" {
+        return true;
+    }
+    let mut parts = section.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (
+            Some("spine"),
+            Some("runtime"),
+            Some("request_context"),
+            None
+        )
+    )
+}
+
+fn prompt_optimization_stable_spine_section(section: &str) -> bool {
+    let section = section.trim();
+    section.starts_with("spine.")
+        && !prompt_optimization_runtime_request_context_section(section)
+        && !crate::core::agent::spine_prompt_section_is_evolvable(section)
+}
+
+fn prompt_optimization_gepa_eligible_section(section: &str) -> bool {
+    let section = section.trim();
+    if section.is_empty() || prompt_optimization_runtime_request_context_section(section) {
+        return false;
+    }
+    !section.starts_with("spine.") || crate::core::agent::spine_prompt_section_is_evolvable(section)
+}
+
+fn prompt_optimization_runtime_context_target_chars(
+    p95_chars: usize,
+    p95_final_prompt_chars: usize,
+) -> usize {
+    if p95_chars == 0 || p95_final_prompt_chars == 0 {
+        return p95_chars;
+    }
+    let target_percent = crate::core::model::context_budget::read_usize_env(
+        "AGENTARK_SPINE_REQUEST_CONTEXT_TARGET_PROMPT_PERCENT",
+    )
+    .unwrap_or(PROMPT_OPTIMIZATION_RUNTIME_CONTEXT_TARGET_PROMPT_PERCENT)
+    .clamp(5, 60);
+    let target = p95_final_prompt_chars.saturating_mul(target_percent) / 100;
+    p95_chars.min(target.max(1))
 }
 
 fn prompt_optimization_section_label(section: &str) -> String {
@@ -2020,22 +2079,59 @@ fn build_prompt_optimization_section_draft(
         return None;
     }
 
-    let slug = prompt_optimization_section_slug(raw_section);
     let label = prompt_optimization_section_label(raw_section);
     let support = prompt_optimization_section_sample_support(section.samples, summary.sample_count);
-    let mut impact_estimate = vec![
-        format!(
-            "Could reduce up to {} from eligible prompt paths before broader prompt changes.",
-            format_char_count(section.p95_chars)
-        ),
-        format!(
-            "Measured across {} section sample{} out of {} prompt-telemetry sample{}.",
-            section.samples,
-            if section.samples == 1 { "" } else { "s" },
-            summary.sample_count,
-            if summary.sample_count == 1 { "" } else { "s" }
-        ),
-    ];
+    let is_runtime_request_context =
+        prompt_optimization_runtime_request_context_section(raw_section);
+    let is_stable_spine_section = prompt_optimization_stable_spine_section(raw_section);
+    let runtime_context_target_chars = prompt_optimization_runtime_context_target_chars(
+        section.p95_chars,
+        summary.p95_final_prompt_chars,
+    );
+    let mut impact_estimate = if is_runtime_request_context {
+        vec![
+            format!(
+                "Request Context p95: {} -> ~{} after deterministic runtime compaction.",
+                format_char_count(section.p95_chars),
+                format_char_count(runtime_context_target_chars)
+            ),
+            format!(
+                "Measured from {} matching runtime-context sample{} out of {} prompt-telemetry sample{}.",
+                section.samples,
+                if section.samples == 1 { "" } else { "s" },
+                summary.sample_count,
+                if summary.sample_count == 1 { "" } else { "s" }
+            ),
+        ]
+    } else if is_stable_spine_section {
+        vec![
+            format!(
+                "Stable Spine section p95: {}; reduce it in code because it is not a deployable GEPA surface.",
+                format_char_count(section.p95_chars)
+            ),
+            format!(
+                "Measured across {} section sample{} out of {} prompt-telemetry sample{}.",
+                section.samples,
+                if section.samples == 1 { "" } else { "s" },
+                summary.sample_count,
+                if summary.sample_count == 1 { "" } else { "s" }
+            ),
+        ]
+    } else {
+        vec![
+            format!(
+                "Could reduce up to {} from eligible prompt paths before broader prompt changes.",
+                format_char_count(section.p95_chars)
+            ),
+            format!(
+                "Measured across {} section sample{} out of {} prompt-telemetry sample{}.",
+                section.samples,
+                if section.samples == 1 { "" } else { "s" },
+                summary.sample_count,
+                if summary.sample_count == 1 { "" } else { "s" }
+            ),
+        ]
+    };
     if let Some(line) =
         prompt_section_coverage_label(section.p95_chars, summary.p95_final_prompt_chars)
     {
@@ -2049,16 +2145,40 @@ fn build_prompt_optimization_section_draft(
     }
     if let Some(profile) = profile {
         if profile.estimated_saved_tokens_p95 > 0 {
-            impact_estimate.push(format!(
-                "Estimated p95 prompt-token reduction is about {} tokens before GEPA validation.",
-                profile.estimated_saved_tokens_p95
-            ));
+            if is_runtime_request_context {
+                impact_estimate.push(format!(
+                    "Estimated p95 prompt-token reduction is about {} tokens after runtime compaction.",
+                    profile.estimated_saved_tokens_p95
+                ));
+            } else if is_stable_spine_section {
+                impact_estimate.push(format!(
+                    "Estimated p95 prompt-token reduction is about {} tokens after code compaction.",
+                    profile.estimated_saved_tokens_p95
+                ));
+            } else {
+                impact_estimate.push(format!(
+                    "Estimated p95 prompt-token reduction is about {} tokens before GEPA validation.",
+                    profile.estimated_saved_tokens_p95
+                ));
+            }
         }
         if let Some(cost) = profile.estimated_saved_cost_usd_p95 {
-            impact_estimate.push(format!(
-                "Estimated p95 prompt-cost reduction is about ${:.4} before GEPA validation.",
-                cost
-            ));
+            if is_runtime_request_context {
+                impact_estimate.push(format!(
+                    "Estimated p95 prompt-cost reduction is about ${:.4} after runtime compaction.",
+                    cost
+                ));
+            } else if is_stable_spine_section {
+                impact_estimate.push(format!(
+                    "Estimated p95 prompt-cost reduction is about ${:.4} after code compaction.",
+                    cost
+                ));
+            } else {
+                impact_estimate.push(format!(
+                    "Estimated p95 prompt-cost reduction is about ${:.4} before GEPA validation.",
+                    cost
+                ));
+            }
         }
         if let Some(latency) = profile.p95_latency_ms {
             impact_estimate.push(format!(
@@ -2099,46 +2219,112 @@ fn build_prompt_optimization_section_draft(
             "Outcome profile: {:.1}% of matching samples were failed, corrected, slow, or expensive.",
             profile.issue_rate * 100.0
         ));
-        evidence.push(format!(
-            "Holdout set contains {} user-specific case{} for GEPA validation.",
-            profile.holdout_cases.len(),
-            if profile.holdout_cases.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
+        if is_runtime_request_context {
+            evidence.push(
+                "This section is generated from structured runtime request metadata rather than an evolvable prompt/profile fragment."
+                    .to_string(),
+            );
+        } else if is_stable_spine_section {
+            evidence.push(
+                "This stable Spine section is non-evolvable; GEPA prompt-fragment candidates cannot deploy changes to it."
+                    .to_string(),
+            );
+        } else {
+            evidence.push(format!(
+                "Holdout set contains {} user-specific case{} for GEPA validation.",
+                profile.holdout_cases.len(),
+                if profile.holdout_cases.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+    } else if is_runtime_request_context {
+        evidence.push(
+            "This section is generated from structured runtime request metadata rather than an evolvable prompt/profile fragment."
+                .to_string(),
+        );
+    } else if is_stable_spine_section {
+        evidence.push(
+            "This stable Spine section is non-evolvable; GEPA prompt-fragment candidates cannot deploy changes to it."
+                .to_string(),
+        );
     }
-    let mut expected_benefit = vec![
-        "Lower prompt tokens and latency on turns where this section can be represented more compactly.".to_string(),
-        "Keeps the change reviewable because GEPA produces a tested prompt/profile candidate before deployment.".to_string(),
-    ];
+    let mut expected_benefit = if is_runtime_request_context {
+        vec![
+            "Lower prompt tokens and latency by compacting runtime metadata before it is appended to Spine prompts.".to_string(),
+            "Preserves structured keys and truncation metadata so large request context remains explicit instead of silently disappearing.".to_string(),
+        ]
+    } else if is_stable_spine_section {
+        vec![
+            "Lower prompt tokens and latency by shortening the stable Spine contract in code.".to_string(),
+            "Avoids repeated GEPA fallback runs for a section that cannot be changed by prompt-fragment rollout.".to_string(),
+        ]
+    } else {
+        vec![
+            "Lower prompt tokens and latency on turns where this section can be represented more compactly.".to_string(),
+            "Keeps the change reviewable because GEPA produces a tested prompt/profile candidate before deployment.".to_string(),
+        ]
+    };
     if profile.is_some_and(|profile| profile.issue_rate > 0.0) {
         expected_benefit.push(
             "Ranks this work higher because the user's recent slow, costly, corrected, or failed samples are concentrated here."
                 .to_string(),
         );
     }
-    let caveats = vec![
-        "If the section carries critical context, over-compression can reduce answer quality.".to_string(),
-        "The candidate must prove quality in background tests and canary monitoring before deployment.".to_string(),
-    ];
+    let caveats = if is_runtime_request_context {
+        vec![
+            "Very large runtime fields are preview-truncated, so flows that need full payload detail should fetch the referenced artifact or source data explicitly.".to_string(),
+            "Prompt telemetry should be checked after restart to confirm the live p95 reduction on real traffic.".to_string(),
+        ]
+    } else if is_stable_spine_section {
+        vec![
+            "Stable contract wording must keep the durable resource routing and schedule-field rules intact.".to_string(),
+            "Prompt telemetry should be checked after restart to confirm the live p95 reduction on real traffic.".to_string(),
+        ]
+    } else {
+        vec![
+            "If the section carries critical context, over-compression can reduce answer quality.".to_string(),
+            "The candidate must prove quality in background tests and canary monitoring before deployment.".to_string(),
+        ]
+    };
     let score = prompt_optimization_section_score(summary, section)
         + profile
             .map(|profile| profile.opportunity_score * 1.5)
             .unwrap_or_default();
     Some(PromptOptimizationOpportunityDraft {
-        id: format!("prompt-opt-section-{}", slug),
-        title: format!("Reduce {} prompt weight", label),
-        proposal_summary: format!(
-            "Prompt telemetry shows the {} section is a large part of recent prompts. Evolve can ask GEPA to find a smaller representation and test it before rollout.",
-            label
-        ),
+        id: prompt_optimization_proposal_id_for_section(raw_section),
+        title: if is_runtime_request_context {
+            "Reduce Request Context runtime prompt weight".to_string()
+        } else {
+            format!("Reduce {} prompt weight", label)
+        },
+        proposal_summary: if is_runtime_request_context {
+            "Prompt telemetry shows runtime request context is a large part of recent prompts. This path is generated from structured request metadata, so AgentArk should compact it deterministically instead of sending it to GEPA."
+                .to_string()
+        } else if is_stable_spine_section {
+            format!(
+                "Prompt telemetry shows the {} section is a large part of recent prompts. This stable Spine section must be shortened in code; GEPA cannot deploy changes to it.",
+                label
+            )
+        } else {
+            format!(
+                "Prompt telemetry shows the {} section is a large part of recent prompts. Evolve can ask GEPA to find a smaller representation and test it before rollout.",
+                label
+            )
+        },
         evidence,
         expected_benefit,
         caveats,
         risk_level,
-        target_scope: "prompt_profile".to_string(),
+        target_scope: if is_runtime_request_context {
+            "runtime_context".to_string()
+        } else if is_stable_spine_section {
+            "stable_spine_prompt".to_string()
+        } else {
+            "prompt_profile".to_string()
+        },
         change_preview: EvolutionChangePreview {
             before: vec![
                 format!(
@@ -2151,13 +2337,28 @@ fn build_prompt_optimization_section_draft(
                     format_char_count(summary.p95_final_prompt_chars)
                 ),
             ],
-            after: vec![
-                format!(
-                    "Ask GEPA to produce a smaller representation for {} while preserving task-relevant detail.",
-                    label
-                ),
-                "Use background tests and canary monitoring before any stable prompt/profile deployment.".to_string(),
-            ],
+            after: if is_runtime_request_context {
+                vec![
+                    format!(
+                        "Cap and compact structured runtime request context to about {} at p95 for this traffic shape.",
+                        format_char_count(runtime_context_target_chars)
+                    ),
+                    "Keep GEPA reserved for evolvable prompt/profile surfaces that can produce deployable candidates.".to_string(),
+                ]
+            } else if is_stable_spine_section {
+                vec![
+                    format!("Shorten {} in the stable Spine prompt code.", label),
+                    "Do not queue GEPA for this section because it is not an evolvable prompt/profile surface.".to_string(),
+                ]
+            } else {
+                vec![
+                    format!(
+                        "Ask GEPA to produce a smaller representation for {} while preserving task-relevant detail.",
+                        label
+                    ),
+                    "Use background tests and canary monitoring before any stable prompt/profile deployment.".to_string(),
+                ]
+            },
             impact_estimate,
         },
         opportunity: profile.cloned(),
@@ -2620,6 +2821,58 @@ pub(super) async fn update_prompt_optimization_review_state(
     Ok(())
 }
 
+async fn runtime_request_context_compaction_disabled(storage: &crate::storage::Storage) -> bool {
+    storage
+        .get(crate::core::self_evolve::SPINE_REQUEST_CONTEXT_COMPACTION_DISABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+fn apply_runtime_context_compaction_lifecycle(
+    lifecycle: &mut PromptOptimizationLifecycleState,
+    compaction_disabled: bool,
+) {
+    lifecycle.live_surface = Some("runtime_context".to_string());
+    lifecycle.rollout_percent = None;
+    lifecycle.baseline_version = None;
+    lifecycle.candidate_version = None;
+    lifecycle.rollback_recommended = false;
+    if compaction_disabled {
+        lifecycle.status = "rolled_back".to_string();
+        lifecycle.job_status = Some("runtime_compaction_disabled".to_string());
+        lifecycle.rollback_available = false;
+        lifecycle.reason = Some(
+            "Runtime request-context compaction is disabled from Evolve. New Spine requests use the full compact request context until compaction is restored."
+                .to_string(),
+        );
+    } else {
+        lifecycle.status = "deployed".to_string();
+        lifecycle.job_status = Some("not_gepa_eligible".to_string());
+        lifecycle.rollback_available = true;
+        lifecycle.reason = Some(
+            "Runtime request context is compacted deterministically in the Spine request context builder; GEPA is reserved for evolvable prompt/profile surfaces."
+                .to_string(),
+        );
+    }
+}
+
+fn apply_stable_spine_prompt_lifecycle(lifecycle: &mut PromptOptimizationLifecycleState) {
+    lifecycle.status = "deployed".to_string();
+    lifecycle.job_status = Some("not_gepa_eligible".to_string());
+    lifecycle.live_surface = Some("stable_spine_prompt".to_string());
+    lifecycle.rollout_percent = None;
+    lifecycle.baseline_version = None;
+    lifecycle.candidate_version = None;
+    lifecycle.rollback_available = false;
+    lifecycle.rollback_recommended = false;
+    lifecycle.reason = Some(
+        "This stable Spine section is non-evolvable; prompt weight is handled by code changes, so no GEPA background job was queued."
+            .to_string(),
+    );
+}
+
 async fn current_prompt_telemetry_sample_count(storage: &crate::storage::Storage) -> usize {
     let runs = storage
         .list_recent_experience_runs_any_scope(EVOLUTION_DEV_DEFAULT_LIMIT)
@@ -2685,12 +2938,40 @@ fn prompt_optimization_gepa_context_for_profiles(
     profiles
         .iter()
         .find(|profile| {
-            format!(
-                "prompt-opt-section-{}",
-                prompt_optimization_section_slug(&profile.section)
-            ) == proposal_id
+            prompt_optimization_proposal_id_for_section(&profile.section) == proposal_id
+                && prompt_optimization_gepa_eligible_section(&profile.section)
         })
         .map(prompt_optimization_gepa_context_from_profile)
+}
+
+async fn load_prompt_optimization_section_for_proposal(
+    storage: &crate::storage::Storage,
+    proposal_id: &str,
+) -> Option<String> {
+    let proposal_id = proposal_id.trim();
+    if proposal_id.is_empty() {
+        return None;
+    }
+    let runs = storage
+        .list_recent_experience_runs_any_scope(EVOLUTION_DEV_DEFAULT_LIMIT)
+        .await
+        .unwrap_or_default();
+    let traces = storage
+        .list_execution_trace_summaries(None, EVOLUTION_DEV_DEFAULT_LIMIT, 0)
+        .await
+        .unwrap_or_default();
+    let summary = aggregate_prompt_telemetry_summary_with_traces(&runs, &traces);
+    if let Some(section) = summary.top_sections.iter().find(|section| {
+        prompt_optimization_proposal_id_for_section(&section.section) == proposal_id
+    }) {
+        return Some(section.section.clone());
+    }
+    aggregate_prompt_optimization_opportunity_profiles(&runs, &traces)
+        .into_iter()
+        .find(|profile| {
+            prompt_optimization_proposal_id_for_section(&profile.section) == proposal_id
+        })
+        .map(|profile| profile.section)
 }
 
 async fn load_prompt_optimization_gepa_context(
@@ -2848,7 +3129,7 @@ fn gepa_queue_item_effective_status(queue_status: &str, item: &serde_json::Value
 fn gepa_queue_item_reason(item: &serde_json::Value) -> Option<String> {
     let job = item.get("job").unwrap_or(item);
     let result = item.get("result");
-    result
+    let reason = result
         .and_then(|result| result.get("error"))
         .or_else(|| result.and_then(|result| result.get("stderr_tail")))
         .or_else(|| result.and_then(|result| result.get("message")))
@@ -2859,14 +3140,20 @@ fn gepa_queue_item_reason(item: &serde_json::Value) -> Option<String> {
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
+        .map(str::to_string);
+    reason.or_else(|| {
+        (gepa_queue_item_effective_status("", item) == "failed_fallback").then(|| {
+            "GEPA produced only schema-preserving fallback candidates; no deployable optimization was generated.".to_string()
+        })
+    })
 }
 
 fn gepa_queue_item_prompt_candidate_rejection_reason(item: &serde_json::Value) -> Option<String> {
-    let results = item
+    let import_result = item
         .get("result")
-        .and_then(|result| result.get("import_result"))
-        .and_then(|import_result| import_result.get("results"))
+        .and_then(|result| result.get("import_result"))?;
+    let results = import_result
+        .get("results")
         .and_then(|value| value.as_array())?;
     let mut saw_prompt_result = false;
     let mut gate_reason = None;
@@ -2918,6 +3205,30 @@ fn gepa_queue_item_prompt_candidate_rejection_reason(item: &serde_json::Value) -
     }
 
     if !saw_prompt_result {
+        let summary = import_result.get("summary");
+        let imported = [
+            "prompt_candidates",
+            "prompt_fragment_candidates",
+            "specialist_prompt_candidates",
+            "arkdistill_candidates",
+            "router_learning_candidates",
+        ]
+        .into_iter()
+        .filter_map(|key| summary.and_then(|summary| summary.get(key)))
+        .filter_map(|value| value.as_u64())
+        .sum::<u64>();
+        if imported == 0 {
+            let detail = summary
+                .and_then(|summary| summary.get("rejected_candidates"))
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.iter().find_map(|item| item.as_str()))
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            return Some(match detail {
+                Some(detail) => format!("No valid GEPA candidate was imported: {detail}"),
+                None => "No valid GEPA candidate was imported.".to_string(),
+            });
+        }
         return None;
     }
     gate_reason
@@ -2929,7 +3240,7 @@ fn prompt_background_status_from_gepa_status(status: &str) -> String {
         "running" => "running_background_test".to_string(),
         "pending" => "queued_for_background_test".to_string(),
         "completed" => "background_test_completed".to_string(),
-        "failed" | "timed_out" | "blocked" | "error" => "blocked".to_string(),
+        "failed" | "failed_fallback" | "timed_out" | "blocked" | "error" => "blocked".to_string(),
         other => other.to_string(),
     }
 }
@@ -3075,7 +3386,7 @@ fn prompt_optimization_terminal_queue_status(
     }
     if matches!(
         effective_status.as_str(),
-        "failed" | "timed_out" | "blocked" | "error"
+        "failed" | "failed_fallback" | "timed_out" | "blocked" | "error"
     ) {
         return Some((
             "blocked".to_string(),
@@ -3222,7 +3533,10 @@ pub(super) fn prompt_optimization_terminal_retry_sample_gap(
     let job_status = lifecycle.job_status.as_deref().unwrap_or_default().trim();
     let terminal_background_failure = status == "candidate_rejected"
         || matches!(status, "blocked" | "test_stopped" | "rolled_back")
-            && matches!(job_status, "blocked" | "failed" | "timed_out" | "error");
+            && matches!(
+                job_status,
+                "blocked" | "failed" | "failed_fallback" | "timed_out" | "error"
+            );
     if !terminal_background_failure {
         return None;
     }
@@ -3252,6 +3566,7 @@ pub(super) fn build_prompt_optimization_lifecycle(
     gepa_queue: &serde_json::Value,
     prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
     prompt_rollback_available: bool,
+    runtime_context_compaction_disabled: bool,
 ) -> PromptOptimizationLifecycleState {
     let review_status = review_entry
         .map(|entry| entry.status.trim())
@@ -3274,6 +3589,20 @@ pub(super) fn build_prompt_optimization_lifecycle(
     if review_status != "approved" {
         lifecycle.status = "suggested".to_string();
         lifecycle.rollback_available = false;
+        return lifecycle;
+    }
+    if opportunity.is_some_and(|profile| {
+        prompt_optimization_runtime_request_context_section(&profile.section)
+    }) {
+        apply_runtime_context_compaction_lifecycle(
+            &mut lifecycle,
+            runtime_context_compaction_disabled,
+        );
+        return lifecycle;
+    }
+    if opportunity.is_some_and(|profile| prompt_optimization_stable_spine_section(&profile.section))
+    {
+        apply_stable_spine_prompt_lifecycle(&mut lifecycle);
         return lifecycle;
     }
 
@@ -3729,6 +4058,7 @@ pub(super) fn build_prompt_optimization_proposal(
     gepa_queue: &serde_json::Value,
     prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
     prompt_rollback_available: bool,
+    runtime_context_compaction_disabled: bool,
     id: &str,
     title: &str,
     proposal_summary: &str,
@@ -3756,6 +4086,7 @@ pub(super) fn build_prompt_optimization_proposal(
         gepa_queue,
         prompt_canary_state,
         prompt_rollback_available,
+        runtime_context_compaction_disabled,
     );
 
     PromptOptimizationProposal {
@@ -3784,6 +4115,7 @@ pub(super) fn build_prompt_optimization_opportunities(
     gepa_queue: &serde_json::Value,
     prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
     prompt_rollback_available: bool,
+    runtime_context_compaction_disabled: bool,
 ) -> Vec<PromptOptimizationProposal> {
     if summary.sample_count == 0 {
         return Vec::new();
@@ -3808,6 +4140,8 @@ pub(super) fn build_prompt_optimization_opportunities(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.id.cmp(&right.id))
     });
+    let mut seen_ids = std::collections::BTreeSet::new();
+    drafts.retain(|draft| seen_ids.insert(draft.id.clone()));
 
     drafts
         .into_iter()
@@ -3820,6 +4154,7 @@ pub(super) fn build_prompt_optimization_opportunities(
                 gepa_queue,
                 prompt_canary_state,
                 prompt_rollback_available,
+                runtime_context_compaction_disabled,
                 &draft.id,
                 &draft.title,
                 &draft.proposal_summary,
@@ -4237,6 +4572,7 @@ pub(super) async fn build_evolution_settings_response(
         .is_some();
     let gepa_config =
         crate::core::self_evolve::gepa_bridge::load_gepa_optimizer_config(storage).await;
+    let gepa_run_estimate = build_gepa_run_estimate(&gepa_config, agent_config, primary_model_id);
     let gepa_auto_state =
         crate::core::self_evolve::gepa_bridge::load_gepa_auto_run_state(storage).await;
     let gepa_last_result =
@@ -4295,10 +4631,58 @@ pub(super) async fn build_evolution_settings_response(
         deploy_guard_default: load_deploy_guard_default(storage).await,
         readiness_policy,
         gepa_config,
+        gepa_run_estimate,
         gepa_readiness,
         gepa_auto_state,
         gepa_last_result,
         gepa_queue,
+    }
+}
+
+fn build_gepa_run_estimate(
+    config: &crate::core::self_evolve::gepa_bridge::GepaOptimizerConfig,
+    agent_config: &crate::core::runtime::config::AgentConfig,
+    primary_model_id: &str,
+) -> crate::core::self_evolve::gepa_bridge::GepaRunEstimate {
+    let without_cost = crate::core::self_evolve::gepa_bridge::estimate_gepa_run(config, None);
+    let estimated_cost_usd =
+        selected_gepa_priced_model(agent_config, primary_model_id).and_then(|model| {
+            crate::channels::http::estimate_cost_from_pricing_cache(
+                model,
+                u64::from(without_cost.estimated_calls) * without_cost.input_tokens_per_call,
+                u64::from(without_cost.estimated_calls) * without_cost.output_tokens_per_call,
+            )
+        });
+    crate::core::self_evolve::gepa_bridge::estimate_gepa_run(config, estimated_cost_usd)
+}
+
+fn selected_gepa_priced_model<'a>(
+    config: &'a crate::core::runtime::config::AgentConfig,
+    primary_model_id: &str,
+) -> Option<&'a str> {
+    let slot = config
+        .model_pool
+        .slots
+        .iter()
+        .find(|slot| slot.enabled && slot.id == primary_model_id)
+        .or_else(|| {
+            config.model_pool.slots.iter().find(|slot| {
+                slot.enabled
+                    && matches!(slot.role, crate::core::runtime::config::ModelRole::Primary)
+            })
+        })
+        .or_else(|| config.model_pool.slots.iter().find(|slot| slot.enabled))?;
+    match &slot.provider {
+        crate::core::LlmProvider::OpenAI {
+            model, base_url, ..
+        } if base_url
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().contains("openrouter"))
+            .unwrap_or(false) =>
+        {
+            Some(model.as_str())
+        }
+        _ => None,
     }
 }
 
@@ -5059,6 +5443,8 @@ pub(super) async fn build_evolution_dev_response(
         .ok()
         .flatten()
         .is_some();
+    let runtime_context_compaction_disabled =
+        runtime_request_context_compaction_disabled(storage).await;
     let gepa_queue_for_lifecycle =
         match crate::core::self_evolve::gepa_bridge::queue_status_snapshot(
             &resolve_project_root(),
@@ -5094,6 +5480,7 @@ pub(super) async fn build_evolution_dev_response(
         &gepa_queue_for_lifecycle,
         prompt_canary_state.as_ref(),
         prompt_rollback_available,
+        runtime_context_compaction_disabled,
     );
     let prompt_insights = build_prompt_insights(&prompt_metrics, prompt_canary_state.as_ref());
     // Canary-judge outputs for the UI: the stable-promotion recommendation
@@ -5545,7 +5932,7 @@ pub(super) async fn update_evolution_settings(
         gepa_config_changed = true;
     }
     if let Some(value) = request.gepa_max_metric_calls {
-        gepa_config.max_metric_calls = value;
+        gepa_config.max_metric_calls = value.clamp(1, 8);
         gepa_config_changed = true;
     }
     if let Some(value) = request.gepa_timeout_seconds {
@@ -5553,7 +5940,7 @@ pub(super) async fn update_evolution_settings(
         gepa_config_changed = true;
     }
     if let Some(value) = request.gepa_num_threads {
-        gepa_config.num_threads = value.clamp(1, 2);
+        gepa_config.num_threads = value.clamp(1, 8);
         gepa_config_changed = true;
     }
     if gepa_config_changed {
@@ -6768,59 +7155,66 @@ pub(super) async fn run_evolution_dev_action(
                 let agent = state.agent.read().await;
                 agent.clone()
             };
-            let trace_ref = Arc::new(RwLock::new(ExecutionTrace::default()));
-            let call = crate::core::ToolCall {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: "self_evolve".to_string(),
-                arguments: serde_json::json!({
-                    "mode": "gepa_run",
-                    "request": "Use recent Evolve evidence to generate GEPA prompt candidates.",
-                    "gepa_quiet_window_seconds": 60,
-                    "apply_promotion": false,
-                    "import_after_run": true,
-                }),
-                activity_label: None,
-            };
-            let raw = match agent
-                .handle_self_evolve_tool_call(&call, &trace_ref, None)
+            let readiness = crate::core::self_evolve::gepa_bridge::check_gepa_readiness(
+                &storage,
+                &project_root,
+                &agent_config,
+                &primary_model_id,
+            )
+            .await;
+            if !readiness.ready {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: readiness
+                            .issues
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "GEPA optimizer is not ready.".to_string()),
+                    }),
+                )
+                    .into_response();
+            }
+            let (pending_jobs, running_jobs) =
+                match crate::core::self_evolve::gepa_bridge::active_job_counts(&project_root).await
+                {
+                    Ok(counts) => counts,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to check GEPA queue: {}", error),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+            if pending_jobs > 0 || running_jobs > 0 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "A GEPA optimization is already queued or running.".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            match agent
+                .queue_gepa_seed_run(
+                    "Use recent Evolve evidence to generate GEPA prompt candidates.",
+                    GEPA_AUTO_QUIET_WINDOW_SECS,
+                )
                 .await
             {
-                Ok(raw) => raw,
+                Ok(_) => "GEPA run approved and queued for quiet time. It will run as one bounded idle job; no runtime behavior changes until you deploy a candidate.".to_string(),
                 Err(error) => {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
-                            error: format!("GEPA run failed: {}", error),
+                            error: format!("GEPA run could not be queued: {}", error),
                         }),
                     )
                         .into_response();
                 }
-            };
-            let result = serde_json::from_str::<serde_json::Value>(&raw)
-                .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
-            let status = result
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("completed");
-            match status {
-                "queued" => "GEPA run queued and will start when AgentArk is idle.".to_string(),
-                "blocked" => result
-                    .get("error")
-                    .and_then(|value| value.as_str())
-                    .map(|error| format!("GEPA run blocked: {}", error))
-                    .unwrap_or_else(|| {
-                        "GEPA run was blocked by readiness or budget gates.".to_string()
-                    }),
-                "completed" => {
-                    "GEPA run completed and tracked candidates for user review; no runtime behavior changed.".to_string()
-                }
-                "timed_out" => "GEPA run timed out; it was recorded for review.".to_string(),
-                "failed" => result
-                    .get("stderr_tail")
-                    .and_then(|value| value.as_str())
-                    .map(|error| format!("GEPA run failed: {}", error))
-                    .unwrap_or_else(|| "GEPA run failed; check Evolve status.".to_string()),
-                _ => "GEPA run finished; check Evolve status for details.".to_string(),
             }
         }
         "run_guided_optimization" => {
@@ -6889,6 +7283,29 @@ pub(super) async fn run_evolution_dev_action(
                             "Candidate is '{}'; only surfaced candidates can be approved.",
                             opportunity.status
                         ),
+                    }),
+                )
+                    .into_response();
+            }
+            let (pending_jobs, running_jobs) =
+                match crate::core::self_evolve::gepa_bridge::active_job_counts(&project_root).await
+                {
+                    Ok(counts) => counts,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to check GEPA queue: {}", error),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+            if pending_jobs > 0 || running_jobs > 0 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "A GEPA optimization is already queued or running.".to_string(),
                     }),
                 )
                     .into_response();
@@ -8270,8 +8687,18 @@ pub(super) async fn run_evolution_dev_action(
                     "Failed to reconcile prompt optimization lifecycle before approval action"
                 );
             }
+            let proposal_section =
+                load_prompt_optimization_section_for_proposal(&storage, proposal_id).await;
+            let deterministic_runtime_context = proposal_section
+                .as_deref()
+                .is_some_and(prompt_optimization_runtime_request_context_section);
+            let stable_spine_section = proposal_section
+                .as_deref()
+                .is_some_and(prompt_optimization_stable_spine_section);
+            let code_managed_section = deterministic_runtime_context || stable_spine_section;
             if let Some((fresh_samples, required_samples)) = prompt_optimization_review_state
                 .get(proposal_id)
+                .filter(|_| !code_managed_section)
                 .and_then(|entry| {
                     prompt_optimization_terminal_retry_sample_gap(&entry.lifecycle, sample_baseline)
                 })
@@ -8301,10 +8728,36 @@ pub(super) async fn run_evolution_dev_action(
             let mut queued_job_path: Option<String> = None;
             let mut queued_job_id: Option<String> = None;
             let mut queued_at: Option<String> = None;
+            let mut lifecycle_live_surface: Option<String> = None;
+            let mut lifecycle_deployed_at: Option<String> = None;
             let mut opportunity_required_samples = 0usize;
             let mut queued_new_prompt_optimization = false;
 
-            if let Some((job_status, item)) = existing_job {
+            if deterministic_runtime_context {
+                lifecycle_status = "deployed".to_string();
+                lifecycle_reason = Some(
+                    "Runtime request context is compacted deterministically in the Spine request context builder; GEPA is reserved for evolvable prompt/profile surfaces."
+                        .to_string(),
+                );
+                lifecycle_job_status = Some("not_gepa_eligible".to_string());
+                lifecycle_live_surface = Some("runtime_context".to_string());
+                lifecycle_deployed_at = Some(now.clone());
+                message.push_str(
+                    " Runtime request context compaction is handled in code; no GEPA job was queued.",
+                );
+            } else if stable_spine_section {
+                lifecycle_status = "deployed".to_string();
+                lifecycle_reason = Some(
+                    "This stable Spine section is non-evolvable; prompt weight is handled by code changes, so no GEPA background job was queued."
+                        .to_string(),
+                );
+                lifecycle_job_status = Some("not_gepa_eligible".to_string());
+                lifecycle_live_surface = Some("stable_spine_prompt".to_string());
+                lifecycle_deployed_at = Some(now.clone());
+                message.push_str(
+                    " This stable Spine section is handled in code; no GEPA job was queued.",
+                );
+            } else if let Some((job_status, item)) = existing_job {
                 let job = item.get("job").unwrap_or(item);
                 let effective_status = gepa_queue_item_effective_status(job_status, item);
                 lifecycle_status = prompt_background_status_from_gepa_status(&effective_status);
@@ -8427,6 +8880,10 @@ pub(super) async fn run_evolution_dev_action(
                         queued_job_id.or_else(|| lifecycle.queued_job_id.clone());
                     lifecycle.queued_job_path =
                         queued_job_path.or_else(|| lifecycle.queued_job_path.clone());
+                    lifecycle.live_surface =
+                        lifecycle_live_surface.or_else(|| lifecycle.live_surface.clone());
+                    lifecycle.deployed_at =
+                        lifecycle_deployed_at.or_else(|| lifecycle.deployed_at.clone());
                     if queued_new_prompt_optimization {
                         lifecycle.terminal_baseline_job_id = None;
                     }
@@ -8442,7 +8899,13 @@ pub(super) async fn run_evolution_dev_action(
                             lifecycle.required_samples,
                             opportunity_required_samples,
                         );
-                    lifecycle.rollback_available = false;
+                    if deterministic_runtime_context {
+                        apply_runtime_context_compaction_lifecycle(lifecycle, false);
+                    } else if stable_spine_section {
+                        apply_stable_spine_prompt_lifecycle(lifecycle);
+                    } else {
+                        lifecycle.rollback_available = false;
+                    }
                 },
             )
             .await
@@ -8488,6 +8951,122 @@ pub(super) async fn run_evolution_dev_action(
                 "Recorded rejection for prompt optimization proposal '{}'. Runtime prompt behavior remains unchanged.",
                 proposal_id
             )
+        }
+        "rollback_runtime_context_compaction" => {
+            let Some(proposal_id) = request
+                .proposal_id
+                .as_deref()
+                .or(request.candidate_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "proposal_id or candidate_id is required to roll back runtime request-context compaction."
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            let now = chrono::Utc::now().to_rfc3339();
+            let disabled_state = serde_json::json!({
+                "disabled_at": now,
+                "source": "evolve_ui",
+            });
+            let disabled_bytes =
+                serde_json::to_vec(&disabled_state).unwrap_or_else(|_| b"1".to_vec());
+            if let Err(error) = storage
+                .set(
+                    crate::core::self_evolve::SPINE_REQUEST_CONTEXT_COMPACTION_DISABLED_KEY,
+                    &disabled_bytes,
+                )
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Failed to roll back runtime request-context compaction: {}",
+                            error
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+            if let Err(error) = update_prompt_optimization_lifecycle(
+                &storage,
+                proposal_id,
+                "approved",
+                None,
+                |lifecycle| {
+                    apply_runtime_context_compaction_lifecycle(lifecycle, true);
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    error = %error,
+                    "Failed to update runtime context compaction lifecycle after rollback"
+                );
+            }
+            "Runtime request-context compaction is rolled back. New Spine requests will use the full compact request context."
+                .to_string()
+        }
+        "restore_runtime_context_compaction" => {
+            let Some(proposal_id) = request
+                .proposal_id
+                .as_deref()
+                .or(request.candidate_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "proposal_id or candidate_id is required to restore runtime request-context compaction."
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            if let Err(error) = storage
+                .delete(crate::core::self_evolve::SPINE_REQUEST_CONTEXT_COMPACTION_DISABLED_KEY)
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Failed to restore runtime request-context compaction: {}",
+                            error
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            if let Err(error) = update_prompt_optimization_lifecycle(
+                &storage,
+                proposal_id,
+                "approved",
+                None,
+                |lifecycle| {
+                    lifecycle.deployed_at = Some(now.clone());
+                    apply_runtime_context_compaction_lifecycle(lifecycle, false);
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    error = %error,
+                    "Failed to update runtime context compaction lifecycle after restore"
+                );
+            }
+            "Runtime request-context compaction is restored. New Spine requests will use the deterministic compacted context."
+                .to_string()
         }
         "disable_prompt_canary" => {
             let Some(surface) = request
@@ -8816,7 +9395,7 @@ pub(super) async fn run_evolution_dev_action(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Unsupported action. Use run_guided_optimization, disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, reject_learning_candidate, approve_prompt_optimization_proposal, reject_prompt_optimization_proposal, disable_prompt_canary, promote_prompt_canary_candidate, rollback_prompt_baseline, disable_prompt_canary_candidate, or keep_prompt_canary_candidate."
+                    error: "Unsupported action. Use run_guided_optimization, disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, reject_learning_candidate, approve_prompt_optimization_proposal, reject_prompt_optimization_proposal, rollback_runtime_context_compaction, restore_runtime_context_compaction, disable_prompt_canary, promote_prompt_canary_candidate, rollback_prompt_baseline, disable_prompt_canary_candidate, or keep_prompt_canary_candidate."
                         .to_string(),
                 }),
             )
@@ -9007,6 +9586,296 @@ mod tests {
             ..Default::default()
         };
         assert!(evolve_candidate_scan_message(&surfaced).contains("ready for review"));
+    }
+
+    #[test]
+    fn runtime_context_prompt_optimization_uses_deterministic_path() {
+        let summary = PromptTelemetrySummary {
+            sample_count: 100,
+            p95_final_prompt_chars: 61_447,
+            p95_estimated_total_request_chars: 78_000,
+            top_sections: vec![PromptTelemetrySectionSummary {
+                section: "request_context".to_string(),
+                samples: 82,
+                avg_chars: 21_000.0,
+                p50_chars: 18_000,
+                p95_chars: 31_703,
+            }],
+            ..Default::default()
+        };
+        let section = summary.top_sections.first().expect("test section");
+
+        let draft = build_prompt_optimization_section_draft(&summary, section, None)
+            .expect("runtime context should surface as an optimization opportunity");
+
+        assert_eq!(draft.target_scope, "runtime_context");
+        assert!(draft
+            .change_preview
+            .impact_estimate
+            .iter()
+            .any(|line| line.contains("Request Context p95: 31,703 chars -> ~")));
+        assert!(draft
+            .expected_benefit
+            .iter()
+            .chain(draft.caveats.iter())
+            .all(|line| !line.contains("GEPA")));
+    }
+
+    #[test]
+    fn stable_spine_prompt_optimization_uses_code_managed_path() {
+        let summary = PromptTelemetrySummary {
+            sample_count: 44,
+            p95_final_prompt_chars: 12_000,
+            top_sections: vec![PromptTelemetrySectionSummary {
+                section: "spine.durable_resource_contracts".to_string(),
+                samples: 44,
+                avg_chars: 2_500.0,
+                p50_chars: 2_400,
+                p95_chars: 3_200,
+            }],
+            ..Default::default()
+        };
+        let section = summary.top_sections.first().expect("test section");
+
+        let draft = build_prompt_optimization_section_draft(&summary, section, None)
+            .expect("stable spine section should surface as a code-managed opportunity");
+
+        assert_eq!(draft.target_scope, "stable_spine_prompt");
+        assert!(draft.proposal_summary.contains("GEPA cannot deploy"));
+        assert!(draft
+            .change_preview
+            .after
+            .iter()
+            .any(|line| line.contains("Do not queue GEPA")));
+    }
+
+    #[test]
+    fn runtime_context_prompt_optimization_dedupes_telemetry_aliases() {
+        let summary = PromptTelemetrySummary {
+            sample_count: 100,
+            p95_final_prompt_chars: 61_447,
+            top_sections: vec![
+                PromptTelemetrySectionSummary {
+                    section: "request_context".to_string(),
+                    samples: 82,
+                    avg_chars: 21_000.0,
+                    p50_chars: 18_000,
+                    p95_chars: 31_703,
+                },
+                PromptTelemetrySectionSummary {
+                    section: "spine.runtime.request_context".to_string(),
+                    samples: 82,
+                    avg_chars: 21_000.0,
+                    p50_chars: 18_000,
+                    p95_chars: 31_698,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let proposals = build_prompt_optimization_opportunities(
+            &summary,
+            &[],
+            &[],
+            &PromptOptimizationReviewState::default(),
+            &serde_json::Value::Null,
+            None,
+            false,
+            false,
+        );
+
+        let runtime_proposals = proposals
+            .iter()
+            .filter(|proposal| proposal.target_scope == "runtime_context")
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_proposals.len(), 1);
+        assert_eq!(
+            runtime_proposals[0].id,
+            "prompt-opt-section-request-context"
+        );
+    }
+
+    #[test]
+    fn runtime_context_profiles_are_not_exported_to_gepa() {
+        let runtime_profile = PromptOptimizationOpportunityProfile {
+            section: "request_context".to_string(),
+            label: "Request Context".to_string(),
+            samples: 10,
+            ..Default::default()
+        };
+        let runtime_proposal_id =
+            prompt_optimization_proposal_id_for_section(&runtime_profile.section);
+
+        assert!(prompt_optimization_gepa_context_for_profiles(
+            &runtime_proposal_id,
+            &[runtime_profile]
+        )
+        .is_none());
+
+        let evolvable_profile = PromptOptimizationOpportunityProfile {
+            section: "spine.final_answer_policy".to_string(),
+            label: "Final Answer Policy".to_string(),
+            samples: 10,
+            ..Default::default()
+        };
+        let evolvable_proposal_id =
+            prompt_optimization_proposal_id_for_section(&evolvable_profile.section);
+
+        assert!(prompt_optimization_gepa_context_for_profiles(
+            &evolvable_proposal_id,
+            &[evolvable_profile]
+        )
+        .is_some());
+
+        let stable_spine_profile = PromptOptimizationOpportunityProfile {
+            section: "spine.durable_resource_contracts".to_string(),
+            label: "Spine Durable Resource Contracts".to_string(),
+            samples: 10,
+            ..Default::default()
+        };
+        let stable_spine_proposal_id =
+            prompt_optimization_proposal_id_for_section(&stable_spine_profile.section);
+
+        assert!(prompt_optimization_gepa_context_for_profiles(
+            &stable_spine_proposal_id,
+            &[stable_spine_profile]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn approved_runtime_context_lifecycle_bypasses_failed_gepa_retry_gate() {
+        let opportunity = PromptOptimizationOpportunityProfile {
+            section: "request_context".to_string(),
+            label: "Request Context".to_string(),
+            samples: 56,
+            confidence_sample_target: 36,
+            ..Default::default()
+        };
+        let review_entry = PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "blocked".to_string(),
+                job_status: Some("failed".to_string()),
+                sample_baseline: 56,
+                required_samples: 36,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            prompt_optimization_terminal_retry_sample_gap(&review_entry.lifecycle, 56).is_some()
+        );
+
+        let lifecycle = build_prompt_optimization_lifecycle(
+            "prompt-opt-section-request-context",
+            Some(&review_entry),
+            Some(&opportunity),
+            &PromptTelemetrySummary {
+                sample_count: 56,
+                ..Default::default()
+            },
+            &[],
+            &serde_json::Value::Null,
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(lifecycle.status, "deployed");
+        assert_eq!(lifecycle.job_status.as_deref(), Some("not_gepa_eligible"));
+        assert_eq!(lifecycle.live_surface.as_deref(), Some("runtime_context"));
+    }
+
+    #[test]
+    fn approved_stable_spine_lifecycle_bypasses_failed_gepa_retry_gate() {
+        let opportunity = PromptOptimizationOpportunityProfile {
+            section: "spine.durable_resource_contracts".to_string(),
+            label: "Spine Durable Resource Contracts".to_string(),
+            samples: 44,
+            confidence_sample_target: 36,
+            ..Default::default()
+        };
+        let review_entry = PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "blocked".to_string(),
+                job_status: Some("failed_fallback".to_string()),
+                sample_baseline: 44,
+                required_samples: 36,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            prompt_optimization_terminal_retry_sample_gap(&review_entry.lifecycle, 44).is_some()
+        );
+
+        let lifecycle = build_prompt_optimization_lifecycle(
+            "prompt-opt-section-spine-durable-resource-contracts",
+            Some(&review_entry),
+            Some(&opportunity),
+            &PromptTelemetrySummary {
+                sample_count: 44,
+                ..Default::default()
+            },
+            &[],
+            &serde_json::Value::Null,
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(lifecycle.status, "deployed");
+        assert_eq!(lifecycle.job_status.as_deref(), Some("not_gepa_eligible"));
+        assert_eq!(
+            lifecycle.live_surface.as_deref(),
+            Some("stable_spine_prompt")
+        );
+    }
+
+    #[test]
+    fn failed_fallback_gepa_queue_item_has_user_visible_reason() {
+        let item = serde_json::json!({
+            "result": {
+                "status": "failed_fallback"
+            }
+        });
+
+        assert_eq!(
+            prompt_background_status_from_gepa_status("failed_fallback"),
+            "blocked"
+        );
+        assert!(gepa_queue_item_reason(&item)
+            .unwrap_or_default()
+            .contains("fallback candidates"));
+    }
+
+    #[test]
+    fn runtime_context_compaction_lifecycle_supports_ui_rollback_and_restore() {
+        let mut lifecycle = PromptOptimizationLifecycleState::default();
+
+        apply_runtime_context_compaction_lifecycle(&mut lifecycle, false);
+        assert_eq!(lifecycle.status, "deployed");
+        assert_eq!(lifecycle.job_status.as_deref(), Some("not_gepa_eligible"));
+        assert_eq!(lifecycle.live_surface.as_deref(), Some("runtime_context"));
+        assert!(lifecycle.rollback_available);
+
+        apply_runtime_context_compaction_lifecycle(&mut lifecycle, true);
+        assert_eq!(lifecycle.status, "rolled_back");
+        assert_eq!(
+            lifecycle.job_status.as_deref(),
+            Some("runtime_compaction_disabled")
+        );
+        assert_eq!(lifecycle.live_surface.as_deref(), Some("runtime_context"));
+        assert!(!lifecycle.rollback_available);
+
+        apply_runtime_context_compaction_lifecycle(&mut lifecycle, false);
+        assert_eq!(lifecycle.status, "deployed");
+        assert_eq!(lifecycle.job_status.as_deref(), Some("not_gepa_eligible"));
+        assert!(lifecycle.rollback_available);
     }
 
     #[test]

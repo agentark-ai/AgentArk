@@ -686,12 +686,6 @@ export function SettingsSecurityPanel({
                             </Stack>
                           ),
                         })}
-                        <Alert severity="info" sx={{ py: 0.5 }}>
-                          Pick Cloudflare, Tailscale, ngrok, bore, or any
-                          available provider here. Provider-specific auth,
-                          OAuth, token, key, and advanced fields appear in this
-                          popup before you start access.
-                        </Alert>
                         {tunnelQ.isLoading || tunnelProvidersQ.isLoading ? (
                           <Typography
                             variant="body2"
@@ -709,35 +703,12 @@ export function SettingsSecurityPanel({
                           </Alert>
                         ) : (
                           <Stack spacing={1.1}>
-                            <Alert
-                              severity={tunnelSummaryTone}
-                              sx={{
-                                py: 0.25,
-                                "& .MuiAlert-message": { width: "100%" },
-                              }}
-                            >
-                              <Stack spacing={0.35}>
-                                <Typography
-                                  variant="body2"
-                                  sx={{ fontWeight: 600 }}
-                                >
-                                  {tunnelPrimaryText}
-                                </Typography>
-                                <Typography
-                                  variant="body2"
-                                  sx={{
-                                    color: "inherit",
-                                  }}
-                                >
-                                  {tunnelPrimaryDetail}
-                                </Typography>
-                              </Stack>
-                            </Alert>
                             <TextField
                               label="Access method"
                               select
                               size="small"
                               fullWidth
+                              helperText="Provider auth fields appear below when needed."
                               value={
                                 tunnelSelectedProviderId ||
                                 serverSelectedTunnelProviderId
@@ -766,6 +737,22 @@ export function SettingsSecurityPanel({
                                 );
                               })}
                             </TextField>
+                            <Stack spacing={0.25} sx={{ px: 0.25 }}>
+                              <Typography
+                                variant="body2"
+                                sx={{ fontWeight: 600 }}
+                              >
+                                {tunnelPrimaryText}
+                              </Typography>
+                              {tunnelPrimaryDetail ? (
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "text.secondary" }}
+                                >
+                                  {tunnelPrimaryDetail}
+                                </Typography>
+                              ) : null}
+                            </Stack>
                             {basicTunnelConfigFields.map((field: any) => {
                               const key = str(field.key, "");
                               const inputType = str(field.input_type, "text");

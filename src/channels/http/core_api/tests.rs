@@ -3842,6 +3842,7 @@ fn build_prompt_optimization_opportunities_include_change_preview() {
         &serde_json::json!({}),
         None,
         false,
+        false,
     );
     let proposal = proposals
         .iter()
@@ -3889,6 +3890,7 @@ fn build_prompt_optimization_opportunities_surface_arbitrary_large_prompt_sectio
         &PromptOptimizationReviewState::new(),
         &serde_json::json!({}),
         None,
+        false,
         false,
     );
 
@@ -3996,6 +3998,7 @@ fn prompt_optimization_opportunities_prioritize_outcome_heavy_user_sections() {
         &serde_json::json!({}),
         None,
         false,
+        false,
     );
 
     let first = proposals
@@ -4098,6 +4101,7 @@ fn prompt_optimization_risk_is_not_inflated_by_issue_rate_alone() {
         &PromptOptimizationReviewState::new(),
         &serde_json::json!({}),
         None,
+        false,
         false,
     );
 
@@ -4218,6 +4222,7 @@ fn approved_prompt_optimization_uses_opportunity_confidence_target() {
         }),
         None,
         false,
+        false,
         "prompt-opt-section-action-catalog",
         "Reduce Action Catalog prompt weight",
         "Prompt telemetry shows Action Catalog can be tested.",
@@ -4275,6 +4280,7 @@ fn approved_prompt_optimization_with_missing_gepa_job_is_not_shown_as_queued() {
             "failed": [],
         }),
         None,
+        false,
         false,
     );
 
@@ -4335,6 +4341,7 @@ fn completed_gepa_job_with_blocked_result_is_not_candidate_ready() {
             "failed": [],
         }),
         None,
+        false,
         false,
     );
 
@@ -4404,6 +4411,7 @@ fn completed_gepa_job_with_rejected_prompt_import_is_not_candidate_ready() {
         }),
         None,
         false,
+        false,
     );
 
     assert_eq!(lifecycle.status, "candidate_rejected");
@@ -4412,6 +4420,78 @@ fn completed_gepa_job_with_rejected_prompt_import_is_not_candidate_ready() {
         lifecycle.reason.as_deref(),
         Some("Not promoted: score improvement was below the promotion threshold.")
     );
+}
+
+#[test]
+fn completed_gepa_job_with_zero_imported_candidates_is_not_candidate_ready() {
+    let mut review_state = PromptOptimizationReviewState::new();
+    review_state.insert(
+        "prompt-opt-section-spine-artifact-delivery-policy".to_string(),
+        PromptOptimizationReviewEntry {
+            status: "approved".to_string(),
+            reviewed_at: Some("2026-06-16T17:30:52Z".to_string()),
+            lifecycle: PromptOptimizationLifecycleState {
+                status: "running_background_test".to_string(),
+                sample_baseline: 204,
+                required_samples: 40,
+                ..PromptOptimizationLifecycleState::default()
+            },
+        },
+    );
+    let summary = PromptTelemetrySummary {
+        sample_count: 204,
+        ..PromptTelemetrySummary::default()
+    };
+
+    let lifecycle = build_prompt_optimization_lifecycle(
+        "prompt-opt-section-spine-artifact-delivery-policy",
+        review_state.get("prompt-opt-section-spine-artifact-delivery-policy"),
+        None,
+        &summary,
+        &[],
+        &serde_json::json!({
+            "pending": [],
+            "running": [],
+            "completed": [{
+                "status": "completed",
+                "job": {
+                    "job_id": "gepa-job-1",
+                    "metadata": {
+                        "proposal_id": "prompt-opt-section-spine-artifact-delivery-policy"
+                    }
+                },
+                "result": {
+                    "status": "completed",
+                    "import_result": {
+                        "results": [],
+                        "summary": {
+                            "prompt_candidates": 0,
+                            "prompt_fragment_candidates": 0,
+                            "specialist_prompt_candidates": 0,
+                            "arkdistill_candidates": 0,
+                            "router_learning_candidates": 0,
+                            "rejected_candidates": [
+                                "gepa-1:prompt_fragment_bundle rejected because profile JSON was invalid: invalid type: null, expected usize"
+                            ]
+                        }
+                    },
+                    "stderr_tail": "raw optimizer prompt tail should not be shown as the lifecycle reason"
+                }
+            }],
+            "failed": [],
+        }),
+        None,
+        false,
+        false,
+    );
+
+    assert_eq!(lifecycle.status, "candidate_rejected");
+    assert_eq!(lifecycle.sample_count, 0);
+    assert!(lifecycle
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("No valid GEPA candidate was imported"));
 }
 
 #[test]
@@ -4540,6 +4620,7 @@ fn completed_gepa_job_with_live_prompt_canary_is_shown_as_live_test() {
         }),
         Some(&canary_state),
         true,
+        false,
     );
 
     assert_eq!(lifecycle.status, "testing");
@@ -4613,6 +4694,7 @@ fn prompt_optimization_lifecycle_uses_latest_terminal_gepa_job() {
             }],
         }),
         None,
+        false,
         false,
     );
 

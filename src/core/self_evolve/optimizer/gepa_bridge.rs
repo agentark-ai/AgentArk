@@ -54,6 +54,11 @@ const DEFAULT_GEPA_OPTIMIZER_TIMEOUT_SECONDS: u64 = 30 * 60; // 1800s; backgroun
 const DEFAULT_GEPA_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_GEPA_RETENTION_DAYS: u64 = 30;
 const DEFAULT_GEPA_MAX_RUN_DIRS: usize = 80;
+const MAX_GEPA_METRIC_CALLS: u32 = 8;
+const GEPA_ESTIMATE_BASE_CALLS: u32 = 3;
+const GEPA_ESTIMATE_INPUT_TOKENS_PER_CALL: u64 = 8_000;
+const GEPA_ESTIMATE_OUTPUT_TOKENS_PER_CALL: u64 = 8_192;
+const GEPA_ESTIMATE_SECONDS_PER_CALL: u64 = 150;
 pub const GEPA_OPTIMIZER_CONFIG_KEY: &str = "gepa_optimizer_config_v1";
 pub const GEPA_OPTIMIZER_BUDGET_LEDGER_KEY: &str = "gepa_optimizer_budget_ledger_v1";
 pub const GEPA_OPTIMIZER_AUTO_STATE_KEY: &str = "gepa_optimizer_auto_state_v1";
@@ -121,6 +126,20 @@ pub struct GepaBudgetStatus {
     pub remaining_today_usd: f64,
     pub allowed: bool,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GepaRunEstimate {
+    pub estimated_calls: u32,
+    pub input_tokens_per_call: u64,
+    pub output_tokens_per_call: u64,
+    pub estimated_total_tokens: u64,
+    pub estimated_cost_usd: Option<f64>,
+    pub estimated_minutes: u64,
+    pub num_threads: u32,
+    pub max_metric_calls: u32,
+    pub timeout_seconds: u64,
+    pub approval_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +276,7 @@ pub struct GepaRunResult {
     pub candidates_path: String,
     pub timeout_seconds: u64,
     pub exit_code: Option<i32>,
+    pub actual_cost_usd: Option<f64>,
     pub stdout_tail: String,
     pub stderr_tail: String,
 }
@@ -735,6 +755,31 @@ pub async fn reserve_gepa_budget(
     ))
 }
 
+pub async fn finalize_gepa_budget(
+    storage: &Storage,
+    run_id: &str,
+    spent_usd: f64,
+    status: &str,
+) -> Result<GepaBudgetStatus> {
+    let config = load_gepa_optimizer_config(storage).await;
+    let mut ledger = load_gepa_budget_ledger(storage).await;
+    prune_gepa_budget_ledger(&mut ledger);
+    let now = chrono::Utc::now();
+    finalize_gepa_budget_ledger_entry(&mut ledger, run_id, spent_usd, status, now);
+    storage
+        .set(
+            GEPA_OPTIMIZER_BUDGET_LEDGER_KEY,
+            &serde_json::to_vec(&ledger)?,
+        )
+        .await?;
+    Ok(gepa_budget_status_from_ledger_at(
+        &config,
+        &ledger,
+        now,
+        gepa_budget_timezone(),
+    ))
+}
+
 pub async fn write_pending_job(project_root: &Path, job: &PendingGepaJob) -> Result<String> {
     let pending_dir = gepa_pending_dir(project_root);
     tokio::fs::create_dir_all(&pending_dir).await?;
@@ -1005,6 +1050,38 @@ pub async fn export_optimization_bundle(
         .await
 }
 
+fn gepa_export_target_surfaces(job_metadata: Option<&Value>) -> Vec<&'static str> {
+    const ALL: &[&str] = &[
+        "prompt_bundle",
+        "specialist_prompt_bundle",
+        "prompt_fragment_bundle",
+        "arkdistill_profile",
+        "router_learning",
+    ];
+    let Some(items) = job_metadata
+        .and_then(|metadata| metadata.get("target_gepa_surfaces"))
+        .and_then(|value| value.as_array())
+    else {
+        return ALL.to_vec();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(surface) = item.as_str().map(str::trim) else {
+            continue;
+        };
+        if let Some(allowed) = ALL.iter().copied().find(|allowed| *allowed == surface) {
+            if !out.contains(&allowed) {
+                out.push(allowed);
+            }
+        }
+    }
+    if out.is_empty() {
+        ALL.to_vec()
+    } else {
+        out
+    }
+}
+
 pub async fn export_optimization_bundle_with_metadata(
     storage: &Storage,
     project_root: &Path,
@@ -1044,6 +1121,101 @@ pub async fn export_optimization_bundle_with_metadata(
         .filter_map(redacted_experience_run)
         .collect::<Vec<_>>();
     let router_trace_evidence = export_recent_router_trace_evidence(storage, recent_limit).await;
+    let target_surfaces = gepa_export_target_surfaces(job_metadata);
+    let surface_enabled = |surface: &str| target_surfaces.iter().any(|item| *item == surface);
+    let mut surfaces = serde_json::Map::new();
+    if surface_enabled("prompt_bundle") {
+        surfaces.insert(
+            "prompt_bundle".to_string(),
+            serde_json::to_value(prompt_bundle)?,
+        );
+    }
+    if surface_enabled("specialist_prompt_bundle") {
+        surfaces.insert(
+            "specialist_prompt_bundle".to_string(),
+            serde_json::to_value(specialist_bundle)?,
+        );
+    }
+    if surface_enabled("prompt_fragment_bundle") {
+        surfaces.insert(
+            "prompt_fragment_bundle".to_string(),
+            serde_json::to_value(prompt_fragment_bundle)?,
+        );
+    }
+    if surface_enabled("arkdistill_profile") {
+        surfaces.insert(
+            "arkdistill_profile".to_string(),
+            serde_json::to_value(arkdistill_profile)?,
+        );
+    }
+    let mut benchmarks = serde_json::Map::new();
+    if surface_enabled("prompt_bundle") {
+        benchmarks.insert(
+            "prompt_bundle".to_string(),
+            serde_json::from_str::<Value>(embedded_prompt_benchmark_profile_json())
+                .unwrap_or(Value::Null),
+        );
+    }
+    if surface_enabled("specialist_prompt_bundle") {
+        benchmarks.insert(
+            "specialist_prompt_bundle".to_string(),
+            serde_json::from_str::<Value>(embedded_specialist_prompt_benchmark_profile_json())
+                .unwrap_or(Value::Null),
+        );
+    }
+    if surface_enabled("prompt_fragment_bundle") {
+        benchmarks.insert(
+            "prompt_fragment_bundle".to_string(),
+            prompt_fragment_candidate_benchmark_profile(),
+        );
+    }
+    if surface_enabled("arkdistill_profile") {
+        benchmarks.insert("arkdistill_profile".to_string(), arkdistill_contract());
+    }
+    if surface_enabled("router_learning") {
+        benchmarks.insert(
+            "router_learning".to_string(),
+            router_learning_benchmark_profile(),
+        );
+    }
+    let mut recent_lineage = serde_json::Map::new();
+    if surface_enabled("prompt_bundle") {
+        recent_lineage.insert(
+            "prompt_bundle".to_string(),
+            Value::Array(
+                read_recent_jsonl_values(
+                    project_root.join(".agentark/self_evolve/prompt_bundle_lineage.jsonl"),
+                    12,
+                )
+                .await,
+            ),
+        );
+    }
+    if surface_enabled("specialist_prompt_bundle") {
+        recent_lineage.insert(
+            "specialist_prompt_bundle".to_string(),
+            Value::Array(
+                read_recent_jsonl_values(
+                    project_root
+                        .join(".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl"),
+                    12,
+                )
+                .await,
+            ),
+        );
+    }
+    if surface_enabled("prompt_fragment_bundle") {
+        recent_lineage.insert(
+            "prompt_fragment_bundle".to_string(),
+            Value::Array(
+                read_recent_jsonl_values(
+                    project_root.join(PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH),
+                    12,
+                )
+                .await,
+            ),
+        );
+    }
 
     let bundle = serde_json::json!({
         "schema_version": 1,
@@ -1055,29 +1227,14 @@ pub async fn export_optimization_bundle_with_metadata(
             .and_then(|metadata| metadata.get("opportunity_context"))
             .cloned()
             .unwrap_or(Value::Null),
-        "surfaces": {
-            "prompt_bundle": prompt_bundle,
-            "specialist_prompt_bundle": specialist_bundle,
-            "prompt_fragment_bundle": prompt_fragment_bundle,
-            "arkdistill_profile": arkdistill_profile,
-        },
-        "benchmarks": {
-            "prompt_bundle": serde_json::from_str::<Value>(embedded_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
-            "specialist_prompt_bundle": serde_json::from_str::<Value>(embedded_specialist_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
-            "prompt_fragment_bundle": prompt_fragment_candidate_benchmark_profile(),
-            "arkdistill_profile": arkdistill_contract(),
-            "router_learning": router_learning_benchmark_profile(),
-        },
-        "recent_lineage": {
-            "prompt_bundle": read_recent_jsonl_values(project_root.join(".agentark/self_evolve/prompt_bundle_lineage.jsonl"), 12).await,
-            "specialist_prompt_bundle": read_recent_jsonl_values(project_root.join(".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl"), 12).await,
-            "prompt_fragment_bundle": read_recent_jsonl_values(project_root.join(PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH), 12).await,
-        },
+        "surfaces": Value::Object(surfaces),
+        "benchmarks": Value::Object(benchmarks),
+        "recent_lineage": Value::Object(recent_lineage),
         "experience_runs": recent_runs,
         "router_trace_evidence": router_trace_evidence,
         "candidate_contract": {
             "format": "jsonl",
-            "surfaces": ["prompt_bundle", "specialist_prompt_bundle", "prompt_fragment_bundle", "arkdistill_profile", "router_learning"],
+            "surfaces": target_surfaces,
             "required_fields": ["run_id", "surface", "source", "candidate", "objective_scores", "feedback_summary", "trace_refs", "created_at"]
         }
     });
@@ -1150,6 +1307,7 @@ pub async fn run_python_optimizer(
                 candidates_path: candidates_path.display().to_string(),
                 timeout_seconds,
                 exit_code: None,
+                actual_cost_usd: None,
                 stdout_tail: String::new(),
                 stderr_tail: format!("GEPA optimizer timed out after {} seconds", timeout_seconds),
             });
@@ -1165,14 +1323,27 @@ pub async fn run_python_optimizer(
     } else {
         "failed"
     };
+    let stdout_tail = tail_string(&String::from_utf8_lossy(&output.stdout), 4000);
     Ok(GepaRunResult {
         status: status.to_string(),
         export_path: export_path.display().to_string(),
         candidates_path: candidates_path.display().to_string(),
         timeout_seconds,
         exit_code: output.status.code(),
-        stdout_tail: tail_string(&String::from_utf8_lossy(&output.stdout), 4000),
+        actual_cost_usd: gepa_stdout_actual_cost_usd(&stdout_tail),
+        stdout_tail,
         stderr_tail: tail_string(&String::from_utf8_lossy(&output.stderr), 4000),
+    })
+}
+
+fn gepa_stdout_actual_cost_usd(stdout: &str) -> Option<f64> {
+    stdout.lines().rev().find_map(|line| {
+        let value = serde_json::from_str::<Value>(line.trim()).ok()?;
+        value
+            .get("actual_cost_usd")
+            .or_else(|| value.get("cost_usd"))
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite() && *value >= 0.0)
     })
 }
 
@@ -1189,6 +1360,7 @@ fn apply_gepa_optimizer_env(command: &mut tokio::process::Command, runtime: &Gep
         "AGENTARK_GEPA_MAX_METRIC_CALLS",
         runtime.max_metric_calls.to_string(),
     );
+    command.env("AGENTARK_GEPA_NUM_THREADS", runtime.num_threads.to_string());
     command.env("AGENTARK_GEPA_THREADS", runtime.num_threads.to_string());
     command.env(
         "AGENTARK_GEPA_COST_BUDGET_USD",
@@ -1756,11 +1928,40 @@ fn normalize_gepa_optimizer_config(mut config: GepaOptimizerConfig) -> GepaOptim
     } else {
         default_gepa_auto_mode()
     };
-    config.max_metric_calls = config.max_metric_calls.clamp(1, 512);
+    config.max_metric_calls = config.max_metric_calls.clamp(1, MAX_GEPA_METRIC_CALLS);
     config.daily_budget_usd = config.daily_budget_usd.clamp(0.0, 500.0);
     config.per_run_budget_usd = config.per_run_budget_usd.clamp(0.0, 100.0);
     config.max_runs_per_day = config.max_runs_per_day.clamp(0, 100);
+    config.timeout_seconds = config.timeout_seconds.clamp(60, 6 * 60 * 60);
+    config.num_threads = config.num_threads.clamp(1, 8);
     config
+}
+
+pub fn estimate_gepa_run(
+    config: &GepaOptimizerConfig,
+    estimated_cost_usd: Option<f64>,
+) -> GepaRunEstimate {
+    let config = normalize_gepa_optimizer_config(config.clone());
+    let estimated_calls = GEPA_ESTIMATE_BASE_CALLS.saturating_add(config.max_metric_calls);
+    let estimated_total_tokens = u64::from(estimated_calls).saturating_mul(
+        GEPA_ESTIMATE_INPUT_TOKENS_PER_CALL.saturating_add(GEPA_ESTIMATE_OUTPUT_TOKENS_PER_CALL),
+    );
+    let threads = config.num_threads.max(1);
+    let estimated_seconds = u64::from(estimated_calls)
+        .saturating_mul(GEPA_ESTIMATE_SECONDS_PER_CALL)
+        .div_ceil(u64::from(threads));
+    GepaRunEstimate {
+        estimated_calls,
+        input_tokens_per_call: GEPA_ESTIMATE_INPUT_TOKENS_PER_CALL,
+        output_tokens_per_call: GEPA_ESTIMATE_OUTPUT_TOKENS_PER_CALL,
+        estimated_total_tokens,
+        estimated_cost_usd: estimated_cost_usd.filter(|value| value.is_finite() && *value >= 0.0),
+        estimated_minutes: estimated_seconds.div_ceil(60).max(1),
+        num_threads: threads,
+        max_metric_calls: config.max_metric_calls,
+        timeout_seconds: config.timeout_seconds,
+        approval_required: true,
+    }
 }
 
 fn select_gepa_model_slot<'a>(
@@ -1970,6 +2171,33 @@ fn gepa_budget_entry_counts_as_spend(entry: &GepaBudgetLedgerEntry) -> bool {
     )
 }
 
+fn finalize_gepa_budget_ledger_entry(
+    ledger: &mut GepaBudgetLedger,
+    run_id: &str,
+    spent_usd: f64,
+    status: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let spent_usd = spent_usd.max(0.0);
+    let status = status.trim().if_empty("spent").to_string();
+    if let Some(entry) = ledger
+        .entries
+        .iter_mut()
+        .find(|entry| entry.run_id == run_id)
+    {
+        entry.reserved_usd = spent_usd;
+        entry.status = status;
+        entry.recorded_at = now.to_rfc3339();
+        return;
+    }
+    ledger.entries.push(GepaBudgetLedgerEntry {
+        run_id: run_id.to_string(),
+        reserved_usd: spent_usd,
+        status,
+        recorded_at: now.to_rfc3339(),
+    });
+}
+
 fn gepa_budget_has_today_reservation(
     ledger: &GepaBudgetLedger,
     run_id: &str,
@@ -2074,9 +2302,9 @@ fn default_gepa_max_metric_calls() -> u32 {
 }
 
 fn default_gepa_num_threads() -> u32 {
-    // GEPA evaluates metrics concurrently; 2 is the bridge cap
-    // (MAX_GEPA_BACKGROUND_THREADS). Keeps load bounded on small machines.
-    2
+    // GEPA evaluates metrics concurrently; 4 is the spec default and
+    // remains bounded by the bridge's background-thread cap.
+    4
 }
 
 fn default_gepa_daily_budget_usd() -> f64 {
@@ -2127,16 +2355,18 @@ mod tests {
             per_run_budget_usd: 999.0,
             max_runs_per_day: 999,
             auto_setup: true,
-            timeout_seconds: 1800,
-            num_threads: 2,
+            timeout_seconds: 999_999,
+            num_threads: 999,
         });
 
         assert!(!config.enabled);
         assert_eq!(config.auto_mode, "light");
-        assert_eq!(config.max_metric_calls, 512);
+        assert_eq!(config.max_metric_calls, 8);
         assert_eq!(config.daily_budget_usd, 500.0);
         assert_eq!(config.per_run_budget_usd, 100.0);
         assert_eq!(config.max_runs_per_day, 100);
+        assert_eq!(config.timeout_seconds, 6 * 60 * 60);
+        assert_eq!(config.num_threads, 8);
     }
 
     #[test]
@@ -2242,6 +2472,69 @@ mod tests {
     }
 
     #[test]
+    fn gepa_run_estimate_is_nonzero_and_parallel_aware() {
+        let config = GepaOptimizerConfig {
+            max_metric_calls: 8,
+            timeout_seconds: 1800,
+            num_threads: 4,
+            daily_budget_usd: 1.0,
+            per_run_budget_usd: 0.50,
+            ..GepaOptimizerConfig::default()
+        };
+
+        let estimate = estimate_gepa_run(&config, Some(0.0123));
+
+        assert_eq!(estimate.estimated_calls, 11);
+        assert_eq!(estimate.num_threads, 4);
+        assert!(estimate.estimated_total_tokens > 0);
+        assert!(estimate.estimated_minutes > 0);
+        assert_eq!(estimate.estimated_cost_usd, Some(0.0123));
+        assert!(estimate.approval_required);
+    }
+
+    #[test]
+    fn gepa_export_target_surfaces_filters_to_requested_surface() {
+        let metadata = serde_json::json!({
+            "target_gepa_surfaces": [
+                "prompt_fragment_bundle",
+                "prompt_fragment_bundle",
+                "unknown"
+            ]
+        });
+
+        assert_eq!(
+            gepa_export_target_surfaces(Some(&metadata)),
+            vec!["prompt_fragment_bundle"]
+        );
+        assert!(gepa_export_target_surfaces(None).contains(&"prompt_bundle"));
+    }
+
+    #[test]
+    fn finalized_gepa_budget_entry_counts_as_spend() {
+        let config = GepaOptimizerConfig {
+            daily_budget_usd: 1.0,
+            per_run_budget_usd: 0.5,
+            max_runs_per_day: 0,
+            ..GepaOptimizerConfig::default()
+        };
+        let now = chrono::Utc::now();
+        let mut ledger = GepaBudgetLedger {
+            entries: vec![GepaBudgetLedgerEntry {
+                run_id: "run-1".to_string(),
+                reserved_usd: 0.0,
+                status: "reserved".to_string(),
+                recorded_at: now.to_rfc3339(),
+            }],
+        };
+
+        finalize_gepa_budget_ledger_entry(&mut ledger, "run-1", 0.25, "spent", now);
+        let status = gepa_budget_status_from_ledger_at(&config, &ledger, now, None);
+
+        assert_eq!(status.used_today_usd, 0.25);
+        assert_eq!(ledger.entries[0].status, "spent");
+    }
+
+    #[test]
     fn gepa_budget_run_count_cap_only_applies_when_configured() {
         let ledger = GepaBudgetLedger {
             entries: vec![GepaBudgetLedgerEntry {
@@ -2335,17 +2628,17 @@ mod tests {
     #[test]
     fn gepa_timeout_and_threads_defaults() {
         assert_eq!(default_gepa_optimizer_timeout_seconds(), 1800);
-        assert_eq!(default_gepa_num_threads(), 2);
+        assert_eq!(default_gepa_num_threads(), 4);
     }
 
     #[test]
     fn gepa_config_deserializes_new_fields_with_defaults() {
         let c: GepaOptimizerConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(c.timeout_seconds, 1800);
-        assert_eq!(c.num_threads, 2);
+        assert_eq!(c.num_threads, 4);
         let d = GepaOptimizerConfig::default();
         assert_eq!(d.timeout_seconds, 1800);
-        assert_eq!(d.num_threads, 2);
+        assert_eq!(d.num_threads, 4);
     }
 
     #[test]
@@ -2357,14 +2650,14 @@ mod tests {
             auto_mode: "light".to_string(),
             max_metric_calls: 8,
             per_run_budget_usd: 0.5,
-            num_threads: 2,
+            num_threads: 4,
         };
         let mut cmd = tokio::process::Command::new("python3");
         apply_gepa_optimizer_env(&mut cmd, &runtime);
         let found = cmd
             .as_std()
             .get_envs()
-            .any(|(k, v)| k == "AGENTARK_GEPA_THREADS" && v == Some("2".as_ref()));
-        assert!(found, "AGENTARK_GEPA_THREADS should be set to 2");
+            .any(|(k, v)| k == "AGENTARK_GEPA_NUM_THREADS" && v == Some("4".as_ref()));
+        assert!(found, "AGENTARK_GEPA_NUM_THREADS should be set to 4");
     }
 }

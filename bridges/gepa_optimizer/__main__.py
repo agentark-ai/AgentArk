@@ -31,7 +31,8 @@ DEFAULT_GEPA_MAX_MEMORY_MB = 1024
 DEFAULT_GEPA_REFLECTION_MINIBATCH_SIZE = 1
 DEFAULT_GEPA_MAX_MERGE_INVOCATIONS = 0
 DEFAULT_GEPA_CANDIDATE_SELECTION_STRATEGY = "pareto"
-MAX_GEPA_BACKGROUND_THREADS = 2
+DEFAULT_GEPA_NUM_THREADS = 4
+MAX_GEPA_BACKGROUND_THREADS = 8
 MAX_GEPA_TRAINING_EXAMPLES = 64
 MAX_GEPA_METRIC_CALLS = 8
 MAX_GEPA_TRAINING_VALSET_SIZE = 16
@@ -303,7 +304,16 @@ def _gepa_control_kwargs(env: Mapping[str, str], gepa_parameters: set[str]) -> d
 
 
 def _gepa_thread_count(env: Mapping[str, str]) -> int:
-    return _bounded_int(env, "AGENTARK_GEPA_THREADS", 1, 1, MAX_GEPA_BACKGROUND_THREADS)
+    key = "AGENTARK_GEPA_NUM_THREADS"
+    if not str(env.get(key) or "").strip() and str(env.get("AGENTARK_GEPA_THREADS") or "").strip():
+        key = "AGENTARK_GEPA_THREADS"
+    return _bounded_int(
+        env,
+        key,
+        DEFAULT_GEPA_NUM_THREADS,
+        1,
+        MAX_GEPA_BACKGROUND_THREADS,
+    )
 
 
 def _gepa_lm_runtime_kwargs(env: Mapping[str, str]) -> dict:

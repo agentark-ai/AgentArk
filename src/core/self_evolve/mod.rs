@@ -57,6 +57,9 @@ pub use specialist_prompt_evolution::{
     SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY, SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
 };
 
+pub const SPINE_REQUEST_CONTEXT_COMPACTION_DISABLED_KEY: &str =
+    "spine_request_context_compaction_disabled_v1";
+
 pub(crate) async fn prune_jsonl_archive(archive: &Path, max_entries: usize) -> Result<()> {
     if max_entries == 0 {
         return Ok(());

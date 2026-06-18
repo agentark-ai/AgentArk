@@ -762,7 +762,7 @@ fn bounded_helper_output_tokens(env_key: &str, default_tokens: u32) -> u32 {
         .clamp(128, 8_192)
 }
 
-fn supervised_request_output_budget(request_kind: &str) -> Option<u32> {
+pub(crate) fn supervised_request_output_budget(request_kind: &str) -> Option<u32> {
     match request_kind {
         "model_routed_spine_v1" => Some(bounded_helper_output_tokens(
             "AGENTARK_MODEL_ROUTED_SPINE_MAX_OUTPUT_TOKENS",

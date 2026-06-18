@@ -428,7 +428,12 @@ fn gepa_job_value_failed(value: &serde_json::Value) -> bool {
     value
         .get("status")
         .and_then(|status| status.as_str())
-        .map(|status| matches!(status, "failed" | "timed_out" | "error" | "blocked"))
+        .map(|status| {
+            matches!(
+                status,
+                "failed" | "failed_fallback" | "timed_out" | "error" | "blocked"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -436,7 +441,12 @@ fn gepa_job_failure_retryable(value: &serde_json::Value) -> bool {
     value
         .get("status")
         .and_then(|status| status.as_str())
-        .map(|status| !matches!(status, "failed" | "timed_out" | "error" | "blocked"))
+        .map(|status| {
+            !matches!(
+                status,
+                "failed" | "failed_fallback" | "timed_out" | "error" | "blocked"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -452,7 +462,7 @@ fn gepa_effective_status(value: &serde_json::Value) -> String {
 
 fn gepa_effective_reason(value: &serde_json::Value) -> Option<String> {
     let inner = value.get("result");
-    inner
+    let reason = inner
         .and_then(|result| result.get("error"))
         .or_else(|| inner.and_then(|result| result.get("stderr_tail")))
         .or_else(|| inner.and_then(|result| result.get("message")))
@@ -461,6 +471,24 @@ fn gepa_effective_reason(value: &serde_json::Value) -> Option<String> {
         .or_else(|| value.get("message"))
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
+    reason.or_else(|| {
+        (gepa_effective_status(value) == "failed_fallback").then(|| {
+            "GEPA produced only schema-preserving fallback candidates; no deployable optimization was generated.".to_string()
+        })
+    })
+}
+
+fn gepa_prompt_optimization_target_surface(section: &str) -> Option<&'static str> {
+    let section = section.trim();
+    if section.is_empty() {
+        return None;
+    }
+    if section.starts_with("spine.") {
+        return crate::core::agent::spine_prompt_section_is_evolvable(section)
+            .then_some("prompt_fragment_bundle");
+    }
+    Some("prompt_bundle")
 }
 
 fn gepa_prompt_optimization_metadata(
@@ -478,6 +506,16 @@ fn gepa_prompt_optimization_metadata(
     );
     if let Some(context) = opportunity_context {
         if !context.is_null() {
+            let target_surface = context
+                .get("section")
+                .and_then(|value| value.as_str())
+                .and_then(gepa_prompt_optimization_target_surface);
+            if let Some(target_surface) = target_surface {
+                metadata.insert(
+                    "target_gepa_surfaces".to_string(),
+                    serde_json::json!([target_surface]),
+                );
+            }
             metadata.insert("opportunity_context".to_string(), context);
         }
     }
@@ -642,10 +680,60 @@ fn gepa_prompt_optimization_promotion_settings(
 
 fn gepa_prompt_optimization_timeout_seconds(
     _opportunity_context: Option<&serde_json::Value>,
+    configured_timeout_seconds: u64,
 ) -> u64 {
     const PROMPT_OPTIMIZATION_BACKGROUND_TIMEOUT_SECONDS: u64 = 20 * 60;
-    crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds()
+    configured_timeout_seconds
+        .clamp(60, 6 * 60 * 60)
         .max(PROMPT_OPTIMIZATION_BACKGROUND_TIMEOUT_SECONDS)
+}
+
+fn gepa_run_estimate_for_runtime(
+    runtime: &crate::core::self_evolve::gepa_bridge::GepaOptimizerRuntime,
+    timeout_seconds: u64,
+) -> crate::core::self_evolve::gepa_bridge::GepaRunEstimate {
+    let config = crate::core::self_evolve::gepa_bridge::GepaOptimizerConfig {
+        max_metric_calls: runtime.max_metric_calls,
+        timeout_seconds,
+        num_threads: runtime.num_threads,
+        per_run_budget_usd: runtime.per_run_budget_usd,
+        ..crate::core::self_evolve::gepa_bridge::GepaOptimizerConfig::default()
+    };
+    let without_cost = crate::core::self_evolve::gepa_bridge::estimate_gepa_run(&config, None);
+    let estimated_cost_usd = crate::channels::http::estimate_cost_from_pricing_cache(
+        &runtime.model,
+        u64::from(without_cost.estimated_calls) * without_cost.input_tokens_per_call,
+        u64::from(without_cost.estimated_calls) * without_cost.output_tokens_per_call,
+    );
+    crate::core::self_evolve::gepa_bridge::estimate_gepa_run(&config, estimated_cost_usd)
+}
+
+async fn finalize_gepa_run_budget(
+    storage: &crate::storage::Storage,
+    run_id: &str,
+    result: &crate::core::self_evolve::gepa_bridge::GepaRunResult,
+    estimate: &crate::core::self_evolve::gepa_bridge::GepaRunEstimate,
+) -> serde_json::Value {
+    let (spent_usd, source) = if let Some(cost) = result.actual_cost_usd {
+        (cost, "actual")
+    } else if let Some(cost) = estimate.estimated_cost_usd {
+        (cost, "estimated")
+    } else {
+        (0.0, "unavailable")
+    };
+    let status = if spent_usd > 0.0 {
+        "spent"
+    } else {
+        "completed"
+    };
+    let _ = crate::core::self_evolve::gepa_bridge::finalize_gepa_budget(
+        storage, run_id, spent_usd, status,
+    )
+    .await;
+    serde_json::json!({
+        "spent_usd": spent_usd,
+        "source": source,
+    })
 }
 
 fn typed_tool_error_fields(error: &anyhow::Error) -> Option<TypedToolErrorFields> {
@@ -9850,8 +9938,12 @@ impl Agent {
     ) -> Result<String> {
         let promotion_settings =
             gepa_prompt_optimization_promotion_settings(opportunity_context.as_ref());
-        let optimizer_timeout_seconds =
-            gepa_prompt_optimization_timeout_seconds(opportunity_context.as_ref());
+        let gepa_config =
+            crate::core::self_evolve::gepa_bridge::load_gepa_optimizer_config(&self.storage).await;
+        let optimizer_timeout_seconds = gepa_prompt_optimization_timeout_seconds(
+            opportunity_context.as_ref(),
+            gepa_config.timeout_seconds,
+        );
         self.queue_gepa_job(
             crate::core::self_evolve::gepa_bridge::GepaJobKind::Run,
             request,
@@ -10138,7 +10230,19 @@ impl Agent {
                     &runtime,
                 )
                 .await?;
+                let estimate =
+                    gepa_run_estimate_for_runtime(&runtime, job.optimizer_timeout_seconds);
+                let cost_record =
+                    finalize_gepa_run_budget(&self.storage, budget_run_id, &result, &estimate)
+                        .await;
                 let mut value = serde_json::to_value(&result)?;
+                if let serde_json::Value::Object(obj) = &mut value {
+                    obj.insert(
+                        "run_estimate".to_string(),
+                        serde_json::to_value(&estimate).unwrap_or(serde_json::Value::Null),
+                    );
+                    obj.insert("cost_record".to_string(), cost_record);
+                }
                 if job.import_after_run && result.status == "completed" {
                     let import_result = self
                         .execute_gepa_import(
@@ -11134,7 +11238,26 @@ impl Agent {
                                             &runtime,
                                         )
                                         .await?;
+                                    let estimate = gepa_run_estimate_for_runtime(
+                                        &runtime,
+                                        gepa_optimizer_timeout_seconds,
+                                    );
+                                    let cost_record = finalize_gepa_run_budget(
+                                        &self.storage,
+                                        &budget_run_id,
+                                        &run_result,
+                                        &estimate,
+                                    )
+                                    .await;
                                     let mut value = serde_json::to_value(&run_result)?;
+                                    if let serde_json::Value::Object(obj) = &mut value {
+                                        obj.insert(
+                                            "run_estimate".to_string(),
+                                            serde_json::to_value(&estimate)
+                                                .unwrap_or(serde_json::Value::Null),
+                                        );
+                                        obj.insert("cost_record".to_string(), cost_record);
+                                    }
                                     if gepa_import_after_run && run_result.status == "completed" {
                                         let import_result = self
                                             .execute_gepa_import(
@@ -12589,8 +12712,17 @@ mod tests {
             "mode": "gepa_run",
             "error": "budget gate prevented optimizer execution"
         });
+        let failed_fallback = json!({
+            "status": "failed_fallback",
+            "mode": "gepa_run"
+        });
 
         assert!(gepa_job_value_failed(&blocked));
+        assert!(gepa_job_value_failed(&failed_fallback));
+        assert!(!gepa_job_failure_retryable(&failed_fallback));
+        assert!(gepa_effective_reason(&failed_fallback)
+            .unwrap_or_default()
+            .contains("fallback candidates"));
     }
 
     #[test]
@@ -12647,6 +12779,29 @@ mod tests {
             .and_then(|value| value.get("holdout_cases"))
             .and_then(|value| value.as_array())
             .is_some_and(|items| items.len() == 1));
+    }
+
+    #[test]
+    fn gepa_prompt_optimization_metadata_targets_prompt_fragment_surface() {
+        let metadata = gepa_prompt_optimization_metadata(
+            "prompt-opt-section-spine-artifact-delivery-policy",
+            Some(json!({ "section": "spine.artifact_delivery_policy" })),
+        );
+
+        assert_eq!(
+            metadata.get("target_gepa_surfaces"),
+            Some(&json!(["prompt_fragment_bundle"]))
+        );
+    }
+
+    #[test]
+    fn gepa_prompt_optimization_metadata_does_not_target_stable_spine_sections() {
+        let metadata = gepa_prompt_optimization_metadata(
+            "prompt-opt-section-spine-durable-resource-contracts",
+            Some(json!({ "section": "spine.durable_resource_contracts" })),
+        );
+
+        assert!(metadata.get("target_gepa_surfaces").is_none());
     }
 
     #[test]
@@ -12707,23 +12862,26 @@ mod tests {
     }
 
     #[test]
-    fn gepa_prompt_optimization_uses_longer_background_timeout() {
-        let timeout = gepa_prompt_optimization_timeout_seconds(Some(&json!({
-            "samples": 672,
-            "prompt_weight": {
-                "p95_total_request_chars": 139593
-            },
-            "outcome": {
-                "issue_rate": 0.4524,
-                "quality_issue_rate": 0.0
-            }
-        })));
-
-        assert!(
-            timeout
-                > crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds()
+    fn gepa_prompt_optimization_uses_configured_background_timeout_with_floor() {
+        let timeout = gepa_prompt_optimization_timeout_seconds(
+            Some(&json!({
+                "samples": 672,
+                "prompt_weight": {
+                    "p95_total_request_chars": 139593
+                },
+                "outcome": {
+                    "issue_rate": 0.4524,
+                    "quality_issue_rate": 0.0
+                }
+            })),
+            crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds(),
         );
-        assert_eq!(timeout, 20 * 60);
+
+        assert_eq!(
+            timeout,
+            crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds()
+        );
+        assert_eq!(gepa_prompt_optimization_timeout_seconds(None, 600), 20 * 60);
     }
 
     #[test]

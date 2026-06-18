@@ -32,6 +32,9 @@ const ACTION_DIRECTORY_CONTEXT_MAX_ENTRIES: usize = 24;
 const ACTION_DIRECTORY_CONTEXT_MAX_NAMES: usize = 192;
 const ACTION_DIRECTORY_SCHEMA_FIELD_LIMIT: usize = 8;
 const ACTION_DIRECTORY_FIELD_MAX_CHARS: usize = 360;
+const SPINE_REQUEST_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 32_000;
+const SPINE_REQUEST_CONTEXT_BUDGET_RATIO_PERCENT: usize = 3;
+const SPINE_REQUEST_CONTEXT_MIN_PREVIEW_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 struct ResourceAdapterSpec {
@@ -3967,8 +3970,78 @@ fn bounded_json_for_spine_context(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SpineRequestContextBudget {
+    max_chars: usize,
+}
+
+fn json_char_count(value: &serde_json::Value) -> usize {
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .chars()
+        .count()
+}
+
+fn render_spine_request_context(context: serde_json::Map<String, serde_json::Value>) -> String {
+    format!(
+        "Structured chat request context:\n{}",
+        serde_json::to_string(&serde_json::Value::Object(context))
+            .unwrap_or_else(|_| "{}".to_string())
+    )
+}
+
+fn shrink_spine_request_context_to_budget(
+    mut context: serde_json::Map<String, serde_json::Value>,
+    budget: SpineRequestContextBudget,
+) -> serde_json::Map<String, serde_json::Value> {
+    let originals = context.clone();
+    let mut preview_budgets = originals
+        .iter()
+        .map(|(key, value)| (key.clone(), json_char_count(value)))
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let current = render_spine_request_context(context.clone())
+            .chars()
+            .count();
+        if current <= budget.max_chars {
+            return context;
+        }
+
+        let Some((key, original_value, current_preview_budget)) = originals
+            .iter()
+            .filter_map(|(key, value)| {
+                let current_preview_budget = *preview_budgets.get(key)?;
+                (current_preview_budget > SPINE_REQUEST_CONTEXT_MIN_PREVIEW_CHARS).then_some((
+                    key.clone(),
+                    value.clone(),
+                    current_preview_budget,
+                ))
+            })
+            .max_by_key(|(_, _, current_preview_budget)| *current_preview_budget)
+        else {
+            return context;
+        };
+
+        let overflow = current.saturating_sub(budget.max_chars);
+        let next_preview_budget = current_preview_budget
+            .saturating_sub(overflow.saturating_add(256))
+            .min(current_preview_budget.saturating_mul(2) / 3)
+            .max(SPINE_REQUEST_CONTEXT_MIN_PREVIEW_CHARS);
+        if next_preview_budget >= current_preview_budget {
+            return context;
+        }
+        preview_budgets.insert(key.clone(), next_preview_budget);
+        context.insert(
+            key,
+            bounded_json_for_spine_context(&original_value, next_preview_budget),
+        );
+    }
+}
+
 fn structured_chat_request_context_system_message(
     request_hints: &RequestExecutionHints,
+    budget: Option<SpineRequestContextBudget>,
 ) -> Option<String> {
     let mut context = serde_json::Map::new();
     if request_hints.attachments_present || !request_hints.attachments.is_empty() {
@@ -3978,17 +4051,12 @@ fn structured_chat_request_context_system_message(
                 request_hints.attachments_present || !request_hints.attachments.is_empty()
             ),
         );
-        context.insert(
-            "attachments".to_string(),
-            serde_json::to_value(&request_hints.attachments)
-                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
-        );
+        let attachments = serde_json::to_value(&request_hints.attachments)
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+        context.insert("attachments".to_string(), attachments);
     }
     if let Some(execution_profile) = request_hints.execution_profile.as_ref() {
-        context.insert(
-            "execution_profile".to_string(),
-            bounded_json_for_spine_context(execution_profile, 4_000),
-        );
+        context.insert("execution_profile".to_string(), execution_profile.clone());
         let depth_hint = execution_profile
             .get("depth_hint")
             .or_else(|| execution_profile.get("depth"))
@@ -4007,15 +4075,12 @@ fn structured_chat_request_context_system_message(
         }
     }
     if let Some(arkorbit_context) = request_hints.arkorbit_context.as_ref() {
-        context.insert(
-            "arkorbit_context".to_string(),
-            bounded_json_for_spine_context(arkorbit_context, 8_000),
-        );
+        context.insert("arkorbit_context".to_string(), arkorbit_context.clone());
     }
     if let Some(browser_profile_context) = request_hints.browser_profile_context.as_ref() {
         context.insert(
             "browser_profile_context".to_string(),
-            bounded_json_for_spine_context(browser_profile_context, 8_000),
+            browser_profile_context.clone(),
         );
     }
     if request_hints.client_timezone.is_some()
@@ -4033,21 +4098,22 @@ fn structured_chat_request_context_system_message(
     if !request_hints.recent_actionable_artifacts.is_empty() {
         context.insert(
             "recent_actionable_artifacts".to_string(),
-            bounded_json_for_spine_context(
-                &serde_json::Value::Array(request_hints.recent_actionable_artifacts.clone()),
-                8_000,
-            ),
+            serde_json::Value::Array(request_hints.recent_actionable_artifacts.clone()),
         );
     }
     if context.is_empty() {
         return None;
     }
 
-    Some(format!(
-        "Structured chat request context:\n{}",
-        serde_json::to_string_pretty(&serde_json::Value::Object(context))
-            .unwrap_or_else(|_| "{}".to_string())
-    ))
+    if let Some(budget) = budget.filter(|budget| budget.max_chars > 0) {
+        let compact = render_spine_request_context(context.clone());
+        if compact.chars().count() <= budget.max_chars {
+            return Some(compact);
+        }
+        context = shrink_spine_request_context_to_budget(context, budget);
+    }
+
+    Some(render_spine_request_context(context))
 }
 
 fn execution_profile_requests_long_running(profile: Option<&serde_json::Value>) -> bool {
@@ -4055,6 +4121,47 @@ fn execution_profile_requests_long_running(profile: Option<&serde_json::Value>) 
         .and_then(|value| value.get("long_running"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+fn spine_request_context_budget_for_llm(
+    llm: &crate::core::model::llm::LlmClient,
+) -> SpineRequestContextBudget {
+    let context_tokens = crate::core::model::context_budget::context_window_tokens_for_llm(
+        llm,
+        crate::core::model::context_budget::HistoryBudgetConfig {
+            scope_env: "SPINE",
+            default_context_window_tokens: SPINE_REQUEST_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS,
+            default_budget_ratio_percent: SPINE_REQUEST_CONTEXT_BUDGET_RATIO_PERCENT,
+            min_history_token_budget: 1_024,
+            max_summary_tokens: 8_000,
+        },
+    );
+    let reserved_output_tokens =
+        crate::core::orchestration::execution::supervised_request_output_budget(
+            "model_routed_spine_v1",
+        )
+        .unwrap_or_default() as usize;
+    let ratio_percent = crate::core::model::context_budget::read_usize_env(
+        "AGENTARK_SPINE_REQUEST_CONTEXT_BUDGET_RATIO_PERCENT",
+    )
+    .unwrap_or(SPINE_REQUEST_CONTEXT_BUDGET_RATIO_PERCENT)
+    .clamp(3, 40);
+    let prompt_budget_tokens = context_tokens.saturating_sub(reserved_output_tokens);
+    SpineRequestContextBudget {
+        max_chars: prompt_budget_tokens
+            .saturating_mul(ratio_percent)
+            .saturating_mul(4)
+            / 100,
+    }
+}
+
+async fn spine_request_context_compaction_disabled(storage: &crate::storage::Storage) -> bool {
+    storage
+        .get(crate::core::self_evolve::SPINE_REQUEST_CONTEXT_COMPACTION_DISABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn action_directory_source_rank(source: &crate::actions::ActionSource) -> usize {
@@ -4359,7 +4466,19 @@ impl Agent {
                 content: live_browser_context,
             });
         }
-        if let Some(request_context) = structured_chat_request_context_system_message(request_hints)
+        let request_context_budget =
+            if spine_request_context_compaction_disabled(&self.storage).await {
+                None
+            } else {
+                Some(
+                    self.model_pool
+                        .get(&self.primary_model_id)
+                        .map(|(_, llm)| spine_request_context_budget_for_llm(llm))
+                        .unwrap_or_else(|| spine_request_context_budget_for_llm(&self.llm)),
+                )
+            };
+        if let Some(request_context) =
+            structured_chat_request_context_system_message(request_hints, request_context_budget)
         {
             spine_messages.push(SpineMessage::System {
                 content: request_context,
@@ -11625,7 +11744,7 @@ mod tests {
             ..Default::default()
         };
 
-        let context = structured_chat_request_context_system_message(&hints)
+        let context = structured_chat_request_context_system_message(&hints, None)
             .expect("structured request context should be present");
 
         assert!(context.contains("upload-1"));
@@ -11651,12 +11770,84 @@ mod tests {
             ..Default::default()
         };
 
-        let context = structured_chat_request_context_system_message(&hints)
+        let context = structured_chat_request_context_system_message(&hints, None)
             .expect("artifact context should be present");
 
         assert!(context.contains("recent_actionable_artifacts"));
         assert!(context.contains("app-123"));
         assert!(context.contains("service_manage"));
+    }
+
+    #[test]
+    fn structured_chat_request_context_shrinks_large_runtime_payloads() {
+        let large_text = "x".repeat(12_000);
+        let hints = RequestExecutionHints {
+            attachments_present: true,
+            attachments: (0..200)
+                .map(|index| ChatAttachmentHint {
+                    upload_id: format!("upload-{}-{}", index, "a".repeat(80)),
+                    kind: "document".to_string(),
+                    content_type: Some("application/json".to_string()),
+                    document_id: Some(format!("doc-{}-{}", index, "b".repeat(80))),
+                })
+                .collect(),
+            execution_profile: Some(serde_json::json!({
+                "capability_tags": ["automation"],
+                "runtime_payload": large_text
+            })),
+            arkorbit_context: Some(serde_json::json!({
+                "active_orbit_id": "orbit-large",
+                "runtime_payload": large_text
+            })),
+            browser_profile_context: Some(serde_json::json!({
+                "profile_id": "profile-large",
+                "runtime_payload": large_text
+            })),
+            recent_actionable_artifacts: vec![serde_json::json!({
+                "artifact_id": "artifact-large",
+                "runtime_payload": large_text
+            })],
+            ..Default::default()
+        };
+
+        let context = structured_chat_request_context_system_message(
+            &hints,
+            Some(SpineRequestContextBudget { max_chars: 15_000 }),
+        )
+        .expect("large runtime context should still be represented");
+
+        assert!(
+            context.len() < 15_000,
+            "runtime request context should be capped, got {} chars",
+            context.len()
+        );
+        assert!(context.contains("\"truncated\":true"));
+        assert!(context.contains("\"original_chars\""));
+        assert!(
+            !context.contains("\n  \"attachments\""),
+            "runtime request context should use compact JSON"
+        );
+    }
+
+    #[test]
+    fn structured_chat_request_context_keeps_full_payload_when_budget_allows() {
+        let large_text = "useful-context-".repeat(300);
+        let hints = RequestExecutionHints {
+            arkorbit_context: Some(serde_json::json!({
+                "active_orbit_id": "orbit-rich",
+                "runtime_payload": large_text
+            })),
+            ..Default::default()
+        };
+
+        let context = structured_chat_request_context_system_message(
+            &hints,
+            Some(SpineRequestContextBudget { max_chars: 100_000 }),
+        )
+        .expect("runtime context should be present");
+
+        assert!(!context.contains("\"truncated\":true"));
+        assert!(context.contains("useful-context-useful-context"));
     }
 
     #[test]
@@ -11667,7 +11858,7 @@ mod tests {
             ..Default::default()
         };
 
-        let context = structured_chat_request_context_system_message(&hints)
+        let context = structured_chat_request_context_system_message(&hints, None)
             .expect("temporal context should be present");
 
         assert!(context.contains("client_temporal_context"));
@@ -12639,18 +12830,12 @@ mod tests {
     }
 
     #[test]
-    fn spine_prompt_teaches_durable_contracts_from_single_source() {
+    fn spine_prompt_teaches_compact_durable_contracts() {
         let prompt = build_spine_system_prompt("", None, None);
-        let schedule_contract = super::task_runtime::schedule_task_expected_contract().to_string();
-        let watch_contract = super::task_runtime::watch_expected_contract().to_string();
 
         assert!(
-            prompt.contains(&schedule_contract),
-            "spine prompt must render the same scheduled_task contract as schema and validation"
-        );
-        assert!(
-            prompt.contains(&watch_contract),
-            "spine prompt must render the same watcher contract as schema and validation"
+            prompt.contains("field schemas and validation errors are the full contract source"),
+            "spine prompt must point full field shape to schema and validation"
         );
         assert!(
             prompt.contains("Use cron for recurring scheduled_task cadences"),
@@ -12663,6 +12848,10 @@ mod tests {
         assert!(
             prompt.contains("Use scheduled_task for pure time-based reminders"),
             "spine prompt must teach the scheduled_task ownership boundary"
+        );
+        assert!(
+            !prompt.contains("\"batch_example\""),
+            "spine prompt must not embed the full scheduled_task JSON contract"
         );
     }
 

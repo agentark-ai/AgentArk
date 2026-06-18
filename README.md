@@ -541,6 +541,8 @@ AES-256-GCM encryption at rest. Argon2id key derivation in master-password mode.
 
 AgentArk stores API keys, OAuth tokens, and custom secrets in encrypted `settings:*` KV records. Memory content, integration credentials, and secret-backed placeholders all use the same encrypted storage path. Secrets are resolved at execution time and never appear in LLM-visible tool-call arguments or traces.
 
+Third-party skills are treated as executable code. Before import, AgentArk previews the skill, classifies requested capabilities, and applies policy rules that warn or block risky combinations such as shell, environment, file, network, persistence, and lifecycle-hook access.
+
 | Layer                 | Properties                                                |
 | :-------------------- | :-------------------------------------------------------- |
 | **Data at rest**      | AES-256-GCM with Argon2id key derivation                  |

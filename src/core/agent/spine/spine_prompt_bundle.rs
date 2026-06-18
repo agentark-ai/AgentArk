@@ -360,18 +360,13 @@ fn primitive_schema_summary_fragment(primitive_names: &[&str]) -> String {
     )
 }
 
-fn durable_resource_contracts_fragment() -> String {
-    format!(
-        "Durable resource creation contracts are non-evolvable and share one source with the tool schema and server-side validation. \
-         Use watcher for autonomous condition/change monitoring, trigger-on-change detection, notify-only-when outcomes, repeated polling, or long-running observation that should notify later. \
-         Use scheduled_task for pure time-based reminders, known date/time/recurrence, or recurring work whose action/script is explicitly supplied. \
-         Use cron for recurring scheduled_task cadences; use at/scheduled_for for fully known one-time ISO timestamps; use local_time plus timezone for wall-clock times that must be resolved from runtime temporal context. \
-         Do not infer that local_time replaces cron for recurrence.\n\n\
-         scheduled_task create/update contract: {}\n\n\
-         watcher create/update contract: {}",
-        super::task_runtime::schedule_task_expected_contract(),
-        super::task_runtime::watch_expected_contract(),
-    )
+fn durable_resource_contracts_fragment() -> &'static str {
+    "Durable resource field schemas and validation errors are the full contract source. \
+     In the stable prompt keep only the ownership rules. \
+     Use watcher for autonomous condition/change monitoring, trigger-on-change detection, notify-only-when outcomes, repeated polling, or long-running observation that should notify later. \
+     Use scheduled_task for pure time-based reminders, known date/time/recurrence, or recurring work whose action/script is explicitly supplied. \
+     Use cron for recurring scheduled_task cadences; use at/scheduled_for for fully known one-time ISO timestamps; use local_time plus timezone for wall-clock times that must be resolved from runtime temporal context. \
+     Do not infer that local_time replaces cron for recurrence."
 }
 
 fn tool_call_description_contract_fragment() -> &'static str {

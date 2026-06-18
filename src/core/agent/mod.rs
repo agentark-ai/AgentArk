@@ -160,6 +160,11 @@ pub use streaming::StreamEvent;
 use tool_responses::*;
 pub(crate) use watcher_followup::{WatcherFollowupPreparation, WatcherFollowupWorker};
 
+pub(crate) fn spine_prompt_section_is_evolvable(section: &str) -> bool {
+    let section = section.trim();
+    spine_prompt_bundle::ALLOWED_EVOLVABLE_SPINE_FRAGMENT_IDS.contains(&section)
+}
+
 const TOOL_INTEGRATION_ALIASES_KEY: &str = "tool_integration_aliases_v1";
 const HOOKS_STORAGE_KEY: &str = "hooks_v1";
 const DEFAULT_CHAT_HISTORY_CONTEXT_WINDOW_TOKENS: usize = 32_000;

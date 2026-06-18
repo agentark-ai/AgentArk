@@ -1275,6 +1275,7 @@ pub(super) struct EvolutionSettingsResponse {
     pub(super) deploy_guard_default: bool,
     pub(super) readiness_policy: crate::core::ReadinessPolicy,
     pub(super) gepa_config: crate::core::self_evolve::gepa_bridge::GepaOptimizerConfig,
+    pub(super) gepa_run_estimate: crate::core::self_evolve::gepa_bridge::GepaRunEstimate,
     pub(super) gepa_readiness: crate::core::self_evolve::gepa_bridge::GepaReadiness,
     pub(super) gepa_auto_state: crate::core::self_evolve::gepa_bridge::GepaAutoRunState,
     pub(super) gepa_last_result: Option<serde_json::Value>,

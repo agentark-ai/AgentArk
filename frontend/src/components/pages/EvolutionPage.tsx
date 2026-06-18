@@ -125,6 +125,14 @@ function promptProposalLifecycleStatus(row: JsonRecord): string {
   return "suggested";
 }
 
+function promptProposalIsRuntimeContext(row: JsonRecord): boolean {
+  const lifecycle = promptProposalLifecycle(row);
+  return (
+    str(row.target_scope, "") === "runtime_context" ||
+    str(lifecycle.live_surface, "") === "runtime_context"
+  );
+}
+
 function promptProposalLifecycleLabel(status: string): string {
   switch (status) {
     case "suggested":
@@ -201,6 +209,9 @@ function promptProposalIsPastDecision(row: JsonRecord): boolean {
   const lifecycleStatus = promptProposalLifecycleStatus(row);
   const reviewStatus = str(row.review_status, "open").trim().toLowerCase();
   const jobStatus = str(lifecycle.job_status, "").trim().toLowerCase();
+  if (promptProposalIsRuntimeContext(row) && lifecycleStatus === "rolled_back") {
+    return false;
+  }
   if (reviewStatus === "rejected") return true;
   if (lifecycleStatus === "candidate_rejected") {
     const samples = num(lifecycle.sample_count, 0);
@@ -550,6 +561,17 @@ function formatApproxMoney(value: number | null): string {
   return `$${value.toFixed(4)}`;
 }
 
+function formatIntegerCount(value: number | null, noun: string): string {
+  if (value == null) return `- ${noun}s`;
+  const count = Math.max(0, Math.round(value));
+  return `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function formatApproxMinutes(value: number | null): string {
+  if (value == null) return "-";
+  return `~${Math.max(1, Math.round(value)).toLocaleString()} min`;
+}
+
 function escapeTooltipText(value: unknown): string {
   return str(value, "")
     .replace(/&/g, "&amp;")
@@ -757,6 +779,238 @@ function promptMetricCards(lifecycle: JsonRecord): ExperimentMetricSummary[] {
         latencyDelta == null ? "info" : latencyDelta <= 0 ? "good" : "warn",
     },
   ];
+}
+
+type HistoryChipColor = "default" | "success" | "warning" | "error" | "info";
+
+type EvolutionHistoryRow = {
+  id: string;
+  kindLabel: string;
+  title: string;
+  subtitle: string;
+  statusLabel: string;
+  statusColor: HistoryChipColor;
+  occurredAt: string;
+  detail: JsonRecord;
+  restoreVersion?: string;
+};
+
+function firstTimestamp(...values: unknown[]): string {
+  for (const value of values) {
+    const timestamp = str(value, "").trim();
+    if (timestamp) return timestamp;
+  }
+  return "";
+}
+
+function timestampSortValue(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function candidateStatusColor(status: string): HistoryChipColor {
+  const view = evolveCandidateStatusPresentation(status);
+  if (view.tone === "good") return "success";
+  if (view.tone === "warn") return "warning";
+  if (view.tone === "info") return "info";
+  return "default";
+}
+
+function gepaImportedCandidateCount(importResult: JsonRecord): number {
+  const summary = asRecord(importResult.summary);
+  const summaryCount =
+    num(summary.prompt_candidates, 0) +
+    num(summary.specialist_prompt_candidates, 0) +
+    num(summary.prompt_fragment_candidates, 0) +
+    num(summary.arkdistill_candidates, 0) +
+    num(summary.router_learning_candidates, 0);
+  if (summaryCount > 0) return summaryCount;
+  return recordList(importResult.results).length;
+}
+
+function gepaHistoryRows(
+  completedItems: JsonRecord[],
+  failedItems: JsonRecord[],
+): EvolutionHistoryRow[] {
+  return [...completedItems, ...failedItems].map((row, idx) => {
+    const job = asRecord(row.job);
+    const metadata = asRecord(job.metadata);
+    const result = asRecord(row.result);
+    const importResult = asRecord(result.import_result);
+    const importSummary = asRecord(importResult.summary);
+    const rejectedCandidates = stringList(importSummary.rejected_candidates);
+    const importedCount = gepaImportedCandidateCount(importResult);
+    const jobId = str(job.job_id, str(row.job_id, `gepa-${idx}`));
+    const proposalId = str(metadata.proposal_id, "");
+    const runId = str(result.run_id, str(job.run_id, ""));
+    const resultStatus = str(result.status, str(row.status, ""));
+    const failed = str(row.status, "").trim().toLowerCase() === "failed";
+    const noCandidate =
+      !failed && importedCount === 0 && rejectedCandidates.length > 0;
+    const errorText = str(row.error, str(job.last_error, ""));
+    const tailText = str(result.stderr_tail, str(result.stdout_tail, ""));
+    const helper =
+      errorText ||
+      rejectedCandidates[0] ||
+      (importedCount > 0
+        ? `${formatIntegerCount(importedCount, "candidate")} imported`
+        : tailText || "No candidate import details recorded.");
+    const statusLabel = failed
+      ? "Failed"
+      : noCandidate
+        ? "No candidate"
+        : humanizeStatusLabel(resultStatus || "completed");
+    return {
+      id: `gepa:${jobId}:${str(row.recorded_at, String(idx))}`,
+      kindLabel: "GEPA run",
+      title:
+        str(metadata.title, "") ||
+        (proposalId ? humanizeStatusLabel(proposalId) : "Background optimization run"),
+      subtitle: [
+        proposalId ? `Proposal ${proposalId}` : "",
+        runId ? `Run ${runId}` : "",
+        helper,
+      ]
+        .filter(Boolean)
+        .join(" | "),
+      statusLabel,
+      statusColor: failed ? "error" : noCandidate ? "warning" : "success",
+      occurredAt: firstTimestamp(row.recorded_at, job.finished_at, job.created_at),
+      detail: {
+        source: "gepa_queue",
+        job_id: jobId,
+        proposal_id: proposalId,
+        run_id: runId,
+        imported_candidates: importedCount,
+        rejected_candidates: rejectedCandidates,
+        raw: row,
+      },
+    };
+  });
+}
+
+function promptOptimizationHistoryRows(
+  opportunities: JsonRecord[],
+): EvolutionHistoryRow[] {
+  const historicalStatuses = new Set([
+    "candidate_rejected",
+    "test_regression",
+    "deployed",
+    "rollback_suggested",
+    "rolled_back",
+    "test_stopped",
+    "blocked",
+    "dismissed",
+  ]);
+  return opportunities.flatMap((row) => {
+    const lifecycle = promptProposalLifecycle(row);
+    const status = promptProposalLifecycleStatus(row);
+    const reviewStatus = str(row.review_status, "").trim().toLowerCase();
+    if (!historicalStatuses.has(status) && reviewStatus !== "rejected") {
+      return [];
+    }
+    const proposalId = str(row.id, "");
+    const reason = formatPromptLifecycleReason(str(lifecycle.reason, ""));
+    return [
+      {
+        id: `prompt:${proposalId || str(row.title, "unknown")}:${status}`,
+        kindLabel: "Prompt change",
+        title: str(row.title, "Prompt optimization"),
+        subtitle:
+          reason ||
+          stringList(row.expected_benefit)[0] ||
+          stringList(row.evidence)[0] ||
+          "Lifecycle outcome recorded.",
+        statusLabel: promptProposalLifecycleLabel(status),
+        statusColor: promptProposalLifecycleColor(status),
+        occurredAt: firstTimestamp(
+          lifecycle.deployed_at,
+          lifecycle.queued_at,
+          row.reviewed_at,
+          lifecycle.approved_at,
+        ),
+        detail: {
+          source: "prompt_optimization_lifecycle",
+          proposal_id: proposalId,
+          lifecycle,
+          opportunity: asRecord(row.opportunity),
+          raw: row,
+        },
+      },
+    ];
+  });
+}
+
+function evolveCandidateHistoryRows(rows: JsonRecord[]): EvolutionHistoryRow[] {
+  return rows.map((row, idx) => {
+    const status = evolveCandidateStatus(row);
+    const view = evolveCandidateStatusPresentation(status);
+    const id = str(row.id, `candidate-${idx}`);
+    return {
+      id: `candidate:${id}`,
+      kindLabel: "Candidate",
+      title: str(row.title, "Evolve candidate"),
+      subtitle: evolveCandidateSegmentChipLabel(row),
+      statusLabel: view.label,
+      statusColor: candidateStatusColor(status),
+      occurredAt: firstTimestamp(row.decided_at, row.updated_at, row.created_at),
+      detail: {
+        source: "evolve_candidate",
+        candidate_id: id,
+        raw: row,
+      },
+    };
+  });
+}
+
+function canarySafetyHistoryRows(rows: JsonRecord[]): EvolutionHistoryRow[] {
+  return rows.map((row, idx) => {
+    const eventStatus = str(row.review_status, str(row.status, "open"));
+    const id = str(row.id, String(idx));
+    return {
+      id: `safety:${id}`,
+      kindLabel: "Safety",
+      title: str(row.title, "Canary safety event"),
+      subtitle: str(row.summary, str(row.reason, "Safety review recorded.")),
+      statusLabel: humanizeStatusLabel(str(row.status, eventStatus)),
+      statusColor: promptCanarySafetyStatusColor(eventStatus),
+      occurredAt: firstTimestamp(row.created_at, row.updated_at),
+      detail: {
+        source: "prompt_canary_safety",
+        event_id: id,
+        raw: row,
+      },
+    };
+  });
+}
+
+function snapshotRows(
+  rows: Array<{ version: string; savedAt: string }>,
+): EvolutionHistoryRow[] {
+  return rows.map((snapshot, idx) => ({
+    id: `snapshot:${snapshot.version}`,
+    kindLabel: "Snapshot",
+    title: snapshot.version,
+    subtitle: "Prompt bundle snapshot",
+    statusLabel: idx === 0 ? "Newest" : "Saved",
+    statusColor: idx === 0 ? "info" : "default",
+    occurredAt: snapshot.savedAt,
+    restoreVersion: snapshot.version,
+    detail: {
+      source: "prompt_snapshot_history",
+      version: snapshot.version,
+      saved_at: snapshot.savedAt,
+    },
+  }));
+}
+
+function sortHistoryRows(rows: EvolutionHistoryRow[]): EvolutionHistoryRow[] {
+  return [...rows].sort((a, b) => {
+    const byTime =
+      timestampSortValue(b.occurredAt) - timestampSortValue(a.occurredAt);
+    if (byTime !== 0) return byTime;
+    return a.id.localeCompare(b.id);
+  });
 }
 
 function promptLifecycleSamplesOption(
@@ -1266,6 +1520,70 @@ const ListPager = memo(function ListPager({
           ›
         </Button>
       </Box>
+    </Box>
+  );
+});
+
+const HistoryPager = memo(function HistoryPager({
+  page,
+  pageCount,
+  rangeStart,
+  rangeEnd,
+  total,
+  onPage,
+}: {
+  page: number;
+  pageCount: number;
+  rangeStart: number;
+  rangeEnd: number;
+  total: number;
+  onPage: (page: number) => void;
+}) {
+  if (pageCount <= 1) return null;
+  return (
+    <Box
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 2,
+        mt: 1.5,
+        pt: 1,
+        borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+      }}
+    >
+      <Typography
+        sx={{
+          fontFamily: "var(--font-mono)",
+          fontSize: "0.66rem",
+          color: "var(--text-faint)",
+          letterSpacing: 0.04,
+        }}
+      >
+        {`Showing ${rangeStart}-${rangeEnd} of ${total} rows`}
+      </Typography>
+      <Stack direction="row" spacing={0.75}>
+        <Button
+          size="small"
+          variant="outlined"
+          color="inherit"
+          disabled={page <= 0}
+          onClick={() => onPage(Math.max(0, page - 1))}
+          sx={{ minWidth: 88, borderRadius: 1 }}
+        >
+          Previous
+        </Button>
+        <Button
+          size="small"
+          variant="outlined"
+          color="inherit"
+          disabled={page >= pageCount - 1}
+          onClick={() => onPage(Math.min(pageCount - 1, page + 1))}
+          sx={{ minWidth: 88, borderRadius: 1 }}
+        >
+          Next
+        </Button>
+      </Stack>
     </Box>
   );
 });
@@ -2247,6 +2565,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const [testingPage, setTestingPage] = useState(0);
   const [deployedPage, setDeployedPage] = useState(0);
   const [historyPage, setHistoryPage] = useState(0);
+  const [historyDialogRow, setHistoryDialogRow] =
+    useState<EvolutionHistoryRow | null>(null);
   const [candidateDialogId, setCandidateDialogId] = useState<string | null>(
     null,
   );
@@ -2324,6 +2644,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const gepaConfig = asRecord(evolution.gepa_config);
   const gepaReadiness = asRecord(evolution.gepa_readiness);
   const gepaBudget = asRecord(gepaReadiness.budget);
+  const gepaRunEstimate = asRecord(evolution.gepa_run_estimate);
   const gepaAutoState = asRecord(evolution.gepa_auto_state);
   const gepaLastResult = asRecord(evolution.gepa_last_result);
   const gepaQueue = asRecord(evolution.gepa_queue);
@@ -2350,9 +2671,21 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       ? gepaLastResult
       : (latestGepaQueueRecord ?? {});
   const latestGepaInner = asRecord(latestGepaRecord.result);
+  const latestGepaCostRecord = asRecord(
+    latestGepaInner.cost_record ?? latestGepaRecord.cost_record,
+  );
   const latestGepaStatus = str(
     latestGepaInner.status,
     str(latestGepaRecord.status, ""),
+  ).trim();
+  const latestGepaActualCost =
+    finiteNumber(latestGepaInner.actual_cost_usd) ??
+    finiteNumber(latestGepaRecord.actual_cost_usd);
+  const latestGepaSpentUsd =
+    finiteNumber(latestGepaCostRecord.spent_usd) ?? latestGepaActualCost;
+  const latestGepaCostSource = str(
+    latestGepaCostRecord.source,
+    latestGepaActualCost == null ? "" : "actual",
   ).trim();
   const latestGepaImport = asRecord(
     latestGepaInner.import_result ?? latestGepaRecord.import_result,
@@ -2401,6 +2734,98 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           : latestGepaCandidateCount > 0
             ? ("success" as const)
             : ("info" as const);
+  const gepaEstimatedCalls = finiteNumber(gepaRunEstimate.estimated_calls);
+  const gepaEstimatedTokens = finiteNumber(
+    gepaRunEstimate.estimated_total_tokens,
+  );
+  const gepaEstimatedCost = finiteNumber(gepaRunEstimate.estimated_cost_usd);
+  const gepaEstimatedMinutes = finiteNumber(gepaRunEstimate.estimated_minutes);
+  const gepaEstimatedThreads = finiteNumber(gepaRunEstimate.num_threads);
+  const gepaMaxMetricCalls = finiteNumber(gepaRunEstimate.max_metric_calls);
+  const gepaTimeoutMinutes =
+    finiteNumber(gepaRunEstimate.timeout_seconds) == null
+      ? null
+      : finiteNumber(gepaRunEstimate.timeout_seconds)! / 60;
+  const gepaRunEstimateLine = [
+    gepaEstimatedTokens == null
+      ? null
+      : `~${Math.round(gepaEstimatedTokens).toLocaleString()} tokens`,
+    gepaEstimatedMinutes == null
+      ? null
+      : `${formatApproxMinutes(gepaEstimatedMinutes)} runtime`,
+    gepaEstimatedCost == null
+      ? "cost estimate unavailable"
+      : `${formatApproxMoney(gepaEstimatedCost)} estimated cost`,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const gepaCanApproveRun =
+    !backgroundImprovementPaused &&
+    gepaReady &&
+    gepaBudgetAllowed &&
+    gepaPendingJobs === 0 &&
+    gepaRunningJobs === 0;
+  const gepaApproveBlocker = backgroundImprovementPaused
+    ? "Evolve or GEPA is paused."
+    : !gepaReady
+      ? gepaIssues[0] || "GEPA optimizer is not ready."
+      : !gepaBudgetAllowed
+        ? str(gepaBudget.reason, "Daily GEPA budget is exhausted.")
+        : gepaPendingJobs > 0 || gepaRunningJobs > 0
+          ? "A GEPA optimization is already queued or running."
+          : "";
+  const gepaRunStats: ExperimentMetricSummary[] = [
+    {
+      label: "Run estimate",
+      value: formatApproxMoney(gepaEstimatedCost),
+      helper: `${formatIntegerCount(gepaEstimatedCalls, "model call")} at current limits`,
+      tone: "info",
+      accent:
+        gepaEstimatedCost == null
+          ? undefined
+          : formatApproxMoney(gepaEstimatedCost),
+    },
+    {
+      label: "Token ceiling",
+      value: formatEstimatedTokenSavings(gepaEstimatedTokens),
+      helper: `${formatIntegerCount(gepaMaxMetricCalls, "metric call")} max`,
+      tone: "warn",
+      accent:
+        gepaEstimatedTokens == null
+          ? undefined
+          : `~${Math.round(gepaEstimatedTokens).toLocaleString()}`,
+      unit: gepaEstimatedTokens == null ? undefined : "tokens",
+    },
+    {
+      label: "Runtime",
+      value: formatApproxMinutes(gepaEstimatedMinutes),
+      helper: `${formatIntegerCount(gepaEstimatedThreads, "thread")}, ${formatApproxMinutes(gepaTimeoutMinutes)} timeout`,
+      tone: "info",
+      accent:
+        gepaEstimatedMinutes == null
+          ? undefined
+          : `~${Math.max(1, Math.round(gepaEstimatedMinutes)).toLocaleString()}`,
+      unit: gepaEstimatedMinutes == null ? undefined : "min",
+    },
+    {
+      label: "Last GEPA run",
+      value: latestGepaStatus
+        ? humanizeStatusLabel(latestGepaStatus)
+        : "No run yet",
+      helper:
+        latestGepaSpentUsd == null
+          ? "No cost record yet"
+          : `${formatApproxMoney(latestGepaSpentUsd)}${
+              latestGepaCostSource ? ` ${latestGepaCostSource}` : ""
+            }`,
+      tone:
+        latestGepaStatus === "completed"
+          ? "good"
+          : ["blocked", "failed", "timed_out", "error"].includes(latestGepaStatus)
+            ? "warn"
+            : "info",
+    },
+  ];
   const promptInsights = asRecord(evolutionDev.prompt_insights);
   const classifierInsights = asRecord(
     evolutionDev.classifier_prompt_insights ?? evolutionDev.classifier_insights,
@@ -2547,6 +2972,33 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     () => snapshotHistoryRows(evolutionDev.prompt_snapshot_history),
     [evolutionDev],
   );
+  const historyRows = useMemo(
+    () =>
+      sortHistoryRows([
+        ...gepaHistoryRows(
+          recordList(gepaQueue.completed),
+          recordList(gepaQueue.failed),
+        ),
+        ...promptOptimizationHistoryRows(promptOptimizationOpportunities),
+        ...evolveCandidateHistoryRows([
+          ...deployedCandidates,
+          ...historyCandidates,
+        ]),
+        ...canarySafetyHistoryRows(promptCanarySafetyEvents),
+        ...snapshotRows(promptSnapshots),
+      ]),
+    [
+      deployedCandidates,
+      gepaQueue,
+      historyCandidates,
+      promptCanarySafetyEvents,
+      promptOptimizationOpportunities,
+      promptSnapshots,
+    ],
+  );
+  const historyDialogPayload = historyDialogRow
+    ? JSON.stringify(historyDialogRow.detail, null, 2)
+    : "";
   const dialogCandidate = candidateDialogId
     ? (evolveCandidates.find(
         (row) => str(row.id, "") === candidateDialogId,
@@ -4544,6 +4996,101 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 {lastEvolveScanMessage}
               </Alert>
             ) : null}
+            <Box
+              sx={{
+                display: "grid",
+                gridTemplateColumns: {
+                  xs: "1fr",
+                  lg: "minmax(220px, 1.1fr) repeat(4, minmax(112px, 0.7fr)) auto",
+                },
+                gap: 1,
+                alignItems: "center",
+                borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+                borderBottom: "1px solid var(--ui-rgba-145-170-205-120)",
+                py: 1,
+                mb: 1.25,
+              }}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "var(--text-faint)",
+                    display: "block",
+                    fontFamily: "var(--font-mono)",
+                    fontSize: "0.62rem",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Bounded GEPA run
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: "var(--text-secondary)",
+                    fontSize: "0.75rem",
+                    lineHeight: 1.35,
+                  }}
+                >
+                  Recent Evolve evidence, one quiet-time job.
+                </Typography>
+              </Box>
+              {gepaRunStats.map((metric, metricIdx) => (
+                <EvolveStat
+                  key={`gepa-run-${metric.label}`}
+                  label={metric.label}
+                  value={metric.value}
+                  helper={metric.helper}
+                  tone={metric.tone}
+                  accent={metric.accent}
+                  unit={metric.unit}
+                  progress={metric.progress}
+                  divider={metricIdx > 0}
+                />
+              ))}
+              <Stack
+                spacing={0.4}
+                sx={{
+                  alignItems: { xs: "stretch", lg: "flex-end" },
+                  minWidth: { xs: 0, lg: 148 },
+                }}
+              >
+                <Button
+                  size="small"
+                  variant="contained"
+                  color="success"
+                  sx={{ whiteSpace: "nowrap" }}
+                  title={gepaApproveBlocker || "Queue a bounded GEPA run"}
+                  disabled={
+                    runEvolutionActionMutation.isPending || !gepaCanApproveRun
+                  }
+                  onClick={() =>
+                    void runEvolutionAction(
+                      { action: "run_gepa_seed" },
+                      "GEPA run approved and queued for quiet time.",
+                      `Queue one bounded GEPA optimization for quiet time? Estimate: ${
+                        gepaRunEstimateLine || "unavailable"
+                      }.`,
+                    )
+                  }
+                >
+                  Approve GEPA run
+                </Button>
+                {gepaApproveBlocker ? (
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "var(--text-secondary)",
+                      fontSize: "0.58rem",
+                      lineHeight: 1.25,
+                      textAlign: { xs: "left", lg: "right" },
+                    }}
+                  >
+                    {gepaApproveBlocker}
+                  </Typography>
+                ) : null}
+              </Stack>
+            </Box>
             {arkdistillContextSamples != null && arkdistillContextSamples > 0 ? (
               <Box
                 sx={{
@@ -4795,6 +5342,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                         const previewBefore = stringList(changePreview.before);
                         const previewAfter = stringList(changePreview.after);
                         const impactEstimate = stringList(changePreview.impact_estimate);
+                        const isRuntimeContextProposal = promptProposalIsRuntimeContext(row);
+                        const runtimeContextCompactionRolledBack =
+                          isRuntimeContextProposal && lifecycleStatus === "rolled_back";
                         const collapsedExplanation =
                           str(row.summary, "").trim() ||
                           expectedBenefit[0] ||
@@ -4812,6 +5362,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                             : lifecycleLabel;
                         const decisionHelper = isPromptProposalDismissed
                           ? "Shown under past decisions; you can approve it later."
+                          : runtimeContextCompactionRolledBack
+                            ? "Full request context is serving. Restore compaction from the detail view."
                           : canApprove
                             ? "Nothing changes until you approve it."
                             : lifecycleStatus === "candidate_rejected"
@@ -4850,7 +5402,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                         const openPromptProposalDialog = () => {
                           if (!proposalId) return;
                           setPromptDetailTab(
-                            canManagePromptCanary || lifecycleStatus === "deployed"
+                            isRuntimeContextProposal
+                              ? "deployment"
+                            : canManagePromptCanary || lifecycleStatus === "deployed"
                               ? "deployment"
                               : canRunPromptBackgroundTest || canRetryPromptBackgroundTest
                                 ? "background"
@@ -5136,10 +5690,16 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     allowScrollButtonsMobile
                                   >
                                     <Tab value="proposal" label="Proposal" />
-                                    <Tab value="background" label="Background Test" />
-                                    <Tab value="candidate" label="Candidate" />
+                                    {isRuntimeContextProposal ? null : (
+                                      <Tab value="background" label="Background Test" />
+                                    )}
+                                    {isRuntimeContextProposal ? null : (
+                                      <Tab value="candidate" label="Candidate" />
+                                    )}
                                     <Tab value="deployment" label="Deployment" />
-                                    <Tab value="monitoring" label="Monitoring" />
+                                    {isRuntimeContextProposal ? null : (
+                                      <Tab value="monitoring" label="Monitoring" />
+                                    )}
                                   </Tabs>
                                 </Box>
                                 <PromptDetailSection tab="proposal" active={promptDetailTab}>
@@ -5535,17 +6095,55 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     />
                                     <ResultSummaryCard
                                       label="Rollout"
-                                      value={finiteNumber(lifecycle.rollout_percent) == null ? "-" : `${num(lifecycle.rollout_percent, 0)}%`}
-                                      helper="Canary rollout share for live prompt tests."
+                                      value={
+                                        isRuntimeContextProposal
+                                          ? "All new turns"
+                                          : finiteNumber(lifecycle.rollout_percent) == null
+                                            ? "-"
+                                            : `${num(lifecycle.rollout_percent, 0)}%`
+                                      }
+                                      helper={
+                                        isRuntimeContextProposal
+                                          ? "Runtime request builder setting, not a prompt canary."
+                                          : "Canary rollout share for live prompt tests."
+                                      }
                                       tone="info"
                                     />
                                     <ResultSummaryCard
                                       label="Rollback"
-                                      value={toBool(lifecycle.rollback_available) ? "Available" : "Not available"}
-                                      helper={rollbackRecommended ? "Rollback is recommended." : "Rollback appears here after stable deployment."}
-                                      tone={rollbackRecommended ? "warn" : "info"}
+                                      value={
+                                        runtimeContextCompactionRolledBack
+                                          ? "Rolled back"
+                                          : toBool(lifecycle.rollback_available)
+                                            ? "Available"
+                                            : "Not available"
+                                      }
+                                      helper={
+                                        isRuntimeContextProposal
+                                          ? runtimeContextCompactionRolledBack
+                                            ? "Restore compaction from this dialog."
+                                            : "Roll back compaction from this dialog if it trims too much."
+                                        : rollbackRecommended
+                                          ? "Rollback is recommended."
+                                          : "Rollback appears here after stable deployment."
+                                      }
+                                      tone={
+                                        runtimeContextCompactionRolledBack || rollbackRecommended
+                                          ? "warn"
+                                          : "info"
+                                      }
                                     />
                                   </Box>
+                                  {isRuntimeContextProposal ? (
+                                    <Alert
+                                      severity={runtimeContextCompactionRolledBack ? "warning" : "info"}
+                                      sx={{ borderRadius: 1 }}
+                                    >
+                                      {runtimeContextCompactionRolledBack
+                                        ? "Runtime request-context compaction is rolled back. New Spine requests use the full compact request context until you restore compaction."
+                                        : "Runtime request-context compaction is active through the request-context builder. You can roll it back here; verify impact by watching the next Request Context p95 prompt telemetry after fresh runs."}
+                                    </Alert>
+                                  ) : null}
                                   <Box
                                     sx={{
                                       display: "grid",
@@ -5679,6 +6277,43 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                   >
                                     Approve next stage
                                   </Button>
+                                ) : null}
+                                {isRuntimeContextProposal && !canApprove ? (
+                                  runtimeContextCompactionRolledBack ? (
+                                    <Button
+                                      variant="contained"
+                                      disabled={runEvolutionActionMutation.isPending}
+                                      onClick={() =>
+                                        void runEvolutionAction(
+                                          {
+                                            action: "restore_runtime_context_compaction",
+                                            candidate_id: proposalId,
+                                          },
+                                          "Runtime request-context compaction restored.",
+                                        )
+                                      }
+                                    >
+                                      Restore compaction
+                                    </Button>
+                                  ) : (
+                                    <Button
+                                      color="error"
+                                      variant="outlined"
+                                      disabled={runEvolutionActionMutation.isPending}
+                                      onClick={() =>
+                                        void runEvolutionAction(
+                                          {
+                                            action: "rollback_runtime_context_compaction",
+                                            candidate_id: proposalId,
+                                          },
+                                          "Runtime request-context compaction rolled back.",
+                                          "Roll back request-context compaction? New Spine requests will use the full compact request context.",
+                                        )
+                                      }
+                                    >
+                                      Roll back compaction
+                                    </Button>
+                                  )
                                 ) : null}
                                 {canManagePromptCanary &&
                                 (lifecycleStatus === "testing" ||
@@ -6065,261 +6700,315 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         </Stack>
       ) : null}
       {tab === "history" ? (
-        <Stack spacing={1.5}>
-          <Box className="list-shell" sx={{ p: 1.6 }}>
-            <Typography
-              variant="subtitle1"
-              sx={{
-                color: "var(--text-primary)",
-                fontWeight: 600,
-                fontSize: "0.95rem",
-                lineHeight: 1.3,
-              }}
-            >
-              Past candidates
-            </Typography>
-            <Typography
-              variant="body2"
-              sx={{
-                color: "var(--text-secondary)",
-                fontSize: "0.78rem",
-                lineHeight: 1.4,
-                mt: 0.25,
-                mb: 1.25,
-              }}
-            >
-              Dismissed and auto-reverted candidates. ArkEvolve keeps their
-              evidence and only revisits a segment if it changes materially.
-            </Typography>
-            {historyCandidates.length === 0 ? (
-              <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                No dismissed or reverted candidates yet.
-              </Typography>
-            ) : (
-              (() => {
-                const slice = pageSlice(
-                  historyCandidates,
-                  historyPage,
-                  PROMPT_REVIEW_PAGE_SIZE,
-                );
-                return (
-                  <>
-                    <Stack spacing={1}>
-                      {slice.items.map((row) => (
-                        <EvolveCandidateRow
-                          key={`history-opp-${str(row.id, "")}`}
-                          row={row}
-                          onOpen={openCandidateDialog}
-                        />
-                      ))}
-                    </Stack>
-                    <ListPager
-                      page={slice.page}
-                      pageCount={slice.pageCount}
-                      rangeStart={slice.rangeStart}
-                      rangeEnd={slice.rangeEnd}
-                      total={slice.total}
-                      noun="candidates"
-                      onPage={setHistoryPage}
-                    />
-                  </>
-                );
-              })()
-            )}
-          </Box>
-          <Box className="list-shell" sx={{ p: 1.6 }}>
-            <Typography
-              variant="subtitle1"
-              sx={{
-                color: "var(--text-primary)",
-                fontWeight: 600,
-                fontSize: "0.95rem",
-                lineHeight: 1.3,
-              }}
-            >
-              Safety event log
-            </Typography>
-            <Typography
-              variant="body2"
-              sx={{
-                color: "var(--text-secondary)",
-                fontSize: "0.78rem",
-                lineHeight: 1.4,
-                mt: 0.25,
-                mb: 1.25,
-              }}
-            >
-              Every canary regression ArkEvolve recorded, including
-              auto-reverts. Actionable events also appear under Testing.
-            </Typography>
-            {promptCanarySafetyEvents.length === 0 ? (
-              <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                No safety events recorded.
-              </Typography>
-            ) : (
+        <Box className="list-shell" sx={{ p: 1.2 }}>
+          {(() => {
+            const historySlice = pageSlice(
+              historyRows,
+              historyPage,
+              PROMPT_REVIEW_PAGE_SIZE,
+            );
+            const totalHistoryRows = historyRows.length;
+            const rowSx = {
+              display: "grid",
+              gridTemplateColumns: {
+                xs: "1fr",
+                md: "104px minmax(0, 1fr) 132px 120px auto",
+              },
+              gap: 1,
+              alignItems: "center",
+              p: 1,
+              border: "1px solid var(--ui-rgba-145-170-205-120)",
+              borderRadius: 1,
+            };
+
+            return (
               <Stack spacing={0.75}>
-                {promptCanarySafetyEvents.slice(0, 12).map((row, idx) => {
-                  const eventStatus = str(
-                    row.review_status,
-                    str(row.status, "open"),
-                  );
-                  const createdAt = str(row.created_at, "");
-                  return (
-                    <Box
-                      key={`safety-log-${str(row.id, String(idx))}`}
-                      sx={{
-                        p: 1.1,
-                        border: "1px solid var(--ui-rgba-145-170-205-120)",
-                        borderRadius: 1,
-                      }}
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <Typography
+                    variant="subtitle1"
+                    sx={{
+                      color: "var(--text-primary)",
+                      fontWeight: 600,
+                      fontSize: "0.95rem",
+                    }}
+                  >
+                    History
+                  </Typography>
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`${totalHistoryRows} row${totalHistoryRows === 1 ? "" : "s"}`}
+                  />
+                </Stack>
+                {totalHistoryRows === 0 ? (
+                  <Box sx={rowSx}>
+                    <Chip size="small" variant="outlined" label="Empty" />
+                    <Typography
+                      variant="body2"
+                      sx={{ color: "var(--text-secondary)" }}
                     >
-                      <Stack
-                        direction="row"
-                        spacing={0.75}
-                        useFlexGap
-                        sx={{ alignItems: "center", flexWrap: "wrap" }}
-                      >
-                        <Typography
-                          variant="body2"
-                          sx={{ color: "#e8f4ff", fontWeight: 600 }}
+                      No history yet.
+                    </Typography>
+                  </Box>
+                ) : (
+                  <>
+                    {historySlice.items.map((row) => {
+                      return (
+                        <Box
+                          component="button"
+                          type="button"
+                          key={row.id}
+                          onClick={() => {
+                            setHistoryDialogRow(row);
+                          }}
+                          sx={{
+                            ...rowSx,
+                            width: "100%",
+                            appearance: "none",
+                            background: "transparent",
+                            color: "inherit",
+                            font: "inherit",
+                            textAlign: "left",
+                            cursor: "pointer",
+                            "&:hover": {
+                              borderColor:
+                                "var(--ui-rgba-145-170-205-260)",
+                            },
+                            "&:focus-visible": {
+                              outline: "2px solid rgba(120, 242, 176, 0.8)",
+                              outlineOffset: 2,
+                            },
+                          }}
                         >
-                          {str(row.title, "Canary safety event")}
-                        </Typography>
-                        <Chip
-                          size="small"
-                          color={promptCanarySafetyStatusColor(eventStatus)}
-                          label={humanizeStatusLabel(
-                            str(row.status, eventStatus),
-                          )}
-                        />
-                        {createdAt ? (
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            label={row.kindLabel}
+                          />
+                          <Box sx={{ minWidth: 0 }}>
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                color: "#e8f4ff",
+                                fontWeight: 600,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {row.title}
+                            </Typography>
+                            <Typography
+                              variant="caption"
+                              sx={{
+                                color: "var(--text-faint)",
+                                display: "block",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {row.subtitle}
+                            </Typography>
+                          </Box>
+                          <Chip
+                            size="small"
+                            color={row.statusColor}
+                            variant={row.statusColor === "default" ? "outlined" : "filled"}
+                            label={row.statusLabel}
+                          />
                           <Typography
                             variant="caption"
                             sx={{ color: "var(--text-faint)" }}
                           >
-                            {formatTimestampForHumans(createdAt).label}
+                            {row.occurredAt
+                              ? formatTimestampForHumans(row.occurredAt).label
+                              : "-"}
                           </Typography>
-                        ) : null}
-                      </Stack>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                          display: "block",
-                          mt: 0.35,
-                        }}
-                      >
-                        {str(row.summary, "")}
-                      </Typography>
-                    </Box>
-                  );
-                })}
+                          <Box
+                            aria-hidden
+                            sx={{
+                              justifySelf: { xs: "start", md: "end" },
+                              color: "var(--text-faint)",
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "1rem",
+                            }}
+                          >
+                            &gt;
+                          </Box>
+                        </Box>
+                      );
+                    })}
+                    <HistoryPager
+                      page={historySlice.page}
+                      pageCount={historySlice.pageCount}
+                      rangeStart={historySlice.rangeStart}
+                      rangeEnd={historySlice.rangeEnd}
+                      total={historySlice.total}
+                      onPage={setHistoryPage}
+                    />
+                  </>
+                )}
               </Stack>
-            )}
-          </Box>
-          <Box className="list-shell" sx={{ p: 1.6 }}>
-            <Typography
-              variant="subtitle1"
-              sx={{
-                color: "var(--text-primary)",
-                fontWeight: 600,
-                fontSize: "0.95rem",
-                lineHeight: 1.3,
-              }}
-            >
-              Prompt snapshots
-            </Typography>
-            <Typography
-              variant="body2"
-              sx={{
-                color: "var(--text-secondary)",
-                fontSize: "0.78rem",
-                lineHeight: 1.4,
-                mt: 0.25,
-                mb: 1.25,
-              }}
-            >
-              Restorable prompt-bundle versions saved at each promotion.
-              Restoring disables any active canary.
-            </Typography>
-            {promptSnapshots.length === 0 ? (
-              <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                No snapshots yet. ArkEvolve saves one at every stable
-                promotion.
-              </Typography>
-            ) : (
-              <Stack spacing={0.75}>
-                {promptSnapshots.map((snapshot, idx) => (
-                  <Stack
-                    key={`prompt-snapshot-${snapshot.version}`}
-                    direction="row"
-                    spacing={1}
-                    sx={{
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      p: 1.1,
-                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                      borderRadius: 1,
-                    }}
-                  >
-                    <Box sx={{ minWidth: 0 }}>
-                      <Stack
-                        direction="row"
-                        spacing={0.75}
-                        useFlexGap
-                        sx={{ alignItems: "center", flexWrap: "wrap" }}
-                      >
-                        <Typography
-                          variant="body2"
-                          sx={{
-                            color: "#e8f4ff",
-                            fontWeight: 600,
-                            fontFamily: "var(--font-mono)",
-                            fontSize: "0.78rem",
-                          }}
-                        >
-                          {snapshot.version}
-                        </Typography>
-                        {idx === 0 ? (
-                          <Chip size="small" label="Newest" />
-                        ) : null}
-                      </Stack>
-                      {snapshot.savedAt ? (
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "var(--text-faint)" }}
-                        >
-                          Saved {formatTimestampForHumans(snapshot.savedAt).label}
-                        </Typography>
-                      ) : null}
-                    </Box>
-                    <Button
-                      size="small"
-                      variant="outlined"
-                      color="inherit"
-                      sx={{ flexShrink: 0 }}
-                      disabled={runEvolutionActionMutation.isPending}
-                      onClick={() =>
-                        void runEvolutionAction(
-                          {
-                            action: "rollback_prompt_to_version",
-                            candidate_id: "prompt",
-                            proposal_id: snapshot.version,
-                          },
-                          `Prompt bundle restored to ${snapshot.version}.`,
-                          `Restore the prompt bundle to version "${snapshot.version}"? Any active canary is disabled.`,
-                        )
-                      }
-                    >
-                      Restore
-                    </Button>
-                  </Stack>
-                ))}
-              </Stack>
-            )}
-          </Box>
-        </Stack>
+            );
+          })()}
+        </Box>
       ) : null}
+      <Dialog
+        open={!!historyDialogRow}
+        onClose={() => setHistoryDialogRow(null)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>
+          <Stack spacing={0.75}>
+            <Stack
+              direction={{ xs: "column", md: "row" }}
+              spacing={1}
+              sx={{
+                alignItems: { xs: "flex-start", md: "center" },
+                justifyContent: "space-between",
+              }}
+            >
+              <Typography
+                variant="h6"
+                sx={{ color: "#e8f4ff", fontWeight: 750 }}
+              >
+                {historyDialogRow?.title || "History detail"}
+              </Typography>
+              {historyDialogRow ? (
+                <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap" }}>
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={historyDialogRow.kindLabel}
+                  />
+                  <Chip
+                    size="small"
+                    color={historyDialogRow.statusColor}
+                    variant={
+                      historyDialogRow.statusColor === "default"
+                        ? "outlined"
+                        : "filled"
+                    }
+                    label={historyDialogRow.statusLabel}
+                  />
+                </Stack>
+              ) : null}
+            </Stack>
+            {historyDialogRow ? (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                {historyDialogRow.subtitle}
+              </Typography>
+            ) : null}
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers>
+          {historyDialogRow ? (
+            <Stack spacing={1.25}>
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: { xs: "1fr", md: "repeat(3, minmax(0, 1fr))" },
+                  gap: 0.75,
+                }}
+              >
+                <ResultSummaryCard
+                  label="Type"
+                  value={historyDialogRow.kindLabel}
+                  helper={str(historyDialogRow.detail.source, "history")}
+                  tone="info"
+                />
+                <ResultSummaryCard
+                  label="Outcome"
+                  value={historyDialogRow.statusLabel}
+                  helper={
+                    historyDialogRow.occurredAt
+                      ? formatTimestampForHumans(historyDialogRow.occurredAt).label
+                      : "No timestamp recorded"
+                  }
+                  tone={
+                    historyDialogRow.statusColor === "success"
+                      ? "good"
+                      : historyDialogRow.statusColor === "error" ||
+                          historyDialogRow.statusColor === "warning"
+                        ? "warn"
+                        : "info"
+                  }
+                />
+                <ResultSummaryCard
+                  label="Record"
+                  value={str(historyDialogRow.detail.proposal_id, "") || str(historyDialogRow.detail.job_id, "") || str(historyDialogRow.detail.candidate_id, "") || str(historyDialogRow.detail.version, "") || "-"}
+                  helper="Trace key"
+                  tone="default"
+                />
+              </Box>
+              <Box>
+                <Typography
+                  variant="subtitle2"
+                  sx={{ color: "#e8f4ff", mb: 0.75 }}
+                >
+                  Details
+                </Typography>
+                <Box
+                  component="pre"
+                  sx={{
+                    m: 0,
+                    p: 1,
+                    maxHeight: 380,
+                    overflow: "auto",
+                    border: "1px solid var(--ui-rgba-145-170-205-120)",
+                    borderRadius: 1,
+                    bgcolor: "rgba(8, 14, 24, 0.34)",
+                    color: "var(--text-secondary)",
+                    fontFamily: "var(--font-mono)",
+                    fontSize: "0.72rem",
+                    lineHeight: 1.45,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {historyDialogPayload}
+                </Box>
+              </Box>
+            </Stack>
+          ) : null}
+        </DialogContent>
+        <DialogActions>
+          {historyDialogRow?.restoreVersion ? (
+            <Button
+              variant="outlined"
+              color="inherit"
+              disabled={runEvolutionActionMutation.isPending}
+              onClick={() => {
+                const version = historyDialogRow.restoreVersion;
+                if (!version) return;
+                setHistoryDialogRow(null);
+                void runEvolutionAction(
+                  {
+                    action: "rollback_prompt_to_version",
+                    candidate_id: "prompt",
+                    proposal_id: version,
+                  },
+                  `Prompt bundle restored to ${version}.`,
+                  `Restore the prompt bundle to version "${version}"? Any active canary is disabled.`,
+                );
+              }}
+            >
+              Restore
+            </Button>
+          ) : null}
+          <Button onClick={() => setHistoryDialogRow(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
       <EvolveCandidateDialog
         row={dialogCandidate}
         actionPending={runEvolutionActionMutation.isPending}

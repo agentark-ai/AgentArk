@@ -93,14 +93,17 @@ class GepaControlKwargsTests(unittest.TestCase):
         self.assertEqual(kwargs, {"auto": "heavy"})
         self.assertNotIn("max_metric_calls", kwargs)
 
-    def test_thread_count_defaults_to_single_threaded_execution(self) -> None:
-        self.assertEqual(_gepa_thread_count({}), 1)
+    def test_thread_count_defaults_to_parallel_metric_execution(self) -> None:
+        self.assertEqual(_gepa_thread_count({}), 4)
 
     def test_thread_count_can_be_overridden_within_background_cap(self) -> None:
-        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_THREADS": "2"}), 2)
+        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_NUM_THREADS": "6"}), 6)
 
     def test_thread_count_override_is_capped_for_background_cpu(self) -> None:
-        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_THREADS": "99"}), 2)
+        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_NUM_THREADS": "99"}), 8)
+
+    def test_legacy_thread_env_still_works(self) -> None:
+        self.assertEqual(_gepa_thread_count({"AGENTARK_GEPA_THREADS": "2"}), 2)
 
     def test_lm_runtime_defaults_bound_slow_model_calls(self) -> None:
         self.assertEqual(
