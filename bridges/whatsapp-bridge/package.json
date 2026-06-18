@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@whiskeysockets/baileys": "~6.7.23",
     "express": "^4.22.2",
     "pino": "^9.5.0",
     "qrcode": "^1.5.4"
@@ -16,6 +16,7 @@
     "file-type": "^21.3.2",
     "music-metadata": "^11.12.2",
     "path-to-regexp": "^0.1.13",
-    "protobufjs": "^7.5.8"
+    "form-data": "^4.0.6",
+    "protobufjs": "^7.6.4"
   }
 }
