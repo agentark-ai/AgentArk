@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/dist"

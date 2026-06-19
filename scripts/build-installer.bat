@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 :: Crate Agent - Build Installer Script (Windows)
 :: Creates a portable deployment package
 
-set VERSION=0.1.1
+set VERSION=0.1.2
 set SCRIPT_DIR=%~dp0
 set PROJECT_ROOT=%SCRIPT_DIR%..
 set BUILD_DIR=%PROJECT_ROOT%\dist

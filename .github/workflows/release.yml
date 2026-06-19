@@ -13,6 +13,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   RELEASE_ASSET_NAME: agentark-x86_64-unknown-linux-gnu.tar.gz
+  CARGO_BUILD_JOBS: "1"
 
 permissions:
   contents: read
