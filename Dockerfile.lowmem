@@ -70,6 +70,7 @@
 # ships glibc 2.36, which causes the release link to fail in Docker builds.
 FROM rust:1.94-trixie AS builder
 
+ARG TARGETARCH
 WORKDIR /app
 
 # Copy manifests for dependency resolution
@@ -101,8 +102,8 @@ ARG AGENTARK_BUILD_JOBS=2
 ARG AGENTARK_BUILD_PROFILE=release
 
 # Build dependencies with cache mount (survives across docker builds)
-RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
-    --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=agentark-cargo-target-${TARGETARCH},target=/app/target \
+    --mount=type=cache,id=agentark-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
         cargo build --profile "${AGENTARK_BUILD_PROFILE}"; \
     else \
@@ -124,8 +125,8 @@ COPY assets ./assets
 # incremental work that the cache mount is specifically there to preserve.
 # After the build, we assert the produced binary is at least as new as any src/
 # file so a silently-skipped rebuild can't ship stale code.
-RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
-    --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=agentark-cargo-target-${TARGETARCH},target=/app/target \
+    --mount=type=cache,id=agentark-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
         cargo build --profile "${AGENTARK_BUILD_PROFILE}" --bins; \
     else \
@@ -141,8 +142,8 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
 # Preload the default local embedding model for published/prebuilt images.
 # Runtime still falls back to /app/data/embeddings-cache when this cache is not present.
 ARG AGENTARK_PREFETCH_LOCAL_EMBEDDINGS=true
-RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
-    --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=agentark-cargo-target-${TARGETARCH},target=/app/target \
+    --mount=type=cache,id=agentark-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=agentark-local-embeddings-cache,target=/tmp/agentark-embeddings-cache \
     mkdir -p /app/prebuilt-embeddings-cache /tmp/agentark-embeddings-cache && \
     if [ "${AGENTARK_PREFETCH_LOCAL_EMBEDDINGS}" = "true" ]; then \
