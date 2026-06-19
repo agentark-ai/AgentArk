@@ -283,7 +283,7 @@ fn summarize_arkdistill_parsed_logs(
     totals.savings_percent = round2(totals.average_reduction_ratio * 100.0);
     totals.estimated_prompt_cost_saved_usd = has_cost.then(|| round6(cost_sum));
     let mut by_tool = by_tool.into_values().collect::<Vec<_>>();
-    by_tool.sort_by(|a, b| b.estimated_saved_tokens.cmp(&a.estimated_saved_tokens));
+    by_tool.sort_by_key(|row| std::cmp::Reverse(row.estimated_saved_tokens));
 
     ArkDistillAnalyticsSummary {
         totals,

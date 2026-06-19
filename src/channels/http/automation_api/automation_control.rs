@@ -3235,23 +3235,19 @@ pub(super) fn find_json_value_bounds(raw: &str) -> Option<(usize, usize)> {
                 }
                 stack.push(ch);
             }
-            '}' => {
-                if stack.last() == Some(&'{') {
-                    stack.pop();
-                    if stack.is_empty() {
-                        if let Some(value_start) = start {
-                            return Some((value_start, idx + ch.len_utf8()));
-                        }
+            '}' if stack.last() == Some(&'{') => {
+                stack.pop();
+                if stack.is_empty() {
+                    if let Some(value_start) = start {
+                        return Some((value_start, idx + ch.len_utf8()));
                     }
                 }
             }
-            ']' => {
-                if stack.last() == Some(&'[') {
-                    stack.pop();
-                    if stack.is_empty() {
-                        if let Some(value_start) = start {
-                            return Some((value_start, idx + ch.len_utf8()));
-                        }
+            ']' if stack.last() == Some(&'[') => {
+                stack.pop();
+                if stack.is_empty() {
+                    if let Some(value_start) = start {
+                        return Some((value_start, idx + ch.len_utf8()));
                     }
                 }
             }

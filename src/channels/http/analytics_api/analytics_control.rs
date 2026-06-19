@@ -840,11 +840,11 @@ pub(super) async fn llm_analytics_endpoint(
     }
 
     let mut by_model_list: Vec<LlmAnalyticsBreakdownRow> = by_model.into_values().collect();
-    by_model_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    by_model_list.sort_by_key(|row| std::cmp::Reverse(row.total_tokens));
     let mut by_channel_list: Vec<LlmAnalyticsBreakdownRow> = by_channel.into_values().collect();
-    by_channel_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    by_channel_list.sort_by_key(|row| std::cmp::Reverse(row.total_tokens));
     let mut by_purpose_list: Vec<LlmAnalyticsBreakdownRow> = by_purpose.into_values().collect();
-    by_purpose_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    by_purpose_list.sort_by_key(|row| std::cmp::Reverse(row.total_tokens));
     let arkdistill = summarize_arkdistill_logs_and_traces_window_with_pricing(
         &arkdistill_logs,
         &arkdistill_trace_rows,

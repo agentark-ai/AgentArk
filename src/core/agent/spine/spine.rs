@@ -2328,7 +2328,7 @@ pub async fn run_spine(
                 })
                 .collect::<Vec<_>>();
             let batch_results = join_all(futures).await;
-            for (idx, result) in batch.into_iter().zip(batch_results.into_iter()) {
+            for (idx, result) in batch.into_iter().zip(batch_results) {
                 results_by_index[idx] = Some(result);
             }
         }

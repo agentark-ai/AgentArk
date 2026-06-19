@@ -4026,11 +4026,9 @@ impl UserMemoryCaptureWorker {
                         changed = true;
                     }
                 }
-                "preferred_tone" => {
-                    if profile.tone.as_deref() != Some(trimmed) {
-                        profile.tone = Some(trimmed.to_string());
-                        changed = true;
-                    }
+                "preferred_tone" if profile.tone.as_deref() != Some(trimmed) => {
+                    profile.tone = Some(trimmed.to_string());
+                    changed = true;
                 }
                 _ => {}
             }
