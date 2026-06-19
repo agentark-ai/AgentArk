@@ -12,7 +12,6 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  RELEASE_ASSET_NAME: agentark-x86_64-unknown-linux-gnu.tar.gz
   CARGO_BUILD_JOBS: "1"
 
 permissions:
@@ -160,108 +159,19 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-  release-assets:
+  publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: docker
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Cache cargo dependencies
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-
-            ${{ runner.os }}-cargo-
-
-      - name: Install cargo-auditable
-        run: cargo install cargo-auditable --locked --force
-
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build frontend assets
-        working-directory: frontend
-        run: npm run build
-
-      - name: Build auditable Linux release binary
-        run: cargo auditable build --locked --release
-
-      - name: Assemble release artifacts
-        run: |
-          package_root="dist/agentark-x86_64-unknown-linux-gnu"
-          mkdir -p "${package_root}/frontend"
-          cp target/release/agentark "${package_root}/agentark"
-          cp README.md SECURITY.md VERIFY.md "${package_root}/"
-          cp -R assets "${package_root}/assets"
-          cp -R config "${package_root}/config"
-          cp -R skills "${package_root}/skills"
-          cp -R frontend/dist "${package_root}/frontend/dist"
-          tar -C dist -czf "dist/${{ env.RELEASE_ASSET_NAME }}" agentark-x86_64-unknown-linux-gnu
-          sha256sum "dist/${{ env.RELEASE_ASSET_NAME }}" > dist/SHA256SUMS
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3.9.1
-
-      - name: Sign release artifacts with Sigstore keyless
-        env:
-          COSIGN_EXPERIMENTAL: "true"
-        run: |
-          cosign sign-blob --yes \
-            --output-signature "dist/${{ env.RELEASE_ASSET_NAME }}.sig" \
-            --output-certificate "dist/${{ env.RELEASE_ASSET_NAME }}.pem" \
-            "dist/${{ env.RELEASE_ASSET_NAME }}"
-          cosign sign-blob --yes \
-            --output-signature "dist/SHA256SUMS.sig" \
-            --output-certificate "dist/SHA256SUMS.pem" \
-            dist/SHA256SUMS
-
-      - name: Attest release tarball provenance
-        if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: dist/${{ env.RELEASE_ASSET_NAME }}
-
-      - name: Attest checksum file provenance
-        if: ${{ github.event.repository.private == false || vars.AGENTARK_ENABLE_PRIVATE_ATTESTATIONS == 'true' }}
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: dist/SHA256SUMS
-
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-assets
-          path: dist/*
-
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+            gh release edit "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}"
           else
-            gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
           fi
