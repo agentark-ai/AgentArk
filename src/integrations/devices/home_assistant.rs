@@ -192,7 +192,7 @@ impl HomeAssistantConnector {
             })
             .map(|entity| (Self::score_entity(entity, &terms), entity.clone()))
             .collect::<Vec<_>>();
-        scored.sort_by(|left, right| right.0.cmp(&left.0));
+        scored.sort_by_key(|item| std::cmp::Reverse(item.0));
 
         Ok(serde_json::json!({
             "count": scored.len(),

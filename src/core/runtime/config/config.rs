@@ -2431,15 +2431,10 @@ impl SecureConfigManager {
 
         // Replace primary API key with placeholder
         match &mut sanitized.llm {
-            LlmProvider::Anthropic { api_key, .. } => {
-                if !api_key.is_empty() {
-                    *api_key = "[ENCRYPTED]".to_string();
-                }
-            }
-            LlmProvider::OpenAI { api_key, .. } => {
-                if !api_key.is_empty() {
-                    *api_key = "[ENCRYPTED]".to_string();
-                }
+            LlmProvider::Anthropic { api_key, .. } | LlmProvider::OpenAI { api_key, .. }
+                if !api_key.is_empty() =>
+            {
+                *api_key = "[ENCRYPTED]".to_string();
             }
             _ => {}
         }
@@ -2457,15 +2452,10 @@ impl SecureConfigManager {
         // Replace fallback API key with placeholder
         if let Some(fallback) = &mut sanitized.llm_fallback {
             match fallback {
-                LlmProvider::Anthropic { api_key, .. } => {
-                    if !api_key.is_empty() {
-                        *api_key = "[ENCRYPTED]".to_string();
-                    }
-                }
-                LlmProvider::OpenAI { api_key, .. } => {
-                    if !api_key.is_empty() {
-                        *api_key = "[ENCRYPTED]".to_string();
-                    }
+                LlmProvider::Anthropic { api_key, .. } | LlmProvider::OpenAI { api_key, .. }
+                    if !api_key.is_empty() =>
+                {
+                    *api_key = "[ENCRYPTED]".to_string();
                 }
                 _ => {}
             }
@@ -2593,15 +2583,10 @@ impl SecureConfigManager {
         // Replace model pool API keys with placeholder
         for slot in &mut sanitized.model_pool.slots {
             match &mut slot.provider {
-                LlmProvider::Anthropic { api_key, .. } => {
-                    if !api_key.is_empty() {
-                        *api_key = "[ENCRYPTED]".to_string();
-                    }
-                }
-                LlmProvider::OpenAI { api_key, .. } => {
-                    if !api_key.is_empty() {
-                        *api_key = "[ENCRYPTED]".to_string();
-                    }
+                LlmProvider::Anthropic { api_key, .. } | LlmProvider::OpenAI { api_key, .. }
+                    if !api_key.is_empty() =>
+                {
+                    *api_key = "[ENCRYPTED]".to_string();
                 }
                 _ => {}
             }

@@ -808,9 +808,7 @@ fn next_group_digit_index(source: &str, span: RedactionSpan) -> Option<usize> {
     let mut idx = span.end;
     let mut saw_separator = false;
     while idx < source.len() {
-        let Some(ch) = source[idx..].chars().next() else {
-            return None;
-        };
+        let ch = source[idx..].chars().next()?;
         if grouped_numeric_separator(ch) {
             saw_separator = true;
             idx += ch.len_utf8();

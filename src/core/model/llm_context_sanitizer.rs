@@ -211,9 +211,7 @@ fn find_internal_tool_block_start(input: &str) -> Option<usize> {
 fn find_legacy_tool_result_start(input: &str) -> Option<usize> {
     let mut offset = 0usize;
     while offset < input.len() {
-        let Some(relative) = input[offset..].find(LEGACY_TOOL_RESULT_HEADER) else {
-            return None;
-        };
+        let relative = input[offset..].find(LEGACY_TOOL_RESULT_HEADER)?;
         let absolute = offset + relative;
         if legacy_tool_result_header_is_internal(&input[absolute..]) {
             return Some(absolute);
@@ -247,7 +245,7 @@ fn legacy_tool_call_context_end(block: &str) -> Option<usize> {
     let mut offset = 0usize;
     let mut consumed_header = false;
     for segment in block.split_inclusive('\n') {
-        let line = segment.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+        let line = segment.trim_end_matches(['\r', '\n']);
         let trimmed = line.trim();
         let next_offset = offset + segment.len();
         if !consumed_header {

@@ -515,7 +515,7 @@ pub(super) fn collect_settings_secret_entries(
     }
 
     let mut media_keys: Vec<_> = secrets.media_provider_keys.iter().collect();
-    media_keys.sort_by(|(left, _), (right, _)| left.cmp(right));
+    media_keys.sort_by_key(|(left, _)| *left);
     for (provider, value) in media_keys {
         push_settings_secret_entry(
             &mut entries,
@@ -527,7 +527,7 @@ pub(super) fn collect_settings_secret_entries(
     }
 
     let mut model_keys: Vec<_> = secrets.model_pool_keys.iter().collect();
-    model_keys.sort_by(|(left, _), (right, _)| left.cmp(right));
+    model_keys.sort_by_key(|(left, _)| *left);
     for (slot_id, value) in model_keys {
         push_settings_secret_entry(
             &mut entries,
@@ -539,7 +539,7 @@ pub(super) fn collect_settings_secret_entries(
     }
 
     let mut mcp_auth: Vec<_> = secrets.mcp_auth.iter().collect();
-    mcp_auth.sort_by(|(left, _), (right, _)| left.cmp(right));
+    mcp_auth.sort_by_key(|(left, _)| *left);
     for (server_id, auth) in mcp_auth {
         if let Some(token) = auth.token.as_deref() {
             push_settings_secret_entry(
@@ -566,7 +566,7 @@ pub(super) fn collect_settings_secret_entries(
         .iter()
         .filter(|(key, _)| !is_internal_secret_key(key))
         .collect();
-    custom_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    custom_entries.sort_by_key(|(left, _)| *left);
     for (key, value) in custom_entries {
         if let Some((pack_id, connection_id)) = parse_extension_pack_secret_key(key) {
             let source_label = titleize_secret_label(pack_id);

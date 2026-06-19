@@ -21,15 +21,11 @@ const DEFAULT_OPENAI_EMBEDDINGS_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EmbeddingRequestPriority {
+    #[default]
     Standard,
     HotPath,
-}
-
-impl Default for EmbeddingRequestPriority {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 #[derive(Serialize)]

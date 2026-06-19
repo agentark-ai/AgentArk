@@ -474,9 +474,11 @@ fn prune_stale_lock(profile: &mut BrowserProfileRecord) -> bool {
 }
 
 fn prune_stale_locks(profiles: &mut [BrowserProfileRecord]) -> bool {
-    profiles.iter_mut().fold(false, |changed, profile| {
-        prune_stale_lock(profile) || changed
-    })
+    let mut changed = false;
+    for profile in profiles {
+        changed |= prune_stale_lock(profile);
+    }
+    changed
 }
 
 fn ensure_owner(value: &str) -> Result<String> {

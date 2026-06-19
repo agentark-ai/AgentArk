@@ -182,7 +182,7 @@ impl ActionRuntime {
                     .unwrap_or(20)
                     .clamp(1, 100) as usize;
                 let mut watchers = storage.list_watchers().await?;
-                watchers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                watchers.sort_by_key(|watcher| std::cmp::Reverse(watcher.created_at));
                 let status_label =
                     |status: &crate::core::automation::watcher::WatcherStatus| -> &'static str {
                         match status {

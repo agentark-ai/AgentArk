@@ -1353,7 +1353,7 @@ pub(super) async fn suggest_knowledge_imports(State(state): State<AppState>) -> 
         }
     }
     let mut tokens: Vec<(String, usize)> = token_counts.into_iter().collect();
-    tokens.sort_by(|a, b| b.1.cmp(&a.1));
+    tokens.sort_by_key(|item| std::cmp::Reverse(item.1));
     let suggestions: Vec<serde_json::Value> = tokens
         .into_iter()
         .take(8)

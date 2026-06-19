@@ -799,9 +799,7 @@ fn resolve_schedule_local_time(
         .and_then(|task| task.scheduled_for)
         .map(|value| timezone.local_date_for_utc(value));
     let base_date = explicit_date.unwrap_or_else(|| {
-        if date_policy == "next_occurrence" {
-            now_local_date
-        } else if date_policy == "same_local_date" {
+        if matches!(date_policy.as_str(), "next_occurrence" | "same_local_date") {
             now_local_date
         } else {
             existing_local_date.unwrap_or(now_local_date)
@@ -3458,7 +3456,7 @@ impl Agent {
             critique.clone(),
             output_preview,
             error_text.clone(),
-            next_retry_at.clone(),
+            next_retry_at,
         );
         if let Err(error) = append_automation_run(&storage, run_record).await {
             tracing::warn!(

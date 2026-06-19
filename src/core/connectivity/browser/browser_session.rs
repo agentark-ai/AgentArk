@@ -3335,7 +3335,7 @@ fn browser_hash_value<H: std::hash::Hasher>(value: &serde_json::Value, state: &m
             5u8.hash(state);
             values.len().hash(state);
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             for (key, value) in entries {
                 key.hash(state);
                 browser_hash_value(value, state);

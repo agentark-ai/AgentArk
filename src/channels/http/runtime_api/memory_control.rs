@@ -4969,7 +4969,7 @@ async fn arkmemory_upsert_relation_candidate(
         &relation.evidence,
     );
     let prior_evidence = storage
-        .list_knowledge_relation_evidence_for_relations(&[relation_id.clone()], 1_000)
+        .list_knowledge_relation_evidence_for_relations(std::slice::from_ref(&relation_id), 1_000)
         .await?;
     let evidence_is_new = prior_evidence.iter().all(|item| item.id != evidence_id);
     let prior_relation = storage.get_knowledge_relation(&relation_id).await?;

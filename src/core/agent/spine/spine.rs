@@ -1413,7 +1413,7 @@ fn classify_tool_evidence_failure(
         .and_then(|embedded| embedded.get("retryable").and_then(|value| value.as_bool()));
     let retryable = embedded_retryable
         .or_else(|| value.get("retryable").and_then(|value| value.as_bool()))
-        .unwrap_or_else(|| {
+        .unwrap_or({
             matches!(
                 reason.as_deref(),
                 Some("timeout" | "rate_limited" | "unavailable")
@@ -1940,7 +1940,7 @@ fn collect_spine_tool_stream_preview(
 
 fn readable_spine_tool_name(name: &str) -> String {
     let readable = name
-        .split(|ch: char| ch == '_' || ch == '-')
+        .split(['_', '-'])
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
         .join(" ");
@@ -1953,7 +1953,7 @@ fn readable_spine_tool_name(name: &str) -> String {
 
 fn readable_json_key(key: &str) -> String {
     let readable = key
-        .split(|ch: char| ch == '_' || ch == '-')
+        .split(['_', '-'])
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
         .join(" ");
@@ -2141,7 +2141,7 @@ pub async fn run_spine(
                 }
                 let completion = verification_verdict_for_terminal_candidate(
                     server,
-                    &cx,
+                    cx,
                     &current_user_request,
                     &messages,
                     request.caller_kind,
@@ -2155,7 +2155,7 @@ pub async fn run_spine(
             } else {
                 combined_terminal_verdicts(
                     server,
-                    &cx,
+                    cx,
                     &current_user_request,
                     &messages,
                     current_turn_evidence_start,
@@ -2403,7 +2403,7 @@ pub async fn run_spine(
             } else {
                 verification_verdict_for_terminal_candidate(
                     server,
-                    &cx,
+                    cx,
                     &current_user_request,
                     &messages,
                     request.caller_kind,
@@ -3448,36 +3448,34 @@ impl AgentSpineLlmServer {
                         )
                         .await
                 }
+            } else if self.long_running {
+                candidate
+                    .client
+                    .chat_with_history_for_long_running_tool_with_images(
+                        system_prompt,
+                        &prepared.user_message,
+                        &prepared.history,
+                        &[],
+                        tool_schemas,
+                        image_attachments,
+                        &self.agent.config.model_privacy,
+                        false,
+                    )
+                    .await
             } else {
-                if self.long_running {
-                    candidate
-                        .client
-                        .chat_with_history_for_long_running_tool_with_images(
-                            system_prompt,
-                            &prepared.user_message,
-                            &prepared.history,
-                            &[],
-                            tool_schemas,
-                            image_attachments,
-                            &self.agent.config.model_privacy,
-                            false,
-                        )
-                        .await
-                } else {
-                    candidate
-                        .client
-                        .chat_with_history_for_helper_with_images(
-                            system_prompt,
-                            &prepared.user_message,
-                            &prepared.history,
-                            &[],
-                            tool_schemas,
-                            image_attachments,
-                            &self.agent.config.model_privacy,
-                            false,
-                        )
-                        .await
-                }
+                candidate
+                    .client
+                    .chat_with_history_for_helper_with_images(
+                        system_prompt,
+                        &prepared.user_message,
+                        &prepared.history,
+                        &[],
+                        tool_schemas,
+                        image_attachments,
+                        &self.agent.config.model_privacy,
+                        false,
+                    )
+                    .await
             }
         } else if self.long_running {
             candidate
@@ -7172,9 +7170,9 @@ fn plan_registered_resource_action(
 }
 
 fn resource_action_contract(kind: &str, op: &str) -> Option<&'static ResourceActionContract> {
-    RESOURCE_ACTION_CONTRACTS.iter().find(|contract| {
-        contract.kind == kind && contract.ops.iter().any(|candidate| *candidate == op)
-    })
+    RESOURCE_ACTION_CONTRACTS
+        .iter()
+        .find(|contract| contract.kind == kind && contract.ops.contains(&op))
 }
 
 fn resource_adapter_spec(kind: &str) -> Option<&'static ResourceAdapterSpec> {
@@ -8043,7 +8041,7 @@ fn custom_api_payload_has_endpoint_or_source(payload: &serde_json::Value) -> boo
         || payload
             .get("operation")
             .and_then(|value| value.as_object())
-            .is_some_and(|operation| custom_api_operation_has_endpoint_or_source(operation))
+            .is_some_and(custom_api_operation_has_endpoint_or_source)
         || payload
             .get("operations")
             .and_then(|value| value.as_array())

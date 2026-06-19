@@ -327,7 +327,7 @@ fn summarize_success_payload_value_at_depth(
                     Some((score, summary))
                 })
                 .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| right.0.cmp(&left.0));
+            candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
             candidates.into_iter().map(|(_, summary)| summary).next()
         }
         serde_json::Value::Array(items) => items

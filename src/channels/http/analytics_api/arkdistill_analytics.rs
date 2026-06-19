@@ -351,45 +351,43 @@ fn parse_arkdistill_payload(
     row_model_slot: Option<String>,
     value: &serde_json::Value,
 ) -> Option<ArkDistillParsedLog> {
-    let original_chars = json_i64(&value, "original_chars")
+    let original_chars = json_i64(value, "original_chars").unwrap_or_default().max(0);
+    let distilled_chars = json_i64(value, "distilled_chars")
         .unwrap_or_default()
         .max(0);
-    let distilled_chars = json_i64(&value, "distilled_chars")
-        .unwrap_or_default()
-        .max(0);
-    let saved_chars = json_i64(&value, "saved_chars")
+    let saved_chars = json_i64(value, "saved_chars")
         .unwrap_or_else(|| original_chars.saturating_sub(distilled_chars))
         .max(0);
-    let estimated_original_tokens = json_i64(&value, "estimated_original_tokens")
+    let estimated_original_tokens = json_i64(value, "estimated_original_tokens")
         .unwrap_or_else(|| estimate_tokens(original_chars))
         .max(0);
-    let estimated_distilled_tokens = json_i64(&value, "estimated_distilled_tokens")
+    let estimated_distilled_tokens = json_i64(value, "estimated_distilled_tokens")
         .unwrap_or_else(|| estimate_tokens(distilled_chars))
         .max(0);
-    let estimated_saved_tokens = json_i64(&value, "estimated_saved_tokens")
+    let estimated_saved_tokens = json_i64(value, "estimated_saved_tokens")
         .unwrap_or_else(|| estimated_original_tokens.saturating_sub(estimated_distilled_tokens))
         .max(0);
     if original_chars == 0 && estimated_saved_tokens == 0 {
         return None;
     }
     let tool_name = row_tool_name
-        .or_else(|| json_string(&value, "primitive"))
-        .or_else(|| json_string(&value, "tool_name"))
+        .or_else(|| json_string(value, "primitive"))
+        .or_else(|| json_string(value, "tool_name"))
         .unwrap_or_else(|| "unknown".to_string());
     Some(ArkDistillParsedLog {
         created_at,
         tool_name,
-        action: json_string(&value, "action"),
+        action: json_string(value, "action"),
         model_slot: row_model_slot,
-        model_provider: json_string(&value, "model_provider"),
-        model: json_string(&value, "model"),
+        model_provider: json_string(value, "model_provider"),
+        model: json_string(value, "model"),
         original_chars,
         distilled_chars,
         saved_chars,
         estimated_original_tokens,
         estimated_distilled_tokens,
         estimated_saved_tokens,
-        estimated_prompt_cost_saved_usd: json_f64(&value, "estimated_prompt_cost_saved_usd"),
+        estimated_prompt_cost_saved_usd: json_f64(value, "estimated_prompt_cost_saved_usd"),
     })
 }
 

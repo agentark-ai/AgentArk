@@ -170,7 +170,7 @@ pub struct CapabilityReadinessSnapshot {
     pub entries: Vec<CapabilityReadinessSnapshotEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilityReadinessRegistry {
     generation: u64,
     entries: BTreeMap<CapabilityReadinessKey, CapabilityReadinessEntry>,
@@ -210,15 +210,6 @@ impl<'de> Deserialize<'de> for CapabilityReadinessRegistry {
                 .map(|entry| (entry.key.clone(), entry))
                 .collect(),
         })
-    }
-}
-
-impl Default for CapabilityReadinessRegistry {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            entries: BTreeMap::new(),
-        }
     }
 }
 

@@ -4321,11 +4321,10 @@ fn contains_unquoted_shell_operator(command: &str) -> Result<bool> {
                 } else if ch == '\\' {
                     escape = true;
                     idx += 1;
-                } else if ch == '&' && chars.get(idx + 1) == Some(&'&') {
-                    return Ok(true);
-                } else if ch == '|' || ch == ';' || ch == '`' || ch == '<' || ch == '>' {
-                    return Ok(true);
-                } else if ch == '$' && chars.get(idx + 1) == Some(&'(') {
+                } else if (ch == '&' && chars.get(idx + 1) == Some(&'&'))
+                    || matches!(ch, '|' | ';' | '`' | '<' | '>')
+                    || (ch == '$' && chars.get(idx + 1) == Some(&'('))
+                {
                     return Ok(true);
                 } else {
                     idx += 1;

@@ -914,7 +914,7 @@ impl ActionRuntime {
         if rows.is_empty() {
             return;
         }
-        let series_count = chart.series_names.len().max(1).min(4);
+        let series_count = chart.series_names.len().clamp(1, 4);
         let values = rows
             .iter()
             .flat_map(|row| row.values.iter().take(series_count).copied())

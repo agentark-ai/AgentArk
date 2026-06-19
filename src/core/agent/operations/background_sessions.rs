@@ -819,7 +819,7 @@ impl Agent {
                     .filter(|session| include_closed || !session.status.is_closed())
                     .collect::<Vec<_>>()
             };
-            sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
             let tasks = self.tasks.read().await.all().to_vec();
             let watchers = self.watcher_manager.list().await;
             let lines = sessions

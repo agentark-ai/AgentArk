@@ -73,10 +73,7 @@ pub async fn record_tool_outcome(
         stats.failures += 1;
     }
     let total = stats.successes + stats.failures;
-    if total > 0 {
-        stats.avg_latency_ms =
-            (stats.avg_latency_ms.saturating_mul(total - 1) + latency_ms) / total;
-    }
+    stats.avg_latency_ms = (stats.avg_latency_ms.saturating_mul(total - 1) + latency_ms) / total;
     biases.updated_at = chrono::Utc::now().to_rfc3339();
     save_tool_biases(storage, &biases).await;
 }

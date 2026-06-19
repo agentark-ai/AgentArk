@@ -1850,7 +1850,7 @@ fn normalize_declared_commands(
             id,
             label: if label.is_empty() {
                 action
-                    .split(|ch| matches!(ch, '.' | '_' | ':' | '-'))
+                    .split(['.', '_', ':', '-'])
                     .filter(|part| !part.is_empty())
                     .map(|part| {
                         let mut chars = part.chars();

@@ -347,11 +347,11 @@ fn provider_error_status_codes(raw: &str) -> Vec<u16> {
 
 fn user_visible_platform_failure_message(raw_error: &str) -> String {
     let codes = provider_error_status_codes(raw_error);
-    let reason = if codes.iter().any(|code| *code == 402) {
+    let reason = if codes.contains(&402) {
         "The provider reported an account quota, credits, or billing limit."
     } else if codes.iter().any(|code| *code == 401 || *code == 403) {
         "The provider rejected the configured credentials or model access."
-    } else if codes.iter().any(|code| *code == 429) {
+    } else if codes.contains(&429) {
         "The provider reported a rate limit or temporary capacity limit."
     } else if codes.iter().any(|code| matches!(*code, 408 | 504 | 524)) {
         "The provider timed out before returning a usable response."

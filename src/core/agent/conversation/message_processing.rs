@@ -962,7 +962,7 @@ impl Agent {
                 };
                 recent_messages_context.reverse();
                 let recent_messages_context_value = (!recent_messages_context.is_empty())
-                    .then(|| serde_json::Value::Array(recent_messages_context));
+                    .then_some(serde_json::Value::Array(recent_messages_context));
                 let decision = crate::security::intent_classifier::classify_inbound_with_metadata(
                     &agent.llm,
                     &crate::security::intent_classifier::default_policy(),

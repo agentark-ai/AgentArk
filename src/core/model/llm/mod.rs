@@ -111,11 +111,10 @@ fn repair_truncated_json(raw: &str) -> Option<serde_json::Value> {
         match ch {
             '{' => stack.push('}'),
             '[' => stack.push(']'),
-            '}' | ']' => {
-                if stack.last() == Some(&ch) {
-                    stack.pop();
-                }
+            '}' | ']' if stack.last() == Some(&ch) => {
+                stack.pop();
             }
+            '}' | ']' => {}
             _ => {}
         }
     }
@@ -8398,8 +8397,8 @@ impl LlmClient {
         }
 
         let tool_calls: Vec<ToolCall> = tool_builders
-            .into_iter()
-            .filter_map(|(_idx, tb)| {
+            .into_values()
+            .filter_map(|tb| {
                 if tb.name.is_empty() {
                     return None;
                 }

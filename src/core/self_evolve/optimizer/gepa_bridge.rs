@@ -1122,7 +1122,7 @@ pub async fn export_optimization_bundle_with_metadata(
         .collect::<Vec<_>>();
     let router_trace_evidence = export_recent_router_trace_evidence(storage, recent_limit).await;
     let target_surfaces = gepa_export_target_surfaces(job_metadata);
-    let surface_enabled = |surface: &str| target_surfaces.iter().any(|item| *item == surface);
+    let surface_enabled = |surface: &str| target_surfaces.contains(&surface);
     let mut surfaces = serde_json::Map::new();
     if surface_enabled("prompt_bundle") {
         surfaces.insert(
@@ -1822,7 +1822,7 @@ async fn read_json_files(dir: PathBuf, limit: usize) -> Result<Vec<Value>> {
             .unwrap_or(UNIX_EPOCH);
         files.push((modified, path));
     }
-    files.sort_by(|left, right| right.0.cmp(&left.0));
+    files.sort_by_key(|item| std::cmp::Reverse(item.0));
     let mut values = Vec::new();
     for (_, path) in files.into_iter().take(limit.max(1)) {
         let raw = match tokio::fs::read(&path).await {
@@ -1889,7 +1889,7 @@ async fn prune_run_dirs(dir: PathBuf, retention_days: u64, max_run_dirs: usize) 
         .filter(|(modified, _)| *modified < cutoff)
         .map(|(_, path)| path.clone())
         .collect();
-    run_dirs.sort_by(|left, right| right.0.cmp(&left.0));
+    run_dirs.sort_by_key(|item| std::cmp::Reverse(item.0));
     for (_, path) in run_dirs.into_iter().skip(max_run_dirs.max(1)) {
         remove_targets.insert(path);
     }

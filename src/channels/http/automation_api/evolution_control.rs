@@ -3054,9 +3054,9 @@ fn gepa_queue_item_for_proposal<'a>(
     active_match.or(terminal_match)
 }
 
-pub(super) fn gepa_active_queue_item<'a>(
-    gepa_queue: &'a serde_json::Value,
-) -> Option<(&'static str, &'a serde_json::Value)> {
+pub(super) fn gepa_active_queue_item(
+    gepa_queue: &serde_json::Value,
+) -> Option<(&'static str, &serde_json::Value)> {
     let mut active_match = None;
     for status in ["running", "pending"] {
         let Some(items) = gepa_queue.get(status).and_then(|value| value.as_array()) else {

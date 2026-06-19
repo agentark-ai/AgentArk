@@ -5619,7 +5619,7 @@ fn build_clusters(
         })
         .filter(|(_, global_indices)| !global_indices.is_empty())
         .collect::<Vec<_>>();
-    groups.sort_by(|(_, a), (_, b)| b.len().cmp(&a.len()));
+    groups.sort_by_key(|(_, items)| std::cmp::Reverse(items.len()));
 
     let mut used = HashSet::new();
     let clusters = groups

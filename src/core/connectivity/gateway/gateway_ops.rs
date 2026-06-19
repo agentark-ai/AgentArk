@@ -528,8 +528,7 @@ fn build_pulse_highlights(latest_pulse: Option<&PulseEvent>) -> Vec<GatewayOpsHi
 
 fn build_doctor_highlights(findings: &[DoctorFinding]) -> Vec<GatewayOpsHighlight> {
     let mut ordered = findings.to_vec();
-    ordered
-        .sort_by(|left, right| severity_rank(&right.severity).cmp(&severity_rank(&left.severity)));
+    ordered.sort_by_key(|item| std::cmp::Reverse(severity_rank(&item.severity)));
 
     ordered
         .into_iter()

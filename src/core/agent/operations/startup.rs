@@ -1291,7 +1291,7 @@ impl Agent {
                 match embedder.embed_texts(&texts).await {
                     Ok(embeddings) if embeddings.len() == embed_inputs.len() => {
                         for ((action_name, _), embedding) in
-                            embed_inputs.into_iter().zip(embeddings.into_iter())
+                            embed_inputs.into_iter().zip(embeddings)
                         {
                             if action_catalog_embedding_has_default_dim(&embedding) {
                                 stats.embedded += 1;

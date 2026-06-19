@@ -2875,7 +2875,7 @@ impl ActionRuntime {
     /// resolver semantics: exact canonical equality against the record's
     /// identity fields, plus single-token membership for tokens of length
     /// >= 4 (so "linear" resolves "linear-graphql-api" without "api"
-    /// matching every API record).
+    /// > matching every API record).
     pub(in crate::runtime) fn integration_identity_matches_canonical(
         value: &serde_json::Value,
         raw: &str,

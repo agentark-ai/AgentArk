@@ -651,7 +651,7 @@ async fn activity_surface(
         .collect::<Vec<_>>();
 
     let mut watcher_rows = storage.list_watchers().await.unwrap_or_default();
-    watcher_rows.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    watcher_rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
     let recent_watchers = watcher_rows
         .into_iter()
         .take(limit as usize)

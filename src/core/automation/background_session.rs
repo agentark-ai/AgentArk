@@ -497,7 +497,7 @@ impl BackgroundSessionManager {
 
     pub async fn list(&self) -> Vec<BackgroundSession> {
         let mut sessions: Vec<_> = self.sessions.read().await.values().cloned().collect();
-        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         sessions
     }
 
@@ -529,7 +529,7 @@ impl BackgroundSessionManager {
             })
             .cloned()
             .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         sessions
     }
 

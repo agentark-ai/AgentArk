@@ -991,10 +991,10 @@ impl ActionRuntime {
     /// Arms are detected purely by ENDPOINT SHAPE (base_url/path), never by
     /// docs URLs, provider names, or hostnames. Current arms:
     ///   - GraphQL: single endpoint, POST {query, variables} JSON body.
-    /// Extension point: add new arms here for other self-describing
-    /// protocols (e.g. JSON-RPC single-endpoint POST envelopes) — each arm
-    /// must route through the draft normalizer so the protocol's guards
-    /// (read-only, Content-Type, required body) apply uniformly.
+    ///     Extension point: add new arms here for other self-describing
+    ///     protocols (e.g. JSON-RPC single-endpoint POST envelopes) — each arm
+    ///     must route through the draft normalizer so the protocol's guards
+    ///     (read-only, Content-Type, required body) apply uniformly.
     ///
     /// Returns None when no protocol arm matches; callers then degrade to
     /// declared operations or structured needs_source teaching.
@@ -1201,7 +1201,7 @@ impl ActionRuntime {
             serde_json::Value::String(raw) => {
                 let trimmed = raw.trim();
                 if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                    serde_json::from_str(trimmed).unwrap_or_else(|_| serde_json::Value::String(raw))
+                    serde_json::from_str(trimmed).unwrap_or(serde_json::Value::String(raw))
                 } else {
                     serde_json::Value::String(raw)
                 }

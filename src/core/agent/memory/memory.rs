@@ -2431,9 +2431,7 @@ fn top_level_json_field_value_start(raw: &str, field: &str) -> Option<usize> {
         match bytes[index] {
             b'"' => {
                 let top_level_object = stack.len() == 1 && stack.last() == Some(&b'}');
-                let Some((key, end)) = parse_json_string_literal_at(raw, index) else {
-                    return None;
-                };
+                let (key, end) = parse_json_string_literal_at(raw, index)?;
                 if top_level_object && key == field {
                     let colon = skip_json_whitespace(raw, end);
                     if bytes.get(colon) == Some(&b':') {
@@ -2600,7 +2598,7 @@ fn user_memory_capture_source_fallback_attempt(
 fn source_memory_profile_slot_from_attribute(
     attribute_tokens: &[&str],
 ) -> Option<SourceMemoryProfileSlot> {
-    let has = |needle: &str| attribute_tokens.iter().any(|token| *token == needle);
+    let has = |needle: &str| attribute_tokens.contains(&needle);
     let has_any = |needles: &[&str]| needles.iter().any(|needle| has(needle));
 
     if has("name") && !has_any(&["project", "app", "application", "repo", "repository"]) {

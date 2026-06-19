@@ -1784,16 +1784,15 @@ impl Agent {
                     }
                     depth += 1;
                 }
-                '}' => {
-                    if depth > 0 {
-                        depth -= 1;
-                        if depth == 0 {
-                            if let Some(s) = start {
-                                return Some((s, idx + ch.len_utf8()));
-                            }
+                '}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start {
+                            return Some((s, idx + ch.len_utf8()));
                         }
                     }
                 }
+                '}' => {}
                 _ => {}
             }
         }
@@ -5051,7 +5050,7 @@ impl Agent {
             self.watcher_manager.list(),
             crate::core::list_automation_supervisor_states(&self.storage)
         );
-        watchers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        watchers.sort_by_key(|watcher| std::cmp::Reverse(watcher.created_at));
         let live_ids = watchers
             .iter()
             .map(|watcher| watcher.id.to_string())

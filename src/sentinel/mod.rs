@@ -4015,7 +4015,7 @@ async fn run_doctor_checks(
         ],
     ));
 
-    findings.sort_by(|a, b| severity_weight(&b.severity).cmp(&severity_weight(&a.severity)));
+    findings.sort_by_key(|finding| std::cmp::Reverse(severity_weight(&finding.severity)));
     if findings.len() > 40 {
         findings.truncate(40);
     }

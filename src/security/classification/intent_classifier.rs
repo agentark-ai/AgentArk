@@ -648,11 +648,10 @@ fn collect_json_candidates_from_value(value: serde_json::Value, out: &mut Vec<se
                 }
             }
         }
-        serde_json::Value::String(text) => {
-            if text.contains('{') {
-                collect_json_candidates_from_text(&text, out);
-            }
+        serde_json::Value::String(text) if text.contains('{') => {
+            collect_json_candidates_from_text(&text, out);
         }
+        serde_json::Value::String(_) => {}
         _ => {}
     }
 }

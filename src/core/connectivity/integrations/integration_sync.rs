@@ -1905,7 +1905,7 @@ async fn fetch_google_workspace_items(
     if bundles.iter().any(|bundle| bundle == "drive") {
         items.extend(fetch_workspace_drive_items(ctx).await?);
     }
-    items.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+    items.sort_by_key(|item| std::cmp::Reverse(item.occurred_at));
     items.truncate(40);
     Ok(items)
 }
@@ -2700,7 +2700,7 @@ async fn fetch_github_items(
         );
     }
 
-    items.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+    items.sort_by_key(|item| std::cmp::Reverse(item.occurred_at));
     items.truncate(120);
     Ok(items)
 }

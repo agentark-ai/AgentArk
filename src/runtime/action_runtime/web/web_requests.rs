@@ -233,7 +233,6 @@ impl ActionRuntime {
                                                 source_action: Some("page_fetch".to_string()),
                                                 force_resource: as_resource
                                                     || expected_non_text_resource,
-                                                ..PersistHints::default()
                                             },
                                         )
                                         .await?;
@@ -791,7 +790,6 @@ impl ActionRuntime {
                         suggested_name: suggested_name.clone(),
                         source_action: Some("http_request".to_string()),
                         force_resource: as_resource || expected_non_text_resource,
-                        ..PersistHints::default()
                     },
                 )
                 .await?

@@ -439,7 +439,7 @@ impl OpportunityMiner for OperationContractRepairMiner {
                 evidence_ids.truncate(SEGMENT_EXAMPLE_CAP);
                 let holdout_run_ids = group.run_ids.iter().take(2).cloned().collect::<Vec<_>>();
                 let mut topic_parts = vec![group.label.clone(), group.contract_kind.clone()];
-                topic_parts.extend(group.example_requests.drain(..));
+                topic_parts.append(&mut group.example_requests);
                 OpportunityDraft {
                     miner_key: self.key(),
                     segment_key,

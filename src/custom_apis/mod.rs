@@ -963,14 +963,14 @@ fn collapse_legacy_graphql_default_body_operations(
     }
     let collapse_keys = groups
         .iter()
-        .filter_map(|(key, indexes)| {
-            (indexes.len() > 1
+        .filter(|(_, indexes)| {
+            indexes.len() > 1
                 || indexes.iter().any(|index| {
                     let draft = &operations[*index].draft;
                     draft.default_body.is_some() || !is_generic_graphql_operation_id(&draft.id)
-                }))
-            .then(|| key.clone())
+                })
         })
+        .map(|(key, _)| key.clone())
         .collect::<BTreeSet<_>>();
     if collapse_keys.is_empty() {
         return operations;
@@ -1962,9 +1962,7 @@ fn extract_json_object_from_text(text: &str) -> Option<Value> {
         } else if ch == '}' {
             depth -= 1;
             if depth == 0 {
-                let Some(start) = start else {
-                    return None;
-                };
+                let start = start?;
                 let candidate = &trimmed[start..=idx];
                 if let Ok(value) = serde_json::from_str::<Value>(candidate) {
                     return value.as_object().is_some().then_some(value);

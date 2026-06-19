@@ -138,7 +138,7 @@ pub fn normalize_request_shape(
         if matches!(method.as_str(), "GET" | "HEAD") {
             method = "POST".to_string();
         }
-        if let Some(Value::String(query)) = body.as_ref().map(Value::clone) {
+        if let Some(Value::String(query)) = body.clone() {
             let query = query.trim();
             if !query.is_empty() && graphql_document_has_operation_signal(query) {
                 body = Some(serde_json::json!({ "query": query }));
