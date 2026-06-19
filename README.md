@@ -184,7 +184,7 @@ docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d
 
 The bundled Docker runtime includes Lightpanda for fast free-content fetching and the Evolve GEPA optimizer runtime with DSPy. GEPA uses the same active model configured in AgentArk's Models settings; there is no separate GEPA key, model, button, or `.env` setup. Evolve runs this optimizer automatically only after AgentArk is quiet, enough completed work exists, and the daily cost guardrail allows it. The UI surfaces this as Background improvement status, queue, evidence, and latest result.
 
-For operator inspection, GEPA reads recent evidence from `experience_runs`. Its config, scheduler state, budget ledger, and latest result live in `kv_store` under `gepa_optimizer_config_v1`, `gepa_optimizer_auto_state_v1`, `gepa_optimizer_budget_ledger_v1`, and `gepa_optimizer_last_result_v1`. Queue/run artifacts are file-backed under `/app/.agentark/self_evolve/gepa/{pending,running,completed,failed,runs}`.
+For operator inspection, GEPA reads recent evidence from `experience_runs`. Its config, scheduler state, budget ledger, and latest result live in `kv_store` under `gepa_optimizer_config_v1`, `gepa_optimizer_auto_state_v1`, `gepa_optimizer_budget_ledger_v1`, and `gepa_optimizer_last_result_v1`. Queue/run artifacts are file-backed under `/app/data/.agentark/self_evolve/gepa/{pending,running,completed,failed,runs}` in the `agentark-data` Docker volume.
 
 ### Runtime footprint
 
