@@ -99,12 +99,29 @@ ensure_docker_ready() {
 
 ensure_docker_ready
 
+resolve_compose_project_name() {
+    if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+        printf '%s' "${COMPOSE_PROJECT_NAME}"
+        return
+    fi
+    local existing
+    existing="$(docker ps -a --filter "name=^/agentark-control$" --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null | head -n 1 || true)"
+    if [ -n "${existing}" ]; then
+        printf '%s' "${existing}"
+    else
+        printf '%s' "agentark"
+    fi
+}
+
+COMPOSE_PROJECT_NAME="$(resolve_compose_project_name)"
+export COMPOSE_PROJECT_NAME
+
 compose() {
-    docker compose "$@"
+    docker compose -p "${COMPOSE_PROJECT_NAME}" "$@"
 }
 
 compose_dev() {
-    docker compose -f docker-compose.yml -f docker-compose.dev.yml "$@"
+    docker compose -p "${COMPOSE_PROJECT_NAME}" -f docker-compose.yml -f docker-compose.dev.yml "$@"
 }
 
 pull_runtime_images() {

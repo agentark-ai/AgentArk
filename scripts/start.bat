@@ -15,6 +15,13 @@ REM   scripts\start.bat status       - Show running containers
 
 setlocal enabledelayedexpansion
 
+if "%COMPOSE_PROJECT_NAME%"=="" (
+    for /f "delims=" %%P in ('docker ps -a --filter "name=^/agentark-control$" --format "{{.Label ""com.docker.compose.project""}}" 2^>nul') do (
+        if not "%%P"=="" set "COMPOSE_PROJECT_NAME=%%P"
+    )
+)
+if "%COMPOSE_PROJECT_NAME%"=="" set "COMPOSE_PROJECT_NAME=agentark"
+
 if "%1"=="" goto start
 if "%1"=="start" goto start
 if "%1"=="tunnel" goto tunnel

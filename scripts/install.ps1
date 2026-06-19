@@ -200,6 +200,17 @@ try {
     }
 }
 
+function Get-AgentArkComposeProjectName {
+    if (-not [string]::IsNullOrWhiteSpace($env:COMPOSE_PROJECT_NAME)) {
+        return $env:COMPOSE_PROJECT_NAME.Trim()
+    }
+    $existing = & docker ps -a --filter "name=^/agentark-control$" --format '{{.Label "com.docker.compose.project"}}' 2>$null | Select-Object -First 1
+    if (-not [string]::IsNullOrWhiteSpace($existing)) {
+        return $existing.Trim()
+    }
+    return "agentark"
+}
+
 Write-Host ""
 Write-Host "=========================================" -ForegroundColor White
 Write-Host "  AgentArk Installer" -ForegroundColor White
@@ -223,6 +234,7 @@ Write-Host "[2/4] Runtime files ready at $RuntimeDir." -ForegroundColor Green
 $env:AGENTARK_IMAGE = "${ImageRepository}:$(Get-AgentArkReleaseVersionFromTag $TargetReleaseTag)"
 $env:AGENTARK_RELEASE_REPO = $ReleaseRepo
 $env:AGENTARK_RELEASE_TAG = $TargetReleaseTag
+$env:COMPOSE_PROJECT_NAME = Get-AgentArkComposeProjectName
 
 $postgresPort = 5432
 if ($env:AGENTARK_POSTGRES_PORT -match '^\d+$') { $postgresPort = [int]$env:AGENTARK_POSTGRES_PORT }

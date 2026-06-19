@@ -229,6 +229,20 @@ SCRIPT_EOF
     fi
 }
 
+compose_project_name() {
+    if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+        printf '%s' "${COMPOSE_PROJECT_NAME}"
+        return
+    fi
+    local existing
+    existing="$(docker ps -a --filter "name=^/agentark-control$" --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null | head -n 1 || true)"
+    if [ -n "${existing}" ]; then
+        printf '%s' "${existing}"
+    else
+        printf '%s' "agentark"
+    fi
+}
+
 echo ""
 echo -e "${BOLD}=========================================${NC}"
 echo -e "${BOLD}  AgentArk Installer${NC}"
@@ -253,16 +267,17 @@ echo -e "${GREEN}[2/4] Runtime files ready at ${RUNTIME_DIR}.${NC}"
 export AGENTARK_IMAGE="${IMAGE_REPOSITORY}:$(version_from_tag "${TARGET_RELEASE_TAG}")"
 export AGENTARK_RELEASE_REPO="${RELEASE_REPO}"
 export AGENTARK_RELEASE_TAG="${TARGET_RELEASE_TAG}"
+export COMPOSE_PROJECT_NAME="$(compose_project_name)"
 
 cd "${RUNTIME_DIR}"
 warn_if_port_in_use "${AGENTARK_POSTGRES_PORT:-5432}" "Postgres"
 warn_if_port_in_use "8990" "AgentArk Web UI"
 
 echo -e "${CYAN}[3/4] Pulling AgentArk image ${AGENTARK_IMAGE}...${NC}"
-docker compose pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
+docker compose -p "${COMPOSE_PROJECT_NAME}" pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
 
 echo -e "${GREEN}[4/4] Starting AgentArk...${NC}"
-docker compose up -d
+docker compose -p "${COMPOSE_PROJECT_NAME}" up -d
 
 echo ""
 echo -e "${BOLD}=========================================${NC}"
