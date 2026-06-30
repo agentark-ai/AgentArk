@@ -210,9 +210,16 @@ function Get-AgentArkComposeProjectName {
     if (-not [string]::IsNullOrWhiteSpace($env:COMPOSE_PROJECT_NAME)) {
         return $env:COMPOSE_PROJECT_NAME.Trim()
     }
-    $existing = & docker ps -a --filter "name=^/agentark-control$" --format '{{.Label "com.docker.compose.project"}}' 2>$null | Select-Object -First 1
-    if (-not [string]::IsNullOrWhiteSpace($existing)) {
-        return $existing.Trim()
+    $labelsJson = & docker inspect agentark-control --format '{{json .Config.Labels}}' 2>$null | Select-Object -First 1
+    if (-not [string]::IsNullOrWhiteSpace($labelsJson)) {
+        try {
+            $labels = $labelsJson | ConvertFrom-Json
+            $existing = $labels.'com.docker.compose.project'
+            if (-not [string]::IsNullOrWhiteSpace($existing)) {
+                return $existing.Trim()
+            }
+        } catch {
+        }
     }
     return "agentark"
 }
